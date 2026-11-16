@@ -148,7 +148,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only domains](docs/deployment.md#published-read-only-domains) | Knowledge curated in a git repository, served read-only to agents |
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network (with `evolve.contradictions` off, or its checkpoint pre-fetched too) |
-| [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all of them that registered the domain |
+| [Run on PostgreSQL](docs/deployment.md#run-on-postgresql) | One active instance owns a PostgreSQL database with its accounts and index, a standby takes over; a redeploy keeps everyone signed in |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
 | [Team server with a GitHub App](docs/deployment.md#team-server-with-a-github-app) | An App of your own reads, pulls and shares; access to each domain follows the repository on GitHub |
 | [Reflection on a team server](docs/deployment.md#reflection-on-a-team-server) | People and agents work on a domain's Reflection on one home instance, backed up to its own branch |
@@ -191,7 +191,7 @@ Every other connection exists only after you turn it on:
 - **Hugging Face again**, once you turn on the contradiction check (`evolve.contradictions`), for a one-time download of its local NLI model into the same cache. It sends no engram data.
 - **Your single sign-on provider**, when you configure OIDC sign-in for the web UI. Crystalline talks to the issuer you name.
 - **A remote embedding service**, when you set `embeddings.provider: openai-compatible` in `config.yaml`. The text of your engrams is then sent to the endpoint you configure, to compute its embeddings. The default provider is local and sends nothing.
-- **A PostgreSQL server**, when you set `database.backend: postgres` and `database.url` to share one search index between instances. The index holds the text of your engrams.
+- **A PostgreSQL server**, when you set `database.backend: postgres` and `database.url` to keep the accounts and the search index in the database, with one active instance and a standby that takes over. The index holds the text of your engrams.
 - **A Crystalline server you connect to**, after `crystalline connect <url>` (or with `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` set). Searches and engram reads and writes for its domains go to that server, under your account there. A search over all domains also sends the search text to it. Your local engrams stay on your machine.
 
 Nothing else leaves the machine.

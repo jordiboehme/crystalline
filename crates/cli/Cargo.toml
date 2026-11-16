@@ -52,7 +52,7 @@ restart-after-upgrade = true
 # search, the remote provider and chunking keep working over Turso.
 default = ["local-embeddings", "postgres", "fluid-ui"]
 local-embeddings = ["crystalline-index/local-embeddings"]
-postgres = ["crystalline-index/postgres"]
+postgres = ["crystalline-index/postgres", "crystalline-service/postgres"]
 # The embedded Fluid web UI, which every daemon serves on its HTTP endpoint
 # (on at 127.0.0.1:7411 unless it is turned off). Forwarded to
 # crystalline-service the same way the two above are forwarded to the index, so

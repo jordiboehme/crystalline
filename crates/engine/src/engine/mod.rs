@@ -1459,6 +1459,11 @@ pub struct Engine {
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The accounts a rename moves records in when no resolver is installed:
+    // on Postgres a standalone command hands the database's accounts here
+    // before it finishes a rename an earlier run left half done, because the
+    // accounts file in the state directory is never read there.
+    rename_accounts: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
     // Why the resolver above could not be built, on a stack that tried to
     // build one (every serving stack does, before it answers anything) and
     // could not open the accounts store. While it is set and no resolver is,
@@ -2710,6 +2715,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            rename_accounts: std::sync::OnceLock::new(),
             domain_access_unavailable: std::sync::OnceLock::new(),
             domain_access_absent: std::sync::OnceLock::new(),
             github_governor: std::sync::OnceLock::new(),
@@ -3398,6 +3404,14 @@ impl Engine {
     /// possibly different, store.
     pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
         let _ = self.domain_access.set(access);
+    }
+
+    /// Hand a rename the accounts it moves records in, without installing
+    /// them as the resolver: what a standalone command on Postgres does
+    /// before it finishes a rename an earlier run left half done. The
+    /// installed resolver wins when there is one. A second call is ignored.
+    pub fn set_rename_accounts(&self, access: Arc<crate::scope::DomainAccess>) {
+        let _ = self.rename_accounts.set(access);
     }
 
     /// Record that this stack tried to install the private-domain resolver
@@ -10249,16 +10263,28 @@ pub async fn open_standalone(
     db: &Path,
     want_embeddings: bool,
 ) -> anyhow::Result<Engine> {
+    // The factory resolves the backend from the effective `database`, creates
+    // the parent directory for a Turso file and unsizes the concrete store into
+    // a `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
+    let store =
+        crystalline_index::open_store(&loaded.effective.database(), Some(db), false).await?;
+    open_standalone_with_store(loaded, store, want_embeddings).await
+}
+
+/// [`open_standalone`] over a store the caller opened: on Postgres a command
+/// opens it with the settings of the database claim it holds (its tag and
+/// fence), which this crate does not know about.
+pub async fn open_standalone_with_store(
+    loaded: LoadedConfig,
+    store: Arc<Mutex<dyn Store>>,
+    want_embeddings: bool,
+) -> anyhow::Result<Engine> {
     let LoadedConfig {
         path,
         file,
         effective,
         overlay,
     } = loaded;
-    // The factory resolves the backend from the effective `database`, creates
-    // the parent directory for a Turso file and unsizes the concrete store into
-    // a `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
-    let store = crystalline_index::open_store(&effective.database(), Some(db), false).await?;
     // A standalone data command has no `--read-only` flag of its own, so the
     // mode comes purely from the effective `service.read_only` (config or
     // environment); a read-only config refuses CLI writes here the same way the

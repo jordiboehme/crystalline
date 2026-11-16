@@ -169,10 +169,19 @@ pub(crate) async fn reach_index(
     } else {
         "the configured database".to_string()
     };
-    match crystalline_index::open_store(&cfg.database(), db_override, open_as == OpenAs::Rebuild)
+    // On Postgres the database is claimed for this command first, or refused
+    // with the owner's name when another instance has it (spec section L); a
+    // read-only report never opens it there. A read hands the refusal on as
+    // the reason it could not reach the index, so a listing still degrades;
+    // a write fails with it as it is.
+    match crystalline_service::open_store_for_command(cfg, db_override, open_as == OpenAs::Rebuild)
         .await
     {
         Ok(store) => Ok(IndexRoute::Direct(store)),
+        Err(e) if crystalline_service::claim::refused_by_cli_rule(&e) => match open_as {
+            OpenAs::Read => Ok(IndexRoute::Unreachable(e.to_string())),
+            OpenAs::Write | OpenAs::Rebuild => Err(e),
+        },
         Err(e) => Ok(IndexRoute::Unreachable(
             crystalline_service::instance::index_unreachable_words(
                 &location,
@@ -180,6 +189,34 @@ pub(crate) async fn reach_index(
                 bypassed,
             ),
         )),
+    }
+}
+
+/// The "ownership and durable state" block of `cfg` for `status` and
+/// `doctor`: its lines and its JSON. Only on Postgres; Turso has no block.
+/// Read from the owner row, never from the store (a report opens nothing).
+/// `role` is what the caller knows of the instance it talked to.
+pub(crate) async fn durable_state_block(
+    cfg: &GlobalConfig,
+    role: &str,
+) -> Option<(Vec<String>, serde_json::Value)> {
+    #[cfg(feature = "postgres")]
+    {
+        let report = crystalline_service::durable::durable_state_for_command(cfg, role).await?;
+        Some((report.block_lines(), report.to_json()))
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (cfg, role);
+        None
+    }
+}
+
+/// Print a block from [`durable_state_block`] under its heading.
+pub(crate) fn print_durable_state(lines: &[String]) {
+    println!("Ownership and durable state:");
+    for line in lines {
+        println!("  {line}");
     }
 }
 
@@ -4005,7 +4042,7 @@ pub async fn connect_github(
         .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string());
 
     // Read before the sign-in, which can take minutes.
-    let account_then = AccountThen::read(identity).await?;
+    let account_then = AccountThen::read(identity, cfg).await?;
     let (access_token, login) = match token {
         Some(pat) => {
             let login = crystalline_remote::github::auth::validate_token(api_url.as_deref(), pat)
@@ -4097,7 +4134,10 @@ struct AccountThen {
 }
 
 impl AccountThen {
-    async fn read(identity: &crystalline_remote::TokenIdentity) -> Result<AccountThen> {
+    async fn read(
+        identity: &crystalline_remote::TokenIdentity,
+        cfg: &crystalline_core::config::GlobalConfig,
+    ) -> Result<AccountThen> {
         let nobody = AccountThen {
             asks: None,
             born: None,
@@ -4108,12 +4148,9 @@ impl AccountThen {
         if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
             return Ok(nobody);
         }
-        let path = config::web_auth_db_path()
-            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
-        if !path.exists() {
+        let Some(store) = crystalline_service::existing_accounts_for_cli(cfg).await? else {
             return Ok(nobody);
-        }
-        let store = crystalline_service::rest::AuthStore::open(&path).await?;
+        };
         let born = store.account_born(name).await?;
         Ok(AccountThen {
             asks: Some((store, name.clone())),
@@ -4216,14 +4253,7 @@ impl PersonalApp<'_> {
     /// The accounts database, when this machine has one. Never created
     /// here: a machine without accounts has nothing to link.
     async fn accounts(&self) -> Result<Option<crystalline_service::rest::AuthStore>> {
-        let path = config::web_auth_db_path()
-            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(Some(
-            crystalline_service::rest::AuthStore::open(&path).await?,
-        ))
+        crystalline_service::existing_accounts_for_cli(self.cfg).await
     }
 
     /// The accounts database when this connect links an account, `None`
@@ -4252,7 +4282,7 @@ impl PersonalApp<'_> {
         let app = self.app.as_ref().map_err(|e| anyhow!("{e}"))?;
         let accounts = self.link_target().await?;
         // Read before the sign-in, which can take minutes.
-        let account_then = AccountThen::read(self.identity).await?;
+        let account_then = AccountThen::read(self.identity, self.cfg).await?;
         let credentials = app.credentials();
         let auth_base = app.auth_base();
         let grant = device_flow_grant(auth_base, &credentials.client_id, None)

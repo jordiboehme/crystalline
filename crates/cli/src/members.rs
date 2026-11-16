@@ -37,11 +37,14 @@ use crystalline_service::rest::{
 
 use crate::{MembersCommand, ReflectionGrantCommand, VisibilityArg};
 
-/// Open the accounts database in the state directory, the same file
-/// `crystalline users` writes and the daemon reads.
-async fn store() -> Result<AuthStore> {
-    let path = crystalline_core::config::web_auth_db_path()?;
-    AuthStore::open(&path).await
+/// Open the accounts store `crystalline users` writes and the daemon reads:
+/// the file in the state directory, or on Postgres the configured database
+/// ([`crystalline_service::open_accounts_for_cli`]), as the configuration
+/// `config` (or the default one) names it: the same configuration the domain
+/// was checked against.
+async fn store(config: Option<&Path>) -> Result<AuthStore> {
+    let loaded = crate::cmd::load(config)?;
+    crystalline_service::open_accounts_for_cli(&loaded.effective).await
 }
 
 /// Resolve a domain name against the global config, exactly as it is spelled
@@ -172,8 +175,8 @@ pub async fn require_account(store: &AuthStore, account: &str) -> Result<String>
 /// the acl row is written after it succeeded, so a name nobody has an account
 /// for refuses without a domain having been registered, and an acl row is
 /// never written for a name that failed to register.
-pub async fn check_private_owner(owner: &str) -> Result<String> {
-    let store = store().await?;
+pub async fn check_private_owner(owner: &str, config: Option<&Path>) -> Result<String> {
+    let store = store(config).await?;
     require_account(&store, owner).await
 }
 
@@ -208,7 +211,7 @@ pub async fn close_new_domain(
     json: bool,
 ) -> Result<()> {
     let domain = &require_registered(domain, config)?;
-    let store = store().await?;
+    let store = store(config).await?;
     let written = store
         .set_domain_visibility(domain, true, owner)
         .await
@@ -273,7 +276,7 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
     if !matches!(command, MembersCommand::List { .. }) {
         refuse_governed(&domain, config.as_deref()).await?;
     }
-    let store = store().await?;
+    let store = store(config.as_deref()).await?;
     match command {
         MembersCommand::List { .. } => {
             let acl = store.domain_visibility(&domain).await?;
@@ -355,7 +358,7 @@ async fn reflection(domain: String, command: ReflectionGrantCommand) -> Result<(
             config,
         } => {
             let domain = require_kept_as_files(&domain, config.as_deref())?;
-            let store = store().await?;
+            let store = store(config.as_deref()).await?;
             let user = require_account(&store, &user).await?;
             let level: ReflectionLevel = level.into();
             store
@@ -368,7 +371,7 @@ async fn reflection(domain: String, command: ReflectionGrantCommand) -> Result<(
         }
         ReflectionGrantCommand::Remove { user, config } => {
             let domain = require_kept_as_files(&domain, config.as_deref())?;
-            let store = store().await?;
+            let store = store(config.as_deref()).await?;
             let name = user.trim().to_lowercase();
             if !store.remove_reflection_grant(&domain, &name).await? {
                 bail!("'{name}' holds no Reflection grant on domain '{domain}'");
@@ -426,7 +429,7 @@ pub async fn visibility(
     {
         bail!("Set by {var}; change it there.");
     }
-    let store = store().await?;
+    let store = store(config.as_deref()).await?;
     match visibility {
         VisibilityArg::Private if rule.governed => {
             // GitHub decides access here: the record names the reserved
@@ -577,7 +580,7 @@ pub async fn transfer(
 ) -> Result<()> {
     let domain = require_registered(&domain, config.as_deref())?;
     refuse_governed(&domain, config.as_deref()).await?;
-    let store = store().await?;
+    let store = store(config.as_deref()).await?;
     let new_owner = require_account(&store, &new_owner).await?;
     store.transfer_domain(&domain, &new_owner).await?;
     if json {

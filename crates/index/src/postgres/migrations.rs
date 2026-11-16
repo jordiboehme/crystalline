@@ -10,7 +10,7 @@
 //! that bakes in everything the current [`crate::Store`] trait exercises in one
 //! step rather than replaying the Turso migration history.
 
-use sqlx::{AssertSqlSafe, Executor, PgConnection};
+use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::error::{IndexError, Result};
 
@@ -176,7 +176,33 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "wikilink whole target text",
         sql: SCHEMA_V30,
     },
+    Migration {
+        version: 31,
+        label: "instance owner",
+        sql: SCHEMA_V31,
+    },
 ];
+
+/// A ledger and the ordered steps that raise it: the index set, and the
+/// auth tables' own set. Both run through [`apply_locked_set`] under the one
+/// `MIGRATION_LOCK`.
+pub struct MigrationSet {
+    /// The ledger table that records the applied versions, `(version BIGINT
+    /// PRIMARY KEY, applied_at TEXT NOT NULL)`.
+    pub ledger: &'static str,
+    /// The steps, ascending by version. Append-only.
+    pub steps: &'static [Migration],
+    /// Whether a step's data backfill (Rust code keyed by version) runs after
+    /// its DDL. Only the index set has any.
+    pub index_backfill: bool,
+}
+
+/// The index schema's set, ledger `schema_migration`.
+pub const INDEX_SET: MigrationSet = MigrationSet {
+    ledger: "schema_migration",
+    steps: MIGRATIONS,
+    index_backfill: true,
+};
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
 // strings, not `date`/`timestamptz`, so the canonical current filter and every
@@ -877,6 +903,23 @@ CREATE INDEX IF NOT EXISTS idx_relation_to_whole ON relation(lower(to_whole)) WH
 CREATE INDEX IF NOT EXISTS idx_link_to_whole ON link(lower(to_whole)) WHERE to_whole IS NOT NULL;
 "#;
 
+// The diagnostic row an active instance writes about itself: advisory locks
+// carry no metadata. One row, `id = 1`. It is never part of `WIPE_TABLES`: a
+// wipe empties the index, not who owns the database.
+const SCHEMA_V31: &str = r#"
+CREATE TABLE IF NOT EXISTS instance_owner (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    instance_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    command TEXT,
+    pid BIGINT NOT NULL,
+    backend_pid BIGINT NOT NULL,
+    version TEXT NOT NULL,
+    since TIMESTAMPTZ NOT NULL,
+    released_at TIMESTAMPTZ
+);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -936,6 +979,10 @@ pub const WIPE_TABLES: &[&str] = &[
     "domain",
 ];
 
+/// Tables that belong to the instance, not to the index: a wipe must leave
+/// them alone, so none of them may appear in `WIPE_TABLES`.
+pub const INSTANCE_TABLES: &[&str] = &["instance_owner"];
+
 /// The session-level advisory lock every migration run holds, so instances
 /// that start at the same moment take turns: without it two of them on an
 /// empty database both read version 0 and race on `CREATE EXTENSION vector`,
@@ -945,14 +992,14 @@ pub const WIPE_TABLES: &[&str] = &[
 pub(crate) const MIGRATION_LOCK: i64 = 7301551;
 
 /// What a locked migration run left behind.
-pub(crate) struct LockedRun {
+pub struct LockedRun {
     /// The schema version after the run, or why it failed.
-    pub(crate) version: Result<i64>,
-    /// The session may still hold [`MIGRATION_LOCK`]: taking it failed, or
+    pub version: Result<i64>,
+    /// The session may still hold `MIGRATION_LOCK`: taking it failed, or
     /// releasing it failed or found nothing held. The caller must close the
     /// session instead of giving it back to a pool, as `release_work_claim`
     /// does for a work claim.
-    pub(crate) tainted: bool,
+    pub tainted: bool,
 }
 
 /// Take [`MIGRATION_LOCK`] on `conn`, create `schema` when one is given,
@@ -964,6 +1011,16 @@ pub(crate) struct LockedRun {
 /// A failed release turns a successful run into an error, so a caller never
 /// mistakes a session that may still hold the lock for a clean one.
 pub(crate) async fn apply_locked(conn: &mut PgConnection, schema: Option<&str>) -> LockedRun {
+    apply_locked_set(conn, schema, &INDEX_SET).await
+}
+
+/// `apply_locked` for any [`MigrationSet`]: the same lock, schema creation
+/// and release, over the set's own ledger.
+pub async fn apply_locked_set(
+    conn: &mut PgConnection,
+    schema: Option<&str>,
+    set: &MigrationSet,
+) -> LockedRun {
     if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(MIGRATION_LOCK)
         .execute(&mut *conn)
@@ -984,10 +1041,10 @@ pub(crate) async fn apply_locked(conn: &mut PgConnection, schema: Option<&str>) 
         .execute(&mut *conn)
         .await
         {
-            Ok(_) => apply_unlocked(conn).await,
+            Ok(_) => apply_unlocked(conn, set).await,
             Err(e) => Err(IndexError::Migration(e.to_string())),
         },
-        None => apply_unlocked(conn).await,
+        None => apply_unlocked(conn, set).await,
     };
     let released = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
         .bind(MIGRATION_LOCK)
@@ -1016,26 +1073,28 @@ pub(crate) async fn apply_locked(conn: &mut PgConnection, schema: Option<&str>) 
 /// Ensure the migration ledger exists, then apply every migration above the
 /// recorded version. Returns the resulting schema version. The caller holds
 /// [`MIGRATION_LOCK`].
-async fn apply_unlocked(conn: &mut PgConnection) -> Result<i64> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
-    )
+async fn apply_unlocked(conn: &mut PgConnection, set: &MigrationSet) -> Result<i64> {
+    let ledger = set.ledger;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {ledger} (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )))
+    .execute(&mut *conn)
     .await
     .map_err(|e| IndexError::Migration(e.to_string()))?;
 
-    let current = current_version(conn).await?;
+    let current = current_version(conn, ledger).await?;
     // The Turso twin of this guard: a schema raised past every migration this
     // binary ships is a newer Crystalline's work, not damage, and there is no
     // migration list here that could replay backwards to what this binary
     // expects. Checked before the loop touches anything.
-    let known = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
+    let known = set.steps.last().map(|m| m.version).unwrap_or(0);
     if current > known {
         return Err(IndexError::SchemaTooNew {
             found: current,
             known,
         });
     }
-    for m in MIGRATIONS {
+    for m in set.steps {
         if m.version <= current {
             continue;
         }
@@ -1055,28 +1114,34 @@ async fn apply_unlocked(conn: &mut PgConnection) -> Result<i64> {
             .execute(&mut *tx)
             .await
             .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
-        backfill(&mut tx, m.version)
-            .await
-            .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
+        if set.index_backfill {
+            backfill(&mut tx, m.version)
+                .await
+                .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
+        }
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
-            .bind(m.version)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| IndexError::Migration(e.to_string()))?;
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {ledger} (version, applied_at) VALUES ($1, $2)"
+        )))
+        .bind(m.version)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| IndexError::Migration(e.to_string()))?;
         tx.commit()
             .await
             .map_err(|e| IndexError::Migration(e.to_string()))?;
     }
-    current_version(conn).await
+    current_version(conn, ledger).await
 }
 
-async fn current_version(conn: &mut PgConnection) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM schema_migration")
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| IndexError::Migration(e.to_string()))?;
+async fn current_version(conn: &mut PgConnection, ledger: &str) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT COALESCE(MAX(version), 0) FROM {ledger}"
+    )))
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| IndexError::Migration(e.to_string()))?;
     Ok(row.0)
 }
 
@@ -1819,8 +1884,8 @@ mod tests {
     /// released all the same: the step rolls back, `apply` answers the
     /// error, and the session no longer holds the lock, so an instance whose
     /// migration failed does not keep every other instance from starting.
-    /// The ledger here claims every step but the last while no table exists,
-    /// so the last step's index has nothing to go on.
+    /// The ledger here claims every step but v30 and v31 while no table exists,
+    /// so v30's index has nothing to go on.
     #[tokio::test]
     async fn a_failed_step_still_releases_the_migration_lock() {
         let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
@@ -1838,7 +1903,9 @@ mod tests {
         .execute(&mut conn)
         .await
         .unwrap();
-        let last = MIGRATIONS.last().unwrap().version;
+        // v31 only creates a table, so the step that cannot run over an empty
+        // schema is the one before it, v30's column and indexes.
+        let last = MIGRATIONS.last().unwrap().version - 1;
         sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
             .bind(last - 1)
             .bind(chrono::Utc::now().to_rfc3339())
@@ -2941,5 +3008,124 @@ mod tests {
 
         assert!(failures.is_empty(), "every open succeeds: {failures:?}");
         assert_eq!(extensions, 1, "the extension is created once");
+    }
+
+    /// The instance rows never ride along with a wipe.
+    #[test]
+    fn instance_tables_are_not_wiped() {
+        for t in INSTANCE_TABLES {
+            assert!(
+                !WIPE_TABLES.contains(t),
+                "{t} is an instance table and must stay out of WIPE_TABLES"
+            );
+        }
+    }
+
+    const DUMMY_STEPS: &[Migration] = &[
+        Migration {
+            version: 1,
+            label: "dummy table",
+            sql: "CREATE TABLE IF NOT EXISTS dummy_set_table (id BIGINT PRIMARY KEY)",
+        },
+        Migration {
+            version: 2,
+            label: "dummy column",
+            sql: "ALTER TABLE dummy_set_table ADD COLUMN IF NOT EXISTS note TEXT",
+        },
+    ];
+    const DUMMY_SET: MigrationSet = MigrationSet {
+        ledger: "dummy_set_migration",
+        steps: DUMMY_STEPS,
+        index_backfill: false,
+    };
+
+    /// Two sets on two connections at the same moment, over an empty schema:
+    /// the one lock makes them take turns and both ledgers end complete.
+    #[tokio::test]
+    async fn two_sets_migrate_at_once_on_an_empty_schema() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_twosets_{}", std::process::id());
+        let mut setup = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut setup, &schema).await;
+        let connect = |url: String, schema: String| async move {
+            let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET search_path TO {schema}, public"
+            )))
+            .execute(&mut c)
+            .await
+            .unwrap();
+            c
+        };
+        let mut a = connect(url.clone(), schema.clone()).await;
+        let mut b = connect(url.clone(), schema.clone()).await;
+        let (ra, rb) = tokio::join!(
+            apply_locked_set(&mut a, None, &INDEX_SET),
+            apply_locked_set(&mut b, None, &DUMMY_SET)
+        );
+        assert!(!ra.tainted && !rb.tainted);
+        assert_eq!(ra.version.unwrap(), MIGRATIONS.last().unwrap().version);
+        assert_eq!(rb.version.unwrap(), 2);
+        let owner: bool = sqlx::query_scalar("SELECT to_regclass('instance_owner') IS NOT NULL")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap();
+        assert!(owner, "v31 created instance_owner");
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut setup)
+            .await
+            .unwrap();
+    }
+
+    /// What a v30 binary sees of a v31 schema: a ledger stamped above what it
+    /// knows. Simulated with the 0.32 step list (the first 30 steps) over a
+    /// schema this binary migrated.
+    #[tokio::test]
+    async fn v31_refused_by_a_v30_binary_shape() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_v30bin_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut conn, &schema).await;
+        apply(&mut conn).await.unwrap();
+
+        let v30_binary = MigrationSet {
+            ledger: "schema_migration",
+            steps: &MIGRATIONS[..30],
+            index_backfill: true,
+        };
+        let err = apply_locked_set(&mut conn, None, &v30_binary)
+            .await
+            .version
+            .expect_err("a v30 binary refuses a v31 schema");
+        match err {
+            IndexError::SchemaTooNew { found, known } => {
+                assert_eq!((found, known), (31, 30));
+            }
+            other => panic!("expected SchemaTooNew, got: {other}"),
+        }
+        sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES (32, 'x')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(matches!(
+            apply(&mut conn).await,
+            Err(IndexError::SchemaTooNew { found: 32, .. })
+        ));
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
     }
 }

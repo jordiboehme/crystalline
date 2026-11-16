@@ -81,7 +81,23 @@
 //!   simply ages out of the LRU unused.
 
 mod migrations;
+mod owner;
 mod search;
+mod session;
+
+pub use migrations::{
+    INDEX_SET, INSTANCE_TABLES, LockedRun, Migration, MigrationSet, WIPE_TABLES, apply_locked_set,
+};
+pub use owner::{
+    Acquired, EXIT_MARGIN, FENCE_DETECT_MAX, FenceState, GRACE, LOCK_IDLE_TIMEOUT,
+    LOCK_STATEMENT_TIMEOUT, OwnerIdentity, OwnerRow, OwnerTimings, PROBE_PERIOD, PROBE_RETRIES,
+    PROBE_TIMEOUT, PgOwner, ProbeAction, ProbeOutcome, ProbeState, STANDBY_POLL, StandbyStatus,
+    TERMINATE_WAIT_MS, TIMING_SCALE_ENV, TakeoverReport, probe_owner, read_owner_row, timing_scale,
+};
+pub use session::{
+    OwnerFence, PgRole, PgSessionOptions, PgTarget, application_name, connect_one, lock_key,
+    owner_key,
+};
 
 /// The search statements the plan registry (`tests/it/plans.rs`) reads, reachable
 /// from outside the crate and from nowhere else in it. `search` is a private
@@ -182,23 +198,6 @@ async fn take_spelling_for_rename(
         }
     }
     claim_own_spelling(conn, spelling, id).await
-}
-
-/// The advisory lock id of the work claim `key` in `schema`: FNV-1a 64 over
-/// the schema name, a NUL and the key, computed here so every instance and
-/// every build agrees on it. Advisory locks belong to the database, not to a
-/// schema, so the schema is part of the id: two schemas on one database
-/// (the test suites, or two separate teams) never shut each other out.
-fn work_claim_id(schema: Option<&str>, key: &str) -> i64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    let schema = schema.unwrap_or_default().as_bytes();
-    for b in schema.iter().chain(&[0u8]).chain(key.as_bytes()) {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h as i64
 }
 
 /// Unlock the work claim `id` on its own session and give the connection
@@ -404,7 +403,7 @@ impl PostgresStore {
     /// of their own (lazily, read-only sessions) unless
     /// `CRYSTALLINE_READ_CONNECTIONS=0` turns them off.
     pub async fn open(url: &str) -> Result<PostgresStore> {
-        Self::build(url, None, default_readers()).await
+        Self::build_with(url, None, default_readers(), &PgSessionOptions::default()).await
     }
 
     /// Open a pool at `url`, routing every connection to `schema` (created if
@@ -413,7 +412,13 @@ impl PostgresStore {
     /// the per-test isolation seam for the parity suite; drop it afterwards with
     /// [`PostgresStore::drop_schema`].
     pub async fn open_in_schema(url: &str, schema: &str) -> Result<PostgresStore> {
-        Self::build(url, Some(schema.to_string()), default_readers()).await
+        Self::build_with(
+            url,
+            Some(schema.to_string()),
+            default_readers(),
+            &PgSessionOptions::default(),
+        )
+        .await
     }
 
     /// [`PostgresStore::open_in_schema`] with `readers` read connections,
@@ -423,27 +428,46 @@ impl PostgresStore {
         schema: &str,
         readers: usize,
     ) -> Result<PostgresStore> {
-        Self::build(url, Some(schema.to_string()), readers).await
+        Self::build_with(
+            url,
+            Some(schema.to_string()),
+            readers,
+            &PgSessionOptions::default(),
+        )
+        .await
     }
 
-    async fn build(url: &str, schema: Option<String>, readers: usize) -> Result<PostgresStore> {
+    /// Open a pool at `url` in `schema` (the database default when `None`)
+    /// with `readers` read connections, every connection built with `opts`:
+    /// its `application_name`, keepalives and, when `opts` carries a fence,
+    /// the fence check on every new connection of either pool. A connect the
+    /// fence refuses fails the open, and later fails the statement that
+    /// needed the connection.
+    ///
+    /// The schema itself is created under the migration lock, so two first
+    /// opens of one schema do not race on `CREATE SCHEMA`.
+    pub async fn build_with(
+        url: &str,
+        schema: Option<String>,
+        readers: usize,
+        opts: &PgSessionOptions,
+    ) -> Result<PostgresStore> {
         let db_path = sanitize_url(url);
-        let mut opts = PgPoolOptions::new().max_connections(4);
-        if let Some(s) = schema.clone() {
-            // Only the search path: the schema itself is created under the
-            // migration lock below, so two first opens of one schema do not
-            // race on `CREATE SCHEMA`. A search path naming a schema that does
-            // not exist yet is accepted and takes effect once it does.
-            let setup = format!("SET search_path TO {}, public", quote_ident(&s));
-            opts = opts.after_connect(move |conn, _meta| {
-                let setup = setup.clone();
-                Box::pin(async move {
-                    sqlx::raw_sql(AssertSqlSafe(setup)).execute(conn).await?;
-                    Ok(())
-                })
-            });
-        }
-        let pool = opts.connect(url).await.map_err(IndexError::from)?;
+        let target = PgTarget {
+            url: url.to_string(),
+            schema: schema.clone(),
+        };
+        let connect = session::connect_options(&target, PgRole::Pool, opts)?;
+        let pool = with_session_setup(
+            PgPoolOptions::new().max_connections(4),
+            schema.clone(),
+            PgRole::Pool,
+            opts.fence,
+            None,
+        )
+        .connect_with(connect)
+        .await
+        .map_err(IndexError::from)?;
         // The lock, the steps and the unlock all run on this one connection,
         // so the session-level migration lock pairs with its release.
         let mut conn = pool.acquire().await.map_err(IndexError::from)?;
@@ -468,7 +492,7 @@ impl PostgresStore {
             readers: None,
         };
         if readers > 0 {
-            store.readers = Some(Arc::new(store.read_pool_at(url, readers)?));
+            store.readers = Some(Arc::new(store.read_pool_at(&target, readers, opts)?));
         }
         Ok(store)
     }
@@ -476,23 +500,23 @@ impl PostgresStore {
     /// `count` read connections beside this writer: a pool of their own,
     /// opened lazily, whose sessions are read-only by default and use the
     /// writer's schema. Each reader is a store of its own whose pinned
-    /// connection is its read transaction's, never the writer's.
-    fn read_pool_at(&self, url: &str, count: usize) -> Result<ReadPool<PostgresStore>> {
-        let mut setup = String::from("SET default_transaction_read_only = on");
-        if let Some(s) = &self.schema {
-            setup.push_str(&format!("; SET search_path TO {}, public", quote_ident(s)));
-        }
-        let pool = PgPoolOptions::new()
-            .max_connections(count as u32)
-            .after_connect(move |conn, _meta| {
-                let setup = setup.clone();
-                Box::pin(async move {
-                    sqlx::raw_sql(AssertSqlSafe(setup)).execute(conn).await?;
-                    Ok(())
-                })
-            })
-            .connect_lazy(url)
-            .map_err(IndexError::from)?;
+    /// connection is its read transaction's, never the writer's. Their
+    /// connections are built with `opts` in the `read` role.
+    fn read_pool_at(
+        &self,
+        target: &PgTarget,
+        count: usize,
+        opts: &PgSessionOptions,
+    ) -> Result<ReadPool<PostgresStore>> {
+        let connect = session::connect_options(target, PgRole::Read, opts)?;
+        let pool = with_session_setup(
+            PgPoolOptions::new().max_connections(count as u32),
+            self.schema.clone(),
+            PgRole::Read,
+            opts.fence,
+            Some("SET default_transaction_read_only = on"),
+        )
+        .connect_lazy_with(connect);
         let slots = (0..count)
             .map(|_| PostgresStore {
                 pool: pool.clone(),
@@ -4761,7 +4785,7 @@ impl Store for PostgresStore {
     /// the pool for as long as the claim lives. It never runs on the pinned
     /// transaction connection: that one goes back to the pool at commit.
     async fn try_work_claim(&self, key: &str) -> Result<Option<WorkClaim>> {
-        let id = work_claim_id(self.schema.as_deref(), key);
+        let id = lock_key(self.schema.as_deref(), key);
         let mut conn = self.pool.acquire().await.map_err(IndexError::from)?;
         let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(id)
@@ -5885,9 +5909,31 @@ impl PostgresStore {
     }
 }
 
+/// `pool` with an `after_connect` that runs `first` (if any), then
+/// [`session::prepare_session`], so every new connection of the pool, a
+/// transparent reconnect included, is routed to `schema` and runs the fence
+/// check.
+fn with_session_setup(
+    pool: PgPoolOptions,
+    schema: Option<String>,
+    role: PgRole,
+    fence: Option<OwnerFence>,
+    first: Option<&'static str>,
+) -> PgPoolOptions {
+    pool.after_connect(move |conn, _meta| {
+        let schema = schema.clone();
+        Box::pin(async move {
+            if let Some(first) = first {
+                sqlx::raw_sql(first).execute(&mut *conn).await?;
+            }
+            session::prepare_session(conn, schema.as_deref(), role, fence).await
+        })
+    })
+}
+
 /// How many read connections a store opens by default: [`READ_POOL_SIZE`],
 /// or none with `CRYSTALLINE_READ_CONNECTIONS=0`.
-fn default_readers() -> usize {
+pub(crate) fn default_readers() -> usize {
     if read_connections_enabled() {
         READ_POOL_SIZE
     } else {
@@ -5946,30 +5992,6 @@ impl ReaderBackend for PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    /// The work claim id is fixed: two instances of different builds on one
-    /// database must agree on it, so it never moves with a Rust release or a
-    /// process. The schema is part of it.
-    #[test]
-    fn the_work_claim_id_is_pinned_and_names_the_schema() {
-        use super::work_claim_id;
-        assert_eq!(
-            work_claim_id(None, "contradictions:1"),
-            8_733_647_130_574_241_276
-        );
-        assert_eq!(
-            work_claim_id(Some(""), "contradictions:1"),
-            work_claim_id(None, "contradictions:1")
-        );
-        assert_ne!(
-            work_claim_id(Some("a"), "contradictions:1"),
-            work_claim_id(Some("b"), "contradictions:1")
-        );
-        assert_ne!(
-            work_claim_id(Some("a"), "contradictions:1"),
-            work_claim_id(Some("a"), "contradictions:2")
-        );
-    }
-
     /// A read connection's session is read-only and uses the writer's
     /// schema, and its transaction never is the writer's pinned one.
     #[tokio::test]

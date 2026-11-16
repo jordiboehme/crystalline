@@ -166,25 +166,18 @@ fn ignored_line(var: &str) -> String {
     format!("an account exists already, so {var} is ignored; you can remove it")
 }
 
-/// What `run_serve` calls: read the process environment, open the accounts
-/// database at `accounts` and seed it. Returns the line to say when the admin
-/// was created, `None` otherwise. The store is dropped before this returns, so
-/// the setup token's own open stays the only handle.
-///
-/// The name takes the step every new account takes
-/// ([`crate::engine::Engine::clear_name_for_new_account`]), before the account is
-/// made. A refusal does not stop the start: the way out, `crystalline users
-/// discard-drafts`, needs this daemon running. No admin is made, the reason is
-/// logged, and the next start tries again.
+/// What `run_serve` calls on Turso: read the process environment, open the
+/// accounts database at `accounts` and seed it ([`seed_from_environment_in`]).
+/// Returns the line to say when the admin was created, `None` otherwise. The
+/// store is dropped before this returns, so the setup token's own open stays
+/// the only handle.
 pub(crate) async fn seed_from_environment(
     accounts: Option<&Path>,
     engine: &crate::engine::Engine,
 ) -> anyhow::Result<Option<CreatedAdmin>> {
-    let var = |k: &str| std::env::var(k).ok();
-    if !any_set(&var) {
+    if !any_set(&|k: &str| std::env::var(k).ok()) {
         return Ok(None);
     }
-    let outcome = from_env(var, |p| std::fs::read_to_string(p));
     let Some(path) = accounts else {
         anyhow::bail!(
             "the accounts database could not be located, so the admin from the environment was not created"
@@ -196,6 +189,29 @@ pub(crate) async fn seed_from_environment(
             path.display()
         )
     })?;
+    let created = seed_from_environment_in(&store, engine).await;
+    drop(store);
+    created
+}
+
+/// Read the process environment and seed `store`, an accounts store already
+/// open (the database's on Postgres). Returns the line to say when the admin
+/// was created, `None` otherwise.
+///
+/// The name takes the step every new account takes
+/// ([`crate::engine::Engine::clear_name_for_new_account`]), before the account is
+/// made. A refusal does not stop the start: the way out, `crystalline users
+/// discard-drafts`, needs this daemon running. No admin is made, the reason is
+/// logged, and the next start tries again.
+pub(crate) async fn seed_from_environment_in(
+    store: &AuthStore,
+    engine: &crate::engine::Engine,
+) -> anyhow::Result<Option<CreatedAdmin>> {
+    let var = |k: &str| std::env::var(k).ok();
+    if !any_set(&var) {
+        return Ok(None);
+    }
+    let outcome = from_env(var, |p| std::fs::read_to_string(p));
     let name = outcome
         .as_ref()
         .ok()
@@ -216,8 +232,10 @@ pub(crate) async fn seed_from_environment(
             );
             return Ok(None);
         }
-        // The engine has no accounts handle yet at this point of a start, so the
-        // step above could not end the links the old person gave. This store can.
+        // On Turso the engine has no accounts handle yet at this point of a
+        // start, so the step above could not end the links the old person
+        // gave. This store can (on Postgres it is the engine's own, and the
+        // second ending finds nothing left).
         if let Err(e) = store.end_overlay_grants_of_owner(&account).await {
             tracing::error!(
                 "the admin '{account}' from the environment was not created: the draft links under this name could not be ended ({e:#})"
@@ -225,9 +243,7 @@ pub(crate) async fn seed_from_environment(
             return Ok(None);
         }
     }
-    let seeded = seed(&store, outcome).await;
-    drop(store);
-    match seeded.map_err(anyhow::Error::msg)? {
+    match seed(store, outcome).await.map_err(anyhow::Error::msg)? {
         Seeded::Created => Ok(Some(CreatedAdmin {
             line: created_line(&name),
         })),

@@ -29,6 +29,7 @@ mod desktop_state;
 // builds, where the open seam is read.
 #[cfg(all(debug_assertions, any(target_os = "macos", windows)))]
 mod desktop_update;
+mod docs_links;
 mod doctor;
 mod doctor_names;
 mod domain_case;

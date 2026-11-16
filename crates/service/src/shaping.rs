@@ -346,6 +346,7 @@ mod tests {
             state_dir: None,
             config_path: config_path.map(str::to_string),
             http,
+            standby: None,
         }
     }
 

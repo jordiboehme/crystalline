@@ -895,6 +895,36 @@ fn check_claude_desktop_at(path: &Path, limit: std::time::Duration) -> Option<Cl
     }
 }
 
+/// The ownership and durable state block of a Postgres database.
+fn render_durable_state(out: &mut String, block: &serde_json::Value) {
+    use std::fmt::Write as _;
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or("unknown").to_string();
+    let _ = writeln!(out, "ownership and durable state:");
+    let _ = writeln!(out, "  database: postgres {}", text(&block["database"]));
+    let _ = writeln!(out, "  role: {}", text(&block["role"]));
+    let owner = &block["owner"];
+    let line = match block["owner_state"].as_str() {
+        Some("owned") => format!(
+            "{} (pid {}, version {}, since {})",
+            text(&owner["label"]),
+            owner["pid"].as_i64().unwrap_or(0),
+            text(&owner["version"]),
+            text(&owner["since"]),
+        ),
+        Some("free") => "none, no instance owns the database".to_string(),
+        Some("unknown") => format!(
+            "could not read who owns the database ({})",
+            block["owner_error"].as_str().unwrap_or("unknown")
+        ),
+        _ => "an instance that has not announced itself yet".to_string(),
+    };
+    let _ = writeln!(out, "  owner: {line}");
+    let _ = writeln!(out, "  accounts: in {}", text(&block["accounts"]));
+    for warning in block["warnings"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "  [warning] {}", text(warning));
+    }
+}
+
 /// The `claude desktop` section.
 fn render_claude_desktop(out: &mut String, d: &ClaudeDesktopDoctor) {
     use std::fmt::Write as _;
@@ -1740,6 +1770,10 @@ pub struct ModelLocksDoctor {
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
+    /// Who owns the Postgres database and where the accounts live. `None`
+    /// on Turso.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_state: Option<serde_json::Value>,
     /// How the index was read this run, and, when it could not be, why.
     pub index: IndexAccess,
     /// Per-domain diagnostics.
@@ -2167,6 +2201,11 @@ pub async fn run(
     // A domain filter nobody registers fails before anything is fixed.
     let early = cmd::load(config_override)?;
     select_domains(&early.effective, domain_filter)?;
+    // On Postgres another machine's instance owns the database: nothing is
+    // fixed from here (spec section L).
+    if fix {
+        crystalline_service::refuse_fix_when_owned(&early.effective).await?;
+    }
     let db = cmd::db_path(db_override)?;
     // What this shell would have started, compared with the daemon's own
     // facts. Only without an override: a --config or --db names files, not
@@ -2266,10 +2305,18 @@ pub async fn run(
             reason: crystalline_service::client::packaged_local_engine_refusal(),
         };
     } else if db.is_file() {
-        match crystalline_index::open_store(&cfg.database(), Some(&db), false).await {
+        // By the CLI rule on Postgres: a report never claims the database
+        // and never opens it; `--fix` claims it or is refused (spec section
+        // L).
+        match crystalline_service::open_store_for_command(cfg, Some(&db), false).await {
             Ok(opened) => {
                 index = IndexAccess::Direct;
                 store = Some(opened);
+            }
+            Err(e) if crystalline_service::claim::refused_by_cli_rule(&e) => {
+                index = IndexAccess::Unavailable {
+                    reason: e.to_string(),
+                };
             }
             // Not an abort. Every check that does not need the index still
             // runs below, and the reason travels in the report as guidance.
@@ -2420,7 +2467,17 @@ pub async fn run(
     let kept = check_kept(crate::kept::scan_here(), domain_filter, chrono::Utc::now());
     let case_twins = check_case_twins(cfg);
 
+    // Only an active daemon answers the file-stamp request (a standby
+    // refuses ctl commands), so a daemon route means an active one.
+    let role = if matches!(index, IndexAccess::Daemon) {
+        "active"
+    } else {
+        "none"
+    };
+    let durable_state = cmd::durable_state_block(cfg, role).await.map(|(_, v)| v);
+
     Ok(DoctorReport {
+        durable_state,
         index,
         domains,
         service,
@@ -5134,6 +5191,10 @@ pub fn render_human(report: &DoctorReport) -> String {
             let _ = writeln!(out, "  [problem] {reason}");
         }
         IndexAccess::Absent | IndexAccess::Direct => {}
+    }
+
+    if let Some(block) = &report.durable_state {
+        render_durable_state(&mut out, block);
     }
 
     for d in &report.domains {

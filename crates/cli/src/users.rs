@@ -12,6 +12,12 @@
 //! `users writes` keeps an account's write list in the same database; the
 //! daemon reads it on the next request.
 //!
+//! On Postgres the accounts live in the configured database instead, and a
+//! command here writes them beside the instance that owns it, as a second
+//! short-lived writer (spec section L rule 4): the instance sees a change on
+//! its next lookup, and accounts tables behind this binary are migrated
+//! only by an owner.
+//!
 //! Except on Windows, where the database engine has no cross-process
 //! coordination on its default IO backend yet, so a running daemon holds the
 //! file exclusively: a command here then fails at open time with the message
@@ -30,12 +36,15 @@ use crystalline_service::write_list_matches;
 
 use crate::UsersCommand;
 
-/// Run one `users` subcommand against the auth database in the state
-/// directory. `json` switches `list`, `add` and `writes` to machine-readable
-/// output; the other editing commands confirm in one human line.
+/// Run one `users` subcommand against the accounts store of the
+/// configuration: the auth database in the state directory, or on Postgres
+/// the configured database, written beside the instance that owns it
+/// ([`crystalline_service::open_accounts_for_cli`]). `json` switches `list`,
+/// `add` and `writes` to machine-readable output; the other editing commands
+/// confirm in one human line.
 pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
-    let path = crystalline_core::config::web_auth_db_path()?;
-    let store = AuthStore::open(&path).await?;
+    let loaded = crate::cmd::load(None)?;
+    let store = crystalline_service::open_accounts_for_cli(&loaded.effective).await?;
 
     match command {
         UsersCommand::Add {

@@ -2293,6 +2293,13 @@ fn run() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     init_cli_tracing(cli.command.as_ref());
+    // What a Postgres owner row records for this command, and whether it is a
+    // read-only report that never claims the database (spec section L).
+    crystalline_service::set_command_line(
+        &command_label(&words),
+        words.clone(),
+        is_report(cli.command.as_ref()),
+    );
     // Inside Claude Desktop's app package every new file under AppData lands
     // in the package's private copy, so from here on a write there that was
     // not sent to the daemon fails loudly instead of splitting the state.
@@ -2761,6 +2768,10 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 /// left on their default handling on purpose, so a `SIGTERM` ends this process
 /// without running the ownership drop, exactly as a killed daemon leaves its
 /// record and socket file behind.
+///
+/// With `--standalone` on Postgres it also claims the database as the command
+/// it names, as that command would (spec section L), and gives it back when
+/// the time is up; refused when another instance owns it.
 fn hold_lock(secs: u64, standalone: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     let _ownership = {
@@ -2771,12 +2782,48 @@ fn hold_lock(secs: u64, standalone: Option<&str>) -> anyhow::Result<()> {
         }
         ownership
     };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    if let Some(command) = standalone {
+        let cfg = cmd::load(None)?.effective;
+        runtime.block_on(crystalline_service::claim_database_for_command(
+            &cfg, command,
+        ))?;
+    }
     // The readiness line: a caller waits for it before treating the lock as
     // held, instead of guessing with a sleep.
     println!("holding");
     std::io::stdout().flush()?;
     std::thread::sleep(std::time::Duration::from_secs(secs));
+    runtime.block_on(crystalline_service::release_command_database());
     Ok(())
+}
+
+/// The command as a Postgres owner row records it: `crystalline` and the
+/// subcommand path (`crystalline reindex`, `crystalline domain add`), never
+/// a value, which could be a secret.
+fn command_label(words: &[String]) -> String {
+    let mut label = "crystalline".to_string();
+    let args = std::iter::once("crystalline".to_string()).chain(words.iter().cloned());
+    if let Ok(matches) = Cli::command().try_get_matches_from(args) {
+        let mut at = &matches;
+        while let Some((name, sub)) = at.subcommand() {
+            label.push(' ');
+            label.push_str(name);
+            at = sub;
+        }
+    }
+    label
+}
+
+/// A read-only report: it reads who owns a Postgres database and never
+/// claims it (`status`, `doctor` without `--fix`, `prompt`).
+fn is_report(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        Some(Command::Status { .. } | Command::Prompt { .. } | Command::Doctor { fix: false, .. })
+    )
 }
 
 fn split_commas(s: Option<String>) -> Option<Vec<String>> {
@@ -2820,6 +2867,38 @@ fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
     if v.is_empty() { None } else { Some(v) }
 }
 
+/// A standby's `status` as human text: the database it waits for, who owns
+/// it and how long it has waited.
+fn render_standby(data: &serde_json::Value) {
+    println!(
+        "Daemon: standby (pid {}, v{}, up {})",
+        data["pid"].as_u64().unwrap_or(0),
+        data["version"].as_str().unwrap_or("unknown"),
+        format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
+    );
+    println!(
+        "Database: {}",
+        data["database"].as_str().unwrap_or("(unknown)")
+    );
+    let owner = &data["owner"];
+    match owner["label"].as_str() {
+        Some(label) => println!(
+            "Owned by: {label} (pid {}, version {}, since {})",
+            owner["pid"].as_i64().unwrap_or(0),
+            owner["version"].as_str().unwrap_or("unknown"),
+            owner["since"].as_str().unwrap_or("unknown"),
+        ),
+        None => println!("Owned by: an instance that has not announced itself yet"),
+    }
+    println!(
+        "Waiting: {}, it takes over when the database comes free",
+        format_uptime(data["waiting_secs"].as_u64().unwrap_or(0))
+    );
+    if let Some(error) = data["last_error"].as_str() {
+        println!("Last poll failed: {error}");
+    }
+}
+
 /// `status`: report from the daemon over ctl when one is running and no explicit
 /// `--config`/`--db` override was given, else open the index directly. An
 /// override names an exact config and index the running daemon may not serve, so
@@ -2859,6 +2938,16 @@ async fn status_dispatch(
         && let Some(data) =
             crystalline_service::ctl_routed(json!({ "v": 1, "cmd": "status" })).await?
     {
+        // A standby has no index open: its report is who owns the database
+        // it waits for.
+        if data["role"] == "standby" {
+            if json {
+                println!("{data}");
+            } else {
+                render_standby(&data);
+            }
+            return Ok(());
+        }
         let loaded = cmd::load(config.as_deref());
         let config_error = loaded.as_ref().err().map(|e| e.to_string());
         // What this shell would have started against what the daemon says
@@ -2891,6 +2980,17 @@ async fn status_dispatch(
             state.compare_with(&registered);
         }
         let packaged_line = crystalline_service::desktop_state::packaged_read_line();
+        // On Postgres, who owns the database and where the accounts live,
+        // read from the owner row beside the daemon's own answer.
+        let durable = match &loaded {
+            Ok(loaded) => {
+                // A standby was answered above; the daemon's own role,
+                // active when its reply carries none.
+                let role = data["role"].as_str().unwrap_or("active");
+                cmd::durable_state_block(&loaded.effective, role).await
+            }
+            Err(_) => None,
+        };
         if json {
             let mut data = data;
             if let serde_json::Value::Object(map) = &mut data {
@@ -2908,6 +3008,9 @@ async fn status_dispatch(
                     map.insert("inside_package".to_string(), json!(line));
                 }
                 insert_kept_count(map);
+                if let Some((_, block)) = &durable {
+                    map.insert("durable_state".to_string(), block.clone());
+                }
                 // Present only when something differs, as doctor --json does.
                 if !mismatches.is_empty() {
                     map.insert(
@@ -2949,12 +3052,36 @@ async fn status_dispatch(
             }
             sources::render_sources(&source_rows);
             cmd::render_status(&data, &note);
+            if let Some((lines, _)) = &durable {
+                cmd::print_durable_state(lines);
+            }
         }
         return Ok(());
     }
     // Nothing answered, so the numbers have to come from the index here, and
     // that needs the config the probe above could do without.
     let cfg = cmd::load(config.as_deref())?.effective;
+    // On Postgres a report opens no store (only the owner does): without a
+    // daemon here it is the owner row and where the accounts live.
+    if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none").await {
+        if json {
+            let registered: Vec<&String> = cfg.domains.keys().collect();
+            println!(
+                "{}",
+                json!({
+                    "indexed": false,
+                    "registered": registered,
+                    "sources": source_rows,
+                    "durable_state": block,
+                })
+            );
+        } else {
+            println!("Daemon: not running");
+            sources::render_sources(&source_rows);
+            cmd::print_durable_state(&lines);
+        }
+        return Ok(());
+    }
     let route = cmd::reach_index(
         None,
         &cfg,
@@ -4594,8 +4721,10 @@ where
                         let out = make().await;
                         // A command without a daemon gives back every host
                         // lock it claimed on a shared database, on every
-                        // path it ends by.
+                        // path it ends by, and then the Postgres database it
+                        // claimed for its run.
                         crystalline_service::engine::release_command_locks_everywhere().await;
+                        crystalline_service::release_command_database().await;
                         out
                     }),
             )
@@ -4652,8 +4781,10 @@ where
                         let out = make().await;
                         // A command without a daemon gives back every host
                         // lock it claimed on a shared database, on every
-                        // path it ends by.
+                        // path it ends by, and then the Postgres database it
+                        // claimed for its run.
                         crystalline_service::engine::release_command_locks_everywhere().await;
+                        crystalline_service::release_command_database().await;
                         out
                     }),
             )
@@ -4744,7 +4875,9 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 origin.is_some() && private && cmd::github_app_decides_access(config.as_deref())?;
             let closing = match (private, owner) {
                 (true, Some(owner)) if app_decides => Some(owner.trim().to_lowercase()),
-                (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
+                (true, Some(owner)) => {
+                    Some(members::check_private_owner(&owner, config.as_deref()).await?)
+                }
                 _ => None,
             };
             // The chosen name comes back from the dispatch rather than the

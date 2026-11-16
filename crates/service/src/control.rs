@@ -76,7 +76,7 @@ pub async fn answer_for_test(engine: Arc<Engine>, req: &Value) -> Value {
 
 /// Handle one ctl request, returning the response envelope and whether the
 /// daemon should shut down after replying.
-async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
+pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
     let localized = localized_request(req, &shared.engine).await;
     let req = localized.as_ref().unwrap_or(req);
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("");
@@ -144,30 +144,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // state folder. A client asks this before it attaches, instead of
         // trusting a `service.json` that may be stale or private, so it must
         // never touch the store (`status` does).
-        "holder" => {
-            let mut data = match crate::instance::published_record() {
-                Some(record) => serde_json::to_value(record).unwrap_or_else(|_| json!({})),
-                None => json!({
-                    "pid": shared.pid,
-                    "version": crystalline_core::VERSION,
-                    "mcp_line_options": true,
-                }),
-            };
-            // A record published without a serve intent (the `hold-lock`
-            // test command) carries no `runs_in`; read it now instead.
-            if data.get("runs_in").is_none_or(Value::is_null) {
-                data["runs_in"] = json!(crate::runs_in::RunsIn::here());
-            }
-            data["state_dir"] = json!(
-                crystalline_core::config::state_dir()
-                    .ok()
-                    .map(|dir| dir.display().to_string())
-            );
-            // The config file it loaded, spelled the way a client spells its
-            // own, so `status` and `doctor` can compare the two.
-            data["config_path"] = json!(crate::instance::holder_config_path());
-            (envelope_ok(data), false)
-        }
+        "holder" => (envelope_ok(holder_data(shared.pid)), false),
         "sessions" => (
             envelope_ok(json!({
                 "count": shared.session_count(),
@@ -1322,6 +1299,34 @@ async fn localized_request(req: &Value, engine: &Engine) -> Option<Value> {
     let mut req = req.clone();
     req["domain"] = Value::String(local);
     Some(req)
+}
+
+/// The `holder` answer of the daemon `pid`: the record it published plus its
+/// state folder and config file, all from memory. Shared with the standby's
+/// responder, which answers the same question before any store is open.
+pub(crate) fn holder_data(pid: u32) -> Value {
+    let mut data = match crate::instance::published_record() {
+        Some(record) => serde_json::to_value(record).unwrap_or_else(|_| json!({})),
+        None => json!({
+            "pid": pid,
+            "version": crystalline_core::VERSION,
+            "mcp_line_options": true,
+        }),
+    };
+    // A record published without a serve intent (the `hold-lock`
+    // test command) carries no `runs_in`; read it now instead.
+    if data.get("runs_in").is_none_or(Value::is_null) {
+        data["runs_in"] = json!(crate::runs_in::RunsIn::here());
+    }
+    data["state_dir"] = json!(
+        crystalline_core::config::state_dir()
+            .ok()
+            .map(|dir| dir.display().to_string())
+    );
+    // The config file it loaded, spelled the way a client spells its
+    // own, so `status` and `doctor` can compare the two.
+    data["config_path"] = json!(crate::instance::holder_config_path());
+    data
 }
 
 pub(crate) fn envelope_ok(data: Value) -> Value {

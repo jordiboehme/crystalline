@@ -373,9 +373,18 @@ pub struct Connection {
     /// connection made without asking, which sends the bare line: the safe
     /// direction.
     mcp_line_options: bool,
+    /// The refusal a standby declared in its `holder` answer
+    /// ([`HolderFacts::standby`]): this daemon waits for the database and
+    /// serves no session.
+    standby: Option<String>,
 }
 
 impl Connection {
+    /// The refusal of the standby behind this connection, when it is one.
+    pub fn standby(&self) -> Option<&str> {
+        self.standby.as_deref()
+    }
+
     /// Write the `mcp` handshake and hand back the stream for an rmcp session or
     /// a byte pump.
     ///
@@ -709,8 +718,7 @@ pub(crate) async fn try_attach_displacing_in(
         }
         return (None, None);
     };
-    if attach_policy_for(&facts.version, crystalline_core::VERSION, here) == AttachPolicy::Displace
-    {
+    if displaces(&facts, crystalline_core::VERSION, here) {
         tracing::info!(
             "displacing crystalline daemon v{} (pid {}) in favor of v{}",
             facts.version,
@@ -739,7 +747,12 @@ pub(crate) async fn try_attach_displacing_in(
             ),
         }
     }
-    let conn = connect_socket_at(&sock, facts.mcp_line_options).await;
+    let conn = connect_socket_at(&sock, facts.mcp_line_options)
+        .await
+        .map(|conn| Connection {
+            standby: facts.standby.clone(),
+            ..conn
+        });
     // Said once the attach worked, so a bridge polling for its daemon does
     // not repeat it on every turn.
     if conn.is_some()
@@ -752,6 +765,21 @@ pub(crate) async fn try_attach_displacing_in(
         );
     }
     (conn, None)
+}
+
+/// Whether a client of `own_version` running where `here` says displaces the
+/// daemon that gave `facts`: only an older one ([`attach_policy_for`]), and
+/// never a standby. A standby holds no database work and opens nothing, so
+/// an older one costs nothing, and the newer one spawned in its place would
+/// only wait as a standby itself, or refuse when autostarted. The client
+/// gets the standby's refusal instead.
+fn displaces(
+    facts: &HolderFacts,
+    own_version: &str,
+    here: &crate::runs_in::PackageContext,
+) -> bool {
+    facts.standby.is_none()
+        && attach_policy_for(&facts.version, own_version, here) == AttachPolicy::Displace
 }
 
 /// Attach to a running daemon exactly as it is: a bare pipe connect. Unlike
@@ -788,6 +816,7 @@ async fn connect_socket_at(sock: &Path, mcp_line_options: bool) -> Option<Connec
         .map(|stream| Connection {
             stream,
             mcp_line_options,
+            standby: None,
         })
 }
 
@@ -827,7 +856,26 @@ pub struct HolderFacts {
     /// mean unknown.
     #[serde(default)]
     pub http: Option<HttpBinding>,
+    /// Set by a standby (Postgres, waiting for another instance to let go
+    /// of the database): the sentence it refuses every session and command
+    /// with. `None` for an active daemon and for one older than 0.33.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standby: Option<String>,
 }
+
+/// A daemon that answered as a standby: the bridge gives its sentence to the
+/// MCP client as the initialize error and stops, instead of falling back to
+/// an in-process server that could not take the state folder either.
+#[derive(Debug)]
+pub struct StandbyRefusal(pub String);
+
+impl std::fmt::Display for StandbyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StandbyRefusal {}
 
 /// What one ctl request over the pipe got back.
 enum Probe {
@@ -857,6 +905,7 @@ async fn ctl_once(sock: &Path, request: &str) -> Probe {
         let stream = Connection {
             stream,
             mcp_line_options: false,
+            standby: None,
         }
         .into_ctl()
         .await
@@ -933,6 +982,7 @@ fn facts_from_record(record: Option<LockInfo>) -> Option<HolderFacts> {
         state_dir: None,
         config_path: None,
         http: Some(record.http),
+        standby: None,
     })
 }
 
@@ -956,6 +1006,7 @@ pub(crate) fn facts_from_status(
         state_dir: None,
         config_path: None,
         http: same.map(|r| r.http.clone()),
+        standby: None,
     })
 }
 
@@ -1178,6 +1229,7 @@ async fn ask_to_shut_down(sock: &Path) -> bool {
     let Ok(mut stream) = (Connection {
         stream,
         mcp_line_options: false,
+        standby: None,
     })
     .into_ctl()
     .await
@@ -1528,6 +1580,7 @@ async fn probe_socket_responds() -> bool {
         let mut stream = Connection {
             stream,
             mcp_line_options: false,
+            standby: None,
         }
         .into_ctl()
         .await
@@ -2308,6 +2361,21 @@ pub(crate) async fn ensure_daemon_with(
         HolderState::Free => {}
     }
 
+    // On Postgres an autostarted daemon never waits as a standby. Asked only
+    // once this machine's state folder is known to be free (or its holder
+    // was waited for or dislodged above): a holder of this machine, a daemon
+    // that is starting or a command, is never another machine's. While a
+    // Postgres database is unreachable, each look at its holder here and in
+    // the readiness loop below costs up to `claim::pg::LOOK_WAIT` (5 s) of
+    // this autostart; accepted, since the daemon cannot start on that
+    // database either. On Turso a look answers at once.
+    let database = database_config_quietly(options.config.as_deref());
+    if unknown_holder.is_none()
+        && let Some(cfg) = &database
+    {
+        refuse_or_wait_for_database(cfg).await?;
+    }
+
     spawn_daemon(options)?;
     // Poll readiness: lock record present and socket connectable. Another
     // client's lingering old-binary bridge can be reconnecting during this
@@ -2323,6 +2391,7 @@ pub(crate) async fn ensure_daemon_with(
     // that answers slowly that ask alone can take seconds.
     let mut respawns = 0u32;
     let deadline = Instant::now() + READINESS_BUDGET;
+    let mut next_look = Instant::now() + DATABASE_LOOK_EVERY;
     while Instant::now() < deadline {
         let (conn, displaced) = try_attach_reporting().await;
         if let Some(conn) = conn {
@@ -2332,7 +2401,26 @@ pub(crate) async fn ensure_daemon_with(
             respawns += 1;
             spawn_daemon(options)?;
         }
+        // The race: another machine took the database between the look
+        // above and the spawn, and the daemon left with the lock-held code
+        // (so it no longer holds the state folder). Said at the next look,
+        // not after the whole budget.
+        if let Some(cfg) = &database
+            && Instant::now() >= next_look
+        {
+            next_look = Instant::now() + DATABASE_LOOK_EVERY;
+            let holder = crate::claim::holder(cfg).await;
+            if let Some(message) = another_machines(&holder).await {
+                return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
+            }
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The same race, looked at once more when the budget is spent.
+    if let Some(cfg) = &database
+        && let Some(message) = another_machines(&crate::claim::holder(cfg).await).await
+    {
+        return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
     }
     // A holder we refused to touch is the better explanation of the timeout
     // than the generic one: it names the lock file and how to look at whoever
@@ -2357,6 +2445,68 @@ pub(crate) async fn ensure_daemon_with(
 
 /// How long `ensure_daemon` waits for the daemon it spawned to answer.
 const READINESS_BUDGET: Duration = Duration::from_secs(15);
+
+/// The sentence of a second instance started by mistake, when `holder` is
+/// another machine's: it holds the Postgres database, and no process of this
+/// machine holds the state folder. A daemon of this machine that is starting
+/// holds the folder before it takes the database, and until it has announced
+/// itself the owner row is missing, or is the row of the instance before it
+/// (a crashed owner of another machine, whose sessions it is ending), so
+/// while the folder is held the holder is never called another machine's.
+async fn another_machines(holder: &crate::claim::Holder) -> Option<String> {
+    let message = holder.not_served_here()?;
+    matches!(diagnose_holder().await, HolderState::Free).then_some(message)
+}
+
+/// The refusal when a command of this machine held the database for longer
+/// than `waited`.
+fn local_command_words(command: &str, pid: i64, waited: Duration) -> String {
+    format!(
+        "the command `{command}` (pid {pid}) on this machine holds the database, \
+         and it did not let go within {} s. A daemon starts once it has finished: \
+         wait for it, or stop it, and try again",
+        waited.as_secs().max(1)
+    )
+}
+
+/// How often the readiness wait looks who holds a Postgres database.
+const DATABASE_LOOK_EVERY: Duration = Duration::from_secs(1);
+
+/// Before an autostart on Postgres: refuse with the sentence of a second
+/// instance started by mistake when another machine holds the database
+/// (a [`crate::claim::DatabaseOwned`]), and wait, as for a one-shot command
+/// that holds the state folder, while a command of this machine holds it.
+/// A daemon of this machine, a free database, Turso and a look that failed
+/// all go on to the spawn; the daemon finds out the rest itself.
+/// The effective configuration for the autostart's database look, loaded
+/// with the load's own warnings (an unrecognized `CRYSTALLINE_*` variable, an
+/// unusable `public_url`) muted: the client has said them once already, and
+/// on Turso this look must add no line to what a bridge logs.
+fn database_config_quietly(flag: Option<&Path>) -> Option<config::GlobalConfig> {
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        crate::overlay::load(flag)
+            .ok()
+            .map(|loaded| loaded.effective)
+    })
+}
+
+async fn refuse_or_wait_for_database(cfg: &config::GlobalConfig) -> anyhow::Result<()> {
+    let budget = standalone_wait();
+    let started = Instant::now();
+    loop {
+        let holder = crate::claim::holder(cfg).await;
+        if let Some(message) = another_machines(&holder).await {
+            return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
+        }
+        let Some((command, pid)) = holder.local_command() else {
+            return Ok(());
+        };
+        if started.elapsed() >= budget {
+            anyhow::bail!(local_command_words(&command, pid, budget));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
 /// The daemon log, opened for appending, and started over once it outgrows
 /// 1 MiB. The cap is checked when the file is opened (at spawn time, or when
@@ -3082,6 +3232,49 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The autostart's database look loads the configuration once more; on
+    /// Turso it must log nothing the client's own load already said. The
+    /// unusable `public_url` in the file stands in for every load warning
+    /// (a stray `CRYSTALLINE_*` variable is muted the same way); the plain
+    /// load beside it shows the file does warn.
+    #[test]
+    fn the_autostart_database_look_logs_no_load_warning_on_turso() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "service:\n  public_url: \"http://0.0.0.0:7411\"\n").unwrap();
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let (quiet, loud) = tracing::subscriber::with_default(subscriber, || {
+            let quiet = database_config_quietly(Some(&path));
+            let after_quiet = captured.0.lock().unwrap().len();
+            let _ = crate::overlay::load(Some(&path));
+            (quiet, after_quiet)
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let cfg = quiet.expect("the file loads");
+        assert_eq!(
+            cfg.database().backend,
+            crystalline_core::config::DatabaseBackend::Turso
+        );
+        assert_eq!(loud, 0, "the quiet look logged: {text}");
+        assert!(text.contains("0.0.0.0"), "the plain load warns: {text}");
+    }
 
     /// Only the two bind wildcards are rewritten. Every other spelling is an
     /// address something can really dial, and rewriting one would send a
@@ -5694,6 +5887,40 @@ mod tests {
             attach_policy_for("0.25.0", "0.24.0", &here),
             AttachPolicy::Attach
         );
+    }
+
+    /// The refusal for a command of this machine that holds the database
+    /// reads as one sentence: no run of spaces from a line break.
+    #[test]
+    fn the_local_command_refusal_has_no_runs_of_spaces() {
+        let words = local_command_words("crystalline reindex", 42, Duration::from_secs(30));
+        assert!(!words.contains("  "), "{words}");
+        assert!(
+            words.starts_with(
+                "the command `crystalline reindex` (pid 42) on this machine holds the database, and it did not let go within 30 s."
+            ),
+            "{words}"
+        );
+    }
+
+    /// An older daemon is displaced, an older standby never is.
+    #[test]
+    fn an_older_standby_is_never_displaced() {
+        let here = crate::runs_in::PackageContext::Unpackaged;
+        let mut facts = HolderFacts {
+            pid: 1,
+            version: "0.0.1".to_string(),
+            mcp_line_options: true,
+            runs_in: None,
+            start: None,
+            state_dir: None,
+            config_path: None,
+            http: None,
+            standby: None,
+        };
+        assert!(displaces(&facts, "0.33.0", &here));
+        facts.standby = Some("this instance is a standby".to_string());
+        assert!(!displaces(&facts, "0.33.0", &here));
     }
 
     /// A stand-in for Task Scheduler: `run` starts a scripted daemon on this

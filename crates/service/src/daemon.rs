@@ -498,6 +498,9 @@ pub async fn run_serve(
     // Take ownership first so a second daemon fails fast with the live pid.
     // A one-shot command holding it for a moment is waited for instead.
     let ownership = acquire_ownership_after_standalone().await?;
+    // Kept where a stop during the Postgres start can take it too (see
+    // `crate::standby`); on Turso only this function ever does.
+    let ownership: HeldOwnership = Arc::new(std::sync::Mutex::new(Some(ownership)));
 
     // The lock is held, so this daemon is the only writer of the scratch
     // directory: reclaim whatever a killed predecessor left spilled there. The
@@ -505,7 +508,51 @@ pub async fn run_serve(
     // (see `temp_store::point_at_state_dir`).
     crate::temp_store::sweep_at_startup();
 
-    let store = open_store_as_owner(&loaded.effective, Some(&db_path)).await?;
+    // The stop signal, made before anything can listen for it: on Postgres
+    // the control socket and the HTTP endpoint answer before the daemon's
+    // shared state exists, and a stop they hear must reach the daemon too.
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    // On Postgres the socket is bound and the record published here, the
+    // HTTP endpoint is bound, and the database is taken, or waited for as a
+    // standby (see `crate::standby`). Every other backend gets `None` and
+    // keeps the order below: the store first, then the socket and the record.
+    //
+    // The stop signals are one future for the whole life of the process.
+    // Its first poll installs the signal handlers, which replace the default
+    // disposition for good, so a second listener made later would miss a
+    // signal that came in between. On Turso it is first polled by the
+    // `select!` at the end, as before; on Postgres the standby wait and the
+    // start polls it, and it comes back for that `select!` at the handover.
+    let stop: StopFuture = Box::pin(async {
+        tokio::select! {
+            signal = wait_signal() => signal,
+            gone = test_parent_gone() => gone,
+        }
+    });
+    let (pg_start, turso_stop) = crate::standby::start_on_postgres(
+        &loaded.effective,
+        &ownership,
+        &instance_id,
+        autostarted,
+        http_addr.as_deref(),
+        &shutdown_tx,
+        stop,
+        (!daemon_flag).then_some("crystalline stopped"),
+    )
+    .await?;
+
+    let store = open_store_for_start(&loaded.effective, Some(&db_path), pg_start.as_ref()).await?;
+    start_step("store open");
+    // On a schema the store open just created, the announce after the lock
+    // found no owner table; the row is written now.
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = &pg_start {
+        pg.announce().await?;
+    }
+    // The owner of a Postgres database is its only active instance, so the
+    // host lock of every domain it serves is its own: claimed with take-over,
+    // never waited for until a killed predecessor's heartbeat goes stale.
+    let take_over = take_over || pg_start.is_some();
     // A channel the engine uses to tell the watcher (spawned below) about a
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
@@ -565,6 +612,34 @@ pub async fn run_serve(
         tokio::task::spawn_blocking(move || std::thread::sleep(park));
     }
 
+    // On Postgres the accounts live in the database this instance owns, and
+    // nowhere else: they are opened and installed here, before the rename
+    // below, which moves account records, and the first admin and the
+    // setup token further down are asked of this same store. An accounts
+    // file left in the state directory is never read. On Turso the file is
+    // opened further down, after those two short-lived opens, as before.
+    let pg_accounts = match &pg_start {
+        Some(pg) => {
+            #[cfg(not(feature = "postgres"))]
+            let _ = pg;
+            let access = open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?;
+            // The one durable-state line (spec section F), after the
+            // accounts opened, and each thing left behind on this disk as
+            // its own warning.
+            #[cfg(feature = "postgres")]
+            {
+                let report =
+                    crate::durable::durable_state_of_owner(&loaded.effective, pg.database()).await;
+                tracing::info!("{}", report.startup_line());
+                for warning in &report.warnings {
+                    tracing::warn!("{warning}");
+                }
+            }
+            access
+        }
+        None => None,
+    };
+
     // A domain rename a stopped daemon left half done is finished before
     // anything reads the names: before the routing cache, the watcher, the
     // first sync and the orphan sweep, and before the socket is bound. A
@@ -589,11 +664,17 @@ pub async fn run_serve(
 
     // Bind the socket and publish the lock record: this is the readiness point,
     // reached before the provider build and the initial sync so clients attach
-    // fast.
-    let listener = ownership.bind_listener()?;
-    ownership.publish()?;
+    // fast. On Postgres both happened before the store opened.
+    let turso_listener = match &pg_start {
+        Some(_) => None,
+        None => {
+            let listener = owned(&ownership, |o| o.bind_listener())??;
+            owned(&ownership, |o| o.publish())??;
+            start_step("record published");
+            Some(listener)
+        }
+    };
 
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let (sessions_tx, sessions_rx) = watch::channel(0usize);
     let http_sessions = Arc::new(AtomicUsize::new(0));
     let shared = Arc::new(Shared {
@@ -656,24 +737,47 @@ pub async fn run_serve(
     // handle is closed again well before the HTTP task reopens it below. See
     // [`setup_token_for`] and the print just below - the token is said once and
     // never written anywhere again.
-    let accounts_db = crystalline_core::config::web_auth_db_path().ok();
-    // The first admin from the environment (A9), made before the token is
-    // asked about so an instance that just got its admin draws none. The store
-    // it opens is dropped inside, so `setup_token_for`'s own open is the only
-    // handle left. A refused configuration fails the start here, with a
-    // sentence that never carries the password.
-    let created_admin =
-        crate::first_admin::seed_from_environment(accounts_db.as_deref(), &engine).await?;
-    let setup_token = match http_addr.as_deref() {
-        Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
-        None => None,
+    //
+    // On Postgres both questions go to the accounts store opened above.
+    let (created_admin, setup_token) = match &pg_accounts {
+        Some(store) => {
+            let created = crate::first_admin::seed_from_environment_in(store, &engine).await?;
+            let token = match http_addr.as_deref() {
+                Some(addr) => setup_token_in(addr, store, configured_setup).await,
+                None => None,
+            };
+            (created, token)
+        }
+        None => {
+            let accounts_db = match crate::claim::accounts_location(&loaded.effective) {
+                Ok(crystalline_core::config::AccountsLocation::File(path)) => Some(path),
+                _ => None,
+            };
+            // The first admin from the environment (A9), made before the
+            // token is asked about so an instance that just got its admin
+            // draws none. The store it opens is dropped inside, so
+            // `setup_token_for`'s own open is the only handle left. A refused
+            // configuration fails the start here, with a sentence that never
+            // carries the password.
+            let created =
+                crate::first_admin::seed_from_environment(accounts_db.as_deref(), &engine).await?;
+            let token = match http_addr.as_deref() {
+                Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
+                None => None,
+            };
+            (created, token)
+        }
     };
     // Who reads which domain, known before anything is served or backed up,
     // with the HTTP surface on or off: a Reflection page this daemon writes
     // reaches every reader of its domain and the backup branch either way.
     // Opened after the two short-lived opens above have closed theirs, and
     // shared with the HTTP surface below, so this process holds one handle.
-    let accounts = crate::client::install_domain_access(&engine).await;
+    // On Postgres it was opened before the rename.
+    let accounts = match pg_accounts {
+        Some(store) => Some(store),
+        None => open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?,
+    };
     // Who may read each env-defined team domain on an instance with a GitHub
     // App, recorded before anything is served so a private one is closed
     // from its first request on. A private record that cannot be written
@@ -690,7 +794,7 @@ pub async fn run_serve(
         crate::logging::console_line(&format!(
             "crystalline {} serving on {} (pid {})",
             env!("CARGO_PKG_VERSION"),
-            ownership.socket_display(),
+            owned(&ownership, |o| o.socket_display())?,
             shared.pid
         ));
         crate::logging::console_line(COPYRIGHT_LINE);
@@ -940,8 +1044,14 @@ pub async fn run_serve(
         });
     }
 
-    // The HTTP endpoint, which is on unless it was turned off.
-    if let Some(addr) = http_addr.clone() {
+    // The HTTP endpoint, which is on unless it was turned off. On Postgres it
+    // was bound before the store opened (`None` inside when that bind
+    // failed), and the full router goes into its slot.
+    let early_http = pg_start.as_ref().map(crate::standby::PgStart::http_slot);
+    let base = crate::settings::base_path(&loaded.effective);
+    if let Some(addr) = http_addr.clone()
+        && !matches!(early_http, Some(None))
+    {
         let e = engine.clone();
         let sessions = http_sessions.clone();
         let rx = shared.watch();
@@ -969,9 +1079,23 @@ pub async fn run_serve(
                     tracing::warn!(
                         "HTTP endpoint for {addr} could not be built ({err:#}); this is the configuration it was built from rather than the address, and MCP over the socket is unaffected"
                     );
+                    // The early endpoint keeps answering the probes, and
+                    // nothing there says standby any more.
+                    if let Some(Some(slot)) = &early_http {
+                        slot.swap(crate::standby::probes_router(base));
+                    }
                     return;
                 }
             };
+            if let Some(Some(slot)) = early_http {
+                slot.swap(router);
+                // Ready only while the early endpoint still serves: one that
+                // stopped stays not ready, as it does on the Turso path.
+                if slot.is_serving() {
+                    set_ready(true);
+                }
+                return;
+            }
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(listener) => listener,
                 Err(err) => {
@@ -989,11 +1113,23 @@ pub async fn run_serve(
         });
     }
 
+    // On Postgres the early responder hands the socket over now, and the
+    // owner lock stays held in `database` until the last shutdown step.
+    let (listener, database, mut stop) = match pg_start {
+        Some(pg) => {
+            let (listener, held, stop) = pg.hand_over(&shared).await?;
+            (listener, Some(held), stop)
+        }
+        None => (
+            turso_listener.ok_or_else(|| anyhow::anyhow!("the control socket was never bound"))?,
+            None,
+            turso_stop.ok_or_else(|| anyhow::anyhow!("the stop signals were never set up"))?,
+        ),
+    };
     let accept = tokio::spawn(accept_loop(listener, shared.clone()));
 
     let reason = tokio::select! {
-        signal = wait_signal() => signal,
-        gone = test_parent_gone() => gone,
+        signal = &mut stop => signal,
         _ = shared.wait_shutdown() => shared.shutdown_reason(),
     };
     shared.trigger_shutdown(reason);
@@ -1005,7 +1141,7 @@ pub async fn run_serve(
         "stopping ({reason}); exiting within {}s",
         SHUTDOWN_DEADLINE.as_secs()
     );
-    let departure = Departure::begin(ownership, SHUTDOWN_DEADLINE);
+    let departure = Departure::begin_held(ownership, SHUTDOWN_DEADLINE);
 
     departure.step("waiting for the accept loop");
     let _ = accept.await;
@@ -1035,11 +1171,78 @@ pub async fn run_serve(
     // server rotated is saved. The refresh touches no store.
     departure.settle_sign_ins().await;
 
+    // Last, so everything above still wrote as the owner (a saved sign-in
+    // included): `released_at` and the unlock, and a standby takes over
+    // without the grace. Bounded by the same watchdog; a release that never
+    // ends is cut by the exit, which frees the lock without `released_at`.
+    if let Some(database) = &database {
+        departure.step("releasing the database");
+        database.release().await;
+    }
+
     departure.finish((!daemon_flag).then_some("crystalline stopped"))
 }
 
-/// What a departure keeps back for the steps after the sign-in settle (the
-/// removal and the exit), and so the least the watchdog never sees spent.
+/// Open the index store for the daemon's start: on Postgres with the owner's
+/// connection settings (each connection tagged with the instance id and
+/// fenced on the held lock), elsewhere as [`open_store_as_owner`] does.
+async fn open_store_for_start(
+    cfg: &GlobalConfig,
+    db: Option<&Path>,
+    pg: Option<&crate::standby::PgStart>,
+) -> anyhow::Result<Arc<TokioMutex<dyn Store>>> {
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = pg {
+        return Ok(crystalline_index::open_store_with(
+            &cfg.database(),
+            db,
+            false,
+            &pg.session_options(),
+        )
+        .await?);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = pg;
+    open_store_as_owner(cfg, db).await
+}
+
+/// Open the accounts store the daemon keeps for domain access and the HTTP
+/// surface: in the owned Postgres database with the owner's connection
+/// settings, else the accounts file as [`crate::client::install_domain_access`]
+/// opens it.
+///
+/// On Postgres the accounts live in the database and nowhere else, so a
+/// store that does not open fails the start: the HTTP surface must never
+/// fall back to an accounts file on this machine. The file path keeps its
+/// behaviour (domain access fails closed and the start goes on).
+async fn open_domain_access(
+    engine: &Arc<Engine>,
+    cfg: &GlobalConfig,
+    pg: Option<&crate::standby::PgStart>,
+) -> anyhow::Result<Option<Arc<crate::rest::AuthStore>>> {
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = pg {
+        crate::client::start_github_access(engine);
+        let auth = pg.open_accounts(cfg).await.map_err(|e| {
+            anyhow::anyhow!(
+                "could not open the accounts in the database {} ({e:#}); on Postgres the accounts live in the database, so this instance does not start without them",
+                pg.database()
+            )
+        })?;
+        return Ok(crate::client::install_opened_domain_access(
+            engine,
+            Ok(auth),
+        ));
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = (cfg, pg);
+    Ok(crate::client::install_domain_access(engine).await)
+}
+
+/// What a departure keeps back for the steps after the sign-in settle (on
+/// Postgres the release of the database, then the removal and the exit),
+/// and so the least the watchdog never sees spent. The release is two short
+/// statements on the open lock connection, well inside it.
 const SETTLE_MARGIN: Duration = Duration::from_secs(2);
 
 /// How long a departure that began `elapsed` ago, with `deadline` in all,
@@ -1101,11 +1304,16 @@ impl Departure {
     /// ends the process `deadline` from now unless [`Departure::finish`] does
     /// so first.
     pub(crate) fn begin(ownership: crate::instance::Ownership, deadline: Duration) -> Departure {
+        Departure::begin_held(Arc::new(std::sync::Mutex::new(Some(ownership))), deadline)
+    }
+
+    /// [`Departure::begin`] for an ownership already kept in a shared slot.
+    pub(crate) fn begin_held(ownership: HeldOwnership, deadline: Duration) -> Departure {
         let departure = Departure {
             began: Instant::now(),
             deadline,
             step: Arc::new(std::sync::Mutex::new("starting")),
-            ownership: Arc::new(std::sync::Mutex::new(Some(ownership))),
+            ownership,
         };
         let step = departure.step.clone();
         let ownership = departure.ownership.clone();
@@ -1169,19 +1377,177 @@ impl Departure {
         // A window procedure holding WM_ENDSESSION may now let Windows end
         // the session: nothing of the index is in use any more.
         crate::session_end::notify_stopped();
-        exit_now();
+        exit_with(0);
     }
 }
+
+/// Exit status of a process that lost its fence on durable state (Postgres
+/// ownership): distinct from [`crate::EXIT_LOCK_HELD`] (3), which systemd's
+/// `RestartPreventExitStatus=3` keeps from restarting, so a fenced process is
+/// restarted and rejoins as a standby. Also distinct from 0, 1 and 2.
+pub const EXIT_FENCED: i32 = 4;
 
 /// Flush what this process has written and exit with status 0. Both streams,
 /// because `std::process::exit` runs no destructors and a line still sitting
 /// in a buffer would be lost; stderr is unbuffered in std today, and flushing
 /// it costs nothing if that ever changes.
 fn exit_now() -> ! {
+    exit_with(0)
+}
+
+/// [`exit_now`] with a chosen status.
+pub(crate) fn exit_with(code: i32) -> ! {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    std::process::exit(0)
+    std::process::exit(code)
+}
+
+/// Whether this process owns the durable state (`Active`) or waits for it
+/// (`Standby`). Reported in `/health` as `role`.
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres standby sets it")
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    Active,
+    Standby,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Active => "active",
+            Role::Standby => "standby",
+        }
+    }
+}
+
+/// The process-wide role, read by `/health`. A watch so a standby loop can
+/// subscribe to changes.
+static ROLE: std::sync::LazyLock<watch::Sender<Role>> =
+    std::sync::LazyLock::new(|| watch::channel(Role::Active).0);
+
+/// True once the full router is installed; `/ready` answers 200 only then.
+static READY: AtomicBool = AtomicBool::new(false);
+
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres standby sets it")
+)]
+pub(crate) fn set_role(role: Role) {
+    ROLE.send_replace(role);
+}
+
+pub(crate) fn current_role() -> Role {
+    *ROLE.borrow()
+}
+
+/// A receiver of the process-wide role, for a wait that ends when this
+/// instance turns standby.
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres standby waits on it")
+)]
+pub(crate) fn role_watch() -> watch::Receiver<Role> {
+    ROLE.subscribe()
+}
+
+/// Held by every test that changes the process-wide role or readiness, so
+/// two of them never interleave under a test runner that shares one process
+/// between tests.
+#[cfg(test)]
+pub(crate) static PROCESS_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The tracing target of the start's order marks ([`start_step`]).
+pub(crate) const START_TARGET: &str = "crystalline::start";
+
+/// Mark a step of the start at debug level under [`START_TARGET`], so a test
+/// can read the order of the store open and the record's publish with
+/// `RUST_LOG=crystalline::start=debug` and nothing else changes.
+pub(crate) fn start_step(step: &str) {
+    tracing::debug!(target: START_TARGET, "start: {step}");
+}
+
+pub(crate) fn set_ready(ready: bool) {
+    READY.store(ready, Ordering::SeqCst);
+}
+
+/// The stop signals of a daemon (SIGTERM, SIGINT, a gone test parent), one
+/// future for the life of the process; see `run_serve`.
+pub(crate) type StopFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + Send>>;
+
+/// A daemon's [`crate::instance::Ownership`] in a slot that whoever ends the
+/// process empties: the shutdown, its watchdog or a stop during the start.
+pub(crate) type HeldOwnership = Arc<std::sync::Mutex<Option<crate::instance::Ownership>>>;
+
+/// Run `f` on the ownership in `held`, or fail when a stop already took it.
+fn owned<T>(
+    held: &HeldOwnership,
+    f: impl FnOnce(&crate::instance::Ownership) -> T,
+) -> anyhow::Result<T> {
+    let slot = held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slot.as_ref() {
+        Some(ownership) => Ok(f(ownership)),
+        None => anyhow::bail!("this instance is stopping"),
+    }
+}
+
+/// A swappable router: the listener binds once and the router behind it can
+/// be replaced without rebinding. Each request clones the current router.
+#[derive(Clone)]
+pub(crate) struct HttpSlot {
+    router: Arc<std::sync::RwLock<axum::Router>>,
+    /// Set once the server of this slot has stopped.
+    stopped: Arc<AtomicBool>,
+}
+
+impl HttpSlot {
+    pub(crate) fn new(router: axum::Router) -> Self {
+        Self {
+            router: Arc::new(std::sync::RwLock::new(router)),
+            stopped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn swap(&self, router: axum::Router) {
+        *self
+            .router
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = router;
+    }
+
+    /// Whether the server of this slot still serves: false once
+    /// [`serve_http_slot`] returned.
+    pub(crate) fn is_serving(&self) -> bool {
+        !self.stopped.load(Ordering::SeqCst)
+    }
+}
+
+impl tower_service::Service<axum::extract::Request> for HttpSlot {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = <axum::Router as tower_service::Service<axum::extract::Request>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: axum::extract::Request) -> Self::Future {
+        let mut router = self
+            .router
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        tower_service::Service::call(&mut router, request)
+    }
 }
 
 /// Accept connections until shutdown, dispatching each by its handshake line.
@@ -1256,35 +1622,7 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
     // no options, so both shapes are served.
     let (mode, options) = crate::instance::split_mode_line(&line);
     match mode {
-        "mcp" => {
-            let id = shared.begin_session("mcp");
-            // Refresh the routing cache before this connection initializes so its
-            // instructions reflect the latest virtual MANIFESTs, including edits
-            // made by other instances sharing the database.
-            shared.engine.refresh_routing_cache().await;
-            // The bridge resolved this once at its own startup, from the
-            // `--harness` argument its registration carries and this machine's
-            // install receipt, and re-sends it on every reconnect. The daemon
-            // never re-derives it: its own environment is whoever spawned it
-            // first, and a value re-derived per accepted socket could change
-            // the surface under a live client across a daemon restart.
-            let gate = harness_gate_from_options(&options);
-            let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
-            // The line limit rmcp applies by default, named here from the one
-            // constant the stdio bridge bounds its lines with, so the bridge
-            // never forwards a line this end would drop (see
-            // `crate::line_limit`).
-            let (read, write) = tokio::io::split(stream);
-            let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write)
-                .with_max_line_length(crate::line_limit::STDIO_LINE_LIMIT);
-            match rmcp::serve_server(server, transport).await {
-                Ok(running) => {
-                    let _ = running.waiting().await;
-                }
-                Err(err) => tracing::debug!("mcp session ended during init: {err}"),
-            }
-            shared.end_session(id);
-        }
+        "mcp" => serve_mcp_conn(stream, &options, shared).await,
         "ctl" => {
             // ctl connections are transient operator requests, not agent
             // sessions, so they are deliberately not counted in `sessions`.
@@ -1294,6 +1632,38 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
             tracing::debug!("unknown handshake '{other}'");
         }
     }
+}
+
+/// Serve one `mcp` session on a connection whose handshake line carried
+/// `options`.
+pub(crate) async fn serve_mcp_conn(stream: IpcStream, options: &[&str], shared: Arc<Shared>) {
+    let id = shared.begin_session("mcp");
+    // Refresh the routing cache before this connection initializes so its
+    // instructions reflect the latest virtual MANIFESTs, including edits
+    // made by other instances sharing the database.
+    shared.engine.refresh_routing_cache().await;
+    // The bridge resolved this once at its own startup, from the
+    // `--harness` argument its registration carries and this machine's
+    // install receipt, and re-sends it on every reconnect. The daemon
+    // never re-derives it: its own environment is whoever spawned it
+    // first, and a value re-derived per accepted socket could change
+    // the surface under a live client across a daemon restart.
+    let gate = harness_gate_from_options(options);
+    let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
+    // The line limit rmcp applies by default, named here from the one
+    // constant the stdio bridge bounds its lines with, so the bridge
+    // never forwards a line this end would drop (see
+    // `crate::line_limit`).
+    let (read, write) = tokio::io::split(stream);
+    let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write)
+        .with_max_line_length(crate::line_limit::STDIO_LINE_LIMIT);
+    match rmcp::serve_server(server, transport).await {
+        Ok(running) => {
+            let _ = running.waiting().await;
+        }
+        Err(err) => tracing::debug!("mcp session ended during init: {err}"),
+    }
+    shared.end_session(id);
 }
 
 /// One item on the watcher's debounce channel: a concrete filesystem path from
@@ -1646,8 +2016,18 @@ async fn http_service(
             shutdown,
         );
     }
+    // Only the accounts file is opened here: on Postgres the accounts open
+    // with the start or the start fails, and the HTTP surface never falls
+    // back to a file on this machine.
+    let crystalline_core::config::AccountsLocation::File(path) =
+        crate::claim::accounts_location(&engine.config())?
+    else {
+        anyhow::bail!(
+            "the accounts in the database are not open, and on Postgres the HTTP surface never falls back to an accounts file"
+        );
+    };
     http_service_at(
-        &crystalline_core::config::web_auth_db_path()?,
+        &path,
         allowed_hosts,
         engine,
         http_sessions,
@@ -1689,14 +2069,33 @@ async fn http_service_at(
 async fn run_http(
     listener: tokio::net::TcpListener,
     router: axum::Router,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let slot = HttpSlot::new(router);
+    set_ready(true);
+    serve_http_slot(listener, slot, shutdown).await
+}
+
+/// Serve whatever router `slot` holds on a bound listener until shutdown, the
+/// way [`run_http`] describes. `/ready` answers 503 again once it returns.
+pub(crate) async fn serve_http_slot(
+    listener: tokio::net::TcpListener,
+    slot: HttpSlot,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    axum::serve(
+    // The slot sits behind a fallback service so the connect info the make
+    // service puts in the request extensions reaches the router it holds.
+    let stopped = slot.stopped.clone();
+    let outer = axum::Router::new().fallback_service(slot);
+    let served = axum::serve(
         listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
+        outer.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
-    .await?;
+    .await;
+    stopped.store(true, Ordering::SeqCst);
+    set_ready(false);
+    served?;
     Ok(())
 }
 
@@ -1757,7 +2156,29 @@ async fn setup_token_for(
     if bind_is_loopback(addr) {
         return None;
     }
-    if an_account_already_exists(accounts).await {
+    setup_token_unless(an_account_already_exists(accounts).await, configured)
+}
+
+/// [`setup_token_for`] asked of an accounts store already open: the
+/// database's on Postgres.
+async fn setup_token_in(
+    addr: &str,
+    store: &crate::rest::AuthStore,
+    configured: Option<SetupToken>,
+) -> Option<SetupToken> {
+    if bind_is_loopback(addr) {
+        return None;
+    }
+    setup_token_unless(
+        has_an_account(store, "the accounts in the database").await,
+        configured,
+    )
+}
+
+/// The setup token for a non-loopback bind: none when an account exists,
+/// else the one the operator set, else a fresh one.
+fn setup_token_unless(account_exists: bool, configured: Option<SetupToken>) -> Option<SetupToken> {
+    if account_exists {
         return None;
     }
     if let Some(configured) = configured {
@@ -1871,17 +2292,33 @@ async fn an_account_already_exists(accounts: Option<&Path>) -> bool {
     let Some(path) = accounts else {
         return false;
     };
-    let counted: anyhow::Result<usize> = async {
-        let store = crate::rest::AuthStore::open(path).await?;
-        store.user_count().await
-    }
-    .await;
-    match counted {
-        Ok(count) => count > 0,
+    match crate::rest::AuthStore::open(path).await {
+        Ok(store) => {
+            has_an_account(
+                &store,
+                &format!("the accounts database at {}", path.display()),
+            )
+            .await
+        }
         Err(err) => {
             tracing::warn!(
                 "the accounts database at {} could not be read ({err:#}); starting up as if this instance had no account yet",
                 path.display()
+            );
+            false
+        }
+    }
+}
+
+/// Whether `store` holds an account, `false` when the count fails (said in
+/// the log naming `what`), for the reason [`an_account_already_exists`]
+/// gives.
+async fn has_an_account(store: &crate::rest::AuthStore, what: &str) -> bool {
+    match store.user_count().await {
+        Ok(count) => count > 0,
+        Err(err) => {
+            tracing::warn!(
+                "{what} could not be read ({err:#}); starting up as if this instance had no account yet"
             );
             false
         }
@@ -2233,7 +2670,10 @@ pub fn http_router_with_shutdown(
 /// routed again. Returned as a router (one fallback service) so every caller
 /// keeps serving a router. At the root nothing is wrapped, so the router is
 /// the 0.23.0 one.
-fn under_base_path(router: axum::Router, base: crystalline_core::base::BasePath) -> axum::Router {
+pub(crate) fn under_base_path(
+    router: axum::Router,
+    base: crystalline_core::base::BasePath,
+) -> axum::Router {
     if base.is_root() {
         return router;
     }
@@ -2622,6 +3062,7 @@ fn http_base(
     // here". See `rest::oauth`.
     let mut router = axum::Router::new()
         .route("/health", axum::routing::get(health))
+        .route("/ready", axum::routing::get(ready))
         .merge(crate::rest::well_known_routes(
             oauth.then_some(origin_rule),
             &base_path,
@@ -2832,10 +3273,11 @@ fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static
 /// list of internal hostnames. It is reported on the ctl `status` reply, which
 /// is reachable only over the local unix socket, and through
 /// `crystalline status`, which reads that reply.
-async fn health() -> axum::Json<Value> {
+pub(crate) async fn health() -> axum::Json<Value> {
     let intent = crate::instance::serve_intent();
     axum::Json(serde_json::json!({
         "status": "ok",
+        "role": current_role().as_str(),
         "version": crystalline_core::VERSION,
         "started_by": intent
             .map(|i| i.started_by.as_str())
@@ -2846,6 +3288,16 @@ async fn health() -> axum::Json<Value> {
             _ => "unrecorded",
         },
     }))
+}
+
+/// Readiness probe: 200 once the full router serves, 503 before that (a
+/// standby, a start still opening the store) and after the endpoint stopped.
+pub(crate) async fn ready() -> axum::http::StatusCode {
+    if READY.load(Ordering::SeqCst) {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// Renew this instance's host locks every `secs` seconds until shutdown, so a
@@ -3258,7 +3710,7 @@ fn first_time(flag: &AtomicBool) -> bool {
 
 // --- shutdown + watcher helpers ---------------------------------------------
 
-async fn wait_true(rx: &mut watch::Receiver<bool>) {
+pub(crate) async fn wait_true(rx: &mut watch::Receiver<bool>) {
     loop {
         if *rx.borrow() {
             return;
@@ -3827,13 +4279,6 @@ pub(crate) fn resolve_db(db: Option<&Path>) -> anyhow::Result<PathBuf> {
     }
 }
 
-pub(crate) async fn open_store(
-    cfg: &GlobalConfig,
-    db: Option<&Path>,
-) -> anyhow::Result<Arc<TokioMutex<dyn Store>>> {
-    Ok(crystalline_index::open_store(&cfg.database(), db, false).await?)
-}
-
 /// How long a daemon that holds ownership waits for the index database to come
 /// free before it gives up.
 ///
@@ -3852,7 +4297,7 @@ const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How often the owner asks again while it waits.
 const STORE_LOCK_POLL: Duration = Duration::from_millis(50);
 
-/// [`open_store`], for the one caller that holds the ownership lock.
+/// The store open, for the one caller that holds the ownership lock.
 ///
 /// Holding ownership is what makes waiting correct. Another process on the
 /// index file at that point is either a predecessor that has already given up
@@ -3860,7 +4305,7 @@ const STORE_LOCK_POLL: Duration = Duration::from_millis(50);
 /// lets go by itself. A predecessor of this version is gone within moments of
 /// giving up ownership (see [`Departure`]); an older one may still be winding
 /// down its runtime, and the retry is kept for it. Every other caller of
-/// [`open_store`] fails fast, which is right for them: they hold nothing, and
+/// `crystalline_index::open_store` fails fast, which is right for them: they hold nothing, and
 /// the answer they need is who does.
 async fn open_store_as_owner(
     cfg: &GlobalConfig,
@@ -4031,6 +4476,113 @@ mod tests {
         ] {
             assert!(!text.contains(quiet), "{quiet} passed the filter: {text}");
         }
+    }
+
+    #[test]
+    fn exit_codes_are_distinct() {
+        assert_ne!(EXIT_FENCED, crate::EXIT_LOCK_HELD);
+        for code in [EXIT_FENCED, crate::EXIT_LOCK_HELD] {
+            assert!(![0, 1, 2].contains(&code));
+        }
+    }
+
+    async fn get_status(router: &axum::Router, path: &str) -> (u16, String) {
+        use tower_service::Service;
+        let response = router
+            .clone()
+            .call(
+                axum::http::Request::get(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn probe_router() -> axum::Router {
+        axum::Router::new()
+            .route("/health", axum::routing::get(health))
+            .route("/ready", axum::routing::get(ready))
+    }
+
+    #[tokio::test]
+    async fn ready_and_health_answer_under_the_base_path() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
+        set_ready(true);
+        let wrapped = under_base_path(
+            probe_router(),
+            crystalline_core::base::BasePath::parse("/crystalline").unwrap(),
+        );
+        assert_eq!(get_status(&wrapped, "/crystalline/ready").await.0, 200);
+        assert_eq!(get_status(&wrapped, "/crystalline/health").await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn health_reports_role_active_on_turso() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
+        set_role(Role::Active);
+        let (status, body) = get_status(&probe_router(), "/health").await;
+        assert_eq!(status, 200);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["role"], "active");
+    }
+
+    /// `/ready` answers 503 until the full router serves and again once the
+    /// endpoint stopped: a standby, a start still opening the store and a
+    /// stopped endpoint are all not ready.
+    #[tokio::test]
+    async fn ready_answers_503_while_not_ready() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
+        set_ready(false);
+        assert_eq!(get_status(&probe_router(), "/ready").await.0, 503);
+        set_ready(true);
+        assert_eq!(get_status(&probe_router(), "/ready").await.0, 200);
+        set_ready(false);
+    }
+
+    /// The endpoint that stops turns `/ready` back to 503.
+    #[tokio::test]
+    async fn a_stopped_endpoint_is_not_ready() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stop, rx) = watch::channel(false);
+        let served = tokio::spawn(run_http(listener, probe_router(), rx));
+        tokio::task::yield_now().await;
+        stop.send_replace(true);
+        served.await.unwrap().unwrap();
+        assert_eq!(get_status(&probe_router(), "/ready").await.0, 503);
+    }
+
+    #[tokio::test]
+    async fn http_slot_swaps_router_without_rebind() {
+        use tower_service::Service;
+        let first = axum::Router::new().route("/x", axum::routing::get(|| async { "one" }));
+        let second = axum::Router::new().route("/x", axum::routing::get(|| async { "two" }));
+        let slot = HttpSlot::new(first);
+        let mut service = slot.clone();
+        let request = || {
+            axum::http::Request::get("/x")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let body = |r: axum::response::Response| async move {
+            axum::body::to_bytes(r.into_body(), 16).await.unwrap()
+        };
+        assert_eq!(
+            &body(service.call(request()).await.unwrap()).await[..],
+            b"one"
+        );
+        slot.swap(second);
+        assert_eq!(
+            &body(service.call(request()).await.unwrap()).await[..],
+            b"two"
+        );
     }
 
     /// The bare `/crystalline` prefix is stripped. MCP is the router's

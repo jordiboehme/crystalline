@@ -68,7 +68,102 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use sha2::{Digest, Sha256};
-use turso::{Builder, Connection, Database, Row, Value};
+use turso::{Builder, Connection, Database, Value};
+
+mod db;
+#[cfg(test)]
+mod lint;
+#[cfg(feature = "postgres")]
+mod pg;
+#[cfg(feature = "postgres")]
+mod pg_migrations;
+#[cfg(test)]
+mod tests;
+
+use db::{AuthDb, AuthRow};
+#[cfg(feature = "postgres")]
+pub use pg::auth_write_lock;
+#[cfg(feature = "postgres")]
+pub use pg_migrations::{AUTH_MIGRATIONS, AUTH_TABLES};
+
+/// Why an accounts store did not open.
+#[derive(Debug)]
+pub enum AuthOpenError {
+    /// The accounts tables are older than this binary, and this open may not
+    /// migrate them (only the database's owner migrates).
+    Behind {
+        /// The version the tables are at.
+        found: i64,
+        /// The version this binary needs.
+        need: i64,
+    },
+    /// The accounts tables were migrated by a newer Crystalline.
+    TooNew {
+        /// The version the tables are at.
+        found: i64,
+        /// The newest version this binary knows.
+        known: i64,
+    },
+    /// Anything else: the connection, the migration, the file.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for AuthOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthOpenError::Behind { found, need } => write!(
+                f,
+                "the accounts tables are at version {found}, this binary needs {need}"
+            ),
+            AuthOpenError::TooNew { found, known } => write!(
+                f,
+                "the accounts tables are at version {found}, newer than this binary knows ({known}); upgrade Crystalline"
+            ),
+            AuthOpenError::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthOpenError {}
+
+impl From<anyhow::Error> for AuthOpenError {
+    fn from(e: anyhow::Error) -> AuthOpenError {
+        AuthOpenError::Other(e)
+    }
+}
+
+/// The orphan prunes of the four credential lookups: a row whose account no
+/// longer exists (and, for sessions, an expired one). Turso runs each on
+/// every lookup; Postgres runs all four at open and then hourly
+/// ([`AuthStore::prune_orphans_if_due`]).
+const PRUNE_SESSIONS: &str = "DELETE FROM sessions
+                 WHERE expires_at <= ?1
+                    OR NOT EXISTS (SELECT 1 FROM users u WHERE u.name = sessions.user_name)";
+const PRUNE_MCP_TOKENS: &str = "DELETE FROM mcp_tokens
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.\"user\")";
+const PRUNE_IDENTITY_LINKS: &str = "DELETE FROM identity_link
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.\"user\")";
+const PRUNE_OAUTH_GRANTS: &str = "DELETE FROM oauth_grants
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.\"user\")";
+
+/// On Postgres, the orphans of one name, swept before an account of that
+/// name is created: the hourly prune leaves a window, and an orphan is
+/// exactly what the next account to take the name would inherit.
+const SWEEP_ORPHANS_OF: [&str; 4] = [
+    "DELETE FROM sessions WHERE user_name = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM mcp_tokens WHERE \"user\" = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM identity_link WHERE \"user\" = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM oauth_grants WHERE \"user\" = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+];
+
+/// How old a `last_seen_at` or `last_used` stamp must be before Postgres
+/// writes it again, so the hot path does not write a row on every request.
+/// Turso stamps every time.
+const STAMP_THRESHOLD_SECS: i64 = 60;
 
 /// What a user may do. Ordered least to most privileged; the REST layer maps
 /// each endpoint to the minimum role it accepts.
@@ -297,7 +392,7 @@ fn normalize_github_host(host: &str) -> Result<String> {
 
 const GITHUB_LINK_COLUMNS: &str = "account, host, github_id, login, linked_at, token_live";
 
-fn github_link_from_row(row: &Row) -> GithubLink {
+fn github_link_from_row(row: &AuthRow) -> GithubLink {
     GithubLink {
         account: cell_text(row, 0).unwrap_or_default(),
         host: cell_text(row, 1).unwrap_or_default(),
@@ -567,7 +662,7 @@ impl TokenPair {
 /// closed: a grant whose audience cannot be read is one whose audience
 /// cannot be checked, and answering it with a pair would answer a question
 /// this store does not know the answer to.
-fn audience_matches(row: &Row, column: usize, asked: Option<&str>) -> Result<bool> {
+fn audience_matches(row: &AuthRow, column: usize, asked: Option<&str>) -> Result<bool> {
     let Some(asked) = asked else {
         return Ok(true);
     };
@@ -1133,9 +1228,7 @@ fn normalize_domain(domain: &str) -> Result<String> {
 /// Safe to share across tasks (`Arc<AuthStore>` in the daemon): every method
 /// takes `&self` and serializes its database work internally. See `guard`.
 pub struct AuthStore {
-    // Retained so the connection stays valid for as long as the store does.
-    _db: Database,
-    conn: Connection,
+    db: AuthDb,
     /// Serializes database access within this process.
     ///
     /// turso's [`Connection`] refuses concurrent use outright - a second
@@ -1199,13 +1292,13 @@ CREATE INDEX IF NOT EXISTS sessions_user_name ON sessions (user_name);
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions (expires_at);
 CREATE TABLE IF NOT EXISTS mcp_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
     label TEXT NOT NULL,
     created_at TEXT NOT NULL,
     last_used TEXT
 );
-CREATE INDEX IF NOT EXISTS mcp_tokens_user ON mcp_tokens (user);
+CREATE INDEX IF NOT EXISTS mcp_tokens_user ON mcp_tokens (\"user\");
 CREATE TABLE IF NOT EXISTS domain_acl (
     domain TEXT PRIMARY KEY NOT NULL,
     visibility TEXT NOT NULL,
@@ -1227,14 +1320,14 @@ CREATE INDEX IF NOT EXISTS domain_member_principal
 CREATE TABLE IF NOT EXISTS identity_link (
     issuer TEXT NOT NULL,
     subject TEXT NOT NULL,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     linked_at TEXT NOT NULL,
     linked_by TEXT NOT NULL,
     PRIMARY KEY (issuer, subject)
 );
-CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (user);
+CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (\"user\");
 CREATE UNIQUE INDEX IF NOT EXISTS identity_link_issuer_user
-    ON identity_link (issuer, user);
+    ON identity_link (issuer, \"user\");
 CREATE TABLE IF NOT EXISTS github_link (
     account TEXT PRIMARY KEY NOT NULL, host TEXT NOT NULL, github_id INTEGER NOT NULL,
     login TEXT NOT NULL, linked_at TEXT NOT NULL, token_live INTEGER NOT NULL DEFAULT 1);
@@ -1249,7 +1342,7 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 );
 CREATE TABLE IF NOT EXISTS oauth_grants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     client_id TEXT NOT NULL,
     resource TEXT NOT NULL,
     access_hash TEXT NOT NULL UNIQUE,
@@ -1260,7 +1353,7 @@ CREATE TABLE IF NOT EXISTS oauth_grants (
     created_at TEXT NOT NULL,
     last_used TEXT
 );
-CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (user);
+CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (\"user\");
 CREATE INDEX IF NOT EXISTS oauth_grants_client ON oauth_grants (client_id);
 CREATE INDEX IF NOT EXISTS oauth_grants_previous_refresh
     ON oauth_grants (previous_refresh_hash);
@@ -1278,7 +1371,7 @@ CREATE INDEX IF NOT EXISTS oauth_grant_token_grant ON oauth_grant_token (grant_i
 CREATE INDEX IF NOT EXISTS oauth_grant_token_from ON oauth_grant_token (rotated_from);
 CREATE TABLE IF NOT EXISTS oauth_grant_ended (
     grant_id INTEGER PRIMARY KEY,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     client_id TEXT NOT NULL,
     client_name TEXT NOT NULL,
     redirect_host TEXT NOT NULL,
@@ -1287,7 +1380,7 @@ CREATE TABLE IF NOT EXISTS oauth_grant_ended (
     ended_at INTEGER NOT NULL,
     reason TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS oauth_grant_ended_user ON oauth_grant_ended (user, ended_at);
+CREATE INDEX IF NOT EXISTS oauth_grant_ended_user ON oauth_grant_ended (\"user\", ended_at);
 CREATE TABLE IF NOT EXISTS overlay_grant (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
@@ -1313,6 +1406,11 @@ CREATE TABLE IF NOT EXISTS domain_reflection_grant (
     added_by TEXT NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (domain, account));
 CREATE TABLE IF NOT EXISTS github_delivery (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
 ";
+
+/// The error [`AuthStore::register_oauth_client_within`] fails with when it
+/// cannot count the stored registrations, so a caller can tell a failed
+/// count from a failed insert.
+pub const OAUTH_CLIENTS_UNCOUNTED: &str = "the oauth client registrations could not be counted";
 
 /// How long a GitHub webhook delivery id is remembered, one day in seconds:
 /// a replay inside it does no work (see [`AuthStore::remember_delivery`]).
@@ -1667,11 +1765,99 @@ impl AuthStore {
         ensure_column(&conn, "users", "reflection TEXT").await?;
         ensure_column(&conn, "domain_member", "reflection TEXT").await?;
         let store = AuthStore {
-            _db: db,
-            conn,
+            db: AuthDb::turso(db, conn),
             guard: tokio::sync::Mutex::new(()),
         };
         store.move_oauth_tokens().await?;
+        Ok(store)
+    }
+
+    /// Open the accounts store at `loc`: the Turso file through
+    /// [`AuthStore::open`], or the Postgres database (and schema), migrating
+    /// its accounts tables under the migration lock. `opts` names the
+    /// instance and, in the owner's process, carries the fence every
+    /// connection checks. The connections are in the role `auth`.
+    #[cfg(feature = "postgres")]
+    pub async fn open_at(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+    ) -> Result<AuthStore> {
+        AuthStore::open_at_as(loc, opts, crystalline_index::postgres::PgRole::Auth).await
+    }
+
+    /// [`AuthStore::open_at`] with the connections in `role`: `cli` for a
+    /// command that writes beside the instance that owns the database.
+    #[cfg(feature = "postgres")]
+    pub async fn open_at_as(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+        role: crystalline_index::postgres::PgRole,
+    ) -> Result<AuthStore> {
+        match loc {
+            crystalline_core::config::AccountsLocation::File(path) => AuthStore::open(path).await,
+            crystalline_core::config::AccountsLocation::Postgres(cfg) => {
+                AuthStore::open_postgres(cfg, opts, role, true)
+                    .await
+                    .map_err(|e| match e {
+                        AuthOpenError::Other(e) => e,
+                        other => anyhow::Error::new(other),
+                    })
+            }
+        }
+    }
+
+    /// [`AuthStore::open_at`] without migrating: on Postgres, accounts
+    /// tables behind this binary are [`AuthOpenError::Behind`] and ahead of
+    /// it [`AuthOpenError::TooNew`], for an opener that does not own the
+    /// database and so may not migrate. A Turso file opens as with
+    /// [`AuthStore::open`].
+    #[cfg(feature = "postgres")]
+    pub async fn open_at_no_migrate(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+    ) -> std::result::Result<AuthStore, AuthOpenError> {
+        AuthStore::open_at_no_migrate_as(loc, opts, crystalline_index::postgres::PgRole::Auth).await
+    }
+
+    /// [`AuthStore::open_at_no_migrate`] with the connections in `role`.
+    #[cfg(feature = "postgres")]
+    pub async fn open_at_no_migrate_as(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+        role: crystalline_index::postgres::PgRole,
+    ) -> std::result::Result<AuthStore, AuthOpenError> {
+        match loc {
+            crystalline_core::config::AccountsLocation::File(path) => {
+                AuthStore::open(path).await.map_err(AuthOpenError::Other)
+            }
+            crystalline_core::config::AccountsLocation::Postgres(cfg) => {
+                AuthStore::open_postgres(cfg, opts, role, false).await
+            }
+        }
+    }
+
+    /// The Postgres arm of [`AuthStore::open_at`]: connect, migrate (or
+    /// check the version) and run the first orphan prune. Nothing of the
+    /// Turso open applies: no busy timeout, no column patching, no token
+    /// move, no file checks.
+    #[cfg(feature = "postgres")]
+    async fn open_postgres(
+        cfg: &crystalline_core::config::DatabaseConfig,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+        role: crystalline_index::postgres::PgRole,
+        migrate: bool,
+    ) -> std::result::Result<AuthStore, AuthOpenError> {
+        let target = crystalline_index::postgres::PgTarget::from_config(cfg)
+            .map_err(|e| AuthOpenError::Other(anyhow::Error::new(e)))?;
+        let pg = Box::pin(pg::PgAuth::open(target, opts.clone(), role, migrate)).await?;
+        let store = AuthStore {
+            db: AuthDb::Postgres(Box::new(pg)),
+            guard: tokio::sync::Mutex::new(()),
+        };
+        {
+            let _guard = store.lock().await;
+            store.prune_orphans_if_due().await?;
+        }
         Ok(store)
     }
 
@@ -1698,21 +1884,23 @@ impl AuthStore {
     /// One `BEGIN IMMEDIATE`, because the daemon and the CLI open this file
     /// concurrently and only one of them may move a grant.
     async fn move_oauth_tokens(&self) -> Result<()> {
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .context("moving oauth tokens to their own table")?;
         let result = async {
             let placeholder = format!("{OAUTH_PLACEHOLDER_PREFIX}%");
-            self.conn
+            self.db
                 .execute(
-                    "INSERT OR IGNORE INTO oauth_grant_token
+                    "INSERT INTO oauth_grant_token
                          (refresh_hash, grant_id, access_hash, access_expires_at,
                           refresh_expires_at, issued_at, rotated_at, rotated_from)
                      SELECT refresh_hash, id, access_hash, access_expires_at,
                             refresh_expires_at, access_expires_at - ?2, NULL,
                             previous_refresh_hash
-                     FROM oauth_grants WHERE refresh_hash NOT LIKE ?1",
+                     FROM oauth_grants WHERE refresh_hash NOT LIKE ?1
+                     ON CONFLICT DO NOTHING",
                     vec![
                         Value::Text(placeholder.clone()),
                         Value::Integer(OAUTH_ACCESS_TTL_SECS),
@@ -1720,15 +1908,16 @@ impl AuthStore {
                 )
                 .await
                 .context("moving live oauth tokens")?;
-            self.conn
+            self.db
                 .execute(
-                    "INSERT OR IGNORE INTO oauth_grant_token
+                    "INSERT INTO oauth_grant_token
                          (refresh_hash, grant_id, access_hash, access_expires_at,
                           refresh_expires_at, issued_at, rotated_at, rotated_from)
                      SELECT previous_refresh_hash, id, NULL, 0, 0, 0,
                             access_expires_at - ?2, NULL
                      FROM oauth_grants
-                     WHERE refresh_hash NOT LIKE ?1 AND previous_refresh_hash IS NOT NULL",
+                     WHERE refresh_hash NOT LIKE ?1 AND previous_refresh_hash IS NOT NULL
+                     ON CONFLICT DO NOTHING",
                     vec![
                         Value::Text(placeholder.clone()),
                         Value::Integer(OAUTH_ACCESS_TTL_SECS),
@@ -1736,7 +1925,7 @@ impl AuthStore {
                 )
                 .await
                 .context("moving rotated oauth tokens")?;
-            self.conn
+            self.db
                 .execute(
                     "UPDATE oauth_grants
                      SET access_hash = ?2 || 'access:' || id,
@@ -1754,7 +1943,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Add an account with a password. The name is folded by
@@ -1795,36 +1984,56 @@ impl AuthStore {
         let name = normalize_new_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO users
-                     (name, display, email, role, reflection, pass_hash, disabled, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(display.to_string()),
-                    match email {
-                        Some(e) => Value::Text(e.to_string()),
-                        None => Value::Null,
-                    },
-                    Value::Text(role.as_str().to_string()),
-                    reflection.to_db(),
-                    Value::Text(hash),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
-            .await
-            .with_context(|| format!("adding user '{name}'"))?;
-        Ok(())
+        let _guard = self.lock().await;
+        // On Postgres the insert takes the write lock, so it cannot slip past
+        // `add_first_admin`'s empty-table check, and it sweeps the name's
+        // orphans first. Turso's single writer needs neither.
+        let pg = self.db.is_postgres();
+        if pg {
+            self.db
+                .begin_immediate()
+                .await
+                .with_context(|| format!("adding user '{name}'"))?;
+        }
+        let result = async {
+            self.sweep_orphans_of(&name).await?;
+            self.db
+                .execute(
+                    "INSERT INTO users
+                         (name, display, email, role, reflection, pass_hash, disabled, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display.to_string()),
+                        match email {
+                            Some(e) => Value::Text(e.to_string()),
+                            None => Value::Null,
+                        },
+                        Value::Text(role.as_str().to_string()),
+                        reflection.to_db(),
+                        Value::Text(hash),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("adding user '{name}'"))?;
+            Ok(())
+        }
+        .await;
+        if pg {
+            self.db.finish(result).await
+        } else {
+            result
+        }
     }
 
     /// How many accounts exist. Zero is what opens the first-run setup path,
     /// and it is what `GET /auth/me` reports as `needs_setup`.
     pub async fn user_count(&self) -> Result<usize> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(
             match self
+                .db
                 .query_first("SELECT COUNT(*) FROM users", vec![])
                 .await?
                 .map(|row| row.get_value(0))
@@ -1856,22 +2065,30 @@ impl AuthStore {
         let name = normalize_new_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
-        let _guard = self.guard.lock().await;
-        let written = self
-            .conn
-            .execute(
-                "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
-                 SELECT ?1, ?2, NULL, 'admin', ?3, 0, ?4
-                 WHERE NOT EXISTS (SELECT 1 FROM users)",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(display.to_string()),
-                    Value::Text(hash),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("creating the first admin '{name}'"))?;
+        let result = async {
+            self.sweep_orphans_of(&name).await?;
+            self.db
+                .execute(
+                    "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                     SELECT ?1, ?2, NULL, 'admin', ?3, 0, ?4
+                     WHERE NOT EXISTS (SELECT 1 FROM users)",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display.to_string()),
+                        Value::Text(hash),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("creating the first admin '{name}'"))
+        }
+        .await;
+        let written = self.db.finish(result).await?;
         Ok(written > 0)
     }
 
@@ -1908,12 +2125,13 @@ impl AuthStore {
         };
         // Scoped so the lock is released before the argon2 verify below.
         let row = {
-            let _guard = self.guard.lock().await;
-            self.query_first(
-                &format!("SELECT {USER_COLUMNS}, pass_hash FROM users WHERE name = ?1"),
-                vec![Value::Text(name)],
-            )
-            .await?
+            let _guard = self.lock().await;
+            self.db
+                .query_first(
+                    &format!("SELECT {USER_COLUMNS}, pass_hash FROM users WHERE name = ?1"),
+                    vec![Value::Text(name)],
+                )
+                .await?
         };
         let Some(row) = row else {
             return Ok(PasswordCheck::NoHash);
@@ -1955,13 +2173,14 @@ impl AuthStore {
         let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("updating user '{name}'"))?;
         let result = async {
             let changed = self
-                .conn
+                .db
                 .execute(
                     "UPDATE users SET pass_hash = ?2 WHERE name = ?1",
                     vec![Value::Text(name.clone()), Value::Text(hash)],
@@ -1977,7 +2196,7 @@ impl AuthStore {
                 .await
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Change an account's role. Demoting the last enabled admin is refused
@@ -2001,9 +2220,9 @@ impl AuthStore {
     /// on the machine that holds this file.
     pub async fn set_role_force(&self, name: &str, role: Role) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE users SET role = ?2 WHERE name = ?1",
                 vec![
@@ -2031,9 +2250,9 @@ impl AuthStore {
             .filter(|d| !d.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| name.clone());
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE users SET display = ?2 WHERE name = ?1",
                 vec![Value::Text(name.clone()), Value::Text(display)],
@@ -2063,13 +2282,14 @@ impl AuthStore {
     /// refused disabling rolls back, sessions included.
     pub async fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("updating user '{name}'"))?;
         let result = async {
             let changed = self
-                .conn
+                .db
                 .execute(
                     &format!(
                         "UPDATE users SET disabled = ?2 \
@@ -2087,6 +2307,7 @@ impl AuthStore {
                 // it would have left no enabled admin. The probe is inside the
                 // transaction, so it sees exactly what the update saw.
                 let exists = self
+                    .db
                     .query_first(
                         "SELECT 1 FROM users WHERE name = ?1",
                         vec![Value::Text(name.clone())],
@@ -2103,7 +2324,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Delete an account and everything keyed on its name: its sessions, its
@@ -2132,8 +2353,9 @@ impl AuthStore {
     pub async fn remove_user(&self, name: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("removing user '{name}'"))?;
         let result = async {
@@ -2148,7 +2370,7 @@ impl AuthStore {
             self.delete_overlay_grants_held_by(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
-                .conn
+                .db
                 .execute(
                     &format!("DELETE FROM users WHERE name = ?1 AND {NOT_LAST_ADMIN}"),
                     key.clone(),
@@ -2160,6 +2382,7 @@ impl AuthStore {
                 // be told which. The probe is inside the transaction, so it
                 // sees exactly what the delete saw.
                 let exists = self
+                    .db
                     .query_first("SELECT 1 FROM users WHERE name = ?1", key)
                     .await?;
                 if exists.is_some() {
@@ -2170,7 +2393,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// [`AuthStore::remove_user`] without the last-admin guard, for
@@ -2180,8 +2403,9 @@ impl AuthStore {
     pub async fn remove_user_force(&self, name: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("removing user '{name}'"))?;
         let result = async {
@@ -2196,7 +2420,7 @@ impl AuthStore {
             self.delete_overlay_grants_held_by(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
-                .conn
+                .db
                 .execute("DELETE FROM users WHERE name = ?1", key)
                 .await
                 .with_context(|| format!("removing user '{name}'"))?;
@@ -2206,7 +2430,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// One account by name, or `None` when there is none. The name is folded
@@ -2220,8 +2444,9 @@ impl AuthStore {
     /// ghsot --list` must say "no such user" rather than "holds no tokens".
     pub async fn user(&self, name: &str) -> Result<Option<User>> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
+            .db
             .query_first(
                 &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
                 vec![Value::Text(name)],
@@ -2234,7 +2459,7 @@ impl AuthStore {
     /// wanting `desired` right now.
     pub async fn free_name_from(&self, desired: &str) -> Result<String> {
         let base = normalize_new_account_name(desired)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.free_account_name(&base).await
     }
 
@@ -2244,8 +2469,9 @@ impl AuthStore {
     /// writes, whether the name still holds that account.
     pub async fn account_born(&self, name: &str) -> Result<Option<String>> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
+            .db
             .query_first(
                 "SELECT created_at FROM users WHERE name = ?1",
                 vec![Value::Text(name)],
@@ -2257,17 +2483,17 @@ impl AuthStore {
     /// Every account, by name. Names sort byte-wise, which is the ordering
     /// contract the rest of the workspace's text columns use.
     pub async fn list_users(&self) -> Result<Vec<User>> {
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 &format!("SELECT {USER_COLUMNS} FROM users ORDER BY name"),
-                (),
+                vec![],
             )
             .await
             .context("listing users")?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().await.context("listing users")? {
+        for row in rows {
             out.push(user_from_row(&row));
         }
         Ok(out)
@@ -2277,18 +2503,14 @@ impl AuthStore {
     /// or one a trusted header or a sign-on provisioned), so `users list` can
     /// say so. Kept apart from [`User`], which crosses the REST API.
     pub async fn passwordless_users(&self) -> Result<std::collections::HashSet<String>> {
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
-            .query("SELECT name FROM users WHERE pass_hash IS NULL", ())
+        let _guard = self.lock().await;
+        let rows = self
+            .db
+            .query("SELECT name FROM users WHERE pass_hash IS NULL", vec![])
             .await
             .context("listing accounts without a password")?;
         let mut out = std::collections::HashSet::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .context("listing accounts without a password")?
-        {
+        for row in rows {
             if let Some(name) = cell_text(&row, 0) {
                 out.insert(name);
             }
@@ -2334,67 +2556,71 @@ impl AuthStore {
     ) -> Result<(User, bool)> {
         let display = name.trim().to_string();
         let name = normalize_new_account_name(name)?;
-        let _guard = self.guard.lock().await;
-        let exists = self
-            .query_first(
-                "SELECT 1 FROM users WHERE name = ?1",
-                vec![Value::Text(name.clone())],
-            )
-            .await?
-            .is_some();
-        if !exists {
-            let count = match self
-                .query_first("SELECT COUNT(*) FROM users", vec![])
-                .await?
-                .map(|row| row.get_value(0))
-            {
-                Some(Ok(Value::Integer(n))) => n as usize,
-                _ => 0,
-            };
-            if count >= cap {
-                return Err(refuse(
-                    RefusalKind::CapReached,
-                    format!(
-                        "refusing to provision '{name}': the account cap is reached \
-                         (auth.max_users = {cap}). Remove unused accounts or raise the cap"
-                    ),
-                ));
-            }
-        }
-        let inserted = self
-            .conn
-            .execute(
-                "INSERT OR IGNORE INTO users
-                     (name, display, email, role, pass_hash, disabled, created_at)
-                 VALUES (?1, ?2, NULL, ?3, NULL, 0, ?4)",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(display),
-                    Value::Text(role.as_str().to_string()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("provisioning user '{name}'"))?;
-        self.conn
-            .execute(
-                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
-            .await
-            .context("stamping last_seen_at")?;
-        let user = self
-            .query_first(
-                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
-                vec![Value::Text(name.clone())],
-            )
-            .await?
-            .map(|row| user_from_row(&row))
-            .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))?;
-        Ok((user, inserted > 0))
+        let result = async {
+            let exists = self
+                .db
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(name.clone())],
+                )
+                .await?
+                .is_some();
+            if !exists {
+                let count = match self
+                    .db
+                    .query_first("SELECT COUNT(*) FROM users", vec![])
+                    .await?
+                    .map(|row| row.get_value(0))
+                {
+                    Some(Ok(Value::Integer(n))) => n as usize,
+                    _ => 0,
+                };
+                if count >= cap {
+                    return Err(refuse(
+                        RefusalKind::CapReached,
+                        format!(
+                            "refusing to provision '{name}': the account cap is reached \
+                             (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                        ),
+                    ));
+                }
+            }
+            self.sweep_orphans_of(&name).await?;
+            let inserted = self
+                .db
+                .execute(
+                    "INSERT INTO users
+                         (name, display, email, role, pass_hash, disabled, created_at)
+                     VALUES (?1, ?2, NULL, ?3, NULL, 0, ?4)
+                     ON CONFLICT DO NOTHING",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display),
+                        Value::Text(role.as_str().to_string()),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("provisioning user '{name}'"))?;
+            self.stamp_seen(&name).await?;
+            let user = self
+                .db
+                .query_first(
+                    &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                    vec![Value::Text(name.clone())],
+                )
+                .await?
+                .map(|row| user_from_row(&row))
+                .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))?;
+            Ok((user, inserted > 0))
+        }
+        .await;
+        self.db.finish(result).await
     }
 
     /// The account an external provider's `(issuer, subject)` pair names, or
@@ -2417,20 +2643,21 @@ impl AuthStore {
     pub async fn linked_user(&self, issuer: &str, subject: &str) -> Result<Option<User>> {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "DELETE FROM identity_link
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.user)",
-                (),
-            )
-            .await
-            .context("pruning orphaned identity links")?;
+        let _guard = self.lock().await;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_IDENTITY_LINKS, vec![])
+                .await
+                .context("pruning orphaned identity links")?;
+        }
         Ok(self
+            .db
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED} FROM identity_link l
-                     JOIN users u ON u.name = l.user
+                     JOIN users u ON u.name = l.\"user\"
                      WHERE l.issuer = ?1 AND l.subject = ?2"
                 ),
                 vec![Value::Text(issuer), Value::Text(subject)],
@@ -2459,8 +2686,9 @@ impl AuthStore {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("linking an identity to user '{user}'"))?;
         let result = async {
@@ -2468,7 +2696,7 @@ impl AuthStore {
             self.insert_link(&issuer, &subject, &user, linked_by).await
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Drop the identity `user` holds at `issuer`. `true` when there was one.
@@ -2504,8 +2732,9 @@ impl AuthStore {
     async fn unlink(&self, issuer: &str, user: &str, force: bool) -> Result<bool> {
         let issuer = identity_value(issuer, "issuer")?;
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("unlinking an identity from user '{user}'"))?;
         let result = async {
@@ -2520,9 +2749,9 @@ impl AuthStore {
                 ));
             }
             let changed = self
-                .conn
+                .db
                 .execute(
-                    "DELETE FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                    "DELETE FROM identity_link WHERE issuer = ?1 AND \"user\" = ?2",
                     vec![Value::Text(issuer.clone()), Value::Text(user.to_string())],
                 )
                 .await
@@ -2530,7 +2759,7 @@ impl AuthStore {
             Ok(changed > 0)
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Whether `user` has a local password to sign in with.
@@ -2543,29 +2772,25 @@ impl AuthStore {
     /// already holds, and about whether unlinking would strand it.
     pub async fn has_password(&self, name: &str) -> Result<bool> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.password_present(&name).await
     }
 
     /// Every identity linked to one account, by issuer.
     pub async fn identity_links(&self, user: &str) -> Result<Vec<IdentityLink>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT issuer, subject, linked_at, linked_by FROM identity_link
-                 WHERE user = ?1 ORDER BY issuer",
+                 WHERE \"user\" = ?1 ORDER BY issuer",
                 vec![Value::Text(user.clone())],
             )
             .await
             .with_context(|| format!("reading the identity links of user '{user}'"))?;
         let mut links = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("reading the identity links of user '{user}'"))?
-        {
+        for row in rows {
             links.push(IdentityLink {
                 issuer: cell_text(&row, 0).unwrap_or_default(),
                 subject: cell_text(&row, 1).unwrap_or_default(),
@@ -2619,12 +2844,13 @@ impl AuthStore {
         let account = normalize_account_name(account)?;
         let host = normalize_github_host(host)?;
         let id = i64::try_from(github_id).context("a GitHub id out of range")?;
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("linking GitHub to user '{account}'"))?;
         let result = async {
-            let found = self
+            let found = self.db
                 .query_first(
                     "SELECT created_at FROM users WHERE name = ?1",
                     vec![Value::Text(account.clone())],
@@ -2642,7 +2868,7 @@ impl AuthStore {
                     format!("no such user: '{account}'"),
                 ));
             }
-            if self
+            if self.db
                 .query_first(
                     "SELECT 1 FROM github_link WHERE host = ?1 AND github_id = ?2 AND account <> ?3",
                     vec![
@@ -2660,14 +2886,14 @@ impl AuthStore {
                 ));
             }
             let now = chrono::Utc::now();
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM github_link WHERE account = ?1",
                     vec![Value::Text(account.clone())],
                 )
                 .await
                 .with_context(|| format!("replacing the GitHub link of user '{account}'"))?;
-            self.conn
+            self.db
                 .execute(
                     "INSERT INTO github_link (account, host, github_id, login, linked_at, token_live)
                      VALUES (?1, ?2, ?3, ?4, ?5, 1)",
@@ -2691,14 +2917,15 @@ impl AuthStore {
             })
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// The GitHub link of one account, if it has one.
     pub async fn github_link_of(&self, account: &str) -> Result<Option<GithubLink>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
+            .db
             .query_first(
                 &format!("SELECT {GITHUB_LINK_COLUMNS} FROM github_link WHERE account = ?1"),
                 vec![Value::Text(account)],
@@ -2713,8 +2940,9 @@ impl AuthStore {
         let Ok(id) = i64::try_from(github_id) else {
             return Ok(None);
         };
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
+            .db
             .query_first(
                 "SELECT account FROM github_link WHERE host = ?1 AND github_id = ?2",
                 vec![Value::Text(host), Value::Integer(id)],
@@ -2725,17 +2953,17 @@ impl AuthStore {
 
     /// Every GitHub link, by account.
     pub async fn github_links(&self) -> Result<Vec<GithubLink>> {
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 &format!("SELECT {GITHUB_LINK_COLUMNS} FROM github_link ORDER BY account"),
-                (),
+                vec![],
             )
             .await
             .context("reading the GitHub links")?;
         let mut links = Vec::new();
-        while let Some(row) = rows.next().await.context("reading the GitHub links")? {
+        for row in rows {
             links.push(github_link_from_row(&row));
         }
         Ok(links)
@@ -2745,9 +2973,9 @@ impl AuthStore {
     /// GitHub. False when the account has no link.
     pub async fn set_github_login(&self, account: &str, login: &str) -> Result<bool> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE github_link SET login = ?2 WHERE account = ?1",
                 vec![Value::Text(account), Value::Text(login.to_string())],
@@ -2761,9 +2989,9 @@ impl AuthStore {
     /// the account has no link.
     pub async fn mark_github_token_gone(&self, account: &str) -> Result<bool> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE github_link SET token_live = 0 WHERE account = ?1",
                 vec![Value::Text(account)],
@@ -2776,9 +3004,9 @@ impl AuthStore {
     /// Remove an account's GitHub link. True when there was one.
     pub async fn unlink_github(&self, account: &str) -> Result<bool> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "DELETE FROM github_link WHERE account = ?1",
                 vec![Value::Text(account)],
@@ -2803,12 +3031,13 @@ impl AuthStore {
     /// older than that counts as new. The id is GitHub's
     /// `X-GitHub-Delivery`, stored as given.
     pub async fn remember_delivery_at(&self, id: &str, now: i64) -> Result<bool> {
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .context("remembering a GitHub delivery")?;
         let result = async {
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM github_delivery WHERE received_at < ?1",
                     vec![Value::Integer(now.saturating_sub(DELIVERY_KEPT_SECS))],
@@ -2816,7 +3045,7 @@ impl AuthStore {
                 .await
                 .context("pruning the GitHub deliveries")?;
             let inserted = self
-                .conn
+                .db
                 .execute(
                     "INSERT INTO github_delivery (id, received_at) VALUES (?1, ?2)
                      ON CONFLICT (id) DO NOTHING",
@@ -2827,14 +3056,14 @@ impl AuthStore {
             Ok(inserted > 0)
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Forget the GitHub webhook delivery `id`, so a redelivery of it is
     /// handled: called when handling it failed.
     pub async fn forget_delivery(&self, id: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
-        self.conn
+        let _guard = self.lock().await;
+        self.db
             .execute(
                 "DELETE FROM github_delivery WHERE id = ?1",
                 vec![Value::Text(id.to_string())],
@@ -2881,12 +3110,14 @@ impl AuthStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .context("provisioning an account for a single sign-on")?;
         let result = async {
             let count = match self
+                .db
                 .query_first("SELECT COUNT(*) FROM users", vec![])
                 .await?
                 .map(|row| row.get_value(0))
@@ -2904,7 +3135,8 @@ impl AuthStore {
                 ));
             }
             let name = self.free_account_name(&base).await?;
-            self.conn
+            self.sweep_orphans_of(&name).await?;
+            self.db
                 .execute(
                     "INSERT INTO users
                          (name, display, email, role, pass_hash, disabled, created_at)
@@ -2924,16 +3156,17 @@ impl AuthStore {
                 .with_context(|| format!("provisioning user '{name}'"))?;
             self.insert_link(&issuer, &subject, &name, LINKED_BY_JIT)
                 .await?;
-            self.query_first(
-                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
-                vec![Value::Text(name.clone())],
-            )
-            .await?
-            .map(|row| user_from_row(&row))
-            .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
+            self.db
+                .query_first(
+                    &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                    vec![Value::Text(name.clone())],
+                )
+                .await?
+                .map(|row| user_from_row(&row))
+                .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Refresh what an account shows: its display name and its address, and
@@ -2956,9 +3189,9 @@ impl AuthStore {
             Some(value) => Value::Text(value.to_string()),
             None => Value::Null,
         };
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE users
                  SET display = COALESCE(?2, display), email = COALESCE(?3, email)
@@ -2970,13 +3203,14 @@ impl AuthStore {
         if changed == 0 {
             bail!("no such user: '{name}'");
         }
-        self.query_first(
-            &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
-            vec![Value::Text(name.clone())],
-        )
-        .await?
-        .map(|row| user_from_row(&row))
-        .ok_or_else(|| anyhow!("no such user: '{name}'"))
+        self.db
+            .query_first(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                vec![Value::Text(name.clone())],
+            )
+            .await?
+            .map(|row| user_from_row(&row))
+            .ok_or_else(|| anyhow!("no such user: '{name}'"))
     }
 
     /// Issue a session for an existing account, valid for `ttl_secs` from now.
@@ -2993,12 +3227,14 @@ impl AuthStore {
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl_secs);
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("creating a session for user '{name}'"))?;
         let result = async {
             let exists = self
+                .db
                 .query_first(
                     "SELECT 1 FROM users WHERE name = ?1",
                     vec![Value::Text(name.clone())],
@@ -3007,7 +3243,7 @@ impl AuthStore {
             if exists.is_none() {
                 bail!("no such user: '{name}'");
             }
-            self.conn
+            self.db
                 .execute(
                     "INSERT INTO sessions (token_hash, user_name, csrf, expires_at)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -3023,7 +3259,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await?;
+        self.db.finish(result).await?;
         Ok(Session {
             token,
             csrf,
@@ -3054,13 +3290,15 @@ impl AuthStore {
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = now.saturating_add(ttl_secs);
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("ensuring a session for user '{name}'"))?;
         let mut reused = None;
         let result = async {
             let exists = self
+                .db
                 .query_first(
                     "SELECT 1 FROM users WHERE name = ?1",
                     vec![Value::Text(name.clone())],
@@ -3075,7 +3313,7 @@ impl AuthStore {
             // whose session lapsed would leave a dead row behind on every
             // expiry, forever. Scoped to one account rather than sweeping the
             // table, so the cost stays proportional to the caller.
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM sessions WHERE user_name = ?1 AND expires_at <= ?2",
                     vec![Value::Text(name.clone()), Value::Integer(now)],
@@ -3086,7 +3324,7 @@ impl AuthStore {
                 reused = Some(live);
                 return Ok(());
             }
-            self.conn
+            self.db
                 .execute(
                     "INSERT INTO sessions (token_hash, user_name, csrf, expires_at)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -3102,7 +3340,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await?;
+        self.db.finish(result).await?;
         Ok(match reused {
             Some(csrf) => SessionMint::Reused { csrf },
             None => SessionMint::Created(Session {
@@ -3125,7 +3363,7 @@ impl AuthStore {
     pub async fn newest_session_csrf(&self, name: &str) -> Result<Option<String>> {
         let name = normalize_account_name(name)?;
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.live_csrf(&name, now).await
     }
 
@@ -3139,8 +3377,9 @@ impl AuthStore {
     /// the request.
     pub async fn session_owner(&self, token: &str) -> Result<Option<String>> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
+            .db
             .query_first(
                 "SELECT user_name FROM sessions
                  WHERE token_hash = ?1 AND expires_at > ?2",
@@ -3162,8 +3401,9 @@ impl AuthStore {
     /// store's writes.
     pub async fn session_user_quiet(&self, token: &str) -> Result<Option<User>> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
+            .db
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED}
@@ -3181,9 +3421,10 @@ impl AuthStore {
     /// what pins the reuse invariant in tests: a probe that minted per call
     /// would show here as a growing count.
     pub async fn session_count(&self) -> Result<usize> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(
             match self
+                .db
                 .query_first("SELECT COUNT(*) FROM sessions", vec![])
                 .await?
                 .map(|row| row.get_value(0))
@@ -3204,6 +3445,7 @@ impl AuthStore {
     /// issued in the same second.
     async fn live_csrf(&self, name: &str, now: i64) -> Result<Option<String>> {
         Ok(self
+            .db
             .query_first(
                 "SELECT csrf FROM sessions
                  WHERE user_name = ?1 AND expires_at > ?2
@@ -3230,17 +3472,17 @@ impl AuthStore {
     /// dormant.
     pub async fn session_user(&self, token: &str) -> Result<Option<(User, String)>> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "DELETE FROM sessions
-                 WHERE expires_at <= ?1
-                    OR NOT EXISTS (SELECT 1 FROM users u WHERE u.name = sessions.user_name)",
-                vec![Value::Integer(now)],
-            )
-            .await
-            .context("pruning expired and orphaned sessions")?;
+        let _guard = self.lock().await;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_SESSIONS, vec![Value::Integer(now)])
+                .await
+                .context("pruning expired and orphaned sessions")?;
+        }
         let Some(row) = self
+            .db
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED}, s.csrf
@@ -3258,16 +3500,7 @@ impl AuthStore {
             return Ok(None);
         }
         let csrf = cell_text(&row, 7).unwrap_or_default();
-        self.conn
-            .execute(
-                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
-                vec![
-                    Value::Text(user.name.clone()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
-            .await
-            .context("stamping last_seen_at")?;
+        self.stamp_seen(&user.name).await?;
         Ok(Some((user, csrf)))
     }
 
@@ -3283,17 +3516,127 @@ impl AuthStore {
     /// `name` is an account name a row already carries, so it is stamped as
     /// given: a name that is nobody stamps nothing, which is not an error.
     pub async fn mark_seen(&self, name: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+        let _guard = self.lock().await;
+        self.stamp_seen(name).await
+    }
+
+    /// Stamp `last_seen_at` of `name` with now. On Postgres only when the
+    /// stamp is missing or older than [`STAMP_THRESHOLD_SECS`].
+    async fn stamp_seen(&self, name: &str) -> Result<()> {
+        let now = chrono::Utc::now();
+        if self.db.is_postgres() {
+            self.db
+                .execute(
+                    "UPDATE users SET last_seen_at = ?2
+                     WHERE name = ?1 AND (last_seen_at IS NULL OR last_seen_at < ?3)",
+                    vec![
+                        Value::Text(name.to_string()),
+                        Value::Text(now.to_rfc3339()),
+                        Value::Text(stamp_cutoff(now)),
+                    ],
+                )
+                .await
+        } else {
+            self.db
+                .execute(
+                    "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                    vec![Value::Text(name.to_string()), Value::Text(now.to_rfc3339())],
+                )
+                .await
+        }
+        .context("stamping last_seen_at")?;
+        Ok(())
+    }
+
+    /// Stamp `last_used` of the row `id` of `table` (`mcp_tokens` or
+    /// `oauth_grants`) with now. On Postgres only when the stamp is missing
+    /// or older than [`STAMP_THRESHOLD_SECS`].
+    async fn stamp_used(&self, table: &'static str, id: i64) -> Result<()> {
+        let now = chrono::Utc::now();
+        let (sql, params) = match (table, self.db.is_postgres()) {
+            ("mcp_tokens", false) => (
+                "UPDATE mcp_tokens SET last_used = ?2 WHERE id = ?1",
+                vec![Value::Integer(id), Value::Text(now.to_rfc3339())],
+            ),
+            ("oauth_grants", false) => (
+                "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
+                vec![Value::Integer(id), Value::Text(now.to_rfc3339())],
+            ),
+            ("mcp_tokens", true) => (
+                "UPDATE mcp_tokens SET last_used = ?2
+                 WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
                 vec![
-                    Value::Text(name.to_string()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Integer(id),
+                    Value::Text(now.to_rfc3339()),
+                    Value::Text(stamp_cutoff(now)),
                 ],
-            )
+            ),
+            ("oauth_grants", true) => (
+                "UPDATE oauth_grants SET last_used = ?2
+                 WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
+                vec![
+                    Value::Integer(id),
+                    Value::Text(now.to_rfc3339()),
+                    Value::Text(stamp_cutoff(now)),
+                ],
+            ),
+            _ => bail!("no last_used stamp on {table}"),
+        };
+        self.db.execute(sql, params).await?;
+        Ok(())
+    }
+
+    /// The Postgres orphan prune: the four lookup prunes at once, at open
+    /// and then at most hourly. The caller holds `guard`.
+    async fn prune_orphans_if_due(&self) -> Result<()> {
+        if !self.db.prune_due() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.db
+            .execute(PRUNE_SESSIONS, vec![Value::Integer(now)])
             .await
-            .context("stamping last_seen_at")?;
+            .context("pruning expired and orphaned sessions")?;
+        self.db
+            .execute(PRUNE_MCP_TOKENS, vec![])
+            .await
+            .context("pruning orphaned mcp tokens")?;
+        self.db
+            .execute(PRUNE_IDENTITY_LINKS, vec![])
+            .await
+            .context("pruning orphaned identity links")?;
+        self.db
+            .execute(PRUNE_OAUTH_GRANTS, vec![])
+            .await
+            .context("pruning orphaned oauth grants")?;
+        self.db.prune_done();
+        Ok(())
+    }
+
+    /// Take the in-process guard every method runs under. On Postgres a
+    /// transaction still open at this point was left by a cancelled caller
+    /// (every transaction begins and finishes under the guard), so it is
+    /// rolled back before this caller's statements run.
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        let guard = self.guard.lock().await;
+        self.db.reset_stale_transaction().await;
+        guard
+    }
+
+    /// On Postgres, drop the credentials an account of `name` left behind
+    /// when it vanished other than through [`AuthStore::remove_user`], right
+    /// before an account of that name is created ([`SWEEP_ORPHANS_OF`]).
+    /// Nothing on Turso, whose lookups prune every time.
+    async fn sweep_orphans_of(&self, name: &str) -> Result<()> {
+        if !self.db.is_postgres() {
+            return Ok(());
+        }
+        for sql in SWEEP_ORPHANS_OF {
+            self.db
+                .execute(sql, vec![Value::Text(name.to_string())])
+                .await
+                .with_context(|| format!("sweeping the orphaned credentials of '{name}'"))?;
+        }
         Ok(())
     }
 
@@ -3301,8 +3644,8 @@ impl AuthStore {
     /// out twice, or with a stale cookie, is a normal thing for a browser to
     /// do.
     pub async fn delete_session(&self, token: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
-        self.conn
+        let _guard = self.lock().await;
+        self.db
             .execute(
                 "DELETE FROM sessions WHERE token_hash = ?1",
                 vec![Value::Text(token_hash(token))],
@@ -3319,7 +3662,7 @@ impl AuthStore {
     /// each of which calls it while holding the guard and inside its own
     /// transaction, so the revocation lands with the change or not at all.
     async fn delete_sessions_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM sessions WHERE user_name = ?1",
                 vec![Value::Text(name.to_string())],
@@ -3345,9 +3688,9 @@ impl AuthStore {
     /// account's tokens at read time, so re-enabling must hand every token back
     /// rather than force every integration to be re-issued.
     async fn delete_mcp_tokens_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
-                "DELETE FROM mcp_tokens WHERE user = ?1",
+                "DELETE FROM mcp_tokens WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -3373,12 +3716,14 @@ impl AuthStore {
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
         let result = async {
             let exists = self
+                .db
                 .query_first(
                     "SELECT 1 FROM users WHERE name = ?1",
                     vec![Value::Text(user.clone())],
@@ -3394,11 +3739,8 @@ impl AuthStore {
                 .await
         }
         .await;
-        self.finish(result).await?;
-        // Read after commit, still under `self.guard` and on this connection,
-        // so nothing else on this connection can insert between the commit
-        // above and this read - same reasoning `rotate_mcp_token` relies on.
-        let id = self.conn.last_insert_rowid();
+        // The id is read inside the transaction, from the insert's RETURNING.
+        let id = self.db.finish(result).await?;
         Ok(IssuedMcpToken {
             id,
             token,
@@ -3415,21 +3757,19 @@ impl AuthStore {
         hash: &str,
         label: &str,
         created_at: &str,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                vec![
-                    Value::Text(user.to_string()),
-                    Value::Text(hash.to_string()),
-                    Value::Text(label.to_string()),
-                    Value::Text(created_at.to_string()),
-                ],
-            )
-            .await
-            .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
-        Ok(())
+    ) -> Result<i64> {
+        self.returned_id(
+            "INSERT INTO mcp_tokens (\"user\", token_hash, label, created_at)
+             VALUES (?1, ?2, ?3, ?4) RETURNING id",
+            vec![
+                Value::Text(user.to_string()),
+                Value::Text(hash.to_string()),
+                Value::Text(label.to_string()),
+                Value::Text(created_at.to_string()),
+            ],
+        )
+        .await
+        .with_context(|| format!("issuing an mcp token for user '{user}'"))
     }
 
     /// Create an account with no password and issue one personal MCP token for
@@ -3494,12 +3834,14 @@ impl AuthStore {
         let name = normalize_new_account_name(name)?;
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("adding user '{name}'"))?;
         let result = async {
-            self.conn
+            self.sweep_orphans_of(&name).await?;
+            self.db
                 .execute(
                     "INSERT INTO users
                          (name, display, email, role, reflection, pass_hash, disabled, created_at)
@@ -3522,8 +3864,7 @@ impl AuthStore {
                 .await
         }
         .await;
-        self.finish(result).await?;
-        let id = self.conn.last_insert_rowid();
+        let id = self.db.finish(result).await?;
         Ok(IssuedMcpToken {
             id,
             token,
@@ -3546,20 +3887,21 @@ impl AuthStore {
     /// existed or reached by any other path.
     pub async fn mcp_token_user(&self, token: &str) -> Result<Option<User>> {
         let hash = token_hash(token);
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "DELETE FROM mcp_tokens
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.user)",
-                (),
-            )
-            .await
-            .context("pruning orphaned mcp tokens")?;
+        let _guard = self.lock().await;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_MCP_TOKENS, vec![])
+                .await
+                .context("pruning orphaned mcp tokens")?;
+        }
         let Some(row) = self
+            .db
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED}, m.id
-                     FROM mcp_tokens m JOIN users u ON u.name = m.user
+                     FROM mcp_tokens m JOIN users u ON u.name = m.\"user\"
                      WHERE m.token_hash = ?1"
                 ),
                 vec![Value::Text(hash)],
@@ -3573,14 +3915,7 @@ impl AuthStore {
             return Ok(None);
         }
         if let Ok(Value::Integer(id)) = row.get_value(7) {
-            self.conn
-                .execute(
-                    "UPDATE mcp_tokens SET last_used = ?2 WHERE id = ?1",
-                    vec![
-                        Value::Integer(id),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
-                    ],
-                )
+            self.stamp_used("mcp_tokens", id)
                 .await
                 .context("stamping an mcp token's last_used")?;
         }
@@ -3592,22 +3927,18 @@ impl AuthStore {
     /// keyed on a login name.
     pub async fn list_mcp_tokens(&self, user: &str) -> Result<Vec<McpTokenInfo>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT id, label, created_at, last_used FROM mcp_tokens
-                 WHERE user = ?1 ORDER BY created_at DESC, id DESC",
+                 WHERE \"user\" = ?1 ORDER BY created_at DESC, id DESC",
                 vec![Value::Text(user.clone())],
             )
             .await
             .with_context(|| format!("listing mcp tokens for user '{user}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("listing mcp tokens for user '{user}'"))?
-        {
+        for row in rows {
             let Ok(Value::Integer(id)) = row.get_value(0) else {
                 continue;
             };
@@ -3627,11 +3958,11 @@ impl AuthStore {
     /// account's token ids.
     pub async fn revoke_mcp_token(&self, user: &str, id: i64) -> Result<bool> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
-                "DELETE FROM mcp_tokens WHERE id = ?1 AND user = ?2",
+                "DELETE FROM mcp_tokens WHERE id = ?1 AND \"user\" = ?2",
                 vec![Value::Integer(id), Value::Text(user.clone())],
             )
             .await
@@ -3648,8 +3979,9 @@ impl AuthStore {
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
         // Captured by the closure below and read after `finish` commits, the
@@ -3658,8 +3990,9 @@ impl AuthStore {
         let mut label = String::new();
         let result = async {
             let row = self
+                .db
                 .query_first(
-                    "SELECT label FROM mcp_tokens WHERE id = ?1 AND user = ?2",
+                    "SELECT label FROM mcp_tokens WHERE id = ?1 AND \"user\" = ?2",
                     vec![Value::Integer(id), Value::Text(user.clone())],
                 )
                 .await?;
@@ -3670,33 +4003,19 @@ impl AuthStore {
                 ));
             };
             label = cell_text(&row, 0).unwrap_or_default();
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM mcp_tokens WHERE id = ?1",
                     vec![Value::Integer(id)],
                 )
                 .await
                 .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
-            self.conn
-                .execute(
-                    "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    vec![
-                        Value::Text(user.clone()),
-                        Value::Text(hash.clone()),
-                        Value::Text(label.clone()),
-                        Value::Text(created_at.clone()),
-                    ],
-                )
+            self.insert_mcp_token_row(&user, &hash, &label, &created_at)
                 .await
-                .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
-            Ok(())
+                .with_context(|| format!("rotating an mcp token for user '{user}'"))
         }
         .await;
-        self.finish(result).await?;
-        // Read after commit, still under `self.guard` and on this connection:
-        // see `issue_mcp_token`'s matching comment.
-        let id = self.conn.last_insert_rowid();
+        let id = self.db.finish(result).await?;
         Ok(IssuedMcpToken { id, token, label })
     }
 
@@ -3726,12 +4045,12 @@ impl AuthStore {
         let token = format!("{DRAFT_LINK_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
+        let _guard = self.lock().await;
+        let id = self
+            .returned_id(
                 "INSERT INTO overlay_grant
                      (domain, path, owner, grantee, token_hash, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6) RETURNING id",
                 vec![
                     Value::Text(domain.to_string()),
                     Value::Text(path.to_string()),
@@ -3746,12 +4065,7 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("minting a draft share-link for '{owner}'"))?;
-        // Read after the insert, still under `self.guard` and on this
-        // connection: see `issue_mcp_token`'s matching comment.
-        Ok(MintedGrant {
-            id: self.conn.last_insert_rowid(),
-            token,
-        })
+        Ok(MintedGrant { id, token })
     }
 
     /// Present a link. `Some` when it opens something for `account`, `None`
@@ -3779,13 +4093,15 @@ impl AuthStore {
     ) -> Result<Option<OverlayGrant>> {
         let account = normalize_account_name(account)?;
         let hash = token_hash(token);
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .context("redeeming a draft share-link")?;
         let mut bound: Option<OverlayGrant> = None;
         let result = async {
             let row = self
+                .db
                 .query_first(
                     "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
                      FROM overlay_grant WHERE token_hash = ?1",
@@ -3804,7 +4120,7 @@ impl AuthStore {
                 Some(held) if held == account => bound = Some(grant),
                 Some(_) => {}
                 None => {
-                    self.conn
+                    self.db
                         .execute(
                             "UPDATE overlay_grant SET grantee = ?1
                              WHERE id = ?2 AND grantee IS NULL",
@@ -3821,7 +4137,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await?;
+        self.db.finish(result).await?;
         Ok(bound)
     }
 
@@ -3835,9 +4151,9 @@ impl AuthStore {
         path: &str,
     ) -> Result<Vec<OverlayGrant>> {
         let owner = normalize_account_name(owner)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
                  FROM overlay_grant
@@ -3852,11 +4168,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("listing draft share-links for '{owner}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("listing draft share-links for '{owner}'"))?
-        {
+        for row in rows {
             let grant = grant_from_row(&row);
             if grant.is_live() {
                 out.push(grant);
@@ -3899,7 +4211,7 @@ impl AuthStore {
     ) -> Result<Option<OverlayGrant>> {
         let owner = normalize_account_name(owner)?;
         let revoked_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         // One predicate and one parameter list, built once and used by both
         // statements: an admin ends any link on the instance, everybody else
         // exactly their own. Read and then stamp, both under the one guard and
@@ -3911,8 +4223,8 @@ impl AuthStore {
         if !as_admin {
             params.push(Value::Text(owner.clone()));
         }
-        let mut rows = self
-            .conn
+        let rows = self
+            .db
             .query(
                 &format!(
                     "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
@@ -3923,11 +4235,7 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("revoking a draft share-link for '{owner}'"))?;
-        let found = rows
-            .next()
-            .await
-            .with_context(|| format!("revoking a draft share-link for '{owner}'"))?
-            .map(|row| grant_from_row(&row));
+        let found = rows.into_iter().next().map(|row| grant_from_row(&row));
         let Some(mut grant) = found else {
             return Ok(None);
         };
@@ -3936,7 +4244,7 @@ impl AuthStore {
         if !as_admin {
             params.push(Value::Text(owner.clone()));
         }
-        self.conn
+        self.db
             .execute(
                 &format!(
                     "UPDATE overlay_grant SET revoked_at = ?1
@@ -3965,9 +4273,9 @@ impl AuthStore {
         path: &str,
     ) -> Result<Option<String>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
                  FROM overlay_grant
@@ -3981,11 +4289,7 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("reading a draft share-link for '{account}'"))?;
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("reading a draft share-link for '{account}'"))?
-        {
+        for row in rows {
             let grant = grant_from_row(&row);
             if grant.is_live() {
                 return Ok(Some(grant.owner));
@@ -4006,8 +4310,9 @@ impl AuthStore {
     /// screen come before the irreversible half.
     pub async fn overlay_grant_domain(&self, token: &str) -> Result<Option<String>> {
         let hash = token_hash(token);
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let row = self
+            .db
             .query_first(
                 "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
                  FROM overlay_grant WHERE token_hash = ?1",
@@ -4036,9 +4341,9 @@ impl AuthStore {
         domain: &str,
     ) -> Result<Vec<OverlayGrant>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
                  FROM overlay_grant
@@ -4052,11 +4357,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("listing the draft share-links of '{account}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("listing the draft share-links of '{account}'"))?
-        {
+        for row in rows {
             let grant = grant_from_row(&row);
             if grant.is_live() {
                 out.push(grant);
@@ -4075,9 +4376,9 @@ impl AuthStore {
     /// one back, handed to somebody neither of them would have told.
     pub async fn end_overlay_grants(&self, domain: &str, owner: &str, path: &str) -> Result<u64> {
         let owner = normalize_account_name(owner)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE overlay_grant SET revoked_at = ?1
                  WHERE domain = ?2 AND owner = ?3 AND path = ?4 AND revoked_at IS NULL",
@@ -4098,9 +4399,9 @@ impl AuthStore {
     /// drafts at that path.
     pub async fn end_overlay_grants_of_owner(&self, owner: &str) -> Result<u64> {
         let owner = normalize_account_name(owner)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE overlay_grant SET revoked_at = ?1
                  WHERE owner = ?2 AND revoked_at IS NULL",
@@ -4122,9 +4423,9 @@ impl AuthStore {
     /// is [`AuthStore::end_overlay_grants`] above. Answers how many were
     /// standing.
     pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE overlay_grant SET revoked_at = ?1
                  WHERE domain = ?2 AND revoked_at IS NULL",
@@ -4156,6 +4457,26 @@ impl AuthStore {
         client_uri: Option<&str>,
         redirect_uris: &[String],
     ) -> Result<OauthClient> {
+        match self
+            .register_oauth_client_within(name, client_uri, redirect_uris, None)
+            .await?
+        {
+            Some(client) => Ok(client),
+            None => bail!("the oauth client registrations are full"),
+        }
+    }
+
+    /// [`AuthStore::register_oauth_client`] under a ceiling: `None` when
+    /// `cap` registrations are already stored. The count and the insert are
+    /// one transaction, so two writers (two processes, or the daemon and a
+    /// command) cannot both take the last place.
+    pub async fn register_oauth_client_within(
+        &self,
+        name: &str,
+        client_uri: Option<&str>,
+        redirect_uris: &[String],
+        cap: Option<usize>,
+    ) -> Result<Option<OauthClient>> {
         if redirect_uris.is_empty() {
             bail!("an oauth client registration needs at least one redirect uri");
         }
@@ -4169,32 +4490,55 @@ impl AuthStore {
         };
         let encoded = serde_json::to_string(&client.redirect_uris)
             .context("encoding an oauth client's redirect uris")?;
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO oauth_clients
-                     (client_id, client_name, client_uri, redirect_uris, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![
-                    Value::Text(client.client_id.clone()),
-                    Value::Text(client.client_name.clone()),
-                    match &client.client_uri {
-                        Some(uri) => Value::Text(uri.clone()),
-                        None => Value::Null,
-                    },
-                    Value::Text(encoded),
-                    Value::Text(client.created_at.clone()),
-                ],
-            )
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .context("registering an oauth client")?;
-        Ok(client)
+        let result = async {
+            if let Some(cap) = cap {
+                let held = match self
+                    .db
+                    .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
+                    .await?
+                    .map(|row| row.get_value(0))
+                {
+                    Some(Ok(Value::Integer(n))) => n as usize,
+                    _ => bail!(OAUTH_CLIENTS_UNCOUNTED),
+                };
+                if held >= cap {
+                    return Ok(false);
+                }
+            }
+            self.db
+                .execute(
+                    "INSERT INTO oauth_clients
+                         (client_id, client_name, client_uri, redirect_uris, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        Value::Text(client.client_id.clone()),
+                        Value::Text(client.client_name.clone()),
+                        match &client.client_uri {
+                            Some(uri) => Value::Text(uri.clone()),
+                            None => Value::Null,
+                        },
+                        Value::Text(encoded),
+                        Value::Text(client.created_at.clone()),
+                    ],
+                )
+                .await
+                .context("registering an oauth client")?;
+            Ok(true)
+        }
+        .await;
+        let stored = self.db.finish(result).await?;
+        Ok(stored.then_some(client))
     }
 
     /// One registration by id, or `None` when there is none - which is what an
     /// unknown `client_id` at the authorize or token endpoint looks like.
     pub async fn oauth_client(&self, client_id: &str) -> Result<Option<OauthClient>> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.oauth_client_row(client_id).await
     }
 
@@ -4202,6 +4546,7 @@ impl AuthStore {
     /// already hold it.
     async fn oauth_client_row(&self, client_id: &str) -> Result<Option<OauthClient>> {
         let Some(row) = self
+            .db
             .query_first(
                 "SELECT client_id, client_name, client_uri, redirect_uris, created_at, last_used
                  FROM oauth_clients WHERE client_id = ?1",
@@ -4242,8 +4587,8 @@ impl AuthStore {
     /// error: the caller has already refused the request it was stamping for,
     /// and a second failure mode here would tell it nothing new.
     pub async fn touch_oauth_client(&self, client_id: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
-        self.conn
+        let _guard = self.lock().await;
+        self.db
             .execute(
                 "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
                 vec![
@@ -4273,8 +4618,8 @@ impl AuthStore {
     /// Expiry is the statement's comparison, like every other one here.
     pub async fn prune_oauth_grants(&self) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
-        self.conn
+        let _guard = self.lock().await;
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_token WHERE grant_id IN
                      (SELECT id FROM oauth_grants WHERE refresh_expires_at <= ?1)",
@@ -4286,17 +4631,17 @@ impl AuthStore {
         // orphan prune in `oauth_access_user`) are inert, since every token
         // lookup joins `oauth_grants`; they are swept here rather than on the
         // request path.
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_token
                  WHERE NOT EXISTS
                      (SELECT 1 FROM oauth_grants g WHERE g.id = oauth_grant_token.grant_id)",
-                (),
+                vec![],
             )
             .await
             .context("pruning orphaned oauth tokens")?;
         let removed = self
-            .conn
+            .db
             .execute(
                 "DELETE FROM oauth_grants WHERE refresh_expires_at <= ?1",
                 vec![Value::Integer(now)],
@@ -4305,7 +4650,7 @@ impl AuthStore {
             .context("pruning expired oauth grants")?;
         // The ended-grant records age out on the same schedule: nothing
         // lists one past its seven days, so nothing needs to keep it.
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_ended WHERE ended_at <= ?1",
                 vec![Value::Integer(now - OAUTH_ENDED_KEPT_SECS)],
@@ -4315,11 +4660,11 @@ impl AuthStore {
         // An account's records go with the account (`delete_oauth_grants_of`),
         // but an older binary removes accounts without knowing this table, so
         // records of an account that is gone are swept here too.
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_ended
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grant_ended.user)",
-                (),
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grant_ended.\"user\")",
+                vec![],
             )
             .await
             .context("pruning ended oauth grant records of removed accounts")?;
@@ -4356,9 +4701,9 @@ impl AuthStore {
         let idle_cutoff = (now - chrono::Duration::seconds(OAUTH_CLIENT_UNUSED_SECS)).to_rfc3339();
         let unauthorized_cutoff =
             (now - chrono::Duration::seconds(OAUTH_CLIENT_UNAUTHORIZED_SECS)).to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let removed = self
-            .conn
+            .db
             .execute(
                 "DELETE FROM oauth_clients
                  WHERE NOT EXISTS (
@@ -4376,16 +4721,17 @@ impl AuthStore {
         Ok(removed as usize)
     }
 
-    /// How many registrations are stored, for the cap the registration
-    /// endpoint enforces. That one caller is the whole of it; nothing reports
-    /// this number on a settings surface.
+    /// How many registrations are stored. The registration endpoint's cap
+    /// counts inside [`AuthStore::register_oauth_client_within`] instead,
+    /// in the transaction of the insert; nothing reports this number on a
+    /// settings surface.
     pub async fn count_oauth_clients(&self) -> Result<usize> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         // A count this method cannot read fails the call rather than reading
-        // as an empty table: the one caller is the ceiling on registration,
-        // the only unauthenticated write here, and a zero there would admit
-        // the very row the ceiling exists to refuse.
+        // as an empty table, as the cap's own count does: a zero there would
+        // admit the very row the ceiling exists to refuse.
         match self
+            .db
             .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
             .await?
             .map(|row| row.get_value(0))
@@ -4427,14 +4773,16 @@ impl AuthStore {
         let now = chrono::Utc::now();
         let issued_at = now.timestamp();
         let created_at = now.to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
         let mut id = 0;
         let result = async {
             self.require_live_user(&user).await?;
             if self
+                .db
                 .query_first(
                     "SELECT 1 FROM oauth_clients WHERE client_id = ?1",
                     vec![Value::Text(client_id.to_string())],
@@ -4447,12 +4795,12 @@ impl AuthStore {
             // The token columns of `oauth_grants` get inert placeholders: see
             // `OAUTH_PLACEHOLDER_PREFIX`. The real pair goes to
             // `oauth_grant_token` just below.
-            self.conn
-                .execute(
+            id = self
+                .returned_id(
                     "INSERT INTO oauth_grants
-                         (user, client_id, resource, access_hash, access_expires_at,
+                         (\"user\", client_id, resource, access_hash, access_expires_at,
                           refresh_hash, refresh_expires_at, created_at)
-                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7) RETURNING id",
                     vec![
                         Value::Text(user.clone()),
                         Value::Text(client_id.to_string()),
@@ -4468,13 +4816,10 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
-            // Read inside the transaction, still under `self.guard` and on
-            // this connection: see `issue_mcp_token`'s matching comment.
-            id = self.conn.last_insert_rowid();
             self.mint_oauth_token(id, &pair, None, issued_at).await
         }
         .await;
-        self.finish(result).await?;
+        self.db.finish(result).await?;
         Ok(pair.issued(id))
     }
 
@@ -4498,7 +4843,7 @@ impl AuthStore {
         rotated_from: Option<&str>,
         now: i64,
     ) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "INSERT INTO oauth_grant_token
                      (refresh_hash, grant_id, access_hash, access_expires_at,
@@ -4516,7 +4861,7 @@ impl AuthStore {
             )
             .await
             .context("writing an oauth token pair")?;
-        self.conn
+        self.db
             .execute(
                 "UPDATE oauth_grants SET refresh_expires_at = ?2 WHERE id = ?1",
                 vec![
@@ -4526,7 +4871,7 @@ impl AuthStore {
             )
             .await
             .context("restarting an oauth grant's refresh window")?;
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_token
                  WHERE grant_id = ?1 AND rotated_at IS NULL AND refresh_expires_at <= ?2",
@@ -4534,7 +4879,7 @@ impl AuthStore {
             )
             .await
             .context("pruning expired oauth tokens")?;
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_token
                  WHERE grant_id = ?1 AND rotated_at IS NOT NULL AND rotated_at <= ?2",
@@ -4552,6 +4897,7 @@ impl AuthStore {
     /// that cannot be read must not read as room for one more session.
     async fn count_tokens(&self, sql: &str, params: Vec<Value>) -> Result<i64> {
         match self
+            .db
             .query_first(sql, params)
             .await?
             .map(|row| row.get_value(0))
@@ -4649,8 +4995,9 @@ impl AuthStore {
     ) -> Result<RefreshOutcome> {
         let presented = token_hash(refresh_token);
         let pair = TokenPair::new();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .context("refreshing an oauth grant")?;
         // Captured by the block below and read after `finish` commits, the
@@ -4659,11 +5006,12 @@ impl AuthStore {
         let mut outcome = RefreshOutcome::Unknown;
         let result = async {
             let live = self
+                .db
                 .query_first(
                     "SELECT t.grant_id, g.resource
                      FROM oauth_grant_token t
                      JOIN oauth_grants g ON g.id = t.grant_id
-                     JOIN users u ON u.name = g.user
+                     JOIN users u ON u.name = g.\"user\"
                      WHERE t.refresh_hash = ?1 AND t.rotated_at IS NULL
                        AND g.client_id = ?2 AND g.refresh_expires_at > ?3
                        AND t.refresh_expires_at > ?3 AND u.disabled = 0",
@@ -4682,7 +5030,7 @@ impl AuthStore {
                     outcome = RefreshOutcome::WrongTarget;
                     return Ok(());
                 }
-                self.conn
+                self.db
                     .execute(
                         "UPDATE oauth_grant_token SET rotated_at = ?2, access_hash = NULL
                          WHERE refresh_hash = ?1",
@@ -4696,6 +5044,7 @@ impl AuthStore {
                 return Ok(());
             }
             let rotated = self
+                .db
                 .query_first(
                     "SELECT grant_id, rotated_at FROM oauth_grant_token
                      WHERE refresh_hash = ?1 AND rotated_at IS NOT NULL",
@@ -4715,6 +5064,7 @@ impl AuthStore {
             };
             let since_rotation = now - rotated_at;
             let successor_rotated = self
+                .db
                 .query_first(
                     "SELECT 1 FROM oauth_grant_token
                      WHERE rotated_from = ?1 AND rotated_at IS NOT NULL",
@@ -4727,9 +5077,10 @@ impl AuthStore {
             let in_window = (0..OAUTH_REFRESH_GRACE_SECS).contains(&since_rotation);
             if in_window && !successor_rotated {
                 let grant = self
+                    .db
                     .query_first(
                         "SELECT g.client_id, g.resource, g.refresh_expires_at, u.disabled
-                         FROM oauth_grants g JOIN users u ON u.name = g.user
+                         FROM oauth_grants g JOIN users u ON u.name = g.\"user\"
                          WHERE g.id = ?1",
                         vec![Value::Integer(id)],
                     )
@@ -4795,7 +5146,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await?;
+        self.db.finish(result).await?;
         // The lines are emitted after the commit, never inside the
         // transaction body. A rollback - a disk error, a busy timeout against
         // the CLI holding the write lock - must not leave an audit record
@@ -4850,8 +5201,9 @@ impl AuthStore {
         now: i64,
     ) -> Result<bool> {
         let Some(row) = self
+            .db
             .query_first(
-                "SELECT g.user, g.client_id, c.client_name, c.redirect_uris,
+                "SELECT g.\"user\", g.client_id, c.client_name, c.redirect_uris,
                         g.created_at, g.last_used
                  FROM oauth_grants g
                  LEFT JOIN oauth_clients c ON c.client_id = g.client_id
@@ -4867,12 +5219,21 @@ impl AuthStore {
             .first()
             .map(|uri| redirect_host(uri))
             .unwrap_or_default();
-        self.conn
+        self.db
             .execute(
-                "INSERT OR REPLACE INTO oauth_grant_ended
-                     (grant_id, user, client_id, client_name, redirect_host,
+                "INSERT INTO oauth_grant_ended
+                     (grant_id, \"user\", client_id, client_name, redirect_host,
                       created_at, last_used, ended_at, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (grant_id) DO UPDATE SET
+                     \"user\" = excluded.\"user\",
+                     client_id = excluded.client_id,
+                     client_name = excluded.client_name,
+                     redirect_host = excluded.redirect_host,
+                     created_at = excluded.created_at,
+                     last_used = excluded.last_used,
+                     ended_at = excluded.ended_at,
+                     reason = excluded.reason",
                 vec![
                     Value::Integer(id),
                     Value::Text(user.clone()),
@@ -4889,23 +5250,23 @@ impl AuthStore {
             )
             .await
             .context("recording an ended oauth grant")?;
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_token WHERE grant_id = ?1",
                 vec![Value::Integer(id)],
             )
             .await
             .context("deleting an oauth grant's tokens")?;
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grants WHERE id = ?1",
                 vec![Value::Integer(id)],
             )
             .await
             .context("deleting an oauth grant")?;
-        self.conn
+        self.db
             .execute(
-                "DELETE FROM oauth_grant_ended WHERE user = ?1 AND ended_at <= ?2",
+                "DELETE FROM oauth_grant_ended WHERE \"user\" = ?1 AND ended_at <= ?2",
                 vec![
                     Value::Text(user.clone()),
                     Value::Integer(now - OAUTH_ENDED_KEPT_SECS),
@@ -4913,10 +5274,10 @@ impl AuthStore {
             )
             .await
             .context("pruning ended oauth grant records")?;
-        let mut rows = self
-            .conn
+        let rows = self
+            .db
             .query(
-                "SELECT grant_id FROM oauth_grant_ended WHERE user = ?1
+                "SELECT grant_id FROM oauth_grant_ended WHERE \"user\" = ?1
                  ORDER BY ended_at DESC, grant_id DESC",
                 vec![Value::Text(user)],
             )
@@ -4924,11 +5285,7 @@ impl AuthStore {
             .context("reading ended oauth grant records")?;
         let mut surplus = Vec::new();
         let mut seen = 0;
-        while let Some(row) = rows
-            .next()
-            .await
-            .context("reading ended oauth grant records")?
-        {
+        for row in rows {
             seen += 1;
             if seen > OAUTH_ENDED_KEPT_PER_ACCOUNT
                 && let Ok(Value::Integer(old)) = row.get_value(0)
@@ -4936,9 +5293,8 @@ impl AuthStore {
                 surplus.push(old);
             }
         }
-        drop(rows);
         for old in surplus {
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM oauth_grant_ended WHERE grant_id = ?1",
                     vec![Value::Integer(old)],
@@ -4979,22 +5335,23 @@ impl AuthStore {
             return Ok(None);
         }
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "DELETE FROM oauth_grants
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.user)",
-                (),
-            )
-            .await
-            .context("pruning orphaned oauth grants")?;
+        let _guard = self.lock().await;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_OAUTH_GRANTS, vec![])
+                .await
+                .context("pruning orphaned oauth grants")?;
+        }
         let Some(row) = self
+            .db
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED}, g.id
                      FROM oauth_grant_token t
                      JOIN oauth_grants g ON g.id = t.grant_id
-                     JOIN users u ON u.name = g.user
+                     JOIN users u ON u.name = g.\"user\"
                      WHERE t.access_hash = ?1 AND t.access_expires_at > ?2 AND g.resource = ?3"
                 ),
                 vec![
@@ -5012,14 +5369,7 @@ impl AuthStore {
             return Ok(None);
         }
         if let Ok(Value::Integer(id)) = row.get_value(7) {
-            self.conn
-                .execute(
-                    "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
-                    vec![
-                        Value::Integer(id),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
-                    ],
-                )
+            self.stamp_used("oauth_grants", id)
                 .await
                 .context("stamping an oauth grant's last_used")?;
         }
@@ -5041,15 +5391,15 @@ impl AuthStore {
     /// [`AuthStore::list_ended_oauth_grants`].
     pub async fn list_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT g.id, g.client_id, c.client_name, c.redirect_uris,
                         g.created_at, g.last_used, g.refresh_expires_at
                  FROM oauth_grants g
                  LEFT JOIN oauth_clients c ON c.client_id = g.client_id
-                 WHERE g.user = ?1 AND g.refresh_expires_at > ?2
+                 WHERE g.\"user\" = ?1 AND g.refresh_expires_at > ?2
                  ORDER BY g.created_at DESC, g.id DESC",
                 vec![
                     Value::Text(user.clone()),
@@ -5059,11 +5409,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("listing oauth grants for user '{user}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("listing oauth grants for user '{user}'"))?
-        {
+        for row in rows {
             let Ok(Value::Integer(id)) = row.get_value(0) else {
                 continue;
             };
@@ -5109,14 +5455,14 @@ impl AuthStore {
         now: i64,
     ) -> Result<Vec<OauthGrantInfo>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT grant_id, client_id, client_name, redirect_host, created_at,
                         last_used, ended_at, reason
                  FROM oauth_grant_ended
-                 WHERE user = ?1 AND ended_at > ?2
+                 WHERE \"user\" = ?1 AND ended_at > ?2
                  ORDER BY ended_at DESC, grant_id DESC
                  LIMIT ?3",
                 vec![
@@ -5128,11 +5474,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("listing ended oauth grants for user '{user}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("listing ended oauth grants for user '{user}'"))?
-        {
+        for row in rows {
             let (Ok(Value::Integer(id)), Ok(Value::Integer(ended_at))) =
                 (row.get_value(0), row.get_value(6))
             else {
@@ -5169,14 +5511,16 @@ impl AuthStore {
     pub async fn revoke_oauth_grant(&self, user: &str, id: i64) -> Result<bool> {
         let user = normalize_account_name(user)?;
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("revoking an oauth grant for user '{user}'"))?;
         let result = async {
             if self
+                .db
                 .query_first(
-                    "SELECT 1 FROM oauth_grants WHERE id = ?1 AND user = ?2",
+                    "SELECT 1 FROM oauth_grants WHERE id = ?1 AND \"user\" = ?2",
                     vec![Value::Integer(id), Value::Text(user.clone())],
                 )
                 .await?
@@ -5189,6 +5533,7 @@ impl AuthStore {
         }
         .await;
         let changed = self
+            .db
             .finish(result)
             .await
             .with_context(|| format!("revoking an oauth grant for user '{user}'"))?;
@@ -5210,12 +5555,14 @@ impl AuthStore {
     pub async fn revoke_oauth_grant_by_token(&self, token: &str, client_id: &str) -> Result<bool> {
         let hash = token_hash(token);
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .context("revoking an oauth grant by its token")?;
         let result = async {
             let Some(row) = self
+                .db
                 .query_first(
                     "SELECT t.grant_id FROM oauth_grant_token t
                      JOIN oauth_grants g ON g.id = t.grant_id
@@ -5235,6 +5582,7 @@ impl AuthStore {
         }
         .await;
         let changed = self
+            .db
             .finish(result)
             .await
             .context("revoking an oauth grant by its token")?;
@@ -5256,39 +5604,34 @@ impl AuthStore {
     /// nobody left to tell and goes through `delete_oauth_grants_of`.
     async fn end_oauth_grants_of(&self, name: &str, reason: OauthGrantEndReason) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        let mut rows = self
-            .conn
+        let rows = self
+            .db
             .query(
-                "SELECT id FROM oauth_grants WHERE user = ?1 AND refresh_expires_at > ?2",
+                "SELECT id FROM oauth_grants WHERE \"user\" = ?1 AND refresh_expires_at > ?2",
                 vec![Value::Text(name.to_string()), Value::Integer(now)],
             )
             .await
             .with_context(|| format!("reading oauth grants for user '{name}'"))?;
         let mut ids = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("reading oauth grants for user '{name}'"))?
-        {
+        for row in rows {
             if let Ok(Value::Integer(id)) = row.get_value(0) {
                 ids.push(id);
             }
         }
-        drop(rows);
         for id in ids {
             self.end_oauth_grant(id, reason, now).await?;
         }
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_token WHERE grant_id IN
-                     (SELECT id FROM oauth_grants WHERE user = ?1)",
+                     (SELECT id FROM oauth_grants WHERE \"user\" = ?1)",
                 vec![Value::Text(name.to_string())],
             )
             .await
             .with_context(|| format!("removing oauth tokens for user '{name}'"))?;
-        self.conn
+        self.db
             .execute(
-                "DELETE FROM oauth_grants WHERE user = ?1",
+                "DELETE FROM oauth_grants WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -5313,24 +5656,24 @@ impl AuthStore {
     /// ones nobody is connected through go on their own schedule, through
     /// [`AuthStore::prune_oauth_clients`].
     async fn delete_oauth_grants_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM oauth_grant_token WHERE grant_id IN
-                     (SELECT id FROM oauth_grants WHERE user = ?1)",
+                     (SELECT id FROM oauth_grants WHERE \"user\" = ?1)",
                 vec![Value::Text(name.to_string())],
             )
             .await
             .with_context(|| format!("removing oauth tokens for user '{name}'"))?;
-        self.conn
+        self.db
             .execute(
-                "DELETE FROM oauth_grants WHERE user = ?1",
+                "DELETE FROM oauth_grants WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
             .with_context(|| format!("removing oauth grants for user '{name}'"))?;
-        self.conn
+        self.db
             .execute(
-                "DELETE FROM oauth_grant_ended WHERE user = ?1",
+                "DELETE FROM oauth_grant_ended WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -5345,7 +5688,7 @@ impl AuthStore {
     /// answers for the same string the engine keys its domain map on.
     pub async fn domain_visibility(&self, domain: &str) -> Result<Option<DomainAcl>> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.acl_of(&domain).await
     }
 
@@ -5353,6 +5696,7 @@ impl AuthStore {
     /// the methods that already hold both.
     async fn acl_of(&self, domain: &str) -> Result<Option<DomainAcl>> {
         let row = self
+            .db
             .query_first(
                 "SELECT domain, owner FROM domain_acl WHERE domain = ?1",
                 vec![Value::Text(domain.to_string())],
@@ -5447,9 +5791,9 @@ impl AuthStore {
     /// was a row.
     pub async fn take_back_governed_private(&self, domain: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let had = self.acl_of(&domain).await?.is_some();
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM domain_acl WHERE domain = ?1",
                 vec![Value::Text(domain.clone())],
@@ -5472,14 +5816,15 @@ impl AuthStore {
         let domain = normalize_domain(domain)?;
         let owner = normalize_account_name(owner)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("setting the visibility of domain '{domain}'"))?;
         let result = async {
             if !private {
                 self.delete_members_of_domain(&domain).await?;
-                self.conn
+                self.db
                     .execute(
                         "DELETE FROM domain_acl WHERE domain = ?1",
                         vec![Value::Text(domain.clone())],
@@ -5498,14 +5843,14 @@ impl AuthStore {
             // statements inside the transaction that already serializes them,
             // with no dependence on which conflict syntax the embedded
             // database supports.
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM domain_acl WHERE domain = ?1",
                     vec![Value::Text(domain.clone())],
                 )
                 .await
                 .with_context(|| format!("making domain '{domain}' private"))?;
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM domain_member
                      WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
@@ -5517,7 +5862,7 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("making domain '{domain}' private"))?;
-            self.conn
+            self.db
                 .execute(
                     "INSERT INTO domain_acl (domain, visibility, owner, updated_at)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -5533,7 +5878,7 @@ impl AuthStore {
             Ok(VisibilityWrite::Written)
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Retire every visibility and membership record of one domain, for a
@@ -5557,21 +5902,22 @@ impl AuthStore {
     /// until a domain of that name exists again.
     pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
         let result = async {
             let was_private = self.acl_of(&domain).await?.is_some();
             self.delete_members_of_domain(&domain).await?;
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM domain_reflection_grant WHERE domain = ?1",
                     vec![Value::Text(domain.clone())],
                 )
                 .await
                 .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM domain_acl WHERE domain = ?1",
                     vec![Value::Text(domain.clone())],
@@ -5581,7 +5927,7 @@ impl AuthStore {
             Ok(was_private)
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Carry every record of domain `old` over to `new`: its `domain_acl` row,
@@ -5611,9 +5957,9 @@ impl AuthStore {
         if old == new {
             return Ok(());
         }
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let context = || format!("moving the records of domain '{old}' to '{new}'");
-        self.begin_immediate().await.with_context(context)?;
+        self.db.begin_immediate().await.with_context(context)?;
         let names = vec![Value::Text(old.clone()), Value::Text(new.clone())];
         let result = async {
             // The write lists first, and before the early return below: a
@@ -5625,22 +5971,22 @@ impl AuthStore {
             // with it on the primary key.
             let mut holders = Vec::new();
             {
-                let mut rows = self
-                    .conn
+                let rows = self
+                    .db
                     .query(
                         "SELECT account FROM account_write_domain WHERE pattern = ?1",
                         vec![Value::Text(old.clone())],
                     )
                     .await
                     .with_context(context)?;
-                while let Some(row) = rows.next().await.with_context(context)? {
+                for row in rows {
                     if let Some(account) = cell_text(&row, 0) {
                         holders.push(account);
                     }
                 }
             }
             for account in holders {
-                let both = self
+                let both = self.db
                     .query_first(
                         "SELECT 1 FROM account_write_domain WHERE account = ?1 AND pattern = ?2",
                         vec![Value::Text(account.clone()), Value::Text(new.clone())],
@@ -5662,7 +6008,7 @@ impl AuthStore {
                         Value::Text(new.clone()),
                     ]
                 };
-                self.conn.execute(sql, params).await.with_context(context)?;
+                self.db.execute(sql, params).await.with_context(context)?;
             }
             let mut old_has_records = false;
             for sql in [
@@ -5672,7 +6018,7 @@ impl AuthStore {
                 // A shared domain's grants are its only rows here.
                 "SELECT 1 FROM domain_reflection_grant WHERE domain = ?1",
             ] {
-                if self
+                if self.db
                     .query_first(sql, vec![Value::Text(old.clone())])
                     .await
                     .with_context(context)?
@@ -5698,7 +6044,7 @@ impl AuthStore {
                 "UPDATE overlay_grant SET domain = ?2 WHERE domain = ?1",
                 "UPDATE domain_reflection_grant SET domain = ?2 WHERE domain = ?1",
             ] {
-                self.conn
+                self.db
                     .execute(sql, names.clone())
                     .await
                     .with_context(context)?;
@@ -5706,7 +6052,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Hand a private domain to a different owner.
@@ -5727,8 +6073,9 @@ impl AuthStore {
         let domain = normalize_domain(domain)?;
         let new_owner = normalize_account_name(new_owner)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("transferring domain '{domain}'"))?;
         let result = async {
@@ -5739,7 +6086,7 @@ impl AuthStore {
                 ));
             }
             self.require_live_user(&new_owner).await?;
-            self.conn
+            self.db
                 .execute(
                     "UPDATE domain_acl SET owner = ?2, updated_at = ?3 WHERE domain = ?1",
                     vec![
@@ -5750,7 +6097,7 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("transferring domain '{domain}'"))?;
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM domain_member
                      WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
@@ -5765,7 +6112,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Everyone invited to `domain`, by name. The owner is deliberately absent:
@@ -5773,9 +6120,9 @@ impl AuthStore {
     /// from [`AuthStore::domain_visibility`].
     pub async fn domain_members(&self, domain: &str) -> Result<Vec<DomainMember>> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT principal, level, added_by, added_at, reflection FROM domain_member
                  WHERE domain = ?1 AND principal_kind = ?2 ORDER BY principal",
@@ -5787,11 +6134,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("listing the members of domain '{domain}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("listing the members of domain '{domain}'"))?
-        {
+        for row in rows {
             out.push(DomainMember {
                 principal: cell_text(&row, 0).unwrap_or_default(),
                 level: member_level_from_db(&cell_text(&row, 1).unwrap_or_default()),
@@ -5842,8 +6185,9 @@ impl AuthStore {
             bail!("recording a membership needs an actor to record it as");
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
         let result = async {
@@ -5881,7 +6225,7 @@ impl AuthStore {
                     ),
                 ));
             }
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM domain_member
                      WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
@@ -5893,7 +6237,7 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
-            self.conn
+            self.db
                 .execute(
                     "INSERT INTO domain_member
                          (domain, principal_kind, principal, level, reflection, added_by, added_at)
@@ -5913,7 +6257,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Remove one membership. Returns whether a row was deleted, so a caller
@@ -5921,9 +6265,9 @@ impl AuthStore {
     pub async fn remove_domain_member(&self, domain: &str, principal: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
         let principal = normalize_account_name(principal)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "DELETE FROM domain_member
                  WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
@@ -5942,9 +6286,9 @@ impl AuthStore {
     /// clears it back to "as knowledge".
     pub async fn set_reflection_level(&self, name: &str, level: ReflectionLevel) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "UPDATE users SET reflection = ?1 WHERE name = ?2",
                 vec![level.to_db(), Value::Text(name.clone())],
@@ -5966,7 +6310,7 @@ impl AuthStore {
     ) -> Result<ReflectionLevel> {
         let domain = normalize_domain(domain)?;
         let principal = normalize_account_name(principal)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.member_reflection_in_tx(&domain, &principal).await
     }
 
@@ -5979,6 +6323,7 @@ impl AuthStore {
         principal: &str,
     ) -> Result<ReflectionLevel> {
         let row = self
+            .db
             .query_first(
                 "SELECT reflection FROM domain_member
                  WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
@@ -6038,18 +6383,18 @@ impl AuthStore {
         }
         let now = chrono::Utc::now().to_rfc3339();
         let context = || format!("giving '{account}' the Reflection of domain '{domain}'");
-        let _guard = self.guard.lock().await;
-        self.begin_immediate().await.with_context(context)?;
+        let _guard = self.lock().await;
+        self.db.begin_immediate().await.with_context(context)?;
         let result = async {
             self.require_live_user(&account).await?;
-            self.conn
+            self.db
                 .execute(
                     "DELETE FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
                     vec![Value::Text(domain.clone()), Value::Text(account.clone())],
                 )
                 .await
                 .with_context(context)?;
-            self.conn
+            self.db
                 .execute(
                     "INSERT INTO domain_reflection_grant (domain, account, level, added_by, added_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -6066,7 +6411,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Take `account`'s Reflection grant on `domain` away. Answers whether
@@ -6074,9 +6419,9 @@ impl AuthStore {
     pub async fn remove_reflection_grant(&self, domain: &str, account: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
-            .conn
+            .db
             .execute(
                 "DELETE FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
                 vec![Value::Text(domain.clone()), Value::Text(account.clone())],
@@ -6092,9 +6437,9 @@ impl AuthStore {
     pub async fn reflection_grants(&self, domain: &str) -> Result<Vec<ReflectionGrant>> {
         let domain = normalize_domain(domain)?;
         let context = || format!("listing the Reflection collaborators of domain '{domain}'");
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT account, level, added_by, added_at FROM domain_reflection_grant
                  WHERE domain = ?1 ORDER BY account",
@@ -6103,7 +6448,7 @@ impl AuthStore {
             .await
             .with_context(context)?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().await.with_context(context)? {
+        for row in rows {
             let Some(account) = cell_text(&row, 0) else {
                 continue;
             };
@@ -6132,8 +6477,9 @@ impl AuthStore {
     ) -> Result<Option<ReflectionLevel>> {
         let domain = normalize_domain(domain)?;
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let row = self
+            .db
             .query_first(
                 "SELECT level FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
                 vec![Value::Text(domain), Value::Text(account)],
@@ -6151,14 +6497,17 @@ impl AuthStore {
     /// visibility filter: a domain absent from this list is visible to
     /// everyone who may reach the instance at all.
     pub async fn private_domains(&self) -> Result<Vec<DomainAcl>> {
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
-            .query("SELECT domain, owner FROM domain_acl ORDER BY domain", ())
+        let _guard = self.lock().await;
+        let rows = self
+            .db
+            .query(
+                "SELECT domain, owner FROM domain_acl ORDER BY domain",
+                vec![],
+            )
             .await
             .context("listing the private domains")?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().await.context("listing the private domains")? {
+        for row in rows {
             // A row whose name cannot be read fails the whole call rather than
             // being skipped or defaulted. This list is the *input* to the
             // visibility filter, so dropping an entry (or defaulting it to
@@ -6187,9 +6536,9 @@ impl AuthStore {
     /// reads ownership from the acl rows it already has.
     pub async fn memberships_of(&self, user: &str) -> Result<Vec<(String, MemberLevel)>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
-        let mut rows = self
-            .conn
+        let _guard = self.lock().await;
+        let rows = self
+            .db
             .query(
                 "SELECT domain, level FROM domain_member
                  WHERE principal_kind = ?1 AND principal = ?2 ORDER BY domain",
@@ -6201,11 +6550,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("listing the memberships of '{user}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("listing the memberships of '{user}'"))?
-        {
+        for row in rows {
             let Some(domain) = cell_text(&row, 0) else {
                 continue;
             };
@@ -6226,7 +6571,7 @@ impl AuthStore {
     /// A list only lowers rights; [`crate::scope::DomainAccess`] applies it.
     pub async fn write_list(&self, account: &str) -> Result<Option<Vec<String>>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.write_list_of(&account).await
     }
 
@@ -6250,15 +6595,16 @@ impl AuthStore {
                 "a write list needs at least one entry; to remove the list of '{account}', clear it"
             );
         }
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("setting the write list of '{account}'"))?;
         let result = async {
             self.require_user_row(&account).await?;
             self.delete_write_list_of(&account).await?;
             for pattern in &entries {
-                self.conn
+                self.db
                     .execute(
                         "INSERT INTO account_write_domain (account, pattern) VALUES (?1, ?2)",
                         vec![Value::Text(account.clone()), Value::Text(pattern.clone())],
@@ -6269,7 +6615,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// Remove `account`'s write list, so it writes wherever its role and
@@ -6277,8 +6623,9 @@ impl AuthStore {
     /// list is fine.
     pub async fn clear_write_list(&self, account: &str) -> Result<()> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
-        self.begin_immediate()
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
             .await
             .with_context(|| format!("clearing the write list of '{account}'"))?;
         let result = async {
@@ -6286,13 +6633,13 @@ impl AuthStore {
             self.delete_write_list_of(&account).await
         }
         .await;
-        self.finish(result).await
+        self.db.finish(result).await
     }
 
     /// [`AuthStore::write_list`] without the lock or the folding.
     async fn write_list_of(&self, account: &str) -> Result<Option<Vec<String>>> {
-        let mut rows = self
-            .conn
+        let rows = self
+            .db
             .query(
                 "SELECT pattern FROM account_write_domain WHERE account = ?1 ORDER BY pattern",
                 vec![Value::Text(account.to_string())],
@@ -6300,11 +6647,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("reading the write list of '{account}'"))?;
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .with_context(|| format!("reading the write list of '{account}'"))?
-        {
+        for row in rows {
             if let Some(pattern) = cell_text(&row, 0) {
                 out.push(pattern);
             }
@@ -6316,7 +6659,7 @@ impl AuthStore {
     /// under the name opens nobody's draft. What `name` gave to others ends with
     /// each of its drafts ([`AuthStore::end_overlay_grants`]).
     async fn delete_overlay_grants_held_by(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM overlay_grant WHERE grantee = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6329,7 +6672,7 @@ impl AuthStore {
     /// Delete every write-list row of one account. Inside the caller's
     /// transaction; no lock taken.
     async fn delete_write_list_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM account_write_domain WHERE account = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6343,6 +6686,7 @@ impl AuthStore {
     /// caller's transaction, so the check and the write see one table.
     async fn require_user_row(&self, name: &str) -> Result<()> {
         if self
+            .db
             .query_first(
                 "SELECT 1 FROM users WHERE name = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6376,7 +6720,7 @@ impl AuthStore {
     /// and every automatic answer (the removing admin, the senior manager)
     /// hands somebody a domain nobody gave them.
     async fn disown_domains_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "UPDATE domain_acl SET owner = '' WHERE owner = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6395,6 +6739,7 @@ impl AuthStore {
     /// surprise the day the account is re-enabled.
     async fn require_live_user(&self, name: &str) -> Result<()> {
         let row = self
+            .db
             .query_first(
                 "SELECT disabled FROM users WHERE name = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6427,7 +6772,7 @@ impl AuthStore {
     /// has no membership of any kind, so this must sweep a future group row
     /// too. Not an omission - do not "fix" it.
     async fn delete_members_of_domain(&self, domain: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM domain_member WHERE domain = ?1",
                 vec![Value::Text(domain.to_string())],
@@ -6453,7 +6798,7 @@ impl AuthStore {
     ///
     /// Ownership is handled beside this, by [`AuthStore::disown_domains_of`].
     async fn delete_memberships_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM domain_member WHERE principal_kind = ?1 AND principal = ?2",
                 vec![
@@ -6470,7 +6815,7 @@ impl AuthStore {
     /// [`AuthStore::delete_memberships_of`] drops its membership rows: the
     /// next account to take the name must not inherit them.
     async fn delete_reflection_grants_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM domain_reflection_grant WHERE account = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6499,8 +6844,9 @@ impl AuthStore {
             Value::Text(subject.to_string()),
         ];
         if let Some(row) = self
+            .db
             .query_first(
-                "SELECT user FROM identity_link WHERE issuer = ?1 AND subject = ?2",
+                "SELECT \"user\" FROM identity_link WHERE issuer = ?1 AND subject = ?2",
                 pair.clone(),
             )
             .await?
@@ -6514,8 +6860,9 @@ impl AuthStore {
             ));
         }
         if self
+            .db
             .query_first(
-                "SELECT subject FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                "SELECT subject FROM identity_link WHERE issuer = ?1 AND \"user\" = ?2",
                 vec![
                     Value::Text(issuer.to_string()),
                     Value::Text(user.to_string()),
@@ -6532,9 +6879,9 @@ impl AuthStore {
                 ),
             ));
         }
-        self.conn
+        self.db
             .execute(
-                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
+                "INSERT INTO identity_link (issuer, subject, \"user\", linked_at, linked_by)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 vec![
                     Value::Text(issuer.to_string()),
@@ -6560,6 +6907,7 @@ impl AuthStore {
                 format!("{base}-{attempt}")
             };
             if self
+                .db
                 .query_first(
                     "SELECT 1 FROM users WHERE name = ?1",
                     vec![Value::Text(candidate.clone())],
@@ -6577,8 +6925,9 @@ impl AuthStore {
     /// inside a transaction.
     async fn link_at(&self, issuer: &str, user: &str) -> Result<bool> {
         Ok(self
+            .db
             .query_first(
-                "SELECT 1 FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                "SELECT 1 FROM identity_link WHERE issuer = ?1 AND \"user\" = ?2",
                 vec![
                     Value::Text(issuer.to_string()),
                     Value::Text(user.to_string()),
@@ -6592,8 +6941,9 @@ impl AuthStore {
     /// lock and are inside a transaction.
     async fn link_count(&self, user: &str) -> Result<i64> {
         let row = self
+            .db
             .query_first(
-                "SELECT COUNT(*) FROM identity_link WHERE user = ?1",
+                "SELECT COUNT(*) FROM identity_link WHERE \"user\" = ?1",
                 vec![Value::Text(user.to_string())],
             )
             .await?;
@@ -6610,6 +6960,7 @@ impl AuthStore {
     /// question needs, so no caller can grow a habit of holding one.
     async fn password_present(&self, name: &str) -> Result<bool> {
         let row = self
+            .db
             .query_first(
                 "SELECT pass_hash IS NOT NULL AND pass_hash <> '' FROM users WHERE name = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6623,7 +6974,7 @@ impl AuthStore {
 
     /// Drop the GitHub link of one account, inside the removal transaction.
     async fn delete_github_link_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
                 "DELETE FROM github_link WHERE account = ?1",
                 vec![Value::Text(name.to_string())],
@@ -6637,9 +6988,9 @@ impl AuthStore {
     /// transaction: a link that outlived its account would hand the next
     /// account to claim the name somebody else's sign-on.
     async fn delete_identity_links_of(&self, name: &str) -> Result<()> {
-        self.conn
+        self.db
             .execute(
-                "DELETE FROM identity_link WHERE user = ?1",
+                "DELETE FROM identity_link WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -6656,77 +7007,62 @@ impl AuthStore {
     /// The follow-up existence probe only picks between the two messages -
     /// nothing was written either way - so it does not need to share the
     /// statement's transaction.
+    ///
+    /// On Postgres the statement runs under the write lock: read committed
+    /// lets two guarded edits of two different admins each see the other
+    /// still there, where Turso's single writer decides them one at a time.
     async fn update_guarded(&self, sql: &str, name: &str, value: Value, verb: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
-        let changed = self
-            .conn
-            .execute(sql, vec![Value::Text(name.clone()), value])
-            .await
-            .with_context(|| format!("updating user '{name}'"))?;
-        if changed == 0 {
-            let exists = self
-                .query_first(
-                    "SELECT 1 FROM users WHERE name = ?1",
-                    vec![Value::Text(name.clone())],
-                )
-                .await?;
-            if exists.is_some() {
-                return Err(last_admin_error(verb, &name));
-            }
-            bail!("no such user: '{name}'");
+        let _guard = self.lock().await;
+        let pg = self.db.is_postgres();
+        if pg {
+            self.db
+                .begin_immediate()
+                .await
+                .with_context(|| format!("updating user '{name}'"))?;
         }
-        Ok(())
-    }
-
-    /// Open a write transaction that takes the write lock immediately rather
-    /// than on first write. Deferred would let two processes both start, both
-    /// read, and only then discover they conflict; immediate makes the two
-    /// multi-statement operations here serialize cleanly, which is the whole
-    /// point of using one.
-    async fn begin_immediate(&self) -> Result<()> {
-        self.conn
-            .execute("BEGIN IMMEDIATE", ())
-            .await
-            .context("opening an auth database transaction")?;
-        Ok(())
-    }
-
-    /// Commit when the body succeeded, roll back when it did not. The rollback
-    /// is best-effort: the body's error is what the caller needs to see, and
-    /// an abandoned transaction is released when the connection drops anyway.
-    async fn finish<T>(&self, result: Result<T>) -> Result<T> {
-        match result {
-            Ok(value) => {
-                self.conn
-                    .execute("COMMIT", ())
-                    .await
-                    .context("committing an auth database transaction")?;
-                Ok(value)
+        let result = async {
+            let changed = self
+                .db
+                .execute(sql, vec![Value::Text(name.clone()), value])
+                .await
+                .with_context(|| format!("updating user '{name}'"))?;
+            if changed == 0 {
+                let exists = self
+                    .db
+                    .query_first(
+                        "SELECT 1 FROM users WHERE name = ?1",
+                        vec![Value::Text(name.clone())],
+                    )
+                    .await?;
+                if exists.is_some() {
+                    return Err(last_admin_error(verb, &name));
+                }
+                bail!("no such user: '{name}'");
             }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                Err(e)
-            }
+            Ok(())
+        }
+        .await;
+        if pg {
+            self.db.finish(result).await
+        } else {
+            result
         }
     }
 
-    /// First row of a query, draining the rest so the statement finishes
-    /// instead of rolling back when the cursor drops.
-    async fn query_first(&self, sql: &str, params: Vec<Value>) -> Result<Option<Row>> {
-        let mut rows = self
-            .conn
-            .query(sql, params)
-            .await
-            .context("querying the auth database")?;
-        let first = rows.next().await.context("querying the auth database")?;
-        while rows
-            .next()
-            .await
-            .context("querying the auth database")?
-            .is_some()
-        {}
-        Ok(first)
+    /// Run an `INSERT ... RETURNING id` and give back the new row's id. The id
+    /// comes from the statement itself, so it is the right one on any
+    /// connection and inside the caller's transaction, with no second read.
+    async fn returned_id(&self, sql: &str, params: Vec<Value>) -> Result<i64> {
+        match self
+            .db
+            .query_first(sql, params)
+            .await?
+            .map(|r| r.get_value(0))
+        {
+            Some(Ok(Value::Integer(id))) => Ok(id),
+            _ => bail!("the insert returned no id"),
+        }
     }
 }
 
@@ -6752,7 +7088,7 @@ async fn ensure_column(conn: &Connection, table: &str, column_def: &str) -> Resu
 }
 
 /// Decode the [`USER_COLUMNS`] prefix of a row.
-fn user_from_row(row: &Row) -> User {
+fn user_from_row(row: &AuthRow) -> User {
     User {
         name: cell_text(row, 0).unwrap_or_default(),
         display: cell_text(row, 1).unwrap_or_default(),
@@ -6767,7 +7103,7 @@ fn user_from_row(row: &Row) -> User {
 /// Decode one `overlay_grant` row, in the column order every query above
 /// selects. One decoder rather than four, so a column added later cannot be
 /// read in two different orders.
-fn grant_from_row(row: &Row) -> OverlayGrant {
+fn grant_from_row(row: &AuthRow) -> OverlayGrant {
     OverlayGrant {
         id: match row.get_value(0) {
             Ok(Value::Integer(id)) => id,
@@ -6783,7 +7119,7 @@ fn grant_from_row(row: &Row) -> OverlayGrant {
     }
 }
 
-fn cell_text(row: &Row, idx: usize) -> Option<String> {
+fn cell_text(row: &AuthRow, idx: usize) -> Option<String> {
     match row.get_value(idx) {
         Ok(Value::Text(s)) => Some(s),
         _ => None,
@@ -6866,6 +7202,14 @@ fn decode_redirect_uris(encoded: Option<&str>) -> Vec<String> {
     encoded
         .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
         .unwrap_or_default()
+}
+
+/// The stamp older than which Postgres writes `last_seen_at` or
+/// `last_used` again: [`STAMP_THRESHOLD_SECS`] before `now`, in the same
+/// RFC 3339 UTC form the stamps are written in, so the text comparison is a
+/// time comparison.
+fn stamp_cutoff(now: chrono::DateTime<chrono::Utc>) -> String {
+    (now - chrono::Duration::seconds(STAMP_THRESHOLD_SECS)).to_rfc3339()
 }
 
 /// A unix timestamp column as the RFC 3339 string a person reads. The expiry
@@ -6963,6518 +7307,4 @@ async fn verify_hash(hash: String, password: String) -> Result<bool> {
     })
     .await
     .context("the password verification task failed")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Whether [`open_database`] is expected to reach multiprocess WAL on the
-    /// platform these tests are running on, rather than falling back to a
-    /// legacy open. Observable as the `web-auth.db-tshm` coordination file
-    /// beside the database, which only the multiprocess open creates.
-    ///
-    /// Stated once here, with its two upstream conditions, so no assertion has
-    /// to carry a `cfg` of its own:
-    ///
-    /// * turso_core's `host_shared_wal` cfg, which its `build.rs` sets to
-    ///   `all(any(unix, target_os = "windows"), target_pointer_width = "64")`.
-    ///   Where it is off the flag is a documented no-op and legacy behavior
-    ///   stays, so a 32-bit target never gets the coordination file.
-    /// * an IO backend whose `supports_shared_wal_coordination` is true
-    ///   (turso_core 0.7.2 and 0.8.1 `io/mod.rs`, where the trait default is `false`).
-    ///   The unix and io_uring backends override it to `true`; the default
-    ///   Windows backend, `WindowsIO`, does not, and only `WindowsIOCP`,
-    ///   compiled only under the off-by-default `experimental_win_iocp` cargo
-    ///   feature, does. So a Windows open takes the fallback.
-    ///
-    /// The day either changes upstream, whatever reads this goes red rather
-    /// than quietly stale, which is the point of asserting the mode at all.
-    const MULTIPROCESS_WAL_EXPECTED: bool = cfg!(unix) && cfg!(target_pointer_width = "64");
-
-    async fn store() -> (tempfile::TempDir, AuthStore) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        (dir, store)
-    }
-
-    /// A GitHub delivery id is new once: the second time within a day it is
-    /// a replay.
-    #[tokio::test]
-    async fn a_delivery_is_remembered_once() {
-        let (_dir, store) = store().await;
-        assert!(store.remember_delivery("d-1").await.unwrap());
-        assert!(!store.remember_delivery("d-1").await.unwrap());
-        assert!(store.remember_delivery("d-2").await.unwrap());
-    }
-
-    /// A delivery older than a day is pruned, so its id counts as new again;
-    /// one younger than a day stays.
-    #[tokio::test]
-    async fn a_delivery_older_than_a_day_is_forgotten() {
-        let (_dir, store) = store().await;
-        let now = chrono::Utc::now().timestamp();
-        assert!(
-            store
-                .remember_delivery_at("old", now - 86_401)
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .remember_delivery_at("young", now - 86_399)
-                .await
-                .unwrap()
-        );
-        assert!(store.remember_delivery_at("old", now).await.unwrap());
-        assert!(!store.remember_delivery_at("young", now).await.unwrap());
-    }
-
-    /// A delivery whose handling failed is forgotten, so GitHub's redelivery
-    /// is handled.
-    #[tokio::test]
-    async fn a_forgotten_delivery_is_new_again() {
-        let (_dir, store) = store().await;
-        assert!(store.remember_delivery("d-1").await.unwrap());
-        store.forget_delivery("d-1").await.unwrap();
-        assert!(store.remember_delivery("d-1").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn password_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .verify_password("ada", "correct horse")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .verify_password("ada", "wrong")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// The brief mandates argon2id specifically, and `Argon2::default()` is
-    /// what supplies it, so pin the algorithm the PHC string records. The cost
-    /// parameters are deliberately not pinned: those are meant to track the
-    /// crate's recommendation, not a number frozen here.
-    #[tokio::test]
-    async fn passwords_are_stored_as_argon2id_phc_strings() {
-        let hash = hash_password("hunter2").await.unwrap();
-        assert!(
-            hash.starts_with("$argon2id$"),
-            "expected an argon2id PHC string, got {hash}"
-        );
-        assert!(
-            verify_hash(hash.clone(), "hunter2".to_string())
-                .await
-                .unwrap()
-        );
-        assert!(!verify_hash(hash, "other".to_string()).await.unwrap());
-    }
-
-    /// A hash written by argon2 0.5.3 still verifies after the 0.6 bump. Every
-    /// account provisioned before the upgrade carries one of these, so this is
-    /// the test that says an upgrade is not a mass password reset. Captured
-    /// verbatim from argon2 0.5.3 with `Argon2::default()` on 2026-09-14; the
-    /// password it was written for is beside it, because a hash without its
-    /// password pins nothing.
-    #[tokio::test]
-    async fn a_hash_written_under_argon2_0_5_still_verifies() {
-        const PASSWORD: &str = "correct horse battery staple";
-        const HASH_0_5: &str = "$argon2id$v=19$m=19456,t=2,p=1$lU1KHTS8csu8CtBAN/g/Zw$gq+EDJ0qxuAHNNk1oxZGDP88YjooUWCCp14VWhB+b30";
-
-        assert!(
-            verify_hash(HASH_0_5.to_string(), PASSWORD.to_string())
-                .await
-                .unwrap(),
-            "the stored parameters travel in the PHC string, so the hash verifies whatever this \
-             crate's current defaults are"
-        );
-        assert!(
-            !verify_hash(HASH_0_5.to_string(), "wrong".to_string())
-                .await
-                .unwrap(),
-            "and it still refuses the wrong password"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_same_password_hashes_differently_each_time() {
-        let a = hash_password("pw").await.unwrap();
-        let b = hash_password("pw").await.unwrap();
-        assert_ne!(a, b, "every hash carries its own random salt");
-    }
-
-    #[tokio::test]
-    async fn a_corrupt_hash_fails_closed() {
-        assert!(
-            !verify_hash("not a phc string".to_string(), "pw".to_string())
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_user_never_verifies() {
-        let (_dir, store) = store().await;
-        assert!(
-            store
-                .verify_password("nobody", "pw")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn disabled_user_never_verifies() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        store.set_disabled("ada", true).await.unwrap();
-        assert!(store.verify_password("ada", "pw").await.unwrap().is_none());
-        store.set_disabled("ada", false).await.unwrap();
-        assert!(store.verify_password("ada", "pw").await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn session_create_lookup_and_expiry() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", Some("ada@example.com"), Role::Editor, "pw")
-            .await
-            .unwrap();
-
-        let live = store.create_session("ada", 3600).await.unwrap();
-        assert_eq!(live.token.len(), 64);
-        assert_eq!(live.csrf.len(), 64);
-        assert_ne!(live.token, live.csrf);
-        let (user, csrf) = store.session_user(&live.token).await.unwrap().unwrap();
-        assert_eq!(user.name, "ada");
-        assert_eq!(user.email.as_deref(), Some("ada@example.com"));
-        assert_eq!(user.role, Role::Editor);
-        assert_eq!(csrf, live.csrf);
-
-        let expired = store.create_session("ada", -1).await.unwrap();
-        assert!(store.session_user(&expired.token).await.unwrap().is_none());
-
-        assert!(store.session_user("not-a-token").await.unwrap().is_none());
-        // The live session survived the expired one's prune.
-        assert!(store.session_user(&live.token).await.unwrap().is_some());
-    }
-
-    /// The quiet lookup answers what `session_user` answers and writes
-    /// nothing. Catches a lookup that stamped `last_seen_at` (every open tab
-    /// would read as a fresh sighting) or pruned (a write per check), and
-    /// one that let an expired session or a disabled account through. The
-    /// account is disabled under its session row here: `set_disabled`
-    /// deletes the sessions with it, so only a row an older build left
-    /// behind reaches the filter, and the filter is what keeps it out.
-    #[tokio::test]
-    async fn the_quiet_session_lookup_reads_without_writing() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let live = store.create_session("ada", 3600).await.unwrap();
-        let expired = store.create_session("ada", -1).await.unwrap();
-        let seen = store.user("ada").await.unwrap().unwrap().last_seen;
-        let user = store
-            .session_user_quiet(&live.token)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((user.name.as_str(), user.role), ("ada", Role::Editor));
-        assert!(
-            store
-                .session_user_quiet(&expired.token)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .session_user_quiet("not-a-token")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store.user("ada").await.unwrap().unwrap().last_seen,
-            seen,
-            "not stamped"
-        );
-        assert_eq!(
-            store.session_count().await.unwrap(),
-            2,
-            "the expired row was not pruned"
-        );
-        store.set_role("ada", Role::Viewer).await.unwrap();
-        let user = store
-            .session_user_quiet(&live.token)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(user.role, Role::Viewer, "the stored role, read now");
-        disable_keeping_sessions(&store, "ada").await;
-        assert!(
-            store
-                .session_user_quiet(&live.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "a disabled account's surviving session row answers none"
-        );
-    }
-
-    /// Flag `name` disabled and leave its session rows alone, the state a
-    /// file written before disabling revoked sessions can hold.
-    async fn disable_keeping_sessions(store: &AuthStore, name: &str) {
-        let _guard = store.guard.lock().await;
-        store
-            .conn
-            .execute(
-                "UPDATE users SET disabled = 1 WHERE name = ?1",
-                vec![Value::Text(name.to_string())],
-            )
-            .await
-            .unwrap();
-    }
-
-    /// `ensure_session` issues at most one session per account: the first call
-    /// creates, every later one reuses, and only an account with nothing live
-    /// gets a second row. This is what keeps `/auth/me` from adding a session
-    /// per probe for a trusted-header client that keeps no cookie.
-    #[tokio::test]
-    async fn ensure_session_reuses_a_live_session_rather_than_adding_one() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        assert_eq!(store.session_count().await.unwrap(), 0);
-        assert!(store.newest_session_csrf("ada").await.unwrap().is_none());
-
-        let SessionMint::Created(first) = store.ensure_session("ada", 3600).await.unwrap() else {
-            panic!("the first call has nothing to reuse, so it creates");
-        };
-        assert_eq!(store.session_count().await.unwrap(), 1);
-
-        // Ten more probes, all reusing: the row count does not move and the
-        // token does not change, which is what keeps a second tab working.
-        for _ in 0..10 {
-            let mint = store.ensure_session("AdA", 3600).await.unwrap();
-            assert!(
-                matches!(mint, SessionMint::Reused { .. }),
-                "a live session must be reused, not duplicated"
-            );
-            assert_eq!(mint.csrf(), first.csrf);
-        }
-        assert_eq!(store.session_count().await.unwrap(), 1);
-        assert_eq!(
-            store.newest_session_csrf("ada").await.unwrap().as_deref(),
-            Some(first.csrf.as_str())
-        );
-        // The created session is still the one the cookie resolves to.
-        let (_, csrf) = store.session_user(&first.token).await.unwrap().unwrap();
-        assert_eq!(csrf, first.csrf);
-
-        // An expired session is not live, so the next probe issues a fresh one
-        // and takes the dead row with it. `session_user` is the only other
-        // pruner and a cookieless probe never reaches it, so without this an
-        // account whose session lapsed would leave a row behind every time.
-        store.delete_session(&first.token).await.unwrap();
-        store.create_session("ada", -1).await.unwrap();
-        assert_eq!(store.session_count().await.unwrap(), 1, "the expired row");
-        assert!(store.newest_session_csrf("ada").await.unwrap().is_none());
-        let SessionMint::Created(second) = store.ensure_session("ada", 3600).await.unwrap() else {
-            panic!("nothing live is left to reuse, so this creates");
-        };
-        assert_ne!(second.csrf, first.csrf);
-        assert_eq!(
-            store.session_count().await.unwrap(),
-            1,
-            "the expired row was pruned rather than left beside the new one"
-        );
-
-        // Another account's live session is never handed over.
-        store
-            .add_user("bob", "Bob", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        assert!(store.newest_session_csrf("bob").await.unwrap().is_none());
-        let SessionMint::Created(bobs) = store.ensure_session("bob", 3600).await.unwrap() else {
-            panic!("bob holds nothing, so this creates");
-        };
-        assert_ne!(bobs.csrf, second.csrf);
-
-        // An account nobody created has no session to ensure.
-        assert!(store.ensure_session("ghost", 3600).await.is_err());
-    }
-
-    /// Concurrent probes, which is the two-tabs-at-once case: the check and the
-    /// insert are one transaction, so exactly one session is created however
-    /// many arrive together, and every caller is handed the same token. Without
-    /// the transaction each tab would get its own token and only the one whose
-    /// `Set-Cookie` landed last would be able to write.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_probes_settle_on_one_session() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let store = std::sync::Arc::new(store);
-
-        let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let store = store.clone();
-            tasks.push(tokio::spawn(async move {
-                store.ensure_session("ada", 3600).await.unwrap()
-            }));
-        }
-        let mints: Vec<SessionMint> = futures::future::join_all(tasks)
-            .await
-            .into_iter()
-            .map(|t| t.unwrap())
-            .collect();
-
-        assert_eq!(
-            store.session_count().await.unwrap(),
-            1,
-            "one session however many probes raced for it"
-        );
-        let created = mints
-            .iter()
-            .filter(|m| matches!(m, SessionMint::Created(_)))
-            .count();
-        assert_eq!(created, 1, "exactly one caller created it");
-        let token = mints[0].csrf();
-        for mint in &mints {
-            assert_eq!(mint.csrf(), token, "every tab was handed the same token");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_disabled_user_loses_a_live_session() {
-        let (_dir, store) = store().await;
-        // Editor rather than admin: the role is incidental here, and the last
-        // enabled admin cannot be disabled (see [`NOT_LAST_ADMIN`]).
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let s = store.create_session("ada", 3600).await.unwrap();
-        store.set_disabled("ada", true).await.unwrap();
-        assert!(store.session_user(&s.token).await.unwrap().is_none());
-    }
-
-    /// Disabling is a revocation, not a flag over the session rows: re-enabling
-    /// the account must not hand back the cookies it held before. Otherwise
-    /// disabling a compromised account and enabling it again once the password
-    /// was changed would restore the intruder's session.
-    #[tokio::test]
-    async fn re_enabling_does_not_resurrect_the_sessions_disabling_took() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let s = store.create_session("ada", 3600).await.unwrap();
-        store.set_disabled("ada", true).await.unwrap();
-        store.set_disabled("ada", false).await.unwrap();
-        assert!(
-            store.session_user(&s.token).await.unwrap().is_none(),
-            "the session was deleted, not merely hidden while the flag was set"
-        );
-        // The account itself is back, and a fresh session works.
-        let fresh = store.create_session("ada", 3600).await.unwrap();
-        assert!(store.session_user(&fresh.token).await.unwrap().is_some());
-    }
-
-    /// A password reset evicts whoever was signed in under the old one: a
-    /// session never presents a password again, so without this the holder of a
-    /// cookie minted before the reset keeps the account.
-    #[tokio::test]
-    async fn changing_a_password_revokes_the_sessions_it_issued() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let before = store.create_session("ada", 3600).await.unwrap();
-        store.set_password("ada", "new pw").await.unwrap();
-        assert!(
-            store.session_user(&before.token).await.unwrap().is_none(),
-            "the cookie from before the reset is dead"
-        );
-        assert!(
-            store
-                .verify_password("ada", "new pw")
-                .await
-                .unwrap()
-                .is_some(),
-            "and the new password logs in"
-        );
-        let after = store.create_session("ada", 3600).await.unwrap();
-        assert!(store.session_user(&after.token).await.unwrap().is_some());
-    }
-
-    /// A refused edit revokes nothing: the transaction rolls back with the
-    /// sessions in it, the same property `a_refused_removal_keeps_the_admins_sessions`
-    /// pins for a removal.
-    #[tokio::test]
-    async fn a_refused_edit_leaves_the_sessions_alone() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        let live = store.create_session("ada", 3600).await.unwrap();
-        assert!(
-            store.set_disabled("ada", true).await.is_err(),
-            "the last enabled admin cannot be disabled"
-        );
-        assert!(
-            store.session_user(&live.token).await.unwrap().is_some(),
-            "the rolled-back disabling must leave the live session in place"
-        );
-        assert!(store.set_password("ghost", "new pw").await.is_err());
-        assert!(store.session_user(&live.token).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn the_plaintext_token_is_not_in_the_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        let store = AuthStore::open(&path).await.unwrap();
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "hunter2")
-            .await
-            .unwrap();
-        let s = store.create_session("ada", 3600).await.unwrap();
-        let stored = store
-            .query_first(
-                "SELECT token_hash FROM sessions WHERE token_hash = ?1",
-                vec![Value::Text(token_hash(&s.token))],
-            )
-            .await
-            .unwrap();
-        assert!(stored.is_some(), "the session is stored by its hash");
-
-        // Read the main database *and* its sidecars. A freshly written row
-        // lives in `-wal` until a checkpoint moves it, so scanning only
-        // `web-auth.db` would pass without proving anything.
-        let mut haystack = String::new();
-        let mut files_read = 0;
-        for suffix in ["", "-wal", "-shm"] {
-            let mut p = path.as_os_str().to_os_string();
-            p.push(suffix);
-            if let Ok(bytes) = std::fs::read(std::path::PathBuf::from(p)) {
-                files_read += 1;
-                haystack.push_str(&String::from_utf8_lossy(&bytes));
-            }
-        }
-        assert!(files_read > 0, "at least the main database file must exist");
-        // The hash is what proves the sweep can actually see session bytes; if
-        // this fails the search covered no live data and the assertions below
-        // would be vacuous.
-        assert!(
-            haystack.contains(&token_hash(&s.token)),
-            "the sweep must reach the bytes the session was written into"
-        );
-        assert!(
-            !haystack.contains(&s.token),
-            "the raw token is never stored"
-        );
-        assert!(
-            !haystack.contains("hunter2"),
-            "the password is never stored"
-        );
-    }
-
-    /// The resurrection bug: a session row that outlived its account is
-    /// inherited by the next account to claim the freed name.
-    #[tokio::test]
-    async fn a_readded_name_does_not_inherit_the_old_holders_session() {
-        let (_dir, store) = store().await;
-        // Editor rather than admin: the role is incidental, and the last
-        // enabled admin cannot be removed (see [`NOT_LAST_ADMIN`]).
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let old = store.create_session("ada", 3600).await.unwrap();
-        store.remove_user("ada").await.unwrap();
-        store
-            .add_user("ada", "Ada The Second", None, Role::Viewer, "pw2")
-            .await
-            .unwrap();
-        assert!(
-            store.session_user(&old.token).await.unwrap().is_none(),
-            "the previous holder's token must not resolve to the new account"
-        );
-    }
-
-    /// A session row left behind by an older build (or any other route) must
-    /// not become live again when the name is re-registered.
-    #[tokio::test]
-    async fn an_orphaned_session_row_is_swept_rather_than_inherited() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        let old = store.create_session("ada", 3600).await.unwrap();
-        // Delete only the user row, exactly what the pre-fix ordering could
-        // leave behind if it crashed between its two statements.
-        store
-            .conn
-            .execute(
-                "DELETE FROM users WHERE name = ?1",
-                vec![Value::Text("ada".to_string())],
-            )
-            .await
-            .unwrap();
-        assert!(store.session_user(&old.token).await.unwrap().is_none());
-        store
-            .add_user("ada", "Ada The Second", None, Role::Viewer, "pw2")
-            .await
-            .unwrap();
-        assert!(
-            store.session_user(&old.token).await.unwrap().is_none(),
-            "the orphan must have been swept, not left dormant"
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_user_reports_a_missing_account_without_touching_anything() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        let live = store.create_session("ada", 3600).await.unwrap();
-        assert!(store.remove_user("ghost").await.is_err());
-        // The rollback left the unrelated account and its session intact.
-        assert!(store.session_user(&live.token).await.unwrap().is_some());
-        assert_eq!(store.list_users().await.unwrap().len(), 1);
-    }
-
-    /// The display name is editable, and clearing it falls back to the login
-    /// name: "optional" means a client may always unset it, never that a row
-    /// goes nameless.
-    #[tokio::test]
-    async fn display_names_are_editable_and_clearing_resets_to_the_login_name() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-
-        store
-            .set_display("ada", Some("Ada Lovelace"))
-            .await
-            .unwrap();
-        assert_eq!(store.list_users().await.unwrap()[0].display, "Ada Lovelace");
-
-        store.set_display("ADA", None).await.unwrap();
-        assert_eq!(store.list_users().await.unwrap()[0].display, "ada");
-
-        store.set_display("ada", Some("   ")).await.unwrap();
-        assert_eq!(
-            store.list_users().await.unwrap()[0].display,
-            "ada",
-            "blank is a clear, not a display name of spaces"
-        );
-
-        assert!(store.set_display("ghost", Some("Ghost")).await.is_err());
-    }
-
-    /// Two `AuthStore` handles on one file see each other's writes as they
-    /// happen, in the order the `crystalline users` CLI and the daemon do it.
-    ///
-    /// **Same process only, and deliberately so.** These two handles are not
-    /// two processes and cannot stand in for them: turso keeps a process-wide
-    /// registry of open databases keyed by file identity
-    /// (`Database::lookup_in_registry`), so the second `open` here is handed
-    /// the first one's `Database` back and never opens the file a second time.
-    /// That makes this a test of statement ordering and visibility through one
-    /// engine, which is worth having, and no evidence at all about the file
-    /// locking between processes that [`open_database`] exists to solve. The
-    /// test that does spawn a second process is
-    /// `users_add_works_while_another_process_holds_the_auth_db` in the CLI's
-    /// `tests/users.rs`, and it is the one that fails if the multiprocess WAL
-    /// flag is dropped.
-    #[tokio::test]
-    async fn two_stores_on_one_file_interleave_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        let daemon = AuthStore::open(&path).await.unwrap();
-        let cli = AuthStore::open(&path).await.unwrap();
-
-        // The CLI adds an account; the daemon sees it without reopening.
-        cli.add_user("ada", "Ada", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        let session = daemon.create_session("ada", 3600).await.unwrap();
-        let (user, _) = daemon.session_user(&session.token).await.unwrap().unwrap();
-        assert_eq!(user.role, Role::Viewer);
-
-        // The CLI promotes; the daemon's next lookup reflects it. Editor, not
-        // admin: this account is disabled and removed below, which the
-        // last-admin guard would refuse (see [`NOT_LAST_ADMIN`]).
-        cli.set_role("ada", Role::Editor).await.unwrap();
-        let (user, _) = daemon.session_user(&session.token).await.unwrap().unwrap();
-        assert_eq!(user.role, Role::Editor, "the daemon sees the CLI's write");
-
-        // The daemon writes; the CLI reads it back.
-        let second = daemon.create_session("ada", 3600).await.unwrap();
-        assert!(cli.session_user(&second.token).await.unwrap().is_some());
-
-        // The CLI disables, which revokes; the daemon no longer resolves the
-        // session the CLI's write deleted.
-        cli.set_disabled("ada", true).await.unwrap();
-        assert!(daemon.session_user(&session.token).await.unwrap().is_none());
-
-        // The CLI removes the account entirely, sessions and all, while the
-        // daemon still holds its own handle open.
-        cli.set_disabled("ada", false).await.unwrap();
-        cli.remove_user("ada").await.unwrap();
-        assert!(daemon.session_user(&second.token).await.unwrap().is_none());
-        assert!(daemon.list_users().await.unwrap().is_empty());
-    }
-
-    /// The upgrade path: a `web-auth.db` written by a build that opened
-    /// without the multiprocess WAL flag must open, and keep its accounts,
-    /// under a build that opens with it.
-    ///
-    /// The two modes are exclusive only while a database is *live* in the
-    /// other mode (turso probes both directions on open). Nothing about the
-    /// file itself is mode-specific: the coordination file is a separate
-    /// `-tshm` sibling created on demand, so an existing state directory needs
-    /// no migration. This writes the file exactly as the previous build did,
-    /// closes it and reopens it the way [`open_database`] now does.
-    ///
-    /// The title's promise - that it still opens, with its accounts, and stays
-    /// writable - is asserted everywhere. Which mode did the opening is
-    /// asserted against [`MULTIPROCESS_WAL_EXPECTED`], because on Windows
-    /// multiprocess WAL is refused and the fallback is the correct outcome
-    /// there, not a defect.
-    #[tokio::test]
-    async fn a_database_written_without_the_multiprocess_flag_still_opens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        {
-            let legacy = Builder::new_local(&path.to_string_lossy())
-                .build()
-                .await
-                .unwrap();
-            let conn = legacy.connect().unwrap();
-            conn.execute_batch(SCHEMA).await.unwrap();
-            conn.execute(
-                "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
-                 VALUES ('ada', 'Ada', NULL, 'admin', 'x', 0, '2026-01-01T00:00:00Z')",
-                (),
-            )
-            .await
-            .unwrap();
-        }
-
-        let store = AuthStore::open(&path)
-            .await
-            .expect("an existing legacy-mode database must open");
-        let users = store.list_users().await.unwrap();
-        assert_eq!(users.len(), 1, "the accounts survived the mode change");
-        assert_eq!(users[0].name, "ada");
-        // The account is still editable, so the reopen is a real read-write
-        // open and not a degraded one.
-        store.set_role("ada", Role::Admin).await.unwrap();
-        assert_eq!(
-            path.with_file_name("web-auth.db-tshm").exists(),
-            MULTIPROCESS_WAL_EXPECTED,
-            "the mode that opened the file must be the one this platform can \
-             have (see MULTIPROCESS_WAL_EXPECTED): multiprocess leaves the \
-             coordination file beside the database, the fallback leaves none"
-        );
-    }
-
-    /// The fallback in [`open_database`] hinges on recognizing turso's own
-    /// "not supported" wording, which reaches us as a string rather than a
-    /// typed error. A memory-like path is the one way to provoke that message
-    /// without a network filesystem to hand, so it is what pins it: if a turso
-    /// upgrade rewords it, this fails here, rather than the fallback silently
-    /// going missing on the NFS or SMB state directory it exists for.
-    #[tokio::test]
-    async fn turso_still_words_an_unsupported_multiprocess_open_the_way_we_match() {
-        let err = Builder::new_local(":memory:")
-            .experimental_multiprocess_wal(true)
-            .build()
-            .await
-            .expect_err("multiprocess WAL cannot be had on an in-memory path");
-        assert!(
-            is_multiprocess_unsupported(&err),
-            "the fallback no longer recognizes turso's message: {err}"
-        );
-    }
-
-    /// A locked fallback open is the one failure a user can do something
-    /// about, so it must say what to do rather than hand back turso's byte
-    /// range wording. The error is synthesized here because the platform that
-    /// produces it (Windows, whose default IO backend has no shared WAL
-    /// coordination) is not the platform this test usually runs on: the
-    /// mapping is a pure function of the message, so it is testable
-    /// everywhere.
-    #[test]
-    fn a_locked_fallback_open_says_what_holds_the_database() {
-        let locked = turso::Error::Error(
-            "Locking error: Failed locking file, The process cannot access the file because \
-             another process has locked a portion of the file. (os error 33)"
-                .to_string(),
-        );
-        let err = legacy_open_error(locked, Path::new("/state/web-auth.db"));
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("held by a running daemon"),
-            "the message must name what holds the file: {text}"
-        );
-        assert!(
-            text.contains("crystalline ctl shutdown"),
-            "the message must name the way out: {text}"
-        );
-        assert!(
-            text.contains("web-auth.db"),
-            "the message must name the file: {text}"
-        );
-    }
-
-    /// Any other reason a fallback open fails is not the locked case and must
-    /// keep the plain context, so a corrupt file or a missing directory is not
-    /// reported as a running daemon.
-    #[test]
-    fn a_fallback_open_that_fails_for_another_reason_keeps_the_plain_context() {
-        let other = turso::Error::Error("file is not a database".to_string());
-        let err = legacy_open_error(other, Path::new("/state/web-auth.db"));
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("opening auth database"),
-            "an unrelated failure keeps the plain wording: {text}"
-        );
-        assert!(
-            !text.contains("running daemon"),
-            "an unrelated failure must not blame a daemon: {text}"
-        );
-    }
-
-    /// Two simultaneous logins in the daemon are two concurrent
-    /// `create_session` calls on the one shared `AuthStore`. Both open a
-    /// transaction on the same connection, so without serialization the second
-    /// fails outright with "cannot start a transaction within a transaction"
-    /// rather than queueing. Every call must succeed and every token must work.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_sessions_on_one_store_never_fail_spuriously() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(
-            AuthStore::open(&dir.path().join("web-auth.db"))
-                .await
-                .unwrap(),
-        );
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-
-        let mut tasks = Vec::new();
-        for _ in 0..16 {
-            let store = store.clone();
-            tasks.push(tokio::spawn(async move {
-                store.create_session("ada", 3600).await
-            }));
-        }
-        let mut tokens = Vec::new();
-        for task in tasks {
-            let session = task
-                .await
-                .expect("the task must not panic")
-                .expect("create_session must not fail under concurrency");
-            tokens.push(session.token);
-        }
-        for token in &tokens {
-            assert!(store.session_user(token).await.unwrap().is_some());
-        }
-    }
-
-    /// The same shape with the two transactional methods mixed, plus the
-    /// autocommit ones, so nothing can slip into another call's transaction.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_mixed_writes_on_one_store_never_fail_spuriously() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(
-            AuthStore::open(&dir.path().join("web-auth.db"))
-                .await
-                .unwrap(),
-        );
-        // One admin nobody touches, so every task's promote-then-remove is
-        // allowed: the last-admin guard's `EXISTS` subquery is thereby also
-        // exercised under concurrency rather than short-circuited away.
-        store
-            .add_user("keeper", "Keeper", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        for i in 0..8 {
-            store
-                .add_user(&format!("u{i}"), "U", None, Role::Editor, "pw")
-                .await
-                .unwrap();
-        }
-
-        let mut tasks = Vec::new();
-        for i in 0..8 {
-            let store = store.clone();
-            tasks.push(tokio::spawn(async move {
-                let name = format!("u{i}");
-                store.create_session(&name, 3600).await?;
-                store.set_role(&name, Role::Admin).await?;
-                store.create_session(&name, 3600).await?;
-                store.remove_user(&name).await?;
-                store.list_users().await?;
-                anyhow::Ok(())
-            }));
-        }
-        for task in tasks {
-            task.await
-                .expect("the task must not panic")
-                .expect("no call may fail under concurrency");
-        }
-        let left: Vec<String> = store
-            .list_users()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-        assert_eq!(left, vec!["keeper".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn delete_session_revokes_it() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        let s = store.create_session("ada", 3600).await.unwrap();
-        assert!(store.session_user(&s.token).await.unwrap().is_some());
-        store.delete_session(&s.token).await.unwrap();
-        assert!(store.session_user(&s.token).await.unwrap().is_none());
-        // Logging out twice is not an error.
-        store.delete_session(&s.token).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn ensure_user_is_idempotent() {
-        let (_dir, store) = store().await;
-        let first = store
-            .ensure_user("ada", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        let second = store
-            .ensure_user("ada", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(first.name, second.name);
-        assert_eq!(first.role, second.role);
-        assert_eq!(store.list_users().await.unwrap().len(), 1);
-    }
-
-    /// The provisioning cap: ensure_user refuses to mint an account past the cap,
-    /// while an existing account keeps resolving whatever the count is. This is
-    /// the trusted-header mitigation - a proxy misconfiguration (a header carrying
-    /// a session id, say) must not mint one account per request forever.
-    #[tokio::test]
-    async fn ensure_user_refuses_to_mint_past_the_cap() {
-        let (_dir, store) = store().await;
-        store.ensure_user("ada", Role::Viewer, 2).await.unwrap();
-        store.ensure_user("bob", Role::Viewer, 2).await.unwrap();
-
-        let err = store.ensure_user("cyd", Role::Viewer, 2).await.unwrap_err();
-        assert!(
-            err.to_string().contains("auth.max_users"),
-            "the refusal names the setting: {err}"
-        );
-        assert_eq!(store.list_users().await.unwrap().len(), 2);
-
-        // Existing accounts resolve regardless of the count-vs-cap state.
-        assert_eq!(
-            store
-                .ensure_user("ada", Role::Viewer, 2)
-                .await
-                .unwrap()
-                .name,
-            "ada"
-        );
-        assert_eq!(
-            store
-                .ensure_user("ADA", Role::Viewer, 1)
-                .await
-                .unwrap()
-                .name,
-            "ada"
-        );
-    }
-
-    #[tokio::test]
-    async fn ensure_user_keeps_an_admin_assigned_role() {
-        let (_dir, store) = store().await;
-        store
-            .ensure_user("ada", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        store.set_role("ada", Role::Admin).await.unwrap();
-        let again = store
-            .ensure_user("ada", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(again.role, Role::Admin);
-    }
-
-    #[tokio::test]
-    async fn a_provisioned_user_has_no_password_to_log_in_with() {
-        let (_dir, store) = store().await;
-        store
-            .ensure_user("ada", Role::Editor, usize::MAX)
-            .await
-            .unwrap();
-        assert!(store.verify_password("ada", "").await.unwrap().is_none());
-        store.set_password("ada", "pw").await.unwrap();
-        assert!(store.verify_password("ada", "pw").await.unwrap().is_some());
-    }
-
-    /// The privilege-restoration path: a trusted header carrying a case
-    /// variant must resolve to the existing account, not provision a fresh one
-    /// at the default role.
-    #[tokio::test]
-    async fn ensure_user_folds_case_instead_of_minting_a_second_account() {
-        let (_dir, store) = store().await;
-        // Editor rather than admin: what matters is that a privileged, then
-        // disabled, account is not restored by a case variant, and the last
-        // enabled admin could not be disabled here (see [`NOT_LAST_ADMIN`]).
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        store.set_disabled("ada", true).await.unwrap();
-
-        let same = store
-            .ensure_user("Ada", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(same.name, "ada");
-        assert!(same.disabled, "the disable must not have been undone");
-        assert_eq!(same.role, Role::Editor, "the role must not have been reset");
-        assert_eq!(
-            store.list_users().await.unwrap().len(),
-            1,
-            "no second account may exist for a case variant"
-        );
-    }
-
-    #[tokio::test]
-    async fn names_are_folded_and_trimmed_on_every_path() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("  AdA  ", "Ada", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        let users = store.list_users().await.unwrap();
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].name, "ada", "stored folded and trimmed");
-
-        // Every read and write path accepts any casing of the same name. The
-        // role moves to editor rather than admin so the removal below is not
-        // refused as a lockout (see [`NOT_LAST_ADMIN`]).
-        assert!(store.verify_password("ADA", "pw").await.unwrap().is_some());
-        store.set_role(" Ada ", Role::Editor).await.unwrap();
-        let session = store.create_session("aDa", 3600).await.unwrap();
-        let (user, _) = store.session_user(&session.token).await.unwrap().unwrap();
-        assert_eq!(user.role, Role::Editor);
-        store.set_password("ADA", "pw2").await.unwrap();
-        assert!(store.verify_password("ada", "pw2").await.unwrap().is_some());
-        store.remove_user("  ADA  ").await.unwrap();
-        assert!(store.list_users().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_case_variant_cannot_be_added_twice() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .add_user("ADA", "Impostor", None, Role::Admin, "pw2")
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn an_empty_or_blank_name_is_rejected() {
-        let (_dir, store) = store().await;
-        for blank in ["", "   ", "\t\n"] {
-            assert!(
-                store
-                    .add_user(blank, "Nobody", None, Role::Viewer, "pw")
-                    .await
-                    .is_err(),
-                "add_user must reject {blank:?}"
-            );
-            assert!(
-                store
-                    .ensure_user(blank, Role::Viewer, usize::MAX)
-                    .await
-                    .is_err()
-            );
-            // A login attempt is a `None`, not an error, like every other bad
-            // credential.
-            assert!(store.verify_password(blank, "pw").await.unwrap().is_none());
-        }
-        assert!(store.list_users().await.unwrap().is_empty());
-    }
-
-    /// Login names are space-free: the readable form belongs in the display name.
-    /// Enforced in normalize_account_name so every path - add, ensure, verify, edit -
-    /// refuses the same way.
-    #[tokio::test]
-    async fn a_name_with_internal_whitespace_is_rejected_on_every_path() {
-        let (_dir, store) = store().await;
-        for name in ["ada lovelace", "ada\tlovelace", "a b c"] {
-            assert!(
-                store
-                    .add_user(name, "Ada", None, Role::Viewer, "pw")
-                    .await
-                    .is_err(),
-                "add_user must reject {name:?}"
-            );
-            assert!(
-                store
-                    .ensure_user(name, Role::Viewer, usize::MAX)
-                    .await
-                    .is_err()
-            );
-            assert!(store.set_role(name, Role::Admin).await.is_err());
-            // A login attempt is a NoHash, not an error, like other bad names.
-            assert!(store.verify_password(name, "pw").await.unwrap().is_none());
-        }
-        assert!(store.list_users().await.unwrap().is_empty());
-        // Surrounding whitespace is still merely trimmed.
-        store
-            .add_user("  ada  ", "Ada Lovelace", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        assert_eq!(store.list_users().await.unwrap()[0].name, "ada");
-    }
-
-    /// A governed domain made private at connect names who chose it. The
-    /// machine owner holds no account, so its reserved name is taken without
-    /// the live-account check; any other name still needs a live account,
-    /// and an already-private domain is left as it stands.
-    #[tokio::test]
-    async fn set_governed_private_takes_the_owner_name_and_leaves_a_private_domain_alone() {
-        let (_dir, store) = store().await;
-        assert_eq!(
-            store.set_governed_private("kb", "Owner").await.unwrap(),
-            VisibilityWrite::Written
-        );
-        assert_eq!(
-            store.domain_visibility("kb").await.unwrap().unwrap().owner,
-            "owner"
-        );
-        assert!(store.set_governed_private("ops", "nobody").await.is_err());
-        assert!(store.domain_visibility("ops").await.unwrap().is_none());
-        assert_eq!(
-            store.set_governed_private("kb", "owner").await.unwrap(),
-            VisibilityWrite::AlreadyPrivate {
-                owner: "owner".to_string()
-            }
-        );
-    }
-
-    /// Taking back a connect's private record deletes the acl row and no
-    /// membership row.
-    #[tokio::test]
-    async fn take_back_governed_private_deletes_only_the_acl_row() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        store
-            .add_user("bea", "Bea", None, Role::Viewer, "pw12345678")
-            .await
-            .unwrap();
-        store
-            .set_domain_visibility("kb", true, "ada")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("kb", "bea", MemberLevel::Viewer, None, "ada")
-            .await
-            .unwrap();
-        assert!(store.take_back_governed_private("kb").await.unwrap());
-        assert!(store.domain_visibility("kb").await.unwrap().is_none());
-        assert_eq!(store.domain_members("kb").await.unwrap().len(), 1);
-        assert!(!store.take_back_governed_private("kb").await.unwrap());
-    }
-
-    /// The machine owner's own name is not a login.
-    ///
-    /// `owner` is the actor key every private draft the CLI, the control socket
-    /// and a local stdio agent write is filed under. An account holding it
-    /// would read, edit, share and fold the machine owner's unshared work in
-    /// every reviewing domain at once - in both directions, since the owner
-    /// would be acting in that account's drafts too. Every path that names an
-    /// account folds through `normalize_account_name`, so every one of them
-    /// refuses it, whichever way it is spelled.
-    #[tokio::test]
-    async fn the_machine_owners_name_is_reserved_on_every_path() {
-        let (_dir, store) = store().await;
-        for name in ["owner", "Owner", "OWNER", "  owner  "] {
-            let refusal = store
-                .add_user(name, "Owner", None, Role::Admin, "pw12345678")
-                .await
-                .expect_err("add_user must refuse {name:?}");
-            let message = refusal.to_string();
-            assert!(
-                message.contains("pick another name"),
-                "the refusal teaches what to do instead: {message}"
-            );
-            assert!(
-                store
-                    .ensure_user(name, Role::Viewer, usize::MAX)
-                    .await
-                    .is_err(),
-                "a trusted header cannot provision it either: {name:?}"
-            );
-            assert!(
-                store
-                    .add_first_admin(name, "Owner", "pw12345678")
-                    .await
-                    .is_err(),
-                "and the first-run admin is not it either: {name:?}"
-            );
-            // The lookup paths are untouched: the machine owner's name is a
-            // legitimate principal everywhere it already appears (it holds
-            // drafts, it stands in a fold plan), so naming it answers "nobody
-            // by that name" rather than refusing the name itself.
-            assert!(store.verify_password(name, "pw").await.unwrap().is_none());
-        }
-        assert!(store.list_users().await.unwrap().is_empty());
-        // A name that merely contains it is a name like any other.
-        store
-            .add_user("owner-ada", "Ada", None, Role::Viewer, "pw12345678")
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn normalize_account_name_trims_folds_and_rejects_empty() {
-        assert_eq!(normalize_account_name("  AdA  ").unwrap(), "ada");
-        assert_eq!(normalize_account_name("Ada").unwrap(), "ada");
-        assert!(normalize_account_name("").is_err());
-        assert!(normalize_account_name("   ").is_err());
-        assert!(normalize_account_name("ada lovelace").is_err());
-        // The reserved name folds like any other here; only the account
-        // creation paths refuse it.
-        assert_eq!(normalize_account_name("Owner").unwrap(), "owner");
-        assert!(normalize_new_account_name("Owner").is_err());
-    }
-
-    #[tokio::test]
-    async fn duplicate_add_errors() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .add_user("ada", "Ada Again", None, Role::Viewer, "pw2")
-                .await
-                .is_err()
-        );
-    }
-
-    /// The count the first-run probe reads: zero on a fresh file, and one more
-    /// for every account however it was created.
-    #[tokio::test]
-    async fn user_count_is_zero_until_an_account_exists() {
-        let (_dir, store) = store().await;
-        assert_eq!(store.user_count().await.unwrap(), 0);
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        assert_eq!(store.user_count().await.unwrap(), 1);
-        // The trusted-header path mints accounts too, and they count the same.
-        store
-            .ensure_user("bob", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(store.user_count().await.unwrap(), 2);
-        store.remove_user("bob").await.unwrap();
-        assert_eq!(store.user_count().await.unwrap(), 1);
-    }
-
-    /// The first admin is created only into an empty table, and the account it
-    /// creates is a real one: admin, enabled, folded name, display as typed,
-    /// and a password that verifies.
-    #[tokio::test]
-    async fn add_first_admin_creates_one_admin_and_only_on_an_empty_table() {
-        let (_dir, store) = store().await;
-        assert!(
-            store.add_first_admin("Ada", "Ada", "s3cret").await.unwrap(),
-            "an empty table is what the first-run path is for"
-        );
-        let users = store.list_users().await.unwrap();
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].name, "ada", "the name is folded like every other");
-        assert_eq!(users[0].display, "Ada");
-        assert_eq!(users[0].role, Role::Admin);
-        assert!(!users[0].disabled);
-        assert!(matches!(
-            store.check_password("ada", "s3cret").await.unwrap(),
-            PasswordCheck::Verified(_)
-        ));
-
-        assert!(
-            !store.add_first_admin("bob", "Bob", "pw").await.unwrap(),
-            "the slot is gone once any account exists"
-        );
-        assert_eq!(
-            store.user_count().await.unwrap(),
-            1,
-            "and nothing was written"
-        );
-    }
-
-    /// The account that closes the slot need not be an admin, and need not have
-    /// been created here: `crystalline users add` in another process is the
-    /// case that matters, and it lands an ordinary row.
-    #[tokio::test]
-    async fn add_first_admin_refuses_once_any_account_exists() {
-        let (_dir, added) = store().await;
-        added
-            .add_user("vera", "Vera", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        assert!(
-            !added
-                .add_first_admin("root", "Root", "rootpw")
-                .await
-                .unwrap()
-        );
-        assert_eq!(added.list_users().await.unwrap().len(), 1);
-
-        let (_dir2, provisioned) = store().await;
-        provisioned
-            .ensure_user("proxied", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        assert!(
-            !provisioned
-                .add_first_admin("root", "Root", "rootpw")
-                .await
-                .unwrap()
-        );
-    }
-
-    /// An unusable name is refused before anything is written, so a typo does
-    /// not consume the one slot there is.
-    #[tokio::test]
-    async fn add_first_admin_refuses_a_name_the_store_cannot_key_on() {
-        let (_dir, store) = store().await;
-        assert!(store.add_first_admin("  ", "Blank", "pw").await.is_err());
-        assert!(
-            store
-                .add_first_admin("ada lovelace", "Ada", "pw")
-                .await
-                .is_err()
-        );
-        assert_eq!(store.user_count().await.unwrap(), 0);
-        assert!(store.add_first_admin("ada", "Ada", "pw").await.unwrap());
-    }
-
-    /// Invariant 1's real pin: the claim holds across PROCESSES, which is what
-    /// the REST layer's own guard mutex can never show.
-    ///
-    /// Two [`AuthStore`]s are opened on one `web-auth.db` - the exact shape
-    /// `crystalline users add` takes while the daemon serves - and the first
-    /// admin is raced against a second first-admin call and against a plain
-    /// `add_user`. Two assertions carry the invariant, and neither is "exactly
-    /// one row lands": in the `add_user` leg two rows legitimately can, since
-    /// an ordinary add of a different name is not competing for the slot at
-    /// all. What must hold is that `add_first_admin` reports success at most
-    /// once, and never once any row already exists.
-    ///
-    /// **The two racing calls are `tokio::spawn`ed behind a barrier, and the
-    /// race is repeated ten times.** All three details are load bearing and
-    /// none is style. A `tokio::join!` polls both futures on ONE task, so they
-    /// can only interleave where one of them returns `Pending` - and the
-    /// check-then-insert window this test exists to catch is store work that
-    /// never yields, so a `join!` version of this test passes against exactly
-    /// the naive implementation the plan rejects (measured against a
-    /// deliberately naive store: 12 runs, 12 misses). Spawned onto different
-    /// worker threads and released together, the same race caught that store in
-    /// roughly four rounds out of five, and ten rounds is what turns "roughly
-    /// four out of five" into a pin. Anyone tempted to tidy this back into a
-    /// `join!` is removing the only test that can see the bug.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_second_store_open_cannot_also_win_first_admin() {
-        use std::sync::Arc;
-
-        // Leg one: first admin against first admin, on two opens of one file.
-        for round in 0..10 {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("web-auth.db");
-            let daemon = Arc::new(AuthStore::open(&path).await.unwrap());
-            let cli = Arc::new(AuthStore::open(&path).await.unwrap());
-            // Released together, so what separates the two calls is the work
-            // itself rather than however long each task waited to be scheduled.
-            let gate = Arc::new(tokio::sync::Barrier::new(2));
-            let one = tokio::spawn({
-                let store = daemon.clone();
-                let gate = gate.clone();
-                async move {
-                    gate.wait().await;
-                    store.add_first_admin("root", "Root", "rootpw").await
-                }
-            });
-            let two = tokio::spawn({
-                let store = cli.clone();
-                let gate = gate.clone();
-                async move {
-                    gate.wait().await;
-                    store.add_first_admin("boss", "Boss", "bosspw").await
-                }
-            });
-            let won = [one.await.unwrap().unwrap(), two.await.unwrap().unwrap()];
-            assert_eq!(
-                won.iter().filter(|w| **w).count(),
-                1,
-                "round {round}: exactly one of two racing first-admin calls may win"
-            );
-            assert_eq!(
-                daemon.user_count().await.unwrap(),
-                1,
-                "round {round}: and exactly one row is what they left behind"
-            );
-        }
-
-        // Leg two: first admin against an ordinary add from the other open.
-        // Both may land - the names differ and `users add` is not competing for
-        // the slot - but a first admin created after a row exists would be a
-        // check-then-insert that read stale, and a first admin that reported
-        // failure while writing a row would be worse still.
-        for round in 0..10 {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("web-auth.db");
-            let daemon = Arc::new(AuthStore::open(&path).await.unwrap());
-            let cli = Arc::new(AuthStore::open(&path).await.unwrap());
-            let gate = Arc::new(tokio::sync::Barrier::new(2));
-            let first = tokio::spawn({
-                let store = daemon.clone();
-                let gate = gate.clone();
-                async move {
-                    gate.wait().await;
-                    store.add_first_admin("root", "Root", "rootpw").await
-                }
-            });
-            let added = tokio::spawn({
-                let store = cli.clone();
-                let gate = gate.clone();
-                async move {
-                    gate.wait().await;
-                    store.add_user("ada", "Ada", None, Role::Viewer, "pw").await
-                }
-            });
-            added.await.unwrap().unwrap();
-            // Both racers have finished before the table is read, or the read
-            // could miss a row that was still on its way in.
-            let first = first.await.unwrap().unwrap();
-            let names: Vec<String> = daemon
-                .list_users()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|u| u.name)
-                .collect();
-            if first {
-                assert!(names.contains(&"root".to_string()), "round {round}");
-            } else {
-                assert_eq!(
-                    names,
-                    vec!["ada".to_string()],
-                    "round {round}: a first admin that reported failure must not \
-                     have written a row"
-                );
-            }
-            assert!(
-                !daemon.add_first_admin("late", "Late", "pw").await.unwrap(),
-                "round {round}: and the slot stays shut for every later caller"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn edits_to_an_unknown_user_error() {
-        let (_dir, store) = store().await;
-        assert!(store.set_password("ghost", "pw").await.is_err());
-        assert!(store.set_role("ghost", Role::Admin).await.is_err());
-        assert!(store.set_disabled("ghost", true).await.is_err());
-        assert!(store.remove_user("ghost").await.is_err());
-        assert!(store.create_session("ghost", 60).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn remove_user_takes_its_sessions_with_it() {
-        let (_dir, store) = store().await;
-        // Editor rather than admin: the role is incidental, and the last
-        // enabled admin cannot be removed (see [`NOT_LAST_ADMIN`]).
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let s = store.create_session("ada", 3600).await.unwrap();
-        store.remove_user("ada").await.unwrap();
-        assert!(store.session_user(&s.token).await.unwrap().is_none());
-        assert!(store.list_users().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_users_is_sorted_and_reopens_from_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("web-auth.db");
-        {
-            let store = AuthStore::open(&path).await.unwrap();
-            store
-                .add_user("zoe", "Zoe", None, Role::Viewer, "pw")
-                .await
-                .unwrap();
-            store
-                .add_user("ada", "Ada", None, Role::Admin, "pw")
-                .await
-                .unwrap();
-        }
-        let reopened = AuthStore::open(&path).await.unwrap();
-        let names: Vec<String> = reopened
-            .list_users()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-        assert_eq!(names, vec!["ada".to_string(), "zoe".to_string()]);
-    }
-
-    /// The lockout guard: the last enabled admin cannot be removed, disabled
-    /// or demoted, so an installation cannot lose its last way in. Enforced in
-    /// the store rather than in the `crystalline users` CLI because a
-    /// check-then-act in the CLI would race a second invocation.
-    #[tokio::test]
-    async fn the_last_admin_cannot_be_removed_disabled_or_demoted() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        // A non-admin account is no help: it cannot administer anything.
-        store
-            .add_user("bob", "Bob", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-
-        for err in [
-            store.remove_user("ada").await.unwrap_err(),
-            store.set_disabled("ada", true).await.unwrap_err(),
-            store.set_role("ada", Role::Viewer).await.unwrap_err(),
-        ] {
-            assert!(
-                err.to_string().contains("last admin"),
-                "expected a last-admin refusal, got: {err}"
-            );
-        }
-
-        // Nothing was applied: the account is still an enabled admin.
-        let users = store.list_users().await.unwrap();
-        let ada = users.iter().find(|u| u.name == "ada").unwrap();
-        assert_eq!(ada.role, Role::Admin);
-        assert!(!ada.disabled);
-    }
-
-    /// With a second enabled admin in place, all three operations go through.
-    #[tokio::test]
-    async fn an_admin_can_be_removed_disabled_and_demoted_beside_another_admin() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        store
-            .add_user("bob", "Bob", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        store
-            .add_user("cyd", "Cyd", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        store
-            .add_user("dee", "Dee", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-
-        // Each edit leaves at least one enabled admin behind, so each is
-        // allowed: four admins, then a disable, a demotion and a removal.
-        store.set_disabled("ada", true).await.unwrap();
-        store.set_role("bob", Role::Viewer).await.unwrap();
-        store.remove_user("cyd").await.unwrap();
-
-        // Re-enabling the disabled admin is never refused.
-        store.set_disabled("ada", false).await.unwrap();
-        let users = store.list_users().await.unwrap();
-        assert_eq!(users.len(), 3);
-        assert!(users.iter().any(|u| u.name == "ada" && !u.disabled));
-    }
-
-    /// A disabled admin cannot log in, so it is not a way back in and must not
-    /// satisfy the guard for the one admin that still works.
-    #[tokio::test]
-    async fn a_disabled_admin_does_not_count_as_a_remaining_admin() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        store
-            .add_user("bob", "Bob", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        store.set_disabled("bob", true).await.unwrap();
-
-        assert!(store.remove_user("ada").await.is_err());
-        assert!(store.set_disabled("ada", true).await.is_err());
-        assert!(store.set_role("ada", Role::Editor).await.is_err());
-
-        // The already-disabled admin is not the last *enabled* one, so it is
-        // not itself protected.
-        store.remove_user("bob").await.unwrap();
-    }
-
-    /// The guard only applies to enabled admins. Every other account, and
-    /// every promotion, is untouched by it.
-    #[tokio::test]
-    async fn the_guard_leaves_non_admins_and_promotions_alone() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        store
-            .add_user("bob", "Bob", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        // The one and only viewer is not an admin: no protection.
-        store.set_disabled("bob", true).await.unwrap();
-        store.set_disabled("bob", false).await.unwrap();
-        // Promoting is always allowed, even for the last admin itself.
-        store.set_role("ada", Role::Admin).await.unwrap();
-        store.set_role("bob", Role::Admin).await.unwrap();
-        // Now that there are two, the first may go.
-        store.remove_user("ada").await.unwrap();
-    }
-
-    /// A refused removal must not take the account's sessions with it: the
-    /// whole operation rolls back, not just the delete that was refused.
-    #[tokio::test]
-    async fn a_refused_removal_keeps_the_admins_sessions() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        let live = store.create_session("ada", 3600).await.unwrap();
-        assert!(store.remove_user("ada").await.is_err());
-        assert!(
-            store.session_user(&live.token).await.unwrap().is_some(),
-            "the rolled-back removal must leave the live session in place"
-        );
-    }
-
-    /// The guard must not swallow a plain typo: an unknown name still reports
-    /// itself as unknown rather than as a lockout refusal.
-    #[tokio::test]
-    async fn an_unknown_name_still_reports_itself_as_unknown() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        for err in [
-            store.remove_user("ghost").await.unwrap_err(),
-            store.set_disabled("ghost", true).await.unwrap_err(),
-            store.set_role("ghost", Role::Viewer).await.unwrap_err(),
-        ] {
-            assert!(
-                err.to_string().contains("no such user"),
-                "expected an unknown-user error, got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn roles_round_trip_through_text_and_json() {
-        for role in [Role::Viewer, Role::Editor, Role::Admin] {
-            assert_eq!(role.as_str().parse::<Role>().unwrap(), role);
-            assert_eq!(
-                serde_json::to_value(role).unwrap(),
-                serde_json::Value::String(role.as_str().to_string())
-            );
-        }
-        assert!("root".parse::<Role>().is_err());
-        // A hand-edited or corrupt row resolves to the least privileged role.
-        assert_eq!(role_from_db("root"), Role::Viewer);
-    }
-
-    /// The column migration: a database created by the slice-1 schema (no
-    /// last_seen_at) opens cleanly and gains the column, and opening twice is
-    /// harmless - the idempotent-open contract, extended to columns.
-    #[tokio::test]
-    async fn an_old_database_gains_the_last_seen_column_on_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        // Hand-create the pre-migration shape.
-        {
-            let db = Builder::new_local(&path.to_string_lossy())
-                .build()
-                .await
-                .unwrap();
-            let conn = db.connect().unwrap();
-            conn.execute_batch(
-                "CREATE TABLE users (
-                    name TEXT PRIMARY KEY,
-                    display TEXT NOT NULL,
-                    email TEXT,
-                    role TEXT NOT NULL,
-                    pass_hash TEXT,
-                    disabled INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL
-                );
-                INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
-                VALUES ('ada', 'Ada', NULL, 'admin', NULL, 0, '2026-01-01T00:00:00Z');",
-            )
-            .await
-            .unwrap();
-        }
-        let store = AuthStore::open(&path).await.unwrap();
-        let users = store.list_users().await.unwrap();
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].name, "ada");
-        assert!(users[0].last_seen.is_none(), "never seen yet");
-        drop(store);
-        // Re-opening (the migrated shape) must not fail on the duplicate column.
-        let again = AuthStore::open(&path).await.unwrap();
-        assert_eq!(again.list_users().await.unwrap().len(), 1);
-    }
-
-    /// The two Reflection columns: a file written before them opens, reads
-    /// every account and membership as `default`, and keeps what is set.
-    #[tokio::test]
-    async fn the_reflection_levels_are_stored_and_an_older_file_opens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        {
-            // The shape before 0.26.0: no `reflection` column anywhere.
-            let db = turso::Builder::new_local(path.to_str().unwrap())
-                .build()
-                .await
-                .unwrap();
-            let conn = db.connect().unwrap();
-            // The per-domain grants table came later still (0.30.0).
-            let grants = SCHEMA
-                .find("CREATE TABLE IF NOT EXISTS domain_reflection_grant")
-                .unwrap();
-            let old = format!(
-                "{}{}",
-                &SCHEMA[..grants],
-                SCHEMA[grants..].split_once(";\n").unwrap().1
-            );
-            let old = old.replace("    reflection TEXT,\n", "");
-            assert!(!old.contains("reflection"), "both columns are left out");
-            conn.execute_batch(&old).await.unwrap();
-        }
-        let auth = AuthStore::open(&path).await.unwrap();
-        auth.add_user("ann", "Ann", None, Role::None, "pw12345678")
-            .await
-            .unwrap();
-        auth.add_user("keeper", "Keeper", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        assert_eq!(
-            auth.user("ann").await.unwrap().unwrap().reflection,
-            ReflectionLevel::Default
-        );
-        assert_eq!(auth.user("ann").await.unwrap().unwrap().role, Role::None);
-        // The grants table is made on open.
-        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "keeper")
-            .await
-            .unwrap();
-        auth.set_reflection_level("ann", ReflectionLevel::Contributor)
-            .await
-            .unwrap();
-        assert_eq!(
-            auth.user("ann").await.unwrap().unwrap().reflection,
-            ReflectionLevel::Contributor
-        );
-        auth.set_reflection_level("ann", ReflectionLevel::Default)
-            .await
-            .unwrap();
-        // Created with a level: one write, read back as given.
-        auth.add_user_with_reflection(
-            "bea",
-            "Bea",
-            None,
-            Role::None,
-            ReflectionLevel::Reader,
-            "pw12345678",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            auth.user("bea").await.unwrap().unwrap().reflection,
-            ReflectionLevel::Reader
-        );
-        auth.add_token_only_user_with_reflection(
-            "bot",
-            "bot",
-            None,
-            Role::None,
-            ReflectionLevel::Contributor,
-            "bot",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            auth.user("bot").await.unwrap().unwrap().reflection,
-            ReflectionLevel::Contributor
-        );
-        assert_eq!(
-            auth.user("ann").await.unwrap().unwrap().reflection,
-            ReflectionLevel::Default
-        );
-
-        auth.set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        let err = auth
-            .upsert_domain_member("lab", "ann", MemberLevel::None, None, "keeper")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&err),
-            Some(RefusalKind::EmptyMembership),
-            "{err:#}"
-        );
-        auth.upsert_domain_member(
-            "lab",
-            "ann",
-            MemberLevel::None,
-            Some(ReflectionLevel::Reader),
-            "keeper",
-        )
-        .await
-        .unwrap();
-        let members = auth.domain_members("lab").await.unwrap();
-        assert_eq!(
-            (members[0].level, members[0].reflection),
-            (MemberLevel::None, ReflectionLevel::Reader)
-        );
-        // Changing one axis never resets the other: no Reflection level given
-        // keeps the stored one.
-        auth.upsert_domain_member("lab", "ann", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap();
-        let members = auth.domain_members("lab").await.unwrap();
-        assert_eq!(
-            (members[0].level, members[0].reflection),
-            (MemberLevel::Viewer, ReflectionLevel::Reader)
-        );
-        let err = auth
-            .upsert_domain_member(
-                "lab",
-                "ann",
-                MemberLevel::None,
-                Some(ReflectionLevel::Default),
-                "keeper",
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&err),
-            Some(RefusalKind::EmptyMembership),
-            "{err:#}"
-        );
-        assert_eq!(
-            auth.member_reflection("lab", "ann").await.unwrap(),
-            ReflectionLevel::Reader
-        );
-        assert_eq!(
-            auth.member_reflection("lab", "keeper").await.unwrap(),
-            ReflectionLevel::Default
-        );
-        drop(auth);
-        // Re-opening the migrated file does not fail on the duplicate columns.
-        AuthStore::open(&path).await.unwrap();
-    }
-
-    fn entries(items: &[&str]) -> Vec<String> {
-        items.iter().map(|e| e.to_string()).collect()
-    }
-
-    /// The table is created on open over a database an older build wrote,
-    /// and opening twice is harmless.
-    #[tokio::test]
-    async fn an_old_database_gains_the_write_list_table_on_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        {
-            let db = Builder::new_local(&path.to_string_lossy())
-                .build()
-                .await
-                .unwrap();
-            let conn = db.connect().unwrap();
-            conn.execute_batch(
-                "CREATE TABLE users (
-                    name TEXT PRIMARY KEY,
-                    display TEXT NOT NULL,
-                    email TEXT,
-                    role TEXT NOT NULL,
-                    pass_hash TEXT,
-                    disabled INTEGER NOT NULL DEFAULT 0,
-                    last_seen_at TEXT,
-                    created_at TEXT NOT NULL
-                );
-                INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
-                VALUES ('bot', 'bot', NULL, 'editor', NULL, 0, '2026-01-01T00:00:00Z');",
-            )
-            .await
-            .unwrap();
-        }
-        let store = AuthStore::open(&path).await.unwrap();
-        assert_eq!(store.write_list("bot").await.unwrap(), None);
-        store
-            .set_write_list("bot", &entries(&["agents-bot"]))
-            .await
-            .unwrap();
-        drop(store);
-        let again = AuthStore::open(&path).await.unwrap();
-        assert_eq!(
-            again.write_list("bot").await.unwrap(),
-            Some(entries(&["agents-bot"]))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_write_list_is_set_replaced_read_and_cleared() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("bot", "Bot", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        assert_eq!(store.write_list("bot").await.unwrap(), None);
-        store
-            .set_write_list(
-                "BOT",
-                &entries(&[" shared-* ", "agents-bot", "agents-bot", ""]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.write_list("bot").await.unwrap(),
-            Some(entries(&["agents-bot", "shared-*"])),
-            "trimmed, deduplicated, empties dropped, sorted, keyed on the folded name"
-        );
-        store
-            .set_write_list("bot", &entries(&["other"]))
-            .await
-            .unwrap();
-        assert_eq!(
-            store.write_list("bot").await.unwrap(),
-            Some(entries(&["other"])),
-            "a set replaces the whole list"
-        );
-        store.clear_write_list("bot").await.unwrap();
-        assert_eq!(store.write_list("bot").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn a_write_list_needs_an_account_and_an_entry() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("bot", "Bot", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        let ghost = store
-            .set_write_list("ghost", &entries(&["open"]))
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{ghost:#}").contains("no such user: 'ghost'"),
-            "{ghost:#}"
-        );
-        let ghost = store.clear_write_list("ghost").await.unwrap_err();
-        assert!(
-            format!("{ghost:#}").contains("no such user: 'ghost'"),
-            "{ghost:#}"
-        );
-        let empty = store
-            .set_write_list("bot", &entries(&["", "  "]))
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{empty:#}").contains("at least one entry"),
-            "{empty:#}"
-        );
-        assert_eq!(store.write_list("bot").await.unwrap(), None);
-    }
-
-    /// A rename rewrites exact entries and leaves `*` entries alone, on a
-    /// shared domain too (which has no acl, member or grant row), keeps an
-    /// entry that already named the new name, and a second run changes
-    /// nothing.
-    #[tokio::test]
-    async fn a_rename_follows_exact_write_entries_only() {
-        let (_dir, store) = store().await;
-        for name in ["bot", "both"] {
-            store
-                .add_user(name, name, None, Role::Editor, "pw")
-                .await
-                .unwrap();
-        }
-        store
-            .set_write_list("bot", &entries(&["eng", "eng-*", "open"]))
-            .await
-            .unwrap();
-        store
-            .set_write_list("both", &entries(&["eng", "platform"]))
-            .await
-            .unwrap();
-        store.rename_domain("eng", "platform").await.unwrap();
-        assert_eq!(
-            store.write_list("bot").await.unwrap(),
-            Some(entries(&["eng-*", "open", "platform"]))
-        );
-        assert_eq!(
-            store.write_list("both").await.unwrap(),
-            Some(entries(&["platform"])),
-            "an account that named both ends keeps one entry"
-        );
-        store.rename_domain("eng", "platform").await.unwrap();
-        assert_eq!(
-            store.write_list("bot").await.unwrap(),
-            Some(entries(&["eng-*", "open", "platform"])),
-            "idempotent"
-        );
-    }
-
-    /// The list goes with the account, on both removal paths, so a name
-    /// added again starts with no list.
-    #[tokio::test]
-    async fn removing_an_account_removes_its_write_list() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        for name in ["bot", "bot2"] {
-            store
-                .add_user(name, name, None, Role::Editor, "pw")
-                .await
-                .unwrap();
-            store
-                .set_write_list(name, &entries(&["agents-bot"]))
-                .await
-                .unwrap();
-        }
-        store.remove_user("bot").await.unwrap();
-        store.remove_user_force("bot2").await.unwrap();
-        for name in ["bot", "bot2"] {
-            store
-                .add_user(name, name, None, Role::Editor, "pw")
-                .await
-                .unwrap();
-            assert_eq!(store.write_list(name).await.unwrap(), None, "{name}");
-        }
-    }
-
-    /// Resolving a session stamps the account as seen; a trusted-header contact
-    /// (ensure_user) stamps it too.
-    #[tokio::test]
-    async fn resolving_a_session_updates_last_seen() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        assert!(store.list_users().await.unwrap()[0].last_seen.is_none());
-
-        let s = store.create_session("ada", 3600).await.unwrap();
-        store.session_user(&s.token).await.unwrap().unwrap();
-        let seen = store.list_users().await.unwrap()[0].last_seen.clone();
-        assert!(seen.is_some(), "a resolved session is a sighting");
-
-        let provisioned = store
-            .ensure_user("bob", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        assert!(
-            provisioned.last_seen.is_some(),
-            "provisioning is a sighting too"
-        );
-    }
-
-    #[tokio::test]
-    async fn marking_a_sighting_moves_last_seen() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Viewer, "pw")
-            .await
-            .unwrap();
-        let before = store.user("ada").await.unwrap().unwrap().last_seen;
-        assert!(before.is_none(), "an account nobody has used yet");
-        store.mark_seen("ada").await.unwrap();
-        let after = store.user("ada").await.unwrap().unwrap().last_seen;
-        assert!(after.is_some(), "and one that just arrived");
-        // A name nobody holds is not an error: the caller stamps a row it read,
-        // and a row removed in between is somebody else's problem to report.
-        store.mark_seen("nobody").await.unwrap();
-    }
-
-    /// The operator escape hatch: --force bypasses the last-admin guard. It still
-    /// reports a missing account, and a forced removal still takes the sessions
-    /// with it in the same transaction.
-    #[tokio::test]
-    async fn forced_edits_bypass_the_last_admin_guard() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        let live = store.create_session("ada", 3600).await.unwrap();
-
-        // The guarded paths refuse; the forced ones do not.
-        assert!(store.set_role("ada", Role::Viewer).await.is_err());
-        store.set_role_force("ada", Role::Viewer).await.unwrap();
-        assert_eq!(store.list_users().await.unwrap()[0].role, Role::Viewer);
-
-        store.set_role_force("ada", Role::Admin).await.unwrap();
-        assert!(store.remove_user("ada").await.is_err());
-        store.remove_user_force("ada").await.unwrap();
-        assert!(store.list_users().await.unwrap().is_empty());
-        assert!(
-            store.session_user(&live.token).await.unwrap().is_none(),
-            "a forced removal still revokes the sessions"
-        );
-
-        assert!(store.set_role_force("ghost", Role::Viewer).await.is_err());
-        assert!(store.remove_user_force("ghost").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn mcp_token_round_trip_and_revocation() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let issued = store.issue_mcp_token("ada", "laptop-agent").await.unwrap();
-        assert!(issued.token.starts_with("cmt_"));
-        assert_eq!(issued.token.len(), 4 + 64);
-        let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
-        assert_eq!(user.name, "ada");
-        let listed = store.list_mcp_tokens("ada").await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert!(listed[0].last_used.is_some());
-
-        // The store never keeps the plaintext - proved, not just commented.
-        // Read the raw column via the store's own connection (tests are a
-        // descendant module, so the private field and helper are reachable)
-        // and check it against an independently computed sha256, the same
-        // property `token_hash` is supposed to have.
-        let row = store
-            .query_first(
-                "SELECT token_hash FROM mcp_tokens WHERE id = ?1",
-                vec![Value::Integer(issued.id)],
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let stored_hash = cell_text(&row, 0).unwrap();
-        assert_eq!(stored_hash.len(), 64, "a sha256 hex digest is 64 chars");
-        assert!(
-            stored_hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "the stored value must be hex, not the token itself"
-        );
-        assert_ne!(stored_hash, issued.token);
-        assert!(!stored_hash.contains(issued.token.as_str()));
-        assert!(!issued.token.contains(stored_hash.as_str()));
-        let mut hasher = Sha256::new();
-        hasher.update(issued.token.as_bytes());
-        let expected = crystalline_index::hex_lower(&hasher.finalize());
-        assert_eq!(
-            stored_hash, expected,
-            "the column holds sha256 of the whole token, prefix included"
-        );
-
-        assert!(store.revoke_mcp_token("ada", issued.id).await.unwrap());
-        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn a_token_only_account_has_no_password_and_one_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        let issued = store
-            .add_token_only_user("Agent-Build", "Agent-Build", None, Role::Editor, "build")
-            .await
-            .unwrap();
-        assert!(issued.token.starts_with("cmt_"));
-        assert_eq!(issued.token.len(), 4 + 64);
-        assert_eq!(issued.label, "build");
-
-        for attempt in ["", "pw12345678", "agent-build"] {
-            assert!(
-                store
-                    .verify_password("agent-build", attempt)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "password sign-in never succeeds for a token-only account"
-            );
-        }
-        assert!(matches!(
-            store.check_password("agent-build", "x").await.unwrap(),
-            PasswordCheck::NoHash
-        ));
-
-        let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
-        assert_eq!(user.name, "agent-build");
-        assert_eq!(user.role, Role::Editor);
-        assert_eq!(store.list_mcp_tokens("agent-build").await.unwrap().len(), 1);
-        assert!(
-            store
-                .passwordless_users()
-                .await
-                .unwrap()
-                .contains("agent-build")
-        );
-        let debug = format!("{issued:?}");
-        assert!(!debug.contains(&issued.token), "{debug}");
-    }
-
-    #[tokio::test]
-    async fn a_token_only_account_with_a_taken_name_is_refused_and_issues_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        store
-            .add_user("ada", "Ada", None, Role::Viewer, "pw12345678")
-            .await
-            .unwrap();
-        let err = store
-            .add_token_only_user("ADA", "Ada", None, Role::Editor, "build")
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("UNIQUE constraint"), "{err:#}");
-        assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
-        let ada = store.user("ada").await.unwrap().unwrap();
-        assert_eq!(ada.role, Role::Viewer, "the existing account is untouched");
-        assert!(
-            store
-                .verify_password("ada", "pw12345678")
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_token_issue_leaves_no_account() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let taken = store.issue_mcp_token("ada", "laptop").await.unwrap();
-        // The token hash is UNIQUE, so reusing a live token makes the second
-        // insert fail after the account insert succeeded.
-        let err = store
-            .add_token_only_user_with(
-                "agent-build",
-                "agent-build",
-                None,
-                Role::Editor,
-                ReflectionLevel::Default,
-                "build",
-                taken.token.clone(),
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("UNIQUE constraint"), "{err:#}");
-        assert!(
-            store.user("agent-build").await.unwrap().is_none(),
-            "the account was rolled back with the token"
-        );
-        assert_eq!(store.list_mcp_tokens("ada").await.unwrap().len(), 1);
-        // The name is free again.
-        store
-            .add_token_only_user("agent-build", "agent-build", None, Role::Editor, "build")
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn mcp_token_of_a_disabled_account_stops_resolving() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let issued = store.issue_mcp_token("ada", "t").await.unwrap();
-        store.set_disabled("ada", true).await.unwrap();
-        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
-
-        // Disabled without deletion: the row must still be there, and
-        // re-enabling must hand the very same token back rather than force a
-        // re-issue.
-        let listed = store.list_mcp_tokens("ada").await.unwrap();
-        assert_eq!(
-            listed.len(),
-            1,
-            "disabling an account must not delete its mcp tokens"
-        );
-        store.set_disabled("ada", false).await.unwrap();
-        let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
-        assert_eq!(user.name, "ada");
-    }
-
-    #[tokio::test]
-    async fn an_orphaned_mcp_token_row_cannot_resolve_and_gets_pruned() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let issued = store.issue_mcp_token("ada", "agent").await.unwrap();
-
-        // Simulate the stranded-row scenario `issue_mcp_token`'s own
-        // transaction now prevents live: an account vanishing by a path other
-        // than `remove_user`'s sweep, leaving an `mcp_tokens` row with no
-        // matching account (the table carries no foreign key). A row written
-        // before this defense existed, or reached some other way, must still
-        // fail closed rather than resolve for whoever next claims the name.
-        store
-            .conn
-            .execute("DELETE FROM users WHERE name = 'ada'", ())
-            .await
-            .unwrap();
-
-        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
-
-        let remaining = store
-            .query_first("SELECT COUNT(*) FROM mcp_tokens", vec![])
-            .await
-            .unwrap()
-            .unwrap();
-        let count = match remaining.get_value(0) {
-            Ok(Value::Integer(n)) => n,
-            other => panic!("unexpected COUNT(*) result: {other:?}"),
-        };
-        assert_eq!(
-            count, 0,
-            "mcp_token_user must prune the orphaned row, not just refuse it"
-        );
-    }
-
-    #[tokio::test]
-    async fn mcp_token_rotation_replaces_in_one_step() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open(&dir.path().join("web-auth.db"))
-            .await
-            .unwrap();
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let first = store.issue_mcp_token("ada", "agent").await.unwrap();
-        let second = store.rotate_mcp_token("ada", first.id).await.unwrap();
-        assert_eq!(second.label, "agent");
-        assert!(store.mcp_token_user(&first.token).await.unwrap().is_none());
-        assert!(store.mcp_token_user(&second.token).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn removing_a_user_revokes_its_mcp_tokens() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let issued = store.issue_mcp_token("ada", "agent").await.unwrap();
-        store.remove_user("ada").await.unwrap();
-        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
-        assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
-    }
-
-    /// A name that is not an account reads as `None`, and a folded spelling of
-    /// one that is finds it: the difference between "no such user" and "an
-    /// account with no tokens" rests on this.
-    #[tokio::test]
-    async fn one_account_is_read_back_by_any_spelling_of_its_name() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        for spelling in ["ada", "ADA", "  Ada  "] {
-            let found = store.user(spelling).await.unwrap();
-            assert_eq!(found.expect("'{spelling}' is ada").name, "ada");
-        }
-        assert!(store.user("ghost").await.unwrap().is_none());
-    }
-
-    /// The one unhashed copy of a live credential must never be one
-    /// `tracing::debug!` or one failed assertion away from a log file, while
-    /// the id and the label - the parts that make such a line useful - still
-    /// print. Asserted on the random half rather than on the whole token: the
-    /// redaction keeps the [`MCP_TOKEN_PREFIX`], so `!contains(&issued.token)`
-    /// would pass even if the secret leaked in pieces.
-    #[tokio::test]
-    async fn an_issued_token_never_prints_its_secret() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let issued = store.issue_mcp_token("ada", "laptop").await.unwrap();
-        let secret = issued
-            .token
-            .strip_prefix(MCP_TOKEN_PREFIX)
-            .expect("a token carries the prefix");
-        let text = format!("{issued:?}");
-        assert!(!text.contains(secret), "the secret is redacted: {text}");
-        assert!(text.contains("redacted"), "and says so: {text}");
-        assert!(
-            text.contains("laptop") && text.contains(&issued.id.to_string()),
-            "while the id and label still print: {text}"
-        );
-    }
-
-    /// The membership cast every test below shares: two accounts that own or
-    /// join things and one that never does.
-    async fn members_cast(store: &AuthStore) {
-        for (name, role) in [
-            ("keeper", Role::Editor),
-            ("mem", Role::Viewer),
-            ("out", Role::Editor),
-        ] {
-            store
-                .add_user(name, name, None, role, "pw12345678")
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn a_domain_is_shared_until_somebody_makes_it_private() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        assert!(store.domain_visibility("lab").await.unwrap().is_none());
-        assert!(store.private_domains().await.unwrap().is_empty());
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        let acl = store.domain_visibility("lab").await.unwrap().unwrap();
-        assert_eq!(acl.domain, "lab");
-        assert_eq!(acl.owner, "keeper");
-        assert_eq!(
-            store.private_domains().await.unwrap(),
-            vec![DomainAcl {
-                domain: "lab".into(),
-                owner: "keeper".into()
-            }]
-        );
-        // The name is trimmed but never folded: the engine keys its domain map
-        // on the literal name.
-        assert!(store.domain_visibility("  lab  ").await.unwrap().is_some());
-        assert!(store.domain_visibility("Lab").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn a_domain_acl_needs_a_live_owner() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        let err = store
-            .set_domain_visibility("lab", true, "ghost")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no such user"), "{err}");
-        store.set_disabled("mem", true).await.unwrap();
-        let err = store
-            .set_domain_visibility("lab", true, "mem")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("disabled"), "{err}");
-        assert!(
-            store.domain_visibility("lab").await.unwrap().is_none(),
-            "a refused call writes nothing"
-        );
-    }
-
-    #[tokio::test]
-    async fn making_a_domain_shared_again_takes_its_members_with_it() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap();
-        assert_eq!(store.domain_members("lab").await.unwrap().len(), 1);
-        store
-            .set_domain_visibility("lab", false, "keeper")
-            .await
-            .unwrap();
-        assert!(store.domain_visibility("lab").await.unwrap().is_none());
-        assert!(
-            store.domain_members("lab").await.unwrap().is_empty(),
-            "the members go with the acl, so making it private again does not \
-             restore somebody else's invitations"
-        );
-        assert!(store.memberships_of("mem").await.unwrap().is_empty());
-        // Asking for a state that already holds is not an error.
-        store
-            .set_domain_visibility("lab", false, "keeper")
-            .await
-            .unwrap();
-    }
-
-    /// A domain rename carries every record the accounts database keeps under
-    /// the old name: the acl row with its owner, the membership rows and the
-    /// draft share-links. A second call finds nothing under the old name and is
-    /// fine, which is what a rename completed again after a crash does.
-    #[tokio::test]
-    async fn renaming_a_domain_moves_its_acl_members_and_grants() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("eng", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("eng", "mem", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("eng", "out", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap();
-        let grant = store
-            .mint_overlay_grant("eng", "plan.md", "keeper", None)
-            .await
-            .unwrap();
-
-        store.rename_domain("eng", "platform").await.unwrap();
-
-        assert!(store.domain_visibility("eng").await.unwrap().is_none());
-        assert!(store.domain_members("eng").await.unwrap().is_empty());
-        assert_eq!(
-            store
-                .domain_visibility("platform")
-                .await
-                .unwrap()
-                .map(|acl| acl.owner),
-            Some("keeper".to_string())
-        );
-        let mut members: Vec<(String, MemberLevel)> = store
-            .domain_members("platform")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| (m.principal, m.level))
-            .collect();
-        members.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            members,
-            vec![
-                ("mem".to_string(), MemberLevel::Viewer),
-                ("out".to_string(), MemberLevel::Editor),
-            ]
-        );
-        assert_eq!(
-            store.overlay_grant_domain(&grant.token).await.unwrap(),
-            Some("platform".to_string())
-        );
-        assert!(
-            store
-                .overlay_grants_of("keeper", "eng", "plan.md")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        store
-            .rename_domain("eng", "platform")
-            .await
-            .expect("a second call finds nothing under the old name");
-        assert_eq!(store.domain_members("platform").await.unwrap().len(), 2);
-        store
-            .rename_domain("never", "seen")
-            .await
-            .expect("a domain with no records has nothing to move");
-    }
-
-    /// The renamed domain's records win over stale ones already under the new
-    /// name: the stale acl owner, every stale member (colliding or not) and
-    /// every stale share-link go, so none of them gains access to the renamed
-    /// domain. A second call leaves the moved rows alone.
-    #[tokio::test]
-    async fn renaming_onto_stale_records_keeps_the_renamed_domains_rows() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("eng", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("eng", "mem", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap();
-        let live = store
-            .mint_overlay_grant("eng", "plan.md", "keeper", None)
-            .await
-            .unwrap();
-        // Stale records under the new name, from a removal that never forgot
-        // them: another owner, a colliding and a non-colliding member, and a
-        // share-link.
-        store
-            .set_domain_visibility("platform", true, "out")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("platform", "mem", MemberLevel::Viewer, None, "out")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("platform", "keeper", MemberLevel::Manager, None, "out")
-            .await
-            .unwrap();
-        let stale = store
-            .mint_overlay_grant("platform", "old.md", "out", None)
-            .await
-            .unwrap();
-
-        store.rename_domain("eng", "platform").await.unwrap();
-        assert!(store.domain_visibility("eng").await.unwrap().is_none());
-        assert!(store.domain_members("eng").await.unwrap().is_empty());
-        renamed_records_won(&store, &live.token, &stale.token).await;
-
-        store
-            .rename_domain("eng", "platform")
-            .await
-            .expect("a second call finds nothing under the old name");
-        renamed_records_won(&store, &live.token, &stale.token).await;
-    }
-
-    /// What `renaming_onto_stale_records_keeps_the_renamed_domains_rows`
-    /// expects under `platform` after each call.
-    async fn renamed_records_won(store: &AuthStore, live: &str, stale: &str) {
-        assert_eq!(
-            store
-                .domain_visibility("platform")
-                .await
-                .unwrap()
-                .map(|acl| acl.owner),
-            Some("keeper".to_string()),
-            "the renamed domain's owner, not the stale one"
-        );
-        let members: Vec<(String, MemberLevel)> = store
-            .domain_members("platform")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| (m.principal, m.level))
-            .collect();
-        assert_eq!(
-            members,
-            vec![("mem".to_string(), MemberLevel::Editor)],
-            "only the renamed domain's members, at their levels"
-        );
-        assert_eq!(
-            store.overlay_grant_domain(live).await.unwrap(),
-            Some("platform".to_string())
-        );
-        assert_eq!(
-            store.overlay_grant_domain(stale).await.unwrap(),
-            None,
-            "the stale share-link is gone"
-        );
-    }
-
-    /// A rename that changes only the case is a real rename: names are stored
-    /// as registered and compare byte for byte.
-    #[tokio::test]
-    async fn a_case_only_domain_rename_moves_the_records() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("Eng", true, "keeper")
-            .await
-            .unwrap();
-        store.rename_domain("Eng", "eng").await.unwrap();
-        assert!(store.domain_visibility("Eng").await.unwrap().is_none());
-        assert!(store.domain_visibility("eng").await.unwrap().is_some());
-    }
-
-    /// Privatizing a domain that is already private writes nothing: not the
-    /// owner, not the membership rows. It used to hand the domain to whoever
-    /// asked last, which made a retried request an ownership transfer nobody
-    /// asked for and dropped the previous owner - who holds no membership row
-    /// by construction - to no access at all.
-    #[tokio::test]
-    async fn privatizing_an_already_private_domain_writes_nothing() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap();
-
-        let again = store
-            .set_domain_visibility("lab", true, "out")
-            .await
-            .unwrap();
-        assert_eq!(
-            again,
-            VisibilityWrite::AlreadyPrivate {
-                owner: "keeper".to_string()
-            },
-            "the answer says it was already private, and names the owner it kept"
-        );
-        assert_eq!(
-            store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "keeper",
-            "a visibility statement is not an ownership transfer"
-        );
-        assert_eq!(
-            store.domain_members("lab").await.unwrap().len(),
-            1,
-            "and nobody was evicted"
-        );
-
-        // The verb that DOES change an owner still does, and still keeps the
-        // members: the two paths that change an owner must agree, and one of
-        // them is no longer this one.
-        store.transfer_domain("lab", "out").await.unwrap();
-        assert_eq!(
-            store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "out"
-        );
-        assert_eq!(
-            store.domain_members("lab").await.unwrap().len(),
-            1,
-            "an owner change is not an eviction"
-        );
-    }
-
-    // `promoting_a_member_to_owner_drops_the_row_that_now_says_less` used to sit
-    // here, promoting a member by privatizing an already-private domain with a
-    // new owner. That is not a thing this method does any more - privatizing
-    // one that is already private writes nothing at all - and the step it was
-    // really about is `transfer_domain`'s, which the test below pins on the one
-    // path that still takes it.
-
-    #[tokio::test]
-    async fn transfer_domain_swaps_the_owner_and_drops_its_member_row() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "out", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap();
-        store.transfer_domain("lab", "mem").await.unwrap();
-        assert_eq!(
-            store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "mem"
-        );
-        let members = store.domain_members("lab").await.unwrap();
-        assert_eq!(
-            members
-                .iter()
-                .map(|m| m.principal.as_str())
-                .collect::<Vec<_>>(),
-            vec!["out"],
-            "the new owner's membership row is gone: it could only say less"
-        );
-        assert!(store.memberships_of("mem").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn transfer_domain_refuses_a_shared_domain_and_a_dead_owner() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        let err = store
-            .transfer_domain("lab", "mem")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not private"), "{err}");
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        let err = store
-            .transfer_domain("lab", "ghost")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no such user"), "{err}");
-        assert_eq!(
-            store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "keeper",
-            "a refused transfer leaves the owner alone"
-        );
-    }
-
-    #[tokio::test]
-    async fn membership_is_upserted_and_removed_by_name() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "MEM", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "mem", MemberLevel::Manager, None, "keeper")
-            .await
-            .unwrap();
-        let members = store.domain_members("lab").await.unwrap();
-        assert_eq!(
-            members.len(),
-            1,
-            "an upsert replaces rather than duplicates"
-        );
-        assert_eq!(members[0].principal, "mem", "the name is folded");
-        assert_eq!(members[0].level, MemberLevel::Manager);
-        assert_eq!(members[0].added_by, "keeper");
-        assert!(!members[0].added_at.is_empty());
-        assert_eq!(
-            store.memberships_of("Mem").await.unwrap(),
-            vec![("lab".to_string(), MemberLevel::Manager)]
-        );
-        assert!(store.remove_domain_member("lab", "mem").await.unwrap());
-        assert!(
-            !store.remove_domain_member("lab", "mem").await.unwrap(),
-            "removing what is not there reports itself rather than erroring"
-        );
-        assert!(store.domain_members("lab").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn membership_refuses_a_shared_domain_a_stranger_and_the_owner() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        let err = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not private"), "{err}");
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        let err = store
-            .upsert_domain_member("lab", "ghost", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no such user"), "{err}");
-        let err = store
-            .upsert_domain_member("lab", "keeper", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("already holds every level"), "{err}");
-        store.set_disabled("mem", true).await.unwrap();
-        let err = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, None, "keeper")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("disabled"), "{err}");
-        let err = store
-            .upsert_domain_member("lab", "out", MemberLevel::Viewer, None, "  ")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("an actor to record it as"), "{err}");
-        assert!(store.domain_members("lab").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn removing_a_user_takes_its_memberships_with_it() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .add_user("boss", "boss", None, Role::Admin, "pw12345678")
-            .await
-            .unwrap();
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "mem", MemberLevel::Manager, None, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "out", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap();
-        store.remove_user("mem").await.unwrap();
-        store.remove_user_force("out").await.unwrap();
-        assert!(
-            store.domain_members("lab").await.unwrap().is_empty(),
-            "a re-added name must not inherit the old holder's access"
-        );
-    }
-
-    #[tokio::test]
-    async fn removing_a_user_leaves_the_domains_it_owned_owned_by_nobody() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap();
-        store.remove_user("keeper").await.unwrap();
-        let acl = store
-            .domain_visibility("lab")
-            .await
-            .unwrap()
-            .expect("the domain stays private when its owner goes");
-        assert_eq!(
-            acl.owner, "",
-            "owned by nobody: a name no live account can ever hold"
-        );
-        assert_eq!(
-            store.domain_members("lab").await.unwrap().len(),
-            1,
-            "and the people invited into it keep their levels"
-        );
-        // Re-adding the freed name mints a different person. The resolver half
-        // of this is `a_re_added_owner_name_does_not_inherit_the_domain` in
-        // `crate::scope`; here the record itself must not name them.
-        store
-            .add_user("keeper", "keeper", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        assert_eq!(
-            store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            ""
-        );
-        assert!(store.memberships_of("keeper").await.unwrap().is_empty());
-    }
-
-    /// The forced removal takes the same step. `remove_user_force` runs the
-    /// same four cleanups the guarded remove does, and this is the one of them
-    /// that widens rather than narrows if it is ever dropped: a private domain
-    /// left naming a departed account would hand it to whoever next signs up
-    /// under that login name. The guarded path is pinned above; a `--force`
-    /// removal is exactly the path an operator reaches for when the account
-    /// being removed is the last admin, so it must not be the one that leaks.
-    #[tokio::test]
-    async fn force_removing_a_user_also_leaves_its_domains_owned_by_nobody() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap();
-        store.remove_user_force("keeper").await.unwrap();
-        let acl = store
-            .domain_visibility("lab")
-            .await
-            .unwrap()
-            .expect("the domain stays private when its owner is forced out");
-        assert_eq!(
-            acl.owner, "",
-            "owned by nobody, exactly as the guarded removal leaves it"
-        );
-        assert_eq!(
-            store.domain_members("lab").await.unwrap().len(),
-            1,
-            "and the people invited into it keep their levels"
-        );
-    }
-
-    /// Every membership refusal carries its kind as a TYPE, and its own
-    /// sentence as the message.
-    ///
-    /// The pin that lets `rest::members` classify by value: matching prose
-    /// meant a rewording here silently turned a 409 into a 500. Both halves
-    /// are asserted - the kind, which the surface decides on, and the
-    /// message, which the operator-facing surfaces still print - so neither
-    /// can be dropped in favour of the other.
-    #[tokio::test]
-    async fn every_membership_refusal_carries_its_kind_and_its_words() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-
-        let shared = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&shared),
-            Some(RefusalKind::NotPrivate)
-        );
-        assert!(
-            format!("{shared:#}").contains("is not private"),
-            "{shared:#}"
-        );
-
-        let no_owner = store.transfer_domain("lab", "mem").await.unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&no_owner),
-            Some(RefusalKind::NotPrivate)
-        );
-
-        store
-            .set_domain_visibility("lab", true, "keeper")
-            .await
-            .unwrap();
-        let owner = store
-            .upsert_domain_member("lab", "keeper", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&owner),
-            Some(RefusalKind::OwnerIsNotAMember)
-        );
-        assert!(format!("{owner:#}").contains("owns domain"), "{owner:#}");
-
-        let ghost = store
-            .upsert_domain_member("lab", "ghost", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&ghost),
-            Some(RefusalKind::NoSuchAccount)
-        );
-
-        // A disabled account is the SAME kind as one that does not exist. The
-        // two are told apart only in the message, which is what lets a surface
-        // that must not distinguish them answer with one word-for-word reply
-        // and be sure it has no second branch.
-        store.set_disabled("mem", true).await.unwrap();
-        let disabled = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&disabled),
-            Some(RefusalKind::NoSuchAccount),
-            "an existing-but-disabled account is not a kind of its own"
-        );
-        assert!(
-            format!("{disabled:#}").contains("is disabled"),
-            "{disabled:#}"
-        );
-
-        // A principal that cannot be a login name at all carries its own kind,
-        // which is what lets the one route taking a principal in the BODY
-        // answer the 422 its documentation promises rather than a 500.
-        let malformed = store
-            .upsert_domain_member("lab", "  ", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&malformed),
-            Some(RefusalKind::InvalidName)
-        );
-
-        // A domain with no acl row is shared as far as this table knows, so it
-        // refuses as NotPrivate rather than as a fault. Named for what it
-        // asserts: this leg is not the no-kind one.
-        let unregistered = store
-            .upsert_domain_member("nosuchdomain", "mem", MemberLevel::Editor, None, "keeper")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&unregistered),
-            Some(RefusalKind::NotPrivate),
-            "a domain with no acl row is shared as far as this table knows"
-        );
-
-        // And a failure that is nobody's doing carries no kind at all, so the
-        // surfaces keep answering 500 for what is genuinely theirs. This is the
-        // arm `rest::members::store_error`'s `None` branch answers, and without
-        // a leg here nothing in the workspace pins it.
-        let no_actor = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, None, "  ")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&no_actor),
-            None,
-            "an empty actor is this server's own bug, not a refusal with a kind"
-        );
-        assert!(
-            format!("{no_actor:#}").contains("needs an actor"),
-            "{no_actor:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_membership_tables_survive_a_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        {
-            let store = AuthStore::open(&path).await.unwrap();
-            members_cast(&store).await;
-            store
-                .set_domain_visibility("lab", true, "keeper")
-                .await
-                .unwrap();
-            store
-                .upsert_domain_member("lab", "mem", MemberLevel::Manager, None, "keeper")
-                .await
-                .unwrap();
-        }
-        // The schema is idempotent DDL, so opening the same file again applies
-        // it a second time and must change nothing.
-        let store = AuthStore::open(&path).await.unwrap();
-        assert_eq!(
-            store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "keeper"
-        );
-        assert_eq!(
-            store.memberships_of("mem").await.unwrap(),
-            vec![("lab".to_string(), MemberLevel::Manager)]
-        );
-    }
-
-    #[test]
-    fn member_levels_round_trip_through_text_and_json() {
-        for level in [
-            MemberLevel::Viewer,
-            MemberLevel::Editor,
-            MemberLevel::Manager,
-        ] {
-            assert_eq!(level.to_string().parse::<MemberLevel>().unwrap(), level);
-            assert_eq!(
-                serde_json::to_string(&level).unwrap(),
-                format!("\"{}\"", level.as_str())
-            );
-        }
-        assert_eq!(
-            " Manager ".parse::<MemberLevel>().unwrap(),
-            MemberLevel::Manager
-        );
-        assert!("keeper".parse::<MemberLevel>().is_err());
-        assert_eq!(
-            member_level_from_db("nonsense"),
-            MemberLevel::Viewer,
-            "an unreadable row never fails open"
-        );
-    }
-
-    #[test]
-    fn a_domain_name_is_trimmed_and_never_empty() {
-        assert_eq!(normalize_domain("  lab ").unwrap(), "lab");
-        assert_eq!(normalize_domain("My Domain").unwrap(), "My Domain");
-        assert!(normalize_domain("   ").is_err());
-    }
-
-    // --- identity links ---------------------------------------------------
-
-    /// An account provisioned from an identity is found back by that
-    /// identity, and by nothing else.
-    #[tokio::test]
-    async fn a_provisioned_identity_is_found_back_by_its_pair() {
-        let (_dir, store) = store().await;
-        let user = store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "ada",
-                Some("Ada Lovelace"),
-                Some("ada@example.test"),
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        assert_eq!(user.name, "ada");
-        assert_eq!(user.display, "Ada Lovelace");
-        assert_eq!(user.email.as_deref(), Some("ada@example.test"));
-        assert_eq!(user.role, Role::Viewer);
-
-        let found = store
-            .linked_user("https://idp.example", "sub-1")
-            .await
-            .unwrap()
-            .expect("the pair names the account");
-        assert_eq!(found.name, "ada");
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-2")
-                .await
-                .unwrap()
-                .is_none(),
-            "another subject at the same issuer is another person"
-        );
-        assert!(
-            store
-                .linked_user("https://other.example", "sub-1")
-                .await
-                .unwrap()
-                .is_none(),
-            "the same subject at another issuer is another person"
-        );
-        let links = store.identity_links("ada").await.unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].issuer, "https://idp.example");
-        assert_eq!(links[0].subject, "sub-1");
-        assert_eq!(links[0].linked_by, "jit");
-        assert!(!links[0].linked_at.is_empty());
-    }
-
-    /// A link whose account is gone is swept the moment it is looked up,
-    /// rather than left dormant for the next account to take the name.
-    ///
-    /// The direct analogue of
-    /// `an_orphaned_session_row_is_swept_rather_than_inherited`, and for the
-    /// same reason: an identity link is a credential, and a dormant one signs
-    /// a stranger into whoever next holds that login name.
-    #[tokio::test]
-    async fn an_orphaned_identity_link_is_swept_rather_than_inherited() {
-        let (_dir, store) = store().await;
-        store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "ada",
-                Some("Ada"),
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        // Delete only the account row. Both removal paths are transactional
-        // and sweep the links themselves, so this is the state a differently
-        // built binary writing the same file, a hand edit, or a future
-        // deletion path that forgets the sweep would leave behind.
-        store
-            .conn
-            .execute(
-                "DELETE FROM users WHERE name = ?1",
-                vec![Value::Text("ada".to_string())],
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-1")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        store
-            .add_user("ada", "Ada The Second", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-1")
-                .await
-                .unwrap()
-                .is_none(),
-            "the orphan must have been swept, not left dormant"
-        );
-        assert!(
-            store.identity_links("ada").await.unwrap().is_empty(),
-            "and the account that took the name inherits nothing"
-        );
-    }
-
-    /// The engine enforces both constraints, not only `insert_link`'s checks:
-    /// a raw duplicate pair and a second identity for one account at one
-    /// issuer are both refused by the database itself.
-    #[tokio::test]
-    async fn the_database_itself_refuses_a_duplicate_pair_and_a_second_identity() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
-            .await
-            .unwrap();
-        let insert = |subject: &str, user: &str| {
-            store.conn.execute(
-                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![
-                    Value::Text("https://idp.example".to_string()),
-                    Value::Text(subject.to_string()),
-                    Value::Text(user.to_string()),
-                    Value::Text("2026-09-07T00:00:00Z".to_string()),
-                    Value::Text("test".to_string()),
-                ],
-            )
-        };
-        insert("sub-1", "ada").await.unwrap();
-        assert!(
-            insert("sub-1", "ada").await.is_err(),
-            "the primary key on (issuer, subject) is the engine's, not ours"
-        );
-        assert!(
-            insert("sub-2", "ada").await.is_err(),
-            "and one account holds one identity per issuer, by unique index"
-        );
-    }
-
-    /// A name already taken is uniquified rather than joined, and the
-    /// suffixes keep counting.
-    #[tokio::test]
-    async fn provisioning_uniquifies_a_taken_name() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        let second = store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "Ada",
-                None,
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.name, "ada-2");
-        let third = store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-2",
-                "ada",
-                None,
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        assert_eq!(third.name, "ada-3");
-        assert_eq!(
-            store.user("ada").await.unwrap().unwrap().role,
-            Role::Admin,
-            "the account that held the name is untouched"
-        );
-    }
-
-    /// Provisioning honours the account cap, and refuses in words that name
-    /// the setting.
-    #[tokio::test]
-    async fn provisioning_refuses_past_the_account_cap() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        let err = store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "grace",
-                None,
-                None,
-                Role::Viewer,
-                1,
-            )
-            .await
-            .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("auth.max_users"), "{message}");
-        assert!(store.user("grace").await.unwrap().is_none());
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-1")
-                .await
-                .unwrap()
-                .is_none(),
-            "a refused provisioning leaves no link behind"
-        );
-    }
-
-    /// A pair belongs to one account, and an account holds one identity per
-    /// issuer. Both refusals name what is in the way.
-    #[tokio::test]
-    async fn a_pair_links_once_and_an_account_holds_one_identity_per_issuer() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        store
-            .add_user("grace", "Grace", None, Role::Editor, "correct horse")
-            .await
-            .unwrap();
-        store
-            .link_identity("https://idp.example", "sub-1", "ada", "ada")
-            .await
-            .unwrap();
-
-        let err = store
-            .link_identity("https://idp.example", "sub-1", "grace", "grace")
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("already linked"), "{err:#}");
-
-        let err = store
-            .link_identity("https://idp.example", "sub-2", "ada", "ada")
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("already holds"), "{err:#}");
-
-        // A second issuer is a second identity, and that is allowed.
-        store
-            .link_identity("https://other.example", "sub-2", "ada", "ada")
-            .await
-            .unwrap();
-        assert_eq!(store.identity_links("ada").await.unwrap().len(), 2);
-        assert!(store.identity_links("grace").await.unwrap().is_empty());
-    }
-
-    /// Linking refuses a name that is nobody, so a link can never point at an
-    /// account that does not exist.
-    #[tokio::test]
-    async fn an_identity_cannot_be_linked_to_a_name_that_is_nobody() {
-        let (_dir, store) = store().await;
-        let err = store
-            .link_identity("https://idp.example", "sub-1", "ghost", "admin")
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("no such user"), "{err:#}");
-    }
-
-    /// Unlinking removes the link and says whether there was one.
-    #[tokio::test]
-    async fn unlinking_reports_whether_it_removed_anything() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        store
-            .link_identity("https://idp.example", "sub-1", "ada", "ada")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .unlink_identity("https://idp.example", "ada")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .unlink_identity("https://idp.example", "ada")
-                .await
-                .unwrap(),
-            "the second unlink had nothing to remove"
-        );
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-1")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// An account provisioned by a sign-on has no password, so its identity
-    /// link is the only way into it: unlinking the last one is refused, in
-    /// words that name the command which gives it a second way in.
-    #[tokio::test]
-    async fn unlinking_the_last_way_into_an_account_is_refused() {
-        let (_dir, store) = store().await;
-        store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "ada",
-                None,
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        let err = store
-            .unlink_identity("https://idp.example", "ada")
-            .await
-            .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("crystalline users passwd"),
-            "the refusal teaches the way out: {message}"
-        );
-        assert_eq!(
-            StoreRefusal::kind_of(&err),
-            Some(RefusalKind::LastCredential),
-            "the refusal travels as a type, not as prose"
-        );
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-1")
-                .await
-                .unwrap()
-                .is_some(),
-            "a refused unlink removes nothing"
-        );
-    }
-
-    /// The rule is about the last way IN, not about the last link: an account
-    /// with a password may unlink everything, and an account with two
-    /// identities may unlink one of them.
-    #[tokio::test]
-    async fn a_second_way_in_is_what_makes_an_unlink_allowed() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        store
-            .link_identity("https://idp.example", "sub-1", "ada", "ada")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .unlink_identity("https://idp.example", "ada")
-                .await
-                .unwrap(),
-            "a password is the other way in"
-        );
-
-        store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-2",
-                "grace",
-                None,
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        store
-            .link_identity("https://other.example", "sub-9", "grace", "grace")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .unlink_identity("https://idp.example", "grace")
-                .await
-                .unwrap(),
-            "the other identity is the other way in"
-        );
-        let err = store
-            .unlink_identity("https://other.example", "grace")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&err),
-            Some(RefusalKind::LastCredential),
-            "the one that is left is the last way in"
-        );
-    }
-
-    /// An unlink that removes nothing is not a refusal: the account keeps
-    /// whatever it had, so there is nothing to protect it from.
-    #[tokio::test]
-    async fn an_unlink_at_an_issuer_holding_no_link_is_a_no_op() {
-        let (_dir, store) = store().await;
-        store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "ada",
-                None,
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        assert!(
-            !store
-                .unlink_identity("https://elsewhere.example", "ada")
-                .await
-                .unwrap(),
-            "there was no link at that issuer to remove"
-        );
-    }
-
-    /// The admin repair: an operator whose provider re-issued its subjects
-    /// unlinks the stale identity and links the new one, which needs a way
-    /// past the guard. Forcing it is the only way, and it does strand the
-    /// account until the link is remade.
-    #[tokio::test]
-    async fn a_forced_unlink_is_the_admin_repair() {
-        let (_dir, store) = store().await;
-        store
-            .provision_linked_user(
-                "https://idp.example",
-                "old-sub",
-                "ada",
-                None,
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .unlink_identity_force("https://idp.example", "ada")
-                .await
-                .unwrap()
-        );
-        assert!(store.identity_links("ada").await.unwrap().is_empty());
-        store
-            .link_identity("https://idp.example", "new-sub", "ada", LINKED_BY_CLI)
-            .await
-            .unwrap();
-        let found = store
-            .linked_user("https://idp.example", "new-sub")
-            .await
-            .unwrap()
-            .expect("the repaired pair names the account");
-        assert_eq!(found.name, "ada");
-        assert_eq!(
-            store.identity_links("ada").await.unwrap()[0].linked_by,
-            LINKED_BY_CLI
-        );
-    }
-
-    /// Whether an account has a local password, which is what the unlink rule
-    /// and the profile card both turn on. A name that is nobody has none.
-    #[tokio::test]
-    async fn a_password_is_reported_without_being_read_back() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        store
-            .provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "grace",
-                None,
-                None,
-                Role::Viewer,
-                100,
-            )
-            .await
-            .unwrap();
-        assert!(store.has_password("ada").await.unwrap());
-        assert!(!store.has_password("grace").await.unwrap());
-        assert!(!store.has_password("nobody").await.unwrap());
-        store.set_password("grace", "correct horse").await.unwrap();
-        assert!(
-            store.has_password("grace").await.unwrap(),
-            "`users passwd` is what gives a provisioned account a second way in"
-        );
-    }
-
-    /// Removing an account takes its identity links with it, so the pair
-    /// cannot resurrect a deleted account on the next sign-in.
-    #[tokio::test]
-    async fn removing_an_account_takes_its_identity_links() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        store
-            .add_user("grace", "Grace", None, Role::Admin, "correct horse")
-            .await
-            .unwrap();
-        store
-            .link_identity("https://idp.example", "sub-1", "ada", "ada")
-            .await
-            .unwrap();
-        store
-            .link_identity("https://idp.example", "sub-2", "grace", "grace")
-            .await
-            .unwrap();
-
-        store.remove_user("ada").await.unwrap();
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-1")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        store.remove_user_force("grace").await.unwrap();
-        assert!(
-            store
-                .linked_user("https://idp.example", "sub-2")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// Presentation data refreshes, and an absent claim clears nothing.
-    #[tokio::test]
-    async fn refreshing_presentation_never_clears_what_was_not_sent() {
-        let (_dir, store) = store().await;
-        store
-            .add_user(
-                "ada",
-                "Ada",
-                Some("ada@example.test"),
-                Role::Editor,
-                "correct horse",
-            )
-            .await
-            .unwrap();
-        let refreshed = store
-            .refresh_presentation("ada", Some("Ada L"), Some("new@example.test"))
-            .await
-            .unwrap();
-        assert_eq!(refreshed.display, "Ada L");
-        assert_eq!(refreshed.email.as_deref(), Some("new@example.test"));
-        assert_eq!(refreshed.role, Role::Editor, "presentation moves no role");
-
-        let untouched = store.refresh_presentation("ada", None, None).await.unwrap();
-        assert_eq!(untouched.display, "Ada L");
-        assert_eq!(untouched.email.as_deref(), Some("new@example.test"));
-    }
-
-    /// Two first sign-ins for one subject leave one account and one link.
-    ///
-    /// The property the single transaction buys: the loser's account insert
-    /// rolls back with its refused link, rather than staying behind as an
-    /// orphan nobody can sign into. An implementation that created the account
-    /// and linked it in two calls would pass every other test here and leave
-    /// `ada-2` behind on this one.
-    #[tokio::test]
-    async fn two_first_sign_ins_for_one_subject_leave_one_account_and_one_link() {
-        let (_dir, store) = store().await;
-        let provision = || {
-            store.provision_linked_user(
-                "https://idp.example",
-                "sub-1",
-                "ada",
-                Some("Ada"),
-                None,
-                Role::Viewer,
-                100,
-            )
-        };
-        let outcomes = {
-            let (first, second) = tokio::join!(provision(), provision());
-            [first, second]
-        };
-        assert_eq!(
-            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
-            1,
-            "exactly one of the two races provisions"
-        );
-        let refusal = outcomes
-            .iter()
-            .find_map(|outcome| outcome.as_ref().err())
-            .expect("the loser is refused");
-        assert!(
-            format!("{refusal:#}").contains("already linked"),
-            "{refusal:#}"
-        );
-        assert_eq!(
-            store.list_users().await.unwrap().len(),
-            1,
-            "the loser left no orphan account behind"
-        );
-        assert_eq!(store.identity_links("ada").await.unwrap().len(), 1);
-    }
-
-    /// The resource every grant below is issued for: the origin the MCP
-    /// transport is served from, no trailing slash, which is the spelling
-    /// [`normalize_resource`] settles on.
-    const OAUTH_RESOURCE: &str = "https://crystal.example";
-
-    /// The OAuth cast every grant test starts from: one account and one
-    /// registered client.
-    async fn oauth_cast(store: &AuthStore) -> OauthClient {
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        store
-            .register_oauth_client(
-                "Some Client",
-                Some("https://client.example"),
-                &["https://client.example/callback".to_string()],
-            )
-            .await
-            .unwrap()
-    }
-
-    /// One integer column of one grant row, for the assertions that are about
-    /// what the database holds rather than about what a method answered.
-    async fn grant_int(store: &AuthStore, id: i64, column: &str) -> i64 {
-        let row = store
-            .query_first(
-                &format!("SELECT {column} FROM oauth_grants WHERE id = ?1"),
-                vec![Value::Integer(id)],
-            )
-            .await
-            .unwrap()
-            .expect("the grant row is there");
-        match row.get_value(0) {
-            Ok(Value::Integer(n)) => n,
-            other => panic!("unexpected {column}: {other:?}"),
-        }
-    }
-
-    /// The same for a text column.
-    async fn grant_text(store: &AuthStore, id: i64, column: &str) -> String {
-        let row = store
-            .query_first(
-                &format!("SELECT {column} FROM oauth_grants WHERE id = ?1"),
-                vec![Value::Integer(id)],
-            )
-            .await
-            .unwrap()
-            .expect("the grant row is there");
-        cell_text(&row, 0).unwrap_or_default()
-    }
-
-    /// One text column of the token row a refresh token is stored under.
-    async fn token_text(store: &AuthStore, refresh_token: &str, column: &str) -> Option<String> {
-        let row = store
-            .query_first(
-                &format!("SELECT {column} FROM oauth_grant_token WHERE refresh_hash = ?1"),
-                vec![Value::Text(token_hash(refresh_token))],
-            )
-            .await
-            .unwrap()
-            .expect("the token row is there");
-        cell_text(&row, 0)
-    }
-
-    /// The same for an integer column, `None` for NULL.
-    async fn token_int(store: &AuthStore, refresh_token: &str, column: &str) -> Option<i64> {
-        let row = store
-            .query_first(
-                &format!("SELECT {column} FROM oauth_grant_token WHERE refresh_hash = ?1"),
-                vec![Value::Text(token_hash(refresh_token))],
-            )
-            .await
-            .unwrap()
-            .expect("the token row is there");
-        match row.get_value(0) {
-            Ok(Value::Integer(n)) => Some(n),
-            _ => None,
-        }
-    }
-
-    async fn count_rows(store: &AuthStore, table: &str) -> i64 {
-        let row = store
-            .query_first(&format!("SELECT COUNT(*) FROM {table}"), vec![])
-            .await
-            .unwrap()
-            .expect("COUNT(*) always answers");
-        match row.get_value(0) {
-            Ok(Value::Integer(n)) => n,
-            other => panic!("unexpected COUNT(*) result: {other:?}"),
-        }
-    }
-
-    /// A password reset also ends what an agent was given under the old
-    /// password: the account's MCP tokens and its OAuth grants, access and
-    /// refresh token alike. Another account's credentials are left alone.
-    #[tokio::test]
-    async fn a_password_reset_revokes_mcp_tokens_and_oauth_grants() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        store
-            .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let token = store.issue_mcp_token("ada", "agent").await.unwrap();
-        let grant = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let other_token = store.issue_mcp_token("bob", "agent").await.unwrap();
-        let other_grant = store
-            .issue_oauth_grant("bob", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        // An earlier ended grant, whose record the reset must keep.
-        let earlier = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        assert!(store.revoke_oauth_grant("ada", earlier.id).await.unwrap());
-
-        store.set_password("ada", "a new password").await.unwrap();
-
-        // The person sees on the Connected clients card why the client was
-        // signed out, and the record of the earlier revoke is still there.
-        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
-        let reasons: Vec<_> = ended
-            .iter()
-            .map(|g| (g.id, g.ended.as_ref().unwrap().reason))
-            .collect();
-        assert_eq!(ended.len(), 2, "{reasons:?}");
-        assert!(reasons.contains(&(grant.id, OauthGrantEndReason::PasswordReset)));
-        assert!(reasons.contains(&(earlier.id, OauthGrantEndReason::Revoked)));
-        assert_eq!(
-            count_rows(&store, "oauth_grant_token").await,
-            1,
-            "only bob's"
-        );
-        assert!(
-            store
-                .list_ended_oauth_grants("bob")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        assert!(
-            store.mcp_token_user(&token.token).await.unwrap().is_none(),
-            "the MCP token from before the reset is dead"
-        );
-        assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
-        assert!(
-            store
-                .oauth_access_user(&grant.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "the OAuth access token from before the reset is dead"
-        );
-        assert!(
-            matches!(
-                store
-                    .refresh_oauth_grant(&grant.refresh_token, &client.client_id, None)
-                    .await
-                    .unwrap(),
-                RefreshOutcome::Unknown
-            ),
-            "and its refresh token cannot mint a new one"
-        );
-        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
-
-        assert!(
-            store
-                .mcp_token_user(&other_token.token)
-                .await
-                .unwrap()
-                .is_some(),
-            "another account keeps its MCP token"
-        );
-        assert!(
-            store
-                .oauth_access_user(&other_grant.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some(),
-            "and its OAuth grant"
-        );
-    }
-
-    /// Removing an account takes its ended-grant records with it: there is
-    /// nobody left to read them, and the name may be claimed again.
-    #[tokio::test]
-    async fn removing_an_account_drops_its_ended_grant_records() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store.set_password("ada", "a new password").await.unwrap();
-        assert_eq!(store.list_ended_oauth_grants("ada").await.unwrap().len(), 1);
-        store.remove_user("ada").await.unwrap();
-        assert_eq!(count_rows(&store, "oauth_grant_ended").await, 0);
-    }
-
-    /// A refused reset revokes nothing: the account that does not exist takes
-    /// no other account's tokens with it, and the transaction rolls back.
-    #[tokio::test]
-    async fn a_refused_password_reset_keeps_every_token() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let token = store.issue_mcp_token("ada", "agent").await.unwrap();
-        let grant = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        assert!(store.set_password("ghost", "pw").await.is_err());
-        assert!(store.mcp_token_user(&token.token).await.unwrap().is_some());
-        assert!(
-            store
-                .list_ended_oauth_grants("ada")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            store
-                .oauth_access_user(&grant.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    /// The audience rule and the expiry, the two properties an access token
-    /// carries beyond "this is ada". The expiry is reached by winding the
-    /// column back through the connection, because `issue_oauth_grant` takes
-    /// no TTL: the thirty days and the hour are the store's, not a caller's.
-    #[tokio::test]
-    async fn an_oauth_grant_resolves_only_for_its_resource_and_until_it_expires() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        assert!(issued.access_token.starts_with(OAUTH_ACCESS_PREFIX));
-        assert!(issued.refresh_token.starts_with(OAUTH_REFRESH_PREFIX));
-        assert_eq!(issued.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
-        assert_eq!(
-            token_text(&store, &issued.refresh_token, "access_hash").await,
-            Some(token_hash(&issued.access_token)),
-            "only the hash is written, the same way an MCP token is stored"
-        );
-        assert!(
-            grant_text(&store, issued.id, "access_hash")
-                .await
-                .starts_with(OAUTH_PLACEHOLDER_PREFIX),
-            "the grant row's own token columns hold only placeholders"
-        );
-
-        let user = store
-            .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-            .await
-            .unwrap()
-            .expect("the token resolves for the resource it was issued for");
-        assert_eq!(user.name, "ada");
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, "https://crystal.example/")
-                .await
-                .unwrap()
-                .is_some(),
-            "one trailing slash is the same resource"
-        );
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, "https://other.example")
-                .await
-                .unwrap()
-                .is_none(),
-            "a token issued for one resource never opens another"
-        );
-        assert!(
-            store
-                .oauth_access_user("coa_not-a-token", OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let listed = store.list_oauth_grants("ada").await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert!(
-            listed[0].last_used.is_some(),
-            "resolving stamped the grant, which is what the management list shows"
-        );
-
-        store.set_disabled("ada", true).await.unwrap();
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "a disabled account's grant resolves for nobody"
-        );
-        store.set_disabled("ada", false).await.unwrap();
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some(),
-            "and re-enabling hands it back, the way a disabled account's MCP tokens come back"
-        );
-
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_grant_token SET access_expires_at = 1 WHERE grant_id = ?1",
-                vec![Value::Integer(issued.id)],
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "an expired access token resolves for nobody"
-        );
-    }
-
-    /// A grant is a row about an account and a registration, so neither may be
-    /// invented by the write. The transaction is what makes the two checks
-    /// mean anything at the moment of the insert.
-    #[tokio::test]
-    async fn a_grant_needs_a_live_account_and_a_registered_client() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let ghost = store
-            .issue_oauth_grant("ghost", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .expect_err("an account that is nobody gets no grant");
-        assert!(format!("{ghost:#}").contains("no such user"), "{ghost:#}");
-
-        let stranger = store
-            .issue_oauth_grant("ada", "coc_nobody", OAUTH_RESOURCE)
-            .await
-            .expect_err("a registration that does not exist gets no grant");
-        assert!(
-            format!("{stranger:#}").contains("no such oauth client"),
-            "{stranger:#}"
-        );
-
-        store.set_disabled("ada", true).await.unwrap();
-        let disabled = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .expect_err("a disabled account gets no new grant");
-        assert!(format!("{disabled:#}").contains("disabled"), "{disabled:#}");
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-    }
-
-    /// What a rotation is: one grant row moved along, both tokens replaced,
-    /// the predecessor's access token dead on the spot and the refresh window
-    /// restarted. Presenting the predecessor's *refresh* token is a replay
-    /// rather than a miss, so that half is
-    /// [`a_replayed_refresh_token_revokes_the_whole_grant`]'s.
-    #[tokio::test]
-    async fn a_refresh_rotates_both_tokens_and_the_predecessor_stops_working() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let first = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        // Bring the refresh window in close, so "the thirty days start at
-        // rotation" cannot pass by accident on the window the issue opened.
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_grants SET refresh_expires_at = ?2 WHERE id = ?1",
-                vec![
-                    Value::Integer(first.id),
-                    Value::Integer(chrono::Utc::now().timestamp() + 60),
-                ],
-            )
-            .await
-            .unwrap();
-
-        let outcome = store
-            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(second) = outcome else {
-            panic!("a live refresh token rotates, got {outcome:?}");
-        };
-        assert_eq!(
-            second.id, first.id,
-            "a rotation moves one grant along rather than forking it"
-        );
-        assert_ne!(second.access_token, first.access_token);
-        assert_ne!(second.refresh_token, first.refresh_token);
-        assert_eq!(second.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
-        assert!(
-            store
-                .oauth_access_user(&first.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "the predecessor's access token stops the moment its successor exists"
-        );
-        assert!(
-            store
-                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            grant_int(&store, first.id, "refresh_expires_at").await
-                > chrono::Utc::now().timestamp() + OAUTH_REFRESH_TTL_SECS - 60,
-            "the new refresh token's thirty days start at the rotation"
-        );
-        assert!(
-            token_int(&store, &first.refresh_token, "rotated_at")
-                .await
-                .is_some(),
-            "a rotated row is kept with its rotation time, which is what makes a replay detectable"
-        );
-        assert!(
-            token_text(&store, &first.refresh_token, "access_hash")
-                .await
-                .is_none(),
-            "and its access token is gone"
-        );
-        assert_eq!(
-            token_text(&store, &second.refresh_token, "rotated_from").await,
-            Some(token_hash(&first.refresh_token)),
-            "the successor names what it was minted from"
-        );
-        assert_eq!(store.list_oauth_grants("ada").await.unwrap().len(), 1);
-    }
-
-    /// A rotated refresh token coming back is evidence that a copy of it
-    /// leaked, so the grant it belonged to is revoked rather than refreshed -
-    /// and it is evidence whoever presents it, which is why the rule keys on
-    /// the token alone while a rotation keys on the token and its client.
-    #[tokio::test]
-    async fn a_replayed_refresh_token_revokes_the_whole_grant() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let stranger = store
-            .register_oauth_client(
-                "Another Client",
-                None,
-                &["https://x.example/cb".to_string()],
-            )
-            .await
-            .unwrap();
-        let first = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let outcome = store
-            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(second) = outcome else {
-            panic!("a live refresh token rotates, got {outcome:?}");
-        };
-
-        let replay = store
-            .refresh_oauth_grant(&first.refresh_token, &stranger.client_id, None)
-            .await
-            .unwrap();
-        match replay {
-            RefreshOutcome::Replayed { grant, .. } => assert_eq!(grant, first.id),
-            other => panic!("a rotated refresh token is a replay, got {other:?}"),
-        }
-        assert!(
-            store
-                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "the revocation took the successor's access token with it"
-        );
-        assert!(
-            matches!(
-                store
-                    .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
-                    .await
-                    .unwrap(),
-                RefreshOutcome::Unknown
-            ),
-            "and its refresh token, because the whole row is gone"
-        );
-        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
-        assert_eq!(ended.len(), 1, "the replay is recorded");
-        assert_eq!(
-            ended[0].ended.as_ref().map(|e| e.reason),
-            Some(OauthGrantEndReason::Replayed)
-        );
-    }
-
-    /// A token two rotations back is a replay, even inside the grace window.
-    /// The token it was rotated into has itself been rotated, so whoever
-    /// held the answer has moved on and does not need the old token any
-    /// more: its return is evidence of a copy, not of a parallel session.
-    #[tokio::test]
-    async fn a_token_two_rotations_back_is_a_replay() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let first = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let outcome = store
-            .refresh_oauth_grant_at(&first.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(second) = outcome else {
-            panic!("a live refresh token rotates, got {outcome:?}");
-        };
-        let outcome = store
-            .refresh_oauth_grant_at(&second.refresh_token, &client.client_id, None, now + 1)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(third) = outcome else {
-            panic!("the successor rotates in its turn, got {outcome:?}");
-        };
-        assert!(
-            store
-                .oauth_access_user(&third.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        match store
-            .refresh_oauth_grant_at(&first.refresh_token, &client.client_id, None, now + 2)
-            .await
-            .unwrap()
-        {
-            RefreshOutcome::Replayed {
-                grant,
-                since_rotation,
-            } => {
-                assert_eq!(grant, first.id);
-                assert_eq!(since_rotation, 2, "seconds since its own rotation");
-            }
-            other => panic!("the token two rotations back is a replay, got {other:?}"),
-        }
-        assert!(
-            store
-                .oauth_access_user(&third.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "the replay revoked the grant, the newest pair with it"
-        );
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-        assert_eq!(count_rows(&store, "oauth_grant_token").await, 0);
-    }
-
-    /// The three ways a refresh misses without being a replay. None of them
-    /// may touch the grant: an unknown token is a stranger, a live token at
-    /// the wrong registration is a client mixing up its credentials, and an
-    /// expired one is a client that waited too long. Only a token that was
-    /// actually rotated revokes anything.
-    #[tokio::test]
-    async fn an_unknown_refresh_token_is_neither_rotated_nor_a_replay() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let stranger = store
-            .register_oauth_client(
-                "Another Client",
-                None,
-                &["https://x.example/cb".to_string()],
-            )
-            .await
-            .unwrap();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-
-        for (token, client_id, why) in [
-            (
-                "cor_nothing".to_string(),
-                client.client_id.clone(),
-                "a token nobody issued",
-            ),
-            (
-                issued.refresh_token.clone(),
-                stranger.client_id.clone(),
-                "a live token at the wrong registration",
-            ),
-        ] {
-            assert!(
-                matches!(
-                    store
-                        .refresh_oauth_grant(&token, &client_id, None)
-                        .await
-                        .unwrap(),
-                    RefreshOutcome::Unknown
-                ),
-                "{why} rotates nothing"
-            );
-        }
-
-        store.set_disabled("ada", true).await.unwrap();
-        assert!(
-            matches!(
-                store
-                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
-                    .await
-                    .unwrap(),
-                RefreshOutcome::Unknown
-            ),
-            "a disabled account refreshes nothing"
-        );
-        store.set_disabled("ada", false).await.unwrap();
-
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_grants SET refresh_expires_at = 1 WHERE id = ?1",
-                vec![Value::Integer(issued.id)],
-            )
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                store
-                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
-                    .await
-                    .unwrap(),
-                RefreshOutcome::Unknown
-            ),
-            "an expired refresh token rotates nothing"
-        );
-        assert_eq!(
-            count_rows(&store, "oauth_grants").await,
-            1,
-            "and none of the four refusals deleted the grant"
-        );
-    }
-
-    /// Revoking is one delete, so both of a grant's tokens stop together, and
-    /// removing the account sweeps what is left - the resurrection hazard
-    /// `mcp_tokens` documents, one table over: a grant row that outlived its
-    /// account would be inherited by the next holder of the freed name.
-    #[tokio::test]
-    async fn revoking_a_grant_stops_both_tokens_and_removing_the_account_sweeps_them() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-
-        let listed = store.list_oauth_grants("ada").await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, issued.id);
-        assert_eq!(listed[0].client_id, client.client_id);
-        assert_eq!(listed[0].client_name, "Some Client");
-        assert_eq!(
-            listed[0].redirect_host, "client.example",
-            "the card names the host the client redirects to"
-        );
-        assert!(listed[0].last_used.is_none());
-        assert!(
-            chrono::DateTime::parse_from_rfc3339(&listed[0].refresh_expires_at).is_ok(),
-            "the expiry a person reads is RFC 3339: {}",
-            listed[0].refresh_expires_at
-        );
-
-        store
-            .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        assert!(
-            !store.revoke_oauth_grant("bob", issued.id).await.unwrap(),
-            "another account's revoke never reaches this grant"
-        );
-        assert!(store.revoke_oauth_grant("ada", issued.id).await.unwrap());
-        assert!(
-            !store.revoke_oauth_grant("ada", issued.id).await.unwrap(),
-            "a second revoke removes nothing"
-        );
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            matches!(
-                store
-                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
-                    .await
-                    .unwrap(),
-                RefreshOutcome::Unknown
-            ),
-            "one deleted row stops both tokens at once"
-        );
-
-        let second = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store.remove_user("ada").await.unwrap();
-        assert!(
-            store
-                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            count_rows(&store, "oauth_grants").await,
-            0,
-            "the removal swept the row rather than leaving it for the next holder of the name"
-        );
-        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
-    }
-
-    /// The forced removal path sweeps the same rows the guarded one does. The
-    /// two are separate statements that have to be kept in step, which is why
-    /// every sweep on this file carries a test on both.
-    #[tokio::test]
-    async fn force_removing_an_account_sweeps_its_oauth_grants_too() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store.remove_user_force("ada").await.unwrap();
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-    }
-
-    /// A registration is what a client gets instead of a secret, so it has to
-    /// come back exactly as it was written, including the order of its
-    /// redirect uris - the token endpoint compares against them.
-    #[tokio::test]
-    async fn a_registration_is_read_back_by_its_client_id_and_touched() {
-        let (_dir, store) = store().await;
-        assert_eq!(store.count_oauth_clients().await.unwrap(), 0);
-        let uris = vec![
-            "http://127.0.0.1:33418/callback".to_string(),
-            "https://client.example/cb".to_string(),
-        ];
-        let client = store
-            .register_oauth_client("Some Client", Some("https://client.example"), &uris)
-            .await
-            .unwrap();
-        assert!(client.client_id.starts_with(OAUTH_CLIENT_PREFIX));
-        assert_eq!(
-            client.client_id.len(),
-            OAUTH_CLIENT_PREFIX.len() + 32,
-            "a client id is the prefix plus 32 hex characters"
-        );
-        assert!(client.last_used.is_none());
-
-        let read = store
-            .oauth_client(&client.client_id)
-            .await
-            .unwrap()
-            .expect("the registration reads back by its id");
-        assert_eq!(read.client_name, "Some Client");
-        assert_eq!(read.client_uri.as_deref(), Some("https://client.example"));
-        assert_eq!(read.redirect_uris, uris);
-        assert_eq!(read.created_at, client.created_at);
-        assert!(store.oauth_client("coc_nobody").await.unwrap().is_none());
-        assert_eq!(store.count_oauth_clients().await.unwrap(), 1);
-
-        store.touch_oauth_client(&client.client_id).await.unwrap();
-        let touched = store
-            .oauth_client(&client.client_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            touched.last_used.is_some(),
-            "an authorization a person allowed stamps the registration"
-        );
-        store
-            .touch_oauth_client("coc_nobody")
-            .await
-            .expect("touching a registration that is gone is a no-op, not an error");
-
-        assert!(
-            store
-                .register_oauth_client("Some Client", None, &[])
-                .await
-                .is_err(),
-            "a registration with nowhere to redirect is refused"
-        );
-        let second = store
-            .register_oauth_client("Another", None, &["https://a.example/cb".to_string()])
-            .await
-            .unwrap();
-        assert_ne!(second.client_id, client.client_id);
-        assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
-    }
-
-    /// Registrations arrive one per fresh connection and nobody deletes them,
-    /// so the store prunes the ones that never became a connection. A
-    /// registration somebody is still connected through is never pruned, and
-    /// an authorization a person allowed buys another thirty days.
-    #[tokio::test]
-    async fn an_unused_registration_is_pruned_after_thirty_days() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let fresh = store
-            .register_oauth_client("Fresh", None, &["https://fresh.example/cb".to_string()])
-            .await
-            .unwrap();
-        let stale = store
-            .register_oauth_client("Stale", None, &["https://stale.example/cb".to_string()])
-            .await
-            .unwrap();
-        let used = store
-            .register_oauth_client("Used", None, &["https://used.example/cb".to_string()])
-            .await
-            .unwrap();
-        let issued = store
-            .issue_oauth_grant("ada", &used.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-
-        // Age two of the three through the connection: the thirty days are the
-        // store's, and no method winds the clock back.
-        let long_ago = "2020-01-01T00:00:00+00:00";
-        for id in [&stale.client_id, &used.client_id] {
-            store
-                .conn
-                .execute(
-                    "UPDATE oauth_clients SET created_at = ?2, last_used = NULL
-                     WHERE client_id = ?1",
-                    vec![Value::Text(id.clone()), Value::Text(long_ago.to_string())],
-                )
-                .await
-                .unwrap();
-        }
-        assert_eq!(store.count_oauth_clients().await.unwrap(), 3);
-        assert_eq!(
-            store.prune_oauth_clients().await.unwrap(),
-            1,
-            "only the old registration that never produced a grant goes"
-        );
-        assert!(
-            store
-                .oauth_client(&stale.client_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .oauth_client(&fresh.client_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "a registration inside the window stays"
-        );
-        assert!(
-            store.oauth_client(&used.client_id).await.unwrap().is_some(),
-            "and so does an old one somebody is still connected through"
-        );
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some(),
-            "the prune left the live connection alone"
-        );
-
-        // An authorization somebody allowed stamps `last_used`, and that is
-        // what keeps an old registration alive for another thirty days. Nothing
-        // an unauthenticated request does reaches this column: see
-        // `only_an_allowed_authorization_stamps_a_registration_as_used`.
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
-                vec![
-                    Value::Text(fresh.client_id.clone()),
-                    Value::Text(long_ago.to_string()),
-                ],
-            )
-            .await
-            .unwrap();
-        store.touch_oauth_client(&fresh.client_id).await.unwrap();
-        assert_eq!(store.prune_oauth_clients().await.unwrap(), 0);
-        assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
-    }
-
-    /// **Reading a registration is not using it**: only an authorization that
-    /// a person actually allowed moves a row off the one-hour clock.
-    ///
-    /// The distinction is the whole of why the short clock works. Everything an
-    /// authorization *request* does to a registration is read it - look it up
-    /// by the id the caller named, compare the redirect uri it presented - and
-    /// that request carries no identity: the person has not signed in yet, and
-    /// a caller that registered the client is authorizing against its own row,
-    /// so every check on that leg passes by construction. If reading stamped
-    /// `last_used`, one extra unauthenticated request per row would move it to
-    /// the thirty-day branch, and the fill-and-hold the short clock exists to
-    /// prevent would be back at the cost of one GET.
-    ///
-    /// So [`AuthStore::touch_oauth_client`] is called when consent is ALLOWED
-    /// and when a grant is issued or refreshed, never on the authorize request,
-    /// and nothing else in this file writes that column. This test is the
-    /// contract in executable form for the two tasks that hold those call
-    /// sites.
-    #[tokio::test]
-    async fn only_an_allowed_authorization_stamps_a_registration_as_used() {
-        let (_dir, store) = store().await;
-        let client = store
-            .register_oauth_client("Asker", None, &["https://asker.example/cb".to_string()])
-            .await
-            .unwrap();
-        assert!(client.last_used.is_none());
-
-        // Everything the authorize leg does to the row before a person has
-        // decided anything, twice over.
-        for _ in 0..2 {
-            let read = store
-                .oauth_client(&client.client_id)
-                .await
-                .unwrap()
-                .expect("the registration reads back");
-            assert!(
-                read.last_used.is_none(),
-                "reading a registration never stamps it"
-            );
-        }
-
-        // Two hours later that row is still on the short clock, because
-        // nothing it has been through counts as an authorization.
-        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
-                vec![
-                    Value::Text(client.client_id.clone()),
-                    Value::Text(two_hours_ago.clone()),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.prune_oauth_clients().await.unwrap(),
-            1,
-            "an hour of being asked about is not an hour of being used"
-        );
-
-        // The same row, with the one thing that does count: a person allowed
-        // it, which is what the consent endpoint stamps.
-        let allowed = store
-            .register_oauth_client("Allowed", None, &["https://allowed.example/cb".to_string()])
-            .await
-            .unwrap();
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
-                vec![
-                    Value::Text(allowed.client_id.clone()),
-                    Value::Text(two_hours_ago),
-                ],
-            )
-            .await
-            .unwrap();
-        store.touch_oauth_client(&allowed.client_id).await.unwrap();
-        assert_eq!(store.prune_oauth_clients().await.unwrap(), 0);
-        assert!(
-            store
-                .oauth_client(&allowed.client_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "an allowed authorization buys the thirty days"
-        );
-    }
-
-    /// **A registration nobody ever authorized expires within the hour**, and
-    /// only one somebody did gets the thirty days.
-    ///
-    /// The two clocks exist because the two rows mean different things. A row
-    /// that never reached the authorize endpoint is the residue of a client
-    /// that registered and walked away - or of an anonymous caller filling the
-    /// table, which is the only way the cap is ever reached - and keeping it
-    /// for thirty days is what would make that filling stick. A row that HAS
-    /// authorized is somebody's client between connections, and thirty idle
-    /// days is the right patience for it.
-    #[tokio::test]
-    async fn a_registration_that_never_authorized_expires_within_the_hour() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        let never = store
-            .register_oauth_client("Never", None, &["https://never.example/cb".to_string()])
-            .await
-            .unwrap();
-        let authorized = store
-            .register_oauth_client("Asked", None, &["https://asked.example/cb".to_string()])
-            .await
-            .unwrap();
-        let connected = store
-            .register_oauth_client("Live", None, &["https://live.example/cb".to_string()])
-            .await
-            .unwrap();
-        store
-            .issue_oauth_grant("ada", &connected.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let just_now = store
-            .register_oauth_client("Fresh", None, &["https://fresh.example/cb".to_string()])
-            .await
-            .unwrap();
-
-        // Two hours ago for all three of the old ones, and the one that
-        // authorized did so half an hour ago: well past the hour, nowhere near
-        // the thirty days.
-        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-        let half_hour_ago = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
-        for id in [
-            &never.client_id,
-            &authorized.client_id,
-            &connected.client_id,
-        ] {
-            store
-                .conn
-                .execute(
-                    "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
-                    vec![Value::Text(id.clone()), Value::Text(two_hours_ago.clone())],
-                )
-                .await
-                .unwrap();
-        }
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
-                vec![
-                    Value::Text(authorized.client_id.clone()),
-                    Value::Text(half_hour_ago),
-                ],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store.prune_oauth_clients().await.unwrap(),
-            1,
-            "only the registration nobody authorized, holding nothing, goes"
-        );
-        assert!(
-            store
-                .oauth_client(&never.client_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .oauth_client(&authorized.client_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "a registration somebody authorized gets the thirty days"
-        );
-        assert!(
-            store
-                .oauth_client(&connected.client_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "and one somebody is connected through is never collected at all"
-        );
-        assert!(
-            store
-                .oauth_client(&just_now.client_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "a registration made a moment ago has its hour"
-        );
-
-        // The same row, thirty idle days later.
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
-                vec![
-                    Value::Text(authorized.client_id.clone()),
-                    Value::Text("2020-01-01T00:00:00+00:00".to_string()),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(store.prune_oauth_clients().await.unwrap(), 1);
-        assert!(
-            store
-                .oauth_client(&authorized.client_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// The two unhashed copies of a live credential must never be one
-    /// `tracing::debug!` or one failed assertion away from a log file, and the
-    /// enum that carries a rotation's answer must not undo that.
-    #[tokio::test]
-    async fn an_issued_oauth_grant_never_prints_its_secrets() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let text = format!("{issued:?}");
-        for (prefix, token) in [
-            (OAUTH_ACCESS_PREFIX, &issued.access_token),
-            (OAUTH_REFRESH_PREFIX, &issued.refresh_token),
-        ] {
-            let secret = token
-                .strip_prefix(prefix)
-                .expect("a token carries its prefix");
-            assert!(!text.contains(secret), "the secret is redacted: {text}");
-        }
-        assert!(text.contains("redacted"), "and says so: {text}");
-        assert!(
-            text.contains(&issued.id.to_string()),
-            "while the id still prints: {text}"
-        );
-
-        let rotated = store
-            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
-            .await
-            .unwrap();
-        let printed = format!("{rotated:?}");
-        let RefreshOutcome::Rotated(next) = &rotated else {
-            panic!("a live refresh token rotates, got {printed}");
-        };
-        let secret = next
-            .access_token
-            .strip_prefix(OAUTH_ACCESS_PREFIX)
-            .expect("a token carries its prefix");
-        assert!(
-            !printed.contains(secret),
-            "the outcome redacts what it wraps: {printed}"
-        );
-    }
-
-    /// A grant past its refresh window can never work again: no rotation, no
-    /// replay, and its access token died an hour into the thirty days. So it
-    /// is neither a connection to show a person nor a row to keep - and while
-    /// it is kept, it pins its registration against the client prune, which is
-    /// what makes the ordering of the two prunes load bearing.
-    #[tokio::test]
-    async fn an_expired_grant_is_pruned_and_never_listed_as_a_connection() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let live = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let dead = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        close_refresh_window(&store, dead.id).await;
-
-        let listed = store.list_oauth_grants("ada").await.unwrap();
-        assert_eq!(
-            listed.len(),
-            1,
-            "a grant that cannot work again is not a connection anybody can act on"
-        );
-        assert_eq!(listed[0].id, live.id);
-        assert_eq!(store.prune_oauth_grants().await.unwrap(), 1);
-        assert_eq!(count_rows(&store, "oauth_grants").await, 1);
-        assert!(
-            store
-                .oauth_access_user(&live.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some(),
-            "the prune left the live grant alone"
-        );
-
-        // A registration abandoned after one connection: its dead grant holds
-        // it against the client prune until the grant prune runs first.
-        let abandoned = store
-            .register_oauth_client("Abandoned", None, &["https://gone.example/cb".to_string()])
-            .await
-            .unwrap();
-        let stranded = store
-            .issue_oauth_grant("ada", &abandoned.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        close_refresh_window(&store, stranded.id).await;
-        // Age *both* registrations past the window, so what keeps the first
-        // one is its live grant rather than its freshness - which is the
-        // property the last assertion is about.
-        for id in [&abandoned.client_id, &client.client_id] {
-            store
-                .conn
-                .execute(
-                    "UPDATE oauth_clients SET created_at = '2020-01-01T00:00:00+00:00'
-                     WHERE client_id = ?1",
-                    vec![Value::Text(id.clone())],
-                )
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            store.prune_oauth_clients().await.unwrap(),
-            0,
-            "while the dead grant is there it pins the registration"
-        );
-        assert_eq!(store.prune_oauth_grants().await.unwrap(), 1);
-        assert_eq!(
-            store.prune_oauth_clients().await.unwrap(),
-            1,
-            "and the registration goes in the same pass, once its grant has"
-        );
-        assert!(
-            store
-                .oauth_client(&client.client_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "the registration somebody is still connected through stays, \
-             old as it is, because its live grant is what holds it"
-        );
-    }
-
-    /// Close a grant's refresh window through the connection, the only way to
-    /// reach an expiry the store owns.
-    async fn close_refresh_window(store: &AuthStore, id: i64) {
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_grants SET refresh_expires_at = 1 WHERE id = ?1",
-                vec![Value::Integer(id)],
-            )
-            .await
-            .unwrap();
-    }
-
-    /// Two parallel sessions of one client refresh with the same token: the
-    /// first rotates, the second arrives inside the grace window and gets a
-    /// pair of its own. Both pairs work, both refresh tokens are live, and the
-    /// grant survives. The write lock decides the order, so racing requests
-    /// reach the same two answers.
-    #[tokio::test]
-    async fn two_parallel_refreshes_inside_the_window_both_succeed() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let (one, two) = tokio::join!(
-            store.refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now),
-            store.refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now),
-        );
-        let mut pairs = Vec::new();
-        let mut reissued = 0;
-        for outcome in [one.unwrap(), two.unwrap()] {
-            match outcome {
-                RefreshOutcome::Rotated(pair) => pairs.push(pair),
-                RefreshOutcome::Reissued {
-                    grant,
-                    since_rotation,
-                } => {
-                    assert_eq!(since_rotation, 0);
-                    reissued += 1;
-                    pairs.push(grant);
-                }
-                other => panic!("both parallel refreshes succeed, got {other:?}"),
-            }
-        }
-        assert_eq!(reissued, 1, "one rotates, the other is reissued");
-        assert_ne!(pairs[0].refresh_token, pairs[1].refresh_token);
-        assert_ne!(pairs[0].access_token, pairs[1].access_token);
-        for pair in &pairs {
-            assert_eq!(pair.id, issued.id, "one grant, not a fork");
-            assert_eq!(pair.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
-            assert!(
-                store
-                    .oauth_access_user(&pair.access_token, OAUTH_RESOURCE)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "each session's access token works"
-            );
-        }
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "the rotated token's own access token stopped"
-        );
-        // Each new refresh token is live in its own right.
-        for (i, pair) in pairs.iter().enumerate() {
-            let outcome = store
-                .refresh_oauth_grant_at(&pair.refresh_token, &client.client_id, None, now + 10)
-                .await
-                .unwrap();
-            assert!(
-                matches!(outcome, RefreshOutcome::Rotated(_)),
-                "session {i} rotates its own token, got {outcome:?}"
-            );
-        }
-        assert_eq!(store.list_oauth_grants("ada").await.unwrap().len(), 1);
-        assert!(
-            store
-                .list_ended_oauth_grants("ada")
-                .await
-                .unwrap()
-                .is_empty(),
-            "nothing ended"
-        );
-    }
-
-    /// The same token presented again 60 seconds or more after its rotation
-    /// is a replay: the grant is revoked and the record says why. 59 seconds
-    /// is still inside the window.
-    #[tokio::test]
-    async fn the_same_token_after_the_window_revokes_the_grant() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let outcome = store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(rotated) = outcome else {
-            panic!("a live refresh token rotates, got {outcome:?}");
-        };
-        let outcome = store
-            .refresh_oauth_grant_at(
-                &issued.refresh_token,
-                &client.client_id,
-                None,
-                now + OAUTH_REFRESH_GRACE_SECS - 1,
-            )
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                outcome,
-                RefreshOutcome::Reissued {
-                    since_rotation: 59,
-                    ..
-                }
-            ),
-            "59 seconds is inside the window, got {outcome:?}"
-        );
-        match store
-            .refresh_oauth_grant_at(
-                &issued.refresh_token,
-                &client.client_id,
-                None,
-                now + OAUTH_REFRESH_GRACE_SECS,
-            )
-            .await
-            .unwrap()
-        {
-            RefreshOutcome::Replayed {
-                grant,
-                since_rotation,
-            } => {
-                assert_eq!(grant, issued.id);
-                assert_eq!(since_rotation, OAUTH_REFRESH_GRACE_SECS);
-            }
-            other => panic!("60 seconds after the rotation is a replay, got {other:?}"),
-        }
-        assert!(
-            store
-                .oauth_access_user(&rotated.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none(),
-            "the whole grant is gone"
-        );
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-        assert_eq!(count_rows(&store, "oauth_grant_token").await, 0);
-        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
-        assert_eq!(ended.len(), 1);
-        assert_eq!(ended[0].id, issued.id);
-        assert_eq!(ended[0].client_name, "Some Client");
-        assert_eq!(ended[0].redirect_host, "client.example");
-        assert_eq!(
-            ended[0].ended.as_ref().map(|e| e.reason),
-            Some(OauthGrantEndReason::Replayed)
-        );
-    }
-
-    /// Inside the window, the token still has to come from the client it was
-    /// issued to: another client presenting it is a replay, not a parallel
-    /// session. And a disabled account gets nothing, as on the live path.
-    #[tokio::test]
-    async fn the_grace_window_keeps_the_client_and_account_checks() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let stranger = store
-            .register_oauth_client(
-                "Another Client",
-                None,
-                &["https://x.example/cb".to_string()],
-            )
-            .await
-            .unwrap();
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap();
-
-        store.set_disabled("ada", true).await.unwrap();
-        assert!(matches!(
-            store
-                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 1)
-                .await
-                .unwrap(),
-            RefreshOutcome::Unknown
-        ));
-        store.set_disabled("ada", false).await.unwrap();
-        assert!(matches!(
-            store
-                .refresh_oauth_grant_at(
-                    &issued.refresh_token,
-                    &client.client_id,
-                    Some("https://other.example"),
-                    now + 1
-                )
-                .await
-                .unwrap(),
-            RefreshOutcome::WrongTarget
-        ));
-        assert!(matches!(
-            store
-                .refresh_oauth_grant_at(&issued.refresh_token, &stranger.client_id, None, now + 1)
-                .await
-                .unwrap(),
-            RefreshOutcome::Replayed { .. }
-        ));
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-    }
-
-    /// The live refresh tokens of a grant, counted in the database.
-    async fn live_tokens(store: &AuthStore) -> i64 {
-        store
-            .count_tokens(
-                "SELECT COUNT(*) FROM oauth_grant_token WHERE rotated_at IS NULL",
-                vec![],
-            )
-            .await
-            .unwrap()
-    }
-
-    /// Whether the row of `refresh_token` is still in the database.
-    async fn token_row_exists(store: &AuthStore, refresh_token: &str) -> bool {
-        store
-            .query_first(
-                "SELECT 1 FROM oauth_grant_token WHERE refresh_hash = ?1",
-                vec![Value::Text(token_hash(refresh_token))],
-            )
-            .await
-            .unwrap()
-            .is_some()
-    }
-
-    /// A copy of one rotated token presented over and over inside the window
-    /// gets at most two pairs of its own (a retry and a parallel session);
-    /// the third presentation is a replay that ends the grant. At no point is
-    /// a session's live token deleted to make room, so the real session is
-    /// never pushed out while the copy keeps the grant.
-    #[tokio::test]
-    async fn a_flood_of_copies_inside_the_window_revokes_and_evicts_nobody() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(real) = store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap()
-        else {
-            panic!("a live refresh token rotates");
-        };
-        let mut copies = Vec::new();
-        for i in 1..=OAUTH_REISSUES_PER_ROTATION {
-            match store
-                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + i)
-                .await
-                .unwrap()
-            {
-                RefreshOutcome::Reissued { grant, .. } => copies.push(grant),
-                other => panic!("presentation {i} inside the window is reissued, got {other:?}"),
-            }
-            assert!(
-                token_row_exists(&store, &real.refresh_token).await,
-                "the real session's token is never deleted"
-            );
-            assert!(
-                store
-                    .oauth_access_user(&real.access_token, OAUTH_RESOURCE)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        assert_eq!(live_tokens(&store).await, 1 + OAUTH_REISSUES_PER_ROTATION);
-
-        match store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 5)
-            .await
-            .unwrap()
-        {
-            RefreshOutcome::Replayed {
-                grant,
-                since_rotation,
-            } => {
-                assert_eq!(grant, issued.id);
-                assert_eq!(since_rotation, 5);
-            }
-            other => panic!("the third copy inside the window is a replay, got {other:?}"),
-        }
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-        assert_eq!(
-            store.list_ended_oauth_grants("ada").await.unwrap()[0]
-                .ended
-                .as_ref()
-                .map(|e| e.reason),
-            Some(OauthGrantEndReason::Replayed)
-        );
-    }
-
-    /// The live set has a hard ceiling, and reaching it never deletes a
-    /// session: a reissue into a full set is a replay.
-    #[tokio::test]
-    async fn a_reissue_into_a_full_live_set_is_a_replay() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap();
-        // Sessions left behind earlier, written straight into the table.
-        for i in 1..OAUTH_LIVE_TOKENS_MAX {
-            store
-                .conn
-                .execute(
-                    "INSERT INTO oauth_grant_token
-                         (refresh_hash, grant_id, access_hash, access_expires_at,
-                          refresh_expires_at, issued_at, rotated_at, rotated_from)
-                     VALUES (?1, ?2, NULL, 0, ?3, ?4, NULL, NULL)",
-                    vec![
-                        Value::Text(format!("filler{i}")),
-                        Value::Integer(issued.id),
-                        Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
-                        Value::Integer(now - 100),
-                    ],
-                )
-                .await
-                .unwrap();
-        }
-        assert_eq!(live_tokens(&store).await, OAUTH_LIVE_TOKENS_MAX);
-        assert!(matches!(
-            store
-                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 1)
-                .await
-                .unwrap(),
-            RefreshOutcome::Replayed { .. }
-        ));
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-    }
-
-    /// Rotating a chain many times never makes an old token forgotten: the
-    /// rotated hashes are kept by time, not by count, so a token nine and more
-    /// rotations back is still a replay.
-    #[tokio::test]
-    async fn a_token_many_rotations_back_still_replays() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let mut current = issued.clone();
-        for i in 0..12 {
-            match store
-                .refresh_oauth_grant_at(&current.refresh_token, &client.client_id, None, now + i)
-                .await
-                .unwrap()
-            {
-                RefreshOutcome::Rotated(next) => current = next,
-                other => panic!("a live token rotates, got {other:?}"),
-            }
-        }
-        assert_eq!(live_tokens(&store).await, 1);
-        assert_eq!(count_rows(&store, "oauth_grant_token").await, 13);
-        match store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 3600)
-            .await
-            .unwrap()
-        {
-            RefreshOutcome::Replayed { grant, .. } => assert_eq!(grant, issued.id),
-            other => panic!("a token twelve rotations back is a replay, got {other:?}"),
-        }
-    }
-
-    /// A rotated token is forgotten only once thirty days have passed since
-    /// its rotation, by which time its own window has closed as well.
-    #[tokio::test]
-    async fn a_rotated_token_is_forgotten_after_thirty_days() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(second) = store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap()
-        else {
-            panic!("a live refresh token rotates");
-        };
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_grant_token SET rotated_at = ?2 WHERE refresh_hash = ?1",
-                vec![
-                    Value::Text(token_hash(&issued.refresh_token)),
-                    Value::Integer(now - OAUTH_REFRESH_TTL_SECS + 10),
-                ],
-            )
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(third) = store
-            .refresh_oauth_grant_at(&second.refresh_token, &client.client_id, None, now + 1)
-            .await
-            .unwrap()
-        else {
-            panic!("a live refresh token rotates");
-        };
-        assert!(
-            token_row_exists(&store, &issued.refresh_token).await,
-            "younger than thirty days: kept"
-        );
-        store
-            .refresh_oauth_grant_at(&third.refresh_token, &client.client_id, None, now + 20)
-            .await
-            .unwrap();
-        assert!(
-            !token_row_exists(&store, &issued.refresh_token).await,
-            "thirty days after its rotation it is pruned"
-        );
-    }
-
-    /// The window of a rotated token closes once any pair minted from it has
-    /// been rotated, a sibling from inside the window included.
-    #[tokio::test]
-    async fn a_siblings_rotation_closes_the_window_for_its_parent() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap();
-        let RefreshOutcome::Reissued { grant: sibling, .. } = store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 1)
-            .await
-            .unwrap()
-        else {
-            panic!("inside the window the token is reissued");
-        };
-        assert!(matches!(
-            store
-                .refresh_oauth_grant_at(&sibling.refresh_token, &client.client_id, None, now + 2)
-                .await
-                .unwrap(),
-            RefreshOutcome::Rotated(_)
-        ));
-        assert!(matches!(
-            store
-                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 3)
-                .await
-                .unwrap(),
-            RefreshOutcome::Replayed { .. }
-        ));
-    }
-
-    /// A clock stepped back makes the age negative, and a negative age is
-    /// outside the window rather than a window that never closes.
-    #[tokio::test]
-    async fn a_rotation_time_in_the_future_is_no_reissue() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
-            .await
-            .unwrap();
-        match store
-            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now - 5)
-            .await
-            .unwrap()
-        {
-            RefreshOutcome::Replayed { since_rotation, .. } => assert_eq!(since_rotation, -5),
-            other => panic!("a negative age is a replay, got {other:?}"),
-        }
-    }
-
-    /// The daemon and the CLI hold two store handles on one file; two
-    /// refreshes of one token through both at the same moment still get one
-    /// rotation and one reissue, and the grant lives.
-    #[tokio::test]
-    async fn parallel_refreshes_through_two_stores_on_one_file_both_succeed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        let daemon = AuthStore::open(&path).await.unwrap();
-        let cli = AuthStore::open(&path).await.unwrap();
-        let client = oauth_cast(&daemon).await;
-        let issued = daemon
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let (one, two) = tokio::join!(
-            daemon.refresh_oauth_grant(&issued.refresh_token, &client.client_id, None),
-            cli.refresh_oauth_grant(&issued.refresh_token, &client.client_id, None),
-        );
-        let outcomes = [one.unwrap(), two.unwrap()];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|o| matches!(o, RefreshOutcome::Rotated(_)))
-                .count(),
-            1,
-            "{outcomes:?}"
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|o| matches!(o, RefreshOutcome::Reissued { .. }))
-                .count(),
-            1,
-            "{outcomes:?}"
-        );
-        assert_eq!(daemon.list_oauth_grants("ada").await.unwrap().len(), 1);
-        assert_eq!(cli.list_oauth_grants("ada").await.unwrap().len(), 1);
-    }
-
-    /// The record of an ended grant: written for a replay (above) and for an
-    /// explicit revoke here, listed newest first, left out after seven days,
-    /// and never carrying a token.
-    #[tokio::test]
-    async fn an_explicit_revoke_is_recorded_and_listed_for_a_while() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let one = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        let two = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        assert!(store.revoke_oauth_grant("ada", one.id).await.unwrap());
-        assert!(
-            store
-                .revoke_oauth_grant_by_token(&two.refresh_token, &client.client_id)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store.revoke_oauth_grant("ada", one.id).await.unwrap(),
-            "an ended grant cannot be revoked again"
-        );
-        assert_eq!(count_rows(&store, "oauth_grant_token").await, 0);
-        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
-        let reasons: Vec<_> = ended
-            .iter()
-            .map(|g| (g.id, g.ended.as_ref().unwrap().reason))
-            .collect();
-        assert!(reasons.contains(&(one.id, OauthGrantEndReason::Revoked)));
-        assert!(reasons.contains(&(two.id, OauthGrantEndReason::ClientRevoked)));
-        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
-        let json = serde_json::to_string(&ended).unwrap();
-        assert!(json.contains("\"reason\":\"revoked\""), "{json}");
-        assert!(!json.contains(OAUTH_ACCESS_PREFIX) && !json.contains(OAUTH_REFRESH_PREFIX));
-
-        let later = chrono::Utc::now().timestamp() + OAUTH_ENDED_KEPT_SECS + 1;
-        assert!(
-            store
-                .list_ended_oauth_grants_at("ada", later)
-                .await
-                .unwrap()
-                .is_empty(),
-            "after seven days the record is no longer listed"
-        );
-        store
-            .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .list_ended_oauth_grants("bob")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// The rotation time of a migrated predecessor is read off the access
-    /// token's issue. A predecessor rotated ten seconds before the upgrade is
-    /// inside the window afterwards and is reissued, not a replay.
-    #[tokio::test]
-    async fn a_migrated_predecessor_inside_the_window_is_reissued() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        let previous = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
-        let (id, client_id) = {
-            let store = AuthStore::open(&path).await.unwrap();
-            let client = oauth_cast(&store).await;
-            let now = chrono::Utc::now().timestamp();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO oauth_grants
-                         (user, client_id, resource, access_hash, access_expires_at,
-                          refresh_hash, previous_refresh_hash, refresh_expires_at, created_at)
-                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    vec![
-                        Value::Text(client.client_id.clone()),
-                        Value::Text(OAUTH_RESOURCE.to_string()),
-                        Value::Text(token_hash("coa_current")),
-                        Value::Integer(now + OAUTH_ACCESS_TTL_SECS - 10),
-                        Value::Text(token_hash("cor_current")),
-                        Value::Text(token_hash(&previous)),
-                        Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
-                    ],
-                )
-                .await
-                .unwrap();
-            (store.conn.last_insert_rowid(), client.client_id)
-        };
-        let store = AuthStore::open(&path).await.unwrap();
-        let rotated_at = token_int(&store, &previous, "rotated_at").await.unwrap();
-        let now = chrono::Utc::now().timestamp();
-        assert!(
-            (now - 12..=now - 8).contains(&rotated_at),
-            "the rotation time is the current access token's issue: {rotated_at} vs {now}"
-        );
-        match store
-            .refresh_oauth_grant(&previous, &client_id, None)
-            .await
-            .unwrap()
-        {
-            RefreshOutcome::Reissued { grant, .. } => assert_eq!(grant.id, id),
-            other => panic!("inside the window after the upgrade, got {other:?}"),
-        }
-    }
-
-    /// A file written before 0.32.1 holds each grant's pair in `oauth_grants`
-    /// itself, with the predecessor in `previous_refresh_hash`. Opening it
-    /// moves both into `oauth_grant_token`: the access token keeps working,
-    /// the refresh token rotates, and the predecessor is still a replay
-    /// (its rotation time is read off the access token's issue, an hour ago
-    /// here, far outside the window).
-    #[tokio::test]
-    async fn an_old_store_with_a_previous_refresh_hash_keeps_working() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        let access = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
-        let refresh = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
-        let previous = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
-        let id = {
-            let store = AuthStore::open(&path).await.unwrap();
-            let client = oauth_cast(&store).await;
-            let now = chrono::Utc::now().timestamp();
-            // What the 0.32.0 issue and rotation wrote, column by column.
-            store
-                .conn
-                .execute(
-                    "INSERT INTO oauth_grants
-                         (user, client_id, resource, access_hash, access_expires_at,
-                          refresh_hash, previous_refresh_hash, refresh_expires_at, created_at)
-                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    vec![
-                        Value::Text(client.client_id.clone()),
-                        Value::Text(OAUTH_RESOURCE.to_string()),
-                        Value::Text(token_hash(&access)),
-                        Value::Integer(now + 60),
-                        Value::Text(token_hash(&refresh)),
-                        Value::Text(token_hash(&previous)),
-                        Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
-                    ],
-                )
-                .await
-                .unwrap();
-            store.conn.last_insert_rowid()
-        };
-        let store = AuthStore::open(&path).await.unwrap();
-        // A second open moves nothing twice.
-        drop(store);
-        let store = AuthStore::open(&path).await.unwrap();
-        assert_eq!(count_rows(&store, "oauth_grant_token").await, 2);
-        assert!(
-            grant_text(&store, id, "refresh_hash")
-                .await
-                .starts_with(OAUTH_PLACEHOLDER_PREFIX)
-        );
-        let client_id = store.list_oauth_grants("ada").await.unwrap()[0]
-            .client_id
-            .clone();
-        assert!(
-            store
-                .oauth_access_user(&access, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_some(),
-            "the access token minted before the upgrade still resolves"
-        );
-        let outcome = store
-            .refresh_oauth_grant(&refresh, &client_id, None)
-            .await
-            .unwrap();
-        let RefreshOutcome::Rotated(next) = outcome else {
-            panic!("the refresh token minted before the upgrade rotates, got {outcome:?}");
-        };
-        assert_eq!(next.id, id);
-        match store
-            .refresh_oauth_grant(&previous, &client_id, None)
-            .await
-            .unwrap()
-        {
-            RefreshOutcome::Replayed { grant, .. } => assert_eq!(grant, id),
-            other => panic!("the old predecessor is still a replay, got {other:?}"),
-        }
-    }
-
-    /// The host on the consent screen and the grant card is a fact a person is
-    /// asked to recognize, so a uri that names no host must not get to write
-    /// that line itself.
-    #[test]
-    fn a_redirect_uri_with_no_host_never_shows_its_own_text() {
-        assert_eq!(redirect_host("https://client.example/cb"), "client.example");
-        assert_eq!(
-            redirect_host("http://127.0.0.1:33418/callback"),
-            "127.0.0.1:33418"
-        );
-        for uri in [
-            "javascript:alert(1)",
-            "data:text/html,<b>your bank</b>",
-            "not a url at all",
-        ] {
-            assert_eq!(
-                redirect_host(uri),
-                NO_REDIRECT_HOST,
-                "a uri with no host says so rather than speaking for itself: {uri}"
-            );
-        }
-    }
-
-    /// The empty string is not an audience. Refusing it at both ends means the
-    /// two halves of the check cannot agree on nothing and let a token
-    /// through, even if an origin derivation upstream ever produced one.
-    #[tokio::test]
-    async fn an_empty_resource_is_refused_on_both_sides() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        for resource in ["", "/", "   "] {
-            assert!(
-                store
-                    .issue_oauth_grant("ada", &client.client_id, resource)
-                    .await
-                    .is_err(),
-                "a grant with no audience is refused: {resource:?}"
-            );
-        }
-        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
-
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store
-            .conn
-            .execute(
-                "UPDATE oauth_grants SET resource = '' WHERE id = ?1",
-                vec![Value::Integer(issued.id)],
-            )
-            .await
-            .unwrap();
-        for resource in ["", "/"] {
-            assert!(
-                store
-                    .oauth_access_user(&issued.access_token, resource)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "an empty origin opens nothing, whatever a row holds: {resource:?}"
-            );
-        }
-    }
-
-    /// A grant whose registration vanished stays listable, so it stays
-    /// revocable: its tokens still resolve, and a list that dropped the row
-    /// would leave the account no way to stop them.
-    #[tokio::test]
-    async fn a_grant_outlives_a_vanished_registration_rather_than_hiding() {
-        let (_dir, store) = store().await;
-        let client = oauth_cast(&store).await;
-        let issued = store
-            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
-            .await
-            .unwrap();
-        store
-            .conn
-            .execute("DELETE FROM oauth_clients", ())
-            .await
-            .unwrap();
-
-        let listed = store.list_oauth_grants("ada").await.unwrap();
-        assert_eq!(listed.len(), 1, "the grant is still listed");
-        assert_eq!(listed[0].id, issued.id);
-        assert!(
-            !listed[0].client_name.is_empty(),
-            "with something a person can read where the registration was"
-        );
-        assert!(store.revoke_oauth_grant("ada", issued.id).await.unwrap());
-        assert!(
-            store
-                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// The resource comparison is the audience check, so its tolerance is
-    /// exactly one trailing slash: nothing is lowercased and no other
-    /// canonicalization happens, because an origin that differs in any other
-    /// way is a different origin.
-    #[test]
-    fn a_resource_tolerates_one_trailing_slash_and_nothing_else() {
-        assert_eq!(
-            normalize_resource("https://crystal.example/"),
-            "https://crystal.example"
-        );
-        assert_eq!(
-            normalize_resource("  https://crystal.example  "),
-            "https://crystal.example"
-        );
-        assert_eq!(
-            normalize_resource("https://crystal.example//"),
-            "https://crystal.example/",
-            "one slash, not every slash"
-        );
-        assert_eq!(
-            normalize_resource("https://Crystal.Example"),
-            "https://Crystal.Example",
-            "case is the caller's business, not the store's"
-        );
-        assert_eq!(normalize_resource("/"), "");
-    }
-
-    /// Every account a share-link test needs: the author who holds a draft,
-    /// the colleague the link is for, and a third party who finds the link.
-    async fn grant_cast(store: &AuthStore) {
-        for name in ["alice", "bob", "carol"] {
-            store
-                .add_user(name, name, None, Role::Editor, "pw12345678")
-                .await
-                .unwrap();
-        }
-    }
-
-    /// A share-link is for one person, and the first one to open it is that
-    /// person for good.
-    ///
-    /// The whole of the sharing rule: a grant is minted for a draft rather
-    /// than for a name, so the author never has to know the login of whoever
-    /// they are handing it to - and the moment somebody opens it, it belongs
-    /// to that account and to nobody else. A second account presenting the
-    /// same token is told the same thing an invented one is told, because a
-    /// link that admitted a second reader would be a draft shared with
-    /// whoever the first reader forwarded it to.
-    #[tokio::test]
-    async fn a_grant_binds_its_first_redeemer_and_refuses_a_second() {
-        let (_dir, store) = store().await;
-        grant_cast(&store).await;
-        let minted = store
-            .mint_overlay_grant("team", "plan.md", "alice", None)
-            .await
-            .unwrap();
-        assert!(minted.token.starts_with(DRAFT_LINK_PREFIX));
-
-        let bound = store
-            .redeem_overlay_grant(&minted.token, "bob")
-            .await
-            .unwrap()
-            .expect("the first redeemer binds it");
-        assert_eq!(
-            (
-                bound.domain.as_str(),
-                bound.path.as_str(),
-                bound.owner.as_str()
-            ),
-            ("team", "plan.md", "alice")
-        );
-        assert_eq!(bound.grantee.as_deref(), Some("bob"));
-
-        assert!(
-            store
-                .redeem_overlay_grant(&minted.token, "bob")
-                .await
-                .unwrap()
-                .is_some(),
-            "and the person it bound to keeps it"
-        );
-        assert!(
-            store
-                .redeem_overlay_grant(&minted.token, "carol")
-                .await
-                .unwrap()
-                .is_none(),
-            "while anybody else is told what an invented token is told"
-        );
-        assert_eq!(
-            store
-                .overlay_grant_for("bob", "team", "plan.md")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("alice"),
-            "the bound account sees whose draft it is"
-        );
-        assert!(
-            store
-                .overlay_grant_for("carol", "team", "plan.md")
-                .await
-                .unwrap()
-                .is_none(),
-            "and nobody else sees anything"
-        );
-    }
-
-    /// The two ways a grant ends, and they end it the same way: the token
-    /// still exists and resolves to nothing.
-    #[tokio::test]
-    async fn a_revoked_or_expired_grant_redeems_to_none() {
-        let (_dir, store) = store().await;
-        grant_cast(&store).await;
-
-        let revoked = store
-            .mint_overlay_grant("team", "plan.md", "alice", None)
-            .await
-            .unwrap();
-        let listed = store
-            .overlay_grants_of("alice", "team", "plan.md")
-            .await
-            .unwrap();
-        assert_eq!(listed.len(), 1, "the author sees what they minted");
-        assert!(
-            store
-                .revoke_overlay_grant("bob", revoked.id, false)
-                .await
-                .unwrap()
-                .is_none(),
-            "and nobody else can take it back"
-        );
-        let swept = store
-            .mint_overlay_grant("team", "plan.md", "alice", None)
-            .await
-            .unwrap();
-        assert!(
-            store
-                .revoke_overlay_grant("bob", swept.id, true)
-                .await
-                .unwrap()
-                .is_some(),
-            "an admin closes a link on this instance whoever minted it"
-        );
-        assert!(
-            store
-                .redeem_overlay_grant(&swept.token, "bob")
-                .await
-                .unwrap()
-                .is_none(),
-            "and the row was stamped, not only answered"
-        );
-        let taken = store
-            .revoke_overlay_grant("alice", revoked.id, false)
-            .await
-            .unwrap()
-            .expect("its author takes it back");
-        assert_eq!(
-            (
-                taken.domain.as_str(),
-                taken.owner.as_str(),
-                taken.path.as_str()
-            ),
-            ("team", "alice", "plan.md"),
-            "and the row says which draft it was on, which is what ends the sessions inside it"
-        );
-        assert!(
-            taken.revoked_at.is_some(),
-            "answered as it now stands, taken back"
-        );
-        assert!(
-            store
-                .revoke_overlay_grant("alice", revoked.id, false)
-                .await
-                .unwrap()
-                .is_none(),
-            "and taking back what is already back is nothing at all"
-        );
-        assert!(
-            store
-                .redeem_overlay_grant(&revoked.token, "bob")
-                .await
-                .unwrap()
-                .is_none(),
-            "a revoked link admits nobody"
-        );
-
-        let expired = store
-            .mint_overlay_grant(
-                "team",
-                "plan.md",
-                "alice",
-                Some("2020-01-01T00:00:00Z".to_string()),
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .redeem_overlay_grant(&expired.token, "bob")
-                .await
-                .unwrap()
-                .is_none(),
-            "and neither does one whose window has closed"
-        );
-
-        let live = store
-            .mint_overlay_grant("team", "plan.md", "alice", None)
-            .await
-            .unwrap();
-        store
-            .redeem_overlay_grant(&live.token, "bob")
-            .await
-            .unwrap()
-            .expect("a live one still binds");
-        assert_eq!(
-            store.end_domain_overlay_grants("team").await.unwrap(),
-            2,
-            "and the domain leaving review mode ends every link nobody had \
-             revoked: the live one and the expired one, whose window had closed \
-             but whose row was still open"
-        );
-        assert!(
-            store
-                .overlay_grant_for("bob", "team", "plan.md")
-                .await
-                .unwrap()
-                .is_none(),
-            "so the account it was bound to holds nothing any more"
-        );
-    }
-
-    /// The link is the credential, so it may never reach a log line - the rule
-    /// [`IssuedMcpToken`] already keeps, kept the same way and asserted on the
-    /// random half for the same reason.
-    #[tokio::test]
-    async fn minted_grant_debug_redacts_the_token() {
-        let (_dir, store) = store().await;
-        grant_cast(&store).await;
-        let minted = store
-            .mint_overlay_grant("team", "plan.md", "alice", None)
-            .await
-            .unwrap();
-        let secret = minted
-            .token
-            .strip_prefix(DRAFT_LINK_PREFIX)
-            .expect("a link carries the prefix");
-        let text = format!("{minted:?}");
-        assert!(!text.contains(secret), "the secret is redacted: {text}");
-        assert!(text.contains("redacted"), "and says so: {text}");
-        assert!(
-            text.contains(&minted.id.to_string()),
-            "while the id still prints: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn one_github_id_links_to_one_account_per_host() {
-        let (_dir, auth) = store().await;
-        for name in ["ann", "bea"] {
-            auth.add_user(name, name, None, Role::Editor, "pw12345678")
-                .await
-                .unwrap();
-        }
-        let link = auth
-            .link_github("ann", "GitHub.com", 42, "ann-gh")
-            .await
-            .unwrap();
-        assert_eq!(link.host, "github.com");
-        assert_eq!(link.github_id, 42);
-        assert!(link.token_live);
-        let err = auth
-            .link_github("bea", "github.com", 42, "other")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&err),
-            Some(RefusalKind::GithubIdTaken)
-        );
-        assert!(err.to_string().contains(
-            "this GitHub account is already linked to another Crystalline account; an admin can unlink it there"
-        ));
-        // The same id on another host is another person.
-        auth.link_github("bea", "ghe.example.com", 42, "bea-ghe")
-            .await
-            .unwrap();
-        assert_eq!(
-            auth.account_for_github("github.com", 42)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("ann")
-        );
-        assert_eq!(
-            auth.account_for_github("ghe.example.com", 42)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("bea")
-        );
-        assert_eq!(
-            auth.account_for_github("github.com", 7).await.unwrap(),
-            None
-        );
-        assert_eq!(auth.github_links().await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn relinking_replaces_the_row() {
-        let (_dir, auth) = store().await;
-        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        auth.link_github("ann", "github.com", 1, "old")
-            .await
-            .unwrap();
-        auth.mark_github_token_gone("ann").await.unwrap();
-        let link = auth
-            .link_github("ann", "github.com", 2, "new")
-            .await
-            .unwrap();
-        assert_eq!(link.github_id, 2);
-        assert!(link.token_live, "a fresh link has a live token");
-        let all = auth.github_links().await.unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].login, "new");
-        assert_eq!(
-            auth.account_for_github("github.com", 1).await.unwrap(),
-            None
-        );
-        // The same id again is a relink of one's own row, not a conflict.
-        auth.link_github("ann", "github.com", 2, "renamed")
-            .await
-            .unwrap();
-        assert_eq!(
-            auth.github_link_of("ann").await.unwrap().unwrap().login,
-            "renamed"
-        );
-        auth.set_github_login("ann", "again").await.unwrap();
-        assert_eq!(
-            auth.github_link_of("ann").await.unwrap().unwrap().login,
-            "again"
-        );
-        assert!(auth.unlink_github("ann").await.unwrap());
-        assert!(!auth.unlink_github("ann").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn removing_a_user_removes_its_link() {
-        let (_dir, auth) = store().await;
-        auth.add_user("root", "Root", None, Role::Admin, "pw12345678")
-            .await
-            .unwrap();
-        for name in ["ann", "bea"] {
-            auth.add_user(name, name, None, Role::Editor, "pw12345678")
-                .await
-                .unwrap();
-        }
-        auth.link_github("ann", "github.com", 5, "ann")
-            .await
-            .unwrap();
-        auth.link_github("bea", "github.com", 6, "bea")
-            .await
-            .unwrap();
-        auth.remove_user("ann").await.unwrap();
-        auth.remove_user_force("bea").await.unwrap();
-        assert!(auth.github_links().await.unwrap().is_empty());
-        auth.add_user("cy", "Cy", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        auth.link_github("cy", "github.com", 5, "cy").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn marking_the_token_gone_keeps_the_link() {
-        let (_dir, auth) = store().await;
-        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        auth.link_github("ann", "github.com", 9, "ann")
-            .await
-            .unwrap();
-        assert!(auth.mark_github_token_gone("ann").await.unwrap());
-        let link = auth.github_link_of("ann").await.unwrap().unwrap();
-        assert!(!link.token_live);
-        assert_eq!(link.github_id, 9);
-        assert!(!auth.mark_github_token_gone("nobody").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn an_old_database_gains_the_table_on_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        {
-            let db = turso::Builder::new_local(path.to_str().unwrap())
-                .build()
-                .await
-                .unwrap();
-            let conn = db.connect().unwrap();
-            let start = SCHEMA
-                .find("CREATE TABLE IF NOT EXISTS github_link")
-                .unwrap();
-            let end = start + SCHEMA[start..].find("github_link_host_id").unwrap();
-            let end = end + SCHEMA[end..].find(";\n").unwrap() + 2;
-            let old = format!("{}{}", &SCHEMA[..start], &SCHEMA[end..]);
-            assert!(!old.contains("github_link"));
-            conn.execute_batch(&old).await.unwrap();
-        }
-        let auth = AuthStore::open(&path).await.unwrap();
-        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
-            .await
-            .unwrap();
-        auth.link_github("ann", "github.com", 3, "ann")
-            .await
-            .unwrap();
-        assert_eq!(auth.github_links().await.unwrap().len(), 1);
-    }
-
-    // ---- Per-domain Reflection collaborators (Task 3.4) ----
-
-    async fn reflection_grant_cast(auth: &AuthStore) {
-        for name in ["ann", "bea"] {
-            auth.add_user(name, name, None, Role::Viewer, "pw12345678")
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn a_reflection_grant_is_stored_listed_and_removed() {
-        let (_dir, auth) = store().await;
-        reflection_grant_cast(&auth).await;
-        auth.set_reflection_grant("eng", "Ann", ReflectionLevel::Reader, "boss")
-            .await
-            .unwrap();
-        auth.set_reflection_grant("eng", "bea", ReflectionLevel::Contributor, "boss")
-            .await
-            .unwrap();
-        // A second write changes the level of the one row.
-        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Contributor, "keeper")
-            .await
-            .unwrap();
-        let grants = auth.reflection_grants("eng").await.unwrap();
-        let seen: Vec<(&str, ReflectionLevel, &str)> = grants
-            .iter()
-            .map(|g| (g.account.as_str(), g.level, g.added_by.as_str()))
-            .collect();
-        assert_eq!(
-            seen,
-            vec![
-                ("ann", ReflectionLevel::Contributor, "keeper"),
-                ("bea", ReflectionLevel::Contributor, "boss"),
-            ]
-        );
-        assert_eq!(
-            auth.reflection_grant("eng", "ann").await.unwrap(),
-            Some(ReflectionLevel::Contributor)
-        );
-        assert_eq!(auth.reflection_grant("ops", "ann").await.unwrap(), None);
-        assert!(auth.remove_reflection_grant("eng", "ANN").await.unwrap());
-        assert!(!auth.remove_reflection_grant("eng", "ann").await.unwrap());
-        assert_eq!(auth.reflection_grant("eng", "ann").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn a_default_grant_is_refused() {
-        let (_dir, auth) = store().await;
-        reflection_grant_cast(&auth).await;
-        let err = auth
-            .set_reflection_grant("eng", "ann", ReflectionLevel::Default, "boss")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            StoreRefusal::kind_of(&err),
-            Some(RefusalKind::EmptyMembership)
-        );
-        assert!(format!("{err}").contains("use remove"), "{err}");
-        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_grant_names_a_live_account() {
-        let (_dir, auth) = store().await;
-        reflection_grant_cast(&auth).await;
-        auth.set_disabled("bea", true).await.unwrap();
-        for name in ["nobody", "bea", crate::scope::OWNER_IDENTITY_NAME] {
-            let err = auth
-                .set_reflection_grant("eng", name, ReflectionLevel::Reader, "boss")
-                .await
-                .unwrap_err();
-            assert_eq!(
-                StoreRefusal::kind_of(&err),
-                Some(RefusalKind::NoSuchAccount),
-                "{name}: {err}"
-            );
-        }
-        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
-    }
-
-    /// A shared domain has no acl, member or share-link row, so the grants
-    /// alone must carry the rename. Stale grants under the new name go.
-    #[tokio::test]
-    async fn renaming_a_domain_carries_its_grants() {
-        let (_dir, auth) = store().await;
-        reflection_grant_cast(&auth).await;
-        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "boss")
-            .await
-            .unwrap();
-        auth.set_reflection_grant("ops", "bea", ReflectionLevel::Contributor, "boss")
-            .await
-            .unwrap();
-        auth.rename_domain("eng", "ops").await.unwrap();
-        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
-        let moved: Vec<String> = auth
-            .reflection_grants("ops")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|g| g.account)
-            .collect();
-        assert_eq!(moved, vec!["ann".to_string()]);
-        // Again after a crash: nothing under the old name, nothing changes.
-        auth.rename_domain("eng", "ops").await.unwrap();
-        assert_eq!(auth.reflection_grants("ops").await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn forgetting_a_domain_drops_its_grants() {
-        let (_dir, auth) = store().await;
-        reflection_grant_cast(&auth).await;
-        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "boss")
-            .await
-            .unwrap();
-        auth.set_reflection_grant("ops", "ann", ReflectionLevel::Reader, "boss")
-            .await
-            .unwrap();
-        assert!(!auth.forget_domain("eng").await.unwrap());
-        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
-        assert_eq!(auth.reflection_grants("ops").await.unwrap().len(), 1);
-    }
-
-    /// A grant left behind would be inherited by the next account to take
-    /// the name, as a membership row would.
-    #[tokio::test]
-    async fn removing_an_account_drops_its_grants() {
-        let (_dir, auth) = store().await;
-        reflection_grant_cast(&auth).await;
-        for name in ["ann", "bea"] {
-            auth.set_reflection_grant("eng", name, ReflectionLevel::Reader, "boss")
-                .await
-                .unwrap();
-        }
-        auth.remove_user("ann").await.unwrap();
-        auth.remove_user_force("bea").await.unwrap();
-        auth.add_user("ann", "ann", None, Role::Viewer, "pw12345678")
-            .await
-            .unwrap();
-        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
-        assert_eq!(auth.reflection_grant("eng", "ann").await.unwrap(), None);
-    }
-
-    /// Making a domain shared forgets its members, never its Reflection
-    /// collaborators: a grant does not depend on the visibility.
-    #[tokio::test]
-    async fn a_grant_outlives_a_visibility_change_and_a_transfer() {
-        let (_dir, auth) = store().await;
-        reflection_grant_cast(&auth).await;
-        auth.set_domain_visibility("eng", true, "bea")
-            .await
-            .unwrap();
-        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "bea")
-            .await
-            .unwrap();
-        auth.add_user("cy", "cy", None, Role::Viewer, "pw12345678")
-            .await
-            .unwrap();
-        auth.transfer_domain("eng", "cy").await.unwrap();
-        auth.set_domain_visibility("eng", false, "cy")
-            .await
-            .unwrap();
-        assert_eq!(
-            auth.reflection_grant("eng", "ann").await.unwrap(),
-            Some(ReflectionLevel::Reader)
-        );
-    }
 }

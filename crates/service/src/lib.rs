@@ -11,6 +11,7 @@
 
 pub(crate) mod automation_ctl;
 pub mod automation_trigger;
+pub mod claim;
 pub mod client;
 pub mod control;
 pub mod daemon;
@@ -19,6 +20,8 @@ pub mod desktop_offer;
 pub mod desktop_open;
 pub mod desktop_state;
 pub mod desktop_update;
+#[cfg(feature = "postgres")]
+pub mod durable;
 mod first_admin;
 pub mod instance;
 pub use crystalline_identity::join;
@@ -33,6 +36,7 @@ mod session_end;
 #[cfg(windows)]
 mod session_end_windows;
 pub mod shaping;
+mod standby;
 pub use crystalline_identity::scope;
 pub use crystalline_rest as rest;
 pub mod stub;
@@ -58,6 +62,11 @@ pub use crystalline_rest::collab;
 /// literal therefore fails CI instead of silently leaving the tool unrouted.
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
+pub use claim::{
+    CommandDbOwner, DatabaseOwned, claim_database_for_command, existing_accounts_for_cli,
+    open_accounts_for_cli, open_store_for_command, refuse_fix_when_owned, release_command_database,
+    set_command_line,
+};
 pub use client::{
     ROUTING_READ_ONLY_KEY, VirtualRouting, adopt_domain_names_direct, collect_orphaned_domains,
     configure, ctl_if_running, ctl_if_running_passive, ctl_required, ctl_routed,
@@ -89,6 +98,7 @@ pub use crystalline_identity::scope::{
     Scope, WriteRights, overlay_actor, reflection_right_word, write_list_matches,
 };
 pub use crystalline_remote::ops::DiscardTarget;
+pub use daemon::EXIT_FENCED;
 pub use daemon::run_serve;
 pub use instance::{EXIT_LOCK_HELD, HttpBinding, LockHeld, ServeIntent, StartMode};
 pub use mcp::McpServer;

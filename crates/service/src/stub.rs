@@ -468,6 +468,7 @@ mod tests {
             state_dir: None,
             config_path: None,
             http: None,
+            standby: None,
         }
     }
 

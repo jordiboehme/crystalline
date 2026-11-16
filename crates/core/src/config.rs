@@ -739,6 +739,31 @@ pub struct DatabaseConfig {
     /// and the default `index.db` path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The Postgres schema every connection routes to (`search_path`). Absent
+    /// means the database default. Ignored on Turso. Must pass
+    /// [`validate_schema_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+}
+
+/// Check a Postgres schema name: a plain identifier of lowercase ASCII
+/// letters, digits and `_`, not starting with a digit, at most 63 bytes
+/// (`[a-z_][a-z0-9_]{0,62}`).
+pub fn validate_schema_name(s: &str) -> Result<(), ConfigError> {
+    let bytes = s.as_bytes();
+    let ok = !bytes.is_empty()
+        && bytes.len() <= 63
+        && (bytes[0].is_ascii_lowercase() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(ConfigError::Database(format!(
+            "the database schema '{s}' is not a plain identifier: use lowercase letters, digits and _, not starting with a digit, at most 63 bytes"
+        )))
+    }
 }
 
 /// Hand-written for the reason [`OidcConfig`]'s is: a Postgres URL carries the
@@ -756,6 +781,7 @@ impl std::fmt::Debug for DatabaseConfig {
         f.debug_struct("DatabaseConfig")
             .field("backend", &self.backend)
             .field("url", &self.url.as_ref().map(|_| SECRET_DISPLAY))
+            .field("schema", &self.schema)
             .finish()
     }
 }
@@ -766,6 +792,13 @@ impl DatabaseConfig {
     /// Postgres backend requires a non-empty URL beginning `postgres://` or
     /// `postgresql://`; a Turso backend accepts any URL as a file-path override.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // A schema is only read on Postgres, so a stray one on Turso is not
+        // an error.
+        if self.backend == DatabaseBackend::Postgres
+            && let Some(schema) = self.schema.as_deref()
+        {
+            validate_schema_name(schema)?;
+        }
         if self.backend == DatabaseBackend::Postgres {
             match self.url.as_deref() {
                 Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => Ok(()),
@@ -1853,6 +1886,39 @@ pub fn web_auth_db_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("web-auth.db"))
 }
 
+/// Where the accounts, sessions, MCP tokens and OAuth grants live: the
+/// `web-auth.db` file in the state directory, or the configured Postgres
+/// database and schema, beside the index.
+#[derive(Clone, Debug)]
+pub enum AccountsLocation {
+    /// A Turso file, `<state_dir>/web-auth.db`.
+    File(PathBuf),
+    /// The Postgres database (and schema) the index uses.
+    Postgres(DatabaseConfig),
+}
+
+impl AccountsLocation {
+    /// The accounts location for `db`: Postgres when `db` names the postgres
+    /// backend, else the `web-auth.db` file in `state_dir`, the same path
+    /// [`web_auth_db_path`] gives for the default state directory.
+    pub fn resolve(db: &DatabaseConfig, state_dir: &Path) -> AccountsLocation {
+        match db.backend {
+            DatabaseBackend::Postgres => AccountsLocation::Postgres(db.clone()),
+            DatabaseBackend::Turso => AccountsLocation::File(state_dir.join("web-auth.db")),
+        }
+    }
+
+    /// Whether accounts may already be stored here: the file exists, or the
+    /// location is Postgres, where it always counts as present (the tables
+    /// are created on the first open).
+    pub fn exists(&self) -> bool {
+        match self {
+            AccountsLocation::File(path) => path.exists(),
+            AccountsLocation::Postgres(_) => true,
+        }
+    }
+}
+
 /// The single-instance lock path, `<state_dir>/service.lock`. Lock only: the
 /// owner holds an exclusive OS lock on this file for its lifetime and the
 /// contents are meaningless. The owner's record lives at [`service_info_path`],
@@ -1976,6 +2042,33 @@ pub fn models_dir_is_user_provided() -> bool {
 mod tests {
     use super::*;
 
+    /// Turso keeps the accounts in `web-auth.db` in the state directory;
+    /// Postgres keeps them in the configured database, which always exists.
+    #[test]
+    fn accounts_location_follows_the_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = AccountsLocation::resolve(&DatabaseConfig::default(), dir.path());
+        match &file {
+            AccountsLocation::File(path) => assert_eq!(path, &dir.path().join("web-auth.db")),
+            other => panic!("{other:?}"),
+        }
+        assert!(!file.exists());
+        std::fs::write(dir.path().join("web-auth.db"), b"").unwrap();
+        assert!(file.exists());
+        let pg = DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some("postgres://u:secret@h/db".to_string()),
+            schema: Some("team_a".to_string()),
+        };
+        let loc = AccountsLocation::resolve(&pg, dir.path());
+        match &loc {
+            AccountsLocation::Postgres(cfg) => assert_eq!(cfg.schema.as_deref(), Some("team_a")),
+            other => panic!("{other:?}"),
+        }
+        assert!(loc.exists());
+        assert!(!format!("{loc:?}").contains("secret"));
+    }
+
     #[test]
     fn the_webhook_debug_render_masks_the_secret_and_keeps_the_url() {
         let cfg = GlobalConfig {
@@ -2031,6 +2124,7 @@ mod tests {
             database: Some(DatabaseConfig {
                 backend: DatabaseBackend::Postgres,
                 url: Some("postgres://crystalline:hunter2@db.example.test/crystalline".into()),
+                schema: None,
             }),
             ..GlobalConfig::default()
         };
@@ -2423,6 +2517,7 @@ mod tests {
             database: Some(DatabaseConfig {
                 backend: DatabaseBackend::Postgres,
                 url: Some("postgresql://localhost/db".to_string()),
+                schema: None,
             }),
             ..GlobalConfig::default()
         };
@@ -2432,10 +2527,40 @@ mod tests {
     }
 
     #[test]
+    fn database_schema_validates_identifiers() {
+        for ok in ["team_a", "_x1", "a", &"a".repeat(63)] {
+            assert!(validate_schema_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["Team", "1a", "a-b", "", &"a".repeat(64), "a b", "ä"] {
+            assert!(validate_schema_name(bad).is_err(), "{bad}");
+        }
+        let db = DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some("postgres://localhost/db".to_string()),
+            schema: Some("Team".to_string()),
+        };
+        assert!(db.validate().is_err());
+    }
+
+    #[test]
+    fn database_config_debug_shows_schema_and_masks_url() {
+        let db = DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some("postgres://u:hunter2@db/x".to_string()),
+            schema: Some("team_a".to_string()),
+        };
+        let rendered = format!("{db:?}");
+        assert!(rendered.contains("team_a"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains(SECRET_DISPLAY), "{rendered}");
+    }
+
+    #[test]
     fn turso_url_is_an_optional_path_override_and_always_valid() {
         let db = DatabaseConfig {
             backend: DatabaseBackend::Turso,
             url: Some("/tmp/custom-index.db".to_string()),
+            schema: None,
         };
         assert!(db.validate().is_ok());
     }
@@ -2445,6 +2570,7 @@ mod tests {
         let db = DatabaseConfig {
             backend: DatabaseBackend::Postgres,
             url: None,
+            schema: None,
         };
         assert!(db.validate().is_err());
     }
@@ -2454,6 +2580,7 @@ mod tests {
         let db = DatabaseConfig {
             backend: DatabaseBackend::Postgres,
             url: Some("mysql://localhost/db".to_string()),
+            schema: None,
         };
         assert!(db.validate().is_err());
     }

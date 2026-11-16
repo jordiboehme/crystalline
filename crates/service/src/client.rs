@@ -13,8 +13,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 use crystalline_remote::ops::DiscardTarget;
 
-use crate::daemon::{Departure, SHUTDOWN_DEADLINE, open_store, resolve_db};
-use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone};
+use crate::daemon::{Departure, SHUTDOWN_DEADLINE, resolve_db};
+use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone_with_store};
 use crate::instance::{
     Connection, HarnessGate, acquire_ownership, acquire_standalone_ownership, ensure_daemon,
     try_attach,
@@ -53,7 +53,7 @@ pub fn use_daemon(db: Option<&Path>, config_path: Option<&Path>) -> bool {
 /// after. If the opener was a `server/discover` probe, this error tells the
 /// client we are a legacy server - true only in the sense that we are about to
 /// stop being any kind of server at all.
-fn initialize_error_reply(opener_line: &str, err_text: &str) -> Option<String> {
+pub(crate) fn initialize_error_reply(opener_line: &str, err_text: &str) -> Option<String> {
     let msg: Value = serde_json::from_str(opener_line).ok()?;
     let id = msg.get("id")?;
     let reply = serde_json::json!({
@@ -245,6 +245,11 @@ pub async fn run_mcp(
         // as a client while the client is still composing its first request.
         let (opened, daemon) = tokio::join!(read_session_opener(&mut stdin), async {
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
+            if let Some(refusal) = conn.standby() {
+                return Err(anyhow::Error::new(crate::instance::StandbyRefusal(
+                    refusal.to_string(),
+                )));
+            }
             conn.into_mcp(harness_gate.clone())
                 .await
                 .map_err(|e| anyhow::Error::new(e).context("daemon MCP handshake failed"))
@@ -266,6 +271,19 @@ pub async fn run_mcp(
     };
     // Hand the opener back so the serving path reads it as its first line.
     stdin.replay(opener);
+
+    // A standby answered: it waits for another instance's database and
+    // serves no session, and an in-process server could not take its state
+    // folder either. Or the database is owned by an instance elsewhere, so
+    // no daemon was started for it, and an in-process server would be
+    // refused the same way. The sentence is the initialize error, and the
+    // error this process ends with, so it reaches the client and stderr
+    // alike.
+    if let Some(Err(e)) = &daemon
+        && let Some(refusal) = final_refusal(e)
+    {
+        return refuse_session(&mut stdout, opener_line.as_deref(), refusal).await;
+    }
 
     // A daemon is up: relay through it. A failed attach or handshake falls
     // through to the embedded path rather than propagating, so an unreachable
@@ -318,7 +336,16 @@ pub async fn run_mcp(
     // the chain for the Desktop log).
     match build_embedded(db, config_path, read_only, harness_gate).await {
         Ok(stack) => run_embedded_stdio(stack, stdin).await,
+        // Another instance owns the Postgres database: no status server
+        // would help, the client gets the sentence as the initialize error.
+        Err(e) if e.is::<crate::claim::DatabaseOwned>() => {
+            let refusal = e.to_string();
+            refuse_session(&mut stdout, opener_line.as_deref(), refusal).await
+        }
         Err(e) => {
+            // A database this stack claimed before a later step failed goes
+            // back now, not when the stub's session ends.
+            crate::claim::release_command_database().await;
             tracing::error!(
                 "crystalline mcp cannot start ({e:#}); serving a degraded status server"
             );
@@ -340,6 +367,35 @@ pub async fn run_mcp(
             }
         }
     }
+}
+
+/// The sentence of an attach or start that must not be tried again: a
+/// standby that serves no session, or a Postgres database another instance
+/// owns. Said once and final; any other failure is not one of these.
+fn final_refusal(e: &anyhow::Error) -> Option<String> {
+    if let Some(refusal) = e.downcast_ref::<crate::instance::StandbyRefusal>() {
+        return Some(refusal.0.clone());
+    }
+    e.downcast_ref::<crate::claim::DatabaseOwned>()
+        .map(|owned| owned.message.clone())
+}
+
+/// Answer the client's opener with `refusal` as the initialize error, then
+/// end with it as this process's error, so it reaches stderr too.
+async fn refuse_session<W>(
+    stdout: &mut W,
+    opener_line: Option<&str>,
+    refusal: String,
+) -> anyhow::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(reply) = opener_line.and_then(|line| initialize_error_reply(line, &refusal)) {
+        let _ = stdout.write_all(reply.as_bytes()).await;
+        let _ = stdout.write_all(b"\n").await;
+        let _ = stdout.flush().await;
+    }
+    Err(anyhow::anyhow!("{refusal}"))
 }
 
 /// The oldest Claude Desktop extension launcher this binary works with, as a
@@ -673,6 +729,26 @@ where
     }
 }
 
+/// The daemon answered the replayed `initialize` with an error: it will not
+/// serve this session (a standby does that), so the bridge stops trying.
+#[derive(Debug)]
+struct InitRefused(String);
+
+impl std::fmt::Display for InitRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InitRefused {}
+
+impl InitRefused {
+    /// The refusal inside a replay error, when it is one.
+    fn of(e: &std::io::Error) -> Option<&InitRefused> {
+        e.get_ref()?.downcast_ref::<InitRefused>()
+    }
+}
+
 /// Re-establish the MCP session on a fresh daemon connection: replay the
 /// client's `initialize` verbatim and swallow the daemon's answer (the client
 /// already holds one), replay `notifications/initialized`, then answer every
@@ -703,6 +779,14 @@ where
             let is_init_response =
                 msg.get("method").is_none() && msg.get("id").map(|id| id.to_string()) == init_key;
             if is_init_response {
+                if let Some(error) = msg.get("error") {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the daemon refused the session")
+                        .to_string();
+                    return Err(std::io::Error::other(InitRefused(message)));
+                }
                 break;
             }
             // Anything the daemon volunteers before answering the replayed
@@ -784,12 +868,22 @@ where
             tracing::warn!("daemon connection lost; reconnecting");
             let conn = match ensure_daemon(true, db, config_path, read_only).await {
                 Ok(conn) => conn,
+                // A database another machine owns stays owned: said once,
+                // and the session ends instead of asking again.
+                Err(e) if final_refusal(&e).is_some() => return Err(e),
                 Err(e) => {
                     tracing::warn!("reconnect failed: {e}");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 }
             };
+            // The daemon that came back is a standby: it serves no session,
+            // so the session ends with its sentence.
+            if let Some(refusal) = conn.standby() {
+                return Err(anyhow::Error::new(crate::instance::StandbyRefusal(
+                    refusal.to_string(),
+                )));
+            }
             // Re-sent on every reconnect: the daemon builds a fresh
             // `McpServer` per accepted socket (`daemon.rs`), so a restart
             // would otherwise flip an onboarded harness back to served in the
@@ -801,6 +895,12 @@ where
             match resync(&mut relay, &mut session, &mut stdout).await {
                 Ok(()) => break,
                 Err(e) => {
+                    // The daemon refused the replayed initialize (a standby
+                    // that gave no facts on the pipe answers that way):
+                    // final too.
+                    if let Some(refused) = InitRefused::of(&e) {
+                        return Err(anyhow::anyhow!("{}", refused.0));
+                    }
                     tracing::warn!("session replay failed: {e}");
                     continue;
                 }
@@ -823,6 +923,9 @@ struct EmbeddedStack {
     stop_sources: tokio::sync::watch::Sender<bool>,
 }
 
+/// What the owner row records for an embedded MCP stack.
+const EMBEDDED_COMMAND: &str = "crystalline mcp --embedded";
+
 /// Build the full in-process stack: take the index lock (refused if held),
 /// load the config and overlay, open the store, construct the engine, launch
 /// the background sync and embed workers and prime the routing cache. Every
@@ -841,7 +944,14 @@ async fn build_embedded(
     let loaded = overlay::load(config_path)?;
     let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db)?;
-    let store = open_store(&loaded.effective, Some(&db_path)).await?;
+    // On Postgres this stack is the database's owner for the session, as a
+    // command is for its run: claimed once, or refused with the owner's name
+    // when another instance has it (spec section O).
+    let claim =
+        crate::claim::claim_database_for_session(&loaded.effective, EMBEDDED_COMMAND).await?;
+    let store =
+        crate::claim::open_store_as(claim.as_ref(), &loaded.effective, Some(&db_path), false)
+            .await?;
     // A channel the embed worker (spawned below) listens on: connecting an
     // origin mid-session schedules its embedding pass here instead of running
     // it inline, so the connect request returns without waiting on the model.
@@ -993,6 +1103,9 @@ where
     // its own, is waited for with what is left of the deadline, so a token
     // pair the server rotated is saved.
     departure.settle_sign_ins().await;
+    // The database last, as a daemon gives it back: the sign-in above may
+    // still have written to it.
+    crate::claim::release_command_database().await;
     departure.finish(None)
 }
 
@@ -1107,15 +1220,28 @@ async fn open_standalone_noting(
     // An explicit --db or --config never asked the daemon in the first place,
     // which changes the remedy rather than the diagnosis.
     let bypassed = !use_daemon(db, config_path);
-    let engine = open_standalone(loaded, db_path, want_embeddings)
+    let unreachable = |e: anyhow::Error| {
+        anyhow::anyhow!(crate::instance::index_unreachable_words(
+            &location,
+            &format!("{e:#}"),
+            bypassed
+        ))
+    };
+    // On Postgres the database is claimed for this command first, or the
+    // command is refused before anything opens (spec section L). The refusal
+    // goes out as it is: it names the owner, which the index wording does not.
+    let claim = match crate::claim::claim_for_this_command(&loaded.effective).await {
+        Ok(claim) => claim,
+        Err(e) if crate::claim::refused_by_cli_rule(&e) => return Err(e),
+        Err(e) => return Err(unreachable(e)),
+    };
+    let store =
+        crate::claim::open_store_as(claim.as_ref(), &loaded.effective, Some(db_path), false)
+            .await
+            .map_err(unreachable)?;
+    let engine = open_standalone_with_store(loaded, store, want_embeddings)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!(crate::instance::index_unreachable_words(
-                &location,
-                &format!("{e:#}"),
-                bypassed
-            ))
-        })?
+        .map_err(unreachable)?
         .with_machine_owner_lookup(machine_owner_for_engine());
     if bypassed && note {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
@@ -1139,6 +1265,22 @@ async fn finish_leftover_rename_owned(engine: &Engine) -> Option<Value> {
     }
     match acquire_standalone_ownership("crystalline command finishing an earlier domain rename") {
         Ok(ownership) => {
+            // On Postgres the records the rename moves are in the database
+            // this command claimed, never in an accounts file.
+            let cfg = engine.config();
+            if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+                match crate::claim::accounts_location(&cfg) {
+                    Ok(loc) => match crate::claim::open_accounts_for_command(&cfg, &loc).await {
+                        Ok(auth) => engine.set_rename_accounts(Arc::new(
+                            crate::scope::DomainAccess::new(Arc::new(auth)),
+                        )),
+                        Err(e) => tracing::warn!(
+                            "the accounts in the database could not be opened for the rename an earlier run left half done ({e:#})"
+                        ),
+                    },
+                    Err(e) => tracing::warn!("{e:#}"),
+                }
+            }
             engine.set_holds_state_dir(true);
             let finished = engine.finish_leftover_rename().await;
             engine.set_holds_state_dir(false);
@@ -1629,10 +1771,11 @@ pub async fn domain_remove(
     }
     let name = localize_standalone(&engine, name).await;
     let name = name.as_str();
-    if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
-        && auth_path.exists()
+    let cfg = engine.config();
+    if let Ok(loc) = crate::claim::accounts_location(&cfg)
+        && loc.exists()
     {
-        let auth = std::sync::Arc::new(crate::rest::AuthStore::open(&auth_path).await?);
+        let auth = std::sync::Arc::new(crate::claim::open_accounts_for_command(&cfg, &loc).await?);
         engine.set_domain_access(std::sync::Arc::new(
             crate::scope::DomainAccess::new(auth).with_governor(engine.knowledge_governor()),
         ));
@@ -1663,7 +1806,9 @@ pub async fn domain_remove(
 /// same reason). It also needs no accounts database installed ahead of time:
 /// [`crate::engine::Engine::rename_domain`]'s own `rename_access` opens
 /// `web-auth.db` under the state directory itself when one exists and none
-/// was installed, the same fallback `domain_remove` has no equivalent of.
+/// was installed, the same fallback `domain_remove` has no equivalent of. On
+/// Postgres, where that file is never read, the accounts in the database are
+/// installed before the rename.
 pub async fn domain_rename(
     domain: &str,
     new: &str,
@@ -1704,6 +1849,13 @@ pub async fn domain_rename(
     // half done, because that recovery reads names the table would hide.
     if use_daemon(db, config_path) {
         crate::route::install_sources(&engine);
+    }
+    // On Postgres the records the rename moves live in the database this
+    // command claimed, and the engine never reads an accounts file there:
+    // they are installed first, as the daemon installs them at its start.
+    let engine = Arc::new(engine);
+    if engine.config().database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+        install_domain_access(&engine).await;
     }
     // A rename runs only while this process holds the state directory, as a
     // daemon does; the engine refuses it otherwise, in words that name the
@@ -1769,11 +1921,12 @@ pub use crystalline_engine::machine_rename_owner;
 /// machine's default configuration does not load, say) is handed on as it
 /// is, so the engine refuses a rename and skips a name adoption rather than
 /// running either unchecked; a warning says so once here.
-/// Install the private-domain resolver on a serving stack, over this
-/// machine's accounts store, and hand the store back for the HTTP surface to
-/// share. Every serving stack calls it before it answers anything: the
-/// daemon (HTTP on or off), the embedded stdio stack and a one-shot tool
-/// run, so a stack knows its readers whether or not anybody signs in here.
+/// Install the private-domain resolver on a serving stack, over the
+/// accounts store of its configuration (the database on Postgres), and hand
+/// the store back for the HTTP surface to share. Every serving stack calls
+/// it before it answers anything: the daemon (HTTP on or off), the embedded
+/// stdio stack and a one-shot tool run, so a stack knows its readers whether
+/// or not anybody signs in here.
 /// A store that is not there is not created: with no account there is no
 /// private domain, and the engine refuses other domains' sources should the
 /// file appear while it runs.
@@ -1785,25 +1938,45 @@ pub use crystalline_engine::machine_rename_owner;
 pub(crate) async fn install_domain_access(
     engine: &Arc<Engine>,
 ) -> Option<Arc<crate::rest::AuthStore>> {
-    // Who reads a domain connected through the GitHub App follows GitHub,
-    // and the App is loaded off the request path, starting now. The
-    // governor is built first, so the load warms it up when it lands.
-    engine.github_governor();
-    engine.preload_github_app();
-    let opened = match crystalline_core::config::web_auth_db_path() {
+    start_github_access(engine);
+    let cfg = engine.config();
+    let opened = match crate::claim::accounts_location(&cfg) {
         // No store yet: no account and no private domain exist, so nothing
         // is opened (or created, which would change this machine's state
         // from a stack that only reads it). The engine watches for the file
-        // and fails closed should it appear.
-        Ok(path) if !path.exists() => {
+        // and fails closed should it appear. A Postgres location always
+        // counts as present.
+        Ok(crystalline_core::config::AccountsLocation::File(path)) if !path.exists() => {
             engine.set_domain_access_absent(path);
             return None;
         }
-        Ok(path) => crate::rest::AuthStore::open(&path)
+        Ok(loc) => crate::claim::open_accounts_for_command(&cfg, &loc)
             .await
             .map_err(|e| format!("{e:#}")),
         Err(e) => Err(format!("{e:#}")),
     };
+    install_opened_domain_access(engine, opened)
+}
+
+/// Who reads a domain connected through the GitHub App follows GitHub, and
+/// the App is loaded off the request path, starting now, before the
+/// accounts store is opened. The governor is built first, so the load warms
+/// it up when it lands. Every stack that installs domain access calls this
+/// first, the daemon on Postgres included.
+pub(crate) fn start_github_access(engine: &Arc<Engine>) {
+    engine.github_governor();
+    engine.preload_github_app();
+    crate::daemon::start_step("github app preload");
+}
+
+/// [`install_domain_access`] over an accounts store the caller opened (or
+/// failed to open, with the reason): installed as the engine's domain access
+/// and handed back, or, when it did not open, domain access fails closed and
+/// the reason is logged.
+pub(crate) fn install_opened_domain_access(
+    engine: &Arc<Engine>,
+    opened: Result<crate::rest::AuthStore, String>,
+) -> Option<Arc<crate::rest::AuthStore>> {
     match opened {
         Ok(auth) => {
             let auth = Arc::new(auth);
@@ -2676,8 +2849,14 @@ pub async fn virtual_routing_bullets(
     };
     // No rename recovery here: this read-only render takes no ownership of
     // the state directory, so a rename left half done waits for the next
-    // opener that does.
-    match open_standalone(loaded, &db_path, false).await {
+    // opener that does. On Postgres the store opens by the CLI rule: `prompt`
+    // is a read-only report, so an owned database is not opened at all and
+    // the bullets are left out.
+    let Ok(store) = crate::claim::open_store_for_command(config, Some(&db_path), false).await
+    else {
+        return VirtualRouting::default();
+    };
+    match open_standalone_with_store(loaded, store, false).await {
         Ok(engine) => {
             let (bullets, read_only) = engine.virtual_routing().await;
             VirtualRouting { bullets, read_only }
@@ -3590,6 +3769,45 @@ mod tests {
             "nothing from the replayed handshake reaches the client: {out}"
         );
         assert!(relay.outstanding.is_empty());
+        daemon.await.unwrap();
+    }
+
+    /// A daemon that answers the replayed `initialize` with an error (a
+    /// standby that gave no facts on the pipe) ends the replay with its
+    /// sentence as an [`InitRefused`], which the bridge takes as final.
+    #[tokio::test]
+    async fn resync_reports_a_refused_initialize() {
+        let mut relay = RelayState::default();
+        relay.note_client_line(
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{}}}"#,
+        );
+        relay.note_server_line(r#"{"jsonrpc":"2.0","id":0,"result":{"serverInfo":{}}}"#);
+
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            let init = lines.next_line().await.unwrap().unwrap();
+            assert!(init.contains("\"initialize\""), "{init}");
+            write
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32000,\"message\":\"this instance is a standby\"}}\n",
+                )
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        });
+
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+        let e = resync(&mut relay, &mut session, &mut stdout)
+            .await
+            .expect_err("a refused initialize ends the replay");
+        assert_eq!(
+            InitRefused::of(&e).map(|r| r.0.as_str()),
+            Some("this instance is a standby")
+        );
+        assert!(stdout.is_empty(), "nothing reaches the client");
         daemon.await.unwrap();
     }
 

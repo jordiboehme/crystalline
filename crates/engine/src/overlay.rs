@@ -171,6 +171,18 @@ pub const RESERVED_VARS: &[&str] = &[
     // with it set logs no warning.
     crystalline_core::desktop_extension::BINARY_ENV,
     "CRYSTALLINE_TEST_POSTGRES_URL",
+    // The owner-lock tests scale the takeover timings down so a handover
+    // takes milliseconds. Read straight from the environment, never through
+    // the settings registry.
+    "CRYSTALLINE_TEST_OWNER_TIMING_SCALE",
+    // The Postgres start's test hold (`START_HOLD_ENV` in the service
+    // crate's standby): a debug daemon waits this many milliseconds right
+    // after it took the owner lock. Read straight from the environment.
+    "CRYSTALLINE_TEST_START_HOLD_MS",
+    // The fenced exit's test hold (`FENCE_EXIT_HOLD_ENV` in the service
+    // crate's standby): a debug daemon that lost the owner lock waits this
+    // many milliseconds before it exits. Read straight from the environment.
+    "CRYSTALLINE_TEST_FENCE_EXIT_HOLD_MS",
     // The CLI's token-store seam (`crystalline::cmd::test_token_store_dir`):
     // it points a `connect github` at a plain file under a tempdir so the
     // tests never reach this machine's keychain. Read straight from the
@@ -1446,6 +1458,23 @@ mod tests {
         ] {
             assert!(is_reserved(name), "{name}");
         }
+    }
+
+    #[test]
+    fn schema_env_maps_to_database_schema() {
+        let ov = overlay(&[("CRYSTALLINE_DATABASE_SCHEMA", "team_a")]).unwrap();
+        assert!(ov.overrides_key("database.schema"));
+        let effective = ov.apply(&GlobalConfig::default());
+        assert_eq!(effective.database().schema.as_deref(), Some("team_a"));
+    }
+
+    #[test]
+    fn invalid_schema_env_names_the_variable() {
+        let err = overlay(&[("CRYSTALLINE_DATABASE_SCHEMA", "Team-A")]).unwrap_err();
+        assert!(
+            err.to_string().contains("CRYSTALLINE_DATABASE_SCHEMA"),
+            "{err}"
+        );
     }
 
     #[test]

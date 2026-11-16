@@ -1591,23 +1591,29 @@ async fn registered(
     let checked = check_metadata(body)?;
 
     prune_registrations(&state.auth).await;
-    let held = state
-        .auth
-        .count_oauth_clients()
-        .await
-        .map_err(|error| store_unavailable("counting the registrations", &error))?;
-    if held >= MAX_OAUTH_CLIENTS {
-        return Err(OauthError::no_room());
-    }
+    // The count and the insert are one transaction in the store, so two
+    // writers cannot both take the last place.
     let client = state
         .auth
-        .register_oauth_client(
+        .register_oauth_client_within(
             &checked.name,
             checked.client_uri.as_deref(),
             &checked.redirect_uris,
+            Some(MAX_OAUTH_CLIENTS),
         )
         .await
-        .map_err(|error| store_unavailable("storing the registration", &error))?;
+        .map_err(|error| {
+            let counting = error.chain().any(|e| {
+                e.to_string() == crystalline_identity::auth_store::OAUTH_CLIENTS_UNCOUNTED
+            });
+            let what = if counting {
+                "counting the registrations"
+            } else {
+                "storing the registration"
+            };
+            store_unavailable(what, &error)
+        })?
+        .ok_or_else(OauthError::no_room)?;
     // Never the name or the uris: both are attacker-chosen text, and the id is
     // what every later line about this client is keyed on anyway.
     tracing::info!(
