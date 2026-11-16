@@ -242,6 +242,10 @@ jobs:
             run_the_tests "the artifact lookup for $name failed"
           fi
           if [ -z "$runs" ]; then
+            # The usual reason: main moved while the pull request was open
+            # and it merged without being brought up to date, so the merge
+            # commit's tree is one no pull request run has seen.
+            echo "::notice title=tree skip missed::no green pull request run of the tree $tree (no unexpired $name). Likely the pull request was not up to date with main when it merged, so the tests run again here."
             run_the_tests "no pull request run of this repository left an unexpired $name"
           fi
 
@@ -1360,6 +1364,13 @@ jobs:
       - name: The docs' action pins match the workspace version
         run: bash scripts/version-pins.sh
 
+      # The decision the release-check job makes on main, run on every
+      # change so the script is exercised before a release depends on it. On
+      # a pull request that bumps the version it reports the release the
+      # merge would start; otherwise it says there is nothing to release.
+      - name: The release check reads the version and its tag
+        run: bash scripts/release-check.sh
+
   # Static checks of the workflows and the bundled action. actionlint catches
   # expression, type and shell errors; zizmor catches the security mistakes
   # (template injection, over-wide tokens, persisted credentials, unpinned
@@ -1529,19 +1540,30 @@ jobs:
           team-repository: 'false'
           comment: 'false'
 
-  # The proof `changes` looks for on main: this pull request run passed every
-  # gated job on this tree. A job `if` without a status function means
-  # `success() && ...`, and a skipped need skips this job, so a run with a
-  # failed, cancelled or skipped gated job uploads nothing. That includes a
-  # documentation-only pull request, whose heavy jobs were skipped; main's own
-  # classifier skips the same tree anyway. The ungated jobs (style, cargo-deny,
-  # fluid-audit) are left out on purpose: they run again on every push to main,
-  # and the two audits can go red on a new advisory that has nothing to do with
-  # this tree. workflow-lint is ungated too but waited for: a workflow that
-  # fails it should not count as tested. A matrix job such as `test`,
-  # `fluid-unit` or `fluid-smoke` is a success here only when every one of its
-  # legs is, so each shard of the unit tests and of the browser smoke is
-  # required.
+  # The aggregate: every gated job either passed or was skipped on purpose.
+  # It is the one required status check of the `main` ruleset, and on a push
+  # to main it is what the release waits for.
+  #
+  # It runs whatever its needs did (`always()`), and its first step fails when
+  # any need failed or was cancelled. A plain `needs` would skip it instead,
+  # and GitHub reports a skipped job as a success to a required check, so a
+  # red pull request could merge. A skipped need is fine: a documentation-only
+  # change skips the heavy jobs, and so does a push to main whose tree a pull
+  # request tested. A dispatched run is the stress job alone and leaves this
+  # job out.
+  #
+  # On a pull request it also uploads the proof `changes` looks for on main:
+  # this pull request run passed every gated job on this tree. Only when every
+  # need passed and none was skipped, so a run with a failed, cancelled or
+  # skipped gated job uploads nothing. That includes a documentation-only pull
+  # request, whose heavy jobs were skipped; main's own classifier skips the
+  # same tree anyway. The ungated jobs (style, cargo-deny, fluid-audit) are
+  # left out on purpose: they run again on every push to main, and the two
+  # audits can go red on a new advisory that has nothing to do with this
+  # tree. workflow-lint is ungated too but waited for: a workflow that fails
+  # it should not count as tested. A matrix job such as `test`, `fluid-unit`
+  # or `fluid-smoke` is a success here only when every one of its legs is, so
+  # each shard of the unit tests and of the browser smoke is required.
   ci-passed:
     name: ci-passed
     timeout-minutes: 10
@@ -1558,17 +1580,32 @@ jobs:
       - musl-spike
       - verify-action
       - workflow-lint
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Every gated job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key): \(.value.result)"' <<<"$RESULTS")
+          jq -r 'to_entries[] | "  \(.value.result)  \(.key)"' <<<"$RESULTS"
+          if [ -n "$bad" ]; then
+            echo "::error::not every gated job passed: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi
+          echo "ci-passed: every gated job passed or was skipped"
+
       # The commit every job above checked out: refs/pull/N/merge at
       # github.sha.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.event_name == 'pull_request' && !contains(needs.*.result, 'skipped') }}
         with:
           persist-credentials: false
 
       - name: Name the tested tree
         id: tree
+        if: ${{ github.event_name == 'pull_request' && !contains(needs.*.result, 'skipped') }}
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
@@ -1580,6 +1617,7 @@ jobs:
 
       # A re-run of this job uploads the same name again, hence overwrite.
       - name: Upload the proof
+        if: ${{ github.event_name == 'pull_request' && !contains(needs.*.result, 'skipped') }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tested-tree-${{ steps.tree.outputs.tree }}
@@ -1587,3 +1625,70 @@ jobs:
           retention-days: 7
           overwrite: true
           if-no-files-found: error
+
+  # Release on merge. The last pull request of a version bumps it and adds
+  # release-notes/v<version>.md; once that merge passes `ci-passed` on main,
+  # this releases it. scripts/release-check.sh decides: a version that is
+  # already tagged is a no-op with one line, a new version without its notes
+  # fails here, and a new version with its notes releases.
+  #
+  # Only the `release` job holds a concurrency group, never cancelled in
+  # progress, so two releases never run at once and a check never waits. A
+  # second release that queues behind a running one finds the tag when its
+  # release.yml starts and stops green. A third that queues while one waits
+  # replaces the waiting one, which shows as cancelled; a cancelled release
+  # job is re-run by hand.
+  #
+  # `style` is waited for too: it runs scripts/version-pins.sh, so a version
+  # bump that left a pin in docs/evolve.md or fluid/package.json behind does
+  # not ship. `ci-passed` leaves style out on purpose (see there).
+  release-check:
+    name: release-check
+    timeout-minutes: 10
+    needs: [ci-passed, style]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-passed.result == 'success' && needs.style.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Is this version new
+        id: check
+        run: bash scripts/release-check.sh
+
+  # The release itself, release.yml called with the tag. A called workflow
+  # gets no more than this job grants, so these are the scopes release.yml's
+  # publishing jobs name (publish: contents write and the two attestation
+  # scopes; images and fluid-image: packages write). The secrets go by name,
+  # as release.yml passes them to build.yml, never `inherit`; the Apple ones
+  # resolve to the `release` environment's copies inside the signing legs.
+  # The `release` environment admits main, so the called jobs may enter it.
+  release:
+    name: release
+    needs: release-check
+    if: ${{ needs.release-check.outputs.release == 'true' }}
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    # A local reusable workflow resolves at the commit this run started on;
+    # see release.yml's build job for the zizmor ignore.
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
+    with:
+      tag: ${{ needs.release-check.outputs.tag }}
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}

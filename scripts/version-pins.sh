@@ -8,10 +8,9 @@
 # the action ref users copy into their workflow, the binary version that
 # workflow downloads, and the prose that tells them pinning both is what makes
 # the check reproducible, and release-notes/v<version>.md is the file the
-# tagged release workflow publishes as the release page's body - on main the
-# version is always the last released one, so a bump that lands without its
-# notes file fails here, in the release PR, before the tag exists rather than
-# in the tagged workflow after a build has already run.
+# release workflow publishes as the release page's body - a merge of a version
+# bump releases it, so a bump that lands without its notes file fails here, in
+# the release PR, before the merge rather than on main after it.
 #
 # A bump that updates some of the four files goes green and ships, and every
 # reader who copies the docs/evolve.md snippet pins the previous release, or
@@ -64,12 +63,12 @@ if [ "$fluid" != "$version" ]; then
 fi
 
 # release-notes/v<version>.md must exist, be non-empty and open with an H1
-# that carries text: the tagged release workflow's own `notes` job checks the
+# that carries text: the release workflow's own `notes` job checks the
 # same three things before any build starts, and this is what catches a
 # missing file earlier, in the release PR, while it is still a one-line fix.
 notesfile="$root/release-notes/v$version.md"
 if [ ! -s "$notesfile" ]; then
-  echo "::error file=release-notes/v$version.md::release-notes/v$version.md is missing or empty. The workspace version on main is always the last released one, so this file is the body the release page for v$version shows; add it in this PR before the tag is pushed." >&2
+  echo "::error file=release-notes/v$version.md::release-notes/v$version.md is missing or empty. The workspace version on main is always the released one or the one about to be released, so this file is the body the release page for v$version shows; add it in this PR, because merging it releases v$version." >&2
   bad=1
 elif ! head -1 "$notesfile" | grep -qE '^# .+'; then
   echo "::error file=release-notes/v$version.md::release-notes/v$version.md must open with an H1 (a line starting with '# ' followed by text), the release's motto." >&2
