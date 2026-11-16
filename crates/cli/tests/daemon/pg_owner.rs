@@ -659,6 +659,10 @@ fn terminated_lock_session_exits_with_fenced_code() {
     );
 }
 
+/// How long a fenced owner waits before its exit in the paused test: long
+/// enough for its watcher to index the dropped file, were it let through.
+const FENCE_EXIT_HOLD_MS: &str = "5000";
+
 /// Sends SIGCONT to a stopped child when dropped, so a failed assertion
 /// never leaves it stopped.
 struct Paused(i32);
@@ -685,7 +689,9 @@ impl Drop for Paused {
 /// every session of the paused owner and serves. A file dropped into the
 /// paused owner's domain meanwhile is never indexed: once it wakes it is
 /// fenced and exits with code 4, and the engram rows it wrote before the
-/// pause are what is left.
+/// pause are what is left. The fenced exit is held for a few seconds (a
+/// debug-only test hook), so the woken owner's watcher really tries to
+/// write the file and only the connect fence of its pools keeps it out.
 #[test]
 fn paused_owner_cannot_write_after_takeover() {
     let Some(pg) = PgScratch::new("hopause") else {
@@ -693,7 +699,11 @@ fn paused_owner_cannot_write_after_takeover() {
     };
     let active_env = Env::new("hopa").on_postgres(&pg);
     active_env.setup_domain("notes");
-    let mut active = Serve::start(&active_env, None);
+    let mut active = Serve::start_with(
+        &active_env,
+        None,
+        &[("CRYSTALLINE_TEST_FENCE_EXIT_HOLD_MS", FENCE_EXIT_HOLD_MS)],
+    );
     active.wait_ready();
     let engrams = || pg.text(&format!("SELECT count(*)::text FROM {}.engram", pg.schema));
     wait_until(Duration::from_secs(30), "the seed was indexed", || {
@@ -738,9 +748,8 @@ fn paused_owner_cannot_write_after_takeover() {
     );
 
     drop(paused);
-    assert_eq!(active.wait_exit(Duration::from_secs(15)), Some(4));
-    // Long enough for a watcher event the wake delivered to have landed.
-    std::thread::sleep(Duration::from_secs(1));
+    active.wait_log("test hook: holding the fenced exit");
+    assert_eq!(active.wait_exit(Duration::from_secs(20)), Some(4));
     assert_eq!(
         engrams(),
         before,
@@ -902,4 +911,34 @@ fn a_refused_takeover_names_the_grant() {
         use sqlx::Connection;
         let _ = predecessor.close().await;
     });
+}
+
+/// On Postgres the accounts live in the database only: when they cannot be
+/// opened (here their tables are ahead of this binary), the start fails
+/// with a sentence that says so, and the HTTP surface never falls back to
+/// an accounts file on this machine.
+#[test]
+fn accounts_that_do_not_open_stop_the_start_on_postgres() {
+    let Some(pg) = PgScratch::new("hoauth") else {
+        return;
+    };
+    assert!(pg.sql(&format!(
+        "CREATE TABLE {0}.auth_schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL); \
+         INSERT INTO {0}.auth_schema_migration VALUES (999, '2026-11-16T00:00:00Z')",
+        pg.schema
+    )));
+    let env = Env::new("hoauth").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    let code = serve.wait_exit(Duration::from_secs(30));
+    let log = serve.log();
+    assert_ne!(code, Some(0), "{log}");
+    assert!(
+        log.contains("could not open the accounts in the database")
+            && log.contains("does not start without them"),
+        "{log}"
+    );
+    assert!(
+        !env.state_dir().join("web-auth.db").exists(),
+        "an accounts file was made"
+    );
 }

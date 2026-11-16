@@ -358,7 +358,8 @@ fn terminate_refused(database: &str) -> IndexError {
     IndexError::Invalid(format!(
         "this instance took the database {database} but may not end the sessions of the instance \
          before it: grant its database role pg_signal_backend, or run every instance on this \
-         database as the same role"
+         database as the same role (when the instance before ran as a superuser, only the \
+         same role or a superuser may end its sessions)"
     ))
 }
 
@@ -1021,6 +1022,7 @@ mod tests {
         };
         assert!(text.contains("db:5432/c, schema a"), "{text}");
         assert!(text.contains("pg_signal_backend"), "{text}");
+        assert!(text.contains("ran as a superuser"), "{text}");
         assert!(
             matches!(
                 terminate_error(sqlx::Error::RowNotFound, "x"),

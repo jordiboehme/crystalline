@@ -86,10 +86,7 @@ impl PgStart {
     /// connection made after the lock is lost is refused.
     #[cfg(feature = "postgres")]
     pub(crate) fn session_options(&self) -> crystalline_index::postgres::PgSessionOptions {
-        crystalline_index::postgres::PgSessionOptions {
-            instance_tag: Some(self.instance_id.clone()),
-            fence: Some(self.owner.fence()),
-        }
+        owner_session_options(&self.instance_id, self.owner.fence())
     }
 
     /// Write the owner row again: on a schema the store open just created
@@ -102,6 +99,12 @@ impl PgStart {
                 self.database
             )
         })
+    }
+
+    /// The database, as the log names it.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn database(&self) -> &str {
+        &self.database
     }
 
     /// Open the accounts store in the database this instance owns, with the
@@ -149,6 +152,20 @@ impl PgStart {
             },
             stop,
         ))
+    }
+}
+
+/// The settings of every Postgres connection an owner opens: tagged with its
+/// full instance id (the owner thread tags its own sessions with the same
+/// id, so the takeover spares them) and fenced on the held lock.
+#[cfg(feature = "postgres")]
+fn owner_session_options(
+    instance_id: &str,
+    fence: crystalline_index::postgres::OwnerFence,
+) -> crystalline_index::postgres::PgSessionOptions {
+    crystalline_index::postgres::PgSessionOptions {
+        instance_tag: Some(instance_id.to_string()),
+        fence: Some(fence),
     }
 }
 
@@ -688,7 +705,7 @@ mod pg {
         let guard = tokio::spawn(guard_start(stop, shutdown.subscribe(), done, leaving));
         // From the lock on, a lost lock ends the process with EXIT_FENCED,
         // during the start as later.
-        tokio::spawn(watch_fence(owner.fenced(), described.clone()));
+        watch_fence(&owner, described.clone());
         if let Some(hold) = start_hold() {
             tracing::info!("test hook: holding the start for {}ms", hold.as_millis());
             tokio::time::sleep(hold).await;
@@ -761,21 +778,76 @@ mod pg {
         )
     }
 
+    /// The test-only variable that holds a fenced exit for this many
+    /// milliseconds after the fence line, so a test can see the woken
+    /// owner's writes refused by the connect fence alone. Read by a debug
+    /// build only.
+    pub(crate) const FENCE_EXIT_HOLD_ENV: &str = "CRYSTALLINE_TEST_FENCE_EXIT_HOLD_MS";
+
+    /// How long [`FENCE_EXIT_HOLD_ENV`] holds a fenced exit, in a debug build.
+    fn fence_exit_hold() -> Option<Duration> {
+        if !cfg!(debug_assertions) {
+            return None;
+        }
+        std::env::var(FENCE_EXIT_HOLD_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    }
+
     /// Exit with [`crate::daemon::EXIT_FENCED`] once the owner lock is lost:
     /// one error line, and none of the departure's steps, whose writes
     /// (host locks, a checkpoint, a saved sign-in) would race the instance
     /// that owns the database now.
-    async fn watch_fence(mut fenced: watch::Receiver<FenceState>, database: String) {
-        loop {
-            let state = fenced.borrow_and_update().clone();
-            if let FenceState::Fenced(reason) = state {
-                tracing::error!("{}", fenced_line(&database, &reason));
-                crate::daemon::exit_with(crate::daemon::EXIT_FENCED);
-            }
-            if fenced.changed().await.is_err() {
-                return;
-            }
+    ///
+    /// The wait runs on a thread of its own, so a runtime whose workers are
+    /// all busy or stuck cannot delay the exit. A watch needs no runtime to
+    /// be waited on.
+    fn watch_fence(owner: &PgOwner, database: String) {
+        let (fenced, watched) = (owner.fenced(), database.clone());
+        let spawned = std::thread::Builder::new()
+            .name("crystalline-fence".to_string())
+            .spawn(move || {
+                if let Some(reason) = futures::executor::block_on(fenced_reason(fenced)) {
+                    exit_fenced(&watched, &reason);
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "could not start the fence thread ({e}); the fence is watched on the runtime"
+            );
+            let fenced = owner.fenced();
+            tokio::spawn(async move {
+                if let Some(reason) = fenced_reason(fenced).await {
+                    exit_fenced(&database, &reason);
+                }
+            });
         }
+    }
+
+    /// The reason of the fence, once there is one; `None` when the owner is
+    /// gone without one.
+    async fn fenced_reason(mut fenced: watch::Receiver<FenceState>) -> Option<String> {
+        loop {
+            if let FenceState::Fenced(reason) = fenced.borrow_and_update().clone() {
+                return Some(reason);
+            }
+            fenced.changed().await.ok()?;
+        }
+    }
+
+    /// Log the fence line and exit with [`crate::daemon::EXIT_FENCED`].
+    fn exit_fenced(database: &str, reason: &str) -> ! {
+        tracing::error!("{}", fenced_line(database, reason));
+        if let Some(hold) = fence_exit_hold() {
+            tracing::info!(
+                "test hook: holding the fenced exit for {}ms",
+                hold.as_millis()
+            );
+            std::thread::sleep(hold);
+        }
+        crate::daemon::exit_with(crate::daemon::EXIT_FENCED);
     }
 
     /// How a stop leaves before the daemon serves.
@@ -943,6 +1015,21 @@ mod pg {
                 );
                 assert!(standby_refusal(unknown.as_ref()).contains("has not announced itself yet"));
             }
+        }
+
+        /// Every owner connection carries the full instance id and the
+        /// fence, never the untagged, unfenced default.
+        #[test]
+        fn owner_connections_are_tagged_and_fenced() {
+            let fence = crystalline_index::postgres::OwnerFence {
+                key: -42,
+                lock_pid: 4242,
+            };
+            let id = "0123456789abcdef-instance";
+            let opts = super::super::owner_session_options(id, fence);
+            assert_eq!(opts.instance_tag.as_deref(), Some(id));
+            let got = opts.fence.expect("the fence");
+            assert_eq!((got.key, got.lock_pid), (-42, 4242));
         }
 
         /// The takeover line says whether the grace was waited out, and the

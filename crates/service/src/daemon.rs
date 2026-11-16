@@ -725,7 +725,7 @@ pub async fn run_serve(
     // reaches every reader of its domain and the backup branch either way.
     // Opened after the two short-lived opens above have closed theirs, and
     // shared with the HTTP surface below, so this process holds one handle.
-    let accounts = open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await;
+    let accounts = open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?;
     // Who may read each env-defined team domain on an instance with a GitHub
     // App, recorded before anything is served so a private one is closed
     // from its first request on. A private record that cannot be written
@@ -1158,23 +1158,38 @@ async fn open_store_for_start(
 /// surface: in the owned Postgres database with the owner's connection
 /// settings, else the accounts file as [`crate::client::install_domain_access`]
 /// opens it.
+///
+/// On Postgres the accounts live in the database and nowhere else, so a
+/// store that does not open fails the start: the HTTP surface must never
+/// fall back to an accounts file on this machine. The file path keeps its
+/// behaviour (domain access fails closed and the start goes on).
 async fn open_domain_access(
     engine: &Arc<Engine>,
     cfg: &GlobalConfig,
     pg: Option<&crate::standby::PgStart>,
-) -> Option<Arc<crate::rest::AuthStore>> {
+) -> anyhow::Result<Option<Arc<crate::rest::AuthStore>>> {
     #[cfg(feature = "postgres")]
     if let Some(pg) = pg {
-        let opened = pg.open_accounts(cfg).await.map_err(|e| format!("{e:#}"));
-        return crate::client::install_opened_domain_access(engine, opened);
+        let auth = pg.open_accounts(cfg).await.map_err(|e| {
+            anyhow::anyhow!(
+                "could not open the accounts in the database {} ({e:#}); on Postgres the accounts live in the database, so this instance does not start without them",
+                pg.database()
+            )
+        })?;
+        return Ok(crate::client::install_opened_domain_access(
+            engine,
+            Ok(auth),
+        ));
     }
     #[cfg(not(feature = "postgres"))]
     let _ = (cfg, pg);
-    crate::client::install_domain_access(engine).await
+    Ok(crate::client::install_domain_access(engine).await)
 }
 
-/// What a departure keeps back for the steps after the sign-in settle (the
-/// removal and the exit), and so the least the watchdog never sees spent.
+/// What a departure keeps back for the steps after the sign-in settle (on
+/// Postgres the release of the database, then the removal and the exit),
+/// and so the least the watchdog never sees spent. The release is two short
+/// statements on the open lock connection, well inside it.
 const SETTLE_MARGIN: Duration = Duration::from_secs(2);
 
 /// How long a departure that began `elapsed` ago, with `deadline` in all,
