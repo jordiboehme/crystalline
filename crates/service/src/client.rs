@@ -729,11 +729,6 @@ where
     }
 }
 
-/// Re-establish the MCP session on a fresh daemon connection: replay the
-/// client's `initialize` verbatim and swallow the daemon's answer (the client
-/// already holds one), replay `notifications/initialized`, then answer every
-/// request the restart orphaned with a JSON-RPC error so the client can retry
-/// instead of hanging.
 /// The daemon answered the replayed `initialize` with an error: it will not
 /// serve this session (a standby does that), so the bridge stops trying.
 #[derive(Debug)]
@@ -754,6 +749,11 @@ impl InitRefused {
     }
 }
 
+/// Re-establish the MCP session on a fresh daemon connection: replay the
+/// client's `initialize` verbatim and swallow the daemon's answer (the client
+/// already holds one), replay `notifications/initialized`, then answer every
+/// request the restart orphaned with a JSON-RPC error so the client can retry
+/// instead of hanging.
 async fn resync<Out, S>(
     relay: &mut RelayState,
     session: &mut Session<S>,
@@ -868,7 +868,7 @@ where
             tracing::warn!("daemon connection lost; reconnecting");
             let conn = match ensure_daemon(true, db, config_path, read_only).await {
                 Ok(conn) => conn,
-                // A database another instance owns stays owned: said once,
+                // A database another machine owns stays owned: said once,
                 // and the session ends instead of asking again.
                 Err(e) if final_refusal(&e).is_some() => return Err(e),
                 Err(e) => {
@@ -923,6 +923,9 @@ struct EmbeddedStack {
     stop_sources: tokio::sync::watch::Sender<bool>,
 }
 
+/// What the owner row records for an embedded MCP stack.
+const EMBEDDED_COMMAND: &str = "crystalline mcp --embedded";
+
 /// Build the full in-process stack: take the index lock (refused if held),
 /// load the config and overlay, open the store, construct the engine, launch
 /// the background sync and embed workers and prime the routing cache. Every
@@ -930,9 +933,6 @@ struct EmbeddedStack {
 /// terminal failure leaves [`run_mcp`]'s bounded reader, opener and all, intact for
 /// the degraded stub to serve. The effective read-only mode is the explicit
 /// flag or `service.read_only`.
-/// What the owner row records for an embedded MCP stack.
-const EMBEDDED_COMMAND: &str = "crystalline mcp --embedded";
-
 async fn build_embedded(
     db: Option<&Path>,
     config_path: Option<&Path>,
@@ -1232,7 +1232,7 @@ async fn open_standalone_noting(
     // goes out as it is: it names the owner, which the index wording does not.
     let claim = match crate::claim::claim_for_this_command(&loaded.effective).await {
         Ok(claim) => claim,
-        Err(e) if e.is::<crate::claim::DatabaseOwned>() => return Err(e),
+        Err(e) if crate::claim::refused_by_cli_rule(&e) => return Err(e),
         Err(e) => return Err(unreachable(e)),
     };
     let store =

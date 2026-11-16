@@ -171,14 +171,14 @@ pub(crate) async fn reach_index(
     };
     // On Postgres the database is claimed for this command first, or refused
     // with the owner's name when another instance has it (spec section L); a
-    // read-only report only looks who owns it. A read hands the refusal on as
+    // read-only report never opens it there. A read hands the refusal on as
     // the reason it could not reach the index, so a listing still degrades;
     // a write fails with it as it is.
     match crystalline_service::open_store_for_command(cfg, db_override, open_as == OpenAs::Rebuild)
         .await
     {
         Ok(store) => Ok(IndexRoute::Direct(store)),
-        Err(e) if e.is::<crystalline_service::DatabaseOwned>() => match open_as {
+        Err(e) if crystalline_service::claim::refused_by_cli_rule(&e) => match open_as {
             OpenAs::Read => Ok(IndexRoute::Unreachable(e.to_string())),
             OpenAs::Write | OpenAs::Rebuild => Err(e),
         },

@@ -2267,14 +2267,14 @@ pub async fn run(
         };
     } else if db.is_file() {
         // By the CLI rule on Postgres: a report never claims the database
-        // and opens nothing while another instance owns it; `--fix` claims
-        // it or is refused (spec section L).
+        // and never opens it; `--fix` claims it or is refused (spec section
+        // L).
         match crystalline_service::open_store_for_command(cfg, Some(&db), false).await {
             Ok(opened) => {
                 index = IndexAccess::Direct;
                 store = Some(opened);
             }
-            Err(e) if e.is::<crystalline_service::DatabaseOwned>() => {
+            Err(e) if crystalline_service::claim::refused_by_cli_rule(&e) => {
                 index = IndexAccess::Unavailable {
                     reason: e.to_string(),
                 };

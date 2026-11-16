@@ -1152,13 +1152,228 @@ fn reindex_without_daemon_runs_and_releases_when_free() {
         "the database is still held"
     );
 
-    let (ok, out, err) = env.run_full(&["status"]);
-    assert!(ok, "{out}{err}");
+    let (_, out, err) = env.run_full(&["status"]);
+    assert!(
+        format!("{out}{err}").contains("has no active instance"),
+        "{out}{err}"
+    );
     assert_eq!(
         owner_command(&pg),
         "crystalline reindex|true",
         "status claimed the database"
     );
+}
+
+/// A read-only report on Postgres never opens the store, free or owned
+/// (only an owner migrates): on an empty schema `status` and `doctor`
+/// create nothing and say there is no active instance, and a look that
+/// fails counts as unavailable, never as free.
+#[cfg(feature = "postgres")]
+#[test]
+fn reports_never_open_the_store_on_postgres() {
+    let Some(pg) = PgScratch::new("clrep") else {
+        return;
+    };
+    let env = Env::new("clrep").on_postgres(&pg);
+    let (_, out, err) = env.run_full(&["status"]);
+    assert!(
+        format!("{out}{err}").contains("has no active instance"),
+        "{out}{err}"
+    );
+    let (_, out, err) = env.run_full(&["doctor"]);
+    assert!(!format!("{out}{err}").contains("is owned by"), "{out}{err}");
+    assert_eq!(schema_objects(&pg), "0", "a report opened the store");
+
+    // Nothing listens on port 1: the look fails.
+    let unreachable = pg.url.replacen(
+        &pg.url
+            .split('@')
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap()
+            .to_string(),
+        "127.0.0.1:1",
+        1,
+    );
+    let mut status = Command::new(bin());
+    env.apply(&mut status);
+    let out = status
+        .env("CRYSTALLINE_DATABASE_URL", &unreachable)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("could not read who owns the database"),
+        "{text}"
+    );
+}
+
+/// A command of this machine that holds the database (here
+/// `hold-lock --standalone`, the shape of a long `crystalline reindex`) is
+/// waited for by `crystalline mcp`, as a one-shot command that holds the
+/// state folder is: no sentence about another machine, and the session
+/// starts once the command has finished.
+#[test]
+fn mcp_waits_for_a_command_of_this_machine() {
+    let Some(pg) = PgScratch::new("cllocal") else {
+        return;
+    };
+    let env = Env::new("cllocal").on_postgres(&pg);
+    env.setup_domain("eng");
+    let mut hold = Command::new(bin());
+    env.apply(&mut hold);
+    let mut hold = hold
+        .args([
+            "hold-lock",
+            "--secs",
+            "4",
+            "--standalone",
+            "crystalline reindex",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(hold.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    assert_eq!(line.trim(), "holding");
+
+    // Stdin stays open until the answer is in: a relaying bridge ends when
+    // its client leaves.
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let log = env.state_dir().with_file_name("bridge.log");
+    let mut bridge = cmd
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut stdin = bridge.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "it", "version": "0" },
+            },
+        })
+    )
+    .unwrap();
+    let mut reply = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(bridge.stdout.take().unwrap()),
+        &mut reply,
+    )
+    .unwrap();
+    drop(stdin);
+    let _ = bridge.wait();
+    let err = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!err.contains("does not serve it"), "{err}");
+    let reply: Value = serde_json::from_str(reply.trim()).unwrap_or(Value::Null);
+    assert!(reply["result"].is_object(), "{reply} {err}");
+    assert!(hold.wait().unwrap().success());
+    let (ok, out, err) = env.run_full(&["ctl", "shutdown"]);
+    assert!(ok, "{out}{err}");
+}
+
+/// A bridge whose daemon of this machine restarts mid-session on Postgres
+/// keeps the session: it reconnects to the next daemon, which takes the
+/// database over, and answers the next request.
+#[test]
+fn bridge_survives_a_local_daemon_restart_on_postgres() {
+    let Some(pg) = PgScratch::new("clrestart") else {
+        return;
+    };
+    let env = Env::new("clrestart").on_postgres(&pg);
+    env.setup_domain("eng");
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut bridge = cmd
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = bridge.stdin.take().unwrap();
+    let (lines_tx, lines) = std::sync::mpsc::channel::<String>();
+    let stdout = bridge.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if lines_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let answer_to = |id: u64| -> Value {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no answer to request {id}"));
+            let msg: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            if msg["id"] == id {
+                return msg;
+            }
+        }
+    };
+    let send = |stdin: &mut std::process::ChildStdin, msg: Value| {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    };
+    send(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "it", "version": "0" },
+            },
+        }),
+    );
+    assert!(answer_to(1)["result"].is_object());
+    send(
+        &mut stdin,
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    let first = env.lock_pid().expect("the bridge started a daemon");
+
+    let (ok, out, err) = env.run_full(&["ctl", "shutdown"]);
+    assert!(ok, "{out}{err}");
+    wait_until(Duration::from_secs(30), "a new daemon serves", || {
+        env.lock_pid().is_some_and(|pid| pid != first)
+    });
+    send(
+        &mut stdin,
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    );
+    let listed = answer_to(2);
+    assert!(listed["result"]["tools"].is_array(), "{listed}");
+    assert_ne!(owner_row(&pg), "", "the new daemon owns the database");
+
+    drop(stdin);
+    let _ = bridge.wait();
+    let (ok, out, err) = env.run_full(&["ctl", "shutdown"]);
+    assert!(ok, "{out}{err}");
 }
 
 /// A command holding the database (`hold-lock --standalone`, the shape of

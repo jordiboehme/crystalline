@@ -15,8 +15,8 @@
 //!   ends the command with [`crate::daemon::EXIT_FENCED`].
 //!
 //! The read-only reports (`status`, `doctor` without `--fix`, `prompt`) never
-//! take the lock: on an owned database they open nothing, on a free one they
-//! open as before ([`set_command_line`]).
+//! take the lock and on Postgres never open the store, free or owned: only an
+//! owner migrates ([`set_command_line`]).
 //!
 //! The Turso path never comes here: every function answers "nothing to
 //! claim" for it.
@@ -65,8 +65,7 @@ static COMMAND: OnceLock<CommandLine> = OnceLock::new();
 /// `label` is what the owner row records (`crystalline reindex`), `words`
 /// are the arguments as typed (for the example in a refusal), and `report`
 /// marks a read-only report (`status`, `doctor` without `--fix`, `prompt`),
-/// which never takes the database: on an owned one it opens nothing, on a
-/// free one it opens as before.
+/// which never takes the database and on Postgres never opens it.
 pub fn set_command_line(label: &str, words: Vec<String>, report: bool) {
     let _ = COMMAND.set(CommandLine {
         label: label.to_string(),
@@ -83,12 +82,41 @@ fn command_label() -> String {
 }
 
 /// The command as a person types it: `crystalline` and the arguments.
+/// The paths `--db` and `--config` name are this machine's, so they are left
+/// out of an example meant for another machine.
 fn command_example() -> String {
     match COMMAND.get() {
-        Some(c) if !c.words.is_empty() => format!("crystalline {}", c.words.join(" ")),
+        Some(c) if !c.words.is_empty() => {
+            format!("crystalline {}", without_local_paths(&c.words).join(" "))
+        }
         Some(c) => c.label.clone(),
         None => "crystalline <command>".to_string(),
     }
+}
+
+/// `words` without `--db`, `--config` and their values (as `--db x` or
+/// `--db=x`).
+fn without_local_paths(words: &[String]) -> Vec<String> {
+    const LOCAL: [&str; 2] = ["--db", "--config"];
+    let mut kept = Vec::new();
+    let mut skip_value = false;
+    for word in words {
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        if LOCAL.contains(&word.as_str()) {
+            skip_value = true;
+            continue;
+        }
+        if LOCAL
+            .iter()
+            .any(|flag| word.starts_with(&format!("{flag}=")))
+        {
+            continue;
+        }
+        kept.push(word.clone());
+    }
+    kept
 }
 
 fn is_report() -> bool {
@@ -205,15 +233,16 @@ async fn claim(cfg: &GlobalConfig, command: &str) -> anyhow::Result<Claim> {
     }
     let target = PgTarget::from_config(&database).map_err(|e| anyhow::anyhow!("{e}"))?;
     let described = target.describe();
-    // An id of this process's own: the takeover ends every session of the
-    // database that is not tagged with it, so a daemon of this machine that
-    // is paused, and shares the machine's instance id, is ended too.
-    let instance_id = pg::process_instance_id();
+    // An id of this process's own (see `pg::process_instance_id`): the
+    // takeover ends every session of the database not tagged with it, so a
+    // paused daemon of this machine is ended too.
+    let machine = crystalline_core::config::read_or_create_instance_id().ok();
+    let instance_id = pg::process_instance_id(machine.as_deref());
     let me = OwnerIdentity {
         instance_id: instance_id.clone(),
         label: cfg
             .instance_name()
-            .or_else(|| crystalline_core::config::read_or_create_instance_id().ok())
+            .or(machine)
             .unwrap_or_else(|| instance_id.clone()),
         command: Some(command.to_string()),
         version: crystalline_core::VERSION.to_string(),
@@ -305,8 +334,8 @@ pub(crate) async fn open_store_as(
 
 /// Open the store of `cfg` for this process's command, by the CLI rule: on
 /// Postgres the database is claimed first (refused with [`DatabaseOwned`]
-/// when another instance owns it), and a read-only report only looks who
-/// owns it and never claims it. Turso opens as before.
+/// when another instance owns it), and a read-only report never opens it
+/// ([`DatabaseNotOpened`]). Turso opens as before.
 pub async fn open_store_for_command(
     cfg: &GlobalConfig,
     db: Option<&Path>,
@@ -316,56 +345,185 @@ pub async fn open_store_for_command(
     open_store_as(claim.as_ref(), cfg, db, resilient).await
 }
 
+/// Whether `e` is the CLI rule's refusal to open the database: a
+/// [`DatabaseOwned`] or a [`DatabaseNotOpened`]. Its sentence goes out as it
+/// is, never inside the wording of an index that failed to open.
+pub fn refused_by_cli_rule(e: &anyhow::Error) -> bool {
+    e.is::<DatabaseOwned>() || e.is::<DatabaseNotOpened>()
+}
+
 /// The claim this process's command opens its stores under: a claim on
-/// Postgres, nothing on Turso, and for a read-only report nothing either,
-/// once a look found the database free. A [`DatabaseOwned`] when another
-/// instance owns it.
+/// Postgres and nothing on Turso. A [`DatabaseOwned`] when another instance
+/// owns the database. A read-only report on Postgres never opens it, free
+/// or owned (only an owner migrates): it is refused with the owner's
+/// sentence or a [`DatabaseNotOpened`].
 pub(crate) async fn claim_for_this_command(
     cfg: &GlobalConfig,
 ) -> anyhow::Result<Option<CommandDbOwner>> {
     if is_report() {
-        if let Some(message) = report_refusal(cfg).await {
-            anyhow::bail!(DatabaseOwned { message });
-        }
-        return Ok(None);
+        return report_on(cfg).await;
     }
     claim_database_for_command(cfg, &command_label()).await
 }
 
-/// For a read-only report on Postgres: the refusal when another session
-/// holds the database, read without the lock; `None` when it is free, on
-/// Turso, or when the look itself failed (the open that follows says why).
-async fn report_refusal(cfg: &GlobalConfig) -> Option<String> {
-    #[cfg(feature = "postgres")]
-    {
-        let (database, owner) = pg::look(cfg).await?;
-        Some(pg::command_refusal(
-            &database,
-            owner.as_ref(),
-            &command_example(),
-        ))
-    }
-    #[cfg(not(feature = "postgres"))]
-    {
-        let _ = cfg;
-        None
+#[cfg(not(feature = "postgres"))]
+async fn report_on(_cfg: &GlobalConfig) -> anyhow::Result<Option<CommandDbOwner>> {
+    Ok(None)
+}
+
+/// A read-only report: `Ok(None)` on Turso, where it opens the index as
+/// before; on Postgres always a refusal that says why it opens nothing. A
+/// look that failed or ran out of time counts as unavailable, never as free.
+#[cfg(feature = "postgres")]
+async fn report_on(cfg: &GlobalConfig) -> anyhow::Result<Option<CommandDbOwner>> {
+    let example = command_example();
+    match holder(cfg).await {
+        Holder::NotPostgres => Ok(None),
+        Holder::Free { database } => Err(anyhow::Error::new(DatabaseNotOpened {
+            message: pg::no_active_instance(&database, &example),
+        })),
+        Holder::Here { database, owner } | Holder::Elsewhere { database, owner } => {
+            Err(anyhow::Error::new(DatabaseOwned {
+                message: pg::command_refusal(&database, owner.as_ref(), &example),
+            }))
+        }
+        Holder::Unknown { database, error } => Err(anyhow::Error::new(DatabaseNotOpened {
+            message: pg::owner_unknown(&database, &error, &example),
+        })),
     }
 }
 
-/// Before an autostart: the sentence of a second instance started by
-/// mistake when the Postgres database of `cfg` is owned, read without the
-/// lock. `None` on Turso, on a free database, and when the look failed (the
-/// spawned daemon then finds out itself).
-pub(crate) async fn owned_elsewhere(cfg: &GlobalConfig) -> Option<String> {
-    #[cfg(feature = "postgres")]
-    {
-        let (database, owner) = pg::look(cfg).await?;
-        Some(pg::not_served_here(&database, owner.as_ref()))
+/// A read-only report's refusal to open a Postgres database: there is no
+/// active instance to read it through, or who owns it could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseNotOpened {
+    /// The sentence: why nothing was opened.
+    pub message: String,
+}
+
+impl std::fmt::Display for DatabaseNotOpened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
-    #[cfg(not(feature = "postgres"))]
-    {
-        let _ = cfg;
-        None
+}
+
+impl std::error::Error for DatabaseNotOpened {}
+
+/// Who holds the Postgres database of a configuration, read without the
+/// lock.
+#[derive(Debug)]
+pub(crate) enum Holder {
+    /// Turso, or a build without the Postgres backend.
+    NotPostgres,
+    /// No session holds the owner lock.
+    Free { database: String },
+    /// A process of this machine holds it: its daemon or one of its
+    /// commands (the owner row carries this machine's instance id).
+    #[cfg(feature = "postgres")]
+    Here {
+        database: String,
+        owner: Option<crystalline_index::postgres::OwnerRow>,
+    },
+    /// Another machine holds it, or a holder that has not announced itself.
+    #[cfg(feature = "postgres")]
+    Elsewhere {
+        database: String,
+        owner: Option<crystalline_index::postgres::OwnerRow>,
+    },
+    /// The look failed or ran out of time.
+    Unknown { database: String, error: String },
+}
+
+impl Holder {
+    /// The sentence of a second instance started by mistake (spec section
+    /// O), when another machine holds the database.
+    pub(crate) fn not_served_here(&self) -> Option<String> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Holder::Elsewhere { database, owner } => {
+                Some(pg::not_served_here(database, owner.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The command of this machine that holds the database, with its pid,
+    /// when one does (not its daemon).
+    pub(crate) fn local_command(&self) -> Option<(String, i64)> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Holder::Here {
+                owner: Some(owner), ..
+            } => owner.command.clone().map(|c| (c, owner.pid)),
+            _ => None,
+        }
+    }
+
+    /// Whether another machine holds the database under an owner row that
+    /// is announced: not a holder that is still starting.
+    pub(crate) fn announced_elsewhere(&self) -> bool {
+        match self {
+            #[cfg(feature = "postgres")]
+            Holder::Elsewhere {
+                owner: Some(owner), ..
+            } => owner.released_at.is_none(),
+            _ => false,
+        }
+    }
+}
+
+/// Who holds the Postgres database of `cfg`, read on a probe connection
+/// without the lock, bounded in time.
+#[cfg(not(feature = "postgres"))]
+pub(crate) async fn holder(_cfg: &GlobalConfig) -> Holder {
+    Holder::NotPostgres
+}
+
+/// Who holds the Postgres database of `cfg`, read on a probe connection
+/// without the lock, bounded in time.
+#[cfg(feature = "postgres")]
+pub(crate) async fn holder(cfg: &GlobalConfig) -> Holder {
+    use crystalline_core::config::DatabaseBackend;
+    use crystalline_index::postgres::{PgTarget, probe_owner};
+
+    let config = cfg.database();
+    if config.backend != DatabaseBackend::Postgres {
+        return Holder::NotPostgres;
+    }
+    let target = match PgTarget::from_config(&config) {
+        Ok(target) => target,
+        Err(e) => {
+            return Holder::Unknown {
+                database: "the configured database".to_string(),
+                error: e.to_string(),
+            };
+        }
+    };
+    let database = target.describe();
+    let looked = tokio::time::timeout(pg::LOOK_WAIT, probe_owner(&target)).await;
+    match looked {
+        Err(_) => Holder::Unknown {
+            database,
+            error: format!("no answer within {}s", pg::LOOK_WAIT.as_secs()),
+        },
+        Ok(Err(e)) => Holder::Unknown {
+            database,
+            error: e.to_string(),
+        },
+        Ok(Ok(None)) => Holder::Free { database },
+        Ok(Ok(Some(owner))) => {
+            let machine = crystalline_core::config::read_or_create_instance_id().ok();
+            let here = owner
+                .as_ref()
+                .filter(|o| o.released_at.is_none())
+                .zip(machine.as_deref())
+                .is_some_and(|(o, m)| pg::of_this_machine(&o.instance_id, m));
+            if here {
+                Holder::Here { database, owner }
+            } else {
+                Holder::Elsewhere { database, owner }
+            }
+        }
     }
 }
 
@@ -373,34 +531,32 @@ pub(crate) async fn owned_elsewhere(cfg: &GlobalConfig) -> Option<String> {
 pub(crate) mod pg {
     use std::time::Duration;
 
-    use crystalline_core::config::{DatabaseBackend, GlobalConfig};
-    use crystalline_index::postgres::{OwnerRow, PgTarget, probe_owner};
+    use crystalline_index::postgres::OwnerRow;
 
     /// How long a look at the owner may take before it is given up.
-    const LOOK_WAIT: Duration = Duration::from_secs(5);
+    pub(crate) const LOOK_WAIT: Duration = Duration::from_secs(5);
 
-    /// A fresh id for this process, 32 hex characters.
-    pub(super) fn process_instance_id() -> String {
-        let mut bytes = [0u8; 16];
+    /// A fresh id for this process: 16 random hex characters, then `-` and
+    /// this machine's instance id when there is one. The random head is
+    /// what tags its connections (their first 8 characters), so the
+    /// takeover ends a paused daemon of this machine too; the tail tells a
+    /// client of this machine that the holder is one of its own commands.
+    pub(super) fn process_instance_id(machine: Option<&str>) -> String {
+        let mut bytes = [0u8; 8];
         getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        let head: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        match machine {
+            Some(machine) => format!("{head}-{machine}"),
+            None => head,
+        }
     }
 
-    /// Whether another session holds the Postgres database of `cfg`, read
-    /// on a probe connection without the lock: the database and the owner
-    /// row (`None` inside when the holder has not announced itself). `None`
-    /// on Turso, when the database is free, or when the look failed.
-    pub(super) async fn look(cfg: &GlobalConfig) -> Option<(String, Option<OwnerRow>)> {
-        let database = cfg.database();
-        if database.backend != DatabaseBackend::Postgres {
-            return None;
-        }
-        let target = PgTarget::from_config(&database).ok()?;
-        let held = tokio::time::timeout(LOOK_WAIT, probe_owner(&target))
-            .await
-            .ok()?
-            .ok()??;
-        Some((target.describe(), held))
+    /// Whether an owner row's `instance_id` is this machine's: its daemon
+    /// (the machine id itself) or one of its commands (a process id ending
+    /// in it).
+    pub(crate) fn of_this_machine(instance_id: &str, machine: &str) -> bool {
+        !machine.is_empty()
+            && (instance_id == machine || instance_id.ends_with(&format!("-{machine}")))
     }
 
     /// The owner row, unless it records a release (then it is the instance
@@ -415,6 +571,15 @@ pub(crate) mod pg {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
+    /// `running `<command>`, ` when the holder is a command, else nothing.
+    fn running(owner: &OwnerRow) -> String {
+        owner
+            .command
+            .as_deref()
+            .map(|c| format!("running `{c}`, "))
+            .unwrap_or_default()
+    }
+
     /// The refusal of a command on an owned database (spec section L).
     pub(crate) fn command_refusal(
         database: &str,
@@ -422,19 +587,13 @@ pub(crate) mod pg {
         example: &str,
     ) -> String {
         let holder = match current(owner) {
-            Some(o) => {
-                let command = o
-                    .command
-                    .as_deref()
-                    .map(|c| format!("running `{c}`, "))
-                    .unwrap_or_default();
-                format!(
-                    "the active instance {} ({command}pid {}, since {})",
-                    o.label,
-                    o.pid,
-                    since(o)
-                )
-            }
+            Some(o) => format!(
+                "the active instance {} ({}pid {}, since {})",
+                o.label,
+                running(o),
+                o.pid,
+                since(o)
+            ),
             None => "an instance that has not announced itself yet".to_string(),
         };
         format!(
@@ -447,11 +606,26 @@ pub(crate) mod pg {
     /// mistake).
     pub(crate) fn not_served_here(database: &str, owner: Option<&OwnerRow>) -> String {
         let holder = match current(owner) {
-            Some(o) => format!("{} (since {})", o.label, since(o)),
+            Some(o) => format!("{} ({}since {})", o.label, running(o), since(o)),
             None => "an instance that has not announced itself yet".to_string(),
         };
         format!(
             "the database {database} is owned by {holder}; this machine does not serve it. Point Crystalline at another database or schema, or stop that instance."
+        )
+    }
+
+    /// A read-only report on a database no instance owns: it opens nothing,
+    /// because only an owner migrates.
+    pub(crate) fn no_active_instance(database: &str, example: &str) -> String {
+        format!(
+            "the database {database} has no active instance, and `{example}` does not open it: only the instance that owns a database opens it. Start one with `crystalline serve`."
+        )
+    }
+
+    /// A read-only report that could not read who owns the database.
+    pub(crate) fn owner_unknown(database: &str, error: &str, example: &str) -> String {
+        format!(
+            "could not read who owns the database {database} ({error}), and `{example}` does not open it without the instance that owns it."
         )
     }
 
@@ -512,14 +686,55 @@ pub(crate) mod pg {
             );
         }
 
-        /// A process id is fresh per process and long enough that its first
-        /// 8 characters tag it apart from any other.
+        /// A command holder is named with its command in both sentences.
         #[test]
-        fn a_process_instance_id_is_random_hex() {
-            let (a, b) = (process_instance_id(), process_instance_id());
-            assert_eq!(a.len(), 32);
-            assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
-            assert_ne!(a, b);
+        fn both_sentences_name_a_command_holder() {
+            let held = row(Some("crystalline sync"), false);
+            assert!(
+                not_served_here("x", Some(&held))
+                    .contains("owned by prod-a (running `crystalline sync`, since ")
+            );
         }
+
+        /// A process id is fresh per process, its first 8 characters tag it
+        /// apart from any other, and its tail says which machine runs it.
+        #[test]
+        fn a_process_instance_id_is_random_and_names_its_machine() {
+            let machine = "5f0c2a7e-0000-4000-8000-000000000001";
+            let (a, b) = (
+                process_instance_id(Some(machine)),
+                process_instance_id(Some(machine)),
+            );
+            assert_ne!(a[..8], b[..8]);
+            assert!(a[..16].bytes().all(|c| c.is_ascii_hexdigit()));
+            assert!(of_this_machine(&a, machine));
+            assert!(of_this_machine(machine, machine), "the daemon's own id");
+            assert!(!of_this_machine(&a, "another-machine"));
+            assert!(!of_this_machine("0123456789abcdef", ""));
+            assert_eq!(process_instance_id(None).len(), 16);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example for another machine leaves this machine's paths out.
+    #[test]
+    fn the_example_drops_local_paths() {
+        let words: Vec<String> = [
+            "--db",
+            "/tmp/x.db",
+            "reindex",
+            "--full",
+            "--config=/home/me/c.yaml",
+            "--config",
+            "/c.yaml",
+        ]
+        .iter()
+        .map(|w| w.to_string())
+        .collect();
+        assert_eq!(without_local_paths(&words), ["reindex", "--full"]);
     }
 }

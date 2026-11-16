@@ -2314,16 +2314,6 @@ pub(crate) async fn ensure_daemon_with(
         anyhow::bail!("no Crystalline daemon is running; start one with `crystalline serve`");
     }
 
-    // On Postgres an autostarted daemon never waits as a standby: when
-    // another instance owns the database, the spawn is refused here, with
-    // the owner's name on this client's stderr, before anything starts.
-    // Read without the lock; a look that fails leaves it to the daemon.
-    if let Ok(loaded) = crate::overlay::load(options.config.as_deref())
-        && let Some(message) = crate::claim::owned_elsewhere(&loaded.effective).await
-    {
-        return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
-    }
-
     // The daemon we are about to spawn is detached, so its own bind failure
     // only ever reaches `daemon.log`. Asked here as well as there, the person
     // running the command is told what is wrong instead of waiting out the 15s
@@ -2371,6 +2361,19 @@ pub(crate) async fn ensure_daemon_with(
         HolderState::Free => {}
     }
 
+    // On Postgres an autostarted daemon never waits as a standby. Asked only
+    // once this machine's state folder is known to be free (or its holder
+    // was waited for or dislodged above): a holder of this machine, a daemon
+    // that is starting or a command, is never another machine's.
+    let database = crate::overlay::load(options.config.as_deref())
+        .ok()
+        .map(|loaded| loaded.effective);
+    if unknown_holder.is_none()
+        && let Some(cfg) = &database
+    {
+        refuse_or_wait_for_database(cfg).await?;
+    }
+
     spawn_daemon(options)?;
     // Poll readiness: lock record present and socket connectable. Another
     // client's lingering old-binary bridge can be reconnecting during this
@@ -2386,6 +2389,7 @@ pub(crate) async fn ensure_daemon_with(
     // that answers slowly that ask alone can take seconds.
     let mut respawns = 0u32;
     let deadline = Instant::now() + READINESS_BUDGET;
+    let mut next_look = Instant::now() + DATABASE_LOOK_EVERY;
     while Instant::now() < deadline {
         let (conn, displaced) = try_attach_reporting().await;
         if let Some(conn) = conn {
@@ -2395,7 +2399,34 @@ pub(crate) async fn ensure_daemon_with(
             respawns += 1;
             spawn_daemon(options)?;
         }
+        // The race: another machine took the database between the look
+        // above and the spawn, and the daemon left with the lock-held code.
+        // Said as soon as that machine has announced itself, not after the
+        // whole budget.
+        if let Some(cfg) = &database
+            && Instant::now() >= next_look
+        {
+            next_look = Instant::now() + DATABASE_LOOK_EVERY;
+            let holder = crate::claim::holder(cfg).await;
+            if holder.announced_elsewhere()
+                && let Some(message) = holder.not_served_here()
+            {
+                return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
+            }
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The same race with a holder that never announced itself: another
+    // machine's only while no process of this machine holds the state folder
+    // (a daemon of this machine that is still starting holds it).
+    if let Some(cfg) = &database {
+        let holder = crate::claim::holder(cfg).await;
+        if let Some(message) = holder.not_served_here()
+            && (holder.announced_elsewhere()
+                || matches!(diagnose_holder().await, HolderState::Free))
+        {
+            return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
+        }
     }
     // A holder we refused to touch is the better explanation of the timeout
     // than the generic one: it names the lock file and how to look at whoever
@@ -2420,6 +2451,36 @@ pub(crate) async fn ensure_daemon_with(
 
 /// How long `ensure_daemon` waits for the daemon it spawned to answer.
 const READINESS_BUDGET: Duration = Duration::from_secs(15);
+
+/// How often the readiness wait looks who holds a Postgres database.
+const DATABASE_LOOK_EVERY: Duration = Duration::from_secs(1);
+
+/// Before an autostart on Postgres: refuse with the sentence of a second
+/// instance started by mistake when another machine holds the database
+/// (a [`crate::claim::DatabaseOwned`]), and wait, as for a one-shot command
+/// that holds the state folder, while a command of this machine holds it.
+/// A daemon of this machine, a free database, Turso and a look that failed
+/// all go on to the spawn; the daemon finds out the rest itself.
+async fn refuse_or_wait_for_database(cfg: &config::GlobalConfig) -> anyhow::Result<()> {
+    let budget = standalone_wait();
+    let started = Instant::now();
+    loop {
+        let holder = crate::claim::holder(cfg).await;
+        if let Some(message) = holder.not_served_here() {
+            return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
+        }
+        let Some((command, pid)) = holder.local_command() else {
+            return Ok(());
+        };
+        if started.elapsed() >= budget {
+            anyhow::bail!(
+                "the command `{command}` (pid {pid}) on this machine holds the database,                  and it did not let go within {} s. A daemon starts once it has finished:                  wait for it, or stop it, and try again",
+                budget.as_secs().max(1)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
 /// The daemon log, opened for appending, and started over once it outgrows
 /// 1 MiB. The cap is checked when the file is opened (at spawn time, or when
