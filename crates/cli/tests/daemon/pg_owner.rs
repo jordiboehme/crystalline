@@ -2000,6 +2000,7 @@ fn doctor_fix_refused_when_owned() {
 
 /// An accounts file left on this disk is named by `doctor` on Postgres, and
 /// is not read.
+#[cfg(feature = "postgres")]
 #[test]
 fn doctor_warns_local_disk_rows_on_postgres() {
     let Some(pg) = PgScratch::new("dswarn") else {
@@ -2054,6 +2055,7 @@ fn url_credentials(pg: &PgScratch) -> String {
 
 /// A daemonless `status` on a free database reports no owner, succeeds and
 /// opens nothing.
+#[cfg(feature = "postgres")]
 #[test]
 fn status_on_a_free_database_says_free() {
     let Some(pg) = PgScratch::new("dsfree") else {

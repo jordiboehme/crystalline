@@ -443,6 +443,27 @@ fn is_broken(e: &sqlx::Error) -> bool {
     }
 }
 
+/// Whether `e` is the server's cancel of a statement (SQLSTATE 57014), as its
+/// `statement_timeout` raises it.
+fn is_query_canceled(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("57014"))
+}
+
+/// Take a stale cancel off `conn` before a probe is retried. A probe given up
+/// on the client side leaves its answer on the wire, and sqlx hands a stale
+/// error to the next statement: when the server's own `statement_timeout`
+/// ended that probe, its 57014 would fail the retry at once and count as a
+/// second failure. One `SELECT 1` takes it; a 57014 here (the stale one, or
+/// this statement's own on a server that is still slow) is ignored, so the
+/// retry reads the lock and not the old error.
+async fn drain_stale_cancel(conn: &mut PgConnection) -> std::result::Result<(), sqlx::Error> {
+    match sqlx::query("SELECT 1").execute(conn).await {
+        Ok(_) => Ok(()),
+        Err(e) if is_query_canceled(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// The lock-free view of `target`: `None` when no session holds the owner
 /// lock, else the owner row (`None` inside when the holder has not announced
 /// itself). Uses a `probe` connection and creates nothing.
@@ -544,6 +565,7 @@ impl PgOwner {
             fence_tx,
             lock_pid: lock_pid.clone(),
             probe: ProbeState::new(),
+            drain_before_probe: false,
         };
         std::thread::Builder::new()
             .name("crystalline-pg-owner".to_string())
@@ -716,6 +738,9 @@ struct Worker {
     fence_tx: watch::Sender<FenceState>,
     lock_pid: Arc<AtomicI32>,
     probe: ProbeState,
+    /// The last probe was given up on the client side, so its answer may
+    /// still be on the wire: the next probe drains it first.
+    drain_before_probe: bool,
 }
 
 impl Worker {
@@ -962,15 +987,27 @@ impl Worker {
 
     async fn probe_once(&mut self) -> ProbeOutcome {
         let (key, limit) = (self.key, self.timings.probe_timeout);
+        let drain = std::mem::take(&mut self.drain_before_probe);
         let Ok((held, conn)) = self.holding() else {
             return ProbeOutcome::Broken;
         };
-        let probe = sqlx::query_scalar::<_, bool>(HOLDS_KEY_SQL)
-            .bind(key)
-            .bind(held.lock_pid)
-            .fetch_one(&mut *conn);
+        // The drain and the probe share the one timeout, so a retry still
+        // fits the `FENCE_DETECT_MAX` the grace is built on.
+        let probe = async {
+            if drain {
+                drain_stale_cancel(&mut *conn).await?;
+            }
+            sqlx::query_scalar::<_, bool>(HOLDS_KEY_SQL)
+                .bind(key)
+                .bind(held.lock_pid)
+                .fetch_one(&mut *conn)
+                .await
+        };
         match tokio::time::timeout(limit, probe).await {
-            Err(_) => ProbeOutcome::Timeout,
+            Err(_) => {
+                self.drain_before_probe = true;
+                ProbeOutcome::Timeout
+            }
             Ok(Ok(true)) => ProbeOutcome::Held,
             Ok(Ok(false)) => ProbeOutcome::NotHeld,
             Ok(Err(e)) if is_broken(&e) => ProbeOutcome::Broken,
@@ -1260,6 +1297,57 @@ mod tests {
         assert_ne!(a.fence().key, b.fence().key);
         a.release().await.unwrap();
         b.release().await.unwrap();
+    }
+
+    /// A statement given up on the client side whose server-side
+    /// `statement_timeout` fires later leaves its 57014 on the wire, and sqlx
+    /// hands it to the next statement: without the drain a probe retry would
+    /// fail at once on that stale error. The drain takes it, and the next
+    /// statement reads its own answer.
+    #[tokio::test]
+    async fn a_stale_cancel_is_drained_before_the_probe_retry() {
+        let Some(url) = pg_url() else {
+            eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let scratch = ScratchSchema::new(&url, "ownd");
+        let t = target(&url, &scratch);
+        async fn leave_a_stale_cancel(c: &mut PgConnection) {
+            sqlx::query("SET statement_timeout = '200ms'")
+                .execute(&mut *c)
+                .await
+                .unwrap();
+            let given_up = tokio::time::timeout(
+                Duration::from_millis(50),
+                sqlx::query("SELECT pg_sleep(2)").execute(&mut *c),
+            )
+            .await;
+            assert!(
+                given_up.is_err(),
+                "the slow statement answered: {given_up:?}"
+            );
+            // The server cancels it at 200ms; its error waits on the wire.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // Without the drain the next statement reads the stale cancel.
+        let mut c = plain(&t).await;
+        leave_a_stale_cancel(&mut c).await;
+        let stale = sqlx::query_scalar::<_, bool>("SELECT true")
+            .fetch_one(&mut c)
+            .await;
+        assert!(
+            stale.as_ref().is_err_and(is_query_canceled),
+            "no stale cancel: {stale:?}"
+        );
+        // With it the next statement reads its own answer.
+        let mut c = plain(&t).await;
+        leave_a_stale_cancel(&mut c).await;
+        drain_stale_cancel(&mut c).await.unwrap();
+        let fresh: bool = sqlx::query_scalar("SELECT true")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert!(fresh);
     }
 
     #[tokio::test]

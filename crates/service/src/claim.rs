@@ -56,6 +56,13 @@ struct CommandLine {
     /// `crystalline reindex`: the subcommand path, no values.
     label: String,
     /// The arguments as they were typed, for the refusal's example.
+    #[cfg_attr(
+        not(feature = "postgres"),
+        allow(
+            dead_code,
+            reason = "only the postgres backend refuses a command with an example"
+        )
+    )]
     words: Vec<String>,
     /// A read-only report, which never takes the lock.
     report: bool,
@@ -85,11 +92,21 @@ fn command_label() -> String {
 
 /// The command as a person types it: `crystalline` and the arguments.
 /// The paths `--db` and `--config` name are this machine's, so they are left
-/// out of an example meant for another machine.
+/// out of an example meant for another machine, and the value of a flag that
+/// carries a secret is shown as `<value>`: the example lands on stderr and in
+/// `status --json`.
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(
+        dead_code,
+        reason = "only the postgres backend refuses a command with an example"
+    )
+)]
 fn command_example() -> String {
     match COMMAND.get() {
         Some(c) if !c.words.is_empty() => {
-            format!("crystalline {}", without_local_paths(&c.words).join(" "))
+            let words = without_secret_values(&without_local_paths(&c.words));
+            format!("crystalline {}", words.join(" "))
         }
         Some(c) => c.label.clone(),
         None => "crystalline <command>".to_string(),
@@ -98,6 +115,13 @@ fn command_example() -> String {
 
 /// `words` without `--db`, `--config` and their values (as `--db x` or
 /// `--db=x`).
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(
+        dead_code,
+        reason = "only the postgres backend refuses a command with an example"
+    )
+)]
 fn without_local_paths(words: &[String]) -> Vec<String> {
     const LOCAL: [&str; 2] = ["--db", "--config"];
     let mut kept = Vec::new();
@@ -117,6 +141,58 @@ fn without_local_paths(words: &[String]) -> Vec<String> {
             continue;
         }
         kept.push(word.clone());
+    }
+    kept
+}
+
+/// Whether `--name` carries a secret: `token`, `password` or `secret` alone,
+/// or any of them or `key` as the last part of the name (`--mcp-token`,
+/// `--client-secret`, `--private-key`). A bare `--key` is an engram field's
+/// name, never a secret.
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(
+        dead_code,
+        reason = "only the postgres backend refuses a command with an example"
+    )
+)]
+fn is_secret_flag(name: &str) -> bool {
+    const SECRET: [&str; 3] = ["token", "password", "secret"];
+    name.strip_prefix("--").is_some_and(|name| {
+        SECRET.contains(&name)
+            || SECRET
+                .iter()
+                .chain(&["key"])
+                .any(|s| name.ends_with(&format!("-{s}")))
+    })
+}
+
+/// `words` with the value of every secret-carrying flag (as `--token x` or
+/// `--token=x`) replaced by `<value>`. The word after such a flag is masked
+/// whatever it looks like, since a secret can start with `-`.
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(
+        dead_code,
+        reason = "only the postgres backend refuses a command with an example"
+    )
+)]
+fn without_secret_values(words: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut mask_value = false;
+    for word in words {
+        if std::mem::take(&mut mask_value) {
+            kept.push("<value>".to_string());
+            continue;
+        }
+        match word.split_once('=') {
+            Some((flag, _)) if is_secret_flag(flag) => kept.push(format!("{flag}=<value>")),
+            Some(_) => kept.push(word.clone()),
+            None => {
+                mask_value = is_secret_flag(word);
+                kept.push(word.clone());
+            }
+        }
     }
     kept
 }
@@ -197,7 +273,7 @@ pub async fn release_command_database() {
         tracing::warn!("could not release the database ({e}); the exit frees it");
     }
     #[cfg(not(feature = "postgres"))]
-    drop(held);
+    let _ = held;
 }
 
 /// What a lock attempt found.
@@ -543,6 +619,10 @@ impl std::error::Error for DatabaseNotOpened {}
 /// Who holds the Postgres database of a configuration, read without the
 /// lock.
 #[derive(Debug)]
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres backend finds a holder")
+)]
 pub(crate) enum Holder {
     /// Turso, or a build without the Postgres backend.
     NotPostgres,
@@ -855,5 +935,55 @@ mod tests {
         .map(|w| w.to_string())
         .collect();
         assert_eq!(without_local_paths(&words), ["reindex", "--full"]);
+    }
+
+    /// The example never repeats the value of a flag that carries a secret,
+    /// in either spelling; other flags and their values stay.
+    #[test]
+    fn the_example_hides_secret_values() {
+        let words: Vec<String> = [
+            "connect",
+            "github",
+            "--token",
+            "ghp_secret1",
+            "--client-secret=hush",
+            "--mcp-token",
+            "label-a",
+            "--private-key",
+            "-----BEGIN",
+            "--password=pw",
+            "--key",
+            "k1",
+            "--full",
+            "--name",
+            "alpha",
+            "--token-file",
+            "/t",
+        ]
+        .iter()
+        .map(|w| w.to_string())
+        .collect();
+        assert_eq!(
+            without_secret_values(&words),
+            [
+                "connect",
+                "github",
+                "--token",
+                "<value>",
+                "--client-secret=<value>",
+                "--mcp-token",
+                "<value>",
+                "--private-key",
+                "<value>",
+                "--password=<value>",
+                "--key",
+                "k1",
+                "--full",
+                "--name",
+                "alpha",
+                "--token-file",
+                "/t",
+            ]
+        );
     }
 }

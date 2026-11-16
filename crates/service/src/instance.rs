@@ -2364,10 +2364,12 @@ pub(crate) async fn ensure_daemon_with(
     // On Postgres an autostarted daemon never waits as a standby. Asked only
     // once this machine's state folder is known to be free (or its holder
     // was waited for or dislodged above): a holder of this machine, a daemon
-    // that is starting or a command, is never another machine's.
-    let database = crate::overlay::load(options.config.as_deref())
-        .ok()
-        .map(|loaded| loaded.effective);
+    // that is starting or a command, is never another machine's. While a
+    // Postgres database is unreachable, each look at its holder here and in
+    // the readiness loop below costs up to `claim::pg::LOOK_WAIT` (5 s) of
+    // this autostart; accepted, since the daemon cannot start on that
+    // database either. On Turso a look answers at once.
+    let database = database_config_quietly(options.config.as_deref());
     if unknown_holder.is_none()
         && let Some(cfg) = &database
     {
@@ -2476,6 +2478,18 @@ const DATABASE_LOOK_EVERY: Duration = Duration::from_secs(1);
 /// that holds the state folder, while a command of this machine holds it.
 /// A daemon of this machine, a free database, Turso and a look that failed
 /// all go on to the spawn; the daemon finds out the rest itself.
+/// The effective configuration for the autostart's database look, loaded
+/// with the load's own warnings (an unrecognized `CRYSTALLINE_*` variable, an
+/// unusable `public_url`) muted: the client has said them once already, and
+/// on Turso this look must add no line to what a bridge logs.
+fn database_config_quietly(flag: Option<&Path>) -> Option<config::GlobalConfig> {
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        crate::overlay::load(flag)
+            .ok()
+            .map(|loaded| loaded.effective)
+    })
+}
+
 async fn refuse_or_wait_for_database(cfg: &config::GlobalConfig) -> anyhow::Result<()> {
     let budget = standalone_wait();
     let started = Instant::now();
@@ -3218,6 +3232,49 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The autostart's database look loads the configuration once more; on
+    /// Turso it must log nothing the client's own load already said. The
+    /// unusable `public_url` in the file stands in for every load warning
+    /// (a stray `CRYSTALLINE_*` variable is muted the same way); the plain
+    /// load beside it shows the file does warn.
+    #[test]
+    fn the_autostart_database_look_logs_no_load_warning_on_turso() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "service:\n  public_url: \"http://0.0.0.0:7411\"\n").unwrap();
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let (quiet, loud) = tracing::subscriber::with_default(subscriber, || {
+            let quiet = database_config_quietly(Some(&path));
+            let after_quiet = captured.0.lock().unwrap().len();
+            let _ = crate::overlay::load(Some(&path));
+            (quiet, after_quiet)
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let cfg = quiet.expect("the file loads");
+        assert_eq!(
+            cfg.database().backend,
+            crystalline_core::config::DatabaseBackend::Turso
+        );
+        assert_eq!(loud, 0, "the quiet look logged: {text}");
+        assert!(text.contains("0.0.0.0"), "the plain load warns: {text}");
+    }
 
     /// Only the two bind wildcards are rewritten. Every other spelling is an
     /// address something can really dial, and rewriting one would send a

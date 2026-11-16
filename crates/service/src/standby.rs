@@ -292,12 +292,22 @@ mod pg {
         }
     }
 
-    /// The line a standby logs at start and once a minute.
-    pub(crate) fn standby_line(database: &str, owner: Option<&OwnerRow>) -> String {
-        format!(
+    /// The line a standby logs at start and once a minute. When the last
+    /// poll did not reach the database, the line says why, so an outage does
+    /// not hide behind the last owner seen.
+    pub(crate) fn standby_line(
+        database: &str,
+        owner: Option<&OwnerRow>,
+        last_error: Option<&str>,
+    ) -> String {
+        let line = format!(
             "standby: the database {database} is owned by {}; waiting",
             owner_phrase(owner)
-        )
+        );
+        match last_error {
+            Some(error) => format!("{line}; the last poll failed: {error}"),
+            None => line,
+        }
     }
 
     /// The sentence a standby refuses every command and session with.
@@ -902,6 +912,12 @@ mod pg {
         /// lock is given back, a new connection is refused at connect, and
         /// the instance that takes the database next ends the ones still
         /// open before it writes anything.
+        ///
+        /// A stop during the takeover grace, before the announce, cannot
+        /// mark the owner row released: the row is still the predecessor's
+        /// (the release only marks a row with this instance's id), so the
+        /// next owner waits the grace once more. Harmless, and the price of
+        /// never writing over a row this instance has not announced.
         async fn leave(self, phase: &str, reason: &str) -> ! {
             tracing::info!("{phase}: stopping ({reason})");
             match tokio::time::timeout(RELEASE_WAIT, self.owner.release()).await {
@@ -1004,7 +1020,11 @@ mod pg {
                 reason = stop.as_mut() => return Ok(WaitEnd::Stop(reason)),
                 _ = crate::daemon::wait_true(&mut shutdown) => return Ok(WaitEnd::Stop("ctl shutdown")),
                 _ = log.tick() => {
-                    tracing::info!("{}", standby_line(database, seen.borrow().owner.as_ref()));
+                    let status = seen.borrow();
+                    tracing::info!(
+                        "{}",
+                        standby_line(database, status.owner.as_ref(), status.last_error.as_deref())
+                    );
                 }
             }
         }
@@ -1036,8 +1056,16 @@ mod pg {
         fn the_standby_sentences_name_the_owner() {
             let owner = row(false);
             assert_eq!(
-                standby_line("db:5432/c, schema a", Some(&owner)),
+                standby_line("db:5432/c, schema a", Some(&owner), None),
                 "standby: the database db:5432/c, schema a is owned by prod-a (pid 42, version 0.33.0, since 2026-11-16T09:30:00Z); waiting"
+            );
+            assert_eq!(
+                standby_line(
+                    "db:5432/c, schema a",
+                    Some(&owner),
+                    Some("connection refused")
+                ),
+                "standby: the database db:5432/c, schema a is owned by prod-a (pid 42, version 0.33.0, since 2026-11-16T09:30:00Z); waiting; the last poll failed: connection refused"
             );
             assert_eq!(
                 standby_refusal(Some(&owner)),
@@ -1045,7 +1073,7 @@ mod pg {
             );
             for unknown in [None, Some(row(true))] {
                 assert!(
-                    standby_line("x", unknown.as_ref())
+                    standby_line("x", unknown.as_ref(), None)
                         .contains("an instance that has not announced itself yet")
                 );
                 assert!(standby_refusal(unknown.as_ref()).contains("has not announced itself yet"));
