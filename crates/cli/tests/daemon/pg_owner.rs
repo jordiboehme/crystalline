@@ -402,6 +402,11 @@ fn turso_order_unchanged() {
     assert_eq!(health["role"], "active");
     serve.terminate();
     assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+    let log = serve.log();
+    assert!(
+        !log.contains("releasing the database"),
+        "Turso has no database to release:\n{log}"
+    );
 }
 
 /// The log line a former standby writes when the start hold begins.
@@ -474,6 +479,8 @@ fn a_former_standby_serves_what_its_start_parked() {
     assert!(ok, "{out}{err}");
     assert_eq!(active.wait_exit(Duration::from_secs(15)), Some(0));
     standby.wait_log(HOLDING);
+    // Not ready while it starts: the full router is not in yet.
+    assert_eq!(standby.get("/ready").unwrap().status().as_u16(), 503);
 
     // Both asked inside the hold.
     let status = {
@@ -533,4 +540,366 @@ fn a_former_standby_serves_what_its_start_parked() {
     let health: Value = standby.get("/health").unwrap().json().unwrap();
     assert_eq!(health["role"], "active");
     standby.wait_ready();
+}
+
+/// This environment's instance id, as the daemon read or made it.
+fn instance_id(env: &Env) -> String {
+    std::fs::read_to_string(env.state_dir().join("instance-id"))
+        .expect("the instance id")
+        .trim()
+        .to_string()
+}
+
+/// The owner row of `pg`'s schema as `instance_id|released`, where
+/// `released` is `t` or `f`; empty when there is no row.
+fn owner_row(pg: &PgScratch) -> String {
+    pg.text(&format!(
+        "SELECT instance_id || '|' || (released_at IS NOT NULL)::text FROM {}.instance_owner WHERE id = 1",
+        pg.schema
+    ))
+}
+
+/// Wait until `check` holds, or panic with `what` after `within`.
+fn wait_until(within: Duration, what: &str, mut check: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !check() {
+        assert!(start.elapsed() < within, "{what} within {within:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A clean stop gives the database back (`released_at` and the unlock, as
+/// the last shutdown step), so the standby takes over at its next poll and
+/// skips the grace: it serves in under 3 s.
+#[test]
+fn graceful_stop_hands_over_without_grace() {
+    let Some(pg) = PgScratch::new("hograce") else {
+        return;
+    };
+    let (active_env, mut active, standby_env, mut standby) = active_and_standby(&pg, "hog");
+
+    let (ok, out, err) = active_env.run_full(&["ctl", "shutdown"]);
+    assert!(ok, "{out}{err}");
+    let asked = Instant::now();
+    assert_eq!(active.wait_exit(Duration::from_secs(15)), Some(0));
+    standby.wait_ready();
+    assert!(
+        asked.elapsed() < Duration::from_secs(3),
+        "the handover took {:?}:\n{}",
+        asked.elapsed(),
+        standby.log()
+    );
+    let log = active.log();
+    let settled = log
+        .find("shutdown: saving a refreshed sign-in")
+        .expect(&log);
+    let released = log.find("shutdown: releasing the database").expect(&log);
+    assert!(settled < released, "the release is the last step:\n{log}");
+    let log = standby.log();
+    assert!(log.contains("without a grace"), "{log}");
+    assert_eq!(
+        owner_row(&pg),
+        format!("{}|false", instance_id(&standby_env))
+    );
+}
+
+/// A killed owner releases nothing: the standby gets the lock once the
+/// server ends the dead session, waits out the grace, and then serves.
+#[test]
+fn kill_9_hands_over_after_grace() {
+    let Some(pg) = PgScratch::new("hokill") else {
+        return;
+    };
+    let (_active_env, mut active, standby_env, mut standby) = active_and_standby(&pg, "hok");
+
+    unsafe {
+        libc::kill(active.pid(), libc::SIGKILL);
+    }
+    let _ = active.wait_exit(Duration::from_secs(10));
+    standby.wait_ready();
+    let log = standby.log();
+    assert!(log.contains("after a grace of"), "{log}");
+    assert_eq!(
+        owner_row(&pg),
+        format!("{}|false", instance_id(&standby_env))
+    );
+}
+
+/// An owner whose lock session is ended from outside is fenced: it exits
+/// with code 4, without the departure's steps, and the standby takes over.
+#[test]
+fn terminated_lock_session_exits_with_fenced_code() {
+    let Some(pg) = PgScratch::new("hofence") else {
+        return;
+    };
+    let (_active_env, mut active, standby_env, mut standby) = active_and_standby(&pg, "hof");
+
+    assert_eq!(
+        pg.text(&format!(
+            "SELECT pg_terminate_backend(backend_pid::int)::text FROM {}.instance_owner",
+            pg.schema
+        )),
+        "true"
+    );
+    assert_eq!(active.wait_exit(Duration::from_secs(15)), Some(4));
+    let log = active.log();
+    assert!(
+        log.contains("lost ownership of the database")
+            && log.contains("stopping so another instance can take over"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("shutdown:"),
+        "a fenced exit ran the departure:\n{log}"
+    );
+    standby.wait_ready();
+    assert_eq!(
+        owner_row(&pg),
+        format!("{}|false", instance_id(&standby_env))
+    );
+}
+
+/// Sends SIGCONT to a stopped child when dropped, so a failed assertion
+/// never leaves it stopped.
+struct Paused(i32);
+
+impl Paused {
+    fn new(pid: i32) -> Paused {
+        unsafe {
+            libc::kill(pid, libc::SIGSTOP);
+        }
+        Paused(pid)
+    }
+}
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0, libc::SIGCONT);
+        }
+    }
+}
+
+/// A paused owner cannot write after a takeover: while it is stopped the
+/// server ends its idle lock session, the standby takes the lock, ends
+/// every session of the paused owner and serves. A file dropped into the
+/// paused owner's domain meanwhile is never indexed: once it wakes it is
+/// fenced and exits with code 4, and the engram rows it wrote before the
+/// pause are what is left.
+#[test]
+fn paused_owner_cannot_write_after_takeover() {
+    let Some(pg) = PgScratch::new("hopause") else {
+        return;
+    };
+    let active_env = Env::new("hopa").on_postgres(&pg);
+    active_env.setup_domain("notes");
+    let mut active = Serve::start(&active_env, None);
+    active.wait_ready();
+    let engrams = || pg.text(&format!("SELECT count(*)::text FROM {}.engram", pg.schema));
+    wait_until(Duration::from_secs(30), "the seed was indexed", || {
+        engrams().parse::<u64>().unwrap_or(0) > 0
+    });
+    // Settled: the count does not move for a second.
+    let mut before = engrams();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let now = engrams();
+        if now == before {
+            break;
+        }
+        before = now;
+    }
+    let tag: String = instance_id(&active_env).chars().take(8).collect();
+    let standby_env = Env::new("hops").on_postgres(&pg);
+    let mut standby = Serve::start(&standby_env, None);
+    standby.wait_role("standby");
+
+    let paused = Paused::new(active.pid());
+    // `setup_domain` put the domain beside the state folder's base.
+    let domain_dir = active_env
+        .state_dir()
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .join("kb-notes");
+    assert!(domain_dir.is_dir(), "{}", domain_dir.display());
+    std::fs::write(
+        domain_dir.join("late.md"),
+        "---\ntype: engram\ntitle: Late\npermalink: late\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nwritten while the owner was paused\n",
+    )
+    .unwrap();
+    standby.wait_ready();
+    let left = pg.text(&format!(
+        "SELECT count(*)::text FROM pg_stat_activity WHERE split_part(application_name, '/', 3) = '{tag}'"
+    ));
+    assert_eq!(
+        left, "0",
+        "a session of the paused owner outlived the takeover"
+    );
+
+    drop(paused);
+    assert_eq!(active.wait_exit(Duration::from_secs(15)), Some(4));
+    // Long enough for a watcher event the wake delivered to have landed.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        engrams(),
+        before,
+        "the paused owner wrote after the takeover"
+    );
+    assert!(standby.alive(), "{}", standby.log());
+}
+
+/// A clean stop records `released_at` in the owner row and frees the lock.
+#[test]
+fn released_at_set_on_clean_stop() {
+    let Some(pg) = PgScratch::new("horel") else {
+        return;
+    };
+    let env = Env::new("horel").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let me = instance_id(&env);
+    assert_eq!(owner_row(&pg), format!("{me}|false"));
+
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+    assert_eq!(owner_row(&pg), format!("{me}|true"));
+    let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
+    assert_eq!(
+        pg.text(&format!("SELECT pg_try_advisory_lock({key})::text")),
+        "true",
+        "the database is still held"
+    );
+}
+
+/// The owner of a Postgres database claims the host lock of each of its
+/// domains with take-over: after a killed owner, the new one hosts the
+/// domain at once, long before the dead one's heartbeat goes stale.
+#[test]
+fn new_owner_takes_host_locks_at_once_after_kill() {
+    let Some(pg) = PgScratch::new("hohost") else {
+        return;
+    };
+    let stale: &[(&str, &str)] = &[("CRYSTALLINE_STALE_SECS", "600")];
+    let active_env = Env::new("hoha").on_postgres(&pg);
+    active_env.setup_domain("notes");
+    let standby_env = Env::new("hohs").on_postgres(&pg);
+    standby_env.setup_domain("notes");
+    let holder = || {
+        pg.text(&format!(
+            "SELECT l.holder_instance_id FROM {s}.domain_lock l JOIN {s}.domain d ON d.id = l.domain_id \
+             WHERE d.name = 'notes'",
+            s = pg.schema
+        ))
+    };
+
+    let mut active = Serve::start_with(&active_env, None, stale);
+    active.wait_ready();
+    let first = instance_id(&active_env);
+    wait_until(
+        Duration::from_secs(30),
+        "the first owner hosts notes",
+        || holder() == first,
+    );
+    let mut standby = Serve::start_with(&standby_env, None, stale);
+    standby.wait_role("standby");
+
+    unsafe {
+        libc::kill(active.pid(), libc::SIGKILL);
+    }
+    let _ = active.wait_exit(Duration::from_secs(10));
+    standby.wait_ready();
+    let second = instance_id(&standby_env);
+    wait_until(Duration::from_secs(15), "the new owner hosts notes", || {
+        holder() == second
+    });
+}
+
+/// A login role made for one test, dropped with its grants afterwards.
+#[cfg(feature = "postgres")]
+struct LowRole<'a> {
+    pg: &'a PgScratch,
+    name: String,
+}
+
+#[cfg(feature = "postgres")]
+impl Drop for LowRole<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .pg
+            .sql(&format!("DROP OWNED BY {0}; DROP ROLE {0}", self.name));
+    }
+}
+
+/// A takeover that may not end its predecessor's sessions stops the start
+/// with the sentence that names the grant to give. The predecessor is a
+/// session of a superuser tagged as an owner-process connection; the new
+/// instance runs as a plain role, which may not end it.
+#[cfg(feature = "postgres")]
+#[test]
+fn a_refused_takeover_names_the_grant() {
+    let Some(pg) = PgScratch::new("hogrant") else {
+        return;
+    };
+    let role = LowRole {
+        pg: &pg,
+        name: format!("cq_low_{}", std::process::id()),
+    };
+    assert!(pg.sql(&format!(
+        "CREATE ROLE {0} LOGIN PASSWORD 'low'; GRANT ALL ON SCHEMA {1} TO {0}",
+        role.name, pg.schema
+    )));
+    let url = pg.url.clone();
+    let (scheme, rest) = url.split_once("://").unwrap();
+    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let low_url = format!("{scheme}://{}:low@{host}", role.name);
+
+    let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
+    let name = crystalline_index::postgres::application_name(
+        key,
+        "deadbeef",
+        crystalline_index::postgres::PgRole::Pool,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (predecessor, seen) = runtime.block_on(async {
+        use sqlx::Connection;
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let predecessor = sqlx::PgConnection::connect_with(&options.application_name(&name))
+            .await
+            .unwrap();
+        // The plain role must see the predecessor's name, or the takeover
+        // would match nothing and never be refused.
+        let mut low = sqlx::PgConnection::connect(&low_url).await.unwrap();
+        let seen: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1")
+                .bind(&name)
+                .fetch_one(&mut low)
+                .await
+                .unwrap();
+        let _ = low.close().await;
+        (predecessor, seen)
+    });
+    assert_eq!(
+        seen, 1,
+        "a plain role does not see other roles' session names"
+    );
+
+    let env = Env::new("hogrant").on_postgres(&pg);
+    let mut serve = Serve::start_with(&env, None, &[("CRYSTALLINE_DATABASE_URL", &low_url)]);
+    let code = serve.wait_exit(Duration::from_secs(30));
+    assert_ne!(code, Some(0), "{}", serve.log());
+    let log = serve.log();
+    assert!(
+        log.contains("may not end the sessions of the instance before it")
+            && log.contains("grant its database role pg_signal_backend")
+            && !log.contains("invalid input"),
+        "{log}"
+    );
+    runtime.block_on(async {
+        use sqlx::Connection;
+        let _ = predecessor.close().await;
+    });
 }

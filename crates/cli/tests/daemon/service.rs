@@ -141,7 +141,7 @@ impl Env {
     fn sock_path(&self) -> PathBuf {
         self.state_dir().join("service.sock")
     }
-    fn config_path(&self) -> PathBuf {
+    pub(crate) fn config_path(&self) -> PathBuf {
         self.dir.join("config/crystalline/config.yaml")
     }
 
@@ -154,7 +154,7 @@ impl Env {
     /// index path and collide with a running daemon's lock. Leaving it off lets
     /// `domain add` route its sync through a live daemon exactly as a plain
     /// invocation does.
-    fn setup_domain(&self, name: &str) {
+    pub(crate) fn setup_domain(&self, name: &str) {
         self.setup_domain_inner(name, true);
     }
 
@@ -7144,7 +7144,7 @@ fn no_test_selects_a_schema_through_url_options() {
 /// unset; a set variable whose database cannot be reached fails the test
 /// and names the fix, never skips it.
 pub(crate) struct PgScratch {
-    url: String,
+    pub(crate) url: String,
     pub(crate) schema: String,
     runtime: tokio::runtime::Runtime,
 }
@@ -7176,12 +7176,16 @@ impl PgScratch {
     }
 
     /// The variables that point a process at this scratch schema: the
-    /// backend, the plain URL (no `options`) and the schema.
+    /// backend, the plain URL (no `options`) and the schema. The owner
+    /// timings are divided by 10, so a first start on the empty schema,
+    /// which has no owner row and so waits out the takeover grace, waits
+    /// 1.5 s and not 15 s.
     fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("CRYSTALLINE_DATABASE_BACKEND", "postgres".to_string()),
             ("CRYSTALLINE_DATABASE_URL", self.url.clone()),
             ("CRYSTALLINE_DATABASE_SCHEMA", self.schema.clone()),
+            ("CRYSTALLINE_TEST_OWNER_TIMING_SCALE", "10".to_string()),
         ]
     }
 
