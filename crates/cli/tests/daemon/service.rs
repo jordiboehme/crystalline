@@ -15,12 +15,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crystalline_core::config::{self, GlobalConfig, ResponseFormat, ServiceConfig};
 use serde_json::{Value, json};
 
-fn bin() -> PathBuf {
+pub(crate) fn bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("crystalline")
 }
 
 /// An isolated, short-path environment for one test.
-struct Env {
+pub(crate) struct Env {
     dir: PathBuf,
     /// The model hub every child reaches (`HF_ENDPOINT`).
     hub: &'static str,
@@ -33,7 +33,7 @@ struct Env {
 
 impl Env {
     /// No child here downloads a model: the hub is `crate::common::NO_HUB`.
-    fn new(tag: &str) -> Env {
+    pub(crate) fn new(tag: &str) -> Env {
         Env::with(tag, crate::common::NO_HUB, None)
     }
 
@@ -58,7 +58,7 @@ impl Env {
 
     /// Point every child at the scratch schema of `pg` through the
     /// `CRYSTALLINE_DATABASE_*` variables.
-    fn on_postgres(mut self, pg: &PgScratch) -> Env {
+    pub(crate) fn on_postgres(mut self, pg: &PgScratch) -> Env {
         self.extra = pg.env();
         self
     }
@@ -91,7 +91,7 @@ impl Env {
     /// makes the hermeticity explicit rather than lucky. The one test that wants
     /// an endpoint passes `--http <free port>`, and the flag wins over this
     /// variable.
-    fn apply(&self, cmd: &mut Command) {
+    pub(crate) fn apply(&self, cmd: &mut Command) {
         cmd.env("HOME", &self.dir)
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
@@ -129,13 +129,13 @@ impl Env {
         }
     }
 
-    fn state_dir(&self) -> PathBuf {
+    pub(crate) fn state_dir(&self) -> PathBuf {
         self.dir.join("state/crystalline")
     }
     fn lock_path(&self) -> PathBuf {
         self.state_dir().join("service.lock")
     }
-    fn info_path(&self) -> PathBuf {
+    pub(crate) fn info_path(&self) -> PathBuf {
         self.state_dir().join("service.json")
     }
     fn sock_path(&self) -> PathBuf {
@@ -227,7 +227,7 @@ impl Env {
 
     /// Like [`Self::run`], but also returns stderr - needed to see a command's
     /// failure message, which never lands on stdout.
-    fn run_full(&self, args: &[&str]) -> (bool, String, String) {
+    pub(crate) fn run_full(&self, args: &[&str]) -> (bool, String, String) {
         let mut cmd = Command::new(bin());
         self.apply(&mut cmd);
         let out = cmd.args(args).output().unwrap();
@@ -287,7 +287,7 @@ impl Env {
     /// The pid from the owner record. Reads `service.json`, never the lock
     /// file itself: the record moved there so a reader never has to touch a
     /// handle another process holds an exclusive lock on.
-    fn lock_pid(&self) -> Option<u64> {
+    pub(crate) fn lock_pid(&self) -> Option<u64> {
         let text = std::fs::read_to_string(self.info_path()).ok()?;
         let v: Value = serde_json::from_str(&text).ok()?;
         v.get("pid").and_then(Value::as_u64)
@@ -296,7 +296,7 @@ impl Env {
     /// The last `lines` lines of the daemon log a spawned daemon writes under
     /// this environment's state directory, for a failure message: a daemon a
     /// bridge started has no other place a test can read what it did.
-    fn daemon_log_tail(&self, lines: usize) -> String {
+    pub(crate) fn daemon_log_tail(&self, lines: usize) -> String {
         let path = self.state_dir().join("daemon.log");
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -4464,7 +4464,7 @@ fn parse_jsonrpc(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or(Value::Null)
 }
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
@@ -7143,14 +7143,14 @@ fn no_test_selects_a_schema_through_url_options() {
 /// connection (no `psql` needed). `None`, with a note, when the variable is
 /// unset; a set variable whose database cannot be reached fails the test
 /// and names the fix, never skips it.
-struct PgScratch {
+pub(crate) struct PgScratch {
     url: String,
-    schema: String,
+    pub(crate) schema: String,
     runtime: tokio::runtime::Runtime,
 }
 
 impl PgScratch {
-    fn new(prefix: &str) -> Option<PgScratch> {
+    pub(crate) fn new(prefix: &str) -> Option<PgScratch> {
         let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
             eprintln!("note: skipping the postgres leg (CRYSTALLINE_TEST_POSTGRES_URL is unset)");
             return None;
@@ -7198,12 +7198,12 @@ impl PgScratch {
     }
 
     /// Whether `sql` ran without an error.
-    fn sql(&self, sql: &str) -> bool {
+    pub(crate) fn sql(&self, sql: &str) -> bool {
         self.run(sql).is_ok()
     }
 
     /// The first column of the first row `sql` answers, as text, or empty.
-    fn text(&self, sql: &str) -> String {
+    pub(crate) fn text(&self, sql: &str) -> String {
         use sqlx::{Connection, Row};
         self.runtime.block_on(async {
             let mut conn = sqlx::PgConnection::connect(&self.url).await.unwrap();

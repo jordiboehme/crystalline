@@ -21,6 +21,10 @@ mod automation;
 mod bridge;
 #[cfg(unix)]
 mod mcp_stub;
+// The owner lock on Postgres: the standby phase of `serve`. Reaches the
+// `Env` and `PgScratch` helpers of `service`.
+#[cfg(unix)]
+mod pg_owner;
 // The same two seams as bridge above.
 #[cfg(debug_assertions)]
 mod packaged;
