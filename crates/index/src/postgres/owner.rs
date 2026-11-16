@@ -341,6 +341,27 @@ const TERMINATE_SQL: &str = "WITH targets AS MATERIALIZED (\
      SELECT count(*) FILTER (WHERE ended) FROM \
        (SELECT pg_terminate_backend(pid, $3) AS ended FROM targets) t";
 
+/// The error of the takeover's termination statement. A refused termination
+/// (SQLSTATE 42501: the role may not end the predecessor's sessions) becomes
+/// a sentence that names the database and the remedy, so the start stops
+/// with it; every other error stays as it is.
+fn terminate_error(e: sqlx::Error, database: &str) -> IndexError {
+    let refused = matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("42501"));
+    if refused {
+        return terminate_refused(database);
+    }
+    IndexError::from(e)
+}
+
+/// The sentence of a refused takeover termination on `database`.
+fn terminate_refused(database: &str) -> IndexError {
+    IndexError::Invalid(format!(
+        "this instance took the database {database} but may not end the sessions of the instance \
+         before it: grant its database role pg_signal_backend, or run every instance on this \
+         database as the same role"
+    ))
+}
+
 /// The `instance_owner` table of `schema`, qualified so a missing table in
 /// the schema never resolves to one in `public`.
 fn owner_table(schema: Option<&str>) -> String {
@@ -850,6 +871,7 @@ impl Worker {
     async fn terminate(&mut self) -> Result<u32> {
         let prefix = application_prefix(self.key);
         let tag = short_tag(&self.me.instance_id);
+        let database = self.target.describe();
         let (_, conn) = self.holding()?;
         // Each termination may wait up to TERMINATE_WAIT_MS, longer than the
         // lock connection's statement timeout, so the statement runs in a
@@ -863,7 +885,8 @@ impl Worker {
             .bind(tag)
             .bind(TERMINATE_WAIT_MS)
             .fetch_one(&mut *tx)
-            .await?;
+            .await
+            .map_err(|e| terminate_error(e, &database))?;
         tx.commit().await?;
         Ok(u32::try_from(ended).unwrap_or(u32::MAX))
     }
@@ -986,6 +1009,24 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused takeover termination names the database and the remedy;
+    /// any other error is passed on unchanged.
+    #[test]
+    fn a_refused_termination_says_what_to_grant() {
+        let IndexError::Invalid(text) = terminate_refused("db:5432/c, schema a") else {
+            panic!("not an Invalid error");
+        };
+        assert!(text.contains("db:5432/c, schema a"), "{text}");
+        assert!(text.contains("pg_signal_backend"), "{text}");
+        assert!(
+            matches!(
+                terminate_error(sqlx::Error::RowNotFound, "x"),
+                IndexError::Db(_)
+            ),
+            "another error stays a database error"
+        );
+    }
     use crate::postgres::{PostgresStore, ScratchSchema};
 
     fn pg_url() -> Option<String> {
