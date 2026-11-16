@@ -3962,6 +3962,45 @@ fn a_threads_file_written_on_disk_reaches_the_event_stream() {
 }
 
 #[test]
+fn turso_daemon_ready_is_200_and_role_active() {
+    let env = Env::new("ready");
+    env.setup_domain("eng");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--http", &addr, "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_port(&addr);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let ready = client.get(format!("http://{addr}/ready")).send().unwrap();
+    assert_eq!(ready.status().as_u16(), 200, "GET /ready is 200");
+    let health: Value = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(health["status"], "ok", "{health}");
+    assert_eq!(health["role"], "active", "{health}");
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+}
+
+#[test]
 fn http_smoke_initialize_list_and_search() {
     let env = Env::new("http");
     env.setup_domain("eng");

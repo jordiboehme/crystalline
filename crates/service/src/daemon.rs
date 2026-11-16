@@ -1169,19 +1169,110 @@ impl Departure {
         // A window procedure holding WM_ENDSESSION may now let Windows end
         // the session: nothing of the index is in use any more.
         crate::session_end::notify_stopped();
-        exit_now();
+        exit_with(0);
     }
 }
+
+/// Exit status of a process that lost its fence on durable state (Postgres
+/// ownership): distinct from [`crate::EXIT_LOCK_HELD`] (3), which systemd's
+/// `RestartPreventExitStatus=3` keeps from restarting, so a fenced process is
+/// restarted and rejoins as a standby. Also distinct from 0, 1 and 2.
+pub const EXIT_FENCED: i32 = 4;
 
 /// Flush what this process has written and exit with status 0. Both streams,
 /// because `std::process::exit` runs no destructors and a line still sitting
 /// in a buffer would be lost; stderr is unbuffered in std today, and flushing
 /// it costs nothing if that ever changes.
 fn exit_now() -> ! {
+    exit_with(0)
+}
+
+/// [`exit_now`] with a chosen status.
+pub(crate) fn exit_with(code: i32) -> ! {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    std::process::exit(0)
+    std::process::exit(code)
+}
+
+/// Whether this process owns the durable state (`Active`) or waits for it
+/// (`Standby`). Reported in `/health` as `role`.
+#[allow(dead_code, reason = "first used by the standby phase (Task 1.10)")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    Active,
+    Standby,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Active => "active",
+            Role::Standby => "standby",
+        }
+    }
+}
+
+/// The process-wide role, read by `/health`. A watch so a standby loop can
+/// subscribe to changes.
+static ROLE: std::sync::LazyLock<watch::Sender<Role>> =
+    std::sync::LazyLock::new(|| watch::channel(Role::Active).0);
+
+/// True once the full router is installed; `/ready` answers 200 only then.
+static READY: AtomicBool = AtomicBool::new(false);
+
+#[allow(dead_code, reason = "first used by the standby phase (Task 1.10)")]
+pub(crate) fn set_role(role: Role) {
+    ROLE.send_replace(role);
+}
+
+pub(crate) fn current_role() -> Role {
+    *ROLE.borrow()
+}
+
+pub(crate) fn set_ready(ready: bool) {
+    READY.store(ready, Ordering::SeqCst);
+}
+
+/// A swappable router: the listener binds once and the router behind it can
+/// be replaced without rebinding. Each request clones the current router.
+#[derive(Clone)]
+pub(crate) struct HttpSlot(Arc<std::sync::RwLock<axum::Router>>);
+
+impl HttpSlot {
+    pub(crate) fn new(router: axum::Router) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(router)))
+    }
+
+    #[allow(dead_code, reason = "first used by the standby phase (Task 1.10)")]
+    pub(crate) fn swap(&self, router: axum::Router) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = router;
+    }
+}
+
+impl tower_service::Service<axum::extract::Request> for HttpSlot {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = <axum::Router as tower_service::Service<axum::extract::Request>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: axum::extract::Request) -> Self::Future {
+        let mut router = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        tower_service::Service::call(&mut router, request)
+    }
 }
 
 /// Accept connections until shutdown, dispatching each by its handshake line.
@@ -1691,9 +1782,14 @@ async fn run_http(
     router: axum::Router,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    // The slot sits behind a fallback service so the connect info the make
+    // service puts in the request extensions reaches the router it holds.
+    let slot = HttpSlot::new(router);
+    set_ready(true);
+    let outer = axum::Router::new().fallback_service(slot);
     axum::serve(
         listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
+        outer.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
     .await?;
@@ -2622,6 +2718,7 @@ fn http_base(
     // here". See `rest::oauth`.
     let mut router = axum::Router::new()
         .route("/health", axum::routing::get(health))
+        .route("/ready", axum::routing::get(ready))
         .merge(crate::rest::well_known_routes(
             oauth.then_some(origin_rule),
             &base_path,
@@ -2832,10 +2929,19 @@ fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static
 /// list of internal hostnames. It is reported on the ctl `status` reply, which
 /// is reachable only over the local unix socket, and through
 /// `crystalline status`, which reads that reply.
+async fn ready() -> axum::http::StatusCode {
+    if READY.load(Ordering::SeqCst) {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 async fn health() -> axum::Json<Value> {
     let intent = crate::instance::serve_intent();
     axum::Json(serde_json::json!({
         "status": "ok",
+        "role": current_role().as_str(),
         "version": crystalline_core::VERSION,
         "started_by": intent
             .map(|i| i.started_by.as_str())
@@ -4031,6 +4137,84 @@ mod tests {
         ] {
             assert!(!text.contains(quiet), "{quiet} passed the filter: {text}");
         }
+    }
+
+    #[test]
+    fn exit_codes_are_distinct() {
+        assert_ne!(EXIT_FENCED, crate::EXIT_LOCK_HELD);
+        for code in [EXIT_FENCED, crate::EXIT_LOCK_HELD] {
+            assert!(![0, 1, 2].contains(&code));
+        }
+    }
+
+    async fn get_status(router: &axum::Router, path: &str) -> (u16, String) {
+        use tower_service::Service;
+        let response = router
+            .clone()
+            .call(
+                axum::http::Request::get(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn probe_router() -> axum::Router {
+        axum::Router::new()
+            .route("/health", axum::routing::get(health))
+            .route("/ready", axum::routing::get(ready))
+    }
+
+    #[tokio::test]
+    async fn ready_and_health_answer_under_the_base_path() {
+        set_ready(true);
+        let wrapped = under_base_path(
+            probe_router(),
+            crystalline_core::base::BasePath::parse("/crystalline").unwrap(),
+        );
+        assert_eq!(get_status(&wrapped, "/crystalline/ready").await.0, 200);
+        assert_eq!(get_status(&wrapped, "/crystalline/health").await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn health_reports_role_active_on_turso() {
+        let (status, body) = get_status(&probe_router(), "/health").await;
+        assert_eq!(status, 200);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["role"], "active");
+    }
+
+    #[tokio::test]
+    async fn http_slot_swaps_router_without_rebind() {
+        use tower_service::Service;
+        let first = axum::Router::new().route("/x", axum::routing::get(|| async { "one" }));
+        let second = axum::Router::new().route("/x", axum::routing::get(|| async { "two" }));
+        let slot = HttpSlot::new(first);
+        let mut service = slot.clone();
+        let request = || {
+            axum::http::Request::get("/x")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let body = |r: axum::response::Response| async move {
+            axum::body::to_bytes(r.into_body(), 16).await.unwrap()
+        };
+        assert_eq!(
+            &body(service.call(request()).await.unwrap()).await[..],
+            b"one"
+        );
+        slot.swap(second);
+        assert_eq!(
+            &body(service.call(request()).await.unwrap()).await[..],
+            b"two"
+        );
     }
 
     /// The bare `/crystalline` prefix is stripped. MCP is the router's

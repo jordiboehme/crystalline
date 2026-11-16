@@ -89,6 +89,7 @@ pub use crystalline_identity::scope::{
     Scope, WriteRights, overlay_actor, reflection_right_word, write_list_matches,
 };
 pub use crystalline_remote::ops::DiscardTarget;
+pub use daemon::EXIT_FENCED;
 pub use daemon::run_serve;
 pub use instance::{EXIT_LOCK_HELD, HttpBinding, LockHeld, ServeIntent, StartMode};
 pub use mcp::McpServer;
