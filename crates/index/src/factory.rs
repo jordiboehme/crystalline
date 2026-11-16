@@ -15,6 +15,8 @@ use crystalline_core::config::{self, DatabaseBackend, DatabaseConfig};
 use tokio::sync::Mutex;
 
 use crate::error::{IndexError, Result};
+#[cfg(feature = "postgres")]
+use crate::postgres::PgSessionOptions;
 use crate::store::Store;
 use crate::turso::TursoStore;
 
@@ -38,8 +40,48 @@ pub async fn open_store(
     db_override: Option<&Path>,
     resilient: bool,
 ) -> Result<Arc<Mutex<dyn Store>>> {
-    open_store_in(cfg, db_override, resilient, config::write_fence::fence()).await
+    #[cfg(feature = "postgres")]
+    {
+        open_store_with(cfg, db_override, resilient, &PgSessionOptions::default()).await
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        open_store_in(
+            cfg,
+            db_override,
+            resilient,
+            config::write_fence::fence(),
+            &(),
+        )
+        .await
+    }
 }
+
+/// [`open_store`] with every Postgres connection built with `opts`: the
+/// instance tag in its `application_name` and, when `opts` carries a fence,
+/// the fence check on every new connection of the store's pools. The Turso
+/// backend ignores `opts`.
+#[cfg(feature = "postgres")]
+pub async fn open_store_with(
+    cfg: &DatabaseConfig,
+    db_override: Option<&Path>,
+    resilient: bool,
+    opts: &PgSessionOptions,
+) -> Result<Arc<Mutex<dyn Store>>> {
+    open_store_in(
+        cfg,
+        db_override,
+        resilient,
+        config::write_fence::fence(),
+        opts,
+    )
+    .await
+}
+
+/// The Postgres session options a build without the backend passes along:
+/// nothing.
+#[cfg(not(feature = "postgres"))]
+type PgSessionOptions = ();
 
 /// [`open_store`] under `fence`, the process's own one in production.
 async fn open_store_in(
@@ -47,6 +89,7 @@ async fn open_store_in(
     db_override: Option<&Path>,
     resilient: bool,
     fence: Option<&config::WriteFence>,
+    opts: &PgSessionOptions,
 ) -> Result<Arc<Mutex<dyn Store>>> {
     cfg.validate()
         .map_err(|e| IndexError::Invalid(e.to_string()))?;
@@ -82,7 +125,7 @@ async fn open_store_in(
         // migration machinery, whose inlined debug-build state machine is
         // large enough to overflow the smaller default stacks on Windows
         // main threads and tokio workers.
-        DatabaseBackend::Postgres => Box::pin(open_postgres(cfg, resilient)).await,
+        DatabaseBackend::Postgres => Box::pin(open_postgres(cfg, resilient, opts)).await,
     }
 }
 
@@ -91,16 +134,20 @@ async fn open_store_in(
 /// Postgres: corruption recovery is a Turso file concern, so the branch is kept
 /// for a uniform signature but ignored.
 #[cfg(feature = "postgres")]
-async fn open_postgres(cfg: &DatabaseConfig, resilient: bool) -> Result<Arc<Mutex<dyn Store>>> {
+async fn open_postgres(
+    cfg: &DatabaseConfig,
+    resilient: bool,
+    opts: &PgSessionOptions,
+) -> Result<Arc<Mutex<dyn Store>>> {
     let _ = resilient;
-    let url = cfg
-        .url
-        .as_deref()
-        .ok_or_else(|| IndexError::Invalid("the postgres backend requires a url".to_string()))?;
-    let store = match cfg.schema.as_deref() {
-        Some(schema) => crate::postgres::PostgresStore::open_in_schema(url, schema).await?,
-        None => crate::postgres::PostgresStore::open(url).await?,
-    };
+    let target = crate::postgres::PgTarget::from_config(cfg)?;
+    let store = crate::postgres::PostgresStore::build_with(
+        &target.url,
+        target.schema,
+        crate::postgres::default_readers(),
+        opts,
+    )
+    .await?;
     let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
     Ok(store)
 }
@@ -109,7 +156,11 @@ async fn open_postgres(cfg: &DatabaseConfig, resilient: bool) -> Result<Arc<Mute
 /// `backend: postgres` config on a Turso-only build is an actionable error
 /// rather than a silent fallback.
 #[cfg(not(feature = "postgres"))]
-async fn open_postgres(_cfg: &DatabaseConfig, _resilient: bool) -> Result<Arc<Mutex<dyn Store>>> {
+async fn open_postgres(
+    _cfg: &DatabaseConfig,
+    _resilient: bool,
+    _opts: &PgSessionOptions,
+) -> Result<Arc<Mutex<dyn Store>>> {
     Err(IndexError::Unsupported(
         "this build has no postgres backend; rebuild with the postgres feature \
          or use backend: turso"
@@ -186,16 +237,23 @@ mod tests {
         let fence = config::WriteFence::new("inside a package", vec![roaming.clone()], vec![]);
         let cfg = DatabaseConfig::default();
         let db = roaming.join("crystalline").join("index.db");
-        let err = match open_store_in(&cfg, Some(&db), false, Some(&fence)).await {
-            Ok(_) => panic!("the fenced open went ahead"),
-            Err(err) => err.to_string(),
-        };
+        let err =
+            match open_store_in(&cfg, Some(&db), false, Some(&fence), &Default::default()).await {
+                Ok(_) => panic!("the fenced open went ahead"),
+                Err(err) => err.to_string(),
+            };
         assert!(err.contains("inside a package"), "{err}");
         assert!(!roaming.exists(), "nothing was created under the fence");
         let outside = home.path().join("data").join("index.db");
-        open_store_in(&cfg, Some(&outside), false, Some(&fence))
-            .await
-            .unwrap();
+        open_store_in(
+            &cfg,
+            Some(&outside),
+            false,
+            Some(&fence),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
     }
 
     /// A schema set while the backend is Turso is ignored: the store opens
