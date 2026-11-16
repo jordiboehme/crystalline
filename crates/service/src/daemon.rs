@@ -621,7 +621,16 @@ pub async fn run_serve(
     let pg_accounts = match &pg_start {
         Some(pg) => {
             #[cfg(feature = "postgres")]
-            warn_leftover_accounts_file(pg.database());
+            {
+                // The one durable-state line (spec section F), and each
+                // thing left behind on this disk as its own warning.
+                let report =
+                    crate::durable::durable_state_of_owner(&loaded.effective, pg.database()).await;
+                tracing::info!("{}", report.startup_line());
+                for warning in &report.warnings {
+                    tracing::warn!("{warning}");
+                }
+            }
             #[cfg(not(feature = "postgres"))]
             let _ = pg;
             open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?
@@ -2311,22 +2320,6 @@ async fn has_an_account(store: &crate::rest::AuthStore, what: &str) -> bool {
             );
             false
         }
-    }
-}
-
-/// On Postgres, say once that an accounts file left in the state directory
-/// is not read: the accounts live in `database`.
-#[cfg(feature = "postgres")]
-fn warn_leftover_accounts_file(database: &str) {
-    let Ok(state_dir) = config::state_dir() else {
-        return;
-    };
-    let leftover = state_dir.join("web-auth.db");
-    if leftover.exists() {
-        tracing::warn!(
-            "the accounts file {} is not read: on Postgres the accounts live in the database {database}. Move it away once you no longer need it",
-            leftover.display()
-        );
     }
 }
 

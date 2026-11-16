@@ -395,6 +395,23 @@ async fn report_on(cfg: &GlobalConfig) -> anyhow::Result<Option<CommandDbOwner>>
     }
 }
 
+/// `doctor --fix` on Postgres, before it changes anything: refused with the
+/// owner's sentence (a [`DatabaseOwned`]) while an instance of another
+/// machine owns the database. An instance of this machine is not refused:
+/// repairing its daemon is what `--fix` is for. Turso, a free database and a
+/// look that failed pass.
+pub async fn refuse_fix_when_owned(cfg: &GlobalConfig) -> anyhow::Result<()> {
+    #[cfg(feature = "postgres")]
+    if let Holder::Elsewhere { database, owner } = holder(cfg).await {
+        return Err(anyhow::Error::new(DatabaseOwned {
+            message: pg::command_refusal(&database, owner.as_ref(), &command_example()),
+        }));
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = cfg;
+    Ok(())
+}
+
 /// Where the accounts of `cfg` live (spec section A): the `web-auth.db`
 /// file in the state directory on Turso, the configured database on
 /// Postgres.

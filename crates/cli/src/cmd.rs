@@ -192,6 +192,34 @@ pub(crate) async fn reach_index(
     }
 }
 
+/// The "ownership and durable state" block of `cfg` for `status` and
+/// `doctor`: its lines and its JSON. Only on Postgres; Turso has no block.
+/// Read from the owner row, never from the store (a report opens nothing).
+/// `role` is what the caller knows of the instance it talked to.
+pub(crate) async fn durable_state_block(
+    cfg: &GlobalConfig,
+    role: &str,
+) -> Option<(Vec<String>, serde_json::Value)> {
+    #[cfg(feature = "postgres")]
+    {
+        let report = crystalline_service::durable::durable_state_for_command(cfg, role).await?;
+        Some((report.block_lines(), report.to_json()))
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (cfg, role);
+        None
+    }
+}
+
+/// Print a block from [`durable_state_block`] under its heading.
+pub(crate) fn print_durable_state(lines: &[String]) {
+    println!("Ownership and durable state:");
+    for line in lines {
+        println!("  {line}");
+    }
+}
+
 /// The words a listing uses when the daemon it asked answered badly: an error
 /// envelope, or a reply that did not arrive whole. Its own sentence rather
 /// than the shared lock wording in

@@ -20,6 +20,8 @@ pub mod desktop_offer;
 pub mod desktop_open;
 pub mod desktop_state;
 pub mod desktop_update;
+#[cfg(feature = "postgres")]
+pub mod durable;
 mod first_admin;
 pub mod instance;
 pub use crystalline_identity::join;
@@ -62,7 +64,8 @@ pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use claim::{
     CommandDbOwner, DatabaseOwned, claim_database_for_command, existing_accounts_for_cli,
-    open_accounts_for_cli, open_store_for_command, release_command_database, set_command_line,
+    open_accounts_for_cli, open_store_for_command, refuse_fix_when_owned, release_command_database,
+    set_command_line,
 };
 pub use client::{
     ROUTING_READ_ONLY_KEY, VirtualRouting, adopt_domain_names_direct, collect_orphaned_domains,

@@ -1914,3 +1914,128 @@ fn users_cli_unchanged_on_turso() {
     users_add(&env, "bob", "bob-password");
     assert_eq!(sign_in(&serve, "bob", "bob-password"), 200);
 }
+
+/// The start logs one durable-state line: the owner, the database with its
+/// schema and where the accounts live, and no credential.
+#[test]
+fn startup_line_names_owner_and_accounts() {
+    let Some(pg) = PgScratch::new("dsline") else {
+        return;
+    };
+    let env = Env::new("dsline").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let log = serve.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("durable state: owner of postgres"))
+        .unwrap_or_else(|| panic!("no durable state line:\n{log}"));
+    assert!(
+        line.contains(&format!("schema {}", pg.schema)) && line.contains("accounts in postgres"),
+        "{line}"
+    );
+    assert!(line.contains(" since "), "{line}");
+    let credentials = pg
+        .url
+        .split('@')
+        .next()
+        .and_then(|head| head.split("//").nth(1))
+        .unwrap();
+    assert!(
+        !log.contains(credentials),
+        "the log carries the credentials"
+    );
+}
+
+/// Without a daemon of its own, `status` on an owned database names the
+/// owner from the owner row and where the accounts live, in text and JSON.
+#[test]
+fn status_without_daemon_reports_owner_row() {
+    let Some(pg) = PgScratch::new("dsstat") else {
+        return;
+    };
+    let active_env = Env::new("dsstata").on_postgres(&pg);
+    let mut active = Serve::start(&active_env, None);
+    active.wait_ready();
+    let label = owner_label(&pg);
+
+    let other = Env::new("dsstatb").on_postgres(&pg);
+    let (ok, out, err) = other.run_full(&["status"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("Ownership and durable state:"), "{out}");
+    assert!(out.contains(&format!("Owner: {label}")), "{out}");
+    assert!(out.contains("Accounts: in postgres"), "{out}");
+    let (ok, out, err) = other.run_full(&["status", "--json"]);
+    assert!(ok, "{out}{err}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["durable_state"]["owner"]["label"], label);
+    assert_eq!(status["durable_state"]["accounts"], "postgres");
+    assert_eq!(status["durable_state"]["role"], "none");
+    assert!(active.alive());
+}
+
+/// `doctor --fix` changes nothing while an instance of another machine owns
+/// the database, and a plain `doctor` shows the block.
+#[test]
+fn doctor_fix_refused_when_owned() {
+    let Some(pg) = PgScratch::new("dsfix") else {
+        return;
+    };
+    let active_env = Env::new("dsfixa").on_postgres(&pg);
+    let mut active = Serve::start(&active_env, None);
+    active.wait_ready();
+    let label = owner_label(&pg);
+
+    let other = Env::new("dsfixb").on_postgres(&pg);
+    let (ok, out, err) = other.run_full(&["doctor", "--fix"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("is owned by"), "{out}{err}");
+    let (_, out, err) = other.run_full(&["doctor"]);
+    let text = format!("{out}{err}");
+    assert!(text.contains("ownership and durable state:"), "{text}");
+    assert!(text.contains(&format!("owner: {label}")), "{text}");
+}
+
+/// An accounts file left on this disk is named by `doctor` on Postgres, and
+/// is not read.
+#[test]
+fn doctor_warns_local_disk_rows_on_postgres() {
+    let Some(pg) = PgScratch::new("dswarn") else {
+        return;
+    };
+    let turso = Env::new("dswarn");
+    users_add(&turso, "old", "old-password");
+    let leftover = turso.state_dir().join("web-auth.db");
+    assert!(leftover.exists());
+    let env = turso.on_postgres(&pg);
+    let (_, out, err) = env.run_full(&["doctor"]);
+    let text = format!("{out}{err}");
+    assert!(
+        text.contains(&format!(
+            "the accounts file {} is not read",
+            leftover.display()
+        )),
+        "{text}"
+    );
+    assert_eq!(schema_objects(&pg), "0", "doctor opened the store");
+}
+
+/// On Turso neither `status` nor `doctor` carries the block.
+#[test]
+fn status_block_absent_on_turso() {
+    let env = Env::new("dsturso");
+    let (ok, out, err) = env.run_full(&["status", "--json"]);
+    assert!(ok, "{out}{err}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert!(status.get("durable_state").is_none(), "{out}");
+    let (_, out, err) = env.run_full(&["status"]);
+    assert!(
+        !format!("{out}{err}").contains("durable state"),
+        "{out}{err}"
+    );
+    let (_, out, err) = env.run_full(&["doctor"]);
+    assert!(
+        !format!("{out}{err}").contains("durable state"),
+        "{out}{err}"
+    );
+}

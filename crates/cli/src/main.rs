@@ -2980,6 +2980,12 @@ async fn status_dispatch(
             state.compare_with(&registered);
         }
         let packaged_line = crystalline_service::desktop_state::packaged_read_line();
+        // On Postgres, who owns the database and where the accounts live,
+        // read from the owner row beside the daemon's own answer.
+        let durable = match &loaded {
+            Ok(loaded) => cmd::durable_state_block(&loaded.effective, "active").await,
+            Err(_) => None,
+        };
         if json {
             let mut data = data;
             if let serde_json::Value::Object(map) = &mut data {
@@ -2997,6 +3003,9 @@ async fn status_dispatch(
                     map.insert("inside_package".to_string(), json!(line));
                 }
                 insert_kept_count(map);
+                if let Some((_, block)) = &durable {
+                    map.insert("durable_state".to_string(), block.clone());
+                }
                 // Present only when something differs, as doctor --json does.
                 if !mismatches.is_empty() {
                     map.insert(
@@ -3038,12 +3047,36 @@ async fn status_dispatch(
             }
             sources::render_sources(&source_rows);
             cmd::render_status(&data, &note);
+            if let Some((lines, _)) = &durable {
+                cmd::print_durable_state(lines);
+            }
         }
         return Ok(());
     }
     // Nothing answered, so the numbers have to come from the index here, and
     // that needs the config the probe above could do without.
     let cfg = cmd::load(config.as_deref())?.effective;
+    // On Postgres a report opens no store (only the owner does): without a
+    // daemon here it is the owner row and where the accounts live.
+    if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none").await {
+        if json {
+            let registered: Vec<&String> = cfg.domains.keys().collect();
+            println!(
+                "{}",
+                json!({
+                    "indexed": false,
+                    "registered": registered,
+                    "sources": source_rows,
+                    "durable_state": block,
+                })
+            );
+        } else {
+            println!("Daemon: not running");
+            sources::render_sources(&source_rows);
+            cmd::print_durable_state(&lines);
+        }
+        return Ok(());
+    }
     let route = cmd::reach_index(
         None,
         &cfg,
