@@ -1632,11 +1632,12 @@ jobs:
   # already tagged is a no-op with one line, a new version without its notes
   # fails here, and a new version with its notes releases.
   #
-  # Both jobs share one concurrency group that never cancels a running job, so
-  # a second push to main during a release waits for it, and its check then
-  # finds the tag and does nothing. (A third push while one waits replaces the
-  # waiting one, which shows as cancelled.) release.yml checks the tag again
-  # when it starts, in case two checks passed before either tagged.
+  # Only the `release` job holds a concurrency group, never cancelled in
+  # progress, so two releases never run at once and a check never waits. A
+  # second release that queues behind a running one finds the tag when its
+  # release.yml starts and stops green. A third that queues while one waits
+  # replaces the waiting one, which shows as cancelled; a cancelled release
+  # job is re-run by hand.
   #
   # `style` is waited for too: it runs scripts/version-pins.sh, so a version
   # bump that left a pin in docs/evolve.md or fluid/package.json behind does
@@ -1647,9 +1648,6 @@ jobs:
     needs: [ci-passed, style]
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-passed.result == 'success' && needs.style.result == 'success' }}
     runs-on: ubuntu-latest
-    concurrency:
-      group: release-main
-      cancel-in-progress: false
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       release: ${{ steps.check.outputs.release }}

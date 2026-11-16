@@ -68,7 +68,7 @@ fi
 # missing file earlier, in the release PR, while it is still a one-line fix.
 notesfile="$root/release-notes/v$version.md"
 if [ ! -s "$notesfile" ]; then
-  echo "::error file=release-notes/v$version.md::release-notes/v$version.md is missing or empty. The workspace version on main is always the last released one, so this file is the body the release page for v$version shows; add it in this PR, because merging it releases v$version." >&2
+  echo "::error file=release-notes/v$version.md::release-notes/v$version.md is missing or empty. The workspace version on main is always the released one or the one about to be released, so this file is the body the release page for v$version shows; add it in this PR, because merging it releases v$version." >&2
   bad=1
 elif ! head -1 "$notesfile" | grep -qE '^# .+'; then
   echo "::error file=release-notes/v$version.md::release-notes/v$version.md must open with an H1 (a line starting with '# ' followed by text), the release's motto." >&2

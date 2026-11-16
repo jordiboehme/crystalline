@@ -114,7 +114,8 @@ jobs:
               echo "release: $tag already points at $at, not at $GITHUB_SHA, so another run released it; nothing to do"
               build=false
             fi
-            { echo "tag=$tag"; echo "publish=true"; echo "build=$build"; echo "called=true"; } >> "$GITHUB_OUTPUT"
+            # publish follows build: a run that lost the race publishes nothing.
+            { echo "tag=$tag"; echo "publish=$build"; echo "build=$build"; echo "called=true"; } >> "$GITHUB_OUTPUT"
           elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             { echo "tag=${GITHUB_REF_NAME}"; echo "publish=true"; echo "build=true"; echo "called=false"; } >> "$GITHUB_OUTPUT"
           else
@@ -537,23 +538,48 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download all archives
+      # Only the release's own artifacts, by name. In a call from CI this run
+      # is the CI run, so a bare download would also pull its test artifacts
+      # (the smoke binary with a whole target/debug, the unit shards). The
+      # build legs upload crystalline-<platform>, crystalline-deb-<arch> and
+      # crystalline-msi-<platform>; the jobs above upload the other three.
+      # Each lands in downloads/<artifact name>/, as a bare download did.
+      - name: Download the build archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: crystalline-*
           path: downloads
+
+      - name: Download the MCP bundles
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mcpb-bundles
+          path: downloads/mcpb-bundles
+
+      - name: Download the skill zips
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: skill-zips
+          path: downloads/skill-zips
+
+      - name: Download the SBOMs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sboms
+          path: downloads/sboms
 
       - name: Collect archives and generate checksums
         run: |
           set -euo pipefail
           mkdir -p release
-          # The step above downloads every artifact the run produced, and one of
-          # them is the fluid-dist bundle the build legs embed rather than
-          # anything a reader downloads. Its files carry none of the extensions
-          # below today, so the filter alone would do; the path exclusion is
-          # what keeps that true when the bundler starts emitting something new.
-          # The SBOMs (`*.cdx.json`) are release assets too, so they are listed in
+          # Positively the release artifacts the steps above downloaded, by
+          # folder, then by extension, so nothing else that lands under
+          # downloads/ (another run's artifact, a new bundler output) becomes
+          # a release asset. crystalline-macos-universal is a bare binary and
+          # falls out by extension; the bundle carries it. The SBOMs
+          # (`*.cdx.json`) are release assets too, so they are listed in
           # SHA256SUMS like everything else.
-          find downloads -type f -not -path 'downloads/fluid-dist/*' \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' -o -name '*.cdx.json' \) -exec cp {} release/ \;
+          find downloads -type f \( -path 'downloads/crystalline-*/*' -o -path 'downloads/mcpb-bundles/*' -o -path 'downloads/skill-zips/*' -o -path 'downloads/sboms/*' \) \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' -o -name '*.cdx.json' \) -exec cp {} release/ \;
           cd release
           sha256sum -- * > SHA256SUMS
           ls -la
