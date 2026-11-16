@@ -35,6 +35,15 @@ pub fn auth_write_lock(schema: Option<&str>) -> i64 {
     lock_key(schema, "auth-write")
 }
 
+/// How long a write transaction waits for the auth write lock before it
+/// fails, as Turso's busy timeout bounds its wait for the file lock.
+const AUTH_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '5s'";
+
+/// The server-side backstop for a transaction nobody finishes: the server
+/// ends a session that stays idle inside a transaction this long, which
+/// releases the auth write lock.
+const IDLE_IN_TRANSACTION_TIMEOUT: &str = "SET idle_in_transaction_session_timeout = '30s'";
+
 /// How often the orphan prune runs on Postgres after the one at open.
 pub(super) const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
@@ -68,7 +77,8 @@ pub(super) struct PgAuth {
 /// Whether `e` means the session is gone (or unusable), so the next call
 /// must connect again: an I/O, TLS or protocol failure, or a server error of
 /// the connection-exception (`08`) or operator-intervention (`57P`, which a
-/// `pg_terminate_backend` sends) classes.
+/// `pg_terminate_backend` sends) classes, or `25P03`, the end of a session
+/// left idle inside a transaction.
 fn is_connection_lost(e: &sqlx::Error) -> bool {
     match e {
         sqlx::Error::Io(_)
@@ -77,7 +87,7 @@ fn is_connection_lost(e: &sqlx::Error) -> bool {
         | sqlx::Error::WorkerCrashed => true,
         sqlx::Error::Database(db) => db
             .code()
-            .is_some_and(|c| c.starts_with("08") || c.starts_with("57P")),
+            .is_some_and(|c| c.starts_with("08") || c.starts_with("57P") || c == "25P03"),
         _ => false,
     }
 }
@@ -180,6 +190,22 @@ async fn ledger_version(conn: &mut PgConnection, schema: Option<&str>) -> Result
     Ok(version)
 }
 
+/// A new `auth` connection to `target`, with the idle-in-transaction
+/// backstop set for the session.
+async fn auth_session(target: &PgTarget, opts: &PgSessionOptions) -> Result<PgConnection> {
+    let mut conn = connect_one(target, PgRole::Auth, opts)
+        .await
+        .context("connecting to the accounts database")?;
+    if let Err(e) = sqlx::raw_sql(IDLE_IN_TRANSACTION_TIMEOUT)
+        .execute(&mut conn)
+        .await
+    {
+        let _ = conn.close().await;
+        return Err(anyhow::Error::from(e).context("setting up the accounts connection"));
+    }
+    Ok(conn)
+}
+
 impl PgAuth {
     /// Connect to `target` in the role `auth` and, with `migrate`, apply
     /// [`AUTH_MIGRATIONS`] under the migration lock. Without `migrate` the
@@ -191,9 +217,7 @@ impl PgAuth {
         migrate: bool,
     ) -> std::result::Result<PgAuth, AuthOpenError> {
         let schema = target.schema.clone();
-        let mut conn = connect_one(&target, PgRole::Auth, &opts)
-            .await
-            .context("connecting to the accounts database")?;
+        let mut conn = auth_session(&target, &opts).await?;
         let known = AUTH_MIGRATIONS.steps.last().map_or(0, |m| m.version);
         if migrate {
             let run = apply_locked_set(&mut conn, schema.as_deref(), &AUTH_MIGRATIONS).await;
@@ -245,16 +269,27 @@ impl PgAuth {
         done
     }
 
-    /// Whether the orphan prune is due (it never ran, or ran
-    /// [`PRUNE_EVERY`] ago), marking it as run now when it is.
+    /// Whether the orphan prune is due: it never ran, or ran
+    /// [`PRUNE_EVERY`] ago.
     pub(super) fn prune_due(&self) -> bool {
-        let mut at = self.pruned_at.lock().unwrap_or_else(|e| e.into_inner());
-        match *at {
-            Some(last) if last.elapsed() < PRUNE_EVERY => false,
-            _ => {
-                *at = Some(Instant::now());
-                true
-            }
+        let at = self.pruned_at.lock().unwrap_or_else(|e| e.into_inner());
+        !matches!(*at, Some(last) if last.elapsed() < PRUNE_EVERY)
+    }
+
+    /// Mark the orphan prune as run now, once its statements succeeded.
+    pub(super) fn prune_done(&self) {
+        *self.pruned_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// Roll back a transaction nobody is in any more. Called when the
+    /// store's in-process guard is taken: every transaction begins and
+    /// finishes under that guard, so one still open then was left by a
+    /// caller that was cancelled between `begin` and `finish`, and the
+    /// statements of the next caller must not run inside it.
+    pub(super) async fn reset_stale(&self) {
+        let mut st = self.state.lock().await;
+        if st.in_tx {
+            self.abandon(&mut st).await;
         }
     }
 
@@ -265,10 +300,7 @@ impl PgAuth {
             if st.in_tx {
                 bail!("the accounts database connection was lost inside a transaction");
             }
-            let conn = connect_one(&self.target, PgRole::Auth, &self.opts)
-                .await
-                .context("connecting to the accounts database")?;
-            st.conn = Some(conn);
+            st.conn = Some(auth_session(&self.target, &self.opts).await?);
         }
         Ok(st.conn.as_mut().expect("connected just above"))
     }
@@ -331,10 +363,13 @@ impl PgAuth {
         }
     }
 
-    /// `BEGIN`, then the schema's auth write lock for the rest of the
-    /// transaction. Read committed, so every statement after the lock sees
-    /// what the writer before it committed. A transaction a cancelled caller
-    /// left open is rolled back first; a begin that fails leaves none open.
+    /// `BEGIN ISOLATION LEVEL READ COMMITTED`, a 5 s lock timeout, then the
+    /// schema's auth write lock for the rest of the transaction. Read
+    /// committed whatever the server default is, so every statement after
+    /// the lock sees what the writer before it committed. The transaction
+    /// counts as open from before `BEGIN` is sent, so a caller cancelled
+    /// inside this call leaves one the next guard rolls back. A begin that
+    /// fails leaves none open.
     pub(super) async fn begin(&self) -> Result<()> {
         #[cfg(test)]
         self.begins
@@ -343,9 +378,17 @@ impl PgAuth {
         if st.in_tx {
             self.abandon(&mut st).await;
         }
-        self.control(&mut st, "BEGIN").await?;
+        // Connect while no transaction is open: once it is, a missing
+        // connection is a lost one.
+        self.connection(&mut st).await?;
         st.in_tx = true;
         st.failed = false;
+        for step in ["BEGIN ISOLATION LEVEL READ COMMITTED", AUTH_LOCK_TIMEOUT] {
+            if let Err(e) = self.control(&mut st, step).await {
+                self.abandon(&mut st).await;
+                return Err(e);
+            }
+        }
         let conn = match self.connection(&mut st).await {
             Ok(conn) => conn,
             Err(e) => {

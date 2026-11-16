@@ -76,13 +76,30 @@ impl AuthDb {
         }
     }
 
-    /// Whether the Postgres orphan prune is due, marking it as run when it
-    /// is. Never on Turso, which prunes on every lookup.
+    /// Whether the Postgres orphan prune is due. Never on Turso, which
+    /// prunes on every lookup.
     pub(super) fn prune_due(&self) -> bool {
         match self {
             AuthDb::Turso { .. } => false,
             #[cfg(feature = "postgres")]
             AuthDb::Postgres(pg) => pg.prune_due(),
+        }
+    }
+
+    /// Mark the Postgres orphan prune as run, once it succeeded.
+    pub(super) fn prune_done(&self) {
+        #[cfg(feature = "postgres")]
+        if let AuthDb::Postgres(pg) = self {
+            pg.prune_done();
+        }
+    }
+
+    /// Roll back a Postgres transaction a cancelled caller left open. The
+    /// caller has just taken the store's guard. Nothing on Turso.
+    pub(super) async fn reset_stale_transaction(&self) {
+        #[cfg(feature = "postgres")]
+        if let AuthDb::Postgres(pg) = self {
+            Box::pin(pg.reset_stale()).await;
         }
     }
 

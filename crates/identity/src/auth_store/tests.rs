@@ -6881,6 +6881,73 @@ mod postgres {
             .unwrap();
     }
 
+    /// A transaction a cancelled caller left open is rolled back when the
+    /// store's next call takes the guard: that call's statements do not run
+    /// inside it (a logout is not undone later), and the write lock is free
+    /// for another store at once.
+    #[tokio::test]
+    async fn a_cancelled_transaction_is_rolled_back_before_the_next_call() {
+        let Some(url) = pg_url() else { return };
+        let (a, guard) = pg_test_store(&url, "stl").await;
+        let b = guard.second().await;
+        a.add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let session = a.create_session("ada", 3600).await.unwrap();
+        // Begun and never finished, as by a handler dropped in between.
+        a.db.begin_immediate().await.unwrap();
+        a.delete_session(&session.token).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), b.db.begin_immediate())
+            .await
+            .expect("the write lock was released with the stale transaction")
+            .unwrap();
+        b.db.finish(Ok(())).await.unwrap();
+        a.add_user("bob", "Bob", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        assert!(a.session_user(&session.token).await.unwrap().is_none());
+        assert!(b.session_user(&session.token).await.unwrap().is_none());
+
+        // Cancelled inside `begin` itself, while it waits for the lock.
+        b.db.begin_immediate().await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            a.add_user("carl", "Carl", None, Role::Viewer, "pw12345678"),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the add waited for the lock");
+        b.db.finish(Ok(())).await.unwrap();
+        let again = a.create_session("ada", 3600).await.unwrap();
+        a.delete_session(&again.token).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), b.db.begin_immediate())
+            .await
+            .expect("no transaction of the cancelled add holds the lock")
+            .unwrap();
+        b.db.finish(Ok(())).await.unwrap();
+        assert!(b.session_user(&again.token).await.unwrap().is_none());
+        assert!(b.user("carl").await.unwrap().is_none());
+    }
+
+    /// A writer waits at most about 5 s for a write lock another store holds,
+    /// then fails, as Turso's busy timeout bounds its wait.
+    #[tokio::test]
+    async fn a_held_write_lock_times_out() {
+        let Some(url) = pg_url() else { return };
+        let (a, guard) = pg_test_store(&url, "lto").await;
+        let b = guard.second().await;
+        a.db.begin_immediate().await.unwrap();
+        let started = std::time::Instant::now();
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_secs(10), b.db.begin_immediate())
+                .await
+                .expect("the lock wait is bounded");
+        assert!(waited.is_err(), "the lock was held");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+        a.db.finish(Ok(())).await.unwrap();
+        b.db.begin_immediate().await.unwrap();
+        b.db.finish(Ok(())).await.unwrap();
+    }
+
     /// A lost connection is replaced on the next statement, but never inside
     /// a transaction: that one fails and stays failed until it is finished.
     #[tokio::test]

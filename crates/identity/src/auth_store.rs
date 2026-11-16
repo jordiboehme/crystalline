@@ -1407,6 +1407,11 @@ CREATE TABLE IF NOT EXISTS domain_reflection_grant (
 CREATE TABLE IF NOT EXISTS github_delivery (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
 ";
 
+/// The error [`AuthStore::register_oauth_client_within`] fails with when it
+/// cannot count the stored registrations, so a caller can tell a failed
+/// count from a failed insert.
+pub const OAUTH_CLIENTS_UNCOUNTED: &str = "the oauth client registrations could not be counted";
+
 /// How long a GitHub webhook delivery id is remembered, one day in seconds:
 /// a replay inside it does no work (see [`AuthStore::remember_delivery`]).
 pub const DELIVERY_KEPT_SECS: i64 = 86_400;
@@ -1828,7 +1833,7 @@ impl AuthStore {
             guard: tokio::sync::Mutex::new(()),
         };
         {
-            let _guard = store.guard.lock().await;
+            let _guard = store.lock().await;
             store.prune_orphans_if_due().await?;
         }
         Ok(store)
@@ -1857,7 +1862,7 @@ impl AuthStore {
     /// One `BEGIN IMMEDIATE`, because the daemon and the CLI open this file
     /// concurrently and only one of them may move a grant.
     async fn move_oauth_tokens(&self) -> Result<()> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -1957,7 +1962,7 @@ impl AuthStore {
         let name = normalize_new_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         // On Postgres the insert takes the write lock, so it cannot slip past
         // `add_first_admin`'s empty-table check, and it sweeps the name's
         // orphans first. Turso's single writer needs neither.
@@ -2003,7 +2008,7 @@ impl AuthStore {
     /// How many accounts exist. Zero is what opens the first-run setup path,
     /// and it is what `GET /auth/me` reports as `needs_setup`.
     pub async fn user_count(&self) -> Result<usize> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(
             match self
                 .db
@@ -2038,7 +2043,7 @@ impl AuthStore {
         let name = normalize_new_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2098,7 +2103,7 @@ impl AuthStore {
         };
         // Scoped so the lock is released before the argon2 verify below.
         let row = {
-            let _guard = self.guard.lock().await;
+            let _guard = self.lock().await;
             self.db
                 .query_first(
                     &format!("SELECT {USER_COLUMNS}, pass_hash FROM users WHERE name = ?1"),
@@ -2146,7 +2151,7 @@ impl AuthStore {
         let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2193,7 +2198,7 @@ impl AuthStore {
     /// on the machine that holds this file.
     pub async fn set_role_force(&self, name: &str, role: Role) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -2223,7 +2228,7 @@ impl AuthStore {
             .filter(|d| !d.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| name.clone());
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -2255,7 +2260,7 @@ impl AuthStore {
     /// refused disabling rolls back, sessions included.
     pub async fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2326,7 +2331,7 @@ impl AuthStore {
     pub async fn remove_user(&self, name: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2376,7 +2381,7 @@ impl AuthStore {
     pub async fn remove_user_force(&self, name: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2417,7 +2422,7 @@ impl AuthStore {
     /// ghsot --list` must say "no such user" rather than "holds no tokens".
     pub async fn user(&self, name: &str) -> Result<Option<User>> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
             .db
             .query_first(
@@ -2432,7 +2437,7 @@ impl AuthStore {
     /// wanting `desired` right now.
     pub async fn free_name_from(&self, desired: &str) -> Result<String> {
         let base = normalize_new_account_name(desired)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.free_account_name(&base).await
     }
 
@@ -2442,7 +2447,7 @@ impl AuthStore {
     /// writes, whether the name still holds that account.
     pub async fn account_born(&self, name: &str) -> Result<Option<String>> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
             .db
             .query_first(
@@ -2456,7 +2461,7 @@ impl AuthStore {
     /// Every account, by name. Names sort byte-wise, which is the ordering
     /// contract the rest of the workspace's text columns use.
     pub async fn list_users(&self) -> Result<Vec<User>> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -2476,7 +2481,7 @@ impl AuthStore {
     /// or one a trusted header or a sign-on provisioned), so `users list` can
     /// say so. Kept apart from [`User`], which crosses the REST API.
     pub async fn passwordless_users(&self) -> Result<std::collections::HashSet<String>> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query("SELECT name FROM users WHERE pass_hash IS NULL", vec![])
@@ -2529,7 +2534,7 @@ impl AuthStore {
     ) -> Result<(User, bool)> {
         let display = name.trim().to_string();
         let name = normalize_new_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2616,7 +2621,7 @@ impl AuthStore {
     pub async fn linked_user(&self, issuer: &str, subject: &str) -> Result<Option<User>> {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         if self.db.is_postgres() {
             self.prune_orphans_if_due().await?;
         } else {
@@ -2659,7 +2664,7 @@ impl AuthStore {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2705,7 +2710,7 @@ impl AuthStore {
     async fn unlink(&self, issuer: &str, user: &str, force: bool) -> Result<bool> {
         let issuer = identity_value(issuer, "issuer")?;
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2745,14 +2750,14 @@ impl AuthStore {
     /// already holds, and about whether unlinking would strand it.
     pub async fn has_password(&self, name: &str) -> Result<bool> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.password_present(&name).await
     }
 
     /// Every identity linked to one account, by issuer.
     pub async fn identity_links(&self, user: &str) -> Result<Vec<IdentityLink>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -2817,7 +2822,7 @@ impl AuthStore {
         let account = normalize_account_name(account)?;
         let host = normalize_github_host(host)?;
         let id = i64::try_from(github_id).context("a GitHub id out of range")?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -2896,7 +2901,7 @@ impl AuthStore {
     /// The GitHub link of one account, if it has one.
     pub async fn github_link_of(&self, account: &str) -> Result<Option<GithubLink>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
             .db
             .query_first(
@@ -2913,7 +2918,7 @@ impl AuthStore {
         let Ok(id) = i64::try_from(github_id) else {
             return Ok(None);
         };
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
             .db
             .query_first(
@@ -2926,7 +2931,7 @@ impl AuthStore {
 
     /// Every GitHub link, by account.
     pub async fn github_links(&self) -> Result<Vec<GithubLink>> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -2946,7 +2951,7 @@ impl AuthStore {
     /// GitHub. False when the account has no link.
     pub async fn set_github_login(&self, account: &str, login: &str) -> Result<bool> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -2962,7 +2967,7 @@ impl AuthStore {
     /// the account has no link.
     pub async fn mark_github_token_gone(&self, account: &str) -> Result<bool> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -2977,7 +2982,7 @@ impl AuthStore {
     /// Remove an account's GitHub link. True when there was one.
     pub async fn unlink_github(&self, account: &str) -> Result<bool> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -3004,7 +3009,7 @@ impl AuthStore {
     /// older than that counts as new. The id is GitHub's
     /// `X-GitHub-Delivery`, stored as given.
     pub async fn remember_delivery_at(&self, id: &str, now: i64) -> Result<bool> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -3035,7 +3040,7 @@ impl AuthStore {
     /// Forget the GitHub webhook delivery `id`, so a redelivery of it is
     /// handled: called when handling it failed.
     pub async fn forget_delivery(&self, id: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .execute(
                 "DELETE FROM github_delivery WHERE id = ?1",
@@ -3083,7 +3088,7 @@ impl AuthStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -3162,7 +3167,7 @@ impl AuthStore {
             Some(value) => Value::Text(value.to_string()),
             None => Value::Null,
         };
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -3200,7 +3205,7 @@ impl AuthStore {
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl_secs);
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -3263,7 +3268,7 @@ impl AuthStore {
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = now.saturating_add(ttl_secs);
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -3336,7 +3341,7 @@ impl AuthStore {
     pub async fn newest_session_csrf(&self, name: &str) -> Result<Option<String>> {
         let name = normalize_account_name(name)?;
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.live_csrf(&name, now).await
     }
 
@@ -3350,7 +3355,7 @@ impl AuthStore {
     /// the request.
     pub async fn session_owner(&self, token: &str) -> Result<Option<String>> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
             .db
             .query_first(
@@ -3374,7 +3379,7 @@ impl AuthStore {
     /// store's writes.
     pub async fn session_user_quiet(&self, token: &str) -> Result<Option<User>> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(self
             .db
             .query_first(
@@ -3394,7 +3399,7 @@ impl AuthStore {
     /// what pins the reuse invariant in tests: a probe that minted per call
     /// would show here as a growing count.
     pub async fn session_count(&self) -> Result<usize> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         Ok(
             match self
                 .db
@@ -3445,7 +3450,7 @@ impl AuthStore {
     /// dormant.
     pub async fn session_user(&self, token: &str) -> Result<Option<(User, String)>> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         if self.db.is_postgres() {
             self.prune_orphans_if_due().await?;
         } else {
@@ -3489,7 +3494,7 @@ impl AuthStore {
     /// `name` is an account name a row already carries, so it is stamped as
     /// given: a name that is nobody stamps nothing, which is not an error.
     pub async fn mark_seen(&self, name: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.stamp_seen(name).await
     }
 
@@ -3582,7 +3587,18 @@ impl AuthStore {
             .execute(PRUNE_OAUTH_GRANTS, vec![])
             .await
             .context("pruning orphaned oauth grants")?;
+        self.db.prune_done();
         Ok(())
+    }
+
+    /// Take the in-process guard every method runs under. On Postgres a
+    /// transaction still open at this point was left by a cancelled caller
+    /// (every transaction begins and finishes under the guard), so it is
+    /// rolled back before this caller's statements run.
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        let guard = self.guard.lock().await;
+        self.db.reset_stale_transaction().await;
+        guard
     }
 
     /// On Postgres, drop the credentials an account of `name` left behind
@@ -3606,7 +3622,7 @@ impl AuthStore {
     /// out twice, or with a stale cookie, is a normal thing for a browser to
     /// do.
     pub async fn delete_session(&self, token: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .execute(
                 "DELETE FROM sessions WHERE token_hash = ?1",
@@ -3678,7 +3694,7 @@ impl AuthStore {
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -3796,7 +3812,7 @@ impl AuthStore {
         let name = normalize_new_account_name(name)?;
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -3849,7 +3865,7 @@ impl AuthStore {
     /// existed or reached by any other path.
     pub async fn mcp_token_user(&self, token: &str) -> Result<Option<User>> {
         let hash = token_hash(token);
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         if self.db.is_postgres() {
             self.prune_orphans_if_due().await?;
         } else {
@@ -3889,7 +3905,7 @@ impl AuthStore {
     /// keyed on a login name.
     pub async fn list_mcp_tokens(&self, user: &str) -> Result<Vec<McpTokenInfo>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -3920,7 +3936,7 @@ impl AuthStore {
     /// account's token ids.
     pub async fn revoke_mcp_token(&self, user: &str, id: i64) -> Result<bool> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -3941,7 +3957,7 @@ impl AuthStore {
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -4007,7 +4023,7 @@ impl AuthStore {
         let token = format!("{DRAFT_LINK_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let id = self
             .returned_id(
                 "INSERT INTO overlay_grant
@@ -4055,7 +4071,7 @@ impl AuthStore {
     ) -> Result<Option<OverlayGrant>> {
         let account = normalize_account_name(account)?;
         let hash = token_hash(token);
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -4113,7 +4129,7 @@ impl AuthStore {
         path: &str,
     ) -> Result<Vec<OverlayGrant>> {
         let owner = normalize_account_name(owner)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -4173,7 +4189,7 @@ impl AuthStore {
     ) -> Result<Option<OverlayGrant>> {
         let owner = normalize_account_name(owner)?;
         let revoked_at = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         // One predicate and one parameter list, built once and used by both
         // statements: an admin ends any link on the instance, everybody else
         // exactly their own. Read and then stamp, both under the one guard and
@@ -4235,7 +4251,7 @@ impl AuthStore {
         path: &str,
     ) -> Result<Option<String>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -4272,7 +4288,7 @@ impl AuthStore {
     /// screen come before the irreversible half.
     pub async fn overlay_grant_domain(&self, token: &str) -> Result<Option<String>> {
         let hash = token_hash(token);
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let row = self
             .db
             .query_first(
@@ -4303,7 +4319,7 @@ impl AuthStore {
         domain: &str,
     ) -> Result<Vec<OverlayGrant>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -4338,7 +4354,7 @@ impl AuthStore {
     /// one back, handed to somebody neither of them would have told.
     pub async fn end_overlay_grants(&self, domain: &str, owner: &str, path: &str) -> Result<u64> {
         let owner = normalize_account_name(owner)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -4361,7 +4377,7 @@ impl AuthStore {
     /// drafts at that path.
     pub async fn end_overlay_grants_of_owner(&self, owner: &str) -> Result<u64> {
         let owner = normalize_account_name(owner)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -4385,7 +4401,7 @@ impl AuthStore {
     /// is [`AuthStore::end_overlay_grants`] above. Answers how many were
     /// standing.
     pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -4452,7 +4468,7 @@ impl AuthStore {
         };
         let encoded = serde_json::to_string(&client.redirect_uris)
             .context("encoding an oauth client's redirect uris")?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -4466,7 +4482,7 @@ impl AuthStore {
                     .map(|row| row.get_value(0))
                 {
                     Some(Ok(Value::Integer(n))) => n as usize,
-                    _ => bail!("the oauth client registrations could not be counted"),
+                    _ => bail!(OAUTH_CLIENTS_UNCOUNTED),
                 };
                 if held >= cap {
                     return Ok(false);
@@ -4500,7 +4516,7 @@ impl AuthStore {
     /// One registration by id, or `None` when there is none - which is what an
     /// unknown `client_id` at the authorize or token endpoint looks like.
     pub async fn oauth_client(&self, client_id: &str) -> Result<Option<OauthClient>> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.oauth_client_row(client_id).await
     }
 
@@ -4549,7 +4565,7 @@ impl AuthStore {
     /// error: the caller has already refused the request it was stamping for,
     /// and a second failure mode here would tell it nothing new.
     pub async fn touch_oauth_client(&self, client_id: &str) -> Result<()> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .execute(
                 "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
@@ -4580,7 +4596,7 @@ impl AuthStore {
     /// Expiry is the statement's comparison, like every other one here.
     pub async fn prune_oauth_grants(&self) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .execute(
                 "DELETE FROM oauth_grant_token WHERE grant_id IN
@@ -4663,7 +4679,7 @@ impl AuthStore {
         let idle_cutoff = (now - chrono::Duration::seconds(OAUTH_CLIENT_UNUSED_SECS)).to_rfc3339();
         let unauthorized_cutoff =
             (now - chrono::Duration::seconds(OAUTH_CLIENT_UNAUTHORIZED_SECS)).to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let removed = self
             .db
             .execute(
@@ -4688,7 +4704,7 @@ impl AuthStore {
     /// in the transaction of the insert; nothing reports this number on a
     /// settings surface.
     pub async fn count_oauth_clients(&self) -> Result<usize> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         // A count this method cannot read fails the call rather than reading
         // as an empty table, as the cap's own count does: a zero there would
         // admit the very row the ceiling exists to refuse.
@@ -4735,7 +4751,7 @@ impl AuthStore {
         let now = chrono::Utc::now();
         let issued_at = now.timestamp();
         let created_at = now.to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -4957,7 +4973,7 @@ impl AuthStore {
     ) -> Result<RefreshOutcome> {
         let presented = token_hash(refresh_token);
         let pair = TokenPair::new();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -5297,7 +5313,7 @@ impl AuthStore {
             return Ok(None);
         }
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         if self.db.is_postgres() {
             self.prune_orphans_if_due().await?;
         } else {
@@ -5353,7 +5369,7 @@ impl AuthStore {
     /// [`AuthStore::list_ended_oauth_grants`].
     pub async fn list_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -5417,7 +5433,7 @@ impl AuthStore {
         now: i64,
     ) -> Result<Vec<OauthGrantInfo>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -5473,7 +5489,7 @@ impl AuthStore {
     pub async fn revoke_oauth_grant(&self, user: &str, id: i64) -> Result<bool> {
         let user = normalize_account_name(user)?;
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -5517,7 +5533,7 @@ impl AuthStore {
     pub async fn revoke_oauth_grant_by_token(&self, token: &str, client_id: &str) -> Result<bool> {
         let hash = token_hash(token);
         let now = chrono::Utc::now().timestamp();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -5650,7 +5666,7 @@ impl AuthStore {
     /// answers for the same string the engine keys its domain map on.
     pub async fn domain_visibility(&self, domain: &str) -> Result<Option<DomainAcl>> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.acl_of(&domain).await
     }
 
@@ -5753,7 +5769,7 @@ impl AuthStore {
     /// was a row.
     pub async fn take_back_governed_private(&self, domain: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let had = self.acl_of(&domain).await?.is_some();
         self.db
             .execute(
@@ -5778,7 +5794,7 @@ impl AuthStore {
         let domain = normalize_domain(domain)?;
         let owner = normalize_account_name(owner)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -5864,7 +5880,7 @@ impl AuthStore {
     /// until a domain of that name exists again.
     pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -5919,7 +5935,7 @@ impl AuthStore {
         if old == new {
             return Ok(());
         }
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let context = || format!("moving the records of domain '{old}' to '{new}'");
         self.db.begin_immediate().await.with_context(context)?;
         let names = vec![Value::Text(old.clone()), Value::Text(new.clone())];
@@ -6035,7 +6051,7 @@ impl AuthStore {
         let domain = normalize_domain(domain)?;
         let new_owner = normalize_account_name(new_owner)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -6082,7 +6098,7 @@ impl AuthStore {
     /// from [`AuthStore::domain_visibility`].
     pub async fn domain_members(&self, domain: &str) -> Result<Vec<DomainMember>> {
         let domain = normalize_domain(domain)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -6147,7 +6163,7 @@ impl AuthStore {
             bail!("recording a membership needs an actor to record it as");
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -6227,7 +6243,7 @@ impl AuthStore {
     pub async fn remove_domain_member(&self, domain: &str, principal: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
         let principal = normalize_account_name(principal)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -6248,7 +6264,7 @@ impl AuthStore {
     /// clears it back to "as knowledge".
     pub async fn set_reflection_level(&self, name: &str, level: ReflectionLevel) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -6272,7 +6288,7 @@ impl AuthStore {
     ) -> Result<ReflectionLevel> {
         let domain = normalize_domain(domain)?;
         let principal = normalize_account_name(principal)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.member_reflection_in_tx(&domain, &principal).await
     }
 
@@ -6345,7 +6361,7 @@ impl AuthStore {
         }
         let now = chrono::Utc::now().to_rfc3339();
         let context = || format!("giving '{account}' the Reflection of domain '{domain}'");
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db.begin_immediate().await.with_context(context)?;
         let result = async {
             self.require_live_user(&account).await?;
@@ -6381,7 +6397,7 @@ impl AuthStore {
     pub async fn remove_reflection_grant(&self, domain: &str, account: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let changed = self
             .db
             .execute(
@@ -6399,7 +6415,7 @@ impl AuthStore {
     pub async fn reflection_grants(&self, domain: &str) -> Result<Vec<ReflectionGrant>> {
         let domain = normalize_domain(domain)?;
         let context = || format!("listing the Reflection collaborators of domain '{domain}'");
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -6439,7 +6455,7 @@ impl AuthStore {
     ) -> Result<Option<ReflectionLevel>> {
         let domain = normalize_domain(domain)?;
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let row = self
             .db
             .query_first(
@@ -6459,7 +6475,7 @@ impl AuthStore {
     /// visibility filter: a domain absent from this list is visible to
     /// everyone who may reach the instance at all.
     pub async fn private_domains(&self) -> Result<Vec<DomainAcl>> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -6498,7 +6514,7 @@ impl AuthStore {
     /// reads ownership from the acl rows it already has.
     pub async fn memberships_of(&self, user: &str) -> Result<Vec<(String, MemberLevel)>> {
         let user = normalize_account_name(user)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let rows = self
             .db
             .query(
@@ -6533,7 +6549,7 @@ impl AuthStore {
     /// A list only lowers rights; [`crate::scope::DomainAccess`] applies it.
     pub async fn write_list(&self, account: &str) -> Result<Option<Vec<String>>> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.write_list_of(&account).await
     }
 
@@ -6557,7 +6573,7 @@ impl AuthStore {
                 "a write list needs at least one entry; to remove the list of '{account}', clear it"
             );
         }
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -6585,7 +6601,7 @@ impl AuthStore {
     /// list is fine.
     pub async fn clear_write_list(&self, account: &str) -> Result<()> {
         let account = normalize_account_name(account)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         self.db
             .begin_immediate()
             .await
@@ -6975,7 +6991,7 @@ impl AuthStore {
     /// still there, where Turso's single writer decides them one at a time.
     async fn update_guarded(&self, sql: &str, name: &str, value: Value, verb: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let _guard = self.guard.lock().await;
+        let _guard = self.lock().await;
         let pg = self.db.is_postgres();
         if pg {
             self.db
@@ -7166,9 +7182,6 @@ fn decode_redirect_uris(encoded: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A unix timestamp column as the RFC 3339 string a person reads. The expiry
-/// columns are integers so every comparison happens in SQL; this is the one
-/// place that turns one back into text, on the way out to a management screen.
 /// The stamp older than which Postgres writes `last_seen_at` or
 /// `last_used` again: [`STAMP_THRESHOLD_SECS`] before `now`, in the same
 /// RFC 3339 UTC form the stamps are written in, so the text comparison is a
@@ -7177,6 +7190,9 @@ fn stamp_cutoff(now: chrono::DateTime<chrono::Utc>) -> String {
     (now - chrono::Duration::seconds(STAMP_THRESHOLD_SECS)).to_rfc3339()
 }
 
+/// A unix timestamp column as the RFC 3339 string a person reads. The expiry
+/// columns are integers so every comparison happens in SQL; this is the one
+/// place that turns one back into text, on the way out to a management screen.
 fn rfc3339_from_unix(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|when| when.to_rfc3339())

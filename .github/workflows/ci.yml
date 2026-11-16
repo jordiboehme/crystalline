@@ -439,7 +439,10 @@ jobs:
         if: ${{ matrix.os == 'ubuntu-latest' && needs.changes.outputs.tested != 'true' }}
         env:
           CRYSTALLINE_TEST_AUTH_BACKEND: postgres
-        run: cargo nextest run --workspace --profile ci --locked -E 'package(crystalline-identity)'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo nextest run --workspace --profile ci --locked -E 'package(crystalline-identity)' 2>&1 | tee -a "$RUNNER_TEMP/nextest.log"
 
       # A test that passed on its retry is FLAKY in the log. Show each as a
       # warning on the run; the job stays green.

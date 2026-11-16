@@ -1602,7 +1602,17 @@ async fn registered(
             Some(MAX_OAUTH_CLIENTS),
         )
         .await
-        .map_err(|error| store_unavailable("storing the registration", &error))?
+        .map_err(|error| {
+            let counting = error.chain().any(|e| {
+                e.to_string() == crystalline_identity::auth_store::OAUTH_CLIENTS_UNCOUNTED
+            });
+            let what = if counting {
+                "counting the registrations"
+            } else {
+                "storing the registration"
+            };
+            store_unavailable(what, &error)
+        })?
         .ok_or_else(OauthError::no_room)?;
     // Never the name or the uris: both are attacker-chosen text, and the id is
     // what every later line about this client is keyed on anyway.
