@@ -20,12 +20,21 @@
 //! except the `standby` and `probe` roles. Sessions tagged `none` count as
 //! predecessors, because they are unfenced writers.
 //!
+//! The owner thread also serves the side channel ([`SideChannel`]): a second
+//! connection, in the `side` role and fenced like the pool, on which the
+//! active owner loads and saves the configuration document
+//! (`instance_config`). It runs as its own task on the owner runtime, so a
+//! slow side statement never holds up a probe. The side channel never
+//! migrates; the owner migrates when it opens the store, before the first
+//! side call.
+//!
 //! The timing constants are the shipped values; [`OwnerTimings`] scales them
 //! down by [`timing_scale`] for tests and derives the fence detection bound
 //! and the grace from them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -77,6 +86,15 @@ pub const LOCK_STATEMENT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long `pg_terminate_backend` waits for each predecessor session to be
 /// gone, in milliseconds.
 pub const TERMINATE_WAIT_MS: i64 = 5000;
+
+/// The side channel's `statement_timeout`, set at connect. Not scaled.
+pub const SIDE_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the caller of a blocking side-channel call waits past its own
+/// timeout for the owner thread's answer. The owner thread gives up the
+/// request at the timeout itself, so within this margin the caller learns
+/// what happened instead of guessing.
+const SIDE_REPLY_MARGIN: Duration = Duration::from_millis(500);
 
 /// The test-only divisor of the timings, honored in debug builds only.
 pub const TIMING_SCALE_ENV: &str = "CRYSTALLINE_TEST_OWNER_TIMING_SCALE";
@@ -163,6 +181,11 @@ pub(crate) fn lock_session_settings(t: &OwnerTimings) -> [(&'static str, String)
         ("idle_session_timeout", pg_duration(t.lock_idle_timeout)),
         ("statement_timeout", pg_duration(t.lock_statement_timeout)),
     ]
+}
+
+/// The side channel's `statement_timeout` as a startup option.
+pub(crate) fn side_session_setting() -> (&'static str, String) {
+    ("statement_timeout", pg_duration(SIDE_STATEMENT_TIMEOUT))
 }
 
 /// What one probe of the lock found.
@@ -363,13 +386,23 @@ fn terminate_refused(database: &str) -> IndexError {
     ))
 }
 
-/// The `instance_owner` table of `schema`, qualified so a missing table in
+/// The instance table `name` of `schema`, qualified so a missing table in
 /// the schema never resolves to one in `public`.
-fn owner_table(schema: Option<&str>) -> String {
+fn instance_table(schema: Option<&str>, name: &str) -> String {
     match schema {
-        Some(s) => format!("{}.instance_owner", super::quote_ident(s)),
-        None => "instance_owner".to_string(),
+        Some(s) => format!("{}.{name}", super::quote_ident(s)),
+        None => name.to_string(),
     }
+}
+
+/// The `instance_owner` table of `schema`.
+fn owner_table(schema: Option<&str>) -> String {
+    instance_table(schema, "instance_owner")
+}
+
+/// The `instance_config` table of `schema`.
+fn config_table(schema: Option<&str>) -> String {
+    instance_table(schema, "instance_config")
 }
 
 /// Whether `table` exists. Never creates anything.
@@ -384,7 +417,7 @@ async fn table_exists(conn: &mut PgConnection, table: &str) -> Result<bool> {
 /// The microseconds since the epoch as a time.
 fn from_micros(us: i64) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp_micros(us)
-        .ok_or_else(|| IndexError::Db(format!("an owner row time is out of range: {us}")))
+        .ok_or_else(|| IndexError::Db(format!("a stored time is out of range: {us}")))
 }
 
 /// The owner row from `table`, when the table exists and has it.
@@ -495,6 +528,293 @@ pub async fn read_owner_row(target: &PgTarget) -> Result<Option<OwnerRow>> {
     row
 }
 
+/// The configuration document: the instance's settings and domain registry,
+/// one row of `instance_config`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigDoc {
+    /// The document itself.
+    pub body: serde_json::Value,
+    /// When it was last saved.
+    pub updated_at: DateTime<Utc>,
+    /// Who saved it last.
+    pub updated_by: String,
+}
+
+/// The configuration document from `table`, when the table exists and has
+/// it. Never creates anything.
+async fn read_config(conn: &mut PgConnection, table: &str) -> Result<Option<ConfigDoc>> {
+    if !table_exists(conn, table).await? {
+        return Ok(None);
+    }
+    let sql = format!(
+        "SELECT body::text, (EXTRACT(EPOCH FROM updated_at) * 1000000)::int8, updated_by \
+         FROM {table} WHERE id = 1"
+    );
+    let raw: Option<(String, i64, String)> = sqlx::query_as(AssertSqlSafe(sql))
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some((body, updated_at, updated_by)) = raw else {
+        return Ok(None);
+    };
+    Ok(Some(ConfigDoc {
+        body: serde_json::from_str(&body)?,
+        updated_at: from_micros(updated_at)?,
+        updated_by,
+    }))
+}
+
+/// Replace the configuration document in `table` with `body` (JSON text),
+/// saved by `by`. One explicit transaction: a caller that gives up before
+/// the commit leaves nothing written.
+async fn write_config(conn: &mut PgConnection, table: &str, body: &str, by: &str) -> Result<()> {
+    let sql = format!(
+        "INSERT INTO {table} (id, body, updated_at, updated_by) \
+         VALUES (1, $1::jsonb, now(), $2) \
+         ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, \
+         updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by"
+    );
+    let mut tx = conn.begin().await?;
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(body)
+        .bind(by)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The configuration document of `target`, read on a `probe` connection
+/// without the lock, for a view that runs without the active instance.
+/// `None` when the table or the row does not exist.
+pub async fn read_config_document(target: &PgTarget) -> Result<Option<ConfigDoc>> {
+    let mut conn = connect_one(target, PgRole::Probe, &PgSessionOptions::default()).await?;
+    let doc = read_config(&mut conn, &config_table(target.schema.as_deref())).await;
+    let _ = conn.close().await;
+    doc
+}
+
+/// Where the side task sends its answer: a std channel for a blocking
+/// caller, which may sit inside any runtime, or a oneshot for an async one.
+enum SideReply<T> {
+    Blocking(std::sync::mpsc::SyncSender<Result<T>>),
+    Async(oneshot::Sender<Result<T>>),
+}
+
+impl<T> SideReply<T> {
+    fn send(self, answer: Result<T>) {
+        match self {
+            SideReply::Blocking(tx) => {
+                let _ = tx.try_send(answer);
+            }
+            SideReply::Async(tx) => {
+                let _ = tx.send(answer);
+            }
+        }
+    }
+}
+
+/// What a side-channel request asks for.
+enum SideOp {
+    /// Read the configuration document.
+    Load { reply: SideReply<Option<ConfigDoc>> },
+    /// Replace the configuration document.
+    Save {
+        body: String,
+        by: String,
+        reply: SideReply<()>,
+    },
+}
+
+/// A side-channel request and the moment its caller stops waiting.
+struct SideRequest {
+    deadline: Instant,
+    op: SideOp,
+}
+
+/// `timeout` from now, or a day from now when that overflows.
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400))
+}
+
+/// The error of a side-channel request that ran out of time.
+fn side_timed_out() -> IndexError {
+    IndexError::Db("the database did not answer the side channel in time".to_string())
+}
+
+/// The active owner's way to the configuration document, served on the owner
+/// thread by a second connection in the `side` role: fenced, tagged with the
+/// instance and with a 5 s `statement_timeout`
+/// ([`SIDE_STATEMENT_TIMEOUT`]). It answers only while the owner holds the
+/// lock; the connection is dropped when the lock is released or lost and
+/// after any failed or timed-out request.
+///
+/// The handle is `Clone` and `Send`. The blocking calls work from any thread
+/// and inside any runtime, except on the owner thread itself: there they
+/// return an error at once, because the owner thread would wait for its own
+/// answer forever. The owner thread never calls the side channel.
+///
+/// The side channel never migrates: the table comes from the owner's
+/// migrations, which run before its first call.
+#[derive(Clone)]
+pub struct SideChannel {
+    requests: mpsc::UnboundedSender<SideRequest>,
+    owner_thread: ThreadId,
+}
+
+impl SideChannel {
+    /// Send `op` and wait at most `timeout` (plus a short margin for the
+    /// owner thread's verdict) on this thread.
+    fn blocking<T>(
+        &self,
+        timeout: Duration,
+        make: impl FnOnce(SideReply<T>) -> SideOp,
+    ) -> Result<T> {
+        if std::thread::current().id() == self.owner_thread {
+            return Err(IndexError::Invalid(
+                "side channel called from the owner thread".to_string(),
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let request = SideRequest {
+            deadline: deadline_after(timeout),
+            op: make(SideReply::Blocking(tx)),
+        };
+        self.requests.send(request).map_err(|_| thread_gone())?;
+        match rx.recv_timeout(timeout.saturating_add(SIDE_REPLY_MARGIN)) {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(side_timed_out()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(thread_gone()),
+        }
+    }
+
+    /// The configuration document, waiting at most `timeout` on this thread.
+    /// `None` when there is none yet.
+    pub fn load_config_blocking(&self, timeout: Duration) -> Result<Option<ConfigDoc>> {
+        self.blocking(timeout, |reply| SideOp::Load { reply })
+    }
+
+    /// The configuration document, bounded by [`SIDE_STATEMENT_TIMEOUT`].
+    /// `None` when there is none yet.
+    pub async fn load_config(&self) -> Result<Option<ConfigDoc>> {
+        let (tx, rx) = oneshot::channel();
+        let request = SideRequest {
+            deadline: deadline_after(SIDE_STATEMENT_TIMEOUT),
+            op: SideOp::Load {
+                reply: SideReply::Async(tx),
+            },
+        };
+        self.requests.send(request).map_err(|_| thread_gone())?;
+        rx.await.map_err(|_| thread_gone())?
+    }
+
+    /// Replace the configuration document with `body`, saved by `by`,
+    /// waiting at most `timeout` on this thread. An error, a timeout
+    /// included, leaves the stored document as it was.
+    pub fn save_config_blocking(
+        &self,
+        body: &serde_json::Value,
+        by: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let body = serde_json::to_string(body)?;
+        let by = by.to_string();
+        self.blocking(timeout, |reply| SideOp::Save { body, by, reply })
+    }
+}
+
+/// The side task on the owner thread: one connection, opened on the first
+/// request while the owner holds the lock.
+struct Side {
+    target: PgTarget,
+    instance_id: String,
+    key: i64,
+    table: String,
+    lock_pid: Arc<AtomicI32>,
+    /// The open side connection and the lock session it was fenced on.
+    conn: Option<(PgConnection, i32)>,
+}
+
+impl Side {
+    async fn run(mut self, mut inbox: mpsc::UnboundedReceiver<SideRequest>) {
+        while let Some(request) = inbox.recv().await {
+            self.serve(request).await;
+        }
+    }
+
+    async fn serve(&mut self, request: SideRequest) {
+        let SideRequest { deadline, op } = request;
+        match op {
+            SideOp::Load { reply } => {
+                let answer = bounded(deadline, self.load()).await;
+                self.forget_after(&answer);
+                reply.send(answer);
+            }
+            SideOp::Save { body, by, reply } => {
+                let answer = bounded(deadline, self.save(&body, &by)).await;
+                self.forget_after(&answer);
+                reply.send(answer);
+            }
+        }
+    }
+
+    /// Drop the connection after a failed or timed-out request: its state is
+    /// unknown, and a statement given up on may still answer on the wire.
+    fn forget_after<T>(&mut self, answer: &Result<T>) {
+        if answer.is_err() {
+            self.conn = None;
+        }
+    }
+
+    /// The side connection, fenced on the current lock session. A connection
+    /// opened under another lock session (before a release or a fence) is
+    /// dropped; without the lock there is none.
+    async fn connection(&mut self) -> Result<&mut PgConnection> {
+        let lock_pid = self.lock_pid.load(Ordering::Acquire);
+        let kept = self.conn.take().filter(|(_, pid)| *pid == lock_pid);
+        if lock_pid == 0 {
+            return Err(IndexError::Invalid(
+                "this instance does not hold the database".to_string(),
+            ));
+        }
+        let conn = match kept {
+            Some((conn, _)) => conn,
+            None => {
+                let options = PgSessionOptions {
+                    instance_tag: Some(self.instance_id.clone()),
+                    fence: Some(OwnerFence {
+                        key: self.key,
+                        lock_pid,
+                    }),
+                };
+                connect_one(&self.target, PgRole::Side, &options).await?
+            }
+        };
+        Ok(&mut self.conn.insert((conn, lock_pid)).0)
+    }
+
+    async fn load(&mut self) -> Result<Option<ConfigDoc>> {
+        let table = self.table.clone();
+        read_config(self.connection().await?, &table).await
+    }
+
+    async fn save(&mut self, body: &str, by: &str) -> Result<()> {
+        let table = self.table.clone();
+        write_config(self.connection().await?, &table, body, by).await
+    }
+}
+
+/// `work`, given up at `deadline`.
+async fn bounded<T>(deadline: Instant, work: impl Future<Output = Result<T>>) -> Result<T> {
+    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(side_timed_out());
+    };
+    tokio::time::timeout(left, work)
+        .await
+        .unwrap_or_else(|_| Err(side_timed_out()))
+}
+
 /// A request to the owner thread.
 enum Request {
     /// Try the lock once on a `role` connection; keep the connection after a
@@ -517,15 +837,24 @@ enum Request {
         sql: String,
         reply: oneshot::Sender<Result<String>>,
     },
+    /// Run a function on the owner thread.
+    #[cfg(test)]
+    Run { f: Box<dyn FnOnce() + Send> },
 }
 
 /// The instance-ownership lock of one database schema.
 ///
 /// [`PgOwner::start`] spawns the owner thread; nothing connects until the
 /// first lock attempt. Dropping the handle ends the thread, which closes the
-/// lock connection and so frees the lock without recording a release.
+/// lock connection and so frees the lock without recording a release, and
+/// ends the side channel with it.
+///
+/// The owner thread never calls a secret store, the engine or the side
+/// channel; it only answers requests. A blocking [`SideChannel`] call made on
+/// the owner thread returns an error instead of waiting for itself.
 pub struct PgOwner {
     requests: mpsc::UnboundedSender<Request>,
+    side: SideChannel,
     fenced: watch::Receiver<FenceState>,
     lock_pid: Arc<AtomicI32>,
     key: i64,
@@ -553,6 +882,15 @@ impl PgOwner {
             .enable_all()
             .build()
             .map_err(|e| IndexError::Db(format!("could not start the owner thread: {e}")))?;
+        let side = Side {
+            target: target.clone(),
+            instance_id: me.instance_id.clone(),
+            key,
+            table: config_table(target.schema.as_deref()),
+            lock_pid: lock_pid.clone(),
+            conn: None,
+        };
+        let (side_requests, side_inbox) = mpsc::unbounded_channel();
         let worker = Worker {
             table: owner_table(target.schema.as_deref()),
             target,
@@ -567,12 +905,23 @@ impl PgOwner {
             probe: ProbeState::new(),
             drain_before_probe: false,
         };
-        std::thread::Builder::new()
+        // The side task lives on the owner runtime and ends with it, when
+        // every owner handle is gone.
+        let thread = std::thread::Builder::new()
             .name("crystalline-pg-owner".to_string())
-            .spawn(move || runtime.block_on(worker.run(inbox)))
+            .spawn(move || {
+                runtime.block_on(async move {
+                    tokio::spawn(side.run(side_inbox));
+                    worker.run(inbox).await;
+                })
+            })
             .map_err(|e| IndexError::Db(format!("could not start the owner thread: {e}")))?;
         Ok(PgOwner {
             requests,
+            side: SideChannel {
+                requests: side_requests,
+                owner_thread: thread.thread().id(),
+            },
             fenced,
             lock_pid,
             key,
@@ -692,6 +1041,27 @@ impl PgOwner {
         self.call(|reply| Request::Release { reply }).await
     }
 
+    /// The side channel to the configuration document. It answers while
+    /// this owner holds the lock.
+    pub fn side(&self) -> SideChannel {
+        self.side.clone()
+    }
+
+    /// Run `f` on the owner thread and wait for it to return.
+    #[cfg(test)]
+    async fn run_on_thread(&self, f: impl FnOnce() + Send + 'static) -> Result<()> {
+        let (done, finished) = oneshot::channel::<Result<()>>();
+        self.requests
+            .send(Request::Run {
+                f: Box::new(move || {
+                    f();
+                    let _ = done.send(Ok(()));
+                }),
+            })
+            .map_err(|_| thread_gone())?;
+        finished.await.map_err(|_| thread_gone())?
+    }
+
     /// The text answer of `sql` on the owner thread's current connection.
     #[cfg(test)]
     async fn query(&self, sql: String) -> Result<String> {
@@ -796,6 +1166,8 @@ impl Worker {
                 };
                 let _ = reply.send(answer);
             }
+            #[cfg(test)]
+            Request::Run { f } => f(),
         }
     }
 
@@ -1657,6 +2029,207 @@ mod tests {
         tokio::time::sleep(fast().probe_period * 3).await;
         assert_eq!(*b.fenced().borrow(), FenceState::Holding);
         b.release().await.unwrap();
+    }
+
+    /// A blocking side-channel call made on the owner thread returns an
+    /// error at once instead of waiting for its own answer; the same call on
+    /// another thread is served (here refused only because the owner holds
+    /// nothing). Nothing connects, so no database is needed.
+    #[tokio::test]
+    async fn side_channel_refuses_calls_from_owner_thread() {
+        let t = PgTarget {
+            url: "postgres://u@127.0.0.1:1/none".to_string(),
+            schema: Some("side_unit".to_string()),
+        };
+        let o = PgOwner::start_with(t, identity("aaaaaaaa", "a"), fast()).unwrap();
+        let side = o.side();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let on_thread = side.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            o.run_on_thread(move || {
+                let started = Instant::now();
+                let load = on_thread.load_config_blocking(Duration::from_secs(30));
+                let save = on_thread.save_config_blocking(
+                    &serde_json::json!({}),
+                    "test",
+                    Duration::from_secs(30),
+                );
+                let _ = tx.send((load, save, started.elapsed()));
+            }),
+        )
+        .await
+        .expect("the owner thread waited for itself")
+        .unwrap();
+        let (load, save, took) = rx.recv().unwrap();
+        for answer in [load.map(|_| ()), save] {
+            let Err(IndexError::Invalid(text)) = answer else {
+                panic!("not refused: {answer:?}");
+            };
+            assert_eq!(text, "side channel called from the owner thread");
+        }
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        // Another thread reaches the side task, which refuses for want of
+        // the lock.
+        let answer = std::thread::spawn(move || side.load_config_blocking(Duration::from_secs(5)))
+            .join()
+            .unwrap();
+        let Err(IndexError::Invalid(text)) = answer else {
+            panic!("not refused: {answer:?}");
+        };
+        assert!(text.contains("does not hold"), "{text}");
+    }
+
+    /// The side channel saves and loads the document while the owner holds
+    /// the lock, the lock-free read sees the same row, and without the lock
+    /// the side channel answers nothing.
+    #[tokio::test]
+    async fn config_round_trip() {
+        let Some(url) = pg_url() else {
+            eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
+            return;
+        };
+        // Before any migration the lock-free read finds no table and creates
+        // none.
+        let bare = ScratchSchema::new(&url, "cfgb");
+        assert_eq!(
+            read_config_document(&target(&url, &bare)).await.unwrap(),
+            None
+        );
+        let scratch = ScratchSchema::new(&url, "cfgr");
+        migrate(&url, &scratch).await;
+        let t = target(&url, &scratch);
+        let a = PgOwner::start_with(t.clone(), identity("aaaaaaaa", "a"), fast()).unwrap();
+        let side = a.side();
+        let refused = side.load_config().await.unwrap_err();
+        assert!(refused.to_string().contains("does not hold"), "{refused}");
+        assert!(matches!(
+            a.try_acquire().await.unwrap(),
+            Acquired::Held { .. }
+        ));
+        assert_eq!(side.load_config().await.unwrap(), None);
+        assert_eq!(read_config_document(&t).await.unwrap(), None);
+
+        let first = serde_json::json!({
+            "settings": {"search": {"limit": 7}},
+            "domains": [{"name": "notes", "path": "/srv/notes"}],
+        });
+        let blocking = side.clone();
+        let body = first.clone();
+        tokio::task::spawn_blocking(move || {
+            blocking.save_config_blocking(&body, "test-a", Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let doc = side.load_config().await.unwrap().expect("the document");
+        assert_eq!(doc.body, first);
+        assert_eq!(doc.updated_by, "test-a");
+        assert!((Utc::now() - doc.updated_at).num_seconds().abs() < 60);
+        assert_eq!(read_config_document(&t).await.unwrap(), Some(doc.clone()));
+        let blocking = side.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            blocking.load_config_blocking(Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded, Some(doc.clone()));
+
+        // A second save replaces the whole document.
+        let second = serde_json::json!({"settings": {}});
+        let blocking = side.clone();
+        let body = second.clone();
+        tokio::task::spawn_blocking(move || {
+            blocking.save_config_blocking(&body, "test-b", Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let doc = read_config_document(&t)
+            .await
+            .unwrap()
+            .expect("the document");
+        assert_eq!((doc.body, doc.updated_by.as_str()), (second, "test-b"));
+
+        // The side connection is tagged with the instance and the side role.
+        let mut c = plain(&t).await;
+        let sides: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1")
+                .bind(application_name(a.fence().key, "aaaaaaaa", PgRole::Side))
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(sides, 1);
+
+        // After a release the side channel answers nothing.
+        a.release().await.unwrap();
+        let refused = side.load_config().await.unwrap_err();
+        assert!(refused.to_string().contains("does not hold"), "{refused}");
+    }
+
+    /// A save that waits on a row another session holds gives up at its
+    /// timeout, and the document stays as it was once the other session
+    /// lets go; the next save goes through on a fresh connection.
+    #[tokio::test]
+    async fn save_times_out_under_a_held_row_lock() {
+        let Some(url) = pg_url() else {
+            eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let scratch = ScratchSchema::new(&url, "cfgl");
+        migrate(&url, &scratch).await;
+        let t = target(&url, &scratch);
+        let a = PgOwner::start_with(t.clone(), identity("aaaaaaaa", "a"), fast()).unwrap();
+        assert!(matches!(
+            a.try_acquire().await.unwrap(),
+            Acquired::Held { .. }
+        ));
+        let side = a.side();
+        let save = |body: serde_json::Value, timeout: Duration| {
+            let side = side.clone();
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let answer = side.save_config_blocking(&body, "test", timeout);
+                (answer, started.elapsed())
+            })
+        };
+        let first = serde_json::json!({"n": 1});
+        save(first.clone(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .0
+            .unwrap();
+
+        let mut blocker = plain(&t).await;
+        let mut held = blocker.begin().await.unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "SELECT id FROM {} WHERE id = 1 FOR UPDATE",
+            config_table(t.schema.as_deref())
+        )))
+        .execute(&mut *held)
+        .await
+        .unwrap();
+        let timeout = Duration::from_secs(1);
+        let (answer, took) = save(serde_json::json!({"n": 2}), timeout).await.unwrap();
+        assert!(answer.is_err(), "the save went through a held row");
+        assert!(took < timeout + Duration::from_secs(1), "{took:?}");
+        held.commit().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let doc = read_config_document(&t)
+            .await
+            .unwrap()
+            .expect("the document");
+        assert_eq!(doc.body, first, "the timed-out save landed");
+
+        let third = serde_json::json!({"n": 3});
+        save(third.clone(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(read_config_document(&t).await.unwrap().unwrap().body, third);
+        a.release().await.unwrap();
     }
 
     #[tokio::test]

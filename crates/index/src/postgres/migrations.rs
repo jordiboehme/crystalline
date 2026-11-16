@@ -181,6 +181,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "instance owner",
         sql: SCHEMA_V31,
     },
+    Migration {
+        version: 32,
+        label: "instance config",
+        sql: SCHEMA_V32,
+    },
 ];
 
 /// A ledger and the ordered steps that raise it: the index set, and the
@@ -920,6 +925,19 @@ CREATE TABLE IF NOT EXISTS instance_owner (
 );
 "#;
 
+// The instance's configuration document: the settings and the domain
+// registry, written only by the active owner over its side channel. One row,
+// `id = 1`. Like `instance_owner` it is never part of `WIPE_TABLES`: a wipe
+// empties the index, not the instance's configuration.
+const SCHEMA_V32: &str = r#"
+CREATE TABLE IF NOT EXISTS instance_config (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    body JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    updated_by TEXT NOT NULL
+);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -981,7 +999,7 @@ pub const WIPE_TABLES: &[&str] = &[
 
 /// Tables that belong to the instance, not to the index: a wipe must leave
 /// them alone, so none of them may appear in `WIPE_TABLES`.
-pub const INSTANCE_TABLES: &[&str] = &["instance_owner"];
+pub const INSTANCE_TABLES: &[&str] = &["instance_owner", "instance_config"];
 
 /// The session-level advisory lock every migration run holds, so instances
 /// that start at the same moment take turns: without it two of them on an
@@ -1903,9 +1921,9 @@ mod tests {
         .execute(&mut conn)
         .await
         .unwrap();
-        // v31 only creates a table, so the step that cannot run over an empty
-        // schema is the one before it, v30's column and indexes.
-        let last = MIGRATIONS.last().unwrap().version - 1;
+        // v31 and v32 only create tables, so the last step that cannot run
+        // over an empty schema is v30, with its column and indexes.
+        let last = 30;
         sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
             .bind(last - 1)
             .bind(chrono::Utc::now().to_rfc3339())
@@ -3010,10 +3028,19 @@ mod tests {
         assert_eq!(extensions, 1, "the extension is created once");
     }
 
-    /// The instance rows never ride along with a wipe.
+    /// The instance rows never ride along with a wipe, and every instance
+    /// table is one the index set creates.
     #[test]
-    fn instance_tables_are_not_wiped() {
+    fn wipe_and_instance_tables_disjoint() {
+        let created: String = MIGRATIONS.iter().map(|m| m.sql).collect();
+        for t in ["instance_owner", "instance_config"] {
+            assert!(INSTANCE_TABLES.contains(&t), "{t} is an instance table");
+        }
         for t in INSTANCE_TABLES {
+            assert!(
+                created.contains(&format!("CREATE TABLE IF NOT EXISTS {t} (")),
+                "no index step creates {t}"
+            );
             assert!(
                 !WIPE_TABLES.contains(t),
                 "{t} is an instance table and must stay out of WIPE_TABLES"
@@ -3076,6 +3103,11 @@ mod tests {
             .await
             .unwrap();
         assert!(owner, "v31 created instance_owner");
+        let config: bool = sqlx::query_scalar("SELECT to_regclass('instance_config') IS NOT NULL")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap();
+        assert!(config, "v32 created instance_config");
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&mut setup)
@@ -3083,9 +3115,9 @@ mod tests {
             .unwrap();
     }
 
-    /// What a v30 binary sees of a v31 schema: a ledger stamped above what it
-    /// knows. Simulated with the 0.32 step list (the first 30 steps) over a
-    /// schema this binary migrated.
+    /// What a v30 binary sees of a v31 or later schema: a ledger stamped
+    /// above what it knows. Simulated with the 0.32 step list (the first 30
+    /// steps) over a schema this binary migrated.
     #[tokio::test]
     async fn v31_refused_by_a_v30_binary_shape() {
         let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
@@ -3110,17 +3142,17 @@ mod tests {
             .expect_err("a v30 binary refuses a v31 schema");
         match err {
             IndexError::SchemaTooNew { found, known } => {
-                assert_eq!((found, known), (31, 30));
+                assert_eq!((found, known), (MIGRATIONS.last().unwrap().version, 30));
             }
             other => panic!("expected SchemaTooNew, got: {other}"),
         }
-        sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES (32, 'x')")
+        sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES (99, 'x')")
             .execute(&mut conn)
             .await
             .unwrap();
         assert!(matches!(
             apply(&mut conn).await,
-            Err(IndexError::SchemaTooNew { found: 32, .. })
+            Err(IndexError::SchemaTooNew { found: 99, .. })
         ));
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
