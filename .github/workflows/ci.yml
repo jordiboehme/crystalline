@@ -1646,7 +1646,11 @@ jobs:
     name: release-check
     timeout-minutes: 10
     needs: [ci-passed, style]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-passed.result == 'success' && needs.style.result == 'success' }}
+    # !cancelled(): without a status function the condition gets an implicit
+    # success(), which is false whenever any job up the needs chain was
+    # skipped, and on a main push whose tree a pull request tested the heavy
+    # jobs are skipped on purpose.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-passed.result == 'success' && needs.style.result == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.check.outputs.tag }}
@@ -1670,7 +1674,8 @@ jobs:
   release:
     name: release
     needs: release-check
-    if: ${{ needs.release-check.outputs.release == 'true' }}
+    # !cancelled() for the same reason as release-check above.
+    if: ${{ !cancelled() && needs.release-check.result == 'success' && needs.release-check.outputs.release == 'true' }}
     concurrency:
       group: release-main
       cancel-in-progress: false
