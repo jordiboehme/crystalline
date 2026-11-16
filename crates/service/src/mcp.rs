@@ -7239,7 +7239,9 @@ fn to_error(e: EngineError) -> ErrorData {
         // that reads it can retry correctly in one step.
         | EngineError::Refused(_) => ErrorData::invalid_params(e.to_string(), None),
         EngineError::Remote(remote) => remote_to_error(remote),
-        EngineError::Io { .. } | EngineError::Internal(_) => {
+        EngineError::Io { .. }
+        | EngineError::Internal(_)
+        | EngineError::ConfigMaybeStored(_) => {
             ErrorData::internal_error(e.to_string(), None)
         }
     }

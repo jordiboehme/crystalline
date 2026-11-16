@@ -765,7 +765,9 @@ impl From<EngineError> for ApiError {
             | EngineError::Refused(_)
             | EngineError::EnvTokenConnect => unprocessable_error(detail),
             EngineError::Remote(remote) => remote_to_api_error(remote, detail),
-            EngineError::Io { .. } | EngineError::Internal(_) => internal_error(detail),
+            EngineError::Io { .. }
+            | EngineError::Internal(_)
+            | EngineError::ConfigMaybeStored(_) => internal_error(detail),
         }
     }
 }

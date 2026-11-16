@@ -424,6 +424,11 @@ pub enum EngineError {
     /// An error from the storage or parse layer.
     #[error("{0}")]
     Internal(String),
+    /// A configuration document save whose commit went out and whose outcome
+    /// is unknown: the document may or may not be stored. The caller reads the
+    /// document again instead of assuming either outcome.
+    #[error("{0}")]
+    ConfigMaybeStored(String),
     /// A GitHub collaboration error from the remote origin engine, surfaced
     /// with its message verbatim: every `RemoteError` variant is already
     /// actionable product copy (see `crystalline_remote::error`), so this
