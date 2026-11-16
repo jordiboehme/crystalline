@@ -25,9 +25,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crystalline_core::config::GlobalConfig;
+use crystalline_core::config::{AccountsLocation, GlobalConfig};
 use crystalline_index::Store;
 use tokio::sync::Mutex as TokioMutex;
+
+use crate::rest::AuthStore;
 
 /// A command refused because another instance owns the Postgres database.
 /// Typed so a caller can tell it from a store that failed to open: the
@@ -390,6 +392,115 @@ async fn report_on(cfg: &GlobalConfig) -> anyhow::Result<Option<CommandDbOwner>>
         Holder::Unknown { database, error } => Err(anyhow::Error::new(DatabaseNotOpened {
             message: pg::owner_unknown(&database, &error, &example),
         })),
+    }
+}
+
+/// Where the accounts of `cfg` live (spec section A): the `web-auth.db`
+/// file in the state directory on Turso, the configured database on
+/// Postgres.
+pub fn accounts_location(cfg: &GlobalConfig) -> anyhow::Result<AccountsLocation> {
+    let state_dir = crystalline_core::config::state_dir()
+        .map_err(|e| anyhow::anyhow!("could not resolve the state directory: {e}"))?;
+    Ok(AccountsLocation::resolve(&cfg.database(), &state_dir))
+}
+
+/// The refusal of a Postgres accounts location in a build without the
+/// Postgres backend.
+#[cfg(not(feature = "postgres"))]
+fn no_postgres_backend() -> anyhow::Error {
+    anyhow::anyhow!(
+        "the accounts live in a Postgres database, and this build of Crystalline has no Postgres backend"
+    )
+}
+
+/// Open the accounts store for a command that writes beside the instance
+/// that owns the database (`users`, `domain members`, the account link of a
+/// GitHub sign-in), by spec section L rule 4.
+///
+/// On Turso the `web-auth.db` file opens as it always did. On Postgres the
+/// store opens in the role `cli`, with no fence and without migrating, so
+/// it may run while a daemon owns the database. Accounts tables behind this
+/// binary are migrated only by an owner: the database is claimed for the
+/// command and migrated when it is free, and the command is refused naming
+/// both versions when another instance holds it. Tables ahead of this
+/// binary are refused as too new.
+pub async fn open_accounts_for_cli(cfg: &GlobalConfig) -> anyhow::Result<AuthStore> {
+    let loc = accounts_location(cfg)?;
+    match &loc {
+        AccountsLocation::File(path) => AuthStore::open(path).await,
+        #[cfg(feature = "postgres")]
+        AccountsLocation::Postgres(_) => open_cli_accounts_on_postgres(cfg, &loc).await,
+        #[cfg(not(feature = "postgres"))]
+        AccountsLocation::Postgres(_) => Err(no_postgres_backend()),
+    }
+}
+
+/// [`open_accounts_for_cli`] when this machine may already hold accounts,
+/// `None` when it holds none: a Turso file that does not exist is not
+/// created. A Postgres database always counts as holding them.
+pub async fn existing_accounts_for_cli(cfg: &GlobalConfig) -> anyhow::Result<Option<AuthStore>> {
+    if !accounts_location(cfg)?.exists() {
+        return Ok(None);
+    }
+    open_accounts_for_cli(cfg).await.map(Some)
+}
+
+/// The Postgres arm of [`open_accounts_for_cli`].
+#[cfg(feature = "postgres")]
+async fn open_cli_accounts_on_postgres(
+    cfg: &GlobalConfig,
+    loc: &AccountsLocation,
+) -> anyhow::Result<AuthStore> {
+    use crystalline_identity::auth_store::AuthOpenError;
+    use crystalline_index::postgres::{PgRole, PgSessionOptions};
+
+    let opts = PgSessionOptions {
+        instance_tag: crystalline_core::config::read_or_create_instance_id().ok(),
+        fence: None,
+    };
+    let (found, need) = match AuthStore::open_at_no_migrate_as(loc, &opts, PgRole::Cli).await {
+        Ok(store) => return Ok(store),
+        Err(AuthOpenError::Behind { found, need }) => (found, need),
+        Err(AuthOpenError::Other(e)) => return Err(e),
+        Err(too_new) => return Err(anyhow::Error::new(too_new)),
+    };
+    // Only an owner migrates: take the database for this command when it
+    // is free, and refuse when another instance has it.
+    let claim = match claim_database_for_command(cfg, &command_label()).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => anyhow::bail!("the accounts database is not on Postgres"),
+        Err(e) => match e.downcast_ref::<DatabaseOwned>() {
+            Some(owned) => anyhow::bail!(
+                "the accounts tables are at version {found}, this binary needs {need}; run the command on the active instance. {owned}"
+            ),
+            None => return Err(e),
+        },
+    };
+    AuthStore::open_at(loc, &claim.session_options()).await
+}
+
+/// Open the accounts store at `loc` for this process's own stack: the
+/// `web-auth.db` file on Turso; on Postgres in the database this command
+/// claimed (claimed here when it was not yet), with the claim's tag and
+/// fence, so the store migrates as the owner it is.
+pub(crate) async fn open_accounts_for_command(
+    cfg: &GlobalConfig,
+    loc: &AccountsLocation,
+) -> anyhow::Result<AuthStore> {
+    match loc {
+        AccountsLocation::File(path) => AuthStore::open(path).await,
+        #[cfg(feature = "postgres")]
+        AccountsLocation::Postgres(_) => {
+            let Some(claim) = claim_database_for_command(cfg, &command_label()).await? else {
+                anyhow::bail!("the accounts database is not on Postgres");
+            };
+            AuthStore::open_at(loc, &claim.session_options()).await
+        }
+        #[cfg(not(feature = "postgres"))]
+        AccountsLocation::Postgres(_) => {
+            let _ = cfg;
+            Err(no_postgres_backend())
+        }
     }
 }
 

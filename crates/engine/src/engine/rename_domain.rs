@@ -1994,11 +1994,22 @@ impl Engine {
 
     /// The accounts database the rename moves records in: the one the HTTP
     /// surface installed, else the file under the state directory, opened for
-    /// this rename alone (a daemon at startup and a standalone command have
-    /// none installed). `None` when there is no accounts database at all.
+    /// this rename alone (a daemon at startup on Turso and a standalone
+    /// command have none installed). `None` when there is no accounts
+    /// database at all.
+    ///
+    /// On Postgres the accounts live in the database, and a stack that owns
+    /// it installs them before any rename: an accounts file left in the
+    /// state directory is never read, so a rename with none installed is
+    /// refused rather than moving records in that file.
     async fn rename_access(&self) -> Result<Option<Arc<crate::scope::DomainAccess>>> {
         if let Some(access) = self.domain_access.get() {
             return Ok(Some(access.clone()));
+        }
+        if self.config().database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+            return Err(EngineError::Internal(
+                "the accounts in the database are not open in this process, so the rename cannot move their records; run it where the database is owned, for example on the active instance".to_string(),
+            ));
         }
         let path = self.journal_state_dir()?.join("web-auth.db");
         if !path.is_file() {

@@ -612,6 +612,23 @@ pub async fn run_serve(
         tokio::task::spawn_blocking(move || std::thread::sleep(park));
     }
 
+    // On Postgres the accounts live in the database this instance owns, and
+    // nowhere else: they are opened and installed here, before the rename
+    // below, which moves account records, and the first admin and the
+    // setup token further down are asked of this same store. An accounts
+    // file left in the state directory is never read. On Turso the file is
+    // opened further down, after those two short-lived opens, as before.
+    let pg_accounts = match &pg_start {
+        Some(pg) => {
+            #[cfg(feature = "postgres")]
+            warn_leftover_accounts_file(pg.database());
+            #[cfg(not(feature = "postgres"))]
+            let _ = pg;
+            open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?
+        }
+        None => None,
+    };
+
     // A domain rename a stopped daemon left half done is finished before
     // anything reads the names: before the routing cache, the watcher, the
     // first sync and the orphan sweep, and before the socket is bound. A
@@ -709,24 +726,47 @@ pub async fn run_serve(
     // handle is closed again well before the HTTP task reopens it below. See
     // [`setup_token_for`] and the print just below - the token is said once and
     // never written anywhere again.
-    let accounts_db = crystalline_core::config::web_auth_db_path().ok();
-    // The first admin from the environment (A9), made before the token is
-    // asked about so an instance that just got its admin draws none. The store
-    // it opens is dropped inside, so `setup_token_for`'s own open is the only
-    // handle left. A refused configuration fails the start here, with a
-    // sentence that never carries the password.
-    let created_admin =
-        crate::first_admin::seed_from_environment(accounts_db.as_deref(), &engine).await?;
-    let setup_token = match http_addr.as_deref() {
-        Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
-        None => None,
+    //
+    // On Postgres both questions go to the accounts store opened above.
+    let (created_admin, setup_token) = match &pg_accounts {
+        Some(store) => {
+            let created = crate::first_admin::seed_from_environment_in(store, &engine).await?;
+            let token = match http_addr.as_deref() {
+                Some(addr) => setup_token_in(addr, store, configured_setup).await,
+                None => None,
+            };
+            (created, token)
+        }
+        None => {
+            let accounts_db = match crate::claim::accounts_location(&loaded.effective) {
+                Ok(crystalline_core::config::AccountsLocation::File(path)) => Some(path),
+                _ => None,
+            };
+            // The first admin from the environment (A9), made before the
+            // token is asked about so an instance that just got its admin
+            // draws none. The store it opens is dropped inside, so
+            // `setup_token_for`'s own open is the only handle left. A refused
+            // configuration fails the start here, with a sentence that never
+            // carries the password.
+            let created =
+                crate::first_admin::seed_from_environment(accounts_db.as_deref(), &engine).await?;
+            let token = match http_addr.as_deref() {
+                Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
+                None => None,
+            };
+            (created, token)
+        }
     };
     // Who reads which domain, known before anything is served or backed up,
     // with the HTTP surface on or off: a Reflection page this daemon writes
     // reaches every reader of its domain and the backup branch either way.
     // Opened after the two short-lived opens above have closed theirs, and
     // shared with the HTTP surface below, so this process holds one handle.
-    let accounts = open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?;
+    // On Postgres it was opened before the rename.
+    let accounts = match pg_accounts {
+        Some(store) => Some(store),
+        None => open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?,
+    };
     // Who may read each env-defined team domain on an instance with a GitHub
     // App, recorded before anything is served so a private one is closed
     // from its first request on. A private record that cannot be written
@@ -1964,8 +2004,18 @@ async fn http_service(
             shutdown,
         );
     }
+    // Only the accounts file is opened here: on Postgres the accounts open
+    // with the start or the start fails, and the HTTP surface never falls
+    // back to a file on this machine.
+    let crystalline_core::config::AccountsLocation::File(path) =
+        crate::claim::accounts_location(&engine.config())?
+    else {
+        anyhow::bail!(
+            "the accounts in the database are not open, and on Postgres the HTTP surface never falls back to an accounts file"
+        );
+    };
     http_service_at(
-        &crystalline_core::config::web_auth_db_path()?,
+        &path,
         allowed_hosts,
         engine,
         http_sessions,
@@ -2094,7 +2144,29 @@ async fn setup_token_for(
     if bind_is_loopback(addr) {
         return None;
     }
-    if an_account_already_exists(accounts).await {
+    setup_token_unless(an_account_already_exists(accounts).await, configured)
+}
+
+/// [`setup_token_for`] asked of an accounts store already open: the
+/// database's on Postgres.
+async fn setup_token_in(
+    addr: &str,
+    store: &crate::rest::AuthStore,
+    configured: Option<SetupToken>,
+) -> Option<SetupToken> {
+    if bind_is_loopback(addr) {
+        return None;
+    }
+    setup_token_unless(
+        has_an_account(store, "the accounts in the database").await,
+        configured,
+    )
+}
+
+/// The setup token for a non-loopback bind: none when an account exists,
+/// else the one the operator set, else a fresh one.
+fn setup_token_unless(account_exists: bool, configured: Option<SetupToken>) -> Option<SetupToken> {
+    if account_exists {
         return None;
     }
     if let Some(configured) = configured {
@@ -2208,13 +2280,14 @@ async fn an_account_already_exists(accounts: Option<&Path>) -> bool {
     let Some(path) = accounts else {
         return false;
     };
-    let counted: anyhow::Result<usize> = async {
-        let store = crate::rest::AuthStore::open(path).await?;
-        store.user_count().await
-    }
-    .await;
-    match counted {
-        Ok(count) => count > 0,
+    match crate::rest::AuthStore::open(path).await {
+        Ok(store) => {
+            has_an_account(
+                &store,
+                &format!("the accounts database at {}", path.display()),
+            )
+            .await
+        }
         Err(err) => {
             tracing::warn!(
                 "the accounts database at {} could not be read ({err:#}); starting up as if this instance had no account yet",
@@ -2222,6 +2295,37 @@ async fn an_account_already_exists(accounts: Option<&Path>) -> bool {
             );
             false
         }
+    }
+}
+
+/// Whether `store` holds an account, `false` when the count fails (said in
+/// the log naming `what`), for the reason [`an_account_already_exists`]
+/// gives.
+async fn has_an_account(store: &crate::rest::AuthStore, what: &str) -> bool {
+    match store.user_count().await {
+        Ok(count) => count > 0,
+        Err(err) => {
+            tracing::warn!(
+                "{what} could not be read ({err:#}); starting up as if this instance had no account yet"
+            );
+            false
+        }
+    }
+}
+
+/// On Postgres, say once that an accounts file left in the state directory
+/// is not read: the accounts live in `database`.
+#[cfg(feature = "postgres")]
+fn warn_leftover_accounts_file(database: &str) {
+    let Ok(state_dir) = config::state_dir() else {
+        return;
+    };
+    let leftover = state_dir.join("web-auth.db");
+    if leftover.exists() {
+        tracing::warn!(
+            "the accounts file {} is not read: on Postgres the accounts live in the database {database}. Move it away once you no longer need it",
+            leftover.display()
+        );
     }
 }
 

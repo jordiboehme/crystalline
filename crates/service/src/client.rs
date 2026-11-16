@@ -1755,10 +1755,11 @@ pub async fn domain_remove(
     }
     let name = localize_standalone(&engine, name).await;
     let name = name.as_str();
-    if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
-        && auth_path.exists()
+    let cfg = engine.config();
+    if let Ok(loc) = crate::claim::accounts_location(&cfg)
+        && loc.exists()
     {
-        let auth = std::sync::Arc::new(crate::rest::AuthStore::open(&auth_path).await?);
+        let auth = std::sync::Arc::new(crate::claim::open_accounts_for_command(&cfg, &loc).await?);
         engine.set_domain_access(std::sync::Arc::new(
             crate::scope::DomainAccess::new(auth).with_governor(engine.knowledge_governor()),
         ));
@@ -1789,7 +1790,9 @@ pub async fn domain_remove(
 /// same reason). It also needs no accounts database installed ahead of time:
 /// [`crate::engine::Engine::rename_domain`]'s own `rename_access` opens
 /// `web-auth.db` under the state directory itself when one exists and none
-/// was installed, the same fallback `domain_remove` has no equivalent of.
+/// was installed, the same fallback `domain_remove` has no equivalent of. On
+/// Postgres, where that file is never read, the accounts in the database are
+/// installed before the rename.
 pub async fn domain_rename(
     domain: &str,
     new: &str,
@@ -1830,6 +1833,13 @@ pub async fn domain_rename(
     // half done, because that recovery reads names the table would hide.
     if use_daemon(db, config_path) {
         crate::route::install_sources(&engine);
+    }
+    // On Postgres the records the rename moves live in the database this
+    // command claimed, and the engine never reads an accounts file there:
+    // they are installed first, as the daemon installs them at its start.
+    let engine = Arc::new(engine);
+    if engine.config().database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+        install_domain_access(&engine).await;
     }
     // A rename runs only while this process holds the state directory, as a
     // daemon does; the engine refuses it otherwise, in words that name the
@@ -1895,8 +1905,8 @@ pub use crystalline_engine::machine_rename_owner;
 /// machine's default configuration does not load, say) is handed on as it
 /// is, so the engine refuses a rename and skips a name adoption rather than
 /// running either unchecked; a warning says so once here.
-/// Install the private-domain resolver on a serving stack, over this
-/// machine's accounts store, and hand the store back for the HTTP surface to
+/// Install the private-domain resolver on a serving stack, over the
+/// accounts store of its configuration (the database on Postgres), and hand the store back for the HTTP surface to
 /// share. Every serving stack calls it before it answers anything: the
 /// daemon (HTTP on or off), the embedded stdio stack and a one-shot tool
 /// run, so a stack knows its readers whether or not anybody signs in here.
@@ -1916,16 +1926,18 @@ pub(crate) async fn install_domain_access(
     // governor is built first, so the load warms it up when it lands.
     engine.github_governor();
     engine.preload_github_app();
-    let opened = match crystalline_core::config::web_auth_db_path() {
+    let cfg = engine.config();
+    let opened = match crate::claim::accounts_location(&cfg) {
         // No store yet: no account and no private domain exist, so nothing
         // is opened (or created, which would change this machine's state
         // from a stack that only reads it). The engine watches for the file
-        // and fails closed should it appear.
-        Ok(path) if !path.exists() => {
+        // and fails closed should it appear. A Postgres location always
+        // counts as present.
+        Ok(crystalline_core::config::AccountsLocation::File(path)) if !path.exists() => {
             engine.set_domain_access_absent(path);
             return None;
         }
-        Ok(path) => crate::rest::AuthStore::open(&path)
+        Ok(loc) => crate::claim::open_accounts_for_command(&cfg, &loc)
             .await
             .map_err(|e| format!("{e:#}")),
         Err(e) => Err(format!("{e:#}")),

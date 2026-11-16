@@ -61,7 +61,8 @@ pub use crystalline_rest::collab;
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use claim::{
-    CommandDbOwner, DatabaseOwned, claim_database_for_command, open_store_for_command,
+    CommandDbOwner, DatabaseOwned, accounts_location, claim_database_for_command,
+    existing_accounts_for_cli, open_accounts_for_cli, open_store_for_command,
     release_command_database, set_command_line,
 };
 pub use client::{
