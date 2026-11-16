@@ -33,9 +33,8 @@ use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::session::{
-    HOLDS_KEY_SQL, LOCK_IDLE_SESSION_TIMEOUT, LOCK_STATEMENT_TIMEOUT, OwnerFence, PgRole,
-    PgSessionOptions, PgTarget, application_name, application_prefix, connect_one, owner_key,
-    short_tag,
+    HOLDS_KEY_SQL, OwnerFence, PgRole, PgSessionOptions, PgTarget, application_name,
+    application_prefix, connect_one, owner_key, short_tag,
 };
 use crate::error::{IndexError, Result};
 
@@ -69,6 +68,11 @@ pub const STANDBY_POLL: Duration = Duration::from_secs(2);
 /// The lock connection's `idle_session_timeout`: a lock session that nobody
 /// probes for this long is ended by the server, and the lock with it.
 pub const LOCK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The lock connection's `statement_timeout`, the server side of a probe:
+/// below [`PROBE_TIMEOUT`], so the server gives up on a probe before the
+/// client does.
+pub const LOCK_STATEMENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long `pg_terminate_backend` waits for each predecessor session to be
 /// gone, in milliseconds.
@@ -109,6 +113,8 @@ pub struct OwnerTimings {
     pub standby_poll: Duration,
     /// [`LOCK_IDLE_TIMEOUT`], scaled.
     pub lock_idle_timeout: Duration,
+    /// [`LOCK_STATEMENT_TIMEOUT`], scaled.
+    pub lock_statement_timeout: Duration,
 }
 
 impl OwnerTimings {
@@ -127,6 +133,7 @@ impl OwnerTimings {
             grace: fence_detect_max + exit_margin,
             standby_poll: STANDBY_POLL / scale,
             lock_idle_timeout: LOCK_IDLE_TIMEOUT / scale,
+            lock_statement_timeout: LOCK_STATEMENT_TIMEOUT / scale,
         }
     }
 
@@ -134,6 +141,28 @@ impl OwnerTimings {
     pub fn current() -> OwnerTimings {
         OwnerTimings::at(timing_scale())
     }
+}
+
+/// A duration as a Postgres setting: whole seconds as `Ns`, else `Nms`, and
+/// never below 1 ms, because 0 turns a timeout off.
+fn pg_duration(d: Duration) -> String {
+    let ms = d.as_millis().max(1);
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+/// The lock connection's `idle_session_timeout` and `statement_timeout` at
+/// `t`: set at connect for a `lock` connection and again on a session that
+/// wins the lock, so a paused owner's lock session is ended after the scaled
+/// [`LOCK_IDLE_TIMEOUT`] in a test too.
+pub(crate) fn lock_session_settings(t: &OwnerTimings) -> [(&'static str, String); 2] {
+    [
+        ("idle_session_timeout", pg_duration(t.lock_idle_timeout)),
+        ("statement_timeout", pg_duration(t.lock_statement_timeout)),
+    ]
 }
 
 /// What one probe of the lock found.
@@ -775,23 +804,23 @@ impl Worker {
         if !taken {
             return Ok(Acquired::Busy(read_row(conn, &self.table).await?));
         }
-        if *role != PgRole::Lock {
-            // The won session becomes the lock connection: its name and the
-            // timeouts a lock connection gets at connect. A plain `SET`, not
-            // `SET LOCAL`, because no transaction is open.
-            let name = application_name(self.key, &self.me.instance_id, PgRole::Lock);
-            sqlx::query(
-                "SELECT set_config('application_name', $1, false), \
-                 set_config('idle_session_timeout', $2, false), \
-                 set_config('statement_timeout', $3, false)",
-            )
-            .bind(name)
-            .bind(LOCK_IDLE_SESSION_TIMEOUT)
-            .bind(LOCK_STATEMENT_TIMEOUT)
-            .execute(&mut *conn)
-            .await?;
-            *role = PgRole::Lock;
-        }
+        // The won session is the lock connection: its name and this owner's
+        // lock timeouts, also on a `lock` connection, whose startup options
+        // carry the process timings rather than this owner's. A plain `SET`,
+        // not `SET LOCAL`, because no transaction is open.
+        let name = application_name(self.key, &self.me.instance_id, PgRole::Lock);
+        let [(_, idle), (_, statement)] = lock_session_settings(&self.timings);
+        sqlx::query(
+            "SELECT set_config('application_name', $1, false), \
+             set_config('idle_session_timeout', $2, false), \
+             set_config('statement_timeout', $3, false)",
+        )
+        .bind(name)
+        .bind(idle)
+        .bind(statement)
+        .execute(&mut *conn)
+        .await?;
+        *role = PgRole::Lock;
         let previous = read_row(conn, &self.table).await?;
         self.held = Some(Held {
             lock_pid: pid,
@@ -1039,6 +1068,10 @@ mod tests {
                 t.lock_idle_timeout > t.probe_period + t.probe_timeout,
                 "scale {scale}: {t:?}"
             );
+            assert!(
+                t.lock_statement_timeout < t.probe_timeout,
+                "scale {scale}: {t:?}"
+            );
         }
         let shipped = OwnerTimings::at(1);
         assert_eq!(shipped.fence_detect_max, FENCE_DETECT_MAX);
@@ -1047,18 +1080,11 @@ mod tests {
             (FENCE_DETECT_MAX, GRACE),
             (Duration::from_secs(13), Duration::from_secs(15))
         );
-        // The lock connection's session settings agree with the constants:
-        // the idle timeout is LOCK_IDLE_TIMEOUT and the server gives up on a
-        // probe before the client does.
-        assert_eq!(
-            LOCK_IDLE_SESSION_TIMEOUT,
-            format!("{}s", LOCK_IDLE_TIMEOUT.as_secs())
-        );
-        let statement: u64 = LOCK_STATEMENT_TIMEOUT
-            .trim_end_matches('s')
-            .parse()
-            .unwrap();
-        assert!(Duration::from_secs(statement) < PROBE_TIMEOUT);
+        // The lock session's settings at both scales.
+        let settings = |scale| lock_session_settings(&OwnerTimings::at(scale)).map(|(_, v)| v);
+        assert_eq!(settings(1), ["15s".to_string(), "3s".to_string()]);
+        assert_eq!(settings(10), ["1500ms".to_string(), "300ms".to_string()]);
+        assert_eq!(pg_duration(Duration::ZERO), "1ms");
     }
 
     #[test]
@@ -1129,18 +1155,27 @@ mod tests {
         ));
         assert_eq!(b.fence().lock_pid, 0);
         assert!(probe_owner(&t).await.unwrap().is_some());
-        // A busy try leaves no connection of B behind.
+        // A busy try leaves no connection of B behind. A closed session can
+        // linger in pg_stat_activity for a moment, so look a few times.
         let mut c = plain(&t).await;
-        let b_sessions: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity WHERE starts_with(application_name, $1)",
-        )
-        .bind(format!(
+        let b_prefix = format!(
             "{}bbbbbbbb/",
             application_prefix(owner_key(t.schema.as_deref()))
-        ))
-        .fetch_one(&mut c)
-        .await
-        .unwrap();
+        );
+        let mut b_sessions = -1i64;
+        for _ in 0..50 {
+            b_sessions = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE starts_with(application_name, $1)",
+            )
+            .bind(&b_prefix)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            if b_sessions == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(b_sessions, 0);
         // Once A is gone, B gets it.
         drop(a);
@@ -1479,8 +1514,8 @@ mod tests {
             b.show("application_name").await.unwrap(),
             application_name(b.fence().key, "bbbbbbbb", PgRole::Lock)
         );
-        assert_eq!(b.show("idle_session_timeout").await.unwrap(), "15s");
-        assert_eq!(b.show("statement_timeout").await.unwrap(), "3s");
+        assert_eq!(b.show("idle_session_timeout").await.unwrap(), "1500ms");
+        assert_eq!(b.show("statement_timeout").await.unwrap(), "300ms");
         // The probe keeps holding on the renamed session.
         tokio::time::sleep(fast().probe_period * 3).await;
         assert_eq!(*b.fenced().borrow(), FenceState::Holding);

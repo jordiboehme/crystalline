@@ -196,16 +196,10 @@ const KEEPALIVES: [(&str, &str); 3] = [
     ("tcp_keepalives_count", "3"),
 ];
 
-/// The lock connection's `idle_session_timeout`: a session nobody probes for
-/// this long is ended by the server, and its lock with it.
-pub(crate) const LOCK_IDLE_SESSION_TIMEOUT: &str = "15s";
-
-/// The lock connection's `statement_timeout`, the server side of a probe.
-pub(crate) const LOCK_STATEMENT_TIMEOUT: &str = "3s";
-
 /// The connect options of a `role` connection to `t`: the URL's own options,
 /// then the `application_name`, the keepalives and, for [`PgRole::Lock`], the
-/// idle session and statement timeouts.
+/// idle session and statement timeouts at the current owner timings
+/// ([`super::owner::lock_session_settings`]).
 pub(crate) fn connect_options(
     t: &PgTarget,
     role: PgRole,
@@ -218,10 +212,9 @@ pub(crate) fn connect_options(
         .application_name(&name)
         .options(KEEPALIVES);
     if role == PgRole::Lock {
-        opts = opts.options([
-            ("idle_session_timeout", LOCK_IDLE_SESSION_TIMEOUT),
-            ("statement_timeout", LOCK_STATEMENT_TIMEOUT),
-        ]);
+        opts = opts.options(super::owner::lock_session_settings(
+            &super::owner::OwnerTimings::current(),
+        ));
     }
     Ok(opts)
 }

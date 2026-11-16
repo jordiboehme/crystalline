@@ -89,10 +89,10 @@ pub use migrations::{
     INDEX_SET, INSTANCE_TABLES, LockedRun, Migration, MigrationSet, apply_locked_set,
 };
 pub use owner::{
-    Acquired, EXIT_MARGIN, FENCE_DETECT_MAX, FenceState, GRACE, LOCK_IDLE_TIMEOUT, OwnerIdentity,
-    OwnerRow, OwnerTimings, PROBE_PERIOD, PROBE_RETRIES, PROBE_TIMEOUT, PgOwner, ProbeAction,
-    ProbeOutcome, ProbeState, STANDBY_POLL, StandbyStatus, TERMINATE_WAIT_MS, TIMING_SCALE_ENV,
-    TakeoverReport, probe_owner, read_owner_row, timing_scale,
+    Acquired, EXIT_MARGIN, FENCE_DETECT_MAX, FenceState, GRACE, LOCK_IDLE_TIMEOUT,
+    LOCK_STATEMENT_TIMEOUT, OwnerIdentity, OwnerRow, OwnerTimings, PROBE_PERIOD, PROBE_RETRIES,
+    PROBE_TIMEOUT, PgOwner, ProbeAction, ProbeOutcome, ProbeState, STANDBY_POLL, StandbyStatus,
+    TERMINATE_WAIT_MS, TIMING_SCALE_ENV, TakeoverReport, probe_owner, read_owner_row, timing_scale,
 };
 pub use session::{
     OwnerFence, PgRole, PgSessionOptions, PgTarget, application_name, connect_one, lock_key,
