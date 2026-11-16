@@ -498,6 +498,9 @@ pub async fn run_serve(
     // Take ownership first so a second daemon fails fast with the live pid.
     // A one-shot command holding it for a moment is waited for instead.
     let ownership = acquire_ownership_after_standalone().await?;
+    // Kept where a stop during the Postgres start can take it too (see
+    // `crate::standby`); on Turso only this function ever does.
+    let ownership: HeldOwnership = Arc::new(std::sync::Mutex::new(Some(ownership)));
 
     // The lock is held, so this daemon is the only writer of the scratch
     // directory: reclaim whatever a killed predecessor left spilled there. The
@@ -513,18 +516,26 @@ pub async fn run_serve(
     // HTTP endpoint is bound, and the database is taken, or waited for as a
     // standby (see `crate::standby`). Every other backend gets `None` and
     // keeps the order below: the store first, then the socket and the record.
-    let (ownership, pg_start) = crate::standby::start_on_postgres(
+    //
+    // The stop signals are one future for the whole life of the process.
+    // Its first poll installs the signal handlers, which replace the default
+    // disposition for good, so a second listener made later would miss a
+    // signal that came in between. On Turso it is first polled by the
+    // `select!` at the end, as before; on Postgres the standby wait and the
+    // start polls it, and it comes back for that `select!` at the handover.
+    let stop: StopFuture = Box::pin(async {
+        tokio::select! {
+            signal = wait_signal() => signal,
+            gone = test_parent_gone() => gone,
+        }
+    });
+    let (pg_start, turso_stop) = crate::standby::start_on_postgres(
         &loaded.effective,
-        ownership,
+        &ownership,
         &instance_id,
         http_addr.as_deref(),
         &shutdown_tx,
-        async {
-            tokio::select! {
-                signal = wait_signal() => signal,
-                gone = test_parent_gone() => gone,
-            }
-        },
+        stop,
         (!daemon_flag).then_some("crystalline stopped"),
     )
     .await?;
@@ -618,8 +629,8 @@ pub async fn run_serve(
     let turso_listener = match &pg_start {
         Some(_) => None,
         None => {
-            let listener = ownership.bind_listener()?;
-            ownership.publish()?;
+            let listener = owned(&ownership, |o| o.bind_listener())??;
+            owned(&ownership, |o| o.publish())??;
             start_step("record published");
             Some(listener)
         }
@@ -721,7 +732,7 @@ pub async fn run_serve(
         crate::logging::console_line(&format!(
             "crystalline {} serving on {} (pid {})",
             env!("CARGO_PKG_VERSION"),
-            ownership.socket_display(),
+            owned(&ownership, |o| o.socket_display())?,
             shared.pid
         ));
         crate::logging::console_line(COPYRIGHT_LINE);
@@ -1016,7 +1027,11 @@ pub async fn run_serve(
             };
             if let Some(Some(slot)) = early_http {
                 slot.swap(router);
-                set_ready(true);
+                // Ready only while the early endpoint still serves: one that
+                // stopped stays not ready, as it does on the Turso path.
+                if slot.is_serving() {
+                    set_ready(true);
+                }
                 return;
             }
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -1038,21 +1053,21 @@ pub async fn run_serve(
 
     // On Postgres the early responder hands the socket over now, and the
     // owner lock stays held in `_database` until the process exits.
-    let (listener, _database) = match pg_start {
+    let (listener, _database, mut stop) = match pg_start {
         Some(pg) => {
-            let (listener, held) = pg.hand_over(&shared).await?;
-            (listener, Some(held))
+            let (listener, held, stop) = pg.hand_over(&shared).await?;
+            (listener, Some(held), stop)
         }
         None => (
             turso_listener.ok_or_else(|| anyhow::anyhow!("the control socket was never bound"))?,
             None,
+            turso_stop.ok_or_else(|| anyhow::anyhow!("the stop signals were never set up"))?,
         ),
     };
     let accept = tokio::spawn(accept_loop(listener, shared.clone()));
 
     let reason = tokio::select! {
-        signal = wait_signal() => signal,
-        gone = test_parent_gone() => gone,
+        signal = &mut stop => signal,
         _ = shared.wait_shutdown() => shared.shutdown_reason(),
     };
     shared.trigger_shutdown(reason);
@@ -1064,7 +1079,7 @@ pub async fn run_serve(
         "stopping ({reason}); exiting within {}s",
         SHUTDOWN_DEADLINE.as_secs()
     );
-    let departure = Departure::begin(ownership, SHUTDOWN_DEADLINE);
+    let departure = Departure::begin_held(ownership, SHUTDOWN_DEADLINE);
 
     departure.step("waiting for the accept loop");
     let _ = accept.await;
@@ -1160,11 +1175,16 @@ impl Departure {
     /// ends the process `deadline` from now unless [`Departure::finish`] does
     /// so first.
     pub(crate) fn begin(ownership: crate::instance::Ownership, deadline: Duration) -> Departure {
+        Departure::begin_held(Arc::new(std::sync::Mutex::new(Some(ownership))), deadline)
+    }
+
+    /// [`Departure::begin`] for an ownership already kept in a shared slot.
+    pub(crate) fn begin_held(ownership: HeldOwnership, deadline: Duration) -> Departure {
         let departure = Departure {
             began: Instant::now(),
             deadline,
             step: Arc::new(std::sync::Mutex::new("starting")),
-            ownership: Arc::new(std::sync::Mutex::new(Some(ownership))),
+            ownership,
         };
         let step = departure.step.clone();
         let ownership = departure.ownership.clone();
@@ -1325,21 +1345,57 @@ pub(crate) fn set_ready(ready: bool) {
     READY.store(ready, Ordering::SeqCst);
 }
 
+/// The stop signals of a daemon (SIGTERM, SIGINT, a gone test parent), one
+/// future for the life of the process; see `run_serve`.
+pub(crate) type StopFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + Send>>;
+
+/// A daemon's [`crate::instance::Ownership`] in a slot that whoever ends the
+/// process empties: the shutdown, its watchdog or a stop during the start.
+pub(crate) type HeldOwnership = Arc<std::sync::Mutex<Option<crate::instance::Ownership>>>;
+
+/// Run `f` on the ownership in `held`, or fail when a stop already took it.
+fn owned<T>(
+    held: &HeldOwnership,
+    f: impl FnOnce(&crate::instance::Ownership) -> T,
+) -> anyhow::Result<T> {
+    let slot = held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slot.as_ref() {
+        Some(ownership) => Ok(f(ownership)),
+        None => anyhow::bail!("this instance is stopping"),
+    }
+}
+
 /// A swappable router: the listener binds once and the router behind it can
 /// be replaced without rebinding. Each request clones the current router.
 #[derive(Clone)]
-pub(crate) struct HttpSlot(Arc<std::sync::RwLock<axum::Router>>);
+pub(crate) struct HttpSlot {
+    router: Arc<std::sync::RwLock<axum::Router>>,
+    /// Set once the server of this slot has stopped.
+    stopped: Arc<AtomicBool>,
+}
 
 impl HttpSlot {
     pub(crate) fn new(router: axum::Router) -> Self {
-        Self(Arc::new(std::sync::RwLock::new(router)))
+        Self {
+            router: Arc::new(std::sync::RwLock::new(router)),
+            stopped: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub(crate) fn swap(&self, router: axum::Router) {
         *self
-            .0
+            .router
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = router;
+    }
+
+    /// Whether the server of this slot still serves: false once
+    /// [`serve_http_slot`] returned.
+    pub(crate) fn is_serving(&self) -> bool {
+        !self.stopped.load(Ordering::SeqCst)
     }
 }
 
@@ -1357,7 +1413,7 @@ impl tower_service::Service<axum::extract::Request> for HttpSlot {
 
     fn call(&mut self, request: axum::extract::Request) -> Self::Future {
         let mut router = self
-            .0
+            .router
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
@@ -1890,6 +1946,7 @@ pub(crate) async fn serve_http_slot(
 ) -> anyhow::Result<()> {
     // The slot sits behind a fallback service so the connect info the make
     // service puts in the request extensions reaches the router it holds.
+    let stopped = slot.stopped.clone();
     let outer = axum::Router::new().fallback_service(slot);
     let served = axum::serve(
         listener,
@@ -1897,6 +1954,7 @@ pub(crate) async fn serve_http_slot(
     )
     .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
     .await;
+    stopped.store(true, Ordering::SeqCst);
     set_ready(false);
     served?;
     Ok(())

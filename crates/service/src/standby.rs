@@ -23,7 +23,9 @@ use std::sync::Arc;
 use interprocess::local_socket::tokio::Listener as IpcListener;
 use tokio::sync::watch;
 
-use crate::daemon::{HttpSlot, Shared};
+#[cfg(not(feature = "postgres"))]
+use crate::daemon::HeldOwnership;
+use crate::daemon::{HttpSlot, Shared, StopFuture};
 
 /// What the Postgres path set up before the store opens: the control socket
 /// (served by [`standby_ctl`] until the daemon takes it over), the HTTP slot
@@ -40,9 +42,14 @@ pub(crate) struct PgStart {
     /// The early HTTP slot; `None` when the endpoint is off or its bind
     /// failed (said in the log already).
     http: Option<HttpSlot>,
-    /// The owner lock, held from here to the exit.
+    /// The owner lock, held from here to the exit. Shared with the start
+    /// guard, which releases it when a stop comes during the start.
     #[cfg(feature = "postgres")]
-    owner: crystalline_index::postgres::PgOwner,
+    owner: Arc<crystalline_index::postgres::PgOwner>,
+    /// The start guard: it ends the process on a stop until the handover,
+    /// then gives the stop future back.
+    guard: tokio::task::JoinHandle<Option<StopFuture>>,
+    guard_done: tokio::sync::oneshot::Sender<()>,
     /// The owner row as the predecessor left it, for the takeover.
     #[cfg(feature = "postgres")]
     #[allow(dead_code, reason = "read by the takeover (Task 1.11)")]
@@ -53,7 +60,7 @@ pub(crate) struct PgStart {
 /// the process.
 pub(crate) struct PgHeld {
     #[cfg(feature = "postgres")]
-    _owner: crystalline_index::postgres::PgOwner,
+    _owner: Arc<crystalline_index::postgres::PgOwner>,
 }
 
 impl PgStart {
@@ -64,11 +71,17 @@ impl PgStart {
 
     /// Hand the control socket to the daemon: every connection the early
     /// responder holds for the start is served on `shared` from now on, and
-    /// the listener comes back for the accept loop.
+    /// the listener comes back for the accept loop, with the stop future for
+    /// the daemon's own wait.
     pub(crate) async fn hand_over(
         self,
         shared: &Arc<Shared>,
-    ) -> anyhow::Result<(IpcListener, PgHeld)> {
+    ) -> anyhow::Result<(IpcListener, PgHeld, StopFuture)> {
+        let _ = self.guard_done.send(());
+        let stop =
+            self.guard.await.ok().flatten().ok_or_else(|| {
+                anyhow::anyhow!("the start guard did not give the stop signals back")
+            })?;
         self.handover.send_replace(Some(shared.clone()));
         let listener = self
             .ctl
@@ -80,6 +93,7 @@ impl PgStart {
                 #[cfg(feature = "postgres")]
                 _owner: self.owner,
             },
+            stop,
         ))
     }
 }
@@ -98,14 +112,14 @@ pub(crate) fn probes_router(base: crystalline_core::base::BasePath) -> axum::Rou
 #[cfg(not(feature = "postgres"))]
 pub(crate) async fn start_on_postgres(
     _cfg: &crystalline_core::config::GlobalConfig,
-    ownership: crate::instance::Ownership,
+    _ownership: &HeldOwnership,
     _instance_id: &str,
     _http_addr: Option<&str>,
     _shutdown: &watch::Sender<bool>,
-    _stop_signals: impl std::future::Future<Output = &'static str>,
+    stop: StopFuture,
     _farewell: Option<&'static str>,
-) -> anyhow::Result<(crate::instance::Ownership, Option<PgStart>)> {
-    Ok((ownership, None))
+) -> anyhow::Result<(Option<PgStart>, Option<StopFuture>)> {
+    Ok((None, Some(stop)))
 }
 
 #[cfg(feature = "postgres")]
@@ -128,7 +142,7 @@ mod pg {
 
     use super::PgStart;
     use crate::control::{envelope_err, envelope_ok};
-    use crate::daemon::{HttpSlot, Role, Shared};
+    use crate::daemon::{HeldOwnership, HttpSlot, Role, Shared, StopFuture};
 
     /// The `Retry-After` the standby's HTTP answers carry, in seconds.
     pub(crate) const RETRY_AFTER_SECS: u64 = 5;
@@ -141,6 +155,30 @@ mod pg {
     /// The same answer while the instance that just took the database still
     /// opens its store.
     pub(crate) const STARTING_HTTP: &str = "this instance is starting; try again in a moment";
+
+    /// What a connection parked for the start hears when the start failed
+    /// after the lock was taken.
+    pub(crate) const START_FAILED: &str = "this instance could not start; see its log";
+
+    /// The test-only variable that holds a Postgres start for this many
+    /// milliseconds right after the lock is taken, so a test can reach the
+    /// window between the lock and the handover. Read by a debug build only.
+    pub(crate) const START_HOLD_ENV: &str = "CRYSTALLINE_TEST_START_HOLD_MS";
+
+    /// How long [`START_HOLD_ENV`] holds the start, in a debug build.
+    fn start_hold() -> Option<Duration> {
+        if !cfg!(debug_assertions) {
+            return None;
+        }
+        std::env::var(START_HOLD_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    }
+
+    /// How long a stop during the start waits for the release.
+    const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
     /// How often a standby says in the log who owns the database.
     pub(crate) const STANDBY_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -322,21 +360,29 @@ mod pg {
         }
     }
 
-    /// The daemon's shared state once it is there, or `None` while this
-    /// instance is a standby (or turns into one while waiting) and when the
-    /// start failed.
-    async fn wait_for_daemon(rx: &mut watch::Receiver<Option<Arc<Shared>>>) -> Option<Arc<Shared>> {
+    /// What a parked connection found when its wait ended.
+    enum Waited {
+        /// The daemon serves now.
+        Daemon(Arc<Shared>),
+        /// This instance is a standby (or turned into one while waiting).
+        Standby,
+        /// The start failed after the lock was taken; the process is leaving.
+        Failed,
+    }
+
+    /// Wait for the daemon's shared state while this instance starts.
+    async fn wait_for_daemon(rx: &mut watch::Receiver<Option<Arc<Shared>>>) -> Waited {
         let mut role = crate::daemon::role_watch();
         loop {
             if let Some(shared) = rx.borrow().clone() {
-                return Some(shared);
+                return Waited::Daemon(shared);
             }
             if *role.borrow() == Role::Standby {
-                return None;
+                return Waited::Standby;
             }
             tokio::select! {
-                changed = rx.changed() => if changed.is_err() { return None },
-                changed = role.changed() => if changed.is_err() { return None },
+                changed = rx.changed() => if changed.is_err() { return Waited::Failed },
+                _ = role.changed() => {}
             }
         }
     }
@@ -354,8 +400,11 @@ mod pg {
         match mode {
             "ctl" => serve_early_ctl(stream, view, shutdown, handover).await,
             "mcp" => match wait_for_daemon(&mut handover).await {
-                Some(shared) => crate::daemon::serve_mcp_conn(stream, &options, shared).await,
-                None => refuse_mcp(stream, &view.refusal()).await,
+                Waited::Daemon(shared) => {
+                    crate::daemon::serve_mcp_conn(stream, &options, shared).await
+                }
+                Waited::Standby => refuse_mcp(stream, &view.refusal()).await,
+                Waited::Failed => refuse_mcp(stream, START_FAILED).await,
             },
             other => tracing::debug!("unknown handshake '{other}'"),
         }
@@ -448,16 +497,25 @@ mod pg {
                 }
                 (envelope_ok(data), Stop::No)
             }
+            // Never parked: a stop must reach a standby and a start alike at
+            // once (the standby wait and the start guard both hear it).
+            "shutdown" => {
+                let stop = match handover.borrow().clone() {
+                    Some(shared) => Stop::Daemon(shared),
+                    None => Stop::Standby,
+                };
+                (envelope_ok(json!({ "stopping": true })), stop)
+            }
             _ => match wait_for_daemon(handover).await {
-                Some(shared) => {
+                Waited::Daemon(shared) => {
                     let (response, stop) = crate::control::handle(req, &shared).await;
                     (response, if stop { Stop::Daemon(shared) } else { Stop::No })
                 }
-                None => match cmd {
+                Waited::Standby => match cmd {
                     "status" => (envelope_ok(view.status_data()), Stop::No),
-                    "shutdown" => (envelope_ok(json!({ "stopping": true })), Stop::Standby),
                     _ => (envelope_err(view.refusal()), Stop::No),
                 },
+                Waited::Failed => (envelope_err(START_FAILED), Stop::No),
             },
         }
     }
@@ -472,34 +530,44 @@ mod pg {
 
     /// Take the database on the Postgres path, or wait for it as a standby.
     ///
-    /// Answers `None` for any other backend. On Postgres it binds the
-    /// control socket and publishes the record, binds the HTTP endpoint with
-    /// the standby router in its slot, and tries the owner lock. When the lock
-    /// is held elsewhere this instance is a standby until the lock comes free;
-    /// a stop while it waits removes the record and exits 0, since there is
-    /// nothing to release (`farewell` goes to the console then, as a stopping
-    /// daemon's does). It returns once this instance holds the lock, for the
-    /// normal start, and hands `ownership` back.
+    /// Any other backend gets `(None, Some(stop))`, with `stop` never polled.
+    /// On Postgres it binds the control socket and publishes the record,
+    /// binds the HTTP endpoint with the standby router in its slot, and tries
+    /// the owner lock. When the lock is held elsewhere this instance is a
+    /// standby until the lock comes free. Once it holds the lock a start
+    /// guard takes `stop` and watches it, and a ctl `shutdown`, until the
+    /// handover ([`PgStart::hand_over`] gives `stop` back). A stop at any
+    /// point leaves the same way: the lock released when held, the record
+    /// removed, `farewell` on the console and exit 0.
     pub(crate) async fn start_on_postgres(
         cfg: &GlobalConfig,
-        ownership: crate::instance::Ownership,
+        ownership: &HeldOwnership,
         instance_id: &str,
         http_addr: Option<&str>,
         shutdown: &watch::Sender<bool>,
-        stop_signals: impl std::future::Future<Output = &'static str>,
+        mut stop: StopFuture,
         farewell: Option<&'static str>,
-    ) -> anyhow::Result<(crate::instance::Ownership, Option<PgStart>)> {
+    ) -> anyhow::Result<(Option<PgStart>, Option<StopFuture>)> {
         let database = cfg.database();
         if database.backend != DatabaseBackend::Postgres {
-            return Ok((ownership, None));
+            return Ok((None, Some(stop)));
         }
         let target = PgTarget::from_config(&database).map_err(|e| anyhow::anyhow!("{e}"))?;
         let described = target.describe();
 
         // Bound and published before anything waits or opens: a client that
         // asks the socket is answered from now on.
-        let listener = ownership.bind_listener()?;
-        ownership.publish()?;
+        let listener = {
+            let slot = ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(held) = slot.as_ref() else {
+                anyhow::bail!("this instance is stopping");
+            };
+            let listener = held.bind_listener()?;
+            held.publish()?;
+            listener
+        };
         crate::daemon::start_step("record published");
 
         let http = match http_addr {
@@ -524,7 +592,12 @@ mod pg {
             command: None,
             version: crystalline_core::VERSION.to_string(),
         };
-        let owner = PgOwner::start(target, me).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let owner = Arc::new(PgOwner::start(target, me).map_err(|e| anyhow::anyhow!("{e}"))?);
+        let leaving = Leaving {
+            owner: owner.clone(),
+            ownership: ownership.clone(),
+            farewell,
+        };
         let previous = match owner.try_acquire().await {
             Ok(Acquired::Held { previous, .. }) => previous,
             Ok(Acquired::Busy(row)) => {
@@ -535,7 +608,7 @@ mod pg {
                     &described,
                     status_tx,
                     shutdown.subscribe(),
-                    stop_signals,
+                    &mut stop,
                 )
                 .await?;
                 match end {
@@ -546,31 +619,87 @@ mod pg {
                         );
                         previous
                     }
-                    WaitEnd::Stop(reason) => {
-                        tracing::info!("standby: stopping ({reason})");
-                        // The record, the socket and the lock file go; the
-                        // database was never this instance's.
-                        drop(ownership);
-                        if let Some(line) = farewell {
-                            crate::logging::console_line(line);
-                        }
-                        crate::session_end::notify_stopped();
-                        crate::daemon::exit_with(0);
-                    }
+                    WaitEnd::Stop(reason) => leaving.leave("standby", reason).await,
                 }
             }
             Err(e) => anyhow::bail!("could not reach the database {described} to take it: {e}"),
         };
+
+        // From the lock to the handover a stop must still end the process at
+        // once and give the database back: the store open, the migrations
+        // and (from the takeover on) the grace all run in this window.
+        let (guard_done, done) = tokio::sync::oneshot::channel();
+        let guard = tokio::spawn(guard_start(stop, shutdown.subscribe(), done, leaving));
+        if let Some(hold) = start_hold() {
+            tracing::info!("test hook: holding the start for {}ms", hold.as_millis());
+            tokio::time::sleep(hold).await;
+        }
         Ok((
-            ownership,
             Some(PgStart {
                 ctl,
                 handover,
                 http,
                 owner,
+                guard,
+                guard_done,
                 previous,
             }),
+            None,
         ))
+    }
+
+    /// How a stop leaves before the daemon serves.
+    struct Leaving {
+        owner: Arc<PgOwner>,
+        ownership: HeldOwnership,
+        farewell: Option<&'static str>,
+    }
+
+    impl Leaving {
+        /// Release the lock when it is held (the release does nothing
+        /// otherwise), remove the record, the socket and the lock file, and
+        /// exit 0. `phase` names where the stop came, for the log.
+        async fn leave(self, phase: &str, reason: &str) -> ! {
+            tracing::info!("{phase}: stopping ({reason})");
+            match tokio::time::timeout(RELEASE_WAIT, self.owner.release()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("could not release the database ({e}); the exit frees it")
+                }
+                Err(_) => tracing::warn!(
+                    "the release did not finish in {}s; the exit frees the database",
+                    RELEASE_WAIT.as_secs()
+                ),
+            }
+            drop(
+                self.ownership
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+            if let Some(line) = self.farewell {
+                crate::logging::console_line(line);
+            }
+            crate::session_end::notify_stopped();
+            crate::daemon::exit_with(0);
+        }
+    }
+
+    /// Watch `stop` and a ctl `shutdown` from the lock to the handover and
+    /// leave on either; give `stop` back once `done` fires (or its sender is
+    /// gone: the start failed and the process leaves with the error).
+    async fn guard_start(
+        mut stop: StopFuture,
+        mut shutdown: watch::Receiver<bool>,
+        done: tokio::sync::oneshot::Receiver<()>,
+        leaving: Leaving,
+    ) -> Option<StopFuture> {
+        tokio::select! {
+            biased;
+            _ = done => Some(stop),
+            reason = &mut stop => leaving.leave("start", reason).await,
+            _ = crate::daemon::wait_true(&mut shutdown) => leaving.leave("start", "ctl shutdown").await,
+        }
     }
 
     /// Bind the HTTP endpoint before the store opens and serve the standby
@@ -611,12 +740,11 @@ mod pg {
         database: &str,
         status: watch::Sender<StandbyStatus>,
         mut shutdown: watch::Receiver<bool>,
-        stop_signals: impl std::future::Future<Output = &'static str>,
+        stop: &mut StopFuture,
     ) -> anyhow::Result<WaitEnd> {
         let seen = status.subscribe();
         let acquire = owner.wait_acquire(status);
         tokio::pin!(acquire);
-        tokio::pin!(stop_signals);
         let mut log = tokio::time::interval(STANDBY_LOG_EVERY);
         log.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -630,7 +758,7 @@ mod pg {
                         Err(e) => anyhow::bail!("the wait for the database {database} failed: {e}"),
                     };
                 }
-                reason = &mut stop_signals => return Ok(WaitEnd::Stop(reason)),
+                reason = stop.as_mut() => return Ok(WaitEnd::Stop(reason)),
                 _ = crate::daemon::wait_true(&mut shutdown) => return Ok(WaitEnd::Stop("ctl shutdown")),
                 _ = log.tick() => {
                     tracing::info!("{}", standby_line(database, seen.borrow().owner.as_ref()));

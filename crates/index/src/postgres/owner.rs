@@ -1010,6 +1010,8 @@ impl Worker {
 mod tests {
     use super::*;
 
+    use crate::postgres::{PostgresStore, ScratchSchema};
+
     /// A refused takeover termination names the database and the remedy;
     /// any other error is passed on unchanged.
     #[test]
@@ -1027,7 +1029,6 @@ mod tests {
             "another error stays a database error"
         );
     }
-    use crate::postgres::{PostgresStore, ScratchSchema};
 
     fn pg_url() -> Option<String> {
         std::env::var("CRYSTALLINE_TEST_POSTGRES_URL")

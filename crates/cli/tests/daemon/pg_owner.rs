@@ -29,6 +29,11 @@ struct Serve {
 
 impl Serve {
     fn start(env: &Env, rust_log: Option<&str>) -> Serve {
+        Serve::start_with(env, rust_log, &[])
+    }
+
+    /// [`Serve::start`] with `extra` variables for this child only.
+    fn start_with(env: &Env, rust_log: Option<&str>, extra: &[(&str, &str)]) -> Serve {
         let addr = format!("127.0.0.1:{}", free_port());
         let log = env
             .state_dir()
@@ -39,6 +44,9 @@ impl Serve {
         cmd.env("CRYSTALLINE_TEST_OWNER_TIMING_SCALE", TIMING_SCALE);
         if let Some(filter) = rust_log {
             cmd.env("RUST_LOG", filter);
+        }
+        for (key, value) in extra {
+            cmd.env(key, value);
         }
         let child = cmd
             .args(["serve", "--http", &addr])
@@ -120,6 +128,22 @@ impl Serve {
             assert!(
                 start.elapsed() < within,
                 "serve did not exit within {within:?}:\n{}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until the log holds `needle`, or panic with the log.
+    fn wait_log(&mut self, needle: &str) {
+        let start = Instant::now();
+        while !self.log().contains(needle) {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!("serve exited with {status}:\n{}", self.log());
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the log never said {needle:?}:\n{}",
                 self.log()
             );
             std::thread::sleep(Duration::from_millis(50));
@@ -378,4 +402,135 @@ fn turso_order_unchanged() {
     assert_eq!(health["role"], "active");
     serve.terminate();
     assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+}
+
+/// The log line a former standby writes when the start hold begins.
+const HOLDING: &str = "test hook: holding the start";
+
+/// A standby that took the database over and is still starting (held by
+/// the test hook for 30 s) stops at once on SIGTERM, with exit 0, and gives
+/// the database and its record back: the stop signals are one future for
+/// the whole process, so the standby wait did not swallow them.
+#[cfg(feature = "postgres")]
+#[test]
+fn a_former_standby_stops_at_once_during_its_start() {
+    let Some(pg) = PgScratch::new("sbstart") else {
+        return;
+    };
+    let active_env = Env::new("sbsa").on_postgres(&pg);
+    let mut active = Serve::start(&active_env, None);
+    active.wait_ready();
+    let standby_env = Env::new("sbss").on_postgres(&pg);
+    let mut standby = Serve::start_with(
+        &standby_env,
+        None,
+        &[("CRYSTALLINE_TEST_START_HOLD_MS", "30000")],
+    );
+    standby.wait_role("standby");
+
+    let (ok, out, err) = active_env.run_full(&["ctl", "shutdown"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(active.wait_exit(Duration::from_secs(15)), Some(0));
+    standby.wait_log(HOLDING);
+
+    let asked = Instant::now();
+    standby.terminate();
+    assert_eq!(standby.wait_exit(Duration::from_secs(10)), Some(0));
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the stop waited for the start"
+    );
+    let log = standby.log();
+    assert!(log.contains("start: stopping (SIGTERM)"), "{log}");
+    assert!(!standby_env.info_path().exists(), "the record stayed");
+    let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
+    assert_eq!(
+        pg.text(&format!("SELECT pg_try_advisory_lock({key})::text")),
+        "true",
+        "the database is still held"
+    );
+}
+
+/// A connection made after a former standby took the lock and before the
+/// daemon serves is parked and then served, never refused: an MCP session
+/// gets its initialize result and `status` the daemon's own report.
+#[test]
+fn a_former_standby_serves_what_its_start_parked() {
+    let Some(pg) = PgScratch::new("sbpark") else {
+        return;
+    };
+    let active_env = Env::new("sbpa").on_postgres(&pg);
+    let mut active = Serve::start(&active_env, None);
+    active.wait_ready();
+    let standby_env = Env::new("sbps").on_postgres(&pg);
+    let mut standby = Serve::start_with(
+        &standby_env,
+        None,
+        &[("CRYSTALLINE_TEST_START_HOLD_MS", "3000")],
+    );
+    standby.wait_role("standby");
+
+    let (ok, out, err) = active_env.run_full(&["ctl", "shutdown"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(active.wait_exit(Duration::from_secs(15)), Some(0));
+    standby.wait_log(HOLDING);
+
+    // Both asked inside the hold.
+    let status = {
+        let mut cmd = Command::new(bin());
+        standby_env.apply(&mut cmd);
+        cmd.args(["status", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut cmd = Command::new(bin());
+    standby_env.apply(&mut cmd);
+    let mut mcp = cmd
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = mcp.stdin.take().unwrap();
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "it", "version": "0" },
+        },
+    });
+    writeln!(stdin, "{initialize}").unwrap();
+    let mut first = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(mcp.stdout.take().unwrap()),
+        &mut first,
+    )
+    .unwrap();
+    drop(stdin);
+    let _ = mcp.wait();
+    let reply: Value = serde_json::from_str(first.trim()).unwrap();
+    assert_eq!(reply["id"], 1, "{first}");
+    assert!(
+        reply.get("result").is_some(),
+        "the session was refused: {first}"
+    );
+
+    let out = status.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_str(&text).unwrap();
+    assert_ne!(report["role"], "standby", "{report}");
+    assert_eq!(report["pid"].as_u64(), Some(standby.child.id() as u64));
+
+    let health: Value = standby.get("/health").unwrap().json().unwrap();
+    assert_eq!(health["role"], "active");
+    standby.wait_ready();
 }

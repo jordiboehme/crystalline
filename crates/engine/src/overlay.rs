@@ -175,6 +175,10 @@ pub const RESERVED_VARS: &[&str] = &[
     // takes milliseconds. Read straight from the environment, never through
     // the settings registry.
     "CRYSTALLINE_TEST_OWNER_TIMING_SCALE",
+    // The Postgres start's test hold (`START_HOLD_ENV` in the service
+    // crate's standby): a debug daemon waits this many milliseconds right
+    // after it took the owner lock. Read straight from the environment.
+    "CRYSTALLINE_TEST_START_HOLD_MS",
     // The CLI's token-store seam (`crystalline::cmd::test_token_store_dir`):
     // it points a `connect github` at a plain file under a tempdir so the
     // tests never reach this machine's keychain. Read straight from the
