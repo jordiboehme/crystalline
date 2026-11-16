@@ -434,7 +434,8 @@ jobs:
       # The auth store's suite a second time on the postgres leg, with the
       # accounts in the container started above instead of a Turso file. The
       # whole workspace is named so the build of the run above is reused and
-      # only the identity crate's tests run.
+      # only the identity crate's tests run. It takes the leg's partition like
+      # the run above, so a partitioned leg runs each test once.
       - name: cargo nextest run (auth store on postgres)
         if: ${{ matrix.os == 'ubuntu-latest' && needs.changes.outputs.tested != 'true' }}
         env:
@@ -442,7 +443,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo nextest run --workspace --profile ci --locked -E 'package(crystalline-identity)' 2>&1 | tee -a "$RUNNER_TEMP/nextest.log"
+          args=()
+          if [ -n "$PARTITION" ]; then
+            args+=(--partition "hash:$PARTITION")
+          fi
+          cargo nextest run --workspace --profile ci --locked -E 'package(crystalline-identity)' "${args[@]}" 2>&1 | tee -a "$RUNNER_TEMP/nextest.log"
 
       # A test that passed on its retry is FLAKY in the log. Show each as a
       # warning on the run; the job stays green.

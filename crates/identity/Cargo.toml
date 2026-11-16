@@ -47,6 +47,8 @@ sqlx = { workspace = true, optional = true }
 [dev-dependencies]
 # This crate's own tests always build the Postgres arm, so
 # `CRYSTALLINE_TEST_AUTH_BACKEND=postgres` can run the suite against it.
+# The self dev-dependency is intended (Cargo.lock lists the crate as its own
+# dev-dependency), and `cargo deny` accepts it.
 crystalline-identity = { path = ".", features = ["postgres"] }
 futures = { workspace = true }
 tempfile = { workspace = true }
