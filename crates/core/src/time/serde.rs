@@ -6,9 +6,8 @@
 //! of none, 3, 6 or 9 digits (`2026-01-05T10:17:19.120Z`), [`offset_stamp`]
 //! gives `Z` for offset zero and `+hh:mm` otherwise, and [`day`] gives
 //! `%Y-%m-%d`. Reading is what chrono's `Deserialize` accepted, through
-//! [`parse_lenient_stamp`](super::parse_lenient_stamp),
-//! [`parse_lenient_offset`](super::parse_lenient_offset) and
-//! [`parse_lenient_date`](super::parse_lenient_date).
+//! [`parse_lenient_stamp`], [`parse_lenient_offset`] and
+//! [`parse_lenient_date`].
 //!
 //! Every adapter has an `_option` twin for an `Option` field. It writes
 //! `None` as `null`, and the field must also carry `#[serde(default)]`:
@@ -172,6 +171,43 @@ adapter!(
     "a date",
     "A [`Day`] as `YYYY-MM-DD`."
 );
+
+/// A map from names to [`Stamp`]s (`BTreeMap<String, Stamp>`), each value
+/// written and read as [`stamp`] does. A missing key needs
+/// `#[serde(default)]` on the field to load as an empty map, as for the
+/// `_option` adapters.
+pub mod stamp_map {
+    use super::*;
+    use ::serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    /// One value of the map, read through [`stamp`](super::stamp).
+    struct Value(Stamp);
+
+    impl<'de> Deserialize<'de> for Value {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+            super::stamp::deserialize(d).map(Value)
+        }
+    }
+
+    /// Writes every value as chrono's serde did.
+    pub fn serialize<S: Serializer>(
+        value: &BTreeMap<String, Stamp>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let texts: BTreeMap<&String, String> =
+            value.iter().map(|(k, v)| (k, stamp_text(*v))).collect();
+        texts.serialize(s)
+    }
+
+    /// Reads every value as chrono's `Deserialize` did.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<String, Stamp>, D::Error> {
+        let values = BTreeMap::<String, Value>::deserialize(d)?;
+        Ok(values.into_iter().map(|(k, v)| (k, v.0)).collect())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -451,5 +487,63 @@ mod tests {
                 .unwrap()
                 .contains(r#""maybe_at":null"#)
         );
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct OursMap {
+        #[serde(default, with = "stamp_map")]
+        nudges: std::collections::BTreeMap<String, Stamp>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TheirsMap {
+        #[serde(default)]
+        nudges: std::collections::BTreeMap<String, DateTime<Utc>>,
+    }
+
+    #[test]
+    fn stamp_map_matches_chrono() {
+        let instants = [
+            DateTime::from_timestamp(1_767_608_239, 120_000_000).unwrap(),
+            DateTime::from_timestamp(-1, 999_999_999).unwrap(),
+            DateTime::from_timestamp(0, 0).unwrap(),
+        ];
+        let maps: Vec<Vec<(String, DateTime<Utc>)>> = vec![
+            Vec::new(),
+            vec![("search".into(), instants[0])],
+            instants
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("tool-{i}"), *t))
+                .collect(),
+        ];
+        for entries in maps {
+            let theirs = TheirsMap {
+                nudges: entries.iter().cloned().collect(),
+            };
+            let ours = OursMap {
+                nudges: entries
+                    .iter()
+                    .map(|(k, t)| (k.clone(), Stamp::from_chrono(*t)))
+                    .collect(),
+            };
+            let json = serde_json::to_string(&theirs).unwrap();
+            assert_eq!(serde_json::to_string(&ours).unwrap(), json);
+            let yaml = serde_yaml_ng::to_string(&theirs).unwrap();
+            assert_eq!(serde_yaml_ng::to_string(&ours).unwrap(), yaml);
+            let back: OursMap = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.nudges, ours.nudges);
+            let back: OursMap = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(back.nudges, ours.nudges);
+        }
+        let lenient = r#"{"nudges":{"a":" 2026-1-5T1:7:9 +0200 "}}"#;
+        let ours: OursMap = serde_json::from_str(lenient).unwrap();
+        let theirs: TheirsMap = serde_json::from_str(lenient).unwrap();
+        assert_eq!(ours.nudges["a"].into_chrono(), theirs.nudges["a"]);
+        let missing: OursMap = serde_json::from_str("{}").unwrap();
+        assert!(missing.nudges.is_empty());
+        let bad = r#"{"nudges":{"a":"2026-02-30T00:00:00Z"}}"#;
+        assert!(serde_json::from_str::<OursMap>(bad).is_err());
+        assert!(serde_json::from_str::<TheirsMap>(bad).is_err());
     }
 }

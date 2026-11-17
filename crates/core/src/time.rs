@@ -30,11 +30,16 @@ use chrono::{
 };
 use parse::Parts;
 use std::cmp::Ordering;
+use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ops::{Add, Mul, Neg, Sub};
+use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A UTC instant with nanosecond precision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// `Debug` prints what chrono's `Debug` printed: `2026-01-05T10:17:19Z`.
+/// `Default` is the Unix epoch, as for chrono's `DateTime<Utc>`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Stamp(DateTime<Utc>);
 
 /// An instant together with the UTC offset it was written with.
@@ -42,11 +47,16 @@ pub struct Stamp(DateTime<Utc>);
 /// Equality, ordering and hashing look at the instant only, so
 /// `10:00+02:00` and `08:00+00:00` are the same value; the offset matters
 /// only when the value is written out again.
-#[derive(Clone, Copy, Debug)]
+///
+/// `Debug` prints what chrono's `Debug` printed: the local date and time
+/// and the exact offset, `2026-01-05T12:17:19+02:00`.
+#[derive(Clone, Copy)]
 pub struct OffsetStamp(DateTime<FixedOffset>);
 
 /// A calendar date with no time of day and no offset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// `Debug` prints what chrono's `Debug` printed: `2026-01-05`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Day(NaiveDate);
 
 /// An exact span of time: whole seconds plus nanoseconds, where a day is
@@ -66,28 +76,34 @@ pub fn today_utc() -> Day {
 
 /// `n` days of 86400 seconds each. Panics when the span is out of range,
 /// as chrono's `Duration::days` does.
-pub fn days(n: i64) -> Delta {
+pub const fn days(n: i64) -> Delta {
     Delta(TimeDelta::days(n))
 }
 
 /// `n` hours. Panics when the span is out of range.
-pub fn hours(n: i64) -> Delta {
+pub const fn hours(n: i64) -> Delta {
     Delta(TimeDelta::hours(n))
 }
 
 /// `n` minutes. Panics when the span is out of range.
-pub fn minutes(n: i64) -> Delta {
+pub const fn minutes(n: i64) -> Delta {
     Delta(TimeDelta::minutes(n))
 }
 
 /// `n` seconds. Panics when the span is out of range.
-pub fn seconds(n: i64) -> Delta {
+pub const fn seconds(n: i64) -> Delta {
     Delta(TimeDelta::seconds(n))
 }
 
 /// `n` milliseconds.
-pub fn millis(n: i64) -> Delta {
+pub const fn millis(n: i64) -> Delta {
     Delta(TimeDelta::milliseconds(n))
+}
+
+/// `n` seconds, or `None` when the span is out of range. For a number from
+/// outside input, where [`seconds`] would panic.
+pub fn try_seconds(n: i64) -> Option<Delta> {
+    TimeDelta::try_seconds(n).map(Delta)
 }
 
 impl Delta {
@@ -117,6 +133,11 @@ impl Delta {
     /// Whole milliseconds in the span, truncated toward zero.
     pub fn num_millis(&self) -> i64 {
         self.0.num_milliseconds()
+    }
+
+    /// The span as a `std::time::Duration`, or `None` when it is negative.
+    pub fn to_std(&self) -> Option<Duration> {
+        self.0.to_std().ok()
     }
 
     /// Wraps a chrono span. Removed in stage 3.
@@ -165,6 +186,48 @@ impl Mul<i32> for Delta {
 }
 
 impl Stamp {
+    /// 1970-01-01T00:00:00Z.
+    pub const UNIX_EPOCH: Stamp = Stamp(DateTime::UNIX_EPOCH);
+
+    /// The instant at this UTC date and time of day, or `None` when there is
+    /// no such date or time (second 0 to 59) or it is out of range.
+    pub fn from_ymd_hms(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> Option<Stamp> {
+        let date = NaiveDate::from_ymd_opt(year, month, day)?;
+        date.and_hms_opt(hour, minute, second)
+            .map(|t| Stamp(t.and_utc()))
+    }
+
+    /// The instant a `SystemTime` names, or `None` when it is out of range
+    /// (where chrono's `From<SystemTime>` panicked).
+    pub fn from_system_time(time: SystemTime) -> Option<Stamp> {
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(after) => {
+                Stamp::from_unix(i64::try_from(after.as_secs()).ok()?, after.subsec_nanos())
+            }
+            Err(before) => {
+                let before = before.duration();
+                let secs = i64::try_from(before.as_secs()).ok()?;
+                match before.subsec_nanos() {
+                    0 => Stamp::from_unix(secs.checked_neg()?, 0),
+                    nanos => Stamp::from_unix(-secs - 1, 1_000_000_000 - nanos),
+                }
+            }
+        }
+    }
+
+    /// The instant `micros` microseconds after the Unix epoch, or `None` when
+    /// it is out of range.
+    pub fn from_unix_micros(micros: i64) -> Option<Stamp> {
+        DateTime::from_timestamp_micros(micros).map(Stamp)
+    }
+
     /// The instant `secs` seconds and `nanos` nanoseconds after the Unix
     /// epoch, or `None` when it is out of range or `nanos` is not below one
     /// second.
@@ -190,6 +253,12 @@ impl Stamp {
     /// infinity.
     pub fn unix_millis(&self) -> i64 {
         self.0.timestamp_millis()
+    }
+
+    /// Whole microseconds since the Unix epoch, rounded toward negative
+    /// infinity.
+    pub fn unix_micros(&self) -> i64 {
+        self.0.timestamp_micros()
     }
 
     /// The nanoseconds past the whole second.
@@ -239,6 +308,12 @@ impl Stamp {
         self.0.to_rfc3339_opts(SecondsFormat::Secs, false)
     }
 
+    /// chrono's `Display` of a UTC instant, for log lines:
+    /// `2026-01-05 10:17:19 UTC`, `2026-01-05 10:17:19.120 UTC`.
+    pub fn display_utc(&self) -> String {
+        emit::display_utc(self.unix_seconds(), self.subsec_nanos())
+    }
+
     /// `2026-01-05 10:17 UTC`.
     pub fn ymd_hm_utc(&self) -> String {
         self.0.format("%Y-%m-%d %H:%M UTC").to_string()
@@ -279,6 +354,12 @@ impl OffsetStamp {
         Stamp(self.0.to_utc())
     }
 
+    /// The date in the written offset: `2026-01-05T23:30:00-05:00` is the 5th,
+    /// though it is the 6th in UTC.
+    pub fn day(&self) -> Day {
+        Day(self.0.date_naive())
+    }
+
     /// The written offset in seconds east of UTC.
     pub fn offset_seconds(&self) -> i32 {
         self.0.offset().local_minus_utc()
@@ -306,6 +387,98 @@ impl OffsetStamp {
     #[doc(hidden)]
     pub fn into_chrono(self) -> DateTime<FixedOffset> {
         self.0
+    }
+}
+
+impl Default for Stamp {
+    fn default() -> Stamp {
+        Stamp::UNIX_EPOCH
+    }
+}
+
+impl fmt::Debug for Stamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&emit::debug_utc(self.unix_seconds(), self.subsec_nanos()))
+    }
+}
+
+impl fmt::Debug for OffsetStamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let instant = self.stamp();
+        f.write_str(&emit::debug_offset(
+            instant.unix_seconds(),
+            instant.subsec_nanos(),
+            self.offset_seconds(),
+        ))
+    }
+}
+
+impl fmt::Debug for Day {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (month, day) = (self.month() as u8, self.day() as u8);
+        f.write_str(&emit::date(i64::from(self.year()), month, day))
+    }
+}
+
+/// Moves the instant forward. Panics when out of range, as chrono's
+/// `DateTime + TimeDelta` does; [`Stamp::checked_add`] does not.
+impl Add<Delta> for Stamp {
+    type Output = Stamp;
+
+    fn add(self, rhs: Delta) -> Stamp {
+        self.checked_add(rhs).expect("`Stamp + Delta` overflowed")
+    }
+}
+
+/// Moves the instant back. Panics when out of range, as chrono's
+/// `DateTime - TimeDelta` does; [`Stamp::checked_sub`] does not.
+impl Sub<Delta> for Stamp {
+    type Output = Stamp;
+
+    fn sub(self, rhs: Delta) -> Stamp {
+        self.checked_sub(rhs).expect("`Stamp - Delta` overflowed")
+    }
+}
+
+impl AddAssign<Delta> for Stamp {
+    fn add_assign(&mut self, rhs: Delta) {
+        *self = *self + rhs;
+    }
+}
+
+impl SubAssign<Delta> for Stamp {
+    fn sub_assign(&mut self, rhs: Delta) {
+        *self = *self - rhs;
+    }
+}
+
+/// The span between two instants, as [`Stamp::since`].
+impl Sub<Stamp> for Stamp {
+    type Output = Delta;
+
+    fn sub(self, rhs: Stamp) -> Delta {
+        self.since(rhs)
+    }
+}
+
+/// Moves the date by the whole days in the span (the rest is dropped).
+/// Panics when out of range, as chrono's `NaiveDate + TimeDelta` does.
+impl Add<Delta> for Day {
+    type Output = Day;
+
+    fn add(self, rhs: Delta) -> Day {
+        Day(self.0 + rhs.0)
+    }
+}
+
+/// Moves the date back by the whole days in the span (the rest is
+/// dropped). Panics when out of range, as chrono's `NaiveDate - TimeDelta`
+/// does.
+impl Sub<Delta> for Day {
+    type Output = Day;
+
+    fn sub(self, rhs: Delta) -> Day {
+        Day(self.0 - rhs.0)
     }
 }
 
@@ -1129,6 +1302,283 @@ mod tests {
             Stamp::from_chrono(at(-1, 1, 1, 0)).rfc3339(),
             "-0001-01-01T23:59:59+00:00"
         );
+    }
+
+    #[test]
+    fn offset_stamp_day_is_the_written_date() {
+        let late = parse_rfc3339("2026-01-05T23:30:00-05:00").unwrap();
+        assert_eq!(late.day().ymd(), "2026-01-05");
+        assert_eq!(late.stamp().day_utc().ymd(), "2026-01-06");
+        assert_eq!(late.day().into_chrono(), late.into_chrono().date_naive());
+        let early = parse_rfc3339("2026-01-06T00:30:00+02:00").unwrap();
+        assert_eq!(early.day().ymd(), "2026-01-06");
+        assert_eq!(early.stamp().day_utc().ymd(), "2026-01-05");
+    }
+
+    #[test]
+    fn duration_helpers_are_const_and_try_seconds_never_panics() {
+        const REFRESH: Delta = minutes(5);
+        const SPANS: [Delta; 5] = [days(1), hours(2), minutes(3), seconds(4), millis(5)];
+        assert_eq!(REFRESH.num_seconds(), 300);
+        assert_eq!(
+            SPANS.map(|d| d.num_millis()),
+            [86_400_000, 7_200_000, 180_000, 4_000, 5]
+        );
+        assert_eq!(try_seconds(90), Some(seconds(90)));
+        assert_eq!(try_seconds(-90), Some(seconds(-90)));
+        assert_eq!(try_seconds(i64::MAX), None);
+        assert_eq!(try_seconds(i64::MIN), None);
+        assert_eq!(
+            try_seconds(i64::MAX).is_none(),
+            TimeDelta::try_seconds(i64::MAX).is_none()
+        );
+        assert_eq!(seconds(90).to_std(), Some(Duration::from_secs(90)));
+        assert_eq!(millis(1_500).to_std(), Some(Duration::from_millis(1_500)));
+        assert_eq!(Delta::ZERO.to_std(), Some(Duration::ZERO));
+        assert_eq!(seconds(-1).to_std(), None);
+    }
+
+    #[test]
+    fn operators_match_chrono() {
+        let base = Stamp::from_unix(BASE_SECS, 120_000_000).unwrap();
+        let reference = chrono_utc(BASE_SECS, 120_000_000);
+        let span = days(2) + millis(5);
+        assert_eq!((base + span).into_chrono(), reference + span.into_chrono());
+        assert_eq!((base - span).into_chrono(), reference - span.into_chrono());
+        assert_eq!((base + span) - base, span);
+        assert_eq!(base - (base + span), -span);
+        let mut moving = base;
+        moving += seconds(1);
+        assert_eq!(moving.unix_seconds(), BASE_SECS + 1);
+        moving -= seconds(2);
+        assert_eq!(moving.unix_seconds(), BASE_SECS - 1);
+        let day = Day::from_ymd(2026, 1, 5).unwrap();
+        assert_eq!((day + days(1)).ymd(), "2026-01-06");
+        assert_eq!((day - days(5)).ymd(), "2025-12-31");
+        // Only whole days move a date, as with chrono.
+        assert_eq!((day + hours(47)).ymd(), "2026-01-06");
+        assert_eq!(
+            (day - hours(47)).into_chrono(),
+            day.into_chrono() - TimeDelta::hours(47)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "`Stamp + Delta` overflowed")]
+    fn stamp_plus_delta_panics_out_of_range_as_chrono_does() {
+        let _ = Stamp::UNIX_EPOCH + days(400_000_000);
+    }
+
+    #[test]
+    fn constructors_match_chrono() {
+        assert_eq!(Stamp::UNIX_EPOCH.into_chrono(), DateTime::UNIX_EPOCH);
+        assert_eq!(Stamp::default(), Stamp::UNIX_EPOCH);
+        assert_eq!(Stamp::default().into_chrono(), DateTime::<Utc>::default());
+
+        let built = Stamp::from_ymd_hms(2026, 1, 5, 10, 17, 19).unwrap();
+        assert_eq!(built.rfc3339_secs_z(), "2026-01-05T10:17:19Z");
+        assert_eq!(
+            built.into_chrono(),
+            Utc.with_ymd_and_hms(2026, 1, 5, 10, 17, 19).unwrap()
+        );
+        assert_eq!(Stamp::from_ymd_hms(2026, 2, 30, 0, 0, 0), None);
+        assert_eq!(Stamp::from_ymd_hms(2026, 1, 5, 24, 0, 0), None);
+        assert_eq!(Stamp::from_ymd_hms(2026, 1, 5, 10, 17, 60), None);
+
+        let times = [
+            UNIX_EPOCH + Duration::new(1_767_608_239, 120_000_000),
+            UNIX_EPOCH,
+            UNIX_EPOCH - Duration::new(0, 1),
+            UNIX_EPOCH - Duration::new(86_400, 0),
+            UNIX_EPOCH - Duration::new(1, 500_000_000),
+        ];
+        for time in times {
+            assert_eq!(
+                Stamp::from_system_time(time).unwrap().into_chrono(),
+                DateTime::<Utc>::from(time),
+                "{time:?}"
+            );
+        }
+        let one_before = Stamp::from_system_time(UNIX_EPOCH - Duration::new(0, 1)).unwrap();
+        assert_eq!(
+            (one_before.unix_seconds(), one_before.subsec_nanos()),
+            (-1, 999_999_999)
+        );
+
+        for micros in [0, 1, -1, 1_767_608_239_120_001, -1_500_001] {
+            let ours = Stamp::from_unix_micros(micros).unwrap();
+            let theirs = DateTime::from_timestamp_micros(micros).unwrap();
+            assert_eq!(ours.into_chrono(), theirs, "{micros}");
+            assert_eq!(ours.unix_micros(), theirs.timestamp_micros(), "{micros}");
+            assert_eq!(ours.unix_micros(), micros);
+        }
+        let before = Stamp::from_unix_micros(-1).unwrap();
+        assert_eq!(
+            (before.unix_seconds(), before.subsec_nanos()),
+            (-1, 999_999_000)
+        );
+        assert_eq!(Stamp::from_unix_micros(i64::MAX), None);
+    }
+
+    #[test]
+    fn display_utc_matches_chrono_display() {
+        for nanos in NANOS {
+            let reference = chrono_utc(BASE_SECS, nanos);
+            let stamp = Stamp::from_chrono(reference);
+            assert_eq!(stamp.display_utc(), reference.to_string(), "{nanos}");
+        }
+        assert_eq!(
+            Stamp::from_unix(BASE_SECS, 0).unwrap().display_utc(),
+            "2026-01-05 10:17:19 UTC"
+        );
+        assert_eq!(
+            Stamp::from_unix(BASE_SECS, 120_000_000)
+                .unwrap()
+                .display_utc(),
+            "2026-01-05 10:17:19.120 UTC"
+        );
+    }
+
+    #[test]
+    fn instants_before_1970_floor_their_seconds() {
+        let last = Stamp::from_unix(-1, 999_999_999).unwrap();
+        assert_eq!(last.unix_seconds(), -1);
+        assert_eq!(last.unix_millis(), -1);
+        assert_eq!(last.unix_micros(), -1);
+        assert_eq!(last.subsec_nanos(), 999_999_999);
+        assert_eq!(last.rfc3339(), "1969-12-31T23:59:59.999999999+00:00");
+        let millis_before = Stamp::from_unix_millis(-1).unwrap();
+        assert_eq!(millis_before, Stamp::from_unix(-1, 999_000_000).unwrap());
+        assert_eq!(millis_before.rfc3339(), "1969-12-31T23:59:59.999+00:00");
+        let after = Stamp::from_unix(0, 1).unwrap();
+        assert_eq!(after.since(last).into_chrono(), TimeDelta::nanoseconds(2));
+        assert_eq!(last.since(after).num_millis(), 0);
+        assert_eq!(
+            last.since(Stamp::from_unix(-2, 0).unwrap()).num_millis(),
+            1_999
+        );
+        assert_eq!(
+            Stamp::from_unix(-86_401, 500_000_000).unwrap().rfc3339(),
+            "1969-12-30T23:59:59.500+00:00"
+        );
+    }
+
+    #[test]
+    fn debug_forms_match_chrono() {
+        let instants = [
+            chrono_utc(BASE_SECS, 0),
+            chrono_utc(BASE_SECS, 120_000_000),
+            chrono_utc(BASE_SECS, 123_456_789),
+            chrono_utc(-1, 999_999_999),
+            NaiveDate::from_ymd_opt(2026, 12, 31)
+                .unwrap()
+                .and_hms_nano_opt(23, 59, 59, 1_250_000_000)
+                .unwrap()
+                .and_utc(),
+            NaiveDate::from_ymd_opt(10000, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+            NaiveDate::from_ymd_opt(-1, 6, 30)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc(),
+        ];
+        for instant in instants {
+            assert_eq!(
+                format!("{:?}", Stamp::from_chrono(instant)),
+                format!("{instant:?}")
+            );
+            assert_eq!(
+                format!("{:?}", Day::from_chrono(instant.date_naive())),
+                format!("{:?}", instant.date_naive())
+            );
+            for offset in [0, 7_200, -16_200, 5_405, -29, 86_399] {
+                let written = instant.with_timezone(&FixedOffset::east_opt(offset).unwrap());
+                assert_eq!(
+                    format!("{:?}", OffsetStamp::from_chrono(written)),
+                    format!("{written:?}"),
+                    "{offset}"
+                );
+            }
+        }
+        let at = Stamp::from_unix(BASE_SECS, 120_000_000).unwrap();
+        assert_eq!(format!("{at:?}"), "2026-01-05T10:17:19.120Z");
+        assert_eq!(
+            format!("{:?}", parse_rfc3339("2026-01-05T12:17:19+02:00").unwrap()),
+            "2026-01-05T12:17:19+02:00"
+        );
+        assert_eq!(
+            format!("{:?}", at.to_offset_utc()),
+            "2026-01-05T10:17:19.120+00:00"
+        );
+        assert_eq!(format!("{:?}", at.day_utc()), "2026-01-05");
+        assert_eq!(
+            format!("{:?}", Some(at.day_utc())),
+            format!("{:?}", Some(at.into_chrono().date_naive()))
+        );
+    }
+
+    #[test]
+    fn compact_formats_hold_at_the_edges() {
+        let at = |y, m, d, h, mi, s, nanos| {
+            Stamp::from_chrono(
+                NaiveDate::from_ymd_opt(y, m, d)
+                    .unwrap()
+                    .and_hms_nano_opt(h, mi, s, nanos)
+                    .unwrap()
+                    .and_utc(),
+            )
+        };
+        let rows = [
+            (
+                at(0, 1, 1, 0, 0, 0, 0),
+                "0000-01-01",
+                "0000-01-01 00:00 UTC",
+                "00000101T000000.000Z",
+                "00000101T000000Z",
+                "000101000000",
+            ),
+            (
+                at(9999, 12, 31, 23, 59, 59, 999_999_999),
+                "9999-12-31",
+                "9999-12-31 23:59 UTC",
+                "99991231T235959.999Z",
+                "99991231T235959Z",
+                "991231235959",
+            ),
+            (
+                at(1969, 7, 20, 20, 17, 40, 500_000_000),
+                "1969-07-20",
+                "1969-07-20 20:17 UTC",
+                "19690720T201740.500Z",
+                "19690720T201740Z",
+                "690720201740",
+            ),
+            (
+                at(2026, 1, 5, 10, 17, 19, 123_999_999),
+                "2026-01-05",
+                "2026-01-05 10:17 UTC",
+                "20260105T101719.123Z",
+                "20260105T101719Z",
+                "260105101719",
+            ),
+        ];
+        for (stamp, ymd, hm, millis_z, z, short) in rows {
+            let reference = stamp.into_chrono();
+            assert_eq!(stamp.day_utc().ymd(), ymd);
+            assert_eq!(stamp.ymd_hm_utc(), hm);
+            assert_eq!(stamp.compact_millis_z(), millis_z);
+            assert_eq!(stamp.compact_z(), z);
+            assert_eq!(stamp.yymmddhhmmss(), short);
+            assert_eq!(ymd, reference.format("%Y-%m-%d").to_string());
+            assert_eq!(hm, reference.format("%Y-%m-%d %H:%M UTC").to_string());
+            assert_eq!(millis_z, reference.format("%Y%m%dT%H%M%S%.3fZ").to_string());
+            assert_eq!(z, reference.format("%Y%m%dT%H%M%SZ").to_string());
+            assert_eq!(short, reference.format("%y%m%d%H%M%S").to_string());
+        }
     }
 
     #[test]
