@@ -403,6 +403,9 @@ enum Command {
         addr: String,
     },
     /// Update Crystalline to the newest release.
+    // Hidden while its only verb is the hidden `verify-sums`; PR D of the
+    // self-update plan unhides it when `check`, `now` and `auto` arrive.
+    #[command(hide = true)]
     Update {
         #[command(subcommand)]
         cmd: UpdateCommand,
@@ -2800,6 +2803,59 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
     }
 }
 
+/// `update verify-sums`: exit 0 with one line when the signature over `sums`
+/// verifies with a trusted key ([`trusted_update_keys`]) and names `tag`,
+/// else exit 1 with the refusal on stderr.
+fn verify_sums(sums: &std::path::Path, minisig: &std::path::Path, tag: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let sums_bytes =
+        std::fs::read(sums).with_context(|| format!("cannot read {}", sums.display()))?;
+    let signature = std::fs::read_to_string(minisig)
+        .with_context(|| format!("cannot read {}", minisig.display()))?;
+    let keys = trusted_update_keys()?;
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    match crystalline_core::update::verify_signature(&sums_bytes, &signature, &keys, tag) {
+        Ok(_) => {
+            println!("verified SHA256SUMS for {tag}");
+            Ok(())
+        }
+        Err(refused) => {
+            eprintln!("{refused}");
+            Err(ExitWith(1).into())
+        }
+    }
+}
+
+/// The public keys an update signature is checked with: the compiled-in
+/// release keys and, in a debug build only, the key in the `.pub` file
+/// [`test_update_key`] names, so a test can sign with a throwaway key. A
+/// release build has no such seam: the environment never chooses a trusted
+/// key there.
+fn trusted_update_keys() -> anyhow::Result<Vec<String>> {
+    #[allow(unused_mut)]
+    let mut keys: Vec<String> = crystalline_core::update::RELEASE_KEYS
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    #[cfg(debug_assertions)]
+    if let Some(path) = test_update_key() {
+        use anyhow::Context;
+        let path = std::path::PathBuf::from(path);
+        keys.push(
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read {}", path.display()))?,
+        );
+    }
+    Ok(keys)
+}
+
+/// The test-only seam behind [`trusted_update_keys`]: the path of an extra
+/// trusted `.pub` file. Compiled into debug builds only.
+#[cfg(debug_assertions)]
+fn test_update_key() -> Option<OsString> {
+    std::env::var_os("CRYSTALLINE_TEST_UPDATE_KEY")
+}
+
 /// Hold the index lock and a published service record without ever binding the
 /// socket, then exit. This is the wedged daemon of the 2026-07-28 incident in
 /// its smallest honest form: a real process, a real OS lock, a real record and
@@ -2814,28 +2870,6 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 /// the time is up; refused when another instance owns it. With
 /// `--database-only` it holds that claim alone and never takes the state
 /// folder.
-/// `update verify-sums`: exit 0 with one line when the signature over `sums`
-/// verifies with a compiled-in release key and names `tag`, else exit 1 with
-/// the refusal on stderr.
-fn verify_sums(sums: &std::path::Path, minisig: &std::path::Path, tag: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
-    let sums_bytes =
-        std::fs::read(sums).with_context(|| format!("cannot read {}", sums.display()))?;
-    let signature = std::fs::read_to_string(minisig)
-        .with_context(|| format!("cannot read {}", minisig.display()))?;
-    let keys = crystalline_core::update::RELEASE_KEYS;
-    match crystalline_core::update::verify_signature(&sums_bytes, &signature, &keys, tag) {
-        Ok(_) => {
-            println!("verified SHA256SUMS for {tag}");
-            Ok(())
-        }
-        Err(refused) => {
-            eprintln!("{refused}");
-            Err(ExitWith(1).into())
-        }
-    }
-}
-
 fn hold_lock(secs: u64, standalone: Option<&str>, database_only: bool) -> anyhow::Result<()> {
     use std::io::Write;
     let _ownership = if database_only {
@@ -5905,7 +5939,8 @@ async fn domain_rename_dispatch(
 enum UpdateCommand {
     /// Release: check a `SHA256SUMS` signature with the compiled-in release
     /// keys and the tag in its trusted comment, so the publish job proves the
-    /// key pair before anything is published. Hidden, and not a user step.
+    /// key pair before anything is published. It checks no asset line: an
+    /// install does that. Hidden, and not a user step.
     #[command(name = "verify-sums", hide = true)]
     VerifySums {
         /// The `SHA256SUMS` file.
