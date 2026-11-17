@@ -22,8 +22,9 @@
 //! whether the coding-harness integration `crystalline install` wires up
 //! leaves any trace on disk and, when it does, whether its settings/hooks
 //! file parses and carries the `SessionStart`, `Stop` and `UserPromptSubmit`
-//! hooks (Copilot's `UserPromptSubmit` copy is reported present but noted
-//! inert - a config-file prompt hook's output is dropped there) and how
+//! hooks, plus `SubagentStart` for Claude Code (Copilot's `UserPromptSubmit`
+//! copy is reported present but noted inert - a config-file prompt hook's
+//! output is dropped there) and how
 //! many of the six managed skills are installed or locally modified (against the
 //! install receipt when one exists) and whether a receipt version skew or
 //! retired leftovers await the next session-start refresh - filesystem
@@ -643,6 +644,11 @@ pub struct HarnessDoctor {
     /// `None` - a corrupt file is "checked, found absent (we could not read
     /// it)", not "nothing to check here".
     pub prompt_hook: Option<bool>,
+    /// Whether the `SubagentStart` hook is present. `None` for every harness
+    /// [`crate::install::subagent_start_hook_applies`] answers `false` for
+    /// (all but Claude Code); a settings file that fails to parse reads as
+    /// `Some(false)` for Claude Code, like `prompt_hook`.
+    pub subagent_start_hook: Option<bool>,
     /// How many of the six managed skills have a `SKILL.md` at this
     /// harness's skills folder, whether or not its content still matches the
     /// embedded copy.
@@ -4142,40 +4148,57 @@ fn check_one_harness(harness: HarnessKind, book: &receipt::Receipt) -> HarnessDo
     let paths = harness_paths(harness, false);
     let settings_present = paths.settings.is_file();
 
-    let (session_start_hook, stop_hook, prompt_hook, settings_parse_error) = if is_profile {
-        // The profile harnesses have a session hook and nothing else.
-        match read_profile_json(&paths.settings) {
-            Ok(root) => (
-                root.is_some_and(|r| hook_dialect::session_hook_present(&profile.hooks, &r)),
-                false,
-                None,
-                None,
-            ),
-            Err(e) => (false, false, None, Some(e)),
-        }
-    } else {
-        match install::read_settings(&paths.settings) {
-            Ok(root) => (
-                install::harness_hook_present(
-                    harness,
-                    &root,
-                    "SessionStart",
-                    install::session_start_command(harness),
+    let subagent_applies = install::subagent_start_hook_applies(harness);
+    let (session_start_hook, stop_hook, prompt_hook, subagent_start_hook, settings_parse_error) =
+        if is_profile {
+            // The profile harnesses have a session hook and nothing else.
+            match read_profile_json(&paths.settings) {
+                Ok(root) => (
+                    root.is_some_and(|r| hook_dialect::session_hook_present(&profile.hooks, &r)),
+                    false,
+                    None,
+                    None,
+                    None,
                 ),
-                install::harness_hook_present(harness, &root, "Stop", install::STOP_COMMAND),
-                install::prompt_hook_command(harness).map(|_| {
+                Err(e) => (false, false, None, None, Some(e)),
+            }
+        } else {
+            match install::read_settings(&paths.settings) {
+                Ok(root) => (
                     install::harness_hook_present(
                         harness,
                         &root,
-                        "UserPromptSubmit",
-                        install::PROMPT_COMMAND,
-                    )
-                }),
-                None,
-            ),
-            Err(e) => (false, false, Some(false), Some(e.to_string())),
-        }
-    };
+                        "SessionStart",
+                        install::session_start_command(harness),
+                    ),
+                    install::harness_hook_present(harness, &root, "Stop", install::STOP_COMMAND),
+                    install::prompt_hook_command(harness).map(|_| {
+                        install::harness_hook_present(
+                            harness,
+                            &root,
+                            "UserPromptSubmit",
+                            install::PROMPT_COMMAND,
+                        )
+                    }),
+                    subagent_applies.then(|| {
+                        install::harness_hook_present(
+                            harness,
+                            &root,
+                            "SubagentStart",
+                            install::STOP_COMMAND,
+                        )
+                    }),
+                    None,
+                ),
+                Err(e) => (
+                    false,
+                    false,
+                    Some(false),
+                    subagent_applies.then_some(false),
+                    Some(e.to_string()),
+                ),
+            }
+        };
 
     let (mcp_path, mcp_entry, mcp_parse_error) = if is_profile {
         check_profile_mcp(harness)
@@ -4290,6 +4313,7 @@ fn check_one_harness(harness: HarnessKind, book: &receipt::Receipt) -> HarnessDo
         session_start_hook,
         stop_hook,
         prompt_hook,
+        subagent_start_hook,
         skills_installed,
         skills_modified,
         receipt_version: entry.map(|e| e.version.clone()),
@@ -5021,7 +5045,8 @@ fn mb(bytes: u64) -> String {
     format!("{} MB", bytes / 1_000_000)
 }
 
-/// The `SessionStart`/`Stop`/`UserPromptSubmit` hook lines and the trailing
+/// The `SessionStart`/`Stop`/`UserPromptSubmit` (and, for Claude Code,
+/// `SubagentStart`) hook lines and the trailing
 /// "partial setup" notice, exactly as [`render_human`] prints them under a
 /// harness's settings-file line. Factored out so a test can exercise the
 /// rendering without building a whole [`DoctorReport`].
@@ -5101,10 +5126,21 @@ fn hook_lines(h: &HarnessDoctor) -> String {
             );
         }
     }
-    let applicable: [Option<bool>; 3] = if honoured {
-        [Some(h.session_start_hook), Some(h.stop_hook), h.prompt_hook]
+    if let Some(present) = h.subagent_start_hook {
+        out.push_str(&format!(
+            "    SubagentStart hook: {}\n",
+            if present { "present" } else { "absent" }
+        ));
+    }
+    let applicable: [Option<bool>; 4] = if honoured {
+        [
+            Some(h.session_start_hook),
+            Some(h.stop_hook),
+            h.prompt_hook,
+            h.subagent_start_hook,
+        ]
     } else {
-        [Some(h.session_start_hook), Some(h.stop_hook), None]
+        [Some(h.session_start_hook), Some(h.stop_hook), None, None]
     };
     let present = applicable.iter().flatten().filter(|p| **p).count();
     let expected = applicable.iter().flatten().count();
@@ -7001,6 +7037,31 @@ mod tests {
         // setup, whatever its prompt hook says.
         let copilot_missing_stop = harness("copilot", true, false, Some(true));
         assert!(hook_lines(&copilot_missing_stop).contains("partial setup"));
+    }
+
+    /// Claude Code's `SubagentStart` hook is counted in the partial-setup
+    /// hint: an install from before 0.34.0 that the reconcile has not yet
+    /// refreshed reads as partial, a complete one does not.
+    #[test]
+    fn a_missing_subagent_start_hook_is_a_partial_claude_code_setup() {
+        let mut missing = harness("claude-code", true, true, Some(true));
+        missing.subagent_start_hook = Some(false);
+        let lines = hook_lines(&missing);
+        assert!(lines.contains("SubagentStart hook: absent"), "{lines}");
+        assert!(
+            lines.contains("partial setup - run: crystalline install claude-code"),
+            "{lines}"
+        );
+
+        let mut complete = harness("claude-code", true, true, Some(true));
+        complete.subagent_start_hook = Some(true);
+        let lines = hook_lines(&complete);
+        assert!(lines.contains("SubagentStart hook: present"), "{lines}");
+        assert!(!lines.contains("partial setup"), "{lines}");
+
+        // Codex has no SubagentStart hook to count, so no line either.
+        let codex = harness("codex", true, true, Some(true));
+        assert!(!hook_lines(&codex).contains("SubagentStart"));
     }
 
     /// A profile harness has a session hook only: no Stop or prompt line, and

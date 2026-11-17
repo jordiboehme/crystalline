@@ -16,8 +16,16 @@
 //! prints a word, logs a warning or returns a nonzero exit code. A hook must
 //! never be the reason a harness's turn breaks.
 //!
-//! The bail order, every one of them silent: the stdin payload fails to
-//! parse; the payload names an event other than `Stop`; `stop_hook_active`
+//! A payload named `SubagentStart` takes its own branch instead: the
+//! subagent that is starting gets one short block (`subagent_block`) as
+//! additional context, read from the config overlay alone, with no state
+//! file read or written; see `decide_subagent_start` for when it stays
+//! silent.
+//!
+//! The Stop bail order, every one of them silent: the stdin payload fails to
+//! parse; the payload names an event other than `Stop`; the payload comes
+//! from inside a subagent (`agent_id` or `agentId` set, see
+//! `marks_subagent`), so the parent's state is never touched; `stop_hook_active`
 //! is set (the loop guard both harnesses attach to a hook-caused
 //! continuation, so a second pass over the same turn never doubles up and
 //! never advances the stop counter); the session id fails
@@ -95,10 +103,12 @@ use crystalline_service::maintenance::{self, MAINTENANCE_FILE, MaintenanceState}
 /// session would ever reach for - what this session did and the state it
 /// left behind, temporary paths and outputs, a one-off bug's error text,
 /// steps that will not recur, and facts any model already knows. The
-/// definition now names what a future session would reach for, and the
-/// exclusion list names those five things explicitly so a later rewrite
-/// cannot drop them without a test noticing.
-pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what a future session would reach for: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
+/// definition now names what saves a future session from reinventing the
+/// wheel or stepping into the same trap (Jordi, 2026-11-17: the same test the
+/// capture skill and the subagent block state), and the exclusion list names
+/// those five things explicitly so a later rewrite cannot drop them without a
+/// test noticing.
+pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what saves a future session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, patterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
 
 /// The one plain sentence a person sees when the nudge fires under Claude
 /// Code, which renders it as `Stop says: <text>` on its own notice line.
@@ -208,11 +218,118 @@ pub struct StopInput {
     #[serde(default)]
     pub stop_hook_active: bool,
     /// The event name the harness attaches to the payload, when it does.
-    /// This handler is wired to the Stop event only, so a name other than
-    /// `Stop` is a defensive bail; an absent name is treated as fine, since
-    /// not every harness stamps it.
+    /// This handler answers `Stop` and `SubagentStart`; any other name is a
+    /// defensive bail, and an absent name is treated as `Stop`, since not
+    /// every harness stamps it.
     #[serde(default)]
     pub hook_event_name: Option<String>,
+    /// The subagent id Claude Code and Codex put on a payload sent from
+    /// inside a subagent. Read as a raw JSON value so a number or both
+    /// spellings at once still parse; see `marks_subagent` for what counts.
+    #[serde(default)]
+    pub agent_id: Option<serde_json::Value>,
+    /// The camel-case spelling of `agent_id`, read beside it rather than as
+    /// a serde alias, which would fail on a payload carrying both.
+    #[serde(default, rename = "agentId")]
+    pub agent_id_camel: Option<serde_json::Value>,
+    /// The agent type. Alone it does not mean a subagent: a main session
+    /// started with `claude --agent <name>` carries it without an id. On a
+    /// SubagentStart it picks the block: none for an empty or absent type
+    /// (an internal agent), no store bullet for `Explore` and `Plan`. Read
+    /// as a raw JSON value for the reason the ids are: an unexpected type
+    /// must not fail the parse the Stop path shares. A type that is not a
+    /// string counts as absent.
+    #[serde(default)]
+    pub agent_type: Option<serde_json::Value>,
+    /// Set on a payload Cursor sends when it runs a Claude Code hook it
+    /// imported. Its presence alone keeps the SubagentStart answer silent.
+    /// Read as a raw JSON value for the reason the ids are: an unexpected
+    /// type must not fail the parse the Stop path shares.
+    #[serde(default)]
+    pub cursor_version: Option<serde_json::Value>,
+}
+
+/// Whether a hook payload comes from inside a subagent: either id spelling
+/// is present, not null and not an empty string. Any other value counts as
+/// set, a number too. `agent_type` is deliberately not an input, since a
+/// main session started with `claude --agent <name>` carries it as well.
+pub(crate) fn marks_subagent(
+    agent_id: Option<&serde_json::Value>,
+    agent_id_camel: Option<&serde_json::Value>,
+) -> bool {
+    [agent_id, agent_id_camel]
+        .into_iter()
+        .flatten()
+        .any(|v| !v.is_null() && v.as_str() != Some(""))
+}
+
+/// The block's heading and the three bullets every subagent gets.
+pub(crate) const SUBAGENT_BLOCK_HEAD: &str = "Crystalline (you are a subagent):\n\
+- Search Crystalline (search_engrams, read_engram) before you start.\n\
+- Never ask the user; decide, or name what is open in your report.\n\
+- Skip reflect, evolve_engrams and Crystalline maintenance notices.";
+
+/// The block's store bullet, left out where the subagent cannot or should
+/// not write.
+pub(crate) const SUBAGENT_STORE_BULLET: &str = "- Before you finish, store what saves a later session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, gotchas. Never what you did, what the files you read already say or what any model knows anyway. Search first; edit the engram that covers it (expected_checksum, re-read and retry on a conflict), else write one with an explicit domain. Domain unclear: name it in your report. Your task's instructions win.";
+
+/// The block a subagent gets at start, with or without the store bullet.
+pub(crate) fn subagent_block(store: bool) -> String {
+    if store {
+        format!("{SUBAGENT_BLOCK_HEAD}\n{SUBAGENT_STORE_BULLET}")
+    } else {
+        SUBAGENT_BLOCK_HEAD.to_string()
+    }
+}
+
+/// The SubagentStart answer: the block as additional context for the
+/// subagent, in the one shape Claude Code documents for this event.
+pub(crate) fn subagent_start_answer(block: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": block,
+        }
+    })
+}
+
+/// What a SubagentStart call answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubagentStartDecision {
+    /// Exit 0, empty stdout.
+    Silent,
+    /// Print the block, with the store bullet when `store` is set.
+    Block { store: bool },
+}
+
+/// The pure SubagentStart table. `has_domains` is whether any domain is
+/// registered or mounted at all; `read_only` is whether nothing can be
+/// written, either because the install is read-only or because every
+/// registered domain is read-only by its MANIFEST and nothing is mounted.
+/// So a machine with only read-only domains still gets the block, without
+/// the store bullet, and a machine with no domain gets nothing.
+///
+/// Silent for a payload Cursor sends (`cursor_version`), with no domain, and
+/// for an empty, absent or non-string `agent_type` (an internal agent). `Explore` and
+/// `Plan` are lean and read-only by design, so they get no store bullet.
+/// The `agent_id` the payload carries is the child's own and is ignored.
+pub(crate) fn decide_subagent_start(
+    input: &StopInput,
+    has_domains: bool,
+    read_only: bool,
+) -> SubagentStartDecision {
+    if input.cursor_version.is_some() || !has_domains {
+        return SubagentStartDecision::Silent;
+    }
+    match input
+        .agent_type
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+    {
+        None | Some("") => SubagentStartDecision::Silent,
+        Some("Explore" | "Plan") => SubagentStartDecision::Block { store: false },
+        Some(_) => SubagentStartDecision::Block { store: !read_only },
+    }
 }
 
 /// The persisted state for one session, at
@@ -321,6 +438,9 @@ pub fn decide(
     state: &SessionState,
     transcript: TranscriptStats,
 ) -> StopDecision {
+    if marks_subagent(input.agent_id.as_ref(), input.agent_id_camel.as_ref()) {
+        return StopDecision::Silent;
+    }
     if let Some(name) = input.hook_event_name.as_deref()
         && name != "Stop"
     {
@@ -695,18 +815,28 @@ pub fn run_stop(harness: Option<&str>) {
     {
         return;
     }
+    crate::hook_log::append("stop", &raw);
     let Ok(input) = serde_json::from_str::<StopInput>(&raw) else {
         return;
     };
-    // The two cheap payload checks come before any filesystem or config
-    // work: a miswired event or a hook-caused continuation is a pure no-op
-    // that should neither load the overlay nor advance the stop counter
-    // (continuations are not real stops).
-    if input
-        .hook_event_name
-        .as_deref()
-        .is_some_and(|name| name != "Stop")
-    {
+    // The cheap payload checks come before any filesystem or config work: a
+    // miswired event, a payload from inside a subagent or a hook-caused
+    // continuation is a pure no-op that should neither load the overlay nor
+    // advance the stop counter (continuations are not real stops). The event
+    // is dispatched first, because a SubagentStart carries the starting
+    // subagent's own id and still gets its answer.
+    match input.hook_event_name.as_deref() {
+        Some("SubagentStart") => {
+            run_subagent_start(&input);
+            return;
+        }
+        None | Some("Stop") => {}
+        Some(_) => return,
+    }
+    // Inside a subagent the parent's session is not this one to nudge, and
+    // a harness that shares the parent's session id must not advance the
+    // parent's counter.
+    if marks_subagent(input.agent_id.as_ref(), input.agent_id_camel.as_ref()) {
         return;
     }
     if input.stop_hook_active {
@@ -721,17 +851,11 @@ pub fn run_stop(harness: Option<&str>) {
     // Connected servers: their domains count as somewhere to capture into,
     // and a local copy one of them replaces is out of this session's view.
     // Read from the cache files only; this process never talks to a server.
-    let sources = crystalline_remote::remote_dir().ok().map(|dir| {
-        crystalline_remote::SourceSet::load(
-            dir,
-            crate::sources::local_domains_of(&loaded.effective),
-            crystalline_core::secret_env::process_var,
-        )
-    });
-    let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();
-    let mounted = sources
-        .as_ref()
-        .is_some_and(|s| !s.table().mounts.is_empty());
+    let ConnectedSources {
+        sources,
+        shadowed,
+        mounted,
+    } = connected_sources(&loaded.effective);
     // The local domains this session could capture into: neither hidden by a
     // mount nor read-only. A mounted domain still counts as a place to
     // capture (its server refuses a write it does not take), so the nudge
@@ -881,6 +1005,71 @@ pub fn run_stop(harness: Option<&str>) {
         if let Ok(line) = serde_json::to_string(&payload) {
             println!("{line}");
         }
+    }
+}
+
+/// What the connected servers change about this install's domains, read from
+/// the cache files only: this process never talks to a server.
+struct ConnectedSources {
+    /// The source table, when the remote folder resolves.
+    sources: Option<crystalline_remote::SourceSet>,
+    /// The local domains a mounted one replaces, out of this session's view.
+    shadowed: std::collections::BTreeSet<String>,
+    /// Whether any server domain is mounted.
+    mounted: bool,
+}
+
+/// Load the source table for `effective`, shared by the Stop path and the
+/// SubagentStart branch so both see the same domains.
+fn connected_sources(effective: &crystalline_core::config::GlobalConfig) -> ConnectedSources {
+    let sources = crystalline_remote::remote_dir().ok().map(|dir| {
+        crystalline_remote::SourceSet::load(
+            dir,
+            crate::sources::local_domains_of(effective),
+            crystalline_core::secret_env::process_var,
+        )
+    });
+    let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();
+    let mounted = sources
+        .as_ref()
+        .is_some_and(|s| !s.table().mounts.is_empty());
+    ConnectedSources {
+        sources,
+        shadowed,
+        mounted,
+    }
+}
+
+/// The SubagentStart branch of `hook stop`: one short block for the subagent
+/// that is starting. Static like the rest of this hook, and lighter: only the
+/// config overlay and the cached source table are read, no daemon or network
+/// is used and no state file is read or written. Every bail is silent.
+fn run_subagent_start(input: &StopInput) {
+    let Ok(loaded) = crystalline_service::overlay::load(None) else {
+        return;
+    };
+    let ConnectedSources {
+        shadowed, mounted, ..
+    } = connected_sources(&loaded.effective);
+    let visible = || {
+        loaded
+            .effective
+            .domains
+            .iter()
+            .filter(|(name, _)| !shadowed.contains(*name))
+    };
+    // Any domain at all earns the block; only a writable one (or a mount,
+    // whose server refuses a write it does not take) earns the store bullet.
+    let has_domains = mounted || visible().next().is_some();
+    let writable = mounted || !writable_domain_names(visible()).is_empty();
+    let read_only = loaded.effective.read_only() || !writable;
+    let SubagentStartDecision::Block { store } =
+        decide_subagent_start(input, has_domains, read_only)
+    else {
+        return;
+    };
+    if let Ok(line) = serde_json::to_string(&subagent_start_answer(&subagent_block(store))) {
+        println!("{line}");
     }
 }
 
@@ -1228,7 +1417,274 @@ mod tests {
             transcript_path: None,
             stop_hook_active: false,
             hook_event_name: None,
+            agent_id: None,
+            agent_id_camel: None,
+            agent_type: None,
+            cursor_version: None,
         }
+    }
+
+    // --- the SubagentStart block ---------------------------------------------
+
+    /// The block is the spec's text verbatim, and without the store bullet it
+    /// is the same text minus that last line.
+    #[test]
+    fn subagent_block_matches_the_spec_text() {
+        assert_eq!(
+            subagent_block(true),
+            "Crystalline (you are a subagent):\n\
+             - Search Crystalline (search_engrams, read_engram) before you start.\n\
+             - Never ask the user; decide, or name what is open in your report.\n\
+             - Skip reflect, evolve_engrams and Crystalline maintenance notices.\n\
+             - Before you finish, store what saves a later session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, gotchas. Never what you did, what the files you read already say or what any model knows anyway. Search first; edit the engram that covers it (expected_checksum, re-read and retry on a conflict), else write one with an explicit domain. Domain unclear: name it in your report. Your task's instructions win."
+        );
+        assert_eq!(
+            subagent_block(false),
+            "Crystalline (you are a subagent):\n\
+             - Search Crystalline (search_engrams, read_engram) before you start.\n\
+             - Never ask the user; decide, or name what is open in your report.\n\
+             - Skip reflect, evolve_engrams and Crystalline maintenance notices."
+        );
+        assert!(
+            include_str!("../../../docs/learning-loop.md").contains(&subagent_block(true)),
+            "docs/learning-loop.md quotes the subagent block as it is"
+        );
+    }
+
+    /// Every subagent start pays for this block, so its length is pinned.
+    /// The bullet dashes are not words: counted this way the approved text
+    /// has the 107 words its review names.
+    #[test]
+    fn subagent_block_stays_under_110_words() {
+        let words = subagent_block(true)
+            .split_whitespace()
+            .filter(|w| *w != "-")
+            .count();
+        assert!(words < 110, "the subagent block has {words} words");
+    }
+
+    fn subagent_start(agent_type: Option<&str>) -> StopInput {
+        let mut i = input();
+        i.hook_event_name = Some("SubagentStart".to_string());
+        i.agent_id = Some(serde_json::json!("a0000000000000003"));
+        i.agent_type = agent_type.map(|t| serde_json::json!(t));
+        i
+    }
+
+    #[test]
+    fn decide_subagent_start_table() {
+        use SubagentStartDecision::{Block, Silent};
+        let mut cursor = subagent_start(Some("general-purpose"));
+        cursor.cursor_version = Some(serde_json::json!("2.0.0"));
+        let mut cursor_number = subagent_start(Some("general-purpose"));
+        let mut numeric_type = subagent_start(None);
+        numeric_type.agent_type = Some(serde_json::json!(7));
+        cursor_number.cursor_version = Some(serde_json::json!(2));
+        let cases: &[(&str, StopInput, bool, bool, SubagentStartDecision)] = &[
+            (
+                "a writable domain",
+                subagent_start(Some("general-purpose")),
+                true,
+                false,
+                Block { store: true },
+            ),
+            (
+                "read-only",
+                subagent_start(Some("general-purpose")),
+                true,
+                true,
+                Block { store: false },
+            ),
+            (
+                "no registered or mounted domain",
+                subagent_start(Some("general-purpose")),
+                false,
+                false,
+                Silent,
+            ),
+            (
+                "Explore",
+                subagent_start(Some("Explore")),
+                true,
+                false,
+                Block { store: false },
+            ),
+            (
+                "Plan",
+                subagent_start(Some("Plan")),
+                true,
+                false,
+                Block { store: false },
+            ),
+            (
+                "Explore without a domain",
+                subagent_start(Some("Explore")),
+                false,
+                false,
+                Silent,
+            ),
+            (
+                "an empty agent_type",
+                subagent_start(Some("")),
+                true,
+                false,
+                Silent,
+            ),
+            ("no agent_type", subagent_start(None), true, false, Silent),
+            ("a numeric agent_type", numeric_type, true, false, Silent),
+            ("cursor_version", cursor, true, false, Silent),
+            (
+                "a numeric cursor_version",
+                cursor_number,
+                true,
+                false,
+                Silent,
+            ),
+        ];
+        for (case, i, has_domains, read_only, want) in cases {
+            assert_eq!(
+                decide_subagent_start(i, *has_domains, *read_only),
+                *want,
+                "{case}"
+            );
+        }
+    }
+
+    /// The recorded payload carries the child's own id; it does not silence
+    /// the SubagentStart answer the way it silences a Stop.
+    #[test]
+    fn subagent_start_with_agent_id_prints_the_block() {
+        let i: StopInput = serde_json::from_str(include_str!(
+            "../tests/fixtures/hooks/bg-subagent-SubagentStart.json"
+        ))
+        .expect("the recorded payload parses");
+        assert!(marks_subagent(
+            i.agent_id.as_ref(),
+            i.agent_id_camel.as_ref()
+        ));
+        assert_eq!(
+            decide_subagent_start(&i, true, false),
+            SubagentStartDecision::Block { store: true }
+        );
+    }
+
+    /// The answer carries exactly the one block Claude Code documents for
+    /// SubagentStart, with the event name and the context and nothing else,
+    /// compared as a whole value so no extra key can slip in.
+    #[test]
+    fn the_subagent_start_answer_fits_the_hook_schema() {
+        assert_eq!(
+            subagent_start_answer("the block"),
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SubagentStart",
+                    "additionalContext": "the block"
+                }
+            })
+        );
+    }
+
+    // --- the subagent check --------------------------------------------------
+
+    #[test]
+    fn marks_subagent_table() {
+        let a = serde_json::json!("a");
+        let seven = serde_json::json!(7);
+        let null = serde_json::Value::Null;
+        let empty = serde_json::json!("");
+        let cases: &[(Option<&serde_json::Value>, Option<&serde_json::Value>, bool)] = &[
+            (Some(&a), None, true),
+            (None, Some(&a), true),
+            (Some(&a), Some(&a), true),
+            (Some(&seven), None, true),
+            (None, Some(&seven), true),
+            (Some(&null), None, false),
+            (None, Some(&null), false),
+            (Some(&empty), None, false),
+            (None, Some(&empty), false),
+            (Some(&empty), Some(&null), false),
+            (None, None, false),
+        ];
+        for (id, camel, want) in cases {
+            assert_eq!(
+                marks_subagent(*id, *camel),
+                *want,
+                "agent_id {id:?}, agentId {camel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_input_parses_both_spellings_and_a_number() {
+        let input: StopInput =
+            serde_json::from_str(r#"{"session_id":"s","agent_id":"a","agentId":3}"#)
+                .expect("both spellings and a number parse");
+        assert_eq!(input.agent_id, Some(serde_json::json!("a")));
+        assert_eq!(input.agent_id_camel, Some(serde_json::json!(3)));
+        assert!(marks_subagent(
+            input.agent_id.as_ref(),
+            input.agent_id_camel.as_ref()
+        ));
+    }
+
+    #[test]
+    fn decide_is_silent_inside_a_subagent() {
+        for (id, camel) in [
+            (Some(serde_json::json!("a")), None),
+            (None, Some(serde_json::json!("a"))),
+            (Some(serde_json::json!(7)), None),
+        ] {
+            let mut i = input();
+            i.hook_event_name = Some("Stop".to_string());
+            i.agent_id = id;
+            i.agent_id_camel = camel;
+            let decision = decide(
+                &i,
+                true,
+                false,
+                &SessionState::fresh(),
+                TranscriptStats::Substantial,
+            );
+            assert_eq!(decision, StopDecision::Silent, "{i:?}");
+        }
+    }
+
+    /// `claude --agent <name>` starts a main session that carries
+    /// `agent_type` and no id; it keeps its nudge. The recorded payload, so
+    /// the field spelling is the harness's own.
+    #[test]
+    fn agent_type_alone_is_not_a_subagent() {
+        let i: StopInput =
+            serde_json::from_str(include_str!("../tests/fixtures/hooks/agent-flag-Stop.json"))
+                .expect("the recorded payload parses");
+        assert_eq!(i.agent_type, Some(serde_json::json!("spike")));
+        let decision = decide(
+            &i,
+            true,
+            false,
+            &SessionState::fresh(),
+            TranscriptStats::Substantial,
+        );
+        assert_eq!(decision, StopDecision::Nudge);
+    }
+
+    /// A Stop whose `agent_type` is not a string still parses and still
+    /// nudges: the field the SubagentStart branch reads must not cost the
+    /// main session its reminder.
+    #[test]
+    fn a_numeric_agent_type_still_nudges() {
+        let i: StopInput = serde_json::from_str(
+            r#"{"session_id":"abc-123","hook_event_name":"Stop","agent_type":7}"#,
+        )
+        .expect("a numeric agent_type parses");
+        let decision = decide(
+            &i,
+            true,
+            false,
+            &SessionState::fresh(),
+            TranscriptStats::Substantial,
+        );
+        assert_eq!(decision, StopDecision::Nudge);
     }
 
     // --- valid_session_id ----------------------------------------------------

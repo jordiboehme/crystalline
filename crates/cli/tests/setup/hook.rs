@@ -25,12 +25,20 @@ use crate::daemon_env::DaemonEnv;
 /// The exact reminder text `hook.rs` prints, duplicated here because the
 /// `crystalline` binary has no library target for a test to import it from;
 /// this is a black-box check on what the subprocess actually printed.
-const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what a future session would reach for: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
+const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what saves a future session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, patterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
 
 /// The ride-along maintenance paragraph, duplicated here for the same reason
 /// [`NUDGE_REASON`] is: this is a black-box check on what the subprocess
 /// printed.
 const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call the crystalline evolve_engrams tool and work the queue it returns: apply mechanical findings directly and summarize once at the end; propose judgment findings one at a time and wait for a yes. Engrams captured by a person are judgment class - never rewrite a human's words without asking.";
+
+/// The subagent block's heading and first three bullets, and its store
+/// bullet, duplicated for the same reason [`NUDGE_REASON`] is.
+const SUBAGENT_BLOCK_HEAD: &str = "Crystalline (you are a subagent):\n\
+- Search Crystalline (search_engrams, read_engram) before you start.\n\
+- Never ask the user; decide, or name what is open in your report.\n\
+- Skip reflect, evolve_engrams and Crystalline maintenance notices.";
+const SUBAGENT_STORE_BULLET: &str = "- Before you finish, store what saves a later session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, gotchas. Never what you did, what the files you read already say or what any model knows anyway. Search first; edit the engram that covers it (expected_checksum, re-read and retry on a conflict), else write one with an explicit domain. Domain unclear: name it in your report. Your task's instructions win.";
 
 fn bin() -> Command {
     crate::common::crystalline()
@@ -589,6 +597,131 @@ fn fires_once_then_stays_silent_for_the_same_session() {
     );
 }
 
+/// A recorded payload with the test's session, a real transcript and, when
+/// given, an `agent_id` spliced in.
+fn patched_fixture(
+    name: &str,
+    session_id: &str,
+    transcript: &Path,
+    agent_id: Option<Value>,
+) -> String {
+    let mut payload = crate::common::hook_fixture(name);
+    payload["session_id"] = json!(session_id);
+    payload["transcript_path"] = json!(transcript.display().to_string());
+    if let Some(id) = agent_id {
+        payload["agent_id"] = id;
+    }
+    payload.to_string()
+}
+
+/// Run `hook stop --harness claude-code` under `home` with `config`.
+fn run_stop_hook(home: &Path, config: &Path, payload: &str) -> std::process::Output {
+    let mut cmd = bin();
+    isolate(&mut cmd, home);
+    cmd.env("CRYSTALLINE_CONFIG", config)
+        .args(["hook", "stop", "--harness", "claude-code"])
+        .write_stdin(payload.to_string())
+        .output()
+        .unwrap()
+}
+
+/// A Stop from inside a subagent is silent and touches no state at all: no
+/// session file and no maintenance stamp, since a harness that shares the
+/// parent's session id would otherwise advance the parent's counter. Each
+/// id shape the rule counts as set is tried; the same payload without one
+/// nudges in the same setup.
+#[test]
+fn a_stop_inside_a_subagent_is_silent_and_writes_nothing() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+
+    for (case, id) in [
+        ("agent_id", ("agent_id", json!("a0000000000000003"))),
+        ("agentId", ("agentId", json!("a0000000000000003"))),
+        ("a number", ("agent_id", json!(7))),
+    ] {
+        let home = work.path().join(format!("home-{}", case.replace(' ', "-")));
+        let mut payload = crate::common::hook_fixture("main-Stop.json");
+        payload["transcript_path"] = json!(transcript.display().to_string());
+        payload[id.0] = id.1;
+        let out = run_stop_hook(&home, &config, &payload.to_string());
+        assert_silent(&out, case);
+        assert!(
+            !state_hooks_dir(&home).exists(),
+            "{case}: a subagent's Stop writes no state: {}",
+            state_hooks_dir(&home).display()
+        );
+    }
+
+    let home = work.path().join("home-main");
+    let out = run_stop_hook(
+        &home,
+        &config,
+        &patched_fixture("main-Stop.json", "session-main", &transcript, None),
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(decision["reason"], NUDGE_REASON, "the main session nudges");
+}
+
+/// `claude --agent <name>` starts a main session whose payloads carry
+/// `agent_type` and no id: it keeps its nudge.
+#[test]
+fn an_agent_type_alone_keeps_the_nudge() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+
+    let out = run_stop_hook(
+        &home,
+        &config,
+        &patched_fixture(
+            "agent-flag-Stop.json",
+            "session-agent-flag",
+            &transcript,
+            None,
+        ),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(decision["reason"], NUDGE_REASON);
+}
+
+/// A background subagent makes the main session stop twice in one turn:
+/// once while the child still runs, and once after its task notification
+/// came back as a prompt. The once-per-session rule keeps the second Stop
+/// silent.
+#[test]
+fn the_stop_after_a_background_subagent_finishes_stays_silent() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+    let session = "session-background";
+
+    let out = run_stop_hook(
+        &home,
+        &config,
+        &patched_fixture("bg-main-Stop-running.json", session, &transcript, None),
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(decision["reason"], NUDGE_REASON, "the first Stop nudges");
+
+    let out = run_stop_hook(
+        &home,
+        &config,
+        &patched_fixture("main-Stop.json", session, &transcript, None),
+    );
+    assert_silent(&out, "the Stop after the task notification");
+}
+
 #[test]
 fn malformed_stdin_exits_zero_with_empty_stdout() {
     let work = tempfile::tempdir().unwrap();
@@ -601,8 +734,173 @@ fn malformed_stdin_exits_zero_with_empty_stdout() {
         .write_stdin("this is not json")
         .output()
         .unwrap();
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    assert_silent(&out, "garbage stdin");
+}
+
+/// The SubagentStart answer: exactly one line of JSON carrying `block`.
+fn assert_subagent_block(out: &std::process::Output, block: &str, case: &str) {
+    assert!(out.status.success(), "{case}: exit {:?}", out.status.code());
+    assert!(
+        out.stderr.is_empty(),
+        "{case}: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{case}: one line: {stdout:?}");
+    let answer: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        answer,
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": block,
+            }
+        }),
+        "{case}"
+    );
+}
+
+/// Each recorded SubagentStart gets the block, the child's own `agent_id`
+/// notwithstanding; Explore and Plan get it without the store bullet. No
+/// call reads or writes a state file. The other events recorded inside a
+/// subagent stay silent.
+#[test]
+fn every_recorded_subagent_start_gets_its_block_and_writes_nothing() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let full = format!("{SUBAGENT_BLOCK_HEAD}\n{SUBAGENT_STORE_BULLET}");
+
+    for (fixture, block) in [
+        ("fg-subagent-SubagentStart.json", full.as_str()),
+        ("bg-subagent-SubagentStart.json", full.as_str()),
+        ("nested-outer-SubagentStart.json", full.as_str()),
+        ("nested-inner-SubagentStart.json", full.as_str()),
+        ("explore-SubagentStart.json", SUBAGENT_BLOCK_HEAD),
+        ("plan-SubagentStart.json", SUBAGENT_BLOCK_HEAD),
+    ] {
+        let home = work.path().join(format!("home-{fixture}"));
+        let payload = crate::common::hook_fixture(fixture).to_string();
+        let out = run_stop_hook(&home, &config, &payload);
+        assert_subagent_block(&out, block, fixture);
+        assert!(
+            !state_hooks_dir(&home).exists(),
+            "{fixture}: SubagentStart touches no state"
+        );
+    }
+
+    for fixture in [
+        "fg-subagent-SubagentStop.json",
+        "bg-subagent-SubagentStop.json",
+        "explore-SubagentStop.json",
+        "fg-subagent-PostToolUse.json",
+        "bg-subagent-PostToolUse.json",
+    ] {
+        let home = work.path().join(format!("home-{fixture}"));
+        let payload = crate::common::hook_fixture(fixture).to_string();
+        let out = run_stop_hook(&home, &config, &payload);
+        assert_silent(&out, fixture);
+        assert!(!state_hooks_dir(&home).exists(), "{fixture}: no state");
+    }
+}
+
+/// A payload Cursor sends carries `cursor_version`: the SubagentStart answer
+/// stays silent and writes nothing, whatever type the value has, and a
+/// value of an unexpected type never breaks the parse the Stop path shares.
+#[test]
+fn a_subagent_start_with_cursor_version_is_silent() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+
+    for (case, version) in [("a string", json!("2.1.0")), ("a number", json!(2))] {
+        let home = work.path().join(format!("home-{}", case.replace(' ', "-")));
+        let mut payload = crate::common::hook_fixture("bg-subagent-SubagentStart.json");
+        payload["cursor_version"] = version;
+        let out = run_stop_hook(&home, &config, &payload.to_string());
+        assert_silent(&out, case);
+        assert!(!state_hooks_dir(&home).exists(), "{case}: no state");
+    }
+
+    let transcript = substantial_transcript(work.path());
+    let mut payload = crate::common::hook_fixture("main-Stop.json");
+    payload["session_id"] = json!("session-cursor-number");
+    payload["transcript_path"] = json!(transcript.display().to_string());
+    payload["cursor_version"] = json!(2);
+    let out = run_stop_hook(
+        &work.path().join("home-stop"),
+        &config,
+        &payload.to_string(),
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(decision["reason"], NUDGE_REASON, "a Stop still parses");
+}
+
+/// With no registered or mounted domain the block is not printed at all.
+#[test]
+fn a_subagent_start_without_a_domain_is_silent() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    std::fs::write(&config, "domains: {}\n").unwrap();
+    let payload = crate::common::hook_fixture("bg-subagent-SubagentStart.json").to_string();
+    let out = run_stop_hook(&home, &config, &payload);
+    assert_silent(&out, "no domain");
+}
+
+/// A domain that is registered but read-only by its MANIFEST still gets the
+/// block, without the store bullet; so does a read-only install.
+#[test]
+fn a_subagent_start_with_only_a_read_only_domain_drops_the_store_bullet() {
+    let work = tempfile::tempdir().unwrap();
+    let domain = work.path().join("archive");
+    std::fs::create_dir_all(&domain).unwrap();
+    std::fs::write(
+        domain.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: archive\npermalink: manifest\nread_only: on\n---\n\n## Scope\n\n- x\n",
+    )
+    .unwrap();
+    let config = work.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!("domains:\n  archive:\n    path: {}\n", domain.display()),
+    )
+    .unwrap();
+    let payload = crate::common::hook_fixture("bg-subagent-SubagentStart.json").to_string();
+    let home = work.path().join("home");
+    let out = run_stop_hook(&home, &config, &payload);
+    assert_subagent_block(&out, SUBAGENT_BLOCK_HEAD, "a read-only MANIFEST");
+
+    let writable = work.path().join("writable.yaml");
+    write_domain_config(&writable);
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &writable)
+        .env("CRYSTALLINE_SERVICE_READ_ONLY", "true")
+        .args(["hook", "stop", "--harness", "claude-code"])
+        .write_stdin(payload)
+        .output()
+        .unwrap();
+    assert_subagent_block(&out, SUBAGENT_BLOCK_HEAD, "a read-only install");
+}
+
+/// A hook verb this binary does not know, with flags it does not know,
+/// exits 0 without a word: a settings file written by a newer binary must
+/// never break a session run by an older one.
+#[test]
+fn an_unknown_hook_verb_exits_zero_silently() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .args(["hook", "frobnicate", "--zap", "1", "--harness", "x"])
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert_silent(&out, "an unknown verb");
 }
 
 #[test]
@@ -1417,6 +1715,11 @@ impl DaemonEnv {
     /// Run `hook prompt` against this environment, returning the child's
     /// output and how long the whole spawn took.
     fn hook_prompt(&self, session: &str, prompt: &str) -> (std::process::Output, Duration) {
+        self.hook_prompt_raw(&prompt_payload(session, prompt))
+    }
+
+    /// [`DaemonEnv::hook_prompt`] with the whole stdin payload given.
+    fn hook_prompt_raw(&self, payload: &str) -> (std::process::Output, Duration) {
         let mut cmd = crate::common::crystalline_std();
         self.apply(&mut cmd);
         let start = Instant::now();
@@ -1431,7 +1734,7 @@ impl DaemonEnv {
             .stdin
             .take()
             .unwrap()
-            .write_all(prompt_payload(session, prompt).as_bytes())
+            .write_all(payload.as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
         (out, start.elapsed())
@@ -1662,6 +1965,66 @@ fn the_prompt_hook_names_an_engram_once_per_session_and_again_after_a_compaction
     assert!(
         block.contains(VENT_ADDRESS),
         "the same engram is named: {block:?}"
+    );
+
+    // Inside a subagent: the prompt that names the engram anywhere else costs
+    // no search and writes no state, whichever id spelling the harness uses.
+    for (case, key) in [("agent_id", "agent_id"), ("agentId", "agentId")] {
+        let session = format!("session-subagent-{key}");
+        let mut payload: Value =
+            serde_json::from_str(&prompt_payload(&session, PLAIN_PROMPT)).unwrap();
+        payload[key] = json!("a0000000000000003");
+        let before = stub.calls();
+        let (out, _) = env.hook_prompt_raw(&payload.to_string());
+        assert_silent(&out, case);
+        assert_eq!(
+            stub.calls(),
+            before,
+            "{case}: a subagent's prompt costs no search"
+        );
+        assert!(
+            !env.state_dir()
+                .join("hooks")
+                .join(format!("{session}.json"))
+                .exists(),
+            "{case}: a subagent's prompt writes no state"
+        );
+    }
+    let mut payload: Value = serde_json::from_str(&prompt_payload(session, PLAIN_PROMPT)).unwrap();
+    payload["agent_id"] = json!("a0000000000000003");
+    let state_before = env.session_state(session);
+    let (out, _) = env.hook_prompt_raw(&payload.to_string());
+    assert_silent(&out, "a subagent sharing the parent's session id");
+    assert_eq!(
+        env.session_state(session),
+        state_before,
+        "a subagent leaves the parent's recalled list as it was"
+    );
+
+    // `claude --agent <name>`: the recorded main-session prompt carries
+    // `agent_type` and no id, and recalls like any main session.
+    let mut agent_flag = crate::common::hook_fixture("agent-flag-UserPromptSubmit.json");
+    agent_flag["session_id"] = json!("session-agent-flag");
+    agent_flag["prompt"] = json!(PLAIN_PROMPT);
+    let (out, _) = env.hook_prompt_raw(&agent_flag.to_string());
+    let block = expect_block(&out, "a main session started with --agent");
+    assert!(block.contains(VENT_ADDRESS), "{block:?}");
+
+    // A background subagent's task notification, as recorded, in a session
+    // that has already been shown something: no search, and the list stays
+    // as it was.
+    let mut notification =
+        crate::common::hook_fixture("bg-main-UserPromptSubmit-task-notification.json");
+    notification["session_id"] = json!(session);
+    let before = stub.calls();
+    let state_before = env.session_state(session);
+    let (out, _) = env.hook_prompt_raw(&notification.to_string());
+    assert_silent(&out, "a task notification");
+    assert_eq!(stub.calls(), before, "a task notification costs no search");
+    assert_eq!(
+        env.session_state(session),
+        state_before,
+        "a task notification leaves the recalled list as it was"
     );
 
     env.shutdown();

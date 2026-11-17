@@ -2382,6 +2382,45 @@ fn harnesses_section_reports_both_hooks_present_after_install() {
     assert_eq!(claude["session_start_hook"], serde_json::json!(true));
     assert_eq!(claude["stop_hook"], serde_json::json!(true));
     assert_eq!(claude["prompt_hook"], serde_json::json!(true));
+    assert_eq!(claude["subagent_start_hook"], serde_json::json!(true));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Claude Code settings file carrying the three older hooks but no
+/// `SubagentStart` one reads as a partial setup.
+#[test]
+#[cfg(unix)]
+fn a_missing_subagent_start_hook_reads_as_a_partial_claude_code_setup() {
+    let (home, _state_dir) = isolated_home("harness-no-subagent");
+    let work = tempfile::tempdir().unwrap();
+
+    let mut install_cmd = bin();
+    apply_home(&mut install_cmd, &home);
+    install_cmd
+        .args(["install", "claude-code", "--skip-mcp", "--skip-skills"])
+        .assert()
+        .success();
+    let settings_path = home.join(".claude").join("settings.json");
+    let mut settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings["hooks"]
+        .as_object_mut()
+        .unwrap()
+        .remove("SubagentStart");
+    std::fs::write(&settings_path, settings.to_string()).unwrap();
+
+    let report = doctor_json(&home, work.path());
+    let claude = harness_entry(&report, "claude-code");
+    assert_eq!(claude["subagent_start_hook"], serde_json::json!(false));
+    assert!(harness_entry(&report, "codex")["subagent_start_hook"].is_null());
+
+    let human = doctor_human(&home, work.path());
+    assert!(human.contains("SubagentStart hook: absent"), "{human}");
+    assert!(
+        human.contains("partial setup - run: crystalline install claude-code"),
+        "{human}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

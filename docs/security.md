@@ -137,7 +137,7 @@ With a PostgreSQL database the secrets are not kept on this machine. The GitHub 
 
 Apart from these sealed secrets, nothing is encrypted at rest. Use disk encryption, and the encryption of your database server.
 
-`crystalline install claude-code` registers the MCP server with the `claude` CLI, adds three hooks to `~/.claude/settings.json` (`SessionStart`, `Stop` and `UserPromptSubmit`) and copies six skills into `~/.claude/skills`. With `--project` it writes the hooks and skills into the project's `.claude/` folder and registers the MCP server with project scope instead. Hook entries of other tools are kept. `crystalline uninstall claude-code` removes what install added.
+`crystalline install claude-code` registers the MCP server with the `claude` CLI, adds four hooks to `~/.claude/settings.json` (`SessionStart`, `Stop`, `UserPromptSubmit` and `SubagentStart`) and copies six skills into `~/.claude/skills`. The `SubagentStart` hook tells each subagent to store what it learned without asking you, and what it stores comes back as recall in later sessions; see [The learning loop](learning-loop.md#the-learning-loop) for how to limit it. With `--project` it writes the hooks and skills into the project's `.claude/` folder and registers the MCP server with project scope instead. Hook entries of other tools are kept. `crystalline uninstall claude-code` removes what install added.
 
 ## Verify a release
 
