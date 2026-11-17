@@ -3829,6 +3829,77 @@ fn secret_commands_pass_by_a_daemon_of_another_database() {
     assert!(serve.alive());
 }
 
+/// The owner row names a daemon of this state folder, but not the process
+/// that answers on its control socket (the row of an earlier daemon,
+/// before the next owner announced itself): no secret command routes to
+/// the answering daemon. Without the key `users remove` is refused as with
+/// no daemon; with it the claim meets the held lock and is refused. The
+/// account and its sealed token both stay.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn a_daemon_the_owner_row_does_not_name_takes_no_secret_change() {
+    let Some(pg) = PgScratch::new("vtstalepid") else {
+        return;
+    };
+    let env = Env::new("vtstalepid").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    users_add(&env, "bob", "bob-password");
+    let row = personal_row("bob");
+    seal_token_row(&pg, &row, "bob");
+    pg.run(&format!(
+        "UPDATE {}.instance_owner SET pid = 1 WHERE id = 1",
+        pg.schema
+    ))
+    .unwrap();
+
+    let (ok, out, err) = run_vars(&env, &["users", "remove", "bob"], &NO_SECRET_KEY);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SECRET_KEY"), "{err}");
+    assert_eq!(accounts_named(&pg, "bob"), "1", "the account is kept");
+    assert!(has_secret_row(&pg, &row), "the sealed token is kept");
+
+    let (ok, out, err) = env.run_full(&["users", "remove", "bob"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("sealed in the database"), "{err}");
+    assert_eq!(accounts_named(&pg, "bob"), "1", "the account is kept");
+    assert!(has_secret_row(&pg, &row), "the sealed token is kept");
+    assert!(serve.alive());
+}
+
+/// When who owns the database cannot be read (here no database answers at
+/// all), a secret command is refused with a sentence that says so, not
+/// with one about the key or another instance, and nothing is written.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn a_secret_command_whose_owner_cannot_be_read_is_refused_plainly() {
+    let env = Env::new("vtunknown");
+    let vars = [
+        ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
+        ("CRYSTALLINE_DATABASE_URL", "postgres://u@127.0.0.1:1/none"),
+        ("CRYSTALLINE_SECRET_KEY", crate::service::TEST_SECRET_KEY),
+        ("CRYSTALLINE_SECRET_KEY_FILE", ""),
+    ];
+    for args in [
+        &["users", "remove", "bob"][..],
+        &["connect", "github", "--token", "ghp_unknown"],
+        &["connect", "https://kb.example", "--token"],
+    ] {
+        let (ok, out, err) = run_vars(&env, args, &vars);
+        assert!(!ok, "{args:?}: {out}{err}");
+        assert!(
+            err.contains("could not check who owns the database"),
+            "{args:?}: {err}"
+        );
+        assert!(
+            err.contains("so nothing was changed; run the command again once the database answers"),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains("ghp_unknown"), "the token is never repeated");
+    }
+    assert!(local_github_files(&env).is_empty());
+}
+
 /// A server sign-in on Postgres is made in the pod only: with the key on a
 /// free database and no daemon, `connect <url>` and `disconnect <name>` are
 /// refused before anyone signs in, with the `kubectl exec` example, and

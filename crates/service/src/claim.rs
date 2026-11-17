@@ -670,7 +670,7 @@ async fn route_on_postgres(
         Holder::Here {
             owner: Some(row), ..
         } if row.command.is_none() => {
-            if let Some(route) = route_beside_owner(cfg, seals).await? {
+            if let Some(route) = route_beside_owner(cfg, seals, row.pid).await? {
                 return Ok(route);
             }
         }
@@ -679,6 +679,10 @@ async fn route_on_postgres(
                 message: pg::command_refusal(&database, owner.as_ref(), &command_example()),
             };
             anyhow::bail!(pg::sealed_elsewhere(&owned));
+        }
+        // Who owns it could not be read: nothing can be routed safely.
+        Holder::Unknown { database, error } => {
+            anyhow::bail!(pg::secret_owner_unknown(&database, &error));
         }
         _ => {}
     }
@@ -713,8 +717,14 @@ async fn route_on_postgres(
 /// The route of a command while the owner row names a daemon of this
 /// machine: the change goes to it ([`SecretRoute::Daemon`]) or is sealed
 /// beside it ([`SecretRoute::Beside`]). `None` when no daemon answers on
-/// this machine's control socket: the command then goes on as if there were
-/// none, and its claim is refused while the lock is held.
+/// this machine's control socket, or when the daemon that answers is not
+/// the process the owner row names (`owner_pid`: the row of an earlier
+/// daemon of this state folder, before the next owner announced itself):
+/// the command then goes on as if there were none, and its claim is
+/// refused while the lock is held.
+///
+/// A standby answers with its own refusal (the restart window, while the
+/// row still names a predecessor of this state folder).
 ///
 /// Only a daemon with a sealed vault takes either route: one without (a
 /// Turso daemon, or one older than this command) cannot delete a sealed
@@ -723,6 +733,7 @@ async fn route_on_postgres(
 async fn route_beside_owner(
     cfg: &GlobalConfig,
     seals: bool,
+    owner_pid: i64,
 ) -> anyhow::Result<Option<SecretRoute>> {
     use crystalline_remote::sealed::SealKey;
     use serde_json::Value;
@@ -736,6 +747,11 @@ async fn route_beside_owner(
     };
     if let Some(refusal) = holder.get("standby").and_then(Value::as_str) {
         anyhow::bail!("{refusal}");
+    }
+    // Both pids are the daemon's own, so they compare inside a container
+    // too.
+    if holder.get("pid").and_then(Value::as_i64) != Some(owner_pid) {
+        return Ok(None);
     }
     let Some(theirs) = holder.get("secret_key_id").and_then(Value::as_str) else {
         anyhow::bail!(pg::daemon_without_vault());
@@ -1207,6 +1223,14 @@ pub(crate) mod pg {
         "the daemon of this machine has no sealed vault, so nothing was changed: it is not the instance that owns this database, or it is older than this command. Run the command where the instance that owns the database runs, or update this machine's daemon and run it again".to_string()
     }
 
+    /// The refusal of a command that changes a secret while who owns its
+    /// database could not be read.
+    pub(crate) fn secret_owner_unknown(database: &str, error: &str) -> String {
+        format!(
+            "could not check who owns the database {database} ({error}), so nothing was changed; run the command again once the database answers"
+        )
+    }
+
     /// The refusal of a server sign-in (`connect <url>`, `disconnect`) on
     /// Postgres away from the instance that serves it.
     pub(crate) fn server_sign_in_in_the_pod(example: &str) -> String {
@@ -1257,6 +1281,25 @@ pub(crate) mod pg {
                 released_at: released
                     .then(|| Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap()),
             }
+        }
+
+        /// A daemon of this machine without a sealed vault cannot take a
+        /// secret change: the refusal says nothing was changed and why,
+        /// and no longer blames only the daemon's age.
+        #[test]
+        fn a_daemon_without_a_vault_is_refused_with_both_reasons() {
+            let said = daemon_without_vault();
+            assert!(
+                said.starts_with(
+                    "the daemon of this machine has no sealed vault, so nothing was changed"
+                ),
+                "{said}"
+            );
+            assert!(
+                said.contains("it is not the instance that owns this database"),
+                "{said}"
+            );
+            assert!(said.contains("or it is older than this command"), "{said}");
         }
 
         /// The command refusal names the owner, the command it runs if any,
