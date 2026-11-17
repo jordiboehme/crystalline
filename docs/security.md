@@ -128,7 +128,7 @@ On macOS and Linux the `XDG_*` variables move these folders. On Windows, config 
 With a PostgreSQL database the secrets are not kept on this machine. The GitHub tokens, a saved GitHub App and the sign-ins to connected servers are rows of the table `instance_secret`, and the keychain and the token files above are not used. See [Run on PostgreSQL](deployment.md#run-on-postgresql).
 
 - Each row is sealed with XChaCha20-Poly1305 under a 32 byte key from `CRYSTALLINE_SECRET_KEY` or `CRYSTALLINE_SECRET_KEY_FILE`. The key never enters the database. A row stores only the id of its key, the first 16 hex characters of the key's SHA-256, and the name of the row is bound to the sealed bytes, so a row copied to another name does not open.
-- The key is never logged. The start, `status` and `doctor` show its id and the number of sealed rows, never a row name.
+- The key is never logged. The start logs its id and the number of sealed rows, never a row name. `status` and `doctor` say only whether a key is configured and how many rows are sealed.
 - A lost key means lost secrets: nothing can open the rows without it. A start with a new key stops while rows of the old key remain, so delete them first (`DELETE FROM instance_secret`), then save the App and link GitHub again.
 - Keep the key apart from the database backups. A backup together with its key gives away every secret in it.
 - There is no key rotation yet. The key id in each row keeps it possible for a later version.
