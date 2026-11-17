@@ -3745,6 +3745,191 @@ fn sealing_beside_the_daemon_refuses_another_key() {
     assert!(serve.alive());
 }
 
+/// A Postgres configuration on a machine whose daemon serves another
+/// database (a Turso one here): the secret commands never hand their change
+/// to that daemon, which does not own the database. `users remove` claims
+/// the free database and deletes the sealed token with the account, and the
+/// daemon's own token file for that name stays; `connect github` seals
+/// under its own claim, not beside that daemon.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn secret_commands_pass_by_a_daemon_of_another_database() {
+    use crystalline_remote::{StoredToken, TokenIdentity, TokenStore};
+
+    let Some(pg) = PgScratch::new("vtother") else {
+        return;
+    };
+    let github = PodGithub::start();
+    let env = Env::new("vtother");
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let pg_vars = pg.env();
+    let vars: Vec<(&str, &str)> = pg_vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let pod = pod_vars(&github);
+    let with_github: Vec<(&str, &str)> = pg_vars
+        .iter()
+        .chain(pod.iter())
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+
+    let (ok, out, err) = run_vars(
+        &env,
+        &["users", "add", "bob", "--mcp-token", "agent"],
+        &vars,
+    );
+    assert!(ok, "{out}{err}");
+    let row = personal_row("bob");
+    seal_token_row(&pg, &row, "bob");
+    // The Turso daemon's own token for a person of the same name.
+    let origins = env.state_dir().join("origins");
+    let local =
+        TokenStore::file_fallback_for(&TokenIdentity::Personal("bob".to_string()), &origins)
+            .unwrap();
+    local
+        .save(&StoredToken {
+            access_token: "bob-local".to_string(),
+            host: "github.com".to_string(),
+            user: "bob".to_string(),
+            created_at: chrono::Utc::now(),
+            refresh_token: None,
+            expires_at: None,
+            refresh_expires_at: None,
+        })
+        .unwrap();
+
+    let (ok, out, err) = run_vars(&env, &["users", "remove", "bob"], &vars);
+    assert!(ok, "{out}{err}");
+    assert_eq!(accounts_named(&pg, "bob"), "0");
+    assert!(!has_secret_row(&pg, &row), "the sealed token went too");
+    assert!(
+        local.load().unwrap().is_some(),
+        "the Turso daemon's token is not touched"
+    );
+    assert_eq!(
+        owner_command(&pg),
+        "crystalline users remove|true",
+        "the command claimed the database and gave it back"
+    );
+
+    let (ok, out, err) = run_vars(
+        &env,
+        &["connect", "github", "--token", "ghp_other"],
+        &with_github,
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("(vault token store)"), "{out}");
+    assert!(has_secret_row(&pg, &format!("github:{}", github.host())));
+    assert_eq!(
+        owner_command(&pg),
+        "crystalline connect github|true",
+        "sealed under the command's own claim"
+    );
+    let instance = TokenStore::file_fallback_for(&TokenIdentity::Instance, &origins).unwrap();
+    assert!(instance.load().unwrap().is_none(), "nothing saved locally");
+    assert!(serve.alive());
+}
+
+/// A server sign-in on Postgres is made in the pod only: with the key on a
+/// free database and no daemon, `connect <url>` and `disconnect <name>` are
+/// refused before anyone signs in, with the `kubectl exec` example, and
+/// nothing is written (no claim, no row, no `sources.json`).
+#[cfg(feature = "postgres")]
+#[test]
+fn server_sign_in_away_from_the_pod_is_refused() {
+    let Some(pg) = PgScratch::new("vtsrvaway") else {
+        return;
+    };
+    let env = Env::new("vtsrvaway").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["connect", "https://kb.example", "--token"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("made in the pod"), "{err}");
+    assert!(
+        err.contains("kubectl exec <pod> -- crystalline connect https://kb.example --token"),
+        "{err}"
+    );
+    let (ok, out, err) = env.run_full(&["disconnect", "acme"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("made in the pod"), "{err}");
+    assert!(
+        err.contains("kubectl exec <pod> -- crystalline disconnect acme"),
+        "{err}"
+    );
+    assert_eq!(schema_objects(&pg), "0", "nothing was opened");
+    assert!(
+        !env.state_dir().join("remote").join("sources.json").exists(),
+        "no sources.json"
+    );
+}
+
+/// In the pod: `connect <url>` while the daemon owns the database seals the
+/// server sign-in beside the daemon, tells it to reload its sources, and
+/// the daemon serves the server's domain with the new credential. The
+/// credential is not written to the state folder.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn connect_server_in_the_pod_seals_beside_the_daemon() {
+    let Some(pg) = PgScratch::new("vtpodsrv") else {
+        return;
+    };
+    let server = crate::remote_server::CliServer::start();
+    let env = Env::new("vtpodsrv").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    assert_eq!(secret_rows(&pg), "0");
+
+    let (ok, out, err) = run_with_stdin(
+        &env,
+        &["connect", &server.origin, "--name", "acme", "--token"],
+        &format!("{}\n", server.token_for("keeper")),
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(&format!(
+            "connected to {} as keeper (token); this machine calls it acme",
+            server.origin
+        )),
+        "{out}"
+    );
+    let row = format!(
+        "{}{}",
+        crystalline_remote::server_token::SERVER_ACCOUNT_PREFIX,
+        crystalline_remote::server_key(&server.origin)
+    );
+    assert!(has_secret_row(&pg, &row), "the sign-in is sealed");
+    assert_eq!(secret_rows(&pg), "1");
+    let remote = env.state_dir().join("remote");
+    assert!(remote.join("sources.json").exists(), "the daemon's record");
+    let credential = remote
+        .join(crystalline_remote::server_folder(
+            &crystalline_remote::server_key(&server.origin),
+        ))
+        .join("credential.json");
+    assert!(
+        !credential.exists(),
+        "no credential file in the state folder"
+    );
+
+    // The daemon reloaded its sources and reads the server's domain with
+    // the sealed credential: the command runs without the key, so it could
+    // not open the credential itself.
+    let (ok, out, err) = run_vars(
+        &env,
+        &["read", "vent-driver", "--domain", "open"],
+        &NO_SECRET_KEY,
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("the vent driver retries a write three times"),
+        "{out}"
+    );
+    assert_eq!(
+        owner_command(&pg),
+        "|false",
+        "the owner row stays the daemon's"
+    );
+    assert!(serve.alive());
+}
+
 /// The key id the rows of `pg` were sealed with.
 #[cfg(feature = "postgres")]
 fn migrated_key_id_of(pg: &PgScratch) -> String {

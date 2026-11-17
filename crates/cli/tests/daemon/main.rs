@@ -30,6 +30,11 @@ mod pg_owner;
 // helpers of `pg_owner`.
 #[cfg(unix)]
 mod pg_redeploy;
+// A Crystalline server inside the test process, for a server sign-in made
+// beside the daemon on Postgres (`pg_owner`).
+#[cfg(all(unix, feature = "postgres"))]
+#[path = "../common/remote_server.rs"]
+mod remote_server;
 // The same two seams as bridge above.
 #[cfg(debug_assertions)]
 mod packaged;

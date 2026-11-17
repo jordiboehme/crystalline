@@ -7170,7 +7170,7 @@ impl PgScratch {
     /// divided by 10, so a first start on the empty schema, which has no
     /// owner row and so waits out the takeover grace, waits 1.5 s and not
     /// 15 s.
-    fn env(&self) -> Vec<(&'static str, String)> {
+    pub(crate) fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("CRYSTALLINE_DATABASE_BACKEND", "postgres".to_string()),
             ("CRYSTALLINE_DATABASE_URL", self.url.clone()),

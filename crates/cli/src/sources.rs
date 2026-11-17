@@ -206,10 +206,12 @@ pub async fn connect_server(
         Err(other) => return Err(other.into()),
     }
     let loaded = crate::cmd::load(None)?;
-    // On Postgres the sign-in is sealed in the database by this process:
-    // where it is written is decided before anyone signs in, and a daemon
-    // of this machine reads it again at the reload below.
-    crystalline_service::route_sealing_command(&loaded.effective).await?;
+    // On Postgres the sign-in is sealed in the database by this process,
+    // beside the daemon that owns it: where it is written is decided before
+    // anyone signs in, and that daemon reads it again at the reload below.
+    // Away from that daemon the command is refused: the daemon keeps
+    // sources.json and the vault together.
+    crystalline_service::route_server_sign_in(&loaded.effective).await?;
     let local = local_domains_of(&loaded.effective);
     let dir = remote_dir()?;
     let connected = if token {
@@ -438,8 +440,9 @@ pub async fn disconnect_server(target: String, json: bool) -> anyhow::Result<()>
     // (both forms of a secret set) surfaces here instead of reading as unset
     // below.
     let loaded = crate::cmd::load(None)?;
-    // On Postgres the sign-in is sealed in the database, as for `connect`.
-    crystalline_service::route_sealing_command(&loaded.effective).await?;
+    // On Postgres the sign-in is sealed in the database, as for `connect`,
+    // and changed only beside the daemon that owns it.
+    crystalline_service::route_server_sign_in(&loaded.effective).await?;
     let dir = remote_dir()?;
     let Some(gone) = crystalline_remote::disconnect(&dir, &target).await? else {
         let taken = crystalline_remote::load_sources(&dir)
