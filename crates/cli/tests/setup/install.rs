@@ -386,6 +386,11 @@ fn install_into_an_empty_home_writes_the_exact_managed_shape() {
                 {
                     "hooks": [ { "type": "command", "command": "crystalline hook prompt --harness claude-code", "timeout": 5 } ]
                 }
+            ],
+            "SubagentStart": [
+                {
+                    "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 5 } ]
+                }
             ]
         }
     });
@@ -538,6 +543,82 @@ fn foreign_hooks_survive_install_and_uninstall() {
             .unwrap()
             .contains_key("PreToolUse")
     );
+}
+
+/// A person's own `SubagentStart` hook rides through install and uninstall
+/// untouched; ours is appended after it and removed on uninstall.
+#[test]
+fn the_subagent_start_hook_installs_reports_and_uninstalls_beside_a_users_own() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    let settings_path = claude_settings(&home);
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let own = json!({ "hooks": [ { "type": "command", "command": "my-subagent-hook" } ] });
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({ "hooks": { "SubagentStart": [ own.clone() ] } }))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["hooks"]["subagent_start"], "added", "{report}");
+
+    let human = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("  SubagentStart hook: "), "{human}");
+
+    let groups = read_json(&settings_path)["hooks"]["SubagentStart"].clone();
+    assert_eq!(groups[0], own, "a person's own group stays first");
+    assert_eq!(
+        groups[1]["hooks"][0]["command"],
+        "crystalline hook stop --harness claude-code"
+    );
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["hooks"]["subagent_start"], "removed", "{report}");
+    assert_eq!(
+        read_json(&settings_path)["hooks"]["SubagentStart"],
+        json!([own]),
+        "only our SubagentStart group is removed"
+    );
+}
+
+/// Codex gets no `SubagentStart` entry, and its report leaves the field out.
+#[test]
+fn codex_install_writes_no_subagent_start_hook() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("codex.log");
+    write_shim(&bin_dir, "codex", &log);
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["hooks"].get("subagent_start").is_none(), "{report}");
+    let hooks = read_json(Path::new(report["hooks"]["path"].as_str().unwrap()));
+    assert!(hooks["hooks"].get("SubagentStart").is_none(), "{hooks}");
 }
 
 #[test]
@@ -1635,6 +1716,58 @@ fn prompt_system_reconciles_an_install_from_another_version() {
     assert!(
         !stdout.contains("[crystalline]"),
         "a matching version reconciles nothing: {stdout}"
+    );
+}
+
+/// An install written by an older release has no `SubagentStart` group; the
+/// first session start on this binary adds it through the reconcile, without
+/// a manual `crystalline install`, and leaves a person's own hook on the
+/// event alone. The row names 0.32.2 rather than 0.33.0 because this tree's
+/// own version is 0.33.0 until the release bump, and a row at the current
+/// version is never reconciled.
+#[test]
+fn an_older_install_gains_the_subagent_start_hook_through_the_reconcile() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    let settings_path = claude_settings(&home);
+    let own = json!({ "hooks": [ { "type": "command", "command": "my-subagent-hook" } ] });
+    let mut settings = read_json(&settings_path);
+    settings["hooks"]["SubagentStart"] = json!([own.clone()]);
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.32.2");
+    });
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let groups = read_json(&settings_path)["hooks"]["SubagentStart"].clone();
+    assert_eq!(
+        groups,
+        json!([
+            own,
+            { "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 5 } ] }
+        ]),
+        "the reconcile appends ours after the person's own group"
+    );
+    assert_eq!(
+        read_json(&receipt_file(&home))["installs"][0]["version"],
+        env!("CARGO_PKG_VERSION")
     );
 }
 

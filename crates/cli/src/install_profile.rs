@@ -280,6 +280,7 @@ fn hook_outcome(path: &Path, status: &'static str, written: bool, installed: boo
             session_start: status,
             stop: None,
             prompt: None,
+            subagent_start: None,
             written,
         },
         installed,
