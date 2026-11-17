@@ -6,14 +6,28 @@
 //! was written with), [`Day`] (a calendar date) and [`Delta`] (an exact
 //! span of seconds and nanoseconds), the clock ([`now`], [`today_utc`]), the
 //! duration helpers ([`days`], [`hours`], [`minutes`], [`seconds`],
-//! [`millis`]) and the named emitters. None of the newtypes implements
-//! `Display` or serde's traits, so every byte that leaves Crystalline goes
-//! through a helper named here.
+//! [`millis`]) and the named emitters and parsers. None of the newtypes
+//! implements `Display` or serde's traits, so every byte that leaves
+//! Crystalline goes through a helper named here.
+//!
+//! The parsers ([`parse_rfc3339`], [`parse_lenient_stamp`],
+//! [`parse_lenient_offset`], [`parse_date`], [`parse_lenient_date`],
+//! [`parse_kept_stamp`], [`parse_rfc2822`]) and the RFC 3339 emitter are
+//! written by hand on plain numbers: each grammar reads text into numbers,
+//! and one conversion below turns the numbers into a value. That conversion
+//! is the only place a parser meets the library.
 //!
 //! The values are still backed by chrono in this stage; the names are what
 //! the rest of the workspace moves onto first.
 
-use chrono::{DateTime, Days, FixedOffset, NaiveDate, SecondsFormat, TimeDelta, Utc};
+mod calendar;
+mod emit;
+mod parse;
+
+use chrono::{
+    DateTime, Days, FixedOffset, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, TimeZone, Utc,
+};
+use parse::Parts;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Mul, Neg, Sub};
@@ -211,7 +225,7 @@ impl Stamp {
     /// RFC 3339 with `+00:00` and the fraction in groups of none, 3, 6 or 9
     /// digits, as chrono's `to_rfc3339` writes it.
     pub fn rfc3339(&self) -> String {
-        self.0.to_rfc3339()
+        emit::rfc3339(self.unix_seconds(), self.subsec_nanos(), 0)
     }
 
     /// RFC 3339 in whole seconds with `Z`: `2026-01-05T10:17:19Z`.
@@ -273,7 +287,12 @@ impl OffsetStamp {
     /// fraction in groups of none, 3, 6 or 9 digits, as chrono's
     /// `to_rfc3339` writes it.
     pub fn rfc3339(&self) -> String {
-        self.0.to_rfc3339()
+        let instant = self.stamp();
+        emit::rfc3339(
+            instant.unix_seconds(),
+            instant.subsec_nanos(),
+            self.offset_seconds(),
+        )
     }
 
     /// Wraps a chrono instant with offset. Removed in stage 3.
@@ -394,10 +413,86 @@ impl Day {
     }
 }
 
+/// A strict RFC 3339 instant, as chrono's `DateTime::parse_from_rfc3339`
+/// reads it: `2026-01-05T10:17:19Z`, with `t` or a space allowed for `T`,
+/// an optional fraction of any length (nine digits kept), and `Z`, `z` or
+/// `+hh:mm`/`-hh:mm` (the minus also as U+2212). A leap second `:60` is kept.
+pub fn parse_rfc3339(s: &str) -> Option<OffsetStamp> {
+    parse::rfc3339(s).and_then(offset_stamp_from_parts)
+}
+
+/// An instant as chrono's `FromStr` and `Deserialize` for `DateTime<Utc>`
+/// read it: the grammar of [`parse_lenient_offset`], moved to UTC.
+pub fn parse_lenient_stamp(s: &str) -> Option<Stamp> {
+    parse_lenient_offset(s).map(|value| value.stamp())
+}
+
+/// An instant with its offset as chrono's `FromStr` and `Deserialize` for
+/// `DateTime<FixedOffset>` read it: RFC 3339 plus white space around the
+/// value and its parts, unpadded fields (`2026-1-5T1:7:9Z`), a signed year
+/// of any length, `UTC` as an offset, and an offset written `+0200` or
+/// `+02 00`.
+pub fn parse_lenient_offset(s: &str) -> Option<OffsetStamp> {
+    parse::lenient(s).and_then(offset_stamp_from_parts)
+}
+
+/// A date as chrono's `NaiveDate::parse_from_str(s, "%Y-%m-%d")` reads it:
+/// `2026-01-05`, also `2026-1-5` and a leading space before each number.
+pub fn parse_date(s: &str) -> Option<Day> {
+    parse::date(s).and_then(day_from_parts)
+}
+
+/// A date as chrono's `FromStr` and `Deserialize` for `NaiveDate` read it:
+/// the grammar of [`parse_date`] plus white space before each `-` and at the
+/// end (`2026 - 01 - 05 `).
+pub fn parse_lenient_date(s: &str) -> Option<Day> {
+    parse::lenient_date(s).and_then(day_from_parts)
+}
+
+/// A kept-file stamp, `20260105T101719Z`, as chrono's
+/// `NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ")` reads it, taken as
+/// UTC. A leading `+` makes the year swallow every digit, so
+/// `+20260105T101719Z` is refused.
+pub fn parse_kept_stamp(s: &str) -> Option<Stamp> {
+    parse::kept(s)
+        .and_then(offset_stamp_from_parts)
+        .map(|value| value.stamp())
+}
+
+/// An RFC 2822 date (the HTTP `Date` header), as chrono's
+/// `DateTime::parse_from_rfc2822` reads it: `Mon, 5 Jan 2026 10:17:19 GMT`.
+pub fn parse_rfc2822(s: &str) -> Option<OffsetStamp> {
+    parse::rfc2822(s).and_then(offset_stamp_from_parts)
+}
+
+// The one place a parser meets the library: numbers from a grammar become a
+// value here, and only here. A leap second becomes chrono's leap nanosecond
+// (second 59 plus a full second of nanoseconds), so nothing changes; the
+// library also decides which years and instants it can hold.
+
+fn offset_stamp_from_parts(parts: Parts) -> Option<OffsetStamp> {
+    let date = NaiveDate::from_ymd_opt(parts.year, parts.month.into(), parts.day.into())?;
+    let leap = if parts.leap { 1_000_000_000 } else { 0 };
+    let time = NaiveTime::from_hms_nano_opt(
+        parts.hour.into(),
+        parts.minute.into(),
+        parts.second.into(),
+        parts.nanos + leap,
+    )?;
+    let offset = FixedOffset::east_opt(parts.offset_seconds)?;
+    offset
+        .from_local_datetime(&date.and_time(time))
+        .single()
+        .map(OffsetStamp)
+}
+
+fn day_from_parts(parts: Parts) -> Option<Day> {
+    NaiveDate::from_ymd_opt(parts.year, parts.month.into(), parts.day.into()).map(Day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use std::collections::hash_map::DefaultHasher;
 
     /// 2026-01-05T10:17:19Z.
@@ -678,6 +773,361 @@ mod tests {
         let before = now().day_utc();
         let today = today_utc();
         assert!(today == before || Some(today) == before.checked_add_days(1));
+    }
+
+    /// Requires `ours` to agree with chrono's `theirs` on `input`: both
+    /// refuse, or both accept with the same instant, offset and RFC 3339
+    /// bytes. Returns whether the input was accepted.
+    fn agree_offset(
+        input: &str,
+        ours: Option<OffsetStamp>,
+        theirs: Option<DateTime<FixedOffset>>,
+    ) -> bool {
+        match (ours, theirs) {
+            (None, None) => false,
+            (Some(ours), Some(theirs)) => {
+                assert_eq!(ours.into_chrono(), theirs, "{input:?}");
+                assert_eq!(
+                    ours.offset_seconds(),
+                    theirs.offset().local_minus_utc(),
+                    "{input:?}"
+                );
+                assert_eq!(ours.rfc3339(), theirs.to_rfc3339(), "{input:?}");
+                true
+            }
+            (ours, theirs) => panic!("{input:?}: ours {ours:?}, chrono {theirs:?}"),
+        }
+    }
+
+    /// As [`agree_offset`] for a UTC instant.
+    fn agree_stamp(input: &str, ours: Option<Stamp>, theirs: Option<DateTime<Utc>>) -> bool {
+        match (ours, theirs) {
+            (None, None) => false,
+            (Some(ours), Some(theirs)) => {
+                assert_eq!(ours.into_chrono(), theirs, "{input:?}");
+                assert_eq!(ours.rfc3339(), theirs.to_rfc3339(), "{input:?}");
+                true
+            }
+            (ours, theirs) => panic!("{input:?}: ours {ours:?}, chrono {theirs:?}"),
+        }
+    }
+
+    /// As [`agree_offset`] for a date.
+    fn agree_day(input: &str, ours: Option<Day>, theirs: Option<NaiveDate>) -> bool {
+        match (ours, theirs) {
+            (None, None) => false,
+            (Some(ours), Some(theirs)) => {
+                assert_eq!(ours.into_chrono(), theirs, "{input:?}");
+                true
+            }
+            (ours, theirs) => panic!("{input:?}: ours {ours:?}, chrono {theirs:?}"),
+        }
+    }
+
+    #[test]
+    fn grammar_rows_match_chrono() {
+        // Every row of the J2 table in the design review, then the forms both
+        // libraries read alike. The flag is chrono's answer.
+        let rows: &[(&str, bool)] = &[
+            ("2026-01-05T10:17:19+0200", false),
+            ("2026-01-05T10:17:19+02", false),
+            ("2026-01-05T10:17:19+02:00:30", false),
+            ("2026-01-05T10:17Z", false),
+            ("2026-01-05T10Z", false),
+            ("20260105T101719Z", false),
+            ("2026-01-05T10:17:19,5Z", false),
+            ("2026-01-05T10:17:19Z[UTC]", false),
+            ("2026-01-05T10:17:19+02:00[Europe/Berlin]", false),
+            ("2026-01-05T10:17:19+24:00", false),
+            ("2026-01-05T10:17:19+25:59", false),
+            ("+002026-01-05T10:17:19Z", false),
+            ("2026-01-05T10:17:19.1234567891Z", true),
+            ("2026-01-05T10:17:19\u{2212}02:00", true),
+            ("9999-12-31T23:59:59Z", true),
+            ("2026-12-31T23:59:60Z", true),
+            ("2026-01-05T10:17:60Z", true),
+            ("2026-01-05t10:17:19Z", true),
+            ("2026-01-05T10:17:19z", true),
+            ("2026-01-05 10:17:19Z", true),
+            ("2026-01-05T10:17+02:00", false),
+            ("2026-01-05T10:17:19-00:00", true),
+            ("2026-01-05T10:17:19+00:00", true),
+            ("2026-01-05T10:17:19.12+05:30", true),
+            ("2026-01-05T10:17:19.123456789-04:30", true),
+            ("2026-01-05T10:17:19+23:59", true),
+            ("2026-01-05T10:17:19+02:60", false),
+            ("2026-01-05T10:17:19.Z", false),
+            ("2026-01-05T24:00:00Z", false),
+            ("2026-01-05T10:60:00Z", false),
+            ("2026-01-05T10:17:61Z", false),
+            ("2026-02-29T00:00:00Z", false),
+            ("2024-02-29T00:00:00Z", true),
+            ("2026-00-05T00:00:00Z", false),
+            ("2026-01-00T00:00:00Z", false),
+            ("0000-01-01T00:00:00Z", true),
+            (" 2026-01-05T10:17:19Z", false),
+            ("2026-01-05T10:17:19Z ", false),
+            ("2026-01-05T10:17:19 Z", false),
+            ("2026-1-05T10:17:19Z", false),
+            ("2026-01-05T10:17:19", false),
+            ("", false),
+        ];
+        for (input, accepted) in rows {
+            let ours = parse_rfc3339(input);
+            let theirs = DateTime::parse_from_rfc3339(input).ok();
+            assert_eq!(agree_offset(input, ours, theirs), *accepted, "{input:?}");
+        }
+        let printed = |s: &str| parse_rfc3339(s).unwrap().rfc3339();
+        assert_eq!(printed("2026-12-31T23:59:60Z"), "2026-12-31T23:59:60+00:00");
+        assert_eq!(
+            printed("2026-01-05T10:17:19.1234567891Z"),
+            "2026-01-05T10:17:19.123456789+00:00"
+        );
+        assert_eq!(
+            printed("2026-01-05T10:17:19\u{2212}02:00"),
+            "2026-01-05T10:17:19-02:00"
+        );
+        assert_eq!(
+            printed("2026-01-05T10:17:19-00:00"),
+            "2026-01-05T10:17:19+00:00"
+        );
+        assert_eq!(
+            printed("2026-01-05t10:17:19.5z"),
+            "2026-01-05T10:17:19.500+00:00"
+        );
+    }
+
+    #[test]
+    fn lenient_rows_match_chrono_fromstr() {
+        // The J3 forms and their neighbours. The flag is chrono's answer.
+        let rows: &[(&str, bool)] = &[
+            ("2026-01-05T10:17:19Z", true),
+            (" 2026-01-05T10:17:19Z ", true),
+            ("\t2026-01-05T10:17:19Z\n", true),
+            ("2026-1-5T10:17:19Z", true),
+            ("2026-01-05T1:7:9Z", true),
+            ("+2026-01-05T10:17:19Z", true),
+            ("-0001-01-05T10:17:19Z", true),
+            ("-2026-01-05T10:17:19+02:00", true),
+            ("2026-01-05T10:17:19 +02:00", true),
+            ("2026-01-05T10:17:19+0200", true),
+            ("2026-01-05T10:17:19+02 00", true),
+            ("2026-01-05T10:17:19+02 :: 00", true),
+            ("2026 - 01 - 05T10:17:19Z", true),
+            ("2026-01-05T 10 : 17 : 19Z", true),
+            ("2026-01-05  10:17:19Z", true),
+            ("2026-01-05 T10:17:19Z", false),
+            ("2026-01-05T10:17:19UTC", true),
+            ("2026-01-05T10:17:19 utc", true),
+            ("2026-01-05T10:17:19+02", false),
+            ("2026-01-05T10:17Z", false),
+            ("2026-01-05T10:17:19 .5Z", false),
+            ("2026-01-05T10:17:19.5 Z", true),
+            ("2026-01-05T10:17:19.Z", false),
+            ("+10000-01-01T00:00:00Z", true),
+            ("12026-01-05T10:17:19Z", false),
+            ("26-01-05T10:17:19Z", true),
+            ("2026-01-05T10:17:60Z", true),
+            ("2026-01-05T10:17:19\u{2212}02:00", true),
+            ("2026-01-05T10:17:19.1234567891Z", true),
+            ("2026-01-05T10:17:19-00:00", true),
+            ("2026-01-05T10:17:19+24:00", false),
+            ("2026-01-05T10:17:19Z\u{3000}", true),
+            ("\u{a0}2026-01-05T10:17:19Z", true),
+            ("+262142-12-31T23:59:59Z", true),
+            ("+262142-12-31T23:59:59-01:00", false),
+            ("+262143-01-01T00:00:00Z", false),
+            ("-262143-01-01T00:00:00Z", true),
+            ("-262143-01-01T00:00:00+01:00", false),
+            ("+2147483648-01-01T00:00:00Z", false),
+            ("2026-01-05", false),
+            ("2026-01-05T10:17:19Zx", false),
+            ("", false),
+        ];
+        for (input, accepted) in rows {
+            let ours = parse_lenient_offset(input);
+            let theirs = input.parse::<DateTime<FixedOffset>>().ok();
+            assert_eq!(agree_offset(input, ours, theirs), *accepted, "{input:?}");
+            let json = serde_json::to_string(input).unwrap();
+            let theirs = serde_json::from_str::<DateTime<FixedOffset>>(&json).ok();
+            assert_eq!(agree_offset(input, ours, theirs), *accepted, "{input:?}");
+
+            let ours = parse_lenient_stamp(input);
+            let theirs = input.parse::<DateTime<Utc>>().ok();
+            assert_eq!(agree_stamp(input, ours, theirs), *accepted, "{input:?}");
+            let theirs = serde_json::from_str::<DateTime<Utc>>(&json).ok();
+            assert_eq!(agree_stamp(input, ours, theirs), *accepted, "{input:?}");
+        }
+        let printed = |s: &str| parse_lenient_offset(s).unwrap().rfc3339();
+        assert_eq!(
+            printed("-0001-01-05T10:17:19Z"),
+            "-0001-01-05T10:17:19+00:00"
+        );
+        assert_eq!(
+            printed("+10000-01-01T00:00:00Z"),
+            "+10000-01-01T00:00:00+00:00"
+        );
+        assert_eq!(printed("2026-1-5T1:7:9 +0200"), "2026-01-05T01:07:09+02:00");
+    }
+
+    #[test]
+    fn date_rows_match_chrono() {
+        // (input, accepted by parse_from_str "%Y-%m-%d", accepted by FromStr)
+        let rows: &[(&str, bool, bool)] = &[
+            ("2026-01-05", true, true),
+            ("2026-1-5", true, true),
+            (" 2026-01-05", true, true),
+            ("2026- 01- 05", true, true),
+            ("26-01-05", true, true),
+            ("2026 - 01 - 05", false, true),
+            ("2026-01-05 ", false, true),
+            ("+10000-01-01", true, true),
+            ("-0001-01-01", true, true),
+            ("+2026-01-05", true, true),
+            ("12026-01-05", false, false),
+            ("20260105", false, false),
+            ("2026-01-05T00:00:00", false, false),
+            ("2026-01-05[UTC]", false, false),
+            ("2026-02-30", false, false),
+            ("2024-02-29", true, true),
+            ("2026-13-01", false, false),
+            ("2026-001-05", false, false),
+            ("", false, false),
+        ];
+        for (input, strict, lenient) in rows {
+            let theirs = NaiveDate::parse_from_str(input, "%Y-%m-%d").ok();
+            assert_eq!(
+                agree_day(input, parse_date(input), theirs),
+                *strict,
+                "{input:?}"
+            );
+            let ours = parse_lenient_date(input);
+            let theirs = input.parse::<NaiveDate>().ok();
+            assert_eq!(agree_day(input, ours, theirs), *lenient, "{input:?}");
+            let json = serde_json::to_string(input).unwrap();
+            let theirs = serde_json::from_str::<NaiveDate>(&json).ok();
+            assert_eq!(agree_day(input, ours, theirs), *lenient, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn kept_stamps_match_chrono() {
+        // A signed year takes every digit after the sign, so a leading `+`
+        // or `-` is refused unless something stops the digits.
+        let rows: &[(&str, bool)] = &[
+            ("20260105T101719Z", true),
+            ("+20260105T101719Z", false),
+            ("-20260105T101719Z", false),
+            ("+2026 0105T101719Z", true),
+            (" 20260105T101719Z", true),
+            ("20260105T101760Z", true),
+            ("20260105T241719Z", false),
+            ("20260230T101719Z", false),
+            ("20260105t101719Z", false),
+            ("20260105T101719z", false),
+            ("20260105T101719Z ", false),
+            ("20260105T101719.5Z", false),
+            ("20260105T1017Z", false),
+            ("2026-01-05T10:17:19Z", false),
+            ("", false),
+        ];
+        for (input, accepted) in rows {
+            let theirs = chrono::NaiveDateTime::parse_from_str(input, "%Y%m%dT%H%M%SZ")
+                .ok()
+                .map(|t| t.and_utc());
+            let ours = parse_kept_stamp(input);
+            assert_eq!(agree_stamp(input, ours, theirs), *accepted, "{input:?}");
+        }
+        assert_eq!(
+            parse_kept_stamp("20260105T101719Z")
+                .unwrap()
+                .rfc3339_secs_z(),
+            "2026-01-05T10:17:19Z"
+        );
+    }
+
+    #[test]
+    fn rfc2822_rows_match_chrono() {
+        let rows: &[(&str, bool)] = &[
+            ("Mon, 05 Jan 2026 10:17:19 +0000", true),
+            ("Mon, 5 Jan 2026 10:17:19 GMT", true),
+            ("5 Jan 2026 10:17:19 +0200", true),
+            ("Tue, 05 Jan 2026 10:17:19 GMT", false),
+            ("Mon, 05 Jan 2026 10:17 GMT", true),
+            ("Thu, 31 Dec 2026 23:59:60 GMT", true),
+            ("Mon, 05 Jan 26 10:17:19 GMT", true),
+            ("Mon, 05 Jan 2026 10:17:19 -0500", true),
+            ("Mon, 05 Jan 2026 10:17:19 EST", true),
+            ("Mon, 05 Jan 2026 10:17:19 +02:00", false),
+            ("Mon, 05 Jan 2026 10:17:19 GMT (a (nested) comment)", true),
+            ("Mon, 05 Jan 2026 10:17:19 GMT ", false),
+            ("Mon, 05 January 2026 10:17:19 GMT", false),
+            ("mon, 05 jan 2026 10:17:19 gmt", true),
+            ("Mon, 05 Jan 2026 10:17:19 +2400", false),
+            ("Monday, 05 Jan 2026 10:17:19 GMT", false),
+            ("Mon, 05 Jan 2026 10 : 17:19 GMT", true),
+            ("Mon, 05 Jan 2026 10:17: 19 GMT", false),
+            ("Mon, 05 Jan 2026 10:17:19 J", false),
+            ("Mon, 05 Jan 2026 10:17:19 A", true),
+            ("Mon, 05 Jan 2026 10:17:19 XYZ", false),
+            ("Mon, 05 Jan 2026 10:17:19 \u{2212}0200", false),
+            ("Mon, 05 Jan 2026 10:17:19", false),
+            ("", false),
+        ];
+        for (input, accepted) in rows {
+            let ours = parse_rfc2822(input);
+            let theirs = DateTime::parse_from_rfc2822(input).ok();
+            assert_eq!(agree_offset(input, ours, theirs), *accepted, "{input:?}");
+        }
+        let leap = parse_rfc2822("Thu, 31 Dec 2026 23:59:60 GMT").unwrap();
+        assert_eq!(leap.rfc3339(), "2026-12-31T23:59:60+00:00");
+        let single = parse_rfc2822("Mon, 5 Jan 2026 10:17:19 GMT").unwrap();
+        assert_eq!(single.rfc3339(), "2026-01-05T10:17:19+00:00");
+    }
+
+    #[test]
+    fn rfc3339_emitter_corners_match_chrono() {
+        let at = |y: i32, m: u32, d: u32, nanos: u32| {
+            NaiveDate::from_ymd_opt(y, m, d)
+                .unwrap()
+                .and_hms_nano_opt(23, 59, 59, nanos)
+                .unwrap()
+                .and_utc()
+        };
+        let instants = [
+            at(-1, 1, 1, 0),
+            at(-10000, 6, 30, 5),
+            at(10000, 1, 1, 120_000_000),
+            at(262142, 12, 30, 0),
+            at(-262143, 1, 2, 0),
+            at(9999, 12, 31, 999_999_999),
+            at(2026, 12, 31, 1_000_000_000),
+            at(2026, 12, 31, 1_123_456_000),
+            at(1969, 12, 31, 1),
+            at(0, 1, 1, 1_000),
+        ];
+        let offsets = [0, -29, 29, 30, -30, 86_399, -86_399, 7_200, -16_200, 3_599];
+        for instant in instants {
+            assert_eq!(Stamp::from_chrono(instant).rfc3339(), instant.to_rfc3339());
+            for offset in offsets {
+                let written = instant.with_timezone(&FixedOffset::east_opt(offset).unwrap());
+                assert_eq!(
+                    OffsetStamp::from_chrono(written).rfc3339(),
+                    written.to_rfc3339(),
+                    "{instant:?} {offset}"
+                );
+            }
+        }
+        let written = |offset: i32| {
+            let zone = FixedOffset::east_opt(offset).unwrap();
+            OffsetStamp::from_chrono(at(2026, 1, 5, 0).with_timezone(&zone)).rfc3339()
+        };
+        assert_eq!(written(-29), "2026-01-05T23:59:30-00:00");
+        assert_eq!(written(86_399), "2026-01-06T23:59:58+24:00");
+        assert_eq!(
+            Stamp::from_chrono(at(-1, 1, 1, 0)).rfc3339(),
+            "-0001-01-01T23:59:59+00:00"
+        );
     }
 
     #[test]
