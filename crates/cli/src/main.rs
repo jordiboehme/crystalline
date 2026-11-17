@@ -413,6 +413,11 @@ enum Command {
         /// time is up, as that command does when it finishes.
         #[arg(long)]
         standalone: Option<String>,
+        /// With `--standalone` on Postgres: claim the database only and
+        /// leave the state folder alone, as a command that opens no local
+        /// state (`users add`) does.
+        #[arg(long, requires = "standalone")]
+        database_only: bool,
     },
     /// Release and CI: stage a Claude Desktop extension (manifest, icon and,
     /// for the hollow one, the launcher) under a folder. Hidden, and not a
@@ -2535,7 +2540,11 @@ fn run() -> anyhow::Result<()> {
             pack,
         }) => desktop_bundle::run(kind, &outdir, binary, pack),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
-        Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
+        Some(Command::HoldLock {
+            secs,
+            standalone,
+            database_only,
+        }) => hold_lock(secs, standalone.as_deref(), database_only),
         Some(Command::DaemonTask { action }) => daemon_task_command(action),
         Some(Command::Serve {
             http,
@@ -2776,16 +2785,20 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 ///
 /// With `--standalone` on Postgres it also claims the database as the command
 /// it names, as that command would (spec section L), and gives it back when
-/// the time is up; refused when another instance owns it.
-fn hold_lock(secs: u64, standalone: Option<&str>) -> anyhow::Result<()> {
+/// the time is up; refused when another instance owns it. With
+/// `--database-only` it holds that claim alone and never takes the state
+/// folder.
+fn hold_lock(secs: u64, standalone: Option<&str>, database_only: bool) -> anyhow::Result<()> {
     use std::io::Write;
-    let _ownership = {
+    let _ownership = if database_only {
+        None
+    } else {
         let ownership = crystalline_service::instance::acquire_ownership()?;
         match standalone {
             Some(command) => ownership.publish_standalone(command)?,
             None => ownership.publish()?,
         }
-        ownership
+        Some(ownership)
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
