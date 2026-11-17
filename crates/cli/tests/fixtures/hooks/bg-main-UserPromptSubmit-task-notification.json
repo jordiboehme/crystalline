@@ -1,0 +1,9 @@
+{
+  "cwd": "/tmp/x",
+  "hook_event_name": "UserPromptSubmit",
+  "permission_mode": "default",
+  "prompt": "<task-notification>\n<task-id>00000000-0000-0000-0000-000000000003</task-id>\n<status>completed</status>\n</task-notification>",
+  "prompt_id": "00000000-0000-0000-0000-000000000006",
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "transcript_path": "/tmp/x"
+}

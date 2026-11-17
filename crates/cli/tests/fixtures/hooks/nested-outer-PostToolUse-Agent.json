@@ -1,0 +1,23 @@
+{
+  "agent_id": "00000000-0000-0000-0000-000000000003",
+  "agent_type": "general-purpose",
+  "cwd": "/tmp/x",
+  "duration_ms": 3613,
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "default",
+  "prompt_id": "00000000-0000-0000-0000-000000000002",
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "tool_input": {
+    "description": "prompt",
+    "prompt": "prompt",
+    "run_in_background": false,
+    "subagent_type": "general-purpose"
+  },
+  "tool_name": "Agent",
+  "tool_response": "prompt",
+  "tool_use_id": "00000000-0000-0000-0000-000000000006",
+  "transcript_path": "/tmp/x"
+}

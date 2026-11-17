@@ -1,0 +1,16 @@
+{
+  "agent_type": "spike",
+  "background_tasks": [],
+  "cwd": "/tmp/x",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "last_assistant_message": "prompt",
+  "permission_mode": "default",
+  "prompt_id": "00000000-0000-0000-0000-000000000002",
+  "session_crons": [],
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "stop_hook_active": false,
+  "transcript_path": "/tmp/x"
+}
