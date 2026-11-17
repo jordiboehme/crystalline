@@ -217,26 +217,22 @@ impl AuthDb {
     /// an abandoned transaction is released when the connection drops anyway.
     pub(super) async fn finish<T>(&self, result: Result<T>) -> Result<T> {
         match self {
-            AuthDb::Turso { conn, in_tx, .. } => {
-                let finished = match result {
-                    Ok(value) => match conn.execute("COMMIT", ()).await {
-                        Ok(_) => Ok(value),
-                        Err(e) => {
-                            // A commit that failed leaves the transaction
-                            // open: roll it back rather than keep the lock.
-                            let _ = conn.execute("ROLLBACK", ()).await;
-                            Err(anyhow::Error::from(e)
-                                .context("committing an auth database transaction"))
-                        }
-                    },
-                    Err(e) => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        Err(e)
-                    }
-                };
-                in_tx.store(false, std::sync::atomic::Ordering::SeqCst);
-                finished
-            }
+            AuthDb::Turso { conn, in_tx, .. } => match result {
+                Ok(value) => {
+                    // A commit that fails leaves the transaction open and
+                    // `in_tx` set: the next guard rolls it back.
+                    conn.execute("COMMIT", ())
+                        .await
+                        .context("committing an auth database transaction")?;
+                    in_tx.store(false, std::sync::atomic::Ordering::SeqCst);
+                    Ok(value)
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    in_tx.store(false, std::sync::atomic::Ordering::SeqCst);
+                    Err(e)
+                }
+            },
             #[cfg(feature = "postgres")]
             AuthDb::Postgres(pg) => match result {
                 Ok(value) => {
