@@ -49,5 +49,6 @@ mod prompt;
 mod provision;
 #[cfg(unix)]
 mod source_hooks;
+mod update;
 mod version;
 mod wix;

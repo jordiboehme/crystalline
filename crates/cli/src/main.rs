@@ -402,6 +402,11 @@ enum Command {
         #[arg(default_value = "127.0.0.1:7411")]
         addr: String,
     },
+    /// Update Crystalline to the newest release.
+    Update {
+        #[command(subcommand)]
+        cmd: UpdateCommand,
+    },
     /// Test support: take the index lock, publish a service record and hold
     /// both without ever binding the socket, which is exactly the shape of a
     /// wedged daemon. Hidden, because it exists so the force-takeover path can
@@ -2557,6 +2562,9 @@ fn run() -> anyhow::Result<()> {
             pack,
         }) => desktop_bundle::run(kind, &outdir, binary, pack),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
+        Some(Command::Update {
+            cmd: UpdateCommand::VerifySums { sums, minisig, tag },
+        }) => verify_sums(&sums, &minisig, &tag),
         Some(Command::HoldLock {
             secs,
             standalone,
@@ -2806,6 +2814,28 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 /// the time is up; refused when another instance owns it. With
 /// `--database-only` it holds that claim alone and never takes the state
 /// folder.
+/// `update verify-sums`: exit 0 with one line when the signature over `sums`
+/// verifies with a compiled-in release key and names `tag`, else exit 1 with
+/// the refusal on stderr.
+fn verify_sums(sums: &std::path::Path, minisig: &std::path::Path, tag: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let sums_bytes =
+        std::fs::read(sums).with_context(|| format!("cannot read {}", sums.display()))?;
+    let signature = std::fs::read_to_string(minisig)
+        .with_context(|| format!("cannot read {}", minisig.display()))?;
+    let keys = crystalline_core::update::RELEASE_KEYS;
+    match crystalline_core::update::verify_signature(&sums_bytes, &signature, &keys, tag) {
+        Ok(_) => {
+            println!("verified SHA256SUMS for {tag}");
+            Ok(())
+        }
+        Err(refused) => {
+            eprintln!("{refused}");
+            Err(ExitWith(1).into())
+        }
+    }
+}
+
 fn hold_lock(secs: u64, standalone: Option<&str>, database_only: bool) -> anyhow::Result<()> {
     use std::io::Write;
     let _ownership = if database_only {
@@ -5869,6 +5899,23 @@ async fn domain_rename_dispatch(
             .await?;
     cmd::print_domain_rename(&report, local, json);
     Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+enum UpdateCommand {
+    /// Release: check a `SHA256SUMS` signature with the compiled-in release
+    /// keys and the tag in its trusted comment, so the publish job proves the
+    /// key pair before anything is published. Hidden, and not a user step.
+    #[command(name = "verify-sums", hide = true)]
+    VerifySums {
+        /// The `SHA256SUMS` file.
+        sums: PathBuf,
+        /// Its minisign signature, `SHA256SUMS.minisig`.
+        minisig: PathBuf,
+        /// The release tag the signature must name, such as `v0.34.0`.
+        #[arg(long)]
+        tag: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
