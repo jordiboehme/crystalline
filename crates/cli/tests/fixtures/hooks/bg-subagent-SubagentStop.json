@@ -1,12 +1,12 @@
 {
-  "agent_id": "00000000-0000-0000-0000-000000000003",
+  "agent_id": "a0000000000000003",
   "agent_transcript_path": "/tmp/x",
   "agent_type": "general-purpose",
   "background_tasks": [
     {
       "agent_type": "general-purpose",
       "description": "prompt",
-      "id": "00000000-0000-0000-0000-000000000003",
+      "id": "a0000000000000003",
       "status": "running",
       "type": "subagent"
     }

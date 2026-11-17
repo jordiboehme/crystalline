@@ -1,5 +1,5 @@
 {
-  "agent_id": "00000000-0000-0000-0000-000000000004",
+  "agent_id": "a0000000000000004",
   "agent_type": "general-purpose",
   "cwd": "/tmp/x",
   "hook_event_name": "SubagentStart",
