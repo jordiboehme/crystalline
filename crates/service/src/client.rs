@@ -2577,7 +2577,11 @@ pub async fn origin_resolve(
 /// document (spec section C): without a daemon, `show` reads it lock-free
 /// and a change takes the database for the command or is refused while
 /// another instance owns it. A `database.*` key stays config.yaml's either
-/// way and is written there without asking anyone.
+/// way and is written there without asking anyone. `--config` skips the
+/// daemon there too, so with a daemon of this machine running in document
+/// mode a change with `--config` claims the database and is refused naming
+/// that daemon as the owner, where the same command without the flag goes
+/// through it.
 pub async fn configure(
     action: &str,
     key: Option<&str>,
@@ -2590,12 +2594,15 @@ pub async fn configure(
     // lives): written there and nowhere else, with no daemon asked and no
     // claim on the database, so a machine can always be pointed away from a
     // database another instance owns.
+    let mut preloaded = None;
     if matches!(action, "set" | "unset")
         && key.is_some_and(|k| crate::settings::refuse_database_key_in_document(k).is_err())
         && let Ok(loaded) = overlay::load(config_path)
-        && loaded.mode == overlay::ConfigMode::Document
     {
-        return configure_file(loaded, action, key, value);
+        if loaded.mode == overlay::ConfigMode::Document {
+            return configure_file(loaded, action, key, value);
+        }
+        preloaded = Some(loaded);
     }
     // An explicit --config override names the exact file to operate on. A
     // running daemon answers for ITS config file, which may be a different
@@ -2614,7 +2621,10 @@ pub async fn configure(
     // environment overlay: `show` reads the file config plus the overlay, and a
     // write mutates a clone of the file config and saves it to the resolved
     // path, so no environment value ever bakes into the saved file.
-    let loaded = overlay::load(config_path)?;
+    let loaded = match preloaded {
+        Some(loaded) => loaded,
+        None => overlay::load(config_path)?,
+    };
     if loaded.mode == overlay::ConfigMode::Document {
         return configure_document(loaded, action, key, value, config_path).await;
     }
@@ -2709,7 +2719,8 @@ async fn configure_document(
 ) -> anyhow::Result<Value> {
     use crate::engine::ConfigureAction;
     if let Some(key) = key.filter(|_| action != "show") {
-        crate::settings::refuse_bind_key_in_document(key).map_err(anyhow::Error::msg)?;
+        crate::settings::refuse_bind_key_in_document(key, value.filter(|_| action == "set"))
+            .map_err(anyhow::Error::msg)?;
     }
     let action = match action {
         "show" => {
@@ -2738,7 +2749,8 @@ async fn configure_document(
     let db_path = resolve_db(None)?;
     let (engine, _) =
         open_standalone_noting(loaded, &db_path, false, None, config_path, false).await?;
-    Ok(engine.configure(&action).await?)
+    // A settings change, so a read-only instance takes it from the operator.
+    Ok(engine.configure_as_operator(&action).await?)
 }
 
 /// The configuration document of `loaded`'s database, read on a lock-free
@@ -2960,8 +2972,10 @@ pub async fn provision(
         let db_path = resolve_db(None)?;
         let (engine, _) =
             open_standalone_noting(loaded, &db_path, false, None, config_path, false).await?;
+        // A decision is a settings write, so a read-only instance takes it
+        // from the operator.
         return Ok(engine
-            .provision(&action, &crate::scope::Scope::Unrestricted)
+            .provision_as_operator(&action, &crate::scope::Scope::Unrestricted)
             .await?);
     }
     // `provision` opens no engine at all (see the doc comment above), so it

@@ -17,6 +17,27 @@ impl Engine {
     /// `Engine::announce_a_moved_tool_list`, because this method is the one
     /// seam all three settings callers share.
     pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
+        self.configure_frozen(action, self.read_only).await
+    }
+
+    /// [`Engine::configure`] for the person who runs this instance, over the
+    /// control socket or as a command without a daemon. While the
+    /// configuration is kept in the database a read-only instance still takes
+    /// a settings change from them: a settings write is not a knowledge
+    /// write, and with `service.read_only` saved in the document this is the
+    /// only way to take it out again. In file mode it is [`Engine::configure`].
+    pub async fn configure_as_operator(&self, action: &ConfigureAction) -> Result<Value> {
+        self.configure_frozen(action, self.settings_frozen_for_operator())
+            .await
+    }
+
+    /// Whether the settings are frozen for the operator: on a read-only
+    /// instance in file mode, never in document mode.
+    fn settings_frozen_for_operator(&self) -> bool {
+        self.read_only && !self.config_in_document()
+    }
+
+    async fn configure_frozen(&self, action: &ConfigureAction, frozen: bool) -> Result<Value> {
         match action {
             ConfigureAction::Show => {
                 let views = {
@@ -28,7 +49,7 @@ impl Engine {
                 Ok(json!({ "settings": views }))
             }
             ConfigureAction::Set { key, value } => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
@@ -56,7 +77,7 @@ impl Engine {
                 Ok(view)
             }
             ConfigureAction::Unset { key } => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
@@ -65,7 +86,7 @@ impl Engine {
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard)?;
                     self.apply_setting(&mut file, key, None)?;
-                    let view = self.setting_view_json(&file, key)?;
+                    let view = self.with_base_note(self.setting_view_json(&file, key)?);
                     self.commit_config(&mut file_guard, file)?;
                     view
                 };
@@ -139,11 +160,37 @@ impl Engine {
         .unwrap_or(Value::Null))
     }
 
+    /// `view` (an unset key's [`Engine::setting_view_json`]) with one more
+    /// sentence in its `note` when the configuration is kept in the database
+    /// and the value still comes from config.yaml: the unset cleared the
+    /// document, and the base, which it never writes, still holds the key.
+    fn with_base_note(&self, mut view: Value) -> Value {
+        let Some(base) = self.persisted.as_ref().and_then(|p| p.base_path()) else {
+            return view;
+        };
+        if view.get("source") != Some(&json!(settings::SettingSource::Config)) {
+            return view;
+        }
+        let sentence = format!(
+            "the value comes from config.yaml at {}, which this command does not change",
+            base.display()
+        );
+        if let Value::Object(map) = &mut view {
+            let note = match map.get("note").and_then(Value::as_str) {
+                Some(note) => format!("{note}; {sentence}"),
+                None => sentence,
+            };
+            map.insert("note".to_string(), Value::String(note));
+        }
+        view
+    }
+
     /// Set (`Some`) or unset (`None`) the setting `key` in `file`, with the
     /// pair rule of [`settings::apply_checked`]. In document mode a
     /// `database.*` key is refused (where the configuration lives is decided
-    /// by that block, so it stays in config.yaml and the environment), so is
-    /// `service.http` (bound before the document is read), and the
+    /// by that block, so it stays in config.yaml and the environment), so are
+    /// `service.http` and a `service.public_url` with a path (read before the
+    /// document is read), and the
     /// pair rule is checked over the document merged with its base, the way
     /// the running server reads it.
     fn apply_setting(&self, file: &mut GlobalConfig, key: &str, value: Option<&str>) -> Result<()> {
@@ -155,7 +202,7 @@ impl Engine {
             return Ok(());
         }
         settings::refuse_database_key_in_document(key)
-            .and_then(|()| settings::refuse_bind_key_in_document(key))
+            .and_then(|()| settings::refuse_bind_key_in_document(key, value))
             .map_err(|e| EngineError::Refused(e.to_string()))?;
         let mut next = file.clone();
         match value {
@@ -501,6 +548,28 @@ impl Engine {
         action: &ProvisionAction,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
+        self.provision_frozen(action, scope, self.read_only).await
+    }
+
+    /// [`Engine::provision`] for the person who runs this instance, as
+    /// [`Engine::configure_as_operator`] is for `configure`: while the
+    /// configuration is kept in the database a decision is a settings write,
+    /// so a read-only instance takes it from them.
+    pub async fn provision_as_operator(
+        &self,
+        action: &ProvisionAction,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.provision_frozen(action, scope, self.settings_frozen_for_operator())
+            .await
+    }
+
+    async fn provision_frozen(
+        &self,
+        action: &ProvisionAction,
+        scope: &crate::scope::Scope,
+        frozen: bool,
+    ) -> Result<Value> {
         // Resolved once, and used two different ways below because the two
         // arms owe different things. `Status` is a pure read, so it must not
         // even compute over a domain this caller may not see: the config it is
@@ -551,7 +620,7 @@ impl Engine {
                 Ok(status_report_json(&report))
             }
             ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 // Deciding about a domain is a way of asking whether it exists,
@@ -599,7 +668,7 @@ impl Engine {
                 self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
             ProvisionAction::Apply => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 self.run_provision_apply(&receipt_path, &harnesses, &hidden)
@@ -856,6 +925,168 @@ mod document_tests {
         assert_eq!(
             doc.stored().unwrap()["service"]["http"],
             serde_json::Value::Null
+        );
+    }
+
+    /// A `service.public_url` with a path splits the base path between the
+    /// early probes and the full router, so a set of one is refused in
+    /// document mode, naming where it belongs. A url at the root is saved,
+    /// and an unset is always allowed. In file mode a path is saved as
+    /// before.
+    #[tokio::test]
+    async fn a_public_url_with_a_path_is_refused_in_document_mode() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        let err = engine
+            .configure(&set("service.public_url", "https://kb.example/crystalline"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert!(
+            err.to_string().contains("CRYSTALLINE_SERVICE_PUBLIC_URL"),
+            "{err}"
+        );
+        assert_eq!(doc.stored(), None, "nothing was saved");
+        engine
+            .configure(&set("service.public_url", "https://kb.example/"))
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["public_url"],
+            serde_json::json!("https://kb.example")
+        );
+        engine
+            .configure(&ConfigureAction::Unset {
+                key: "service.public_url".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["public_url"],
+            serde_json::Value::Null
+        );
+
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let path = tmp.path().join("file-mode.yaml");
+        let file_engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(path.clone()),
+        );
+        file_engine
+            .configure(&set("service.public_url", "https://kb.example/crystalline"))
+            .await
+            .unwrap();
+        let saved: GlobalConfig = crystalline_core::config::load_yaml(&path).unwrap();
+        assert_eq!(
+            saved.service_public_url(),
+            Some("https://kb.example/crystalline")
+        );
+    }
+
+    /// With `service.read_only` saved in the document, the operator can still
+    /// change the settings (that is how the flag is taken out again), while
+    /// an agent's settings change and every knowledge write stay refused. In
+    /// file mode a read-only instance refuses the operator too, as before.
+    #[tokio::test]
+    async fn a_read_only_document_takes_settings_from_the_operator() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        engine
+            .configure(&set("service.read_only", "true"))
+            .await
+            .unwrap();
+        let engine = engine.with_read_only(true);
+        let err = engine
+            .configure(&set("service.response_format", "json"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+        let err = engine
+            .provision(&ProvisionAction::Apply, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+        let err = engine
+            .delete_engram_as(
+                &DeleteParams {
+                    identifier: "anything".into(),
+                    domain: "base-only".into(),
+                    expected_checksum: None,
+                },
+                None,
+                &crate::scope::Scope::Unrestricted,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+
+        engine
+            .configure_as_operator(&ConfigureAction::Unset {
+                key: "service.read_only".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["read_only"],
+            serde_json::Value::Null
+        );
+        assert!(engine.read_only(), "the running engine keeps its mode");
+
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let file_engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(tmp.path().join("file-mode.yaml")),
+        )
+        .with_read_only(true);
+        let err = file_engine
+            .configure_as_operator(&set("service.response_format", "json"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+        let err = file_engine
+            .provision_as_operator(&ProvisionAction::Apply, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+    }
+
+    /// An unset in document mode clears the document only; when config.yaml
+    /// still holds the key, the answer says the value comes from there.
+    #[tokio::test]
+    async fn an_unset_of_a_base_key_names_config_yaml() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        let view = engine
+            .configure(&ConfigureAction::Unset {
+                key: "search.retired_weight".into(),
+            })
+            .await
+            .unwrap();
+        let note = view["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains(&format!(
+                "the value comes from config.yaml at {}",
+                tmp.path().join("config.yaml").display()
+            )),
+            "{view}"
+        );
+        // A key config.yaml does not hold gets no such sentence.
+        let view = engine
+            .configure(&ConfigureAction::Unset {
+                key: "service.response_format".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !view["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("config.yaml"),
+            "{view}"
         );
     }
 

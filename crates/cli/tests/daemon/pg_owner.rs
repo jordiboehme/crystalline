@@ -2493,7 +2493,8 @@ fn invalid_document_at_takeover_fails_start() {
 
 /// `service.allowed_hosts` saved in the document applies after a redeploy:
 /// the router, which is built after the takeover read, answers the host,
-/// and the ctl status says it. Another host is still refused.
+/// and the ctl status and the ctl holder answer say it. Another host is
+/// still refused.
 #[test]
 fn config_allowed_hosts_from_document_apply_after_redeploy() {
     let Some(pg) = PgScratch::new("cdhosts") else {
@@ -2513,6 +2514,19 @@ fn config_allowed_hosts_from_document_apply_after_redeploy() {
     let (ok, out, err) = env.run_full(&["ctl", "status", "--json"]);
     assert!(ok, "{out}{err}");
     assert!(out.contains("kb.example"), "{out}");
+    #[cfg(unix)]
+    {
+        let holder = crate::service::ctl_over_the_socket(
+            &env,
+            &serde_json::json!({ "v": 1, "cmd": "holder" }),
+        );
+        assert!(
+            holder["data"]["allowed_hosts"]
+                .as_array()
+                .is_some_and(|hosts| hosts.iter().any(|h| h == "kb.example")),
+            "{holder}"
+        );
+    }
     let ask = |host: &str| {
         reqwest::blocking::Client::new()
             .get(format!("http://{}/api/v1/me", serve.addr))
@@ -2555,6 +2569,58 @@ fn config_set_service_http_refused_in_document_mode() {
     assert!(!ok, "{out}{err}");
     assert!(err.contains("CRYSTALLINE_SERVICE_HTTP"), "{err}");
     assert_eq!(pg.document_value("{service,http}"), "");
+}
+
+/// A `service.public_url` with a path would split the base path between
+/// the early probes and the full router, so a set of one is refused in
+/// document mode, through the daemon and without one, naming where it
+/// belongs; nothing reaches the document.
+#[cfg(feature = "postgres")]
+#[test]
+fn config_set_public_url_with_path_refused_in_document_mode() {
+    let Some(pg) = PgScratch::new("cdpub") else {
+        return;
+    };
+    let url = "https://kb.example/crystalline";
+    let alone = Env::new("cdpubb").on_postgres(&pg);
+    let (ok, out, err) = alone.run_full(&["config", "set", "service.public_url", url]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_PUBLIC_URL"), "{err}");
+    assert_eq!(schema_objects(&pg), "0", "the refusal opened the database");
+
+    let env = Env::new("cdpub").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "set", "service.public_url", url]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_PUBLIC_URL"), "{err}");
+    assert_eq!(pg.document_value("{service,public_url}"), "");
+}
+
+/// `service.read_only` saved in the document does not lock the settings:
+/// `config unset service.read_only` takes it out again with no environment
+/// override, without a daemon and through a read-only daemon.
+#[cfg(feature = "postgres")]
+#[test]
+fn read_only_in_document_can_be_unset() {
+    let Some(pg) = PgScratch::new("cdro") else {
+        return;
+    };
+    let env = Env::new("cdro").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["config", "set", "service.read_only", "true"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,read_only}"), "true");
+    let (ok, out, err) = env.run_full(&["config", "unset", "service.read_only"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,read_only}"), "");
+
+    let (ok, out, err) = env.run_full(&["config", "set", "service.read_only", "true"]);
+    assert!(ok, "{out}{err}");
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "unset", "service.read_only"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,read_only}"), "");
 }
 
 /// Without a daemon of its own, `domain list`, `status` and `doctor` read

@@ -558,4 +558,72 @@ mod tests {
         let e = save_error(crystalline_index::IndexError::NotHost("x".into()));
         assert!(matches!(e, EngineError::Internal(_)));
     }
+
+    /// The merge key by key relies on a set key writing only its own leaf:
+    /// a sibling written beside it (a plain field serialized at its default)
+    /// would override the base's value of that sibling. So one value per
+    /// registry key, alone in a configuration, encodes to that key's path and
+    /// nothing else.
+    #[test]
+    fn every_settable_key_encodes_to_its_own_path_only() {
+        fn leaves(value: &serde_json::Value, at: String, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) if !map.is_empty() => {
+                    for (key, value) in map {
+                        let next = if at.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{at}.{key}")
+                        };
+                        leaves(value, next, out);
+                    }
+                }
+                _ => out.push(at),
+            }
+        }
+        const CANDIDATES: &[&str] = &[
+            "true",
+            "1",
+            "5",
+            "10",
+            "0.5",
+            "json",
+            "https://kb.example",
+            "127.0.0.1:7411",
+            "kb.example",
+            "member",
+            "a-name",
+            "https://kb.example/api/v1/auth/oidc/callback",
+            "viewer",
+            "off",
+            "10s",
+            "personal",
+            "60",
+            "300",
+            "3600",
+        ];
+        let mut wrong = Vec::new();
+        // The database block is never stored in a document.
+        for spec in crate::settings::registry()
+            .iter()
+            .filter(|spec| !spec.key.starts_with("database."))
+        {
+            let mut cfg = GlobalConfig::default();
+            let accepted = CANDIDATES
+                .iter()
+                .find(|value| crate::settings::apply(&mut cfg, spec.key, value).is_ok());
+            if accepted.is_none() {
+                wrong.push(format!("no sample value fits {}", spec.key));
+                continue;
+            }
+            // What `merge` folds key by key (the domains merge by name).
+            let body = serde_json::Value::Object(settings_map(&cfg).unwrap());
+            let mut paths = Vec::new();
+            leaves(&body, String::new(), &mut paths);
+            if paths != [spec.key] {
+                wrong.push(format!("{}: {body}", spec.key));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }

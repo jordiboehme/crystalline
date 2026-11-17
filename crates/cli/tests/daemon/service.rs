@@ -4789,7 +4789,7 @@ fn prompt_system_marks_a_read_only_virtual_domain_with_a_daemon() {
 /// CLI's own client does: the `ctl` mode line, then the command, then one
 /// answer line.
 #[cfg(unix)]
-fn ctl_over_the_socket(env: &Env, cmd: &Value) -> Value {
+pub(crate) fn ctl_over_the_socket(env: &Env, cmd: &Value) -> Value {
     use std::io::{BufRead, BufReader, Write};
     let record: Value = serde_json::from_str(
         &std::fs::read_to_string(env.state_dir().join("service.json")).unwrap(),

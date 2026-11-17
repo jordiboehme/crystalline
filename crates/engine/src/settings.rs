@@ -2778,10 +2778,25 @@ pub fn refuse_database_key_in_document(key: &str) -> Result<(), SettingsError> {
 /// Refuse `service.http` while the configuration is kept in the database:
 /// on Postgres the endpoint is bound before the instance takes the database
 /// over and reads the document, so a value saved there could never apply.
-pub fn refuse_bind_key_in_document(key: &str) -> Result<(), SettingsError> {
+/// A `service.public_url` set to a url with a path is refused too: the early
+/// probes are served under the base path read before the takeover and the
+/// full router under the one read after it, so a path saved in the document
+/// would split the two. `value` is the value a set writes, `None` for an
+/// unset, which is always allowed for `service.public_url` (it is the way to
+/// take a stored path away again).
+pub fn refuse_bind_key_in_document(key: &str, value: Option<&str>) -> Result<(), SettingsError> {
     if key == "service.http" {
         return Err(SettingsError(format!(
             "{key} cannot be changed while the configuration is kept in the database: the endpoint is bound before the database is read, so a value saved there never applies; set CRYSTALLINE_SERVICE_HTTP or service.http in config.yaml and restart"
+        )));
+    }
+    if key == PUBLIC_URL_KEY
+        && let Some(value) = value
+        && service_public_url_problem(value).is_none()
+        && BasePath::of_url(value).is_ok_and(|path| !path.is_root())
+    {
+        return Err(SettingsError(format!(
+            "{key} with a path cannot be saved while the configuration is kept in the database: the base path is read before the database is read, so a path saved there would apply to only part of the server; set CRYSTALLINE_SERVICE_PUBLIC_URL or service.public_url in config.yaml and restart"
         )));
     }
     Ok(())
