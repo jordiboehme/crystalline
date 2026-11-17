@@ -32,6 +32,14 @@ const NUDGE_REASON: &str = "Review this conversation for durable learnings befor
 /// printed.
 const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call the crystalline evolve_engrams tool and work the queue it returns: apply mechanical findings directly and summarize once at the end; propose judgment findings one at a time and wait for a yes. Engrams captured by a person are judgment class - never rewrite a human's words without asking.";
 
+/// The subagent block's heading and first three bullets, and its store
+/// bullet, duplicated for the same reason [`NUDGE_REASON`] is.
+const SUBAGENT_BLOCK_HEAD: &str = "Crystalline (you are a subagent):\n\
+- Search Crystalline (search_engrams, read_engram) before you start.\n\
+- Never ask the user; decide, or name what is open in your report.\n\
+- Skip reflect, evolve_engrams and Crystalline maintenance notices.";
+const SUBAGENT_STORE_BULLET: &str = "- Before you finish, store what saves a later session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, gotchas. Never what you did, what the files you read already say or what any model knows anyway. Search first; edit the engram that covers it (expected_checksum, re-read and retry on a conflict), else write one with an explicit domain. Domain unclear: name it in your report. Your task's instructions win.";
+
 fn bin() -> Command {
     crate::common::crystalline()
 }
@@ -726,8 +734,140 @@ fn malformed_stdin_exits_zero_with_empty_stdout() {
         .write_stdin("this is not json")
         .output()
         .unwrap();
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    assert_silent(&out, "garbage stdin");
+}
+
+/// The SubagentStart answer: exactly one line of JSON carrying `block`.
+fn assert_subagent_block(out: &std::process::Output, block: &str, case: &str) {
+    assert!(out.status.success(), "{case}: exit {:?}", out.status.code());
+    assert!(
+        out.stderr.is_empty(),
+        "{case}: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{case}: one line: {stdout:?}");
+    let answer: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        answer,
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": block,
+            }
+        }),
+        "{case}"
+    );
+}
+
+/// Each recorded SubagentStart gets the block, the child's own `agent_id`
+/// notwithstanding; Explore and Plan get it without the store bullet. No
+/// call reads or writes a state file. The other events recorded inside a
+/// subagent stay silent.
+#[test]
+fn every_recorded_subagent_start_gets_its_block_and_writes_nothing() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let full = format!("{SUBAGENT_BLOCK_HEAD}\n{SUBAGENT_STORE_BULLET}");
+
+    for (fixture, block) in [
+        ("fg-subagent-SubagentStart.json", full.as_str()),
+        ("bg-subagent-SubagentStart.json", full.as_str()),
+        ("nested-outer-SubagentStart.json", full.as_str()),
+        ("nested-inner-SubagentStart.json", full.as_str()),
+        ("explore-SubagentStart.json", SUBAGENT_BLOCK_HEAD),
+        ("plan-SubagentStart.json", SUBAGENT_BLOCK_HEAD),
+    ] {
+        let home = work.path().join(format!("home-{fixture}"));
+        let payload = crate::common::hook_fixture(fixture).to_string();
+        let out = run_stop_hook(&home, &config, &payload);
+        assert_subagent_block(&out, block, fixture);
+        assert!(
+            !state_hooks_dir(&home).exists(),
+            "{fixture}: SubagentStart touches no state"
+        );
+    }
+
+    for fixture in [
+        "fg-subagent-SubagentStop.json",
+        "bg-subagent-SubagentStop.json",
+        "explore-SubagentStop.json",
+        "fg-subagent-PostToolUse.json",
+        "bg-subagent-PostToolUse.json",
+    ] {
+        let home = work.path().join(format!("home-{fixture}"));
+        let payload = crate::common::hook_fixture(fixture).to_string();
+        let out = run_stop_hook(&home, &config, &payload);
+        assert_silent(&out, fixture);
+        assert!(!state_hooks_dir(&home).exists(), "{fixture}: no state");
+    }
+}
+
+/// With no registered or mounted domain the block is not printed at all.
+#[test]
+fn a_subagent_start_without_a_domain_is_silent() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    std::fs::write(&config, "domains: {}\n").unwrap();
+    let payload = crate::common::hook_fixture("bg-subagent-SubagentStart.json").to_string();
+    let out = run_stop_hook(&home, &config, &payload);
+    assert_silent(&out, "no domain");
+}
+
+/// A domain that is registered but read-only by its MANIFEST still gets the
+/// block, without the store bullet; so does a read-only install.
+#[test]
+fn a_subagent_start_with_only_a_read_only_domain_drops_the_store_bullet() {
+    let work = tempfile::tempdir().unwrap();
+    let domain = work.path().join("archive");
+    std::fs::create_dir_all(&domain).unwrap();
+    std::fs::write(
+        domain.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: archive\npermalink: manifest\nread_only: on\n---\n\n## Scope\n\n- x\n",
+    )
+    .unwrap();
+    let config = work.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!("domains:\n  archive:\n    path: {}\n", domain.display()),
+    )
+    .unwrap();
+    let payload = crate::common::hook_fixture("bg-subagent-SubagentStart.json").to_string();
+    let home = work.path().join("home");
+    let out = run_stop_hook(&home, &config, &payload);
+    assert_subagent_block(&out, SUBAGENT_BLOCK_HEAD, "a read-only MANIFEST");
+
+    let writable = work.path().join("writable.yaml");
+    write_domain_config(&writable);
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &writable)
+        .env("CRYSTALLINE_SERVICE_READ_ONLY", "true")
+        .args(["hook", "stop", "--harness", "claude-code"])
+        .write_stdin(payload)
+        .output()
+        .unwrap();
+    assert_subagent_block(&out, SUBAGENT_BLOCK_HEAD, "a read-only install");
+}
+
+/// A hook verb this binary does not know, with flags it does not know,
+/// exits 0 without a word: a settings file written by a newer binary must
+/// never break a session run by an older one.
+#[test]
+fn an_unknown_hook_verb_exits_zero_silently() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .args(["hook", "frobnicate", "--zap", "1", "--harness", "x"])
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert_silent(&out, "an unknown verb");
 }
 
 #[test]

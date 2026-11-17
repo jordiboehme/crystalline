@@ -5,6 +5,7 @@
 //! a socket or a network connection, and none starts a Tokio runtime. Every
 //! other subcommand lands in a later milestone.
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -908,7 +909,8 @@ enum Command {
 }
 
 /// Which harness lifecycle event a `hook` invocation answers: `Stop` at the
-/// end of a turn and `Prompt` in front of every prompt a person submits.
+/// end of a turn (and at a subagent's start) and `Prompt` in front of every
+/// prompt a person submits; any other verb is answered with silence.
 /// Future events attach here without reshaping `hook` again.
 #[derive(Subcommand, Debug)]
 enum HookEvent {
@@ -917,7 +919,8 @@ enum HookEvent {
     /// propose capturing them. Every other call - a stale or malformed
     /// payload, a hook-caused continuation, an unconfigured or read-only
     /// install, a session already nudged or a session too short to be worth
-    /// interrupting - is silent.
+    /// interrupting - is silent. Wired to SubagentStart as well, where it
+    /// gives the starting subagent one short Crystalline block.
     Stop {
         /// Which harness this hook is answering, as `crystalline install`
         /// wrote it into the harness's settings file (claude-code, codex,
@@ -949,6 +952,17 @@ enum HookEvent {
         #[arg(long)]
         harness: Option<String>,
     },
+    /// Any other verb, with any flags: exits 0 without a word, so a hook
+    /// entry a newer binary wrote never breaks a session an older or newer
+    /// binary runs.
+    #[command(external_subcommand)]
+    Unknown(
+        #[allow(
+            dead_code,
+            reason = "clap needs a field to take the verb and its flags; silence is the whole answer"
+        )]
+        Vec<OsString>,
+    ),
 }
 
 /// The kind of prompt to generate: `system` renders the live routing block for
@@ -2679,6 +2693,7 @@ fn run() -> anyhow::Result<()> {
                 let _ = on_runtime_value_current_thread(move || recall::run_prompt(harness));
                 Ok(())
             }
+            HookEvent::Unknown(_) => Ok(()),
         },
     }
 }

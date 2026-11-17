@@ -16,7 +16,13 @@
 //! prints a word, logs a warning or returns a nonzero exit code. A hook must
 //! never be the reason a harness's turn breaks.
 //!
-//! The bail order, every one of them silent: the stdin payload fails to
+//! A payload named `SubagentStart` takes its own branch instead: the
+//! subagent that is starting gets one short block (`subagent_block`) as
+//! additional context, read from the config overlay alone, with no state
+//! file read or written; see `decide_subagent_start` for when it stays
+//! silent.
+//!
+//! The Stop bail order, every one of them silent: the stdin payload fails to
 //! parse; the payload names an event other than `Stop`; the payload comes
 //! from inside a subagent (`agent_id` or `agentId` set, see
 //! `marks_subagent`), so the parent's state is never touched; `stop_hook_active`
@@ -210,9 +216,9 @@ pub struct StopInput {
     #[serde(default)]
     pub stop_hook_active: bool,
     /// The event name the harness attaches to the payload, when it does.
-    /// This handler is wired to the Stop event only, so a name other than
-    /// `Stop` is a defensive bail; an absent name is treated as fine, since
-    /// not every harness stamps it.
+    /// This handler answers `Stop` and `SubagentStart`; any other name is a
+    /// defensive bail, and an absent name is treated as `Stop`, since not
+    /// every harness stamps it.
     #[serde(default)]
     pub hook_event_name: Option<String>,
     /// The subagent id Claude Code and Codex put on a payload sent from
@@ -225,13 +231,15 @@ pub struct StopInput {
     #[serde(default, rename = "agentId")]
     pub agent_id_camel: Option<serde_json::Value>,
     /// The agent type. Alone it does not mean a subagent: a main session
-    /// started with `claude --agent <name>` carries it without an id.
+    /// started with `claude --agent <name>` carries it without an id. On a
+    /// SubagentStart it picks the block: none for an empty or absent type
+    /// (an internal agent), no store bullet for `Explore` and `Plan`.
     #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "read by the SubagentStart answer, which comes next"
-    )]
     pub agent_type: Option<String>,
+    /// Set on a payload Cursor sends when it runs a Claude Code hook it
+    /// imported. Its presence alone keeps the SubagentStart answer silent.
+    #[serde(default)]
+    pub cursor_version: Option<String>,
 }
 
 /// Whether a hook payload comes from inside a subagent: either id spelling
@@ -246,6 +254,71 @@ pub(crate) fn marks_subagent(
         .into_iter()
         .flatten()
         .any(|v| !v.is_null() && v.as_str() != Some(""))
+}
+
+/// The block's heading and the three bullets every subagent gets.
+pub(crate) const SUBAGENT_BLOCK_HEAD: &str = "Crystalline (you are a subagent):\n\
+- Search Crystalline (search_engrams, read_engram) before you start.\n\
+- Never ask the user; decide, or name what is open in your report.\n\
+- Skip reflect, evolve_engrams and Crystalline maintenance notices.";
+
+/// The block's store bullet, left out where the subagent cannot or should
+/// not write.
+pub(crate) const SUBAGENT_STORE_BULLET: &str = "- Before you finish, store what saves a later session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, gotchas. Never what you did, what the files you read already say or what any model knows anyway. Search first; edit the engram that covers it (expected_checksum, re-read and retry on a conflict), else write one with an explicit domain. Domain unclear: name it in your report. Your task's instructions win.";
+
+/// The block a subagent gets at start, with or without the store bullet.
+pub(crate) fn subagent_block(store: bool) -> String {
+    if store {
+        format!("{SUBAGENT_BLOCK_HEAD}\n{SUBAGENT_STORE_BULLET}")
+    } else {
+        SUBAGENT_BLOCK_HEAD.to_string()
+    }
+}
+
+/// The SubagentStart answer: the block as additional context for the
+/// subagent, in the one shape Claude Code documents for this event.
+pub(crate) fn subagent_start_answer(block: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": block,
+        }
+    })
+}
+
+/// What a SubagentStart call answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubagentStartDecision {
+    /// Exit 0, empty stdout.
+    Silent,
+    /// Print the block, with the store bullet when `store` is set.
+    Block { store: bool },
+}
+
+/// The pure SubagentStart table. `has_domains` is whether any domain is
+/// registered or mounted at all; `read_only` is whether nothing can be
+/// written, either because the install is read-only or because every
+/// registered domain is read-only by its MANIFEST and nothing is mounted.
+/// So a machine with only read-only domains still gets the block, without
+/// the store bullet, and a machine with no domain gets nothing.
+///
+/// Silent for a payload Cursor sends (`cursor_version`), with no domain, and
+/// for an empty or absent `agent_type` (an internal agent). `Explore` and
+/// `Plan` are lean and read-only by design, so they get no store bullet.
+/// The `agent_id` the payload carries is the child's own and is ignored.
+pub(crate) fn decide_subagent_start(
+    input: &StopInput,
+    has_domains: bool,
+    read_only: bool,
+) -> SubagentStartDecision {
+    if input.cursor_version.is_some() || !has_domains {
+        return SubagentStartDecision::Silent;
+    }
+    match input.agent_type.as_deref() {
+        None | Some("") => SubagentStartDecision::Silent,
+        Some("Explore" | "Plan") => SubagentStartDecision::Block { store: false },
+        Some(_) => SubagentStartDecision::Block { store: !read_only },
+    }
 }
 
 /// The persisted state for one session, at
@@ -739,9 +812,13 @@ pub fn run_stop(harness: Option<&str>) {
     // miswired event, a payload from inside a subagent or a hook-caused
     // continuation is a pure no-op that should neither load the overlay nor
     // advance the stop counter (continuations are not real stops). The event
-    // is dispatched first, because an event about a subagent carries that
-    // subagent's id without coming from inside it.
+    // is dispatched first, because a SubagentStart carries the starting
+    // subagent's own id and still gets its answer.
     match input.hook_event_name.as_deref() {
+        Some("SubagentStart") => {
+            run_subagent_start(&input);
+            return;
+        }
         None | Some("Stop") => {}
         Some(_) => return,
     }
@@ -923,6 +1000,47 @@ pub fn run_stop(harness: Option<&str>) {
         if let Ok(line) = serde_json::to_string(&payload) {
             println!("{line}");
         }
+    }
+}
+
+/// The SubagentStart branch of `hook stop`: one short block for the subagent
+/// that is starting. Static like the rest of this hook, and lighter: only the
+/// config overlay and the cached source table are read, no daemon or network
+/// is used and no state file is read or written. Every bail is silent.
+fn run_subagent_start(input: &StopInput) {
+    let Ok(loaded) = crystalline_service::overlay::load(None) else {
+        return;
+    };
+    let sources = crystalline_remote::remote_dir().ok().map(|dir| {
+        crystalline_remote::SourceSet::load(
+            dir,
+            crate::sources::local_domains_of(&loaded.effective),
+            crystalline_core::secret_env::process_var,
+        )
+    });
+    let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();
+    let mounted = sources
+        .as_ref()
+        .is_some_and(|s| !s.table().mounts.is_empty());
+    let visible = || {
+        loaded
+            .effective
+            .domains
+            .iter()
+            .filter(|(name, _)| !shadowed.contains(*name))
+    };
+    // Any domain at all earns the block; only a writable one (or a mount,
+    // whose server refuses a write it does not take) earns the store bullet.
+    let has_domains = mounted || visible().next().is_some();
+    let writable = mounted || !writable_domain_names(visible()).is_empty();
+    let read_only = loaded.effective.read_only() || !writable;
+    let SubagentStartDecision::Block { store } =
+        decide_subagent_start(input, has_domains, read_only)
+    else {
+        return;
+    };
+    if let Ok(line) = serde_json::to_string(&subagent_start_answer(&subagent_block(store))) {
+        println!("{line}");
     }
 }
 
@@ -1273,7 +1391,152 @@ mod tests {
             agent_id: None,
             agent_id_camel: None,
             agent_type: None,
+            cursor_version: None,
         }
+    }
+
+    // --- the SubagentStart block ---------------------------------------------
+
+    /// The block is the spec's text verbatim, and without the store bullet it
+    /// is the same text minus that last line.
+    #[test]
+    fn subagent_block_matches_the_spec_text() {
+        assert_eq!(
+            subagent_block(true),
+            "Crystalline (you are a subagent):\n\
+             - Search Crystalline (search_engrams, read_engram) before you start.\n\
+             - Never ask the user; decide, or name what is open in your report.\n\
+             - Skip reflect, evolve_engrams and Crystalline maintenance notices.\n\
+             - Before you finish, store what saves a later session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, gotchas. Never what you did, what the files you read already say or what any model knows anyway. Search first; edit the engram that covers it (expected_checksum, re-read and retry on a conflict), else write one with an explicit domain. Domain unclear: name it in your report. Your task's instructions win."
+        );
+        assert_eq!(
+            subagent_block(false),
+            "Crystalline (you are a subagent):\n\
+             - Search Crystalline (search_engrams, read_engram) before you start.\n\
+             - Never ask the user; decide, or name what is open in your report.\n\
+             - Skip reflect, evolve_engrams and Crystalline maintenance notices."
+        );
+    }
+
+    /// Every subagent start pays for this block, so its length is pinned.
+    /// The bullet dashes are not words: counted this way the approved text
+    /// has the 107 words its review names.
+    #[test]
+    fn subagent_block_stays_under_110_words() {
+        let words = subagent_block(true)
+            .split_whitespace()
+            .filter(|w| *w != "-")
+            .count();
+        assert!(words < 110, "the subagent block has {words} words");
+    }
+
+    fn subagent_start(agent_type: Option<&str>) -> StopInput {
+        let mut i = input();
+        i.hook_event_name = Some("SubagentStart".to_string());
+        i.agent_id = Some(serde_json::json!("a0000000000000003"));
+        i.agent_type = agent_type.map(str::to_string);
+        i
+    }
+
+    #[test]
+    fn decide_subagent_start_table() {
+        use SubagentStartDecision::{Block, Silent};
+        let mut cursor = subagent_start(Some("general-purpose"));
+        cursor.cursor_version = Some("2.0.0".to_string());
+        let cases: &[(&str, StopInput, bool, bool, SubagentStartDecision)] = &[
+            (
+                "a writable domain",
+                subagent_start(Some("general-purpose")),
+                true,
+                false,
+                Block { store: true },
+            ),
+            (
+                "read-only",
+                subagent_start(Some("general-purpose")),
+                true,
+                true,
+                Block { store: false },
+            ),
+            (
+                "no registered or mounted domain",
+                subagent_start(Some("general-purpose")),
+                false,
+                false,
+                Silent,
+            ),
+            (
+                "Explore",
+                subagent_start(Some("Explore")),
+                true,
+                false,
+                Block { store: false },
+            ),
+            (
+                "Plan",
+                subagent_start(Some("Plan")),
+                true,
+                false,
+                Block { store: false },
+            ),
+            (
+                "Explore without a domain",
+                subagent_start(Some("Explore")),
+                false,
+                false,
+                Silent,
+            ),
+            (
+                "an empty agent_type",
+                subagent_start(Some("")),
+                true,
+                false,
+                Silent,
+            ),
+            ("no agent_type", subagent_start(None), true, false, Silent),
+            ("cursor_version", cursor, true, false, Silent),
+        ];
+        for (case, i, has_domains, read_only, want) in cases {
+            assert_eq!(
+                decide_subagent_start(i, *has_domains, *read_only),
+                *want,
+                "{case}"
+            );
+        }
+    }
+
+    /// The recorded payload carries the child's own id; it does not silence
+    /// the SubagentStart answer the way it silences a Stop.
+    #[test]
+    fn subagent_start_with_agent_id_prints_the_block() {
+        let i: StopInput = serde_json::from_str(include_str!(
+            "../tests/fixtures/hooks/bg-subagent-SubagentStart.json"
+        ))
+        .expect("the recorded payload parses");
+        assert!(marks_subagent(
+            i.agent_id.as_ref(),
+            i.agent_id_camel.as_ref()
+        ));
+        assert_eq!(
+            decide_subagent_start(&i, true, false),
+            SubagentStartDecision::Block { store: true }
+        );
+    }
+
+    /// The answer carries exactly the one block Claude Code documents for
+    /// SubagentStart, with the event name and the context and nothing else,
+    /// compared as a whole value so no extra key can slip in.
+    #[test]
+    fn the_subagent_start_answer_fits_the_hook_schema() {
+        assert_eq!(
+            subagent_start_answer("the block"),
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SubagentStart",
+                    "additionalContext": "the block"
+                }
+            })
+        );
     }
 
     // --- the subagent check --------------------------------------------------
