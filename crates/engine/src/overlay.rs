@@ -256,6 +256,12 @@ pub const RESERVED_VARS: &[&str] = &[
     // because its length floor is a serve rule, so reserved here.
     "CRYSTALLINE_SETUP_TOKEN",
     "CRYSTALLINE_SETUP_TOKEN_FILE",
+    // The key that seals the secrets kept in Postgres
+    // (`crystalline_remote::sealed::SealKey::from_env`), plain or as a `_FILE`
+    // path for a Docker secret. Read straight from the environment, never
+    // through the settings registry, so reserved here.
+    "CRYSTALLINE_SECRET_KEY",
+    "CRYSTALLINE_SECRET_KEY_FILE",
     // Read straight from the environment when a store opens
     // (`crystalline_index::reader`): `0` turns the read connections off.
     crystalline_index::reader::READ_CONNECTIONS_ENV,

@@ -26,6 +26,7 @@ pub mod mounts;
 pub mod ops;
 pub mod provider;
 pub mod reflections_backup;
+pub mod sealed;
 pub mod server_client;
 pub mod server_token;
 pub mod sign_in;
