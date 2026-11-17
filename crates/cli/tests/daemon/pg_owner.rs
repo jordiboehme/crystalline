@@ -2223,10 +2223,42 @@ fn config_show_without_daemon_reads_document_lock_free() {
     assert_eq!(owner.get("/ready").unwrap().status().as_u16(), 200);
 }
 
+/// A TCP listener that counts the connections it accepts and drops each at
+/// once: a database address any Postgres connect reaches and fails on.
+struct CountingListener {
+    url: String,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingListener {
+    fn start() -> CountingListener {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        CountingListener {
+            url: format!("postgres://nobody:nothing@127.0.0.1:{port}/nothing"),
+            accepted,
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// A `crystalline mcp` bridge that reaches a daemon never reads the
-/// document itself: run with a database address nothing answers on, its
-/// session still opens at once, because only the daemon talks to the
-/// database.
+/// document itself: its database address is a listener of the test, which
+/// accepts no connection over the bridge's whole session (an initialize, a
+/// tools/list and a pause), while the daemon serves from the real database.
+/// A daemonless `config show` with the same address does reach the
+/// listener, so the count is a real witness.
 #[test]
 fn mcp_bridge_reaching_daemon_never_fetches_document() {
     let Some(pg) = PgScratch::new("cdbridge") else {
@@ -2235,16 +2267,12 @@ fn mcp_bridge_reaching_daemon_never_fetches_document() {
     let env = Env::new("cdbridge").on_postgres(&pg);
     let mut serve = Serve::start(&env, None);
     serve.wait_ready();
+    let watch = CountingListener::start();
     let mut cmd = Command::new(bin());
     env.apply(&mut cmd);
     let log = env.state_dir().with_file_name("bridge.log");
-    let started = Instant::now();
     let mut bridge = cmd
-        // A black-hole address: a connect there hangs until it times out.
-        .env(
-            "CRYSTALLINE_DATABASE_URL",
-            "postgres://nobody:nothing@10.255.255.1:5432/nothing",
-        )
+        .env("CRYSTALLINE_DATABASE_URL", &watch.url)
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2252,9 +2280,32 @@ fn mcp_bridge_reaching_daemon_never_fetches_document() {
         .spawn()
         .unwrap();
     let mut stdin = bridge.stdin.take().unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let stdout = bridge.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let err = || std::fs::read_to_string(&log).unwrap_or_default();
+    let ask = |stdin: &mut std::process::ChildStdin, request: Value| -> Value {
+        writeln!(stdin, "{request}").unwrap();
+        let line = rx
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("the bridge did not answer: {}", err()));
+        serde_json::from_str(line.trim()).unwrap_or(Value::Null)
+    };
+    let reply = ask(
+        &mut stdin,
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
@@ -2262,30 +2313,42 @@ fn mcp_bridge_reaching_daemon_never_fetches_document() {
                 "capabilities": {},
                 "clientInfo": { "name": "it", "version": "0" },
             },
-        })
+        }),
+    );
+    assert!(reply["result"].is_object(), "{reply} {}", err());
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
     )
     .unwrap();
-    let stdout = bridge.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reply = String::new();
-        let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut reply);
-        let _ = tx.send(reply);
-    });
-    let reply = rx.recv_timeout(Duration::from_secs(20));
+    let reply = ask(
+        &mut stdin,
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    );
+    assert!(reply["result"]["tools"].is_array(), "{reply} {}", err());
+    std::thread::sleep(Duration::from_secs(2));
     drop(stdin);
-    let _ = bridge.kill();
     let _ = bridge.wait();
-    let err = std::fs::read_to_string(&log).unwrap_or_default();
-    let reply = reply.unwrap_or_else(|_| panic!("the bridge did not answer: {err}"));
-    let reply: Value = serde_json::from_str(reply.trim()).unwrap_or(Value::Null);
-    assert!(reply["result"].is_object(), "{reply} {err}");
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "the bridge took {:?}: {err}",
-        started.elapsed()
+    assert_eq!(
+        watch.accepted(),
+        0,
+        "the bridge reached the database: {}",
+        err()
     );
     assert!(serve.alive(), "{}", serve.log());
+
+    // The witness: a command without a daemon does reach the address.
+    let other = Env::new("cdbridgeb").on_postgres(&pg);
+    let mut show = Command::new(bin());
+    other.apply(&mut show);
+    let out = show
+        .env("CRYSTALLINE_DATABASE_URL", &watch.url)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(watch.accepted() > 0, "the listener saw no connect at all");
 }
 
 /// A takeover that cannot read the configuration document stops the start
@@ -2328,6 +2391,143 @@ fn unreachable_document_at_takeover_fails_start() {
         "true",
         "the database is still held"
     );
+}
+
+/// A configuration document that does not read as a configuration stops
+/// the start too: the instance never saves an empty document over it.
+#[cfg(feature = "postgres")]
+#[test]
+fn invalid_document_at_takeover_fails_start() {
+    let Some(pg) = PgScratch::new("cdbad") else {
+        return;
+    };
+    let env = Env::new("cdbad").on_postgres(&pg);
+    let mut first = Serve::start(&env, None);
+    first.wait_ready();
+    first.terminate();
+    assert_eq!(first.wait_exit(Duration::from_secs(15)), Some(0));
+    assert!(pg.sql(&format!(
+        "INSERT INTO {}.instance_config (id, body, updated_at, updated_by) \
+         VALUES (1, '{{\"domains\": 7}}', now(), 'test') \
+         ON CONFLICT (id) DO UPDATE SET body = excluded.body",
+        pg.schema
+    )));
+
+    let mut serve = Serve::start(&env, None);
+    let code = serve.wait_exit(Duration::from_secs(30));
+    assert!(
+        matches!(code, Some(c) if c != 0),
+        "{code:?}: {}",
+        serve.log()
+    );
+    let log = serve.log();
+    assert!(
+        log.contains("could not read the configuration in the database") && log.contains("invalid"),
+        "{log}"
+    );
+    assert_eq!(
+        pg.document_value("{domains}"),
+        "7",
+        "the document was replaced"
+    );
+}
+
+/// `service.allowed_hosts` saved in the document applies after a redeploy:
+/// the router, which is built after the takeover read, answers the host,
+/// and the ctl status says it. Another host is still refused.
+#[test]
+fn config_allowed_hosts_from_document_apply_after_redeploy() {
+    let Some(pg) = PgScratch::new("cdhosts") else {
+        return;
+    };
+    let env = Env::new("cdhosts").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "set", "service.allowed_hosts", "kb.example"]);
+    assert!(ok, "{out}{err}");
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+    std::fs::remove_dir_all(env.state_dir()).unwrap();
+
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["ctl", "status", "--json"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("kb.example"), "{out}");
+    let ask = |host: &str| {
+        reqwest::blocking::Client::new()
+            .get(format!("http://{}/api/v1/me", serve.addr))
+            .header("Host", host)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .unwrap()
+    };
+    let refused = ask("evil.example");
+    assert_eq!(refused.status().as_u16(), 403);
+    let answered = ask("kb.example");
+    let status = answered.status().as_u16();
+    let body = answered.text().unwrap_or_default();
+    assert!(
+        !body.contains("Host is not one this instance answers to"),
+        "{status}: {body}"
+    );
+}
+
+/// `service.http` is bound before the takeover reads the document, so a
+/// value saved there could never apply: `config set service.http` is
+/// refused in document mode, through the daemon and without one, and names
+/// where the value belongs.
+#[cfg(feature = "postgres")]
+#[test]
+fn config_set_service_http_refused_in_document_mode() {
+    let Some(pg) = PgScratch::new("cdhttp") else {
+        return;
+    };
+    let alone = Env::new("cdhttpb").on_postgres(&pg);
+    let (ok, out, err) = alone.run_full(&["config", "set", "service.http", "0.0.0.0:7411"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_HTTP"), "{err}");
+    assert_eq!(schema_objects(&pg), "0", "the refusal opened the database");
+
+    let env = Env::new("cdhttp").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "set", "service.http", "0.0.0.0:7411"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_HTTP"), "{err}");
+    assert_eq!(pg.document_value("{service,http}"), "");
+}
+
+/// Without a daemon of its own, `domain list`, `status` and `doctor` read
+/// the registrations from the document lock-free, while the active
+/// instance of another machine keeps the database.
+#[test]
+fn reports_without_daemon_read_document_registrations() {
+    let Some(pg) = PgScratch::new("cdlist") else {
+        return;
+    };
+    let owner_env = Env::new("cdlista").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let dir = owner_env.domain_folder("notes");
+    let (ok, out, err) = owner_env.run_full(&["domain", "add", "notes", dir.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+
+    let env = Env::new("cdlistb").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["--json", "domain", "list"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("notes"), "{out}{err}");
+    let (_, out, err) = env.run_full(&["status", "--json"]);
+    let status: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+    assert_eq!(
+        status["registered"],
+        serde_json::json!(["notes"]),
+        "{out}{err}"
+    );
+    let (_, out, err) = env.run_full(&["doctor"]);
+    assert!(format!("{out}{err}").contains("notes"), "{out}{err}");
+    assert_eq!(owner_command(&pg), "|false", "a report took the database");
+    assert!(owner.alive());
 }
 
 /// A redeploy keeps the configuration: a setting and a domain saved through

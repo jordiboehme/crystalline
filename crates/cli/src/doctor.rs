@@ -2199,7 +2199,9 @@ pub async fn run(
         }
     }
     // A domain filter nobody registers fails before anything is fixed.
-    let early = cmd::load(config_override)?;
+    // On Postgres the registrations are read from the configuration
+    // document without the lock (a report never owns the database).
+    let early = crystalline_service::config_for_report(config_override).await?;
     select_domains(&early.effective, domain_filter)?;
     // On Postgres another machine's instance owns the database: nothing is
     // fixed from here (spec section L).
@@ -2249,7 +2251,7 @@ pub async fn run(
     // registered: the effective config drives every target and the db
     // factory. The whole `LoadedConfig` stays in scope so a later milestone
     // can surface the environment overlay in the report.
-    let loaded = cmd::load(config_override)?;
+    let loaded = crystalline_service::config_for_report(config_override).await?;
     let cfg = &loaded.effective;
     let targets = select_domains(cfg, domain_filter)?;
 

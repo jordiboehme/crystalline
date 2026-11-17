@@ -3060,7 +3060,11 @@ async fn status_dispatch(
     }
     // Nothing answered, so the numbers have to come from the index here, and
     // that needs the config the probe above could do without.
-    let mut cfg = cmd::load(config.as_deref())?.effective;
+    // On Postgres the registrations are read from the configuration
+    // document without the lock.
+    let mut cfg = crystalline_service::config_for_report(config.as_deref())
+        .await?
+        .effective;
     // On Postgres a report opens no store (only the owner does): without a
     // daemon here it is the owner row and where the accounts live.
     if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none").await {
@@ -3221,8 +3225,7 @@ async fn sync_dispatch(
     if accept_disk && domain.is_none() {
         anyhow::bail!(crystalline_index::ACCEPT_DISK_NEEDS_DOMAIN);
     }
-    let mut loaded = cmd::load(config.as_deref())?;
-    let mut cfg = loaded.effective.clone();
+    let mut cfg = cmd::load(config.as_deref())?.effective;
     let route = cmd::reach_index(
         Some(json!({
             "v": 1,
@@ -3285,11 +3288,6 @@ async fn sync_dispatch(
         return Ok(());
     }
     let store = cmd::local_store(route, "sync")?;
-    // With the configuration in the database, the names are the document's
-    // too: read under the claim the open just took.
-    if loaded.mode == crystalline_service::overlay::ConfigMode::Document {
-        loaded = crystalline_service::claim::owned_config(config.as_deref()).await?;
-    }
     // Standalone (no daemon, or an explicit `--db`/`--config` override that
     // bypasses one): `cmd::sync`'s own `select_domains` matches `domain`
     // against `cfg.domains`'s local keys directly, with no resolution of its
@@ -3299,9 +3297,14 @@ async fn sync_dispatch(
     // table, the same one every other standalone domain
     // command now uses: a canonical name or a machine-local alias means the
     // same domain here that it would with a daemon running.
-    let resolved_domain = domain
-        .as_deref()
-        .map(|d| loaded.name_table().resolve(d).unwrap_or(d).to_string());
+    let resolved_domain = domain.as_deref().map(|d| {
+        // Over `cfg`, which the direct route refreshed with the
+        // configuration document on Postgres.
+        crystalline_core::names::NameTable::from_config(&cfg, &Default::default())
+            .resolve(d)
+            .unwrap_or(d)
+            .to_string()
+    });
     cmd::sync(store.clone(), &cfg, resolved_domain.as_deref(), flags, json).await?;
     // Once the sync has returned cleanly, as the daemon's ctl `sync` does: a
     // synced MANIFEST may declare a new name. A sync that failed says so and

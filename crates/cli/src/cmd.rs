@@ -2394,7 +2394,10 @@ pub async fn domain_list(
 ) -> Result<()> {
     // Keep the whole `LoadedConfig`: reads use the effective config, and the
     // overlay marks which rows an environment variable defines.
-    let loaded = load(config_override)?;
+    // On Postgres the registrations are read from the configuration
+    // document without the lock, so the list answers while another instance
+    // owns the database.
+    let loaded = crystalline_service::config_for_report(config_override).await?;
     let mut cfg = loaded.effective;
     // Why the counts are missing when they are, in the helper's words; `None`
     // once they were read, whichever route delivered them.
