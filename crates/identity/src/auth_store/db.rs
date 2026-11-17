@@ -44,6 +44,11 @@ pub(super) enum AuthDb {
         // Retained so the connection stays valid for as long as the store does.
         _db: Database,
         conn: Connection,
+        /// A transaction may be open: set before `BEGIN IMMEDIATE` is sent
+        /// and cleared when it is finished, so one a cancelled caller left
+        /// open is rolled back by the next guard
+        /// ([`AuthDb::reset_stale_transaction`]).
+        in_tx: std::sync::atomic::AtomicBool,
         /// How many `BEGIN IMMEDIATE` this store has run, so a test can pin
         /// that a method runs in a transaction.
         #[cfg(test)]
@@ -60,6 +65,7 @@ impl AuthDb {
         AuthDb::Turso {
             _db: db,
             conn,
+            in_tx: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             begins: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -94,12 +100,23 @@ impl AuthDb {
         }
     }
 
-    /// Roll back a Postgres transaction a cancelled caller left open. The
-    /// caller has just taken the store's guard. Nothing on Turso.
+    /// Roll back a transaction a cancelled caller left open: a future
+    /// dropped between `begin_immediate` and `finish` (a handler whose
+    /// client went away) sends neither `COMMIT` nor `ROLLBACK`, and on Turso
+    /// the open `BEGIN IMMEDIATE` would keep the file's write lock and take
+    /// in every later statement of this connection. The caller has just
+    /// taken the store's guard. The rollback is best effort: a transaction
+    /// that never began, or a commit that went through before the drop,
+    /// leaves nothing to roll back.
     pub(super) async fn reset_stale_transaction(&self) {
-        #[cfg(feature = "postgres")]
-        if let AuthDb::Postgres(pg) = self {
-            Box::pin(pg.reset_stale()).await;
+        match self {
+            AuthDb::Turso { conn, in_tx, .. } => {
+                if in_tx.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                }
+            }
+            #[cfg(feature = "postgres")]
+            AuthDb::Postgres(pg) => Box::pin(pg.reset_stale()).await,
         }
     }
 
@@ -168,12 +185,24 @@ impl AuthDb {
     /// same way.
     pub(super) async fn begin_immediate(&self) -> Result<()> {
         match self {
-            AuthDb::Turso { conn, .. } => {
+            AuthDb::Turso {
+                conn,
+                in_tx,
                 #[cfg(test)]
-                self.count_begin();
-                conn.execute("BEGIN IMMEDIATE", ())
-                    .await
-                    .context("opening an auth database transaction")?;
+                begins,
+                ..
+            } => {
+                #[cfg(test)]
+                begins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Open from before `BEGIN` is sent, so a caller cancelled
+                // inside this call leaves one the next guard rolls back.
+                in_tx.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = conn.execute("BEGIN IMMEDIATE", ()).await {
+                    in_tx.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return Err(
+                        anyhow::Error::from(e).context("opening an auth database transaction")
+                    );
+                }
                 Ok(())
             }
             #[cfg(feature = "postgres")]
@@ -183,30 +212,31 @@ impl AuthDb {
         }
     }
 
-    #[cfg(test)]
-    fn count_begin(&self) {
-        if let AuthDb::Turso { begins, .. } = self {
-            begins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
     /// Commit when the body succeeded, roll back when it did not. The rollback
     /// is best-effort: the body's error is what the caller needs to see, and
     /// an abandoned transaction is released when the connection drops anyway.
     pub(super) async fn finish<T>(&self, result: Result<T>) -> Result<T> {
         match self {
-            AuthDb::Turso { conn, .. } => match result {
-                Ok(value) => {
-                    conn.execute("COMMIT", ())
-                        .await
-                        .context("committing an auth database transaction")?;
-                    Ok(value)
-                }
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
-                }
-            },
+            AuthDb::Turso { conn, in_tx, .. } => {
+                let finished = match result {
+                    Ok(value) => match conn.execute("COMMIT", ()).await {
+                        Ok(_) => Ok(value),
+                        Err(e) => {
+                            // A commit that failed leaves the transaction
+                            // open: roll it back rather than keep the lock.
+                            let _ = conn.execute("ROLLBACK", ()).await;
+                            Err(anyhow::Error::from(e)
+                                .context("committing an auth database transaction"))
+                        }
+                    },
+                    Err(e) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        Err(e)
+                    }
+                };
+                in_tx.store(false, std::sync::atomic::Ordering::SeqCst);
+                finished
+            }
             #[cfg(feature = "postgres")]
             AuthDb::Postgres(pg) => match result {
                 Ok(value) => {

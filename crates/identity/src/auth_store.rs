@@ -4538,7 +4538,8 @@ impl AuthStore {
                 let held = match self
                     .db
                     .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
-                    .await?
+                    .await
+                    .context(OAUTH_CLIENTS_UNCOUNTED)?
                     .map(|row| row.get_value(0))
                 {
                     Some(Ok(Value::Integer(n))) => n as usize,
