@@ -2261,7 +2261,7 @@ impl CountingListener {
             }
         });
         CountingListener {
-            url: format!("postgres://nobody:nothing@127.0.0.1:{port}/nothing"),
+            url: format!("postgres://nobody:s3cretpw@127.0.0.1:{port}/nothing"),
             accepted,
         }
     }
@@ -2395,6 +2395,11 @@ fn a_report_warns_and_answers_when_the_document_cannot_be_read() {
         assert!(
             stderr.contains("could not read the configuration in the database"),
             "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("s3cretpw")
+                && !String::from_utf8_lossy(&out.stdout).contains("s3cretpw"),
+            "{args:?} leaked the password: {stderr}"
         );
         assert!(
             serde_json::from_slice::<Value>(&out.stdout).is_ok(),
