@@ -1,6 +1,7 @@
-# Files outside crystalline-core that still name chrono. Each crate's move
-# onto crystalline_core::time removes its lines; the list goes away with
-# chrono itself. Read by crates/core/tests/it/time_boundary.rs.
+# Files outside crystalline_core::time that still name chrono or use the
+# chrono bridge (from_chrono, into_chrono). Each crate's move onto
+# crystalline_core::time removes its lines; the list goes away with chrono
+# itself. Read by crates/core/tests/it/time_boundary.rs.
 crates/cli/Cargo.toml
 crates/cli/src/automation/run.rs
 crates/cli/src/cmd.rs
@@ -19,6 +20,16 @@ crates/cli/tests/setup/install_desktop.rs
 crates/cli/tests/setup/kept.rs
 crates/cli/tests/setup/source_hooks.rs
 crates/cli/tests/team/github_app.rs
+crates/core/src/emit.rs
+crates/core/src/engram.rs
+crates/core/src/frontmatter.rs
+crates/core/src/import.rs
+crates/core/src/kept.rs
+crates/core/src/parse.rs
+crates/core/src/schema.rs
+crates/core/src/temporal.rs
+crates/core/src/verify/temporal.rs
+crates/core/tests/it/editing.rs
 crates/engine/Cargo.toml
 crates/engine/src/collab/session.rs
 crates/engine/src/domain_view.rs
