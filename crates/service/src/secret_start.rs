@@ -25,6 +25,21 @@ pub(crate) fn missing_key_sentence() -> String {
     )
 }
 
+/// A session or start refused for its secret key: missing on Postgres, or
+/// not one that parses. Typed so the embedded MCP stack can send the
+/// sentence as the initialize error, as it does for an owned database,
+/// instead of serving a status server that cannot help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyRefusal(pub(crate) String);
+
+impl std::fmt::Display for KeyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeyRefusal {}
+
 /// The one warning of a start on Turso with a key set.
 pub(crate) fn turso_ignores_key_sentence() -> String {
     format!(
@@ -44,8 +59,8 @@ pub(crate) fn plan(
     match backend {
         DatabaseBackend::Postgres => match read() {
             Ok(Some(key)) => Ok((Some(key), None)),
-            Ok(None) => Err(anyhow::anyhow!(missing_key_sentence())),
-            Err(e) => Err(anyhow::anyhow!("{e}")),
+            Ok(None) => Err(anyhow::Error::new(KeyRefusal(missing_key_sentence()))),
+            Err(e) => Err(anyhow::Error::new(KeyRefusal(e.to_string()))),
         },
         DatabaseBackend::Turso => Ok((None, set.then(turso_ignores_key_sentence))),
     }
@@ -53,7 +68,7 @@ pub(crate) fn plan(
 
 /// Whether either key variable is set to something other than blank, the
 /// way [`SealKey::from_env`] tells set from unset, without reading a file.
-fn key_variable_set() -> bool {
+pub(crate) fn key_variable_set() -> bool {
     [KEY_ENV, KEY_FILE_ENV].iter().any(|var| {
         std::env::var_os(var).is_some_and(|v| v.to_str().is_none_or(|s| !s.trim().is_empty()))
     })
@@ -108,23 +123,35 @@ pub(crate) async fn open_vault(
     pg: &crate::standby::PgStart,
     key: SealKey,
 ) -> anyhow::Result<VaultSummary> {
+    open_vault_over(pg.side(), pg.database(), key).await
+}
+
+/// [`open_vault`] over the side channel of any owner of `database`: the
+/// daemon's, or a command's that claimed the database
+/// ([`crate::claim::CommandDbOwner`]), which then seals and opens its secrets
+/// as the daemon does.
+#[cfg(feature = "postgres")]
+pub(crate) async fn open_vault_over(
+    side: crystalline_index::postgres::SideChannel,
+    database: &str,
+    key: SealKey,
+) -> anyhow::Result<VaultSummary> {
     use std::sync::Arc;
 
     use crystalline_remote::SecretVault;
 
     let key_id = key.key_id();
-    let pg_vault = Arc::new(crystalline_engine::vault::PgVault::new(pg.side(), &key_id));
+    let pg_vault = Arc::new(crystalline_engine::vault::PgVault::new(side, &key_id));
     let reading = pg_vault.clone();
     let summary = tokio::task::spawn_blocking(move || reading.summary())
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .map_err(|e| {
             anyhow::anyhow!(
-                "could not read the sealed secrets in the database {} ({e}); on Postgres the secrets live in the database, so this instance does not start without them",
-                pg.database()
+                "could not read the sealed secrets in the database {database} ({e}); on Postgres the secrets live in the database, so nothing goes on without them"
             )
         })?;
-    check_key_ids(&summary, &key_id, pg.database())?;
+    check_key_ids(&summary, &key_id, database)?;
     vault::install(pg_vault, key);
     tracing::info!(
         "secrets sealed in postgres with key {key_id} ({} rows)",

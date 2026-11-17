@@ -93,8 +93,8 @@ pub use owner::{
     LOCK_STATEMENT_TIMEOUT, OwnerIdentity, OwnerRow, OwnerTimings, PROBE_PERIOD, PROBE_RETRIES,
     PROBE_TIMEOUT, PgOwner, ProbeAction, ProbeOutcome, ProbeState, SIDE_STATEMENT_TIMEOUT,
     STANDBY_POLL, SecretRow, SecretSummary, SideChannel, StandbyStatus, TERMINATE_WAIT_MS,
-    TIMING_SCALE_ENV, TakeoverReport, VAULT_TIMEOUT, probe_owner, read_config_document,
-    read_owner_row, timing_scale,
+    TIMING_SCALE_ENV, TakeoverReport, VAULT_TIMEOUT, count_sealed_secrets, probe_owner,
+    read_config_document, read_owner_row, timing_scale,
 };
 pub use session::{
     OwnerFence, PgRole, PgSessionOptions, PgTarget, application_name, connect_one, lock_key,

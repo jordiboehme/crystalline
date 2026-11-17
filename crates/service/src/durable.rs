@@ -118,6 +118,47 @@ impl ConfigState {
     }
 }
 
+/// What a report says about the sealed secrets (spec section D): whether
+/// this process has a key and how many rows the database holds. Never a row
+/// name, and a missing key fails nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecretsState {
+    /// Whether `CRYSTALLINE_SECRET_KEY` or `CRYSTALLINE_SECRET_KEY_FILE` is
+    /// set for this process. The key is not read.
+    pub key_configured: bool,
+    /// How many sealed secrets the database holds, `None` when not counted.
+    pub sealed: Option<u64>,
+    /// Why they could not be counted.
+    pub error: Option<String>,
+}
+
+impl SecretsState {
+    fn line(&self) -> String {
+        let rows = match (&self.sealed, &self.error) {
+            (Some(n), _) => format!("{n} sealed in the database"),
+            (None, Some(e)) => format!("not counted ({e})"),
+            (None, None) => "not counted".to_string(),
+        };
+        let key = if self.key_configured {
+            "a key is configured".to_string()
+        } else {
+            format!(
+                "no key is configured here ({}), so a GitHub token changes only on the active instance",
+                crystalline_remote::sealed::KEY_ENV
+            )
+        };
+        format!("Secrets: {rows}; {key}")
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "key_configured": self.key_configured,
+            "sealed": self.sealed,
+            "error": self.error,
+        })
+    }
+}
+
 /// The ownership and durable state of one Postgres database.
 #[derive(Debug, Clone)]
 pub struct DurableStateReport {
@@ -136,6 +177,8 @@ pub struct DurableStateReport {
     pub accounts: AccountsLocationKind,
     /// Where the settings and the domain registry come from.
     pub config: ConfigState,
+    /// The key and the sealed secrets.
+    pub secrets: SecretsState,
     /// One sentence per thing left behind or lost, in the order of the spec.
     pub warnings: Vec<String>,
 }
@@ -212,6 +255,7 @@ impl DurableStateReport {
             self.config.document_words(),
             self.config.base_words()
         ));
+        lines.push(self.secrets.line());
         lines.extend(
             self.config
                 .base_domains_line()
@@ -258,6 +302,7 @@ impl DurableStateReport {
                 "base_path": self.config.base_path.as_ref().map(|p| p.display().to_string()),
                 "base_domains": self.config.base_domains,
             },
+            "secrets": self.secrets.to_json(),
             "warnings": self.warnings,
         })
     }
@@ -292,7 +337,41 @@ pub async fn durable_state_for_command(
         Holder::Unknown { database, error } => (database, OwnerState::Unknown(error), None),
     };
     let config = config_state_for_command(cfg, config_path).await;
-    Some(report_of(cfg, role, database, owner_state, owner, config))
+    let mut report = report_of(cfg, role, database, owner_state, owner, config);
+    report.secrets = secrets_state_for_command(cfg).await;
+    Some(report)
+}
+
+/// The sealed secrets as a command sees them: counted on a lock-free probe
+/// connection, which reads no row and no name, and whether this process has
+/// a key. A count that fails is said in the state and fails nothing.
+#[cfg(feature = "postgres")]
+async fn secrets_state_for_command(cfg: &GlobalConfig) -> SecretsState {
+    let key_configured = crate::secret_start::key_variable_set();
+    let counted = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
+        Ok(target) => crystalline_index::postgres::count_sealed_secrets(&target)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let (sealed, error) = match counted {
+        Ok(n) => (Some(n), None),
+        Err(e) => (None, Some(e)),
+    };
+    SecretsState {
+        key_configured,
+        sealed,
+        error,
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn secrets_state_for_command(_cfg: &GlobalConfig) -> SecretsState {
+    SecretsState {
+        key_configured: crate::secret_start::key_variable_set(),
+        sealed: None,
+        error: Some("this build has no Postgres backend".to_string()),
+    }
 }
 
 /// The configuration state a command sees: the document read on a
@@ -376,6 +455,7 @@ fn report_of(
         owner,
         accounts,
         config,
+        secrets: SecretsState::default(),
         warnings,
     }
 }
@@ -408,6 +488,7 @@ mod tests {
                 base_path: Some(PathBuf::from("/etc/crystalline/config.yaml")),
                 base_domains: vec!["team".to_string(), "docs".to_string()],
             },
+            secrets: SecretsState::default(),
             warnings: vec!["the accounts file /x is not read".to_string()],
         }
     }
