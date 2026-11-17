@@ -303,17 +303,36 @@ pub fn register_virtual_domain_saving(
 }
 
 /// Save `cfg`, the persisted truth with the registration of `name` in it.
-/// A database that did not confirm the save is said as such: the domain may
-/// or may not be registered.
+/// When the database did not confirm the save, the document is read back:
+/// a registration that landed is a plain success, so the command goes on to
+/// index the domain; one that did not land, or a read back that fails too,
+/// is an error that says so.
 fn save_registration(persisted: &PersistedConfig, cfg: &GlobalConfig, name: &str) -> Result<()> {
-    persisted
-        .save(cfg, "domain add")
-        .map_err(|e| match e {
-            crate::engine::EngineError::ConfigMaybeStored(detail) => anyhow!(
-                "the database did not confirm saving the registration of '{name}' ({detail}); it may or may not be registered, so check `crystalline domain list` before trying again"
-            ),
-            other => anyhow!("{other}"),
-        })
+    let detail = match persisted.save(cfg, "domain add") {
+        Ok(()) => return Ok(()),
+        Err(crate::engine::EngineError::ConfigMaybeStored(detail)) => detail,
+        Err(other) => return Err(anyhow!("{other}")),
+    };
+    let read = match persisted {
+        PersistedConfig::Document { doc, .. } => {
+            crate::persisted::read_back(doc.as_ref(), cfg).map_err(|e| e.to_string())
+        }
+        PersistedConfig::File(_) => Err("there is no document to read back".to_string()),
+    };
+    match read {
+        Ok((_, true)) => {
+            tracing::warn!(
+                "the database did not confirm saving the registration of '{name}' ({detail}); reading it back shows it was stored"
+            );
+            Ok(())
+        }
+        Ok((_, false)) => Err(anyhow!(
+            "the database did not confirm saving the registration of '{name}' ({detail}); reading it back shows it was not stored, so '{name}' is not registered; try again"
+        )),
+        Err(why) => Err(anyhow!(
+            "the database did not confirm saving the registration of '{name}' ({detail}), and reading it back failed ({why}); it may or may not be registered, so check `crystalline domain list` before trying again"
+        )),
+    }
 }
 
 /// Before `name` becomes a new domain's name, set aside a `kept/<name>`
@@ -525,6 +544,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("environment variable"), "{err}");
+    }
+
+    /// A registration whose save the database did not confirm is read back:
+    /// one that landed is a plain success, so `domain add` goes on to index
+    /// the domain; one that did not land says so.
+    #[test]
+    fn an_unconfirmed_registration_is_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = GlobalConfig::default();
+        let doc = Arc::new(MemoryDocument::default());
+
+        *doc.fail_after_store.lock().unwrap() = Some(
+            crate::engine::EngineError::ConfigMaybeStored("no answer".into()),
+        );
+        let done = register_virtual_domain_in(
+            loaded_in_document(tmp.path(), &base, doc.clone()),
+            "landed",
+            None,
+        )
+        .unwrap();
+        assert_eq!(done.name, "landed");
+        assert!(!done.adopted);
+
+        *doc.fail.lock().unwrap() = Some(crate::engine::EngineError::ConfigMaybeStored(
+            "no answer".into(),
+        ));
+        let err = register_virtual_domain_in(
+            loaded_in_document(tmp.path(), &base, doc.clone()),
+            "lost",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("was not stored"), "{err}");
+
+        *doc.fail.lock().unwrap() = Some(crate::engine::EngineError::ConfigMaybeStored(
+            "no answer".into(),
+        ));
+        *doc.fail_load.lock().unwrap() = Some(crate::engine::EngineError::Internal("down".into()));
+        let err = register_virtual_domain_in(
+            loaded_in_document(tmp.path(), &base, doc.clone()),
+            "unknown",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("may or may not be registered"),
+            "{err}"
+        );
     }
 
     #[test]
