@@ -1,8 +1,8 @@
 name: Build
 
 # The build, sign, notarize and package half of a release. release.yml calls
-# this for every release (a call from CI on main or a `v*` tag push) and for
-# its manual dry run. All six platform legs
+# this for every release (a call from CI on main) and for its manual dry
+# run. All six platform legs
 # build, the musl legs also make .deb packages and the Windows legs .msi
 # packages.
 #
@@ -107,17 +107,16 @@ jobs:
     needs: fluid-dist
     runs-on: ${{ matrix.os }}
     # The macOS legs sign and notarize, so they run in the protected
-    # `release` environment, which only `v*` tags and main may enter and
-    # which holds the Apple secrets. The other legs need no secret and stay
-    # outside it. So does a manual dry run from any other branch: the
+    # `release` environment, which only main may enter and which holds the
+    # Apple secrets. The other legs need no secret and stay outside it. So
+    # does a manual dry run from any other branch or from a tag: the
     # environment would refuse it, and once the Apple secrets live only in
     # the environment they are empty outside it, so such a dry run builds an
     # unsigned binary as designed (see "Decide whether to sign and
-    # notarize"). deployment: false uses the
-    # environment for its secrets and branch rule without recording a
-    # deployment for every build.
+    # notarize"). deployment: false uses the environment for its secrets and
+    # branch rule without recording a deployment for every build.
     environment:
-      name: ${{ matrix.codesign && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') && 'release' || '' }}
+      name: ${{ matrix.codesign && github.ref == 'refs/heads/main' && 'release' || '' }}
       deployment: false
     strategy:
       fail-fast: false
