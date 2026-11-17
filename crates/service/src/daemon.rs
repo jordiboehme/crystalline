@@ -471,14 +471,11 @@ pub async fn run_serve(
     }
     // An env-defined domain that shadows a config file entry is worth one
     // startup warning (not one per `apply`, which runs constantly): the file
-    // entry is silently overridden while the variable is set.
-    for name in loaded.overlay.shadowed_domains(&loaded.file) {
-        if let Some(env) = loaded.overlay.env_domain(name) {
-            tracing::warn!(
-                "domain '{name}' from {} shadows the config file entry of the same name",
-                env.var
-            );
-        }
+    // entry is silently overridden while the variable is set. On Postgres
+    // the registry is the document over config.yaml, so the warning waits
+    // for the takeover read (below).
+    if overlay::config_mode(&loaded.effective) == overlay::ConfigMode::File {
+        warn_shadowed_domains(&loaded.overlay, &loaded.file);
     }
     // Create any env-defined domain root that does not exist yet, before the
     // watcher computes its roots below: notify refuses to watch a missing
@@ -552,21 +549,29 @@ pub async fn run_serve(
     start_step("store open");
     // On a schema the store open just created, the announce after the lock
     // found no owner table; the row is written now.
+    // What the takeover read found, for the durable-state line below, so
+    // the report does not read the document a second time.
     #[cfg(feature = "postgres")]
-    if let Some(pg) = &pg_start {
-        pg.announce().await?;
-        // The configuration document, read once now that this instance owns
-        // the database and the store open made sure its table exists (spec
-        // section C). A failed read stops the start: an instance that went
-        // on with config.yaml alone would save over the stored settings.
-        read_document_at_takeover(&mut loaded, pg).await?;
-        if let Some(line) = http_addr
-            .as_deref()
-            .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
-        {
-            tracing::warn!("{line}");
+    let takeover_document = match &pg_start {
+        Some(pg) => {
+            pg.announce().await?;
+            // The configuration document, read once now that this instance
+            // owns the database and the store open made sure its table exists
+            // (spec section C). A failed read stops the start: an instance
+            // that went on with config.yaml alone would save over the stored
+            // settings.
+            let document = read_document_at_takeover(&mut loaded, pg).await?;
+            if let Some(line) = http_addr
+                .as_deref()
+                .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
+            {
+                tracing::warn!("{line}");
+            }
+            warn_shadowed_domains(&loaded.overlay, &*loaded.persisted_view()?);
+            Some(document)
         }
-    }
+        None => None,
+    };
     // `service.allowed_hosts` may come from the document too, and the router
     // is built after the read (the `--allowed-host` flag still wins), so the
     // recorded intent, `/health` and the record say what it accepts.
@@ -670,7 +675,13 @@ pub async fn run_serve(
             // its own warning.
             #[cfg(feature = "postgres")]
             {
-                let report = crate::durable::durable_state_of_owner(&loaded, pg.database()).await;
+                let document = takeover_document.clone().unwrap_or_else(|| {
+                    crate::durable::DocumentState::Unreadable(
+                        "the configuration was not read at the takeover".to_string(),
+                    )
+                });
+                let report =
+                    crate::durable::durable_state_of_owner(&loaded, pg.database(), document).await;
                 tracing::info!("{}", report.startup_line());
                 if let Some(line) = report.config.base_domains_line() {
                     tracing::info!("{line}");
@@ -1257,7 +1268,7 @@ async fn open_store_for_start(
 async fn read_document_at_takeover(
     loaded: &mut overlay::LoadedConfig,
     pg: &crate::standby::PgStart,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::durable::DocumentState> {
     let side = pg.side();
     let fatal = |e: String| {
         anyhow::anyhow!(
@@ -1265,12 +1276,30 @@ async fn read_document_at_takeover(
             pg.database()
         )
     };
-    let body = side.load_config().await.map_err(|e| fatal(e.to_string()))?;
+    let doc = side.load_config().await.map_err(|e| fatal(e.to_string()))?;
+    let state = match &doc {
+        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at),
+        None => crate::durable::DocumentState::NotSaved,
+    };
     loaded
-        .attach_document(Arc::new(side), body.map(|d| d.body))
+        .attach_document(Arc::new(side), doc.map(|d| d.body))
         .map_err(|e| fatal(format!("{e:#}")))?;
     start_step("configuration read");
-    Ok(())
+    Ok(state)
+}
+
+/// Warn once at the start about each domain from the environment that
+/// shadows an entry of the same name in `registry` (config.yaml, or on
+/// Postgres the document over it).
+fn warn_shadowed_domains(env: &overlay::EnvOverlay, registry: &GlobalConfig) {
+    for name in env.shadowed_domains(registry) {
+        if let Some(var) = env.env_domain(name) {
+            tracing::warn!(
+                "domain '{name}' from {} shadows the config file entry of the same name",
+                var.var
+            );
+        }
+    }
 }
 
 /// Open the accounts store the daemon keeps for domain access and the HTTP

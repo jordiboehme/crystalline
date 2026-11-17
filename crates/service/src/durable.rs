@@ -330,12 +330,14 @@ async fn read_document_state(_cfg: &GlobalConfig) -> DocumentState {
 }
 
 /// The report of the instance that owns `database`, for its start: the
-/// owner row it just wrote, read back. A row that cannot be read leaves the
-/// line without a time.
+/// owner row it just wrote, read back, and `document`, what the takeover read
+/// of the configuration found (it is not read again). A row that cannot be
+/// read leaves the line without a time.
 #[cfg(feature = "postgres")]
 pub(crate) async fn durable_state_of_owner(
     loaded: &crate::overlay::LoadedConfig,
     database: &str,
+    document: DocumentState,
 ) -> DurableStateReport {
     let cfg = &loaded.effective;
     let row = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
@@ -350,11 +352,7 @@ pub(crate) async fn durable_state_of_owner(
     } else {
         OwnerState::Unannounced
     };
-    let config = ConfigState::new(
-        read_document_state(cfg).await,
-        &loaded.path,
-        loaded.base.as_ref(),
-    );
+    let config = ConfigState::new(document, &loaded.path, loaded.base.as_ref());
     report_of(cfg, "active", database.to_string(), state, row, config)
 }
 
