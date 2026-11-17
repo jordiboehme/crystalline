@@ -189,6 +189,21 @@ impl Env {
             config::save_yaml(&self.config_path(), &cfg).unwrap();
         }
 
+        let dir = self.domain_folder(name);
+        let mut cmd = Command::new(bin());
+        self.apply(&mut cmd);
+        let ok = cmd
+            .args(["domain", "add", name])
+            .arg(&dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "domain add");
+    }
+
+    /// The folder of domain `name` beside the state folder, with a MANIFEST
+    /// and a seed engram, registered nowhere.
+    pub(crate) fn domain_folder(&self, name: &str) -> PathBuf {
         let dir = self.dir.join(format!("kb-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -203,15 +218,7 @@ impl Env {
             "---\ntype: engram\ntitle: Seed\npermalink: seed\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nseed body token\n",
         )
         .unwrap();
-        let mut cmd = Command::new(bin());
-        self.apply(&mut cmd);
-        let ok = cmd
-            .args(["domain", "add", name])
-            .arg(&dir)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "domain add");
+        dir
     }
 
     /// Run a one-shot command, returning (success, stdout).
@@ -2156,8 +2163,8 @@ fn two_openers_of_one_postgres_index_never_both_run_a_rename() {
     assert!(ok, "{out}{err}");
     assert!(err.contains("not finished by this command"), "{err}");
     assert!(env.state_dir().join("rename-journal.json").is_file());
-    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
-    assert!(cfg.domains.contains_key("eng") && !cfg.domains.contains_key("platform"));
+    // On Postgres the registrations live in the configuration document.
+    assert_eq!(pg.document_domains(), "eng");
     drop(wedge);
 
     let (ok, out, err) = env.run_full(&["--json", "search", "seed", "--config", config_arg]);
@@ -2166,8 +2173,7 @@ fn two_openers_of_one_postgres_index_never_both_run_a_rename() {
         !env.state_dir().join("rename-journal.json").exists(),
         "{err}"
     );
-    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
-    assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
+    assert_eq!(pg.document_domains(), "platform");
 }
 
 /// A sync without a daemon on a shared Postgres database follows the host
@@ -7177,6 +7183,25 @@ impl PgScratch {
                 .await?;
             Ok(())
         })
+    }
+
+    /// The names of the domains the configuration document registers,
+    /// sorted and joined with commas; empty without a document.
+    pub(crate) fn document_domains(&self) -> String {
+        self.text(&format!(
+            "SELECT coalesce(string_agg(k, ',' ORDER BY k), '') \
+             FROM {}.instance_config, jsonb_object_keys(body->'domains') k",
+            self.schema
+        ))
+    }
+
+    /// The value at `path` (a Postgres text-array path such as
+    /// `{service,response_format}`) in the configuration document, or empty.
+    pub(crate) fn document_value(&self, path: &str) -> String {
+        self.text(&format!(
+            "SELECT coalesce(body #>> '{path}', '') FROM {}.instance_config",
+            self.schema
+        ))
     }
 
     /// Whether `sql` ran without an error.
