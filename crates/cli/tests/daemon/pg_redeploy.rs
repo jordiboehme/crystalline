@@ -38,13 +38,18 @@ const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const REDIRECT: &str = "http://127.0.0.1:33418/callback";
 
-/// The personal access token `connect github --token` seals.
+/// The personal access token `connect github --token` seals for the
+/// instance.
 #[cfg(feature = "postgres")]
 const GITHUB_TOKEN: &str = "ghp_redeploy";
 
+/// The token `connect github --personal --as alice` seals for the person.
+const PERSONAL_TOKEN: &str = "ghp_personal";
+
 /// A stand-in GitHub on a loopback port: `GET /user` answers the login
-/// `ada-gh`, everything else 404. It records the path and the
-/// `Authorization` header of every request.
+/// `alice-gh` for [`PERSONAL_TOKEN`] and `ada-gh` for any other token,
+/// everything else 404. It records the path and the `Authorization` header
+/// of every request.
 struct RecordingGithub {
     url: String,
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
@@ -71,8 +76,11 @@ impl RecordingGithub {
                     .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
                     .map(|l| l.split_once(':').unwrap().1.trim().to_string())
                     .unwrap_or_default();
-                seen.lock().unwrap().push((path.clone(), auth));
+                seen.lock().unwrap().push((path.clone(), auth.clone()));
                 let (status, body) = match path.as_str() {
+                    "/user" if auth.ends_with(PERSONAL_TOKEN) => {
+                        ("200 OK", r#"{"login":"alice-gh","id":4343}"#)
+                    }
                     "/user" => ("200 OK", r#"{"login":"ada-gh","id":4242}"#),
                     _ => ("404 Not Found", r#"{"message":"Not Found"}"#),
                 };
@@ -289,7 +297,8 @@ fn add_the_account(env: &Env) {
 
 /// A first deployment at `serve` in `env`: the account, a completed OAuth
 /// grant, a virtual domain with one engram and a saved setting. On
-/// Postgres also a GitHub token sealed in the pod (`seal_token`).
+/// Postgres also two GitHub tokens sealed in the pod (`seal_token`): the
+/// instance's and the person's.
 fn first_deploy(env: &Env, serve: &Serve, vars: &[(&str, &str)], seal_token: bool) -> Grant {
     add_the_account(env);
     assert_eq!(sign_in(serve, NAME, PASSWORD), 200);
@@ -311,6 +320,21 @@ fn first_deploy(env: &Env, serve: &Serve, vars: &[(&str, &str)], seal_token: boo
         let (ok, out, err) = run_vars(env, &["connect", "github", "--token", GITHUB_TOKEN], vars);
         assert!(ok, "{out}{err}");
         assert!(out.contains("(vault token store)"), "{out}");
+        let (ok, out, err) = run_vars(
+            env,
+            &[
+                "connect",
+                "github",
+                "--personal",
+                "--as",
+                NAME,
+                "--token",
+                PERSONAL_TOKEN,
+            ],
+            vars,
+        );
+        assert!(ok, "{out}{err}");
+        assert!(out.contains("(vault token store)"), "{out}");
     }
     #[cfg(not(feature = "postgres"))]
     let _ = (vars, seal_token);
@@ -326,6 +350,42 @@ fn empty_the_disk(env: &Env) {
     if config_dir.exists() {
         std::fs::remove_dir_all(&config_dir).unwrap();
     }
+    assert!(!env.state_dir().exists() && !config_dir.exists());
+}
+
+/// The rows a first deployment seals in `pg`: the instance's token and the
+/// person's.
+#[cfg(feature = "postgres")]
+fn sealed_rows_of(pg: &PgScratch, github: &RecordingGithub) -> [bool; 2] {
+    [
+        has_secret_row(pg, &format!("github:{}", github.host())),
+        has_secret_row(pg, &format!("github-personal:{NAME}:{}", github.host())),
+    ]
+}
+
+/// The durable-state line of a start that took over `pg`: it names the key
+/// and the two sealed rows, the App source, and no row name or token.
+#[cfg(feature = "postgres")]
+fn assert_start_line(log: &str) {
+    let line = log
+        .lines()
+        .find(|l| l.contains("durable state: owner of postgres"))
+        .unwrap_or_else(|| panic!("no durable state line:\n{log}"));
+    assert!(
+        line.contains(&format!(
+            "secrets sealed in postgres with key {} (2 rows)",
+            test_key_id()
+        )),
+        "{line}"
+    );
+    assert!(line.ends_with("; GitHub App none"), "{line}");
+    assert!(!log.contains("github:"), "a row name in the log:\n{log}");
+    assert!(
+        !log.contains("github-personal"),
+        "a row name in the log:\n{log}"
+    );
+    assert!(!log.contains(GITHUB_TOKEN), "the token in the log");
+    assert!(!log.contains(PERSONAL_TOKEN), "the token in the log");
 }
 
 /// The admin's GitHub settings at `serve`.
@@ -344,8 +404,8 @@ fn github_settings(serve: &Serve) -> Value {
 /// Everything [`first_deploy`] made, asked of `serve` and of the commands
 /// of `env` (the instance that serves now): the grant refreshes to a new
 /// pair, the account signs in, the domain is listed and its engram read,
-/// the setting holds, and the sealed token is opened and used for a call
-/// to GitHub.
+/// the setting holds, the instance's sealed token is opened and used for a
+/// call to GitHub, and the person's sealed token is opened for them.
 #[cfg(feature = "postgres")]
 fn assert_everything_kept(env: &Env, serve: &Serve, grant: &Grant, github: &RecordingGithub) {
     // The refresh grant: a new pair. No `resource`, as a client sends it:
@@ -398,6 +458,17 @@ fn assert_everything_kept(env: &Env, serve: &Serve, grant: &Grant, github: &Reco
         "the daemon called GitHub with the sealed token: {:?}",
         github.asked.lock().unwrap()
     );
+    // The person's token: its row opens, and the person sees their login.
+    let (cookies, _) = session(serve);
+    let identity: Value = client()
+        .get(format!("http://{}/api/v1/me/github-identity", serve.addr))
+        .header("cookie", cookies)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(identity["connected"], true, "{identity}");
+    assert_eq!(identity["login"], "alice-gh", "{identity}");
     assert_eq!(local_github_files(env), Vec::<std::path::PathBuf>::new());
 }
 
@@ -419,7 +490,8 @@ fn deployed_and_stopped(
     let mut serve = Serve::start_with(env, Some("info"), vars);
     serve.wait_ready();
     let grant = first_deploy(env, &serve, vars, true);
-    assert!(has_secret_row(pg, &format!("github:{}", github.host())));
+    assert_eq!(sealed_rows_of(pg, github), [true, true]);
+    assert_eq!(secret_rows(pg), "2");
     serve.terminate();
     assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
     empty_the_disk(env);
@@ -446,21 +518,8 @@ fn redeploy_keeps_everything() {
     let mut serve = Serve::start_with(&env, Some("info"), &vars);
     serve.wait_ready();
     assert_everything_kept(&env, &serve, &grant, &github);
-    let log = serve.log();
-    let line = log
-        .lines()
-        .find(|l| l.contains("durable state: owner of postgres"))
-        .unwrap_or_else(|| panic!("no durable state line:\n{log}"));
-    assert!(
-        line.contains(&format!(
-            "secrets sealed in postgres with key {} (1 row)",
-            test_key_id()
-        )),
-        "{line}"
-    );
-    assert!(line.contains("GitHub App none"), "{line}");
-    assert!(!log.contains("github:"), "a row name in the log:\n{log}");
-    assert!(!log.contains(GITHUB_TOKEN), "the token in the log");
+    assert_start_line(&serve.log());
+    assert_eq!(sealed_rows_of(&pg, &github), [true, true]);
     assert_eq!(accounts(&pg), "1", "the fresh start made no account");
 }
 
@@ -483,6 +542,7 @@ fn redeploy_after_kill_with_standby() {
     let mut standby = Serve::start_with(&standby_env, Some("info"), &vars);
     standby.wait_role("standby");
     let grant = first_deploy(&active_env, &active, &vars, true);
+    assert_eq!(sealed_rows_of(&pg, &github), [true, true]);
 
     unsafe {
         libc::kill(active.pid(), libc::SIGKILL);
@@ -494,6 +554,9 @@ fn redeploy_after_kill_with_standby() {
         owner_row(&pg),
         format!("{}|false", instance_id(&standby_env))
     );
+    let log = standby.log();
+    assert!(log.contains("after a grace of"), "{log}");
+    assert_start_line(&log);
     assert_everything_kept(&standby_env, &standby, &grant, &github);
 }
 
