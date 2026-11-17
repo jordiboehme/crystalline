@@ -8403,7 +8403,7 @@ async fn configure_lists_no_operator_setting() {
         .filter(|s| s.operator_only)
         .map(|s| s.key)
         .collect();
-    assert_eq!(operator.len(), 29);
+    assert_eq!(operator.len(), 31);
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let keys: Vec<&str> = out["settings"]
@@ -8412,7 +8412,7 @@ async fn configure_lists_no_operator_setting() {
         .iter()
         .map(|s| s["key"].as_str().unwrap())
         .collect();
-    assert_eq!(keys.len(), 20, "{keys:?}");
+    assert_eq!(keys.len(), 18, "{keys:?}");
     assert!(keys.contains(&"github.enabled") && keys.contains(&"search.salience_weight"));
     assert!(
         keys.contains(&"service.response_format"),

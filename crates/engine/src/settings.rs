@@ -688,7 +688,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
-            operator_only: false,
+            operator_only: true,
             apply: set_update_check,
             clear: clear_update_check,
             effective: update_check_effective,
@@ -699,7 +699,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::U64,
             startup_effective: false,
             secret: false,
-            operator_only: false,
+            operator_only: true,
             apply: set_update_min_age_hours,
             clear: clear_update_min_age_hours,
             effective: update_min_age_hours_effective,
@@ -1881,6 +1881,7 @@ fn drop_update_if_empty(config: &mut GlobalConfig) {
 
 fn set_update_check(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
     let parsed: bool = value
+        .trim()
         .parse()
         .map_err(|_| SettingsError(format!("update.check must be true or false, got '{value}'")))?;
     config.update.get_or_insert_with(Default::default).check = Some(parsed);
@@ -1907,7 +1908,11 @@ fn set_update_min_age_hours(config: &mut GlobalConfig, value: &str) -> Result<()
             "update.min_age_hours must be a whole number of hours between 0 and {MAX_UPDATE_MIN_AGE_HOURS}, got '{value}'"
         ))
     };
-    let parsed: u32 = value.trim().parse().map_err(|_| refuse())?;
+    let trimmed = value.trim();
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse());
+    }
+    let parsed: u32 = trimmed.parse().map_err(|_| refuse())?;
     if parsed > MAX_UPDATE_MIN_AGE_HOURS {
         return Err(refuse());
     }
@@ -3144,6 +3149,8 @@ mod tests {
                 "automation.webhook.url",
                 "automation.webhook.secret",
                 "automation.evolve_threshold",
+                "update.check",
+                "update.min_age_hours",
             ]
         );
         // The rule, not only the list: a key added under one of the three
@@ -3154,7 +3161,8 @@ mod tests {
                 || (spec.key.starts_with("service.") && spec.key != "service.response_format")
                 || spec.key == "github.api_url"
                 || spec.key == "github.oauth_client_id"
-                || spec.key.starts_with("automation.");
+                || spec.key.starts_with("automation.")
+                || spec.key.starts_with("update.");
             assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
             assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
             assert!(is_known_key(spec.key), "{}", spec.key);
@@ -3168,7 +3176,7 @@ mod tests {
     #[test]
     fn the_agent_snapshot_and_the_agent_unknown_key_error_name_no_operator_key() {
         let views = agent_snapshot(&GlobalConfig::default(), &EnvOverlay::default());
-        assert_eq!(views.len(), 20);
+        assert_eq!(views.len(), 18);
         assert!(views.iter().all(|v| !is_operator_key(&v.key)));
         assert!(views.iter().any(|v| v.key == "github.enabled"));
         assert!(views.iter().any(|v| v.key == "service.response_format"));
@@ -4501,7 +4509,7 @@ mod tests {
     fn update_check_defaults_off() {
         let mut cfg = GlobalConfig::default();
         assert_eq!(update_check_effective(&cfg), ("false".to_string(), true));
-        apply(&mut cfg, "update.check", "true").unwrap();
+        apply(&mut cfg, "update.check", " true ").unwrap();
         assert_eq!(update_check_effective(&cfg), ("true".to_string(), false));
         assert!(apply(&mut cfg, "update.check", "maybe").is_err());
         unset(&mut cfg, "update.check").unwrap();
@@ -4528,7 +4536,7 @@ mod tests {
     #[test]
     fn min_age_hours_refuses_a_negative_or_text_value() {
         let mut cfg = GlobalConfig::default();
-        for bad in ["-1", "soon", "1.5", "", "721", "99999999999"] {
+        for bad in ["-1", "+5", "soon", "1.5", "", "721", "99999999999"] {
             let err = apply(&mut cfg, "update.min_age_hours", bad).unwrap_err();
             assert!(
                 err.to_string().contains("between 0 and 720"),
