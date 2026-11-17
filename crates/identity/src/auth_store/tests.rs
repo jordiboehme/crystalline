@@ -6548,6 +6548,59 @@ async fn turso_stamps_on_every_lookup() {
     assert_ne!(first, second, "every lookup stamps on Turso");
 }
 
+/// A registration under a ceiling whose count query itself fails says it
+/// could not count, so the endpoint answers "counting the registrations"
+/// rather than "storing the registration".
+#[tokio::test]
+async fn a_failed_count_of_oauth_clients_says_it_could_not_count() {
+    let (auth, _guard) = test_store().await;
+    auth.db
+        .execute("DROP TABLE oauth_clients", vec![])
+        .await
+        .unwrap();
+    let err = auth
+        .register_oauth_client_within("c", None, &["https://x.test/cb".to_string()], Some(10))
+        .await
+        .unwrap_err();
+    assert!(
+        err.chain()
+            .any(|e| e.to_string() == OAUTH_CLIENTS_UNCOUNTED),
+        "{err:#}"
+    );
+}
+
+/// A transaction a caller left open when it was dropped between `begin` and
+/// `finish` (an HTTP handler whose client went away, an MCP call that was
+/// cancelled) is rolled back when the store's next call takes the guard, on
+/// every backend: the next call's own transaction begins, a write after it
+/// is committed and seen by another store on the same database, and the
+/// write lock is free for that store at once.
+#[tokio::test]
+async fn a_dropped_transaction_is_rolled_back_before_the_next_call() {
+    let (a, guard) = test_store().await;
+    let b = guard.second().await;
+    a.add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let session = a.create_session("ada", 3600).await.unwrap();
+    // Begun and never finished, as by a handler dropped in between.
+    a.db.begin_immediate().await.unwrap();
+    a.delete_session(&session.token).await.unwrap();
+    a.add_user("bob", "Bob", None, Role::Viewer, "pw12345678")
+        .await
+        .expect("the next transaction begins");
+    assert!(
+        b.session_user(&session.token).await.unwrap().is_none(),
+        "the logout is committed, not held in the dropped transaction"
+    );
+    assert!(b.user("bob").await.unwrap().is_some());
+    tokio::time::timeout(std::time::Duration::from_secs(5), b.db.begin_immediate())
+        .await
+        .expect("the write lock was released with the dropped transaction")
+        .unwrap();
+    b.db.finish(Ok(())).await.unwrap();
+}
+
 /// The Postgres arm's own tests: each runs in a scratch schema of its own
 /// when `CRYSTALLINE_TEST_POSTGRES_URL` is set, whatever
 /// `CRYSTALLINE_TEST_AUTH_BACKEND` names, and skips with a note otherwise.

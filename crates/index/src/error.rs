@@ -211,6 +211,14 @@ impl From<sqlx::Error> for IndexError {
         {
             return IndexError::Constraint(db.message().to_string());
         }
+        // A fenced connect is refused through the protocol variant, whose
+        // own wording ("encountered unexpected or invalid data") would hide
+        // the reason: the refusal is said as it is.
+        if let sqlx::Error::Protocol(text) = &e
+            && text.starts_with(crate::postgres::session::FENCED_PREFIX)
+        {
+            return IndexError::Db(text.clone());
+        }
         IndexError::Db(e.to_string())
     }
 }
@@ -218,6 +226,26 @@ impl From<sqlx::Error> for IndexError {
 impl From<reqwest::Error> for IndexError {
     fn from(e: reqwest::Error) -> Self {
         IndexError::Remote(e.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "postgres"))]
+mod fence_tests {
+    use super::*;
+
+    /// A fenced connect's refusal reads as itself, not as a protocol error.
+    #[test]
+    fn a_fence_refusal_is_said_without_the_protocol_wording() {
+        let refused = sqlx::Error::Protocol(format!(
+            "{}: the lock session 7 does not hold the owner lock",
+            crate::postgres::session::FENCED_PREFIX
+        ));
+        assert_eq!(
+            IndexError::from(refused).to_string(),
+            "database error: this instance no longer owns the database: the lock session 7 does not hold the owner lock"
+        );
+        let other = IndexError::from(sqlx::Error::Protocol("bad frame".to_string()));
+        assert!(other.to_string().contains("bad frame"), "{other}");
     }
 }
 

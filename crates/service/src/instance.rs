@@ -2428,7 +2428,16 @@ pub(crate) async fn ensure_daemon_with(
     // A holder we refused to touch is the better explanation of the timeout
     // than the generic one: it names the lock file and how to look at whoever
     // owns it, instead of pointing at a daemon log the spawn never reached.
+    // When the database is held too and its owner row names another
+    // machine, that is said beside it: once the folder is freed, it is what
+    // the next try meets. Never instead of it, since while the folder is
+    // held the row may be the one a starting local daemon is taking over.
     if let Some(e) = unknown_holder {
+        if let Some(cfg) = &database
+            && let Some(note) = crate::claim::holder(cfg).await.owner_row_note()
+        {
+            return Err(anyhow::anyhow!("{e}. Besides, {note}"));
+        }
         return Err(e);
     }
     // A one-shot command that took the state directory after the check

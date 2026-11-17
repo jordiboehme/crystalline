@@ -1473,21 +1473,41 @@ fn reports_never_open_the_store_on_postgres() {
 /// starts once the command has finished.
 #[test]
 fn mcp_waits_for_a_command_of_this_machine() {
-    let Some(pg) = PgScratch::new("cllocal") else {
+    mcp_waits_for_a_local_command("cllocal", false);
+}
+
+/// The same wait for a command of this machine that holds the database
+/// but not the state folder (`users add`, `connect github` with the key):
+/// the state folder is free, so only the owner row says who holds the
+/// database, and the bridge waits for it instead of spawning a daemon that
+/// would find the database held and leave.
+#[test]
+fn mcp_waits_for_a_command_that_holds_only_the_database() {
+    mcp_waits_for_a_local_command("cldbonly", true);
+}
+
+/// The body of the two waits above: `database_only` keeps the holding
+/// command off the state folder.
+fn mcp_waits_for_a_local_command(name: &str, database_only: bool) {
+    let Some(pg) = PgScratch::new(name) else {
         return;
     };
-    let env = Env::new("cllocal").on_postgres(&pg);
+    let env = Env::new(name).on_postgres(&pg);
     env.setup_domain("eng");
     let mut hold = Command::new(bin());
     env.apply(&mut hold);
+    hold.args([
+        "hold-lock",
+        "--secs",
+        "4",
+        "--standalone",
+        "crystalline reindex",
+    ]);
+    if database_only {
+        hold.arg("--database-only");
+    }
+    let started = std::time::Instant::now();
     let mut hold = hold
-        .args([
-            "hold-lock",
-            "--secs",
-            "4",
-            "--standalone",
-            "crystalline reindex",
-        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1539,6 +1559,10 @@ fn mcp_waits_for_a_command_of_this_machine() {
     assert!(!err.contains("does not serve it"), "{err}");
     let reply: Value = serde_json::from_str(reply.trim()).unwrap_or(Value::Null);
     assert!(reply["result"].is_object(), "{reply} {err}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the session started before the command let go"
+    );
     assert!(hold.wait().unwrap().success());
     let (ok, out, err) = env.run_full(&["ctl", "shutdown"]);
     assert!(ok, "{out}{err}");

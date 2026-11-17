@@ -109,6 +109,25 @@ pub fn document_body(cfg: &GlobalConfig) -> Result<serde_json::Value> {
     Ok(body)
 }
 
+/// After a save that answered [`EngineError::ConfigMaybeStored`]: read the
+/// document back and say whether what is stored is `intended`. Answers the
+/// stored configuration (the default one when there is no document) and
+/// that verdict, or the error of the read.
+pub fn read_back(
+    doc: &dyn ConfigDocument,
+    intended: &GlobalConfig,
+) -> Result<(GlobalConfig, bool)> {
+    let stored = match doc.load()? {
+        Some(body) => config_from_document(body)?.0,
+        None => GlobalConfig::default(),
+    };
+    let landed = match (document_body(&stored), document_body(intended)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    Ok((stored, landed))
+}
+
 /// Remove the `database` block from a document body. Whether one was there.
 pub fn strip_database(doc: &mut serde_json::Value) -> bool {
     doc.as_object_mut()

@@ -2559,6 +2559,27 @@ mod tests {
         assert!(db.validate().is_err());
     }
 
+    /// On Turso the schema changes nothing it did in 0.32: an unset one is
+    /// never written, a 0.32 config with a Turso block reads and validates
+    /// as before, and a stray schema there, even one that is no identifier,
+    /// is never checked because nothing reads it.
+    #[test]
+    fn an_unset_schema_on_turso_changes_nothing() {
+        let yaml = "database:\n  backend: turso\n  url: /tmp/custom-index.db\n";
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let db = cfg.database.clone().unwrap();
+        assert_eq!(db.schema, None);
+        assert!(db.validate().is_ok());
+        let written = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(!written.contains("schema"), "{written}");
+        assert!(GlobalConfig::default().database().validate().is_ok());
+        let stray = DatabaseConfig {
+            schema: Some("Not-An-Identifier".to_string()),
+            ..db
+        };
+        assert!(stray.validate().is_ok());
+    }
+
     #[test]
     fn database_config_debug_shows_schema_and_masks_url() {
         let db = DatabaseConfig {

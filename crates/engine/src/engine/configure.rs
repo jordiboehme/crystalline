@@ -384,8 +384,8 @@ impl Engine {
     /// `held` is the `file_config` write guard the caller holds. It is
     /// touched only when the database cannot say whether a document save
     /// landed: the document is read back and this engine takes what is
-    /// stored, and the error says which way it went (see
-    /// [`Engine::settle_an_unknown_save`]).
+    /// stored: a change that landed is a plain success, one that did not is
+    /// an error that says so (see [`Engine::settle_an_unknown_save`]).
     ///
     /// Every write logs one line naming its caller, so a daemon log says
     /// which path saved the file when it changed under somebody's feet.
@@ -416,7 +416,7 @@ impl Engine {
                 match persisted.save(config, &caller.to_string()) {
                     Ok(()) => {}
                     Err(EngineError::ConfigMaybeStored(detail)) => {
-                        return Err(self.settle_an_unknown_save(held, config, &detail));
+                        self.settle_an_unknown_save(held, config, &detail)?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -432,56 +432,43 @@ impl Engine {
     }
 
     /// After a document save whose outcome the database did not confirm:
-    /// read the document back, make what is stored this engine's
-    /// configuration (`held` and the effective config) and answer an error
-    /// that says whether `intended` landed. When the read back fails too,
-    /// memory stays as it was and the error says the outcome is unknown.
-    /// Never a plain success or a plain failure: the caller's verb did not
-    /// run to its end either way.
+    /// read the document back and make what is stored this engine's
+    /// configuration (`held` and the effective config). A change that
+    /// landed is a plain success, so the caller's verb runs on (a domain
+    /// add registers and syncs); one that did not land is an error that says
+    /// so. When the read back fails too, memory stays as it was and the
+    /// error says the outcome is unknown.
     fn settle_an_unknown_save(
         &self,
         held: &mut GlobalConfig,
         intended: &GlobalConfig,
         detail: &str,
-    ) -> EngineError {
+    ) -> Result<()> {
         let Some(crate::persisted::PersistedConfig::Document { doc, .. }) = &self.persisted else {
-            return EngineError::ConfigMaybeStored(detail.to_string());
+            return Err(EngineError::ConfigMaybeStored(detail.to_string()));
         };
         let unknown = |why: String| {
             EngineError::ConfigMaybeStored(format!(
                 "the database did not confirm saving the configuration ({detail}), and reading it back failed ({why}); the change may or may not be stored, and this instance keeps the configuration it had"
             ))
         };
-        let stored = match doc.load().and_then(|body| match body {
-            Some(body) => crate::persisted::config_from_document(body).map(|(cfg, _)| cfg),
-            None => Ok(GlobalConfig::default()),
-        }) {
-            Ok(stored) => stored,
-            Err(e) => return unknown(e.to_string()),
-        };
-        let landed = match (
-            crate::persisted::document_body(&stored),
-            crate::persisted::document_body(intended),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        };
-        let effective = match self.effective_of(&stored) {
-            Ok(effective) => effective,
-            Err(e) => return unknown(e.to_string()),
-        };
+        let (stored, landed) = crate::persisted::read_back(doc.as_ref(), intended)
+            .map_err(|e| unknown(e.to_string()))?;
+        let effective = self
+            .effective_of(&stored)
+            .map_err(|e| unknown(e.to_string()))?;
         *held = stored;
         *self.config.write().unwrap() = effective;
         self.mark_names_stale();
-        EngineError::ConfigMaybeStored(if landed {
-            format!(
-                "the database did not confirm saving the configuration ({detail}); reading it back shows the change was stored, and this instance now uses it"
-            )
-        } else {
-            format!(
-                "the database did not confirm saving the configuration ({detail}); reading it back shows the change was not stored, so this instance uses the stored configuration; try again"
-            )
-        })
+        if landed {
+            tracing::warn!(
+                "the database did not confirm saving the configuration ({detail}); reading it back shows the change was stored"
+            );
+            return Ok(());
+        }
+        Err(EngineError::ConfigMaybeStored(format!(
+            "the database did not confirm saving the configuration ({detail}); reading it back shows the change was not stored, so this instance uses the stored configuration; try again"
+        )))
     }
 
     /// In document mode, refuse removing, purging or renaming `name` when the
@@ -1163,22 +1150,26 @@ mod document_tests {
         assert_eq!(doc.stored(), None);
     }
 
-    /// A save the database did not confirm: memory becomes what is stored,
-    /// and the answer says which way it went, never a plain outcome.
+    /// A save the database did not confirm: memory becomes what is stored.
+    /// When the read back shows the change landed, the verb goes on as after
+    /// a plain save; otherwise the answer says which way it went.
     #[tokio::test]
     async fn an_unconfirmed_save_takes_what_is_stored() {
         let doc = Arc::new(MemoryDocument::default());
         let (engine, _, _tmp) = engine_on(doc.clone()).await;
 
-        // Stored after all.
+        // Stored after all: a plain success.
         *doc.fail_after_store.lock().unwrap() =
             Some(EngineError::ConfigMaybeStored("no answer".into()));
-        let err = engine
+        engine
             .configure(&set("service.response_format", "json"))
             .await
-            .unwrap_err();
-        assert!(matches!(err, EngineError::ConfigMaybeStored(_)), "{err}");
-        assert!(err.to_string().contains("the change was stored"), "{err}");
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["response_format"],
+            "json",
+            "the change is stored"
+        );
         assert_eq!(
             engine.config().service.unwrap().response_format,
             Some(crystalline_core::config::ResponseFormat::Json)
@@ -1213,6 +1204,41 @@ mod document_tests {
             engine.config().service.unwrap().response_format,
             Some(crystalline_core::config::ResponseFormat::Json)
         );
+    }
+
+    /// A domain add whose save the database did not confirm but which landed
+    /// runs on like a plain success: registered, and its folder synced into
+    /// the index.
+    #[tokio::test]
+    async fn a_landed_unconfirmed_domain_add_is_indexed() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        let folder = tmp.path().join("team");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("MANIFEST.md"),
+            crystalline_core::manifest_template("team", "2026-11-17"),
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join("landed.md"),
+            "---\ntitle: Landed\ntype: note\nstatus: current\n---\n\n# Landed\n\nA fact.\n",
+        )
+        .unwrap();
+        *doc.fail_after_store.lock().unwrap() =
+            Some(EngineError::ConfigMaybeStored("no answer".into()));
+        let added = engine
+            .domain_add_local(Some("team"), Some(folder.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(added["domain"], "team", "{added}");
+        assert_eq!(
+            added["sync"]["reports"][0]["added"], 2,
+            "the folder was indexed: {added}"
+        );
+        let stored = doc.stored().unwrap();
+        assert!(stored["domains"].get("team").is_some(), "{stored}");
+        assert!(engine.registered_domain_names().contains("team"));
     }
 
     #[tokio::test]

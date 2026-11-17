@@ -556,7 +556,8 @@ pub fn keep_secrets_off_local_stores_for_command() {
 }
 
 /// The value of the `--config` flag among the command's words (as
-/// `--config x` or `--config=x`), the last one when it is given twice.
+/// `--config x` or `--config=x`), the last one when it is given twice. A
+/// word after `--` is a value, never a flag.
 fn command_config_path() -> Option<std::path::PathBuf> {
     config_flag(&COMMAND.get()?.words)
 }
@@ -565,6 +566,9 @@ fn config_flag(words: &[String]) -> Option<std::path::PathBuf> {
     let mut found = None;
     let mut words = words.iter();
     while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
         if word == "--config" {
             found = words.next().map(std::path::PathBuf::from);
         } else if let Some(value) = word.strip_prefix("--config=") {
@@ -1033,6 +1037,21 @@ impl Holder {
         }
     }
 
+    /// What the database's owner row says when another machine's holder is
+    /// named there, as a note beside another refusal: it only reports the
+    /// row, and never says this machine does not serve the database (a
+    /// daemon of this machine that is starting can hold the database while
+    /// the row still names the instance before it).
+    pub(crate) fn owner_row_note(&self) -> Option<String> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Holder::Elsewhere { database, owner } => {
+                Some(pg::owner_row_note(database, owner.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
     /// The command of this machine that holds the database, with its pid,
     /// when one does (not its daemon).
     pub(crate) fn local_command(&self) -> Option<(String, i64)> {
@@ -1186,6 +1205,21 @@ pub(crate) mod pg {
         format!(
             "the database {database} is owned by {holder}; this machine does not serve it. Point Crystalline at another database or schema, or stop that instance."
         )
+    }
+
+    /// The note of [`super::Holder::owner_row_note`].
+    pub(crate) fn owner_row_note(database: &str, owner: Option<&OwnerRow>) -> String {
+        match current(owner) {
+            Some(o) => format!(
+                "the database {database} is held, and its owner row names {} ({}since {}), not this machine",
+                o.label,
+                running(o),
+                since(o)
+            ),
+            None => format!(
+                "the database {database} is held by an instance that has not announced itself yet"
+            ),
+        }
     }
 
     /// A read-only report on a database no instance owns: it opens nothing,
@@ -1350,6 +1384,26 @@ pub(crate) mod pg {
             );
         }
 
+        /// The note beside an unknown local holder reports the owner row
+        /// and does not claim this machine cannot serve the database.
+        #[test]
+        fn the_owner_row_note_reports_the_row() {
+            let held = row(Some("crystalline sync"), false);
+            let note = owner_row_note("db", Some(&held));
+            assert!(
+                note.starts_with(
+                    "the database db is held, and its owner row names prod-a (running `crystalline sync`, since "
+                ),
+                "{note}"
+            );
+            assert!(note.ends_with(", not this machine"), "{note}");
+            assert!(!note.contains("does not serve"), "{note}");
+            assert_eq!(
+                owner_row_note("db", None),
+                "the database db is held by an instance that has not announced itself yet"
+            );
+        }
+
         /// A process id is fresh per process, its first 8 characters tag it
         /// apart from any other, and its tail says which machine runs it.
         #[test]
@@ -1388,6 +1442,25 @@ mod tests {
             Some(std::path::PathBuf::from("/b.yaml"))
         );
         assert_eq!(config_flag(&words(&["status", "--json"])), None);
+        // After `--` every word is a value: content that reads like the flag
+        // does not move the command to another configuration.
+        assert_eq!(
+            config_flag(&words(&[
+                "write", "eng", "Note", "--", "--config", "/b.yaml"
+            ])),
+            None
+        );
+        assert_eq!(
+            config_flag(&words(&[
+                "--config",
+                "/a.yaml",
+                "write",
+                "eng",
+                "--",
+                "--config=/b.yaml"
+            ])),
+            Some(std::path::PathBuf::from("/a.yaml"))
+        );
     }
 
     /// The example for another machine leaves this machine's paths out.

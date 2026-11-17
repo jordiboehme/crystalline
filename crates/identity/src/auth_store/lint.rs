@@ -28,7 +28,9 @@ fn store_sources() -> Vec<(PathBuf, String)> {
 }
 
 /// Every string literal of `source` outside `//` comment lines, escapes left
-/// as written except a backslash-newline, which joins the lines.
+/// as written except a backslash-newline, which joins the lines. A raw
+/// string (`r"..."`, `r#"..."#`) is one literal too, taken as written, with
+/// the quotes inside it: the scan must not cut it at its first `"`.
 fn string_literals(source: &str) -> Vec<String> {
     let code: String = source
         .lines()
@@ -38,7 +40,23 @@ fn string_literals(source: &str) -> Vec<String> {
     let mut literals = Vec::new();
     let mut chars = code.chars().peekable();
     let mut current: Option<String> = None;
+    let mut previous = ' ';
     while let Some(c) = chars.next() {
+        if current.is_none() && c == 'r' && !is_word_char(previous) {
+            let mut lookahead = chars.clone();
+            let mut hashes = 0;
+            while lookahead.peek() == Some(&'#') {
+                lookahead.next();
+                hashes += 1;
+            }
+            if lookahead.next() == Some('"') {
+                chars = lookahead;
+                literals.push(raw_body(&mut chars, hashes));
+                previous = '"';
+                continue;
+            }
+        }
+        previous = c;
         match (&mut current, c) {
             (None, '\'') => {
                 // A char literal such as '"' must not open a string.
@@ -66,6 +84,23 @@ fn string_literals(source: &str) -> Vec<String> {
         }
     }
     literals
+}
+
+/// The body of a raw string whose opening `r`, `hashes` times `#` and `"`
+/// were read: everything up to a `"` followed by as many `#`.
+fn raw_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, hashes: usize) -> String {
+    let mut body = String::new();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut lookahead = chars.clone();
+            if (0..hashes).all(|_| lookahead.next() == Some('#')) {
+                *chars = lookahead;
+                return body;
+            }
+        }
+        body.push(c);
+    }
+    body
 }
 
 fn is_word_char(c: char) -> bool {
@@ -102,7 +137,11 @@ fn sql_literals_without_quoted_user() -> Vec<String> {
         .iter()
         .flat_map(|(_, text)| string_literals(text))
         .filter(|l| has_sql_keyword(l))
-        .map(|l| l.replace("\\\"user\\\"", "").replace("'user'", ""))
+        .map(|l| {
+            l.replace("\\\"user\\\"", "")
+                .replace("\"user\"", "")
+                .replace("'user'", "")
+        })
         .collect()
 }
 
@@ -151,6 +190,42 @@ fn the_lints_scan_the_executor_seam() {
         store_sources()
             .iter()
             .any(|(p, _)| p.ends_with("auth_store/db.rs"))
+    );
+}
+
+/// A raw string is one literal with its quotes, an ordinary one keeps its
+/// escapes, and an `r` ending a word opens nothing.
+#[test]
+fn the_scan_reads_raw_strings_whole() {
+    let source = concat!(
+        "let a = r#\"SELECT \"user\" FROM t\"#;\n",
+        "let b = r\"WHERE x = 1\";\n",
+        "let c = \"plain \\\"q\\\"\";\n",
+        "let for_r = bar\"tail\";\n",
+    );
+    assert_eq!(
+        string_literals(source),
+        [
+            "SELECT \"user\" FROM t",
+            "WHERE x = 1",
+            "plain \\\"q\\\"",
+            "tail",
+        ]
+    );
+}
+
+/// The migrations' raw SQL is scanned too, as one literal per statement
+/// block, not cut at its first quoted identifier.
+#[test]
+fn the_lints_scan_the_raw_migration_sql() {
+    let migrations = store_sources()
+        .into_iter()
+        .find(|(p, _)| p.ends_with("auth_store/pg_migrations.rs"))
+        .expect("the migrations file is scanned");
+    assert!(
+        string_literals(&migrations.1).iter().any(|l| l
+            .contains("CREATE TABLE IF NOT EXISTS users (")
+            && l.contains("\"user\" TEXT")),
     );
 }
 

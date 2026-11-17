@@ -3132,6 +3132,33 @@ mod tests {
             .await
             .unwrap();
         assert!(secret, "v33 created instance_secret");
+        // Each ledger holds exactly its own set's versions, once each: the
+        // two runs did not stamp each other's ledger or a step twice.
+        let versions = |ledger: &'static str| {
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT version FROM {schema}.{ledger} ORDER BY version"
+            )))
+        };
+        let index: Vec<i64> = versions("schema_migration")
+            .fetch_all(&mut setup)
+            .await
+            .unwrap();
+        let expected: Vec<i64> = MIGRATIONS.iter().map(|m| m.version).collect();
+        assert_eq!(index, expected, "the index ledger");
+        let dummy: Vec<i64> = versions("dummy_set_migration")
+            .fetch_all(&mut setup)
+            .await
+            .unwrap();
+        assert_eq!(dummy, [1, 2], "the dummy ledger");
+        let column: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = 'dummy_set_table' AND column_name = 'note')",
+        )
+        .bind(&schema)
+        .fetch_one(&mut setup)
+        .await
+        .unwrap();
+        assert!(column, "the dummy set's second step ran");
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&mut setup)
@@ -3155,9 +3182,22 @@ mod tests {
         fresh_schema(&mut conn, &schema).await;
         apply(&mut conn).await.unwrap();
 
+        // Up to and with v30, found by version rather than by position.
+        let through_v30 = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 30)
+            .expect("the index steps have a v30")
+            + 1;
+        assert!(
+            MIGRATIONS[..through_v30]
+                .iter()
+                .zip(1..)
+                .all(|(m, v)| m.version == v),
+            "the steps up to v30 are v1 to v30 in order"
+        );
         let v30_binary = MigrationSet {
             ledger: "schema_migration",
-            steps: &MIGRATIONS[..30],
+            steps: &MIGRATIONS[..through_v30],
             index_backfill: true,
         };
         let err = apply_locked_set(&mut conn, None, &v30_binary)

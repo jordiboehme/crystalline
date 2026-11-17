@@ -130,8 +130,14 @@ impl SealKey {
                 return Err(bad());
             },
         );
-        let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| bad())?;
-        Ok(SealKey(key))
+        if bytes.len() != 32 {
+            return Err(bad());
+        }
+        // Filled in place: a `[u8; 32]` copied out first would stay on the
+        // stack unwiped, where the key itself is wiped on drop.
+        let mut key = SealKey([0; 32]);
+        key.0.copy_from_slice(&bytes);
+        Ok(key)
     }
 
     /// A key from fixed bytes, for tests only (the `testing` feature): a
