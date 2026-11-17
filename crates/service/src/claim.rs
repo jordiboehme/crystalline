@@ -556,7 +556,8 @@ pub fn keep_secrets_off_local_stores_for_command() {
 }
 
 /// The value of the `--config` flag among the command's words (as
-/// `--config x` or `--config=x`), the last one when it is given twice.
+/// `--config x` or `--config=x`), the last one when it is given twice. A
+/// word after `--` is a value, never a flag.
 fn command_config_path() -> Option<std::path::PathBuf> {
     config_flag(&COMMAND.get()?.words)
 }
@@ -565,6 +566,9 @@ fn config_flag(words: &[String]) -> Option<std::path::PathBuf> {
     let mut found = None;
     let mut words = words.iter();
     while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
         if word == "--config" {
             found = words.next().map(std::path::PathBuf::from);
         } else if let Some(value) = word.strip_prefix("--config=") {
@@ -1388,6 +1392,25 @@ mod tests {
             Some(std::path::PathBuf::from("/b.yaml"))
         );
         assert_eq!(config_flag(&words(&["status", "--json"])), None);
+        // After `--` every word is a value: content that reads like the flag
+        // does not move the command to another configuration.
+        assert_eq!(
+            config_flag(&words(&[
+                "write", "eng", "Note", "--", "--config", "/b.yaml"
+            ])),
+            None
+        );
+        assert_eq!(
+            config_flag(&words(&[
+                "--config",
+                "/a.yaml",
+                "write",
+                "eng",
+                "--",
+                "--config=/b.yaml"
+            ])),
+            Some(std::path::PathBuf::from("/a.yaml"))
+        );
     }
 
     /// The example for another machine leaves this machine's paths out.
