@@ -111,6 +111,15 @@ pub fn clear() {
     registry.installed = None;
 }
 
+/// Whether this process keeps its secrets in the vault: one is installed or
+/// required. A caller that would otherwise read or write the keychain or the
+/// state folder itself (a marker, a lock file, a file copy) asks this first
+/// and leaves them alone.
+pub fn engaged() -> bool {
+    let registry = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    registry.required || registry.installed.is_some()
+}
+
 /// The installed vault and its key; `None` when no vault is required and
 /// none is installed, so the keychain and the file store answer as before.
 pub(crate) fn active() -> Result<Option<Installed>, RemoteError> {
@@ -335,12 +344,18 @@ mod tests {
     fn registry_clear_isolates_tests() {
         let _guard = guard();
         assert!(active().unwrap().is_none());
+        assert!(!engaged());
         require();
         assert!(matches!(active(), Err(RemoteError::VaultUnavailable)));
+        assert!(engaged(), "required is engaged");
         install_memory(key(1));
         assert!(active().unwrap().is_some());
         clear();
         assert!(active().unwrap().is_none(), "clear drops the vault");
+        assert!(!engaged());
+        install_memory(key(1));
+        assert!(engaged(), "installed is engaged");
+        clear();
         // A test that leaves a vault installed and required behind does not
         // reach the next one.
         require();
@@ -449,6 +464,8 @@ mod tests {
                 unavailable(store.load().map(|_| ()), mode);
                 unavailable(store.delete(), mode);
             }
+            // The App store lock is one inside the process: no lock file.
+            drop(crate::AppStoreLock::acquire(dir.path()).unwrap());
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "{mode}");
         };
         require();

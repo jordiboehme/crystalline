@@ -14093,6 +14093,61 @@ mod share_actor_tests {
         TokenIdentity::Personal(name.to_string())
     }
 
+    /// Env > Vault for tokens: the instance token from the environment wins
+    /// while the vault holds one, and a person's token, which the
+    /// environment never carries, comes from the vault. Nothing lands in the
+    /// state folder.
+    #[tokio::test]
+    async fn env_instance_token_wins_over_a_vault_row() {
+        use crate::test_vault::{guard, install_memory, key};
+        let _guard = guard();
+        let vault = install_memory(key(7));
+        let tmp = tempfile::tempdir().unwrap();
+        let origins = tmp.path().join("origins");
+        let token = |user: &str| StoredToken {
+            access_token: format!("{user}-secret"),
+            host: "github.com".to_string(),
+            user: user.to_string(),
+            created_at: Utc::now(),
+            refresh_token: None,
+            expires_at: None,
+            refresh_expires_at: None,
+        };
+        TokenStore::save_resolving_for(
+            &TokenIdentity::Instance,
+            None,
+            &origins,
+            &token("vault-gh"),
+        )
+        .unwrap();
+        TokenStore::save_resolving_for(&personal("alice"), None, &origins, &token("alice-gh"))
+            .unwrap();
+        assert!(vault.has("github"));
+        let overlay = EnvOverlay::from_vars([(
+            "CRYSTALLINE_GITHUB_TOKEN".to_string(),
+            "ghp_from_env".to_string(),
+        )])
+        .unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            GlobalConfig::default(),
+            None,
+            Some(tmp.path().join("config.yaml")),
+        )
+        .with_env_overlay(overlay)
+        .with_origins_dir(origins.clone());
+
+        let (store, token) = engine.github_credential(None).unwrap();
+        assert_eq!(store.kind(), "environment");
+        assert_eq!(token.unwrap().access_token, "ghp_from_env");
+        let (store, token) = engine
+            .github_credential_for(&personal("alice"), None)
+            .unwrap();
+        assert_eq!(store.kind(), "vault");
+        assert_eq!(token.unwrap().user, "alice-gh");
+        assert!(!origins.exists(), "nothing was written to the state folder");
+    }
+
     /// A [`ConnectAuth`] that validates any token as one fixed login and has
     /// no device path: enough to drive a personal connect with no network,
     /// and no keychain, behind it.

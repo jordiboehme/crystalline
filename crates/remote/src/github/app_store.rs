@@ -46,15 +46,34 @@ const LOCK_FILE_NAME: &str = "github-app.lock";
 
 /// An exclusive lock on a state directory's App store, held until dropped.
 /// It holds no secret; the file it locks stays empty.
+///
+/// While this process keeps its secrets in the vault ([`crate::vault::engaged`])
+/// the lock is one inside the process and nothing is written to `dir`: only
+/// the active instance writes the vault, so no other process takes part.
 #[derive(Debug)]
 pub struct AppStoreLock {
-    file: std::fs::File,
+    held: Held,
 }
+
+#[derive(Debug)]
+enum Held {
+    File(std::fs::File),
+    Process(#[allow(dead_code, reason = "held for its drop")] std::sync::MutexGuard<'static, ()>),
+}
+
+/// The App store lock of a process whose secrets are in the vault.
+static VAULT_APP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl AppStoreLock {
     /// Waits for and takes the lock of the App store in `dir`. Blocking: the
     /// holders are short (a store read and a write).
     pub fn acquire(dir: &Path) -> Result<AppStoreLock, RemoteError> {
+        if crate::vault::engaged() {
+            let guard = VAULT_APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            return Ok(AppStoreLock {
+                held: Held::Process(guard),
+            });
+        }
         AppStoreLock::acquire_in(dir, process_fence())
     }
 
@@ -70,13 +89,17 @@ impl AppStoreLock {
             .write(true)
             .open(path)?;
         fs4::FileExt::lock(&file)?;
-        Ok(AppStoreLock { file })
+        Ok(AppStoreLock {
+            held: Held::File(file),
+        })
     }
 }
 
 impl Drop for AppStoreLock {
     fn drop(&mut self) {
-        let _ = fs4::FileExt::unlock(&self.file);
+        if let Held::File(file) = &self.held {
+            let _ = fs4::FileExt::unlock(file);
+        }
     }
 }
 

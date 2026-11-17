@@ -51,8 +51,12 @@ pub mod share_staging;
 pub mod similar;
 pub mod subscribers;
 pub mod temp_store;
+#[cfg(test)]
+pub(crate) mod test_vault;
 #[doc(hidden)]
 pub mod toon;
+#[cfg(feature = "postgres")]
+pub mod vault;
 pub mod web_url;
 
 // The identity crate's modules under the names the moved files already use,

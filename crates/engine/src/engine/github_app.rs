@@ -208,8 +208,16 @@ impl AppHome {
     }
 
     /// Whether an App may be saved here, from the file and the keychain
-    /// marker alone (no keychain read).
+    /// marker alone (no keychain read). While this process keeps its secrets
+    /// in the vault, the state folder is not looked at: the vault row is
+    /// read instead, and a vault that cannot be read counts as "may be
+    /// saved", so a caller fails closed.
     pub fn maybe_saved(&self) -> bool {
+        if crystalline_remote::vault::engaged() {
+            return self
+                .lookup()
+                .map_or(true, |found| found.credentials.is_some());
+        }
         if let AppStore::File { path } = AppStore::file_fallback(&self.dir)
             && path.exists()
         {
@@ -238,7 +246,9 @@ impl AppHome {
         if let Some(seam) = &self.seam {
             return (seam.lookup)();
         }
-        if self.file_only {
+        // In vault mode the store lookup goes to the vault first, whatever
+        // `file_only` says: the file is not where the App lives.
+        if self.file_only && !crystalline_remote::vault::engaged() {
             let store = AppStore::file_fallback(&self.dir);
             let credentials = store.load()?;
             return Ok(AppLookup {
@@ -467,6 +477,11 @@ impl AppHome {
             return Err(EngineError::Conflict(APP_FROM_ENV.to_string()));
         }
         let found = self.lookup()?;
+        // A vault holds the App alone: no file copy or marker to clear.
+        if matches!(found.store, AppStore::Vault { .. }) {
+            found.store.delete_marked(&self.dir)?;
+            return Ok(AppRemoval::default());
+        }
         let file = AppStore::file_fallback(&self.dir);
         match found.keychain_failed {
             None => {
