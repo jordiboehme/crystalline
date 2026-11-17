@@ -27,6 +27,7 @@ globset = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 sha2 = { workspace = true }
+minisign-verify = { workspace = true }
 hmac = { workspace = true }
 anyhow = { workspace = true }
 whoami = { workspace = true }
@@ -40,5 +41,6 @@ zip = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_System_Com", "Win32_UI_Shell"] }
 
 [dev-dependencies]
+minisign = { workspace = true }
 insta = { workspace = true }
 tempfile = { workspace = true }
