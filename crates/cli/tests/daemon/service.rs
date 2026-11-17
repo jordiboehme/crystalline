@@ -7177,6 +7177,9 @@ impl PgScratch {
             ("CRYSTALLINE_DATABASE_SCHEMA", self.schema.clone()),
             ("CRYSTALLINE_TEST_OWNER_TIMING_SCALE", "10".to_string()),
             ("CRYSTALLINE_SECRET_KEY", TEST_SECRET_KEY.to_string()),
+            // Blank counts as unset: a key file the shell names never
+            // makes both variables set.
+            ("CRYSTALLINE_SECRET_KEY_FILE", String::new()),
         ]
     }
 

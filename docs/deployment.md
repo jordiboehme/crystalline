@@ -597,7 +597,7 @@ spec:
               port: 7411
 ```
 
-Run commands in the pod, for example `kubectl exec deploy/crystalline -- crystalline users add agent-build --role editor --mcp-token build`.
+The secret `crystalline-db` holds the database URL and the secret key, for example `kubectl create secret generic crystalline-db --from-literal=url=postgres://... --from-literal=secret-key="$(openssl rand -base64 32)"`. Run commands in the pod, for example `kubectl exec deploy/crystalline -- crystalline users add agent-build --role editor --mcp-token build`.
 
 Sample Compose files ship under [`examples/docker/`](../examples/docker/), and the one deployment that is meant to be run rather than read from under [`deploy/`](../deploy/):
 
