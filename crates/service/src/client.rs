@@ -2853,6 +2853,7 @@ pub async fn config_for_report(
     config_path: Option<&Path>,
 ) -> anyhow::Result<overlay::LoadedConfig> {
     let mut loaded = overlay::load(config_path)?;
+    crate::claim::keep_secrets_off_local_stores(&loaded.effective);
     if let Err(e) = attach_viewed_document(&mut loaded).await {
         tracing::warn!("{e:#}; the registrations shown are config.yaml's alone");
     }

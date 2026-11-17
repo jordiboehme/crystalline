@@ -526,6 +526,28 @@ pub async fn open_store_for_command(
     open_store_as(claim.as_ref(), cfg, db, resilient).await
 }
 
+/// Mark this process as one whose secrets live in the sealed vault when
+/// `cfg` says Postgres (spec section D): from then on no credential call
+/// reads or writes the keychain or the state folder, whatever path asks.
+/// Without an installed vault such a call fails with
+/// [`crystalline_remote::RemoteError::VaultUnavailable`], and a report shows
+/// the secret as sealed instead. Turso: nothing changes.
+pub fn keep_secrets_off_local_stores(cfg: &GlobalConfig) {
+    if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+        crystalline_remote::vault::require();
+    }
+}
+
+/// [`keep_secrets_off_local_stores`] for the configuration at
+/// `config_path` (the default one for `None`), read once at a CLI process's
+/// start. A configuration that does not load changes nothing here: the
+/// command reports it when it loads it itself.
+pub fn keep_secrets_off_local_stores_for(config_path: Option<&Path>) {
+    if let Ok(loaded) = crystalline_engine::overlay::load(config_path) {
+        keep_secrets_off_local_stores(&loaded.effective);
+    }
+}
+
 /// Where a CLI command that changes a secret (a GitHub token, a server
 /// sign-in) makes the change (spec section D and the owner decision of
 /// 2026-11-16).
@@ -542,8 +564,13 @@ pub enum SecretRoute {
     /// A daemon of this machine owns the Postgres database, and this
     /// command seals the secret itself with its own key, on a connection of
     /// its own beside the daemon ([`route_sealing_command`]). It tells the
-    /// daemon afterwards, so the daemon reads the secret again from the
-    /// database: the secret never travels over the socket.
+    /// daemon before and after the write, so the daemon reads the secret
+    /// again from the database: the secret never travels over the socket.
+    ///
+    /// Two writers, one row: a save of the daemon (a token it refreshes)
+    /// and this command's land in the order they commit, and the last one
+    /// wins. Each is a whole row sealed with the same key, so nothing is
+    /// torn; at worst a refresh that lost the race is asked for again.
     Beside,
 }
 
@@ -602,6 +629,17 @@ async fn route_on_postgres(cfg: &GlobalConfig, seals: bool) -> anyhow::Result<Se
                 Ok(None) => anyhow::bail!(pg::no_key_beside_daemon()),
                 Err(e) => anyhow::bail!("{e}"),
             };
+            // The daemon's key decides, also while no row is sealed yet: a
+            // row this process sealed with another key would be one the
+            // daemon cannot open.
+            let mine = key.key_id();
+            match holder.get("secret_key_id").and_then(Value::as_str) {
+                Some(theirs) if theirs == mine => {}
+                Some(theirs) => anyhow::bail!(pg::other_key_than_daemon(theirs, &mine)),
+                None => anyhow::bail!(
+                    "the daemon of this machine does not say which secret key it seals with (it is older than this command, or runs without a sealed vault), so nothing was changed; update it and run the command again"
+                ),
+            }
             let target = crystalline_index::postgres::PgTarget::from_config(&cfg.database())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let database = target.describe();
@@ -629,6 +667,9 @@ async fn route_on_postgres(cfg: &GlobalConfig, seals: bool) -> anyhow::Result<Se
     // The store open migrates the database (the sealed secrets' table
     // among it) and installs the vault with the key.
     drop(open_store_as(Some(&claim), cfg, None, false).await?);
+    // The claim lives in this process's slot until `main` releases it
+    // (`release_command_database`), so it holds for the whole command
+    // whatever the caller does with this handle.
     Ok(SecretRoute::Owned(claim))
 }
 
@@ -1068,6 +1109,16 @@ pub(crate) mod pg {
             "this command seals a GitHub token, a GitHub App or a server sign-in in the database itself, and this process has no secret key, so nothing was changed. Set {} (or {}) to the key of the active instance and run the command again; inside the instance's container it is set already",
             crystalline_remote::sealed::KEY_ENV,
             crystalline_remote::sealed::KEY_FILE_ENV
+        )
+    }
+
+    /// The refusal of a command whose key is not the one the daemon of its
+    /// machine seals with.
+    pub(crate) fn other_key_than_daemon(theirs: &str, mine: &str) -> String {
+        format!(
+            "the active instance on this machine seals its secrets with key {theirs}, but {} here is key {mine}, so nothing was changed. Set {} to the instance's key",
+            crystalline_remote::sealed::KEY_ENV,
+            crystalline_remote::sealed::KEY_ENV
         )
     }
 

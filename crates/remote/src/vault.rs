@@ -120,6 +120,14 @@ pub fn engaged() -> bool {
     registry.required || registry.installed.is_some()
 }
 
+/// The id of the key the installed vault seals with ([`SealKey::key_id`]),
+/// `None` when none is installed. Not secret: what a daemon tells a CLI
+/// process that seals beside it, so a process with another key is refused.
+pub fn installed_key_id() -> Option<String> {
+    let registry = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    registry.installed.as_ref().map(|(_, key)| key.key_id())
+}
+
 /// The installed vault and its key; `None` when no vault is required and
 /// none is installed, so the keychain and the file store answer as before.
 pub(crate) fn active() -> Result<Option<Installed>, RemoteError> {

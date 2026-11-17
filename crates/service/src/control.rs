@@ -1388,6 +1388,10 @@ pub(crate) fn holder_data(pid: u32) -> Value {
     // The config file it loaded, spelled the way a client spells its
     // own, so `status` and `doctor` can compare the two.
     data["config_path"] = json!(crate::instance::holder_config_path());
+    // The id of the key its sealed vault uses, null without one: a CLI that
+    // seals beside this daemon compares its own (spec section D). An id,
+    // never the key.
+    data["secret_key_id"] = json!(crystalline_remote::vault::installed_key_id());
     data
 }
 

@@ -766,6 +766,10 @@ async fn summarize_secrets(conn: &mut PgConnection, table: &str) -> Result<Secre
 /// owner's side channel runs, so a row sealed with another key is never
 /// replaced or deleted.
 ///
+/// A second writer means last write wins on a row both write: the owner's
+/// save and this one land in the order they commit. Each writes a whole row
+/// sealed with the same key, so nothing is torn.
+///
 /// Every call blocks the calling thread for at most [`VAULT_TIMEOUT`],
 /// on a thread and runtime of its own, so it may be called from inside any
 /// runtime, and opens and closes its own connection.

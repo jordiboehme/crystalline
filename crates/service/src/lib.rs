@@ -65,9 +65,9 @@ pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use claim::{
     CommandDbOwner, DatabaseOwned, SecretRoute, claim_database_for_command,
-    existing_accounts_for_cli, open_accounts_for_cli, open_store_for_command,
-    refuse_fix_when_owned, release_command_database, route_sealing_command, route_secret_command,
-    set_command_line,
+    existing_accounts_for_cli, keep_secrets_off_local_stores, keep_secrets_off_local_stores_for,
+    open_accounts_for_cli, open_store_for_command, refuse_fix_when_owned, release_command_database,
+    route_sealing_command, route_secret_command, set_command_line,
 };
 pub use client::{
     ROUTING_READ_ONLY_KEY, VirtualRouting, adopt_domain_names_direct, collect_orphaned_domains,

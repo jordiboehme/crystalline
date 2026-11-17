@@ -2327,6 +2327,44 @@ impl AuthStore {
         self.db.finish(result).await
     }
 
+    /// Whether disabling or removing `name` would pass now: the account
+    /// exists and, with `guarded`, the change leaves an enabled admin (the
+    /// `NOT_LAST_ADMIN` rule [`AuthStore::set_disabled`] and
+    /// [`AuthStore::remove_user`] apply). The error is the sentence the change
+    /// itself would give, with `verb` naming it. Writes nothing.
+    ///
+    /// A look ahead, for a caller that must do something it cannot take back
+    /// before the change (on Postgres `users disable` and `remove` delete the
+    /// sealed GitHub token first): the change itself still decides under its
+    /// own guard.
+    pub async fn check_change_of(&self, name: &str, verb: &str, guarded: bool) -> Result<()> {
+        let name = normalize_account_name(name)?;
+        let key = vec![Value::Text(name.clone())];
+        let guard = if guarded {
+            format!(" AND {NOT_LAST_ADMIN}")
+        } else {
+            String::new()
+        };
+        let passes = self
+            .db
+            .query_first(
+                &format!("SELECT 1 FROM users WHERE name = ?1{guard}"),
+                key.clone(),
+            )
+            .await?;
+        if passes.is_some() {
+            return Ok(());
+        }
+        let exists = self
+            .db
+            .query_first("SELECT 1 FROM users WHERE name = ?1", key)
+            .await?;
+        if exists.is_some() {
+            return Err(last_admin_error(verb, &name));
+        }
+        bail!("no such user: '{name}'")
+    }
+
     /// Delete an account and everything keyed on its name: its sessions, its
     /// MCP tokens, its private-domain memberships and its write list. Errors
     /// if there is no such account.
