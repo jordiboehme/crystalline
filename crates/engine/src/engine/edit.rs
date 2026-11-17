@@ -1083,7 +1083,15 @@ impl Engine {
         }
         let text = match p.operation.as_str() {
             "append" => append_body(source, self.require_content(p)?),
-            "prepend" => prepend_body(source, self.require_content(p)?),
+            "prepend" => {
+                let content = self.require_content(p)?;
+                if super::content_frontmatter::opens_with_frontmatter(content) {
+                    return Err(EngineError::Invalid(
+                        super::content_frontmatter::PREPEND_FRONTMATTER_REFUSAL.into(),
+                    ));
+                }
+                prepend_body(source, content)
+            }
             "find_replace" => {
                 let content = self.require_content(p)?;
                 let find = p.find_text.as_deref().ok_or_else(|| {

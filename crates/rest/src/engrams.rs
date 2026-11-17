@@ -932,11 +932,14 @@ pub async fn create(
     // started a folder next to a sibling with a close name says so, exactly as
     // the MCP write receipt does.
     let scope = identity.scope();
+    // The probe reads the body the write stored, so a frontmatter block the
+    // content opened with is not part of its text.
+    let merged = params.with_content_frontmatter_merged();
     let folders = crate::engine::Engine::close_folder_probe(&written);
     let ((), close) = tokio::join!(
         state
             .engine
-            .attach_similar(&mut written, SimilarProbe::for_write(&params), &scope),
+            .attach_similar(&mut written, SimilarProbe::for_write(&merged), &scope),
         state.engine.close_folders_for(folders.as_ref(), &scope),
     );
     crate::engine::Engine::attach_close_folders(&mut written, &close);

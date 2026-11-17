@@ -13,6 +13,7 @@ mod support;
 mod activity;
 mod attachments;
 mod change_bus;
+mod content_frontmatter;
 mod contradiction_tick;
 mod domain_names;
 mod embed_tick;

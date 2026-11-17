@@ -23,6 +23,37 @@ use crate::parse::{locate, parse_engram};
 /// merged text, or `None` when the two sides collide.
 pub type LineMerge<'f> = &'f dyn Fn(&str, &str, &str) -> Option<String>;
 
+/// The frontmatter keys an engram's schema knows: the ones the parser reads
+/// into typed fields, plus the lifecycle keys the tools write as plain
+/// frontmatter (`salience`, `sources`, `source_version`, `evolve_ack`). A
+/// key outside this list is still kept as a custom key; the list is what
+/// tells a block of engram frontmatter apart from markdown that only looks
+/// like YAML, such as `Note: remember this` between two rules.
+pub const RECOGNIZED_FRONTMATTER_KEYS: &[&str] = &[
+    "type",
+    "title",
+    "permalink",
+    "tags",
+    "status",
+    "description",
+    "resource",
+    "temporal_confidence",
+    "recorded_at",
+    "valid_from",
+    "valid_to",
+    "source_date",
+    "verified",
+    "last_verified",
+    "stale_after",
+    "review_after",
+    "timestamp",
+    "generated",
+    "salience",
+    "sources",
+    "source_version",
+    "evolve_ack",
+];
+
 /// A source cut at its frontmatter delimiters. The four parts concatenate
 /// back to the source byte for byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,6 +900,39 @@ mod tests {
         assert!(!same_content(broken, broken));
         assert!(same_content("just text\n", "just text\n"));
         assert!(!same_content("just text\n", flat));
+    }
+
+    /// Every key the parser reads into a typed field is a recognized key: a
+    /// key that lands outside `extra` is one the schema knows.
+    #[test]
+    fn every_key_the_parser_types_is_recognized() {
+        for key in [
+            "type",
+            "title",
+            "permalink",
+            "tags",
+            "status",
+            "description",
+            "resource",
+            "temporal_confidence",
+            "recorded_at",
+            "valid_from",
+            "valid_to",
+            "source_date",
+            "verified",
+            "last_verified",
+            "stale_after",
+            "review_after",
+            "timestamp",
+            "generated",
+        ] {
+            assert!(RECOGNIZED_FRONTMATTER_KEYS.contains(&key), "{key}");
+        }
+        // And nothing else is read into a typed field: an unlisted key lands
+        // in `extra` as a custom key.
+        let source = "---\nowner: x\n---\nbody\n";
+        let engram = parse_engram(source).unwrap();
+        assert!(engram.frontmatter.extra.contains_key("owner"));
     }
 
     #[test]
