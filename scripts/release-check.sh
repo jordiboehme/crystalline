@@ -102,6 +102,8 @@ repo_slug() {
 release_exists() {
   local tag="$1" repo err rc try
   local tries="${RELEASE_CHECK_TRIES:-6}" wait="${RELEASE_CHECK_WAIT:-30}"
+  case "$tries" in '' | *[!0-9]*) echo "RELEASE_CHECK_TRIES must be a whole number, not '$tries'" >&2; return 1 ;; esac
+  case "$wait" in '' | *[!0-9]*) echo "RELEASE_CHECK_WAIT must be a whole number, not '$wait'" >&2; return 1 ;; esac
   repo="$(repo_slug)" || return 1
   if ! command -v gh >/dev/null 2>&1; then
     echo "::error::gh is not installed, so the release for $tag cannot be looked up" >&2
