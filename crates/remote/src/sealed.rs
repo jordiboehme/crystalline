@@ -12,6 +12,7 @@ use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// The variable holding the key itself.
 pub const KEY_ENV: &str = "CRYSTALLINE_SECRET_KEY";
@@ -57,8 +58,9 @@ pub enum SealError {
     Failed,
 }
 
-/// The 32 byte key that seals and opens secrets. Never printed.
-#[derive(Clone)]
+/// The 32 byte key that seals and opens secrets. Never printed, wiped on
+/// drop, and not `Clone`: share it behind an `Arc`.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SealKey([u8; 32]);
 
 impl fmt::Debug for SealKey {
@@ -69,24 +71,37 @@ impl fmt::Debug for SealKey {
 
 impl SealKey {
     /// Reads the key from [`KEY_ENV`] or [`KEY_FILE_ENV`]. `Ok(None)` when
-    /// neither is set.
+    /// neither is set; a variable that is empty or only whitespace counts as
+    /// unset. Surrounding whitespace (such as a file's trailing newline) is
+    /// trimmed before the key is decoded. A value that is set but not valid
+    /// Unicode is refused as malformed.
     pub fn from_env() -> Result<Option<SealKey>, KeyError> {
-        Self::from_vars(
-            std::env::var(KEY_ENV).ok().as_deref(),
-            std::env::var(KEY_FILE_ENV).ok().as_deref(),
-        )
+        Self::from_vars(std::env::var_os(KEY_ENV), std::env::var_os(KEY_FILE_ENV))
     }
 
-    fn from_vars(plain: Option<&str>, file: Option<&str>) -> Result<Option<SealKey>, KeyError> {
-        let plain = plain.filter(|v| !v.trim().is_empty());
-        let file = file.filter(|v| !v.trim().is_empty());
+    fn from_vars(
+        plain: Option<std::ffi::OsString>,
+        file: Option<std::ffi::OsString>,
+    ) -> Result<Option<SealKey>, KeyError> {
+        let blank = |v: &std::ffi::OsString| v.to_str().is_some_and(|s| s.trim().is_empty());
+        let plain = plain.filter(|v| !blank(v));
+        let file = file.filter(|v| !blank(v));
         match (plain, file) {
             (Some(_), Some(_)) => Err(KeyError::BothSet),
-            (Some(text), None) => Self::parse(text, KEY_ENV).map(Some),
+            (Some(text), None) => {
+                let text = Zeroizing::new(
+                    text.into_string()
+                        .map_err(|_| KeyError::Malformed { var: KEY_ENV })?,
+                );
+                Self::parse(&text, KEY_ENV).map(Some)
+            }
             (None, Some(path)) => {
-                let text = std::fs::read_to_string(path)
-                    .map_err(|e| KeyError::Unreadable(e.kind().to_string()))?;
-                Self::parse(&text, KEY_FILE_ENV).map(Some)
+                let bytes = Zeroizing::new(
+                    std::fs::read(&path).map_err(|e| KeyError::Unreadable(e.kind().to_string()))?,
+                );
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| KeyError::Malformed { var: KEY_FILE_ENV })?;
+                Self::parse(text, KEY_FILE_ENV).map(Some)
             }
             (None, None) => Ok(None),
         }
@@ -95,18 +110,20 @@ impl SealKey {
     fn parse(text: &str, var: &'static str) -> Result<SealKey, KeyError> {
         let text = text.trim();
         let bad = || KeyError::Malformed { var };
-        let bytes = if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-            (0..32)
-                .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).map_err(|_| bad()))
-                .collect::<Result<Vec<u8>, _>>()?
-        } else if text.len() == 44 {
-            base64::engine::general_purpose::STANDARD
-                .decode(text)
-                .map_err(|_| bad())?
-        } else {
-            return Err(bad());
-        };
-        let key: [u8; 32] = bytes.try_into().map_err(|_| bad())?;
+        let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+            if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                (0..32)
+                    .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).map_err(|_| bad()))
+                    .collect::<Result<Vec<u8>, _>>()?
+            } else if text.len() == 44 {
+                base64::engine::general_purpose::STANDARD
+                    .decode(text)
+                    .map_err(|_| bad())?
+            } else {
+                return Err(bad());
+            },
+        );
+        let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| bad())?;
         Ok(SealKey(key))
     }
 
@@ -177,6 +194,10 @@ mod tests {
 
     const HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
+    fn zs(v: &str) -> std::ffi::OsString {
+        v.into()
+    }
+
     fn key() -> SealKey {
         SealKey::parse(HEX, KEY_ENV).unwrap()
     }
@@ -216,26 +237,48 @@ mod tests {
 
     #[test]
     fn short_or_malformed_key_refused_naming_variable() {
-        for bad in ["", "abcd", &HEX[..62], &format!("{HEX}00"), &"z".repeat(64)] {
-            if bad.is_empty() {
-                continue;
-            }
+        for bad in ["abcd", &HEX[..62], &format!("{HEX}00"), &"z".repeat(64)] {
             let err = SealKey::parse(bad, KEY_ENV).unwrap_err().to_string();
             assert!(err.contains("CRYSTALLINE_SECRET_KEY"), "{err}");
+            assert!(!err.contains(bad), "{err}");
         }
-        let err = SealKey::from_vars(Some("short"), None).unwrap_err();
+        let err = SealKey::from_vars(Some(zs("short")), None).unwrap_err();
+        assert!(!err.to_string().contains("short"));
         assert!(err.to_string().contains("CRYSTALLINE_SECRET_KEY"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("k");
         std::fs::write(&path, "short").unwrap();
-        let err = SealKey::from_vars(None, path.to_str()).unwrap_err();
+        let err = SealKey::from_vars(None, Some(path.clone().into_os_string())).unwrap_err();
         assert!(err.to_string().contains("CRYSTALLINE_SECRET_KEY_FILE"));
         assert!(SealKey::from_vars(None, None).unwrap().is_none());
     }
 
     #[test]
+    fn a_tampered_value_and_a_wrong_key_fail_to_open() {
+        let sealed = seal(&key(), "a", b"secret");
+        for at in [1 + 24, sealed.len() - 1] {
+            let mut bad = sealed.clone();
+            bad[at] ^= 1;
+            assert!(matches!(open(&key(), "a", &bad), Err(SealError::Failed)));
+        }
+        let other = SealKey::parse(&"11".repeat(32), KEY_ENV).unwrap();
+        assert!(matches!(open(&other, "a", &sealed), Err(SealError::Failed)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_value_is_malformed_not_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let err = SealKey::from_vars(Some(bad), None).unwrap_err();
+        assert!(matches!(err, KeyError::Malformed { var: KEY_ENV }));
+        let blank = SealKey::from_vars(Some(zs("  ")), Some("".into())).unwrap();
+        assert!(blank.is_none());
+    }
+
+    #[test]
     fn key_and_file_both_set_refused() {
-        let err = SealKey::from_vars(Some(HEX), Some("/x")).unwrap_err();
+        let err = SealKey::from_vars(Some(zs(HEX)), Some("/x".into())).unwrap_err();
         assert!(matches!(err, KeyError::BothSet));
         assert!(err.to_string().contains("CRYSTALLINE_SECRET_KEY_FILE"));
     }
@@ -251,7 +294,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("k");
         std::fs::write(&path, format!("{HEX}\n")).unwrap();
-        let c = SealKey::from_vars(None, path.to_str()).unwrap().unwrap();
+        let c = SealKey::from_vars(None, Some(path.clone().into_os_string()))
+            .unwrap()
+            .unwrap();
         assert_eq!(a.0, c.0);
     }
 
