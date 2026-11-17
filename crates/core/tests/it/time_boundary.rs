@@ -1,9 +1,10 @@
 //! Only crystalline-core may name a date library: every other crate goes
 //! through `crystalline_core::time`.
 //!
-//! The test scans every crate but core (`Cargo.toml`, `src/**/*.rs` and
-//! `tests/**/*.rs`) for `chrono` and `jiff` as a whole word. A file that
-//! names jiff fails. A file that names chrono fails unless it is on
+//! The test scans every crate but core (`Cargo.toml`, `build.rs` and the
+//! `.rs` files under `src`, `tests`, `benches` and `examples`) for `chrono`
+//! and `jiff` as a whole word. A file that names jiff fails. A file that
+//! names chrono fails unless it is on
 //! `crates/core/tests/time_boundary_allow.txt`, the files that still used
 //! chrono when the module arrived; a listed file that no longer names
 //! chrono fails too, so the list shrinks as each crate moves over.
@@ -42,11 +43,13 @@ fn scanned_files(root: &Path) -> Vec<String> {
         if !dir.is_dir() || dir.file_name().is_some_and(|n| n == "core") {
             continue;
         }
-        let manifest = dir.join("Cargo.toml");
-        if manifest.is_file() {
-            files.push(manifest);
+        for top in ["Cargo.toml", "build.rs"] {
+            let file = dir.join(top);
+            if file.is_file() {
+                files.push(file);
+            }
         }
-        for sub in ["src", "tests"] {
+        for sub in ["src", "tests", "benches", "examples"] {
             for file in WalkDir::new(dir.join(sub)).into_iter().flatten() {
                 let path = file.path();
                 if file.file_type().is_file() && path.extension().is_some_and(|e| e == "rs") {

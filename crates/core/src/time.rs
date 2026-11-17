@@ -458,6 +458,12 @@ mod tests {
         let zone = FixedOffset::west_opt(4 * 3600 + 30 * 60).unwrap();
         let written = OffsetStamp::from_chrono(chrono_utc(BASE_SECS, 0).with_timezone(&zone));
         assert_eq!(written.rfc3339(), "2026-01-05T05:47:19-04:30");
+        let reference = chrono_utc(BASE_SECS, 123_450_000);
+        let plus_two = FixedOffset::east_opt(2 * 3600).unwrap();
+        let written = OffsetStamp::from_chrono(reference.with_timezone(&plus_two));
+        assert_eq!(written.rfc3339(), "2026-01-05T12:17:19.123450+02:00");
+        let written = OffsetStamp::from_chrono(reference.with_timezone(&zone));
+        assert_eq!(written.rfc3339(), "2026-01-05T05:47:19.123450-04:30");
     }
 
     #[test]
@@ -571,6 +577,12 @@ mod tests {
         as_text.reverse();
         as_text.sort();
         assert_eq!(as_text, in_order);
+        let offset_in_order: Vec<String> =
+            stamps.iter().map(|s| s.to_offset_utc().rfc3339()).collect();
+        let mut offset_as_text = offset_in_order.clone();
+        offset_as_text.reverse();
+        offset_as_text.sort();
+        assert_eq!(offset_as_text, offset_in_order);
     }
 
     #[test]
@@ -661,7 +673,11 @@ mod tests {
             "2026-01-05T00:00:00+00:00"
         );
         assert!(day < later);
-        assert_eq!(now().day_utc(), today_utc());
+        // Two clock reads may straddle UTC midnight, so today may be one day
+        // after the first read's date, never anything else.
+        let before = now().day_utc();
+        let today = today_utc();
+        assert!(today == before || Some(today) == before.checked_add_days(1));
     }
 
     #[test]
