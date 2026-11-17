@@ -623,6 +623,13 @@ fn known_difference_needs_the_exact_ruled_result() {
 
 #[test]
 fn helpers_agree_with_chrono_on_mutated_inputs() {
+    // Stages 1 and 2: chrono is behind the module, so no difference is
+    // allowed. Task 3.1 drops this assert when it fills KNOWN_DIFFERENCES
+    // with the named rulings.
+    assert!(
+        KNOWN_DIFFERENCES.is_empty(),
+        "chrono is behind crystalline_core::time, so no difference is allowed"
+    );
     let started = Instant::now();
     let mut rng = Rng(0x5eed_2026_0105_1017);
     let names: Vec<&str> = compare("", true)
