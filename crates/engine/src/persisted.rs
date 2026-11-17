@@ -24,6 +24,11 @@ pub const CONFIG_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// the document.
 const DATABASE_KEY: &str = "database";
 
+/// The key of the list that keeps the domains' order in a stored document.
+/// JSONB and a plain JSON map both reorder object keys, so the order of
+/// `domains` travels beside it as a list of names.
+const DOMAIN_ORDER_KEY: &str = "domain_order";
+
 /// The store of the configuration document: one JSON body, replaced whole.
 pub trait ConfigDocument: Send + Sync {
     /// The stored document, `None` when there is none yet.
@@ -89,11 +94,18 @@ impl PersistedConfig {
 }
 
 /// The JSON body a document save stores for `cfg`: the whole configuration
-/// without its `database` block, which is never persisted.
+/// without its `database` block, which is never persisted, plus the order of
+/// its domains as a list of names (see [`config_from_document`]).
 pub fn document_body(cfg: &GlobalConfig) -> Result<serde_json::Value> {
     let mut body = serde_json::to_value(cfg)
         .map_err(|e| EngineError::Internal(format!("failed to encode the configuration: {e}")))?;
     strip_database(&mut body);
+    if let Some(map) = body.as_object_mut()
+        && !cfg.domains.is_empty()
+    {
+        let order = cfg.domains.keys().cloned().map(serde_json::Value::String);
+        map.insert(DOMAIN_ORDER_KEY.to_string(), order.collect());
+    }
     Ok(body)
 }
 
@@ -105,7 +117,9 @@ pub fn strip_database(doc: &mut serde_json::Value) -> bool {
 
 /// Read a stored document body as a configuration. A `database` key found in
 /// it is dropped with a warning (the bootstrap block comes from the file and
-/// the environment only); the flag says whether one was dropped.
+/// the environment only); the flag says whether one was dropped. The domains
+/// come back in the order the document's order list names them; a domain the
+/// list does not name follows in the order the body gives.
 pub fn config_from_document(mut body: serde_json::Value) -> Result<(GlobalConfig, bool)> {
     let dropped = strip_database(&mut body);
     if dropped {
@@ -113,9 +127,22 @@ pub fn config_from_document(mut body: serde_json::Value) -> Result<(GlobalConfig
             "the stored configuration document has a 'database' block; it is ignored, the database settings come from config.yaml and the environment"
         );
     }
-    let cfg = serde_json::from_value(body).map_err(|e| {
+    let order = body
+        .as_object_mut()
+        .and_then(|map| map.remove(DOMAIN_ORDER_KEY));
+    let mut cfg: GlobalConfig = serde_json::from_value(body).map_err(|e| {
         EngineError::Internal(format!("the stored configuration document is invalid: {e}"))
     })?;
+    if let Some(serde_json::Value::Array(names)) = order {
+        let mut ordered = indexmap::IndexMap::with_capacity(cfg.domains.len());
+        for name in names.iter().filter_map(serde_json::Value::as_str) {
+            if let Some(entry) = cfg.domains.shift_remove(name) {
+                ordered.insert(name.to_string(), entry);
+            }
+        }
+        ordered.extend(std::mem::take(&mut cfg.domains));
+        cfg.domains = ordered;
+    }
     Ok((cfg, dropped))
 }
 
@@ -124,31 +151,38 @@ pub fn config_from_document(mut body: serde_json::Value) -> Result<(GlobalConfig
 /// where a document entry replaces the whole base entry (keeping the base
 /// entry's position; document-only domains follow). The `database` block is
 /// the base's: a document has none.
-pub fn merge(base: &GlobalConfig, doc: &GlobalConfig) -> GlobalConfig {
-    let mut merged: GlobalConfig = match (settings_value(base), settings_value(doc)) {
-        (serde_json::Value::Object(mut b), serde_json::Value::Object(d)) => {
-            merge_maps(&mut b, d);
-            serde_json::from_value(serde_json::Value::Object(b))
-                .expect("two valid configurations merge into a valid one")
-        }
-        _ => unreachable!("a configuration serializes to an object"),
-    };
+pub fn merge(base: &GlobalConfig, doc: &GlobalConfig) -> Result<GlobalConfig> {
+    let mut into = settings_map(base)?;
+    merge_maps(&mut into, settings_map(doc)?);
+    let mut merged: GlobalConfig = serde_json::from_value(serde_json::Value::Object(into))
+        .map_err(|e| {
+            EngineError::Internal(format!(
+                "the configuration document does not merge with config.yaml: {e}"
+            ))
+        })?;
     merged.domains = base.domains.clone();
     for (name, entry) in &doc.domains {
         merged.domains.insert(name.clone(), entry.clone());
     }
     merged.database = base.database.clone();
-    merged
+    Ok(merged)
 }
 
 /// `cfg` as a JSON object without the keys `merge` handles itself.
-fn settings_value(cfg: &GlobalConfig) -> serde_json::Value {
-    let mut v = serde_json::to_value(cfg).expect("a configuration serializes");
-    if let Some(map) = v.as_object_mut() {
-        map.remove("domains");
-        map.remove(DATABASE_KEY);
+fn settings_map(cfg: &GlobalConfig) -> Result<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::to_value(cfg) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.remove("domains");
+            map.remove(DATABASE_KEY);
+            Ok(map)
+        }
+        Ok(other) => Err(EngineError::Internal(format!(
+            "a configuration encoded as {other} instead of an object"
+        ))),
+        Err(e) => Err(EngineError::Internal(format!(
+            "failed to encode the configuration: {e}"
+        ))),
     }
-    v
 }
 
 /// Fold `over` into `into`: objects merge key by key, anything else replaces.
@@ -211,34 +245,66 @@ impl ConfigDocument for crystalline_index::postgres::SideChannel {
     }
 }
 
+/// An in-memory [`ConfigDocument`] for tests: it keeps the stored body, can
+/// be told to fail the next save, and can store a save and still answer an
+/// error, which is what a commit with a lost answer looks like.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+pub struct MemoryDocument {
+    /// The stored body, `None` before the first save.
+    pub body: std::sync::Mutex<Option<serde_json::Value>>,
+    /// An error the next save answers without storing anything.
+    pub fail: std::sync::Mutex<Option<EngineError>>,
+    /// An error the next save answers after it stored the body.
+    pub fail_after_store: std::sync::Mutex<Option<EngineError>>,
+    /// An error the next load answers.
+    pub fail_load: std::sync::Mutex<Option<EngineError>>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl MemoryDocument {
+    /// A store holding `body`.
+    pub fn holding(body: serde_json::Value) -> MemoryDocument {
+        MemoryDocument {
+            body: std::sync::Mutex::new(Some(body)),
+            ..Default::default()
+        }
+    }
+
+    /// The stored body, `None` before the first save.
+    pub fn stored(&self) -> Option<serde_json::Value> {
+        self.body.lock().unwrap().clone()
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl ConfigDocument for MemoryDocument {
+    fn load(&self) -> Result<Option<serde_json::Value>> {
+        if let Some(e) = self.fail_load.lock().unwrap().take() {
+            return Err(e);
+        }
+        Ok(self.stored())
+    }
+    fn save(&self, body: &serde_json::Value, _by: &str) -> Result<()> {
+        if let Some(e) = self.fail.lock().unwrap().take() {
+            return Err(e);
+        }
+        *self.body.lock().unwrap() = Some(body.clone());
+        match self.fail_after_store.lock().unwrap().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use crystalline_core::config::{DatabaseConfig, DomainEntry, SearchConfig, ServiceConfig};
 
     use super::*;
     use crate::overlay::EnvOverlay;
 
-    /// An in-memory document store that can be told to fail.
-    #[derive(Default)]
-    struct MemDoc {
-        body: Mutex<Option<serde_json::Value>>,
-        fail: Mutex<Option<EngineError>>,
-    }
-
-    impl ConfigDocument for MemDoc {
-        fn load(&self) -> Result<Option<serde_json::Value>> {
-            Ok(self.body.lock().unwrap().clone())
-        }
-        fn save(&self, body: &serde_json::Value, _by: &str) -> Result<()> {
-            if let Some(e) = self.fail.lock().unwrap().take() {
-                return Err(e);
-            }
-            *self.body.lock().unwrap() = Some(body.clone());
-            Ok(())
-        }
-    }
+    type MemDoc = MemoryDocument;
 
     fn domain(path: &str) -> DomainEntry {
         DomainEntry {
@@ -273,7 +339,7 @@ mod tests {
             "0.3".to_string(),
         )])
         .unwrap();
-        let effective = env.apply(&merge(&base, &doc));
+        let effective = env.apply(&merge(&base, &doc).unwrap());
         let s = effective.search.unwrap();
         // The environment beats the document, which beats the base.
         assert_eq!(s.salience_weight, Some(0.3));
@@ -283,7 +349,7 @@ mod tests {
         // Defaults: a key nobody sets stays absent. Flags are not part of the
         // configuration; they are applied on top by the engine.
         assert!(effective.embeddings.is_none());
-        let doc_only = merge(&base, &doc);
+        let doc_only = merge(&base, &doc).unwrap();
         assert_eq!(doc_only.search.unwrap().salience_weight, Some(0.2));
     }
 
@@ -292,16 +358,25 @@ mod tests {
         let mut base = GlobalConfig::default();
         let mut entry = domain("/base/a");
         entry.provision = Some(true);
+        // A nested map in the base entry must not merge into the document's.
+        entry.origin = Some(crystalline_core::config::OriginConfig {
+            repo: "acme/a".into(),
+            path: Some("docs".into()),
+            branch: Some("main".into()),
+            poll_secs: None,
+        });
         base.domains.insert("a".into(), entry);
         base.domains.insert("b".into(), domain("/base/b"));
         let mut doc = GlobalConfig::default();
         doc.domains.insert("a".into(), domain("/doc/a"));
         doc.domains.insert("c".into(), domain("/doc/c"));
-        let m = merge(&base, &doc);
+        let m = merge(&base, &doc).unwrap();
         let names: Vec<_> = m.domains.keys().cloned().collect();
         assert_eq!(names, ["a", "b", "c"]);
-        // The base's `provision` did not leak into the replacing entry.
+        // The base's `provision` and `origin` did not leak into the replacing
+        // entry.
         assert_eq!(m.domains["a"], domain("/doc/a"));
+        assert!(m.domains["a"].origin.is_none());
         assert_eq!(m.domains["b"], domain("/base/b"));
     }
 
@@ -324,7 +399,7 @@ mod tests {
             domains_root: Some(PathBuf::from("/doc")),
             ..Default::default()
         };
-        let m = merge(&base, &doc);
+        let m = merge(&base, &doc).unwrap();
         let svc = m.service.unwrap();
         assert_eq!(svc.allowed_hosts, Some(vec!["c".to_string()]));
         // Maps merge: the base's scalar the document does not name stays.
@@ -372,7 +447,7 @@ mod tests {
         assert!(stored.get("database").is_none(), "{stored}");
         assert_eq!(stored["domains_root"], "/d");
         // Nor does the merge take one from a document.
-        let m = merge(&GlobalConfig::default(), &cfg);
+        let m = merge(&GlobalConfig::default(), &cfg).unwrap();
         assert!(m.database.is_none());
     }
 
@@ -449,6 +524,33 @@ mod tests {
         *mem.fail.lock().unwrap() = Some(EngineError::ConfigMaybeStored("maybe".into()));
         let err = persisted.save(&next, "test").unwrap_err();
         assert!(matches!(err, EngineError::ConfigMaybeStored(_)));
+    }
+
+    #[test]
+    fn a_document_round_trip_keeps_the_domain_order() {
+        // Neither alphabetical nor by length, so neither a sorted map nor
+        // JSONB's shorter-keys-first order can keep it by accident.
+        let names = ["zeta", "a", "middle", "bb", "ccc-long-name", "b"];
+        let mut cfg = GlobalConfig::default();
+        for name in names {
+            cfg.domains.insert(name.into(), domain(&format!("/{name}")));
+        }
+        let body = document_body(&cfg).unwrap();
+        // Through a string, as the database hands it back, with keys reordered
+        // the way a sorted map orders them.
+        let text = serde_json::to_string(&body).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let (read, _) = config_from_document(back).unwrap();
+        let order: Vec<_> = read.domains.keys().map(String::as_str).collect();
+        assert_eq!(order, names);
+        assert_eq!(read, cfg);
+        // A domain the list misses still comes back, after the listed ones.
+        let mut body = document_body(&cfg).unwrap();
+        body["domain_order"] = serde_json::json!(["b", "zeta"]);
+        let (read, _) = config_from_document(body).unwrap();
+        let order: Vec<_> = read.domains.keys().take(2).map(String::as_str).collect();
+        assert_eq!(order, ["b", "zeta"]);
+        assert_eq!(read.domains.len(), names.len());
     }
 
     #[cfg(feature = "postgres")]

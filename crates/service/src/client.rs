@@ -2846,6 +2846,9 @@ pub async fn virtual_routing_bullets(
         file: config.clone(),
         effective: config.clone(),
         overlay: overlay::EnvOverlay::default(),
+        mode: overlay::config_mode(config),
+        base: None,
+        document: None,
     };
     // No rename recovery here: this read-only render takes no ownership of
     // the state directory, so a rename left half done waits for the next

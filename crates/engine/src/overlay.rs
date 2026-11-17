@@ -1045,25 +1045,112 @@ fn env_var_for(key: &str) -> String {
         .unwrap_or_else(|| format!("CRYSTALLINE_{}", key.replace('.', "_").to_uppercase()))
 }
 
+/// Where the persisted configuration lives, decided by [`load`] from the
+/// bootstrap `database` block without reading any database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigMode {
+    /// The whole configuration is `config.yaml`, as it always was.
+    File,
+    /// The configuration is a document in Postgres on top of `config.yaml`,
+    /// which becomes a read-only base. The document is fetched by whoever
+    /// needs it and handed over with [`LoadedConfig::attach_document`].
+    Document,
+}
+
 /// A config resolved through the single load chokepoint: the file truth, the
 /// effective config (file plus overlay) and the overlay itself, plus the
 /// resolved file path persistence writes back to.
+///
+/// In [`ConfigMode::Document`] the layers move once a document is attached:
+/// `file` becomes the document (what persistence writes), `base` holds the
+/// parsed `config.yaml` and `effective` is the overlay applied to the two
+/// merged. Until then the struct reads as it does in file mode.
 pub struct LoadedConfig {
     /// The resolved config file path: the `--config` flag, else
     /// [`CONFIG_PATH_ENV`], else the default global path. Every persist writes
-    /// here.
+    /// here in file mode; in document mode it is the read-only base.
     pub path: PathBuf,
-    /// The file truth, a missing file reading as the default config. This is
+    /// The persisted truth, a missing file reading as the default config: the
+    /// file in file mode, the attached document in document mode. This is
     /// what persistence writes and never carries an env value.
     pub file: GlobalConfig,
-    /// The effective config, `overlay.apply(&file)`. Every runtime read uses
-    /// this.
+    /// The effective config, `overlay.apply(&file)`, with the base merged in
+    /// underneath in document mode. Every runtime read uses this.
     pub effective: GlobalConfig,
     /// The parsed environment overlay.
     pub overlay: EnvOverlay,
+    /// Where the configuration lives.
+    pub mode: ConfigMode,
+    /// The parsed `config.yaml` under an attached document; `None` in file
+    /// mode and before a document is attached.
+    pub base: Option<GlobalConfig>,
+    /// The attached document store; `None` in file mode and before a
+    /// document is attached.
+    pub document: Option<std::sync::Arc<dyn crate::persisted::ConfigDocument>>,
 }
 
 impl LoadedConfig {
+    /// Take over the configuration document `body` (`None` when none is
+    /// stored yet) read from `doc`: the file read at load becomes the
+    /// read-only base, the document becomes the persisted truth and the
+    /// effective config is recomputed over both. A body that does not read
+    /// as a configuration is an error, never an empty document, so a later
+    /// save cannot overwrite what is stored. In file mode this is an error.
+    pub fn attach_document(
+        &mut self,
+        doc: std::sync::Arc<dyn crate::persisted::ConfigDocument>,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        if self.mode != ConfigMode::Document {
+            anyhow::bail!("the configuration is kept in config.yaml, not in the database");
+        }
+        let document = match body {
+            Some(body) => crate::persisted::config_from_document(body)?.0,
+            None => GlobalConfig::default(),
+        };
+        // A second attach replaces the document and keeps the base it had.
+        let base = match self.base.take() {
+            Some(base) => base,
+            None => std::mem::take(&mut self.file),
+        };
+        self.effective = self
+            .overlay
+            .apply(&crate::persisted::merge(&base, &document)?);
+        self.file = document;
+        self.base = Some(base);
+        self.document = Some(doc);
+        Ok(())
+    }
+
+    /// Where a write of [`LoadedConfig::file`] goes: the config file in file
+    /// mode, the attached document in document mode. Document mode without
+    /// an attached document is refused, so nothing is written into the
+    /// read-only base by mistake.
+    pub fn persisted(&self) -> anyhow::Result<crate::persisted::PersistedConfig> {
+        use crate::persisted::PersistedConfig;
+        match (self.mode, &self.document) {
+            (ConfigMode::File, _) => Ok(PersistedConfig::File(self.path.clone())),
+            (ConfigMode::Document, Some(doc)) => Ok(PersistedConfig::Document {
+                doc: doc.clone(),
+                base: self.path.is_file().then(|| self.path.clone()),
+            }),
+            (ConfigMode::Document, None) => anyhow::bail!(
+                "the configuration is kept in the database and was not read yet, so it cannot be changed here"
+            ),
+        }
+    }
+
+    /// The registrations and settings the persisted layers give together,
+    /// without the environment: the file in file mode, the base with the
+    /// document merged on top in document mode. What a registration checks a
+    /// new name against.
+    pub fn persisted_view(&self) -> anyhow::Result<std::borrow::Cow<'_, GlobalConfig>> {
+        Ok(match &self.base {
+            Some(base) => std::borrow::Cow::Owned(crate::persisted::merge(base, &self.file)?),
+            None => std::borrow::Cow::Borrowed(&self.file),
+        })
+    }
+
     /// The name table this configuration alone gives, for a command that
     /// opens no index: over the effective configuration, environment domains
     /// included, each file domain's canonical name read off its MANIFEST and
@@ -1082,6 +1169,11 @@ impl LoadedConfig {
 /// file (a missing file reading as the default) and layer the overlay on top.
 /// An overlay parse error is returned as-is, so a caller that fails fast aborts
 /// with the variable-naming message.
+///
+/// The [`ConfigMode`] is decided here from the effective `database` block:
+/// Postgres keeps the configuration in a document. Nothing is read from the
+/// database here; a caller that needs the document attaches it with
+/// [`LoadedConfig::attach_document`].
 pub fn load(flag: Option<&Path>) -> anyhow::Result<LoadedConfig> {
     let overlay = EnvOverlay::from_process_env()?;
     let path = resolve_config_path(flag, overlay.config_path())?;
@@ -1095,12 +1187,24 @@ pub fn load(flag: Option<&Path>) -> anyhow::Result<LoadedConfig> {
         tracing::warn!("{warning}");
     }
     let effective = overlay.apply(&file);
+    let mode = config_mode(&effective);
     Ok(LoadedConfig {
         path,
         file,
         effective,
         overlay,
+        mode,
+        base: None,
+        document: None,
     })
+}
+
+/// The mode an effective configuration's `database` block selects.
+pub fn config_mode(effective: &GlobalConfig) -> ConfigMode {
+    match effective.database().backend {
+        config::DatabaseBackend::Postgres => ConfigMode::Document,
+        config::DatabaseBackend::Turso => ConfigMode::File,
+    }
 }
 
 /// Resolve the config file path by precedence: the `--config` flag, then
@@ -1136,6 +1240,76 @@ pub fn load_file(path: &Path) -> anyhow::Result<GlobalConfig> {
 mod tests {
     use super::*;
     use crystalline_core::config::{DatabaseBackend, ShareIdentityMode};
+
+    /// A Postgres configuration decides document mode and nothing connects:
+    /// the URL points at an address that never answers, and the load still
+    /// returns at once, with no document attached.
+    #[test]
+    fn load_never_touches_postgres() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "database:\n  backend: postgres\n  url: postgres://u:p@10.255.255.1:5432/db?connect_timeout=30\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let loaded = load(Some(&path)).unwrap();
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_millis(100), "{took:?}");
+        assert_eq!(loaded.mode, ConfigMode::Document);
+        assert!(loaded.document.is_none() && loaded.base.is_none());
+        assert!(loaded.persisted().is_err());
+        // A Turso configuration stays in file mode.
+        std::fs::write(&path, "domains: {}\n").unwrap();
+        assert_eq!(load(Some(&path)).unwrap().mode, ConfigMode::File);
+    }
+
+    /// Attaching a document moves the file to the base and recomputes the
+    /// effective configuration over both; a body that does not read as a
+    /// configuration is an error and attaches nothing.
+    #[test]
+    fn attach_document_merges_and_refuses_an_invalid_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "database:\n  backend: postgres\n  url: postgres://h/db\ndomains:\n  base-one:\n    kind: virtual\n",
+        )
+        .unwrap();
+        let mut loaded = load(Some(&path)).unwrap();
+        let doc = std::sync::Arc::new(crate::persisted::MemoryDocument::default());
+        let err = loaded
+            .attach_document(doc.clone(), Some(serde_json::json!({ "domains": 7 })))
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid"), "{err}");
+        assert!(loaded.document.is_none());
+        loaded
+            .attach_document(
+                doc,
+                Some(serde_json::json!({ "domains": { "doc-one": { "kind": "virtual" } } })),
+            )
+            .unwrap();
+        let names: Vec<_> = loaded.effective.domains.keys().cloned().collect();
+        assert_eq!(names, ["base-one", "doc-one"]);
+        assert_eq!(loaded.file.domains.len(), 1);
+        assert!(
+            loaded
+                .base
+                .as_ref()
+                .unwrap()
+                .domains
+                .contains_key("base-one")
+        );
+        assert!(
+            loaded.effective.database.is_some(),
+            "the base keeps the database block"
+        );
+        assert!(matches!(
+            loaded.persisted().unwrap(),
+            crate::persisted::PersistedConfig::Document { base: Some(_), .. }
+        ));
+    }
 
     fn overlay(pairs: &[(&str, &str)]) -> Result<EnvOverlay, OverlayError> {
         EnvOverlay::from_vars(

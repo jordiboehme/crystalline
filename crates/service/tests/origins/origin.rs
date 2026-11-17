@@ -7514,6 +7514,9 @@ async fn standalone_on_postgres(
         file: cfg.clone(),
         effective: cfg,
         overlay: EnvOverlay::default(),
+        mode: crystalline_service::overlay::ConfigMode::File,
+        base: None,
+        document: None,
     };
     let engine =
         crystalline_service::engine::open_standalone(loaded, &tmp.join("unused.db"), false)
