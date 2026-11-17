@@ -1394,7 +1394,9 @@ mod tests {
         let times = [
             UNIX_EPOCH + Duration::new(1_767_608_239, 120_000_000),
             UNIX_EPOCH,
-            UNIX_EPOCH - Duration::new(0, 1),
+            // 100 ns: Windows keeps SystemTime in 100 ns ticks, so 1 ns
+            // before the epoch would round to the epoch itself there.
+            UNIX_EPOCH - Duration::new(0, 100),
             UNIX_EPOCH - Duration::new(86_400, 0),
             UNIX_EPOCH - Duration::new(1, 500_000_000),
         ];
@@ -1405,10 +1407,10 @@ mod tests {
                 "{time:?}"
             );
         }
-        let one_before = Stamp::from_system_time(UNIX_EPOCH - Duration::new(0, 1)).unwrap();
+        let one_before = Stamp::from_system_time(UNIX_EPOCH - Duration::new(0, 100)).unwrap();
         assert_eq!(
             (one_before.unix_seconds(), one_before.subsec_nanos()),
-            (-1, 999_999_999)
+            (-1, 999_999_900)
         );
 
         for micros in [0, 1, -1, 1_767_608_239_120_001, -1_500_001] {
