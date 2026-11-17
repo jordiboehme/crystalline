@@ -10,6 +10,19 @@ pub fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
+/// A hook payload recorded from a real harness run, from this crate's
+/// `tests/fixtures/hooks`, parsed so a test can patch the fields it needs
+/// (a real transcript path, a session id, an `agent_id`).
+pub fn hook_fixture(name: &str) -> serde_json::Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hooks")
+        .join(name);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("no hook fixture at {}: {e}", path.display()));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("hook fixture {} is not JSON: {e}", path.display()))
+}
+
 /// The base-directory variables that redirect every child this crate can
 /// spawn into an isolated `home`, so its accounts, config, index and state
 /// never land in the developer's own directories - plus one credential

@@ -975,3 +975,137 @@ fn session_start_names_a_reflection_with_recorded_open_items() {
         "an explicit --config is not this machine's registry"
     );
 }
+
+/// The recorded SessionStart payload, with an `agent_id` spliced in when
+/// given and the `source` set.
+fn session_start(source: &str, agent_id: Option<serde_json::Value>) -> String {
+    let mut payload = crate::common::hook_fixture("main-SessionStart.json");
+    payload["source"] = serde_json::json!(source);
+    if let Some(id) = agent_id {
+        payload["agent_id"] = id;
+    }
+    payload.to_string()
+}
+
+/// Run `prompt system` in the prompt fixture under `home`, returning the
+/// whole output.
+fn prompt_system_output(
+    home: &std::path::Path,
+    extra: &[&str],
+    stdin: &str,
+) -> std::process::Output {
+    let mut cmd = crystalline();
+    isolate(&mut cmd, home);
+    let mut args = vec![
+        "prompt",
+        "system",
+        "--workspace",
+        "workspace",
+        "--config",
+        "config.yaml",
+        "--harness",
+        "claude-code",
+    ];
+    args.extend_from_slice(extra);
+    cmd.current_dir(fixtures_dir().join("prompt-fixture"))
+        .args(&args)
+        .write_stdin(stdin.to_string())
+        .output()
+        .unwrap()
+}
+
+/// A session start from inside a subagent prints nothing in any format, and
+/// exits 0; the same start without the id prints the routing block.
+#[test]
+fn prompt_system_is_silent_inside_a_subagent_in_every_format() {
+    let home = tempfile::tempdir().unwrap();
+    for format in ["text", "json", "copilot", "cursor", "hook-specific"] {
+        for (case, id) in [
+            ("agent_id", Some(serde_json::json!("a0000000000000003"))),
+            ("a number", Some(serde_json::json!(7))),
+        ] {
+            let out = prompt_system_output(
+                home.path(),
+                &["--format", format],
+                &session_start("startup", id),
+            );
+            assert!(out.status.success(), "{format} {case}: {out:?}");
+            assert!(
+                out.stdout.is_empty(),
+                "{format} {case}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        let mut camel = crate::common::hook_fixture("main-SessionStart.json");
+        camel["agentId"] = serde_json::json!("a0000000000000003");
+        let out = prompt_system_output(home.path(), &["--format", format], &camel.to_string());
+        assert!(out.status.success(), "{format} agentId: {out:?}");
+        assert!(out.stdout.is_empty(), "{format} agentId");
+
+        let out = prompt_system_output(
+            home.path(),
+            &["--format", format],
+            &session_start("startup", None),
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("astronomy"),
+            "{format}: the main session gets the routing block"
+        );
+
+        // `claude --agent <name>`: `agent_type` and no id is the main session.
+        let agent_flag = crate::common::hook_fixture("agent-flag-SessionStart.json");
+        let out = prompt_system_output(home.path(), &["--format", format], &agent_flag.to_string());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("astronomy"),
+            "{format}: a main session started with --agent gets the routing block"
+        );
+    }
+}
+
+/// A compaction inside a subagent leaves the parent's recall list alone: a
+/// harness that shares the parent's session id would otherwise empty it.
+/// The same compaction from the main session empties it.
+#[test]
+fn a_compaction_inside_a_subagent_keeps_the_parents_recall_list() {
+    let home = tempfile::tempdir().unwrap();
+    let session = crate::common::hook_fixture("main-SessionStart.json")["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let state = isolated_state_dir(home.path())
+        .join("hooks")
+        .join(format!("{session}.json"));
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::fs::write(
+        &state,
+        serde_json::json!({
+            "v": 1,
+            "stops": 1,
+            "nudged": false,
+            "updated_at": "2026-11-17T00:00:00Z",
+            "recalled": ["crystalline://astronomy/stars"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recalled = || {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        v["recalled"].clone()
+    };
+
+    let out = prompt_system_output(
+        home.path(),
+        &[],
+        &session_start("compact", Some(serde_json::json!("a0000000000000003"))),
+    );
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        recalled(),
+        serde_json::json!(["crystalline://astronomy/stars"])
+    );
+
+    let out = prompt_system_output(home.path(), &[], &session_start("compact", None));
+    assert!(out.status.success());
+    assert_eq!(recalled(), serde_json::json!([]));
+}
