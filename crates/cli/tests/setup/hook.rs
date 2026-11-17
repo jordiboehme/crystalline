@@ -1828,6 +1828,15 @@ fn the_prompt_hook_names_an_engram_once_per_session_and_again_after_a_compaction
         "a subagent leaves the parent's recalled list as it was"
     );
 
+    // `claude --agent <name>`: the recorded main-session prompt carries
+    // `agent_type` and no id, and recalls like any main session.
+    let mut agent_flag = crate::common::hook_fixture("agent-flag-UserPromptSubmit.json");
+    agent_flag["session_id"] = json!("session-agent-flag");
+    agent_flag["prompt"] = json!(PLAIN_PROMPT);
+    let (out, _) = env.hook_prompt_raw(&agent_flag.to_string());
+    let block = expect_block(&out, "a main session started with --agent");
+    assert!(block.contains(VENT_ADDRESS), "{block:?}");
+
     // A background subagent's task notification, as recorded, in a session
     // that has already been shown something: no search, and the list stays
     // as it was.

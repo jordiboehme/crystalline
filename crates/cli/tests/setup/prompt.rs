@@ -1051,6 +1051,14 @@ fn prompt_system_is_silent_inside_a_subagent_in_every_format() {
             String::from_utf8_lossy(&out.stdout).contains("astronomy"),
             "{format}: the main session gets the routing block"
         );
+
+        // `claude --agent <name>`: `agent_type` and no id is the main session.
+        let agent_flag = crate::common::hook_fixture("agent-flag-SessionStart.json");
+        let out = prompt_system_output(home.path(), &["--format", format], &agent_flag.to_string());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("astronomy"),
+            "{format}: a main session started with --agent gets the routing block"
+        );
     }
 }
 

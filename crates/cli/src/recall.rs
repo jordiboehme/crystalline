@@ -480,6 +480,12 @@ mod tests {
             gate_prompt("how does the vent driver retry"),
             Some("how does the vent driver retry".to_string())
         );
+        // Only a prompt that opens with the tag is a notification: a person
+        // asking about one still searches.
+        assert_eq!(
+            gate_prompt("why does the <task-notification> block show up in my session"),
+            Some("why does the <task-notification> block show up in my session".to_string())
+        );
         // Trimmed, not merely accepted.
         assert_eq!(
             gate_prompt("  how does the vent driver retry \n"),
@@ -500,6 +506,20 @@ mod tests {
             input.agent_id_camel.as_ref()
         ));
         assert_eq!(gate_prompt(&input.prompt), None, "{:?}", input.prompt);
+    }
+
+    /// `claude --agent <name>` starts a main session whose prompts carry
+    /// `agent_type` and no id: recall keeps working there.
+    #[test]
+    fn an_agent_type_alone_is_the_main_session() {
+        let input: PromptInput = serde_json::from_str(include_str!(
+            "../tests/fixtures/hooks/agent-flag-UserPromptSubmit.json"
+        ))
+        .expect("the recorded payload parses");
+        assert!(!hook::marks_subagent(
+            input.agent_id.as_ref(),
+            input.agent_id_camel.as_ref()
+        ));
     }
 
     #[test]
