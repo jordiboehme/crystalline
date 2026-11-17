@@ -1741,8 +1741,12 @@ mod tests {
         assert_empty(dir.path());
     }
 
+    /// The environment's token store never asks the vault: not to load,
+    /// save or delete, not even when the vault is required and missing.
+    /// Which store wins is decided above this crate; the engine's
+    /// `env_instance_token_wins_over_a_vault_row` pins that.
     #[test]
-    fn env_token_still_wins_over_vault() {
+    fn the_env_token_store_never_asks_the_vault() {
         use crate::vault::testing::{guard, install_memory, key};
         let _vault = guard();
         let vault = install_memory(key(1));

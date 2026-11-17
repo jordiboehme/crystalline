@@ -595,6 +595,9 @@ mod tests {
     #[test]
     fn app_credentials_round_trip_through_the_file_store_with_mode_0600() {
         let _vault = crate::vault::testing::guard();
+        if !refuse_real_keychain() {
+            return; // only meaningful with CRYSTALLINE_TEST_NO_KEYCHAIN set
+        }
         let dir = tempfile::tempdir().unwrap();
         // Through the resolver, under the no-keychain seam every test runs in.
         let (store, loaded) = AppStore::resolve_and_load(None, dir.path()).unwrap();
@@ -679,6 +682,9 @@ mod tests {
     #[test]
     fn app_lookup_under_the_no_keychain_seam_reads_the_file_and_reports_no_failure() {
         let _vault = crate::vault::testing::guard();
+        if !refuse_real_keychain() {
+            return; // only meaningful with CRYSTALLINE_TEST_NO_KEYCHAIN set
+        }
         let dir = tempfile::tempdir().unwrap();
         let found = AppStore::lookup(Some("ghes.example"), dir.path()).unwrap();
         assert_eq!(found.store.kind(), "file");
@@ -880,8 +886,12 @@ mod tests {
         assert_eq!(names, vec![std::ffi::OsString::from(APP_FILE_NAME)]);
     }
 
+    /// The environment's App store never asks the vault: not to load, save
+    /// or delete, and nothing the vault holds shows through it. Which store
+    /// wins is decided above this crate; the engine's
+    /// `env_app_wins_over_a_vault_row` pins that.
     #[test]
-    fn env_app_still_wins_over_vault() {
+    fn the_env_app_store_never_asks_the_vault() {
         use crate::vault::testing::{guard, install_memory, key};
         let _vault = guard();
         let dir = tempfile::tempdir().unwrap();
