@@ -271,7 +271,11 @@ pub fn register_virtual_domain_in(
 /// without one (`open_standalone_with_store`). This holds only until the
 /// callers attach the document and call the `_in` registrations themselves.
 fn file_until_attached(mut loaded: LoadedConfig) -> LoadedConfig {
-    if loaded.document.is_none() {
+    if loaded.document.is_none() && loaded.mode == crate::overlay::ConfigMode::Document {
+        tracing::warn!(
+            path = %loaded.path.display(),
+            "the configuration is kept in the database, but no document is attached here, so this registration is saved in config.yaml"
+        );
         loaded.mode = crate::overlay::ConfigMode::File;
     }
     loaded

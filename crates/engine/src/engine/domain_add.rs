@@ -1054,9 +1054,9 @@ impl Engine {
         if let Some(conflict) = self.env_domain_conflict(name) {
             return Err(conflict);
         }
-        // A domain only the read-only config.yaml has stays there, refused
+        // A domain the read-only config.yaml registers stays there, refused
         // before anything below purges or sweeps.
-        self.refuse_base_only_domain(&self.file_config.read().unwrap(), name)?;
+        self.refuse_base_domain(name)?;
         // Before the sweep, not after: a removal that is going to refuse must
         // not have closed somebody's co-editing room on the way to refusing.
         let entry = self.domain_entry(name)?;

@@ -386,11 +386,11 @@ impl Engine {
         })
     }
 
-    /// In document mode, refuse removing or renaming `name` when only the
-    /// read-only base has it (see
-    /// [`crate::persisted::refuse_base_only_domain`]). `file` is the document
-    /// the change starts from. Nothing to refuse in file mode.
-    pub(super) fn refuse_base_only_domain(&self, file: &GlobalConfig, name: &str) -> Result<()> {
+    /// In document mode, refuse removing, purging or renaming `name` when the
+    /// read-only base registers it, shadowed by the document or not (see
+    /// [`crate::persisted::refuse_base_domain`]). Nothing to refuse in file
+    /// mode.
+    pub(super) fn refuse_base_domain(&self, name: &str) -> Result<()> {
         match (&self.config_base, &self.persisted) {
             (Some(base), Some(persisted)) => {
                 let path = persisted
@@ -398,7 +398,7 @@ impl Engine {
                     .map(Path::to_path_buf)
                     .or_else(|| self.config_file_path())
                     .unwrap_or_default();
-                crate::persisted::refuse_base_only_domain(base, file, name, &path)
+                crate::persisted::refuse_base_domain(base, name, &path)
             }
             _ => Ok(()),
         }
@@ -871,6 +871,92 @@ mod document_tests {
         assert!(matches!(err, EngineError::Refused(_)), "{err}");
         assert_eq!(doc.stored(), None);
         assert!(engine.config().domains.contains_key("base-only"));
+    }
+
+    /// A base domain the document shadows (its review mode was changed, which
+    /// copies the entry into the document) is still the base's: removing,
+    /// purging and renaming it are refused, and nothing is dropped, purged or
+    /// moved.
+    #[tokio::test]
+    async fn a_shadowed_base_domain_is_not_removed_or_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("team");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("MANIFEST.md"),
+            "---\ntitle: team\ntype: manifest\nstatus: active\n---\n# team\n",
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join("note.md"),
+            "---\ntitle: note\ntype: note\nstatus: active\n---\nbody\n",
+        )
+        .unwrap();
+        let mut entry = DomainEntry::file(folder.clone());
+        entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+        entry.origin = Some(crystalline_core::config::OriginConfig {
+            repo: "acme/team".into(),
+            path: None,
+            branch: Some("main".into()),
+            poll_secs: None,
+        });
+        let mut base = GlobalConfig::default();
+        base.domains.insert("team".into(), entry);
+        let path = tmp.path().join("config.yaml");
+        crystalline_core::config::save_yaml(&path, &base).unwrap();
+        let doc = Arc::new(MemoryDocument::default());
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(path.clone()),
+        )
+        .with_state_dir(tmp.path().join("state"))
+        .with_persisted(
+            PersistedConfig::Document {
+                doc: doc.clone(),
+                base: Some(path),
+            },
+            Some(base),
+        )
+        .unwrap();
+        let scope = crate::scope::Scope::Unrestricted;
+
+        // Leaving review mode shadows the base entry in the document.
+        engine
+            .set_review_mode(
+                "team",
+                None,
+                ReviewModeConfirm::Confirmed { folds: Vec::new() },
+                &scope,
+            )
+            .await
+            .unwrap();
+        let shadowed = doc.stored().unwrap();
+        assert!(shadowed["domains"]["team"].is_object(), "{shadowed}");
+        assert!(engine.config().domains["team"].review.is_none());
+
+        let err = engine.domain_remove("team").await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert!(err.to_string().contains("comes from config.yaml"), "{err}");
+        let err = engine
+            .unregister_domain("team", &scope, true, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        let err = engine
+            .rename_domain_local("team", "renamed", NameOrigin::Explicit, &scope)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+
+        // Nothing dropped, purged or moved.
+        assert_eq!(doc.stored().unwrap(), shadowed);
+        assert!(engine.config().domains.contains_key("team"));
+        assert!(engine.registered_domain_names().contains("team"));
+        assert!(folder.join("note.md").is_file());
+        assert!(!tmp.path().join("renamed").exists());
     }
 
     /// File mode is what it always was: no document, the file written.

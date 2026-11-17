@@ -202,17 +202,13 @@ fn merge_maps(
     }
 }
 
-/// Refuse removing or renaming `name` when it is a base-only domain: it comes
-/// from the read-only `config.yaml` at `base_path`, which only the operator
-/// edits. A domain the document also names is the document's to change (its
-/// entry shadows the base one), so it passes.
-pub fn refuse_base_only_domain(
-    base: &GlobalConfig,
-    doc: &GlobalConfig,
-    name: &str,
-    base_path: &Path,
-) -> Result<()> {
-    if base.domains.contains_key(name) && !doc.domains.contains_key(name) {
+/// Refuse removing or renaming `name` when the read-only `config.yaml` at
+/// `base_path` registers it, which only the operator edits. That holds when
+/// the document shadows the entry too: the shadow carries settings of the
+/// domain (its review mode, a provisioning decision), and dropping or moving
+/// it would leave the base registering the domain where it was.
+pub fn refuse_base_domain(base: &GlobalConfig, name: &str, base_path: &Path) -> Result<()> {
+    if base.domains.contains_key(name) {
         return Err(EngineError::Refused(format!(
             "domain '{name}' comes from config.yaml at {}; edit that file",
             base_path.display()
@@ -416,15 +412,16 @@ mod tests {
         doc.domains.insert("y".into(), domain("/doc/y"));
         doc.domains.insert("z".into(), domain("/doc/z"));
         let path = Path::new("/etc/crystalline/config.yaml");
-        let err = refuse_base_only_domain(&base, &doc, "x", path).unwrap_err();
+        let err = refuse_base_domain(&base, "x", path).unwrap_err();
         assert!(matches!(err, EngineError::Refused(_)));
         assert_eq!(
             err.to_string(),
             "domain 'x' comes from config.yaml at /etc/crystalline/config.yaml; edit that file"
         );
-        // A shadowed base domain and a document-only domain are the document's.
-        refuse_base_only_domain(&base, &doc, "y", path).unwrap();
-        refuse_base_only_domain(&base, &doc, "z", path).unwrap();
+        // A base domain the document shadows is refused too; a document-only
+        // domain is the document's.
+        assert!(refuse_base_domain(&base, "y", path).is_err());
+        refuse_base_domain(&base, "z", path).unwrap();
     }
 
     #[test]

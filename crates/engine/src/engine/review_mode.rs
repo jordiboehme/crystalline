@@ -1592,8 +1592,8 @@ impl Engine {
         let removed = {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;
-            // A domain only the read-only config.yaml has stays there.
-            self.refuse_base_only_domain(&file, name)?;
+            // A domain the read-only config.yaml registers stays there.
+            self.refuse_base_domain(name)?;
             let removed = match file.domains.shift_remove(name) {
                 Some(entry) => entry,
                 None => {
