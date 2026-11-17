@@ -103,10 +103,12 @@ use crystalline_service::maintenance::{self, MAINTENANCE_FILE, MaintenanceState}
 /// session would ever reach for - what this session did and the state it
 /// left behind, temporary paths and outputs, a one-off bug's error text,
 /// steps that will not recur, and facts any model already knows. The
-/// definition now names what a future session would reach for, and the
-/// exclusion list names those five things explicitly so a later rewrite
-/// cannot drop them without a test noticing.
-pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what a future session would reach for: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
+/// definition now names what saves a future session from reinventing the
+/// wheel or stepping into the same trap (Jordi, 2026-11-17: the same test the
+/// capture skill and the subagent block state), and the exclusion list names
+/// those five things explicitly so a later rewrite cannot drop them without a
+/// test noticing.
+pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what saves a future session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, patterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
 
 /// The one plain sentence a person sees when the nudge fires under Claude
 /// Code, which renders it as `Stop says: <text>` on its own notice line.
