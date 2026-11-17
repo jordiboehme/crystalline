@@ -4003,6 +4003,20 @@ pub async fn connect_github(
         );
     }
     let cfg = &loaded.effective;
+    // On Postgres the token is sealed in the database: where it is written
+    // is decided before any sign-in, and the test seam's folder gives way
+    // to the vault.
+    let route = crystalline_service::route_secret_command(cfg).await?;
+    let token_store_dir = match route {
+        crystalline_service::SecretRoute::Local => token_store_dir,
+        _ => None,
+    };
+    if matches!(route, crystalline_service::SecretRoute::Daemon) {
+        if !disconnect {
+            bail!("{CONNECT_THROUGH_THE_INSTANCE}");
+        }
+        return disconnect_through_daemon(identity, cfg, json).await;
+    }
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
@@ -4257,6 +4271,46 @@ fn save_credential(
     }
 }
 
+/// The refusal of `connect github` while a daemon of this machine owns the
+/// Postgres database: the token would be sealed by that daemon, and this
+/// command has no way to hand it over yet.
+const CONNECT_THROUGH_THE_INSTANCE: &str = "on Postgres the GitHub tokens are sealed in the database by the active instance, which runs on this machine, and this command cannot hand a token to it; connect GitHub in the instance's web UI (the GitHub settings for this machine's identity, your own page for a personal one)";
+
+/// `connect github --disconnect` while a daemon of this machine owns the
+/// Postgres database: the GitHub link of the account goes first (the
+/// accounts are written beside the daemon), then the daemon deletes the
+/// sealed token, revoking a person's at GitHub when its App can. Nothing in
+/// the state folder is touched.
+async fn disconnect_through_daemon(
+    identity: &crystalline_remote::TokenIdentity,
+    cfg: &crystalline_core::config::GlobalConfig,
+    json: bool,
+) -> Result<()> {
+    let mut unlinked = false;
+    if let crystalline_remote::TokenIdentity::Personal(name) = identity
+        && name != crystalline_service::engine::OWNER_IDENTITY_NAME
+        && let Some(accounts) = crystalline_service::existing_accounts_for_cli(cfg).await?
+        && accounts.github_link_of(name).await?.is_some()
+    {
+        accounts.unlink_github(name).await?;
+        unlinked = true;
+    }
+    delete_through_daemon(identity).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "disconnected": identity_label(identity),
+                "unlinked": unlinked,
+                "daemon": DaemonNotice::Notified.as_str(),
+            })
+        );
+    } else {
+        println!("Disconnected {}.", identity_phrase(identity));
+    }
+    Ok(())
+}
+
 /// What `connect github --personal` prints when GitHub answers the App's
 /// device flow with `device_flow_disabled`.
 const APP_DEVICE_FLOW_DISABLED: &str = "GitHub refused the sign-in because Device Flow is switched off for the GitHub App: enable Device Flow in the GitHub App's settings on GitHub, then run this again.";
@@ -4493,8 +4547,9 @@ impl PersonalApp<'_> {
             })?;
         }
         // The file a keychain failure at connect time left behind, which a
-        // keychain that works again would not resolve to.
-        if self.token_store_dir.is_none() {
+        // keychain that works again would not resolve to. With the sealed
+        // vault there is none, and the state folder is not touched.
+        if self.token_store_dir.is_none() && !crystalline_remote::vault::engaged() {
             crystalline_remote::TokenStore::file_fallback_for(self.identity, self.state_dir)
                 .and_then(|file| file.delete())
                 .map_err(|e| {
@@ -4599,6 +4654,11 @@ pub(crate) fn forget_credential(
         }
         Err(e) => tracing::debug!("could not resolve the credential to forget: {e}"),
     }
+    // With the sealed vault there is no file beside it: the state folder is
+    // not touched at all.
+    if crystalline_remote::vault::engaged() {
+        return;
+    }
     match crystalline_remote::TokenStore::file_fallback_for(identity, state_dir) {
         Ok(store) => {
             if let Err(e) = store.delete() {
@@ -4606,6 +4666,68 @@ pub(crate) fn forget_credential(
             }
         }
         Err(e) => tracing::debug!("could not resolve the file credential to forget: {e}"),
+    }
+}
+
+/// Deletes `identity`'s sealed credential under this command's own claim of
+/// the database, with the vault installed ([`SecretRoute::Owned`]). Not best
+/// effort: an error means the token may still be there, and the store is
+/// asked again at the end, so `Ok` means none is left.
+///
+/// [`SecretRoute::Owned`]: crystalline_service::SecretRoute::Owned
+pub(crate) fn delete_sealed_credential(
+    identity: &crystalline_remote::TokenIdentity,
+    host: Option<&str>,
+) -> Result<()> {
+    let dir = config::origins_state_dir()
+        .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+    let (store, token) = crystalline_remote::TokenStore::resolve_and_load_for(identity, host, &dir)
+        .map_err(|e| anyhow!("{e}"))?;
+    if token.is_some() {
+        store.delete().map_err(|e| anyhow!("{e}"))?;
+    }
+    let (_, left) = crystalline_remote::TokenStore::resolve_and_load_for(identity, host, &dir)
+        .map_err(|e| anyhow!("{e}"))?;
+    if left.is_some() {
+        bail!("the GitHub token is still saved in the database");
+    }
+    Ok(())
+}
+
+/// Has the daemon that owns the Postgres database delete `identity`'s sealed
+/// credential ([`SecretRoute::Daemon`]): the `forget_credential` message with
+/// `"delete": true`. `Ok` when the daemon answered that no token is left. A
+/// daemon that answers without `deleted` is older and deleted nothing, and
+/// one that went away deleted nothing either: both are errors.
+///
+/// [`SecretRoute::Daemon`]: crystalline_service::SecretRoute::Daemon
+pub(crate) async fn delete_through_daemon(
+    identity: &crystalline_remote::TokenIdentity,
+) -> Result<()> {
+    let account = match identity {
+        crystalline_remote::TokenIdentity::Instance => serde_json::Value::Null,
+        crystalline_remote::TokenIdentity::Personal(name) => serde_json::json!(name),
+    };
+    let answer = crystalline_service::client::ctl_if_running(serde_json::json!({
+        "cmd": "forget_credential",
+        "account": account,
+        "delete": true,
+    }))
+    .await?;
+    match answer {
+        Some(data)
+            if data
+                .get("deleted")
+                .is_some_and(serde_json::Value::is_boolean) =>
+        {
+            Ok(())
+        }
+        Some(_) => bail!(
+            "the daemon of this machine is older than this command and deleted no sealed GitHub token; update it and run the command again"
+        ),
+        None => bail!(
+            "the daemon of this machine stopped before it deleted the GitHub token; run the command again"
+        ),
     }
 }
 

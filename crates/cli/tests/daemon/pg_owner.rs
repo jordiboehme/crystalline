@@ -1195,8 +1195,20 @@ fn schema_objects(pg: &PgScratch) -> String {
 /// `initialize` and closes stdin: the exit code, stdout and stderr. Gives up
 /// after 60 s, so a bridge that loops fails the test instead of hanging it.
 fn mcp_once(env: &Env, args: &[&str]) -> (Option<i32>, String, String) {
+    mcp_once_with(env, args, &[])
+}
+
+/// [`mcp_once`] with `extra` variables on top of `env`'s own.
+fn mcp_once_with(
+    env: &Env,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(bin());
     env.apply(&mut cmd);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
     let mut child = cmd
         .args(args)
         .stdin(Stdio::piped())
@@ -2917,4 +2929,390 @@ fn config_writes_unchanged_on_turso() {
         Some(crystalline_core::config::ResponseFormat::Json)
     );
     assert!(cfg.domains.contains_key("notes"), "{:?}", cfg.domains);
+}
+
+// --- the CLI credential writers on Postgres (spec section D) -----------------
+
+/// Run `crystalline <args>` in `env` with `extra` variables on top of its
+/// own: success, stdout and stderr.
+fn run_vars(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    let out = cmd.args(args).stdin(Stdio::null()).output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Seal a GitHub token for `user` into the row `name` of `pg`'s
+/// `instance_secret`, with the key every Postgres test process runs with.
+#[cfg(feature = "postgres")]
+fn seal_token_row(pg: &PgScratch, name: &str, user: &str) {
+    use crystalline_remote::StoredToken;
+    use crystalline_remote::sealed::{SealKey, seal};
+
+    use crate::service::TEST_SECRET_KEY;
+
+    let token = StoredToken {
+        access_token: format!("{user}-secret"),
+        host: "github.com".to_string(),
+        user: user.to_string(),
+        created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_expires_at: None,
+    };
+    let bytes: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&TEST_SECRET_KEY[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    let key = SealKey::from_bytes(bytes.try_into().unwrap());
+    let sealed = seal(&key, name, &serde_json::to_vec(&token).unwrap());
+    let hex: String = sealed.iter().map(|b| format!("{b:02x}")).collect();
+    pg.run(&format!(
+        "INSERT INTO {}.instance_secret VALUES ('{name}', decode('{hex}', 'hex'), '{}', now())",
+        pg.schema,
+        key.key_id()
+    ))
+    .unwrap();
+}
+
+/// Whether `pg`'s `instance_secret` holds the row `name`.
+#[cfg(feature = "postgres")]
+fn has_secret_row(pg: &PgScratch, name: &str) -> bool {
+    pg.text(&format!(
+        "SELECT count(*)::text FROM {}.instance_secret WHERE name = '{name}'",
+        pg.schema
+    )) == "1"
+}
+
+/// How many accounts named `name` `pg` holds, as text.
+#[cfg(feature = "postgres")]
+fn accounts_named(pg: &PgScratch, name: &str) -> String {
+    pg.text(&format!(
+        "SELECT count(*)::text FROM {}.users WHERE name = '{name}'",
+        pg.schema
+    ))
+}
+
+/// The row a personal GitHub token of `name` is sealed under, on github.com.
+#[cfg(feature = "postgres")]
+fn personal_row(name: &str) -> String {
+    format!("github-personal:{name}")
+}
+
+/// No process without the key touches the vault: with no daemon of this
+/// machine, `users remove`, `users disable` and `users add` are refused
+/// before any write, naming `kubectl exec` and the key variable. The account
+/// and its sealed token both stay: nothing is half done.
+#[cfg(feature = "postgres")]
+#[test]
+fn users_remove_without_key_refused_before_any_write() {
+    let Some(pg) = PgScratch::new("vtnokey") else {
+        return;
+    };
+    let env = Env::new("vtnokey").on_postgres(&pg);
+    users_add(&env, "bob", "bob-password");
+    let row = personal_row("bob");
+    seal_token_row(&pg, &row, "bob");
+    for args in [
+        &["users", "remove", "bob"][..],
+        &["users", "remove", "bob", "--force"],
+        &["users", "disable", "bob"],
+    ] {
+        let (ok, out, err) = run_vars(&env, args, &NO_SECRET_KEY);
+        assert!(!ok, "{out}{err}");
+        assert!(
+            err.contains(&format!(
+                "for example `kubectl exec <pod> -- crystalline {}`",
+                args.join(" ")
+            )),
+            "{err}"
+        );
+        assert!(err.contains("CRYSTALLINE_SECRET_KEY"), "{err}");
+        assert_eq!(accounts_named(&pg, "bob"), "1", "the account is kept");
+        assert!(has_secret_row(&pg, &row), "the sealed token is kept");
+    }
+    let disabled = pg.text(&format!(
+        "SELECT disabled::text FROM {}.users WHERE name = 'bob'",
+        pg.schema
+    ));
+    assert_eq!(disabled, "0", "nothing was disabled");
+    let (ok, out, err) = run_vars(
+        &env,
+        &["users", "add", "carol", "--mcp-token", "agent"],
+        &NO_SECRET_KEY,
+    );
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SECRET_KEY"), "{err}");
+    assert_eq!(accounts_named(&pg, "carol"), "0", "no account was made");
+}
+
+/// With no daemon and a free database, `users remove` with the key claims
+/// the database for the command, deletes the sealed token and the account,
+/// and gives the database back.
+#[cfg(feature = "postgres")]
+#[test]
+fn users_remove_takes_lock_when_free_and_deletes_row() {
+    let Some(pg) = PgScratch::new("vtfree") else {
+        return;
+    };
+    let env = Env::new("vtfree").on_postgres(&pg);
+    users_add(&env, "bob", "bob-password");
+    let row = personal_row("bob");
+    seal_token_row(&pg, &row, "bob");
+    seal_token_row(&pg, "github", "machine");
+    let (ok, out, err) = env.run_full(&["users", "remove", "bob"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(accounts_named(&pg, "bob"), "0");
+    assert!(!has_secret_row(&pg, &row), "the sealed token is deleted");
+    assert!(has_secret_row(&pg, "github"), "another row is kept");
+    assert_eq!(
+        owner_command(&pg),
+        "crystalline users remove|true",
+        "the command held the database and gave it back"
+    );
+}
+
+/// With a daemon of this machine owning the database, `users remove` goes
+/// through it: the daemon deletes the sealed token (`forget_credential` with
+/// `"delete": true`), the command needs no key of its own, and the owner row
+/// stays the daemon's.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn users_remove_deletes_vault_row_via_daemon() {
+    let Some(pg) = PgScratch::new("vtdaemon") else {
+        return;
+    };
+    let env = Env::new("vtdaemon").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = run_with_stdin(
+        &env,
+        &["users", "add", "bob", "--password-stdin"],
+        "bob-password\n",
+    );
+    assert!(ok, "{out}{err}");
+    let row = personal_row("bob");
+    seal_token_row(&pg, &row, "bob");
+    // The daemon answers the delete for a person, and for this machine.
+    let reply = crate::service::ctl_over_the_socket(
+        &env,
+        &serde_json::json!({ "cmd": "forget_credential", "account": "nobody", "delete": true }),
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["data"]["forgotten"], "nobody", "{reply}");
+    assert_eq!(reply["data"]["deleted"], false, "{reply}");
+
+    let (ok, out, err) = run_vars(&env, &["users", "remove", "bob"], &NO_SECRET_KEY);
+    assert!(ok, "{out}{err}");
+    assert_eq!(accounts_named(&pg, "bob"), "0");
+    assert!(!has_secret_row(&pg, &row), "the daemon deleted the row");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+    assert!(serve.alive());
+}
+
+/// While another instance owns the database, `users add` with the key and
+/// no daemon of this machine is refused before the account is written,
+/// with the sentence naming the owner and `kubectl exec`.
+#[cfg(feature = "postgres")]
+#[test]
+fn users_add_refused_before_auth_write_when_owned_elsewhere() {
+    let Some(pg) = PgScratch::new("vtelse") else {
+        return;
+    };
+    let owner_env = Env::new("vtelsea").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let label = owner_label(&pg);
+
+    let env = Env::new("vtelseb").on_postgres(&pg);
+    let (ok, out, err) = run_with_stdin(
+        &env,
+        &["users", "add", "carol", "--password-stdin"],
+        "carol-password\n",
+    );
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("sealed in the database"), "{err}");
+    assert!(
+        err.contains(&format!("is owned by the active instance {label}")),
+        "{err}"
+    );
+    assert!(
+        err.contains("kubectl exec <pod> -- crystalline users add carol"),
+        "{err}"
+    );
+    assert_eq!(accounts_named(&pg, "carol"), "0", "no account was made");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+}
+
+/// The `users` subcommands that change no secret write the accounts beside
+/// the owner as before, with no key and no daemon of this machine: `link`
+/// and `unlink` work while another instance owns the database.
+#[cfg(feature = "postgres")]
+#[test]
+fn users_unlink_unaffected_by_vault() {
+    let Some(pg) = PgScratch::new("vtunlink") else {
+        return;
+    };
+    let owner_env = Env::new("vtunlinka").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    users_add(&owner_env, "bob", "bob-password");
+
+    let env = Env::new("vtunlinkb").on_postgres(&pg);
+    let issuer = "https://idp.example";
+    let (ok, out, err) = run_vars(
+        &env,
+        &[
+            "users",
+            "link",
+            "bob",
+            "--issuer",
+            issuer,
+            "--subject",
+            "s-1",
+        ],
+        &NO_SECRET_KEY,
+    );
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = run_vars(
+        &env,
+        &["users", "unlink", "bob", "--issuer", issuer],
+        &NO_SECRET_KEY,
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("Unlinked 'bob'"), "{out}");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+}
+
+/// `connect github` with no daemon of this machine never writes a token to
+/// the state folder on Postgres: refused before any sign-in while another
+/// instance owns the database, and without the key on a free one. Nothing
+/// appears under `origins/`.
+#[cfg(feature = "postgres")]
+#[test]
+fn connect_github_without_owner_refused_not_written_locally() {
+    let Some(pg) = PgScratch::new("vtconn") else {
+        return;
+    };
+    let env = Env::new("vtconn").on_postgres(&pg);
+    let origins = env.state_dir().join("origins");
+    let args = ["connect", "github", "--token", "ghp_notatoken"];
+    let (ok, out, err) = run_vars(&env, &args, &NO_SECRET_KEY);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SECRET_KEY"), "{err}");
+    assert!(
+        err.contains("kubectl exec <pod> -- crystalline connect github --token <value>"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("ghp_notatoken"),
+        "the token is never repeated"
+    );
+
+    let owner_env = Env::new("vtconna").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let (ok, out, err) = env.run_full(&args);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("sealed in the database"), "{err}");
+    assert!(err.contains("is owned by the active instance"), "{err}");
+    let written: Vec<_> = std::fs::read_dir(&origins)
+        .map(|dir| dir.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(written.is_empty(), "written locally: {written:?}");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+}
+
+/// `crystalline mcp --embedded` on Postgres without the key is refused with
+/// the daemon's sentence as the initialize error, and takes nothing.
+#[cfg(feature = "postgres")]
+#[test]
+fn embedded_refused_without_key() {
+    let Some(pg) = PgScratch::new("vtembed") else {
+        return;
+    };
+    let env = Env::new("vtembed").on_postgres(&pg);
+    let (code, out, err) = mcp_once_with(&env, &["mcp", "--embedded"], &NO_SECRET_KEY);
+    assert_ne!(code, Some(0), "{out}{err}");
+    let message = initialize_error(&out);
+    assert!(message.contains("CRYSTALLINE_SECRET_KEY"), "{message}");
+    assert!(message.contains("openssl rand -base64 32"), "{message}");
+    assert_eq!(schema_objects(&pg), "0", "nothing was created");
+}
+
+/// `status` and `doctor` on Postgres report whether a key is configured
+/// and how many secrets are sealed, never a row name, and a missing key
+/// fails neither.
+#[cfg(feature = "postgres")]
+#[test]
+fn reports_count_sealed_secrets_and_never_need_the_key() {
+    let Some(pg) = PgScratch::new("vtreport") else {
+        return;
+    };
+    let env = Env::new("vtreport").on_postgres(&pg);
+    users_add(&env, "bob", "bob-password");
+    seal_token_row(&pg, &personal_row("bob"), "bob");
+    let (ok, out, err) = run_vars(&env, &["status", "--json"], &NO_SECRET_KEY);
+    assert!(ok, "{out}{err}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    let secrets = &status["durable_state"]["secrets"];
+    assert_eq!(secrets["sealed"], 1, "{status}");
+    assert_eq!(secrets["key_configured"], false, "{status}");
+    let (ok, out, err) = env.run_full(&["status"]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("Secrets: 1 sealed in the database; a key is configured"),
+        "{out}"
+    );
+    let (_, out, err) = run_vars(&env, &["doctor"], &NO_SECRET_KEY);
+    let text = format!("{out}{err}");
+    assert!(
+        text.contains("secrets: 1 sealed in the database; no key is configured here"),
+        "{text}"
+    );
+    for text in [&text, &out] {
+        assert!(!text.contains("github-personal"), "a row name: {text}");
+    }
+}
+
+/// On Turso the credential paths stay as they were: `users add` sweeps a
+/// token file left under the name, `users remove` deletes the person's
+/// token file, both with a secret key set (it is ignored), and no Postgres
+/// is involved.
+#[test]
+fn credential_paths_unchanged_on_turso() {
+    use crystalline_remote::{StoredToken, TokenIdentity, TokenStore};
+
+    let env = Env::new("vtturso");
+    let key = [("CRYSTALLINE_SECRET_KEY", "not-a-key")];
+    let origins = env.state_dir().join("origins");
+    let bob = TokenIdentity::Personal("bob".to_string());
+    let file = TokenStore::file_fallback_for(&bob, &origins).unwrap();
+    let token = StoredToken {
+        access_token: "bob-secret".to_string(),
+        host: "github.com".to_string(),
+        user: "bob".to_string(),
+        created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_expires_at: None,
+    };
+    file.save(&token).unwrap();
+    let (ok, out, err) = run_vars(&env, &["users", "add", "bob", "--mcp-token", "agent"], &key);
+    assert!(ok, "{out}{err}");
+    assert!(
+        file.load().unwrap().is_none(),
+        "the leftover token went at add"
+    );
+    file.save(&token).unwrap();
+    let (ok, out, err) = run_vars(&env, &["users", "remove", "bob"], &key);
+    assert!(ok, "{out}{err}");
+    assert!(file.load().unwrap().is_none(), "the token went at remove");
+    assert!(env.state_dir().join("web-auth.db").exists());
 }
