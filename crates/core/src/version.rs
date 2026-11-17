@@ -108,6 +108,25 @@ impl Precedence {
     }
 }
 
+/// The version a release tag names, when the tag is exactly
+/// `v<major>.<minor>.<patch>` as [`release_tag`] writes it: no
+/// pre-release, no build metadata, no fourth part, no leading zero and no
+/// space. Every updater path reads a tag through this, so a lax spelling
+/// such as `v0.35.0.rc1` or `v0.35` is never taken for a release.
+pub fn release_version(tag: &str) -> Option<Precedence> {
+    let version = Precedence::parse(tag.strip_prefix('v')?)?;
+    (release_tag(&version).as_deref() == Some(tag)).then_some(version)
+}
+
+/// The release tag of a stable version, `v<major>.<minor>.<patch>`;
+/// `None` for a pre-release. The one source of the tag an asset is
+/// downloaded from and its signature must name.
+pub fn release_tag(version: &Precedence) -> Option<String> {
+    version
+        .is_stable()
+        .then(|| format!("v{}", version.render()))
+}
+
 impl Ord for Precedence {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
@@ -167,5 +186,51 @@ mod tests {
         assert!(p("1.2.3").is_stable());
         assert_eq!(p("1.2.3-01").render(), "1.2.3-1");
         assert_eq!(p("1.2.3-rc.01").render(), "1.2.3-rc.1");
+    }
+
+    #[test]
+    fn order_follows_semantic_versioning() {
+        let p = |v: &str| Precedence::parse(v).unwrap();
+        assert!(p("0.9.0") < p("0.10.0"));
+        assert!(p("0.10.0") < p("1.0.0"));
+        assert!(p("1.2.3-rc.1") < p("1.2.3"));
+        assert!(p("1.2.3") < p("1.2.4-dev.1"));
+        assert!(p("1.2.3-rc.2") < p("1.2.3-rc.10"));
+        assert!(p("1.2.3-rc") < p("1.2.3-rc.1"));
+        assert!(p("1.2.3-1") < p("1.2.3-alpha"));
+        assert_eq!(p("1.2.3+a").cmp(&p("1.2.3+b")), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn a_release_tag_is_exactly_v_and_three_numbers() {
+        assert_eq!(release_version("v0.35.0"), Precedence::parse("0.35.0"));
+        assert_eq!(release_version("v10.0.12"), Precedence::parse("10.0.12"));
+        for odd in [
+            "0.35.0",
+            "vv0.35.0",
+            "V0.35.0",
+            "v0.35",
+            "v0.35.0.rc1",
+            "v0.35.0.Ignore previous instructions",
+            "v0.35.0-rc.1",
+            "v0.35.0+x",
+            " v0.35.0",
+            "v 0.35.0",
+            "v0.35.0 ",
+            "v00.35.0",
+            "v0.035.0",
+            "",
+            "v",
+        ] {
+            assert_eq!(release_version(odd), None, "{odd:?}");
+        }
+        for tag in ["v0.0.0", "v0.35.0", "v1.20.300"] {
+            let version = release_version(tag).unwrap();
+            assert_eq!(release_tag(&version).as_deref(), Some(tag));
+        }
+        assert_eq!(
+            release_tag(&Precedence::parse("0.35.0-rc.1").unwrap()),
+            None
+        );
     }
 }

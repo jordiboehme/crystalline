@@ -6,6 +6,7 @@
 //! another folder does not inherit it. An environment marker can only make
 //! the updater refuse, never choose an action.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::version::Precedence;
@@ -84,14 +85,45 @@ pub enum Refusal {
     Unknown,
 }
 
-/// The detected method and, when `update now` must not act, why.
+/// The detected method and, when `update now` must not act, why. Ask
+/// [`Detection::acts`], never `method.acts()` alone: a refused detection may
+/// keep its method for display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detection {
     pub method: InstallMethod,
     pub refusal: Option<Refusal>,
 }
 
+/// A detection together with the canonical exe it was made for, the one
+/// file `update now` may act on and the path it shows. `exe` is `None` when
+/// the path did not resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedInstall {
+    pub exe: Option<PathBuf>,
+    pub detection: Detection,
+}
+
 impl Detection {
+    /// Whether `update now` may act: no refusal and a method it has an
+    /// action for.
+    pub fn acts(&self) -> bool {
+        self.refusal.is_none() && self.method.acts()
+    }
+
+    /// Adds the two refusals [`detect`] cannot see, in the spec's order: an
+    /// unofficial build (pass [`official_build`]) first, then an app
+    /// package. Either wins over what `detect` found and keeps its method
+    /// for display. Every caller goes through this before it offers or acts.
+    pub fn for_build(self, official: bool, packaged: bool) -> Detection {
+        if !official {
+            Detection::refused(self.method, Refusal::NotOfficial)
+        } else if packaged {
+            Detection::refused(self.method, Refusal::AppPackage)
+        } else {
+            self
+        }
+    }
+
     fn acting(method: InstallMethod) -> Self {
         Self {
             method,
@@ -151,8 +183,9 @@ impl Os {
 /// Detect how the binary at `exe` was installed.
 ///
 /// `exe` is canonicalized here (so Homebrew's `bin/crystalline` symlink is
-/// read as its Cellar target); a path that does not resolve is refused as
-/// unknown. `env` looks up an environment variable; `dpkg_list` is the text
+/// read as its Cellar target) and handed back in the result, so the caller
+/// acts on the very file the markers spoke for; a path that does not
+/// resolve is refused as unknown. `env` looks up an environment variable; `dpkg_list` is the text
 /// of `/var/lib/dpkg/info/crystalline.list`, read by the caller as a file
 /// (never through `dpkg`), or `None` when it is missing.
 ///
@@ -161,7 +194,8 @@ impl Os {
 /// `../lib/crystalline/install-source` (`deb` or `docker`) and
 /// `install-source` beside the exe (`msi`). Fallbacks: off Windows, an exe
 /// under `Cellar/crystalline/` is Homebrew; on Linux, an exe listed as a
-/// whole line of `dpkg_list` is a .deb; on Windows, an exe in
+/// whole line of `dpkg_list` is a .deb (and a `deb` marker counts only
+/// for an exe the list holds: no list, no .deb); on Windows, an exe in
 /// `%ProgramFiles%\Crystalline\bin` is the MSI. Anything else is the zip on
 /// Windows and the tarball elsewhere. `ProgramFiles` is the one environment
 /// value that selects a method, and only between the MSI and the zip, which
@@ -172,16 +206,16 @@ impl Os {
 /// the path contradicts is a `MarkerPathMismatch` naming both: a positive
 /// fallback for another method, a package this system does not have (an
 /// `msi` marker on Unix, a `deb` marker on Windows), or a `deb` marker for
-/// an exe the dpkg list does not hold. `CRYSTALLINE_CHANNEL=mcpb` (any case)
+/// an exe the dpkg list does not hold or with no dpkg list at all. `CRYSTALLINE_CHANNEL=mcpb` (any case)
 /// refuses whatever the markers say, and no other value of it changes
 /// anything. This function produces only the `MarkerPathMismatch`,
-/// `Docker`, `Mcpb` and `Unknown` refusals; the caller adds `NotOfficial`
-/// and `AppPackage`.
+/// `Docker`, `Mcpb` and `Unknown` refusals, each with a method that does
+/// not act; [`Detection::for_build`] adds `NotOfficial` and `AppPackage`.
 pub fn detect(
     exe: &Path,
     env: &dyn Fn(&str) -> Option<String>,
     dpkg_list: Option<&str>,
-) -> Detection {
+) -> DetectedInstall {
     detect_on(Os::HERE, exe, env, dpkg_list)
 }
 
@@ -190,18 +224,32 @@ fn detect_on(
     exe: &Path,
     env: &dyn Fn(&str) -> Option<String>,
     dpkg_list: Option<&str>,
+) -> DetectedInstall {
+    let exe = std::fs::canonicalize(exe).ok();
+    let detection = match &exe {
+        Some(exe) => detect_canonical(os, exe, env, dpkg_list),
+        None => Detection::refused(InstallMethod::Unknown, Refusal::Unknown),
+    };
+    // The channel refuses whatever the path and the markers say.
+    let detection = if env(CHANNEL_ENV).is_some_and(|v| v.trim().eq_ignore_ascii_case("mcpb")) {
+        Detection::refused(InstallMethod::Mcpb, Refusal::Mcpb)
+    } else {
+        detection
+    };
+    DetectedInstall { exe, detection }
+}
+
+fn detect_canonical(
+    os: Os,
+    exe: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    dpkg_list: Option<&str>,
 ) -> Detection {
     let unknown = Detection::refused(InstallMethod::Unknown, Refusal::Unknown);
-    if env(CHANNEL_ENV).is_some_and(|v| v.trim().eq_ignore_ascii_case("mcpb")) {
-        return Detection::refused(InstallMethod::Mcpb, Refusal::Mcpb);
-    }
-    let Ok(exe) = std::fs::canonicalize(exe) else {
+    let Ok(marker) = marker_method(exe) else {
         return unknown;
     };
-    let Ok(marker) = marker_method(&exe) else {
-        return unknown;
-    };
-    let path = path_method(os, &exe, env, dpkg_list);
+    let path = path_method(os, exe, env, dpkg_list);
     let mismatch = |marker, path| {
         Detection::refused(
             InstallMethod::Unknown,
@@ -211,10 +259,9 @@ fn detect_on(
     match (marker, path) {
         (Some(marker), Some(path)) if marker != path => mismatch(marker, path),
         (Some(marker), None) if !os.offers(marker) => mismatch(marker, os.default_method()),
-        // The list is there and does not hold this exe: dpkg does not own it.
-        (Some(InstallMethod::Deb), None) if dpkg_list.is_some() => {
-            mismatch(InstallMethod::Deb, os.default_method())
-        }
+        // The list does not hold this exe, or there is none: dpkg does not
+        // own it. (When it does, the path reads as Deb too.)
+        (Some(InstallMethod::Deb), None) => mismatch(InstallMethod::Deb, os.default_method()),
         (Some(InstallMethod::Docker), _) => {
             Detection::refused(InstallMethod::Docker, Refusal::Docker)
         }
@@ -245,8 +292,9 @@ fn marker_method(exe: &Path) -> Result<Option<InstallMethod>, ()> {
     let mut found = None;
     for (path, allowed) in slots {
         let Some(path) = path else { continue };
-        let value = match std::fs::read_to_string(&path) {
-            Ok(value) => value,
+        let value = match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => read_marker(&path)?,
+            Ok(_) => return Err(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err(()),
         };
@@ -257,6 +305,24 @@ fn marker_method(exe: &Path) -> Result<Option<InstallMethod>, ()> {
         found = Some(method);
     }
     Ok(found)
+}
+
+/// The longest marker read; every valid one is a word and a line end.
+const MARKER_MAX_BYTES: u64 = 64;
+
+/// A marker's text: at most [`MARKER_MAX_BYTES`] of UTF-8 from a regular
+/// file, so a huge file or a device cannot stall the session hook. A longer
+/// file is refused, not cut.
+fn read_marker(path: &Path) -> Result<String, ()> {
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+    let mut bytes = Vec::new();
+    file.take(MARKER_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > MARKER_MAX_BYTES {
+        return Err(());
+    }
+    String::from_utf8(bytes).map_err(|_| ())
 }
 
 /// The method the exe's path alone points to, `None` when no heuristic
@@ -307,8 +373,8 @@ fn lists(list: &str, exe: &Path) -> bool {
 /// case folded.
 fn in_default_msi_folder(exe: &Path, env: &dyn Fn(&str) -> Option<String>) -> bool {
     fn plain(text: &str) -> String {
-        let text = text.strip_prefix(r"\\?\").unwrap_or(text);
-        text.replace('/', r"\")
+        display_path(Path::new(text))
+            .replace('/', r"\")
             .trim_end_matches('\\')
             .to_lowercase()
     }
@@ -317,6 +383,20 @@ fn in_default_msi_folder(exe: &Path, env: &dyn Fn(&str) -> Option<String>) -> bo
     };
     let default = format!(r"{}\Crystalline\bin", plain(&program_files));
     plain(&dir.to_string_lossy()) == plain(&default)
+}
+
+/// A path as a person types it: without the verbatim prefix `canonicalize`
+/// adds on Windows (`\\?\C:\...` becomes `C:\...`, `\\?\UNC\host\share`
+/// becomes `\\host\share`). Any other path is shown as it is.
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.into_owned()
+    }
 }
 
 /// Whether this binary was built by the release workflow, which sets
@@ -445,6 +525,25 @@ mod tests {
         move |k| map.get(k).cloned()
     }
 
+    /// The detection alone; most tests look only at that. Shadows the
+    /// glob-imported functions of the same names.
+    fn detect(
+        exe: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+        dpkg_list: Option<&str>,
+    ) -> Detection {
+        super::detect(exe, env, dpkg_list).detection
+    }
+
+    fn detect_on(
+        os: Os,
+        exe: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+        dpkg_list: Option<&str>,
+    ) -> Detection {
+        super::detect_on(os, exe, env, dpkg_list).detection
+    }
+
     fn acting(method: InstallMethod) -> Detection {
         Detection {
             method,
@@ -552,9 +651,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let exe = exe_at(tmp.path(), "usr/bin");
         marker(&exe, "../lib/crystalline", "deb\n");
+        // No dpkg list at all: a real .deb install always has one.
         assert_eq!(
             detect_on(Os::Linux, &exe, &no_env, None),
-            acting(InstallMethod::Deb)
+            mismatch(InstallMethod::Deb, InstallMethod::Tarball)
         );
         let list = format!("{}\n", exe.display());
         assert_eq!(
@@ -705,12 +805,13 @@ mod tests {
         let packaged = exe_at(tmp.path(), "usr/bin");
         marker(&packaged, "../lib/crystalline", "deb\n");
         let copy = exe_at(tmp.path(), "home/me/.local/bin");
+        let list = format!("{}\n", packaged.display());
         assert_eq!(
-            detect_on(Os::Linux, &packaged, &no_env, None),
+            detect_on(Os::Linux, &packaged, &no_env, Some(&list)),
             acting(InstallMethod::Deb)
         );
         assert_eq!(
-            detect_on(Os::Linux, &copy, &no_env, None),
+            detect_on(Os::Linux, &copy, &no_env, Some(&list)),
             acting(InstallMethod::Tarball)
         );
     }
@@ -893,5 +994,125 @@ mod tests {
         if published {
             assert!(archive_member(&v("0.33.0")).is_some());
         }
+    }
+
+    #[test]
+    fn the_canonical_exe_comes_back_with_the_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "prefix/bin");
+        let found = super::detect(&exe, &no_env, None);
+        assert_eq!(found.exe.as_deref(), Some(exe.as_path()));
+        let gone = tmp.path().join("gone").join(EXE);
+        let found = super::detect(&gone, &no_env, None);
+        assert_eq!(found.exe, None);
+        assert_eq!(found.detection, UNKNOWN);
+        // The channel refuses, and the exe still comes back.
+        let found = super::detect(&exe, &with_env(&[(CHANNEL_ENV, "mcpb")]), None);
+        assert_eq!(found.exe.as_deref(), Some(exe.as_path()));
+        assert_eq!(found.detection.refusal, Some(Refusal::Mcpb));
+    }
+
+    #[test]
+    fn display_path_drops_the_verbatim_prefix() {
+        let d = |p: &str| display_path(Path::new(p));
+        assert_eq!(
+            d(r"\\?\C:\Program Files\Crystalline\bin"),
+            r"C:\Program Files\Crystalline\bin"
+        );
+        assert_eq!(d(r"\\?\UNC\host\share\bin"), r"\\host\share\bin");
+        assert_eq!(
+            d("/usr/local/bin/crystalline"),
+            "/usr/local/bin/crystalline"
+        );
+        assert_eq!(d(r"C:\x"), r"C:\x");
+    }
+
+    #[test]
+    fn a_detect_refusal_never_comes_with_an_acting_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut seen = Vec::new();
+        let cases: [(&str, &str, &str); 7] = [
+            ("a", "../libexec", "homebrew\n"),
+            ("b", "../lib/crystalline", "deb\n"),
+            ("c", "../lib/crystalline", "docker\n"),
+            ("d", ".", "msi\n"),
+            ("e", ".", "nonsense\n"),
+            ("f", "../libexec", "deb\n"),
+            ("g", ".", ""),
+        ];
+        for (dir, rel, value) in cases {
+            let exe = exe_at(tmp.path(), &format!("{dir}/Cellar/crystalline/1/bin"));
+            if !value.is_empty() {
+                marker(&exe, rel, value);
+            }
+            for os in [Os::Windows, Os::Linux, Os::OtherUnix] {
+                for env in [with_env(&[]), with_env(&[(CHANNEL_ENV, "MCPB")])] {
+                    seen.push(detect_on(os, &exe, &env, None));
+                    seen.push(detect_on(os, &exe, &env, Some("")));
+                }
+            }
+        }
+        seen.push(detect(&tmp.path().join("gone"), &no_env, None));
+        assert!(seen.iter().any(|d| d.refusal.is_none()));
+        assert!(seen.iter().any(|d| d.refusal.is_some()));
+        for d in seen {
+            if d.refusal.is_some() {
+                assert!(!d.method.acts(), "{d:?}");
+                assert!(!d.acts(), "{d:?}");
+            } else {
+                assert_eq!(d.acts(), d.method.acts(), "{d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_build_refusals_win_in_order_and_keep_the_method() {
+        let outcomes = [
+            acting(InstallMethod::Tarball),
+            acting(InstallMethod::Homebrew),
+            mismatch(InstallMethod::Deb, InstallMethod::Tarball),
+            UNKNOWN,
+            Detection {
+                method: InstallMethod::Mcpb,
+                refusal: Some(Refusal::Mcpb),
+            },
+        ];
+        for found in outcomes {
+            for packaged in [false, true] {
+                let unofficial = found.for_build(false, packaged);
+                assert_eq!(unofficial.refusal, Some(Refusal::NotOfficial));
+                assert_eq!(unofficial.method, found.method);
+                assert!(!unofficial.acts());
+            }
+            let packaged = found.for_build(true, true);
+            assert_eq!(packaged.refusal, Some(Refusal::AppPackage));
+            assert_eq!(packaged.method, found.method);
+            assert!(!packaged.acts());
+            assert_eq!(found.for_build(true, false), found);
+        }
+        assert!(acting(InstallMethod::Tarball).for_build(true, false).acts());
+    }
+
+    #[test]
+    fn a_marker_that_is_too_long_or_not_a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "long/bin");
+        marker(&exe, "../libexec", &format!("homebrew{}\n", " ".repeat(64)));
+        assert_eq!(detect_on(Os::OtherUnix, &exe, &no_env, None), UNKNOWN);
+        let exe = exe_at(tmp.path(), "dir/bin");
+        std::fs::create_dir_all(marker_path(&exe, "../libexec")).unwrap();
+        assert_eq!(detect_on(Os::OtherUnix, &exe, &no_env, None), UNKNOWN);
+        let exe = exe_at(tmp.path(), "bytes/bin");
+        let path = marker_path(&exe, "../libexec");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, [0xff, 0xfe]).unwrap();
+        assert_eq!(detect_on(Os::OtherUnix, &exe, &no_env, None), UNKNOWN);
+        // A marker just under the limit still reads.
+        let exe = exe_at(tmp.path(), "padded/bin");
+        marker(&exe, "../libexec", &format!("homebrew{}", " ".repeat(56)));
+        assert_eq!(
+            detect_on(Os::OtherUnix, &exe, &no_env, None),
+            acting(InstallMethod::Homebrew)
+        );
     }
 }

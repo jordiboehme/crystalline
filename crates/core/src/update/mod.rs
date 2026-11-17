@@ -12,7 +12,7 @@ pub use cache::{
     CheckOutcome, Gate, UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT, UpdateCache, age_gate,
 };
 pub use install::{
-    CHANNEL_ENV, Detection, InstallMethod, MARKER_FILE, Refusal, archive_member, asset_name,
-    detect, official_build, release_platform,
+    CHANNEL_ENV, DetectedInstall, Detection, InstallMethod, MARKER_FILE, Refusal, archive_member,
+    asset_name, detect, display_path, official_build, release_platform,
 };
-pub use verify::{Checks, VerifyError, verify_digest, verify_signature, verify_sums_line};
+pub use verify::{Checks, Sha256Digest, SignedSums, VerifyError, verify_digest, verify_signature};
