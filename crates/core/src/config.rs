@@ -897,6 +897,9 @@ pub enum GithubAppPresence {
     Configured,
     /// An App may be saved and has not been read yet.
     Loading,
+    /// An App would be sealed in the Postgres database, which this process
+    /// does not read (a report without the key or the vault): not checked.
+    Sealed,
 }
 
 /// Why a [`EffectiveShareIdentity`] holds its mode.
@@ -911,6 +914,9 @@ pub enum ShareIdentityReason {
     /// The key is absent and an App may be saved but has not been read: the
     /// narrower share gate holds until it has.
     AppLoading,
+    /// The key is absent and whether an App is saved was not checked: it
+    /// would be sealed in the database, which a report does not read.
+    AppSealed,
 }
 
 /// The share identity mode in effect, and why. The single rule every reader
@@ -941,6 +947,9 @@ impl EffectiveShareIdentity {
             (None, GithubAppPresence::Loading) => {
                 (ShareIdentityMode::Instance, ShareIdentityReason::AppLoading)
             }
+            (None, GithubAppPresence::Sealed) => {
+                (ShareIdentityMode::Instance, ShareIdentityReason::AppSealed)
+            }
         };
         EffectiveShareIdentity { mode, reason }
     }
@@ -957,7 +966,15 @@ impl EffectiveShareIdentity {
             ShareIdentityReason::NoApp => "default, because no GitHub App is configured",
             ShareIdentityReason::App => "default, because a GitHub App is configured",
             ShareIdentityReason::AppLoading => "default, until the GitHub App has been read",
+            ShareIdentityReason::AppSealed => "sealed in the database (not checked)",
         }
+    }
+
+    /// Whether the mode is known: false when it would depend on a GitHub App
+    /// sealed in the database, which was not read. A report then says so
+    /// instead of naming a mode.
+    pub fn is_checked(&self) -> bool {
+        self.reason != ShareIdentityReason::AppSealed
     }
 }
 

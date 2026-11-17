@@ -538,14 +538,40 @@ pub fn keep_secrets_off_local_stores(cfg: &GlobalConfig) {
     }
 }
 
-/// [`keep_secrets_off_local_stores`] for the configuration at
-/// `config_path` (the default one for `None`), read once at a CLI process's
-/// start. A configuration that does not load changes nothing here: the
-/// command reports it when it loads it itself.
-pub fn keep_secrets_off_local_stores_for(config_path: Option<&Path>) {
-    if let Ok(loaded) = crystalline_engine::overlay::load(config_path) {
+/// [`keep_secrets_off_local_stores`] for the configuration this process's
+/// command reads: the file its `--config` names, else `CRYSTALLINE_CONFIG`
+/// or the default one. Read once at a CLI process's start, after
+/// [`set_command_line`], and quietly: the command's own load says what is
+/// wrong with the file. A configuration that does not load changes nothing
+/// here.
+pub fn keep_secrets_off_local_stores_for_command() {
+    let config_path = command_config_path();
+    let loaded =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            crystalline_engine::overlay::load(config_path.as_deref())
+        });
+    if let Ok(loaded) = loaded {
         keep_secrets_off_local_stores(&loaded.effective);
     }
+}
+
+/// The value of the `--config` flag among the command's words (as
+/// `--config x` or `--config=x`), the last one when it is given twice.
+fn command_config_path() -> Option<std::path::PathBuf> {
+    config_flag(&COMMAND.get()?.words)
+}
+
+fn config_flag(words: &[String]) -> Option<std::path::PathBuf> {
+    let mut found = None;
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if word == "--config" {
+            found = words.next().map(std::path::PathBuf::from);
+        } else if let Some(value) = word.strip_prefix("--config=") {
+            found = Some(std::path::PathBuf::from(value));
+        }
+    }
+    found
 }
 
 /// Where a CLI command that changes a secret (a GitHub token, a server
@@ -1116,9 +1142,8 @@ pub(crate) mod pg {
     /// machine seals with.
     pub(crate) fn other_key_than_daemon(theirs: &str, mine: &str) -> String {
         format!(
-            "the active instance on this machine seals its secrets with key {theirs}, but {} here is key {mine}, so nothing was changed. Set {} to the instance's key",
-            crystalline_remote::sealed::KEY_ENV,
-            crystalline_remote::sealed::KEY_ENV
+            "the active instance on this machine seals its secrets with key {theirs}, but {var} here is key {mine}, so nothing was changed. Set {var} to the instance's key",
+            var = crate::secret_start::key_variable_in_use()
         )
     }
 
@@ -1228,6 +1253,22 @@ pub(crate) mod pg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `--config` of a command is read in both spellings, the last one
+    /// winning; without one there is none.
+    #[test]
+    fn the_config_flag_is_read_from_the_words() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            config_flag(&words(&["serve", "--config", "/a.yaml"])),
+            Some(std::path::PathBuf::from("/a.yaml"))
+        );
+        assert_eq!(
+            config_flag(&words(&["--config=/a.yaml", "sync", "--config", "/b.yaml"])),
+            Some(std::path::PathBuf::from("/b.yaml"))
+        );
+        assert_eq!(config_flag(&words(&["status", "--json"])), None);
+    }
 
     /// The example for another machine leaves this machine's paths out.
     #[test]

@@ -232,7 +232,17 @@ impl AppHome {
     /// keychain read, so a report may ask it. What the CLI feeds
     /// [`EffectiveShareIdentity::resolve`] when it has no engine.
     pub fn presence(&self, overlay: &EnvOverlay) -> GithubAppPresence {
-        if overlay.github_app(self.api_url.as_deref()).is_some() || self.maybe_saved() {
+        if overlay.github_app(self.api_url.as_deref()).is_some() {
+            return GithubAppPresence::Configured;
+        }
+        // On Postgres without an installed vault (a CLI report): a saved App
+        // would be sealed in the database, which is not read here.
+        if crystalline_remote::vault::engaged()
+            && crystalline_remote::vault::installed_key_id().is_none()
+        {
+            return GithubAppPresence::Sealed;
+        }
+        if self.maybe_saved() {
             GithubAppPresence::Configured
         } else {
             GithubAppPresence::None

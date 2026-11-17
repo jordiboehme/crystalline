@@ -66,6 +66,20 @@ pub(crate) fn plan(
     }
 }
 
+/// The variable this process's key comes from, for a sentence about it:
+/// [`KEY_FILE_ENV`] when that one is set (not blank), else [`KEY_ENV`].
+#[cfg(feature = "postgres")]
+pub(crate) fn key_variable_in_use() -> &'static str {
+    let set = |var: &str| {
+        std::env::var_os(var).is_some_and(|v| v.to_str().is_none_or(|s| !s.trim().is_empty()))
+    };
+    if set(KEY_FILE_ENV) {
+        KEY_FILE_ENV
+    } else {
+        KEY_ENV
+    }
+}
+
 /// Whether either key variable is set to something other than blank, the
 /// way [`SealKey::from_env`] tells set from unset, without reading a file.
 pub(crate) fn key_variable_set() -> bool {
@@ -107,9 +121,10 @@ pub(crate) fn check_key_ids(
         return Ok(());
     }
     Err(anyhow::anyhow!(
-        "the database {database} holds {} sealed secrets, and some are sealed with key {}, but {KEY_ENV} is key {key_id}. The secrets are kept as they are. Set {KEY_ENV} to the key they were sealed with",
+        "the database {database} holds {} sealed secrets, and some are sealed with key {}, but {var} is key {key_id}. The secrets are kept as they are. Set {var} to the key they were sealed with",
         summary.rows,
-        others.join(", ")
+        others.join(", "),
+        var = key_variable_in_use()
     ))
 }
 

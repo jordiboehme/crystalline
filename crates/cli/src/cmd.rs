@@ -3322,7 +3322,8 @@ fn share_identity_report(cfg: &GlobalConfig) -> Option<serde_json::Value> {
         app,
     );
     Some(serde_json::json!({
-        "mode": share_identity.mode.as_str(),
+        // Unknown while it would depend on an App sealed in the database.
+        "mode": share_identity.is_checked().then(|| share_identity.mode.as_str()),
         "default": share_identity.is_default(),
         "reason": share_identity.reason_text(),
     }))
@@ -3330,11 +3331,13 @@ fn share_identity_report(cfg: &GlobalConfig) -> Option<serde_json::Value> {
 
 /// One human line for a report's `share_identity` block, when it has one.
 fn print_share_identity(data: &serde_json::Value) {
-    if let Some(mode) = data["share_identity"]["mode"].as_str() {
-        println!(
-            "Shares run on: {mode} identity ({})",
-            data["share_identity"]["reason"].as_str().unwrap_or("?")
-        );
+    let reason = data["share_identity"]["reason"].as_str().unwrap_or("?");
+    match data["share_identity"]["mode"].as_str() {
+        Some(mode) => println!("Shares run on: {mode} identity ({reason})"),
+        None if data["share_identity"].is_object() => {
+            println!("Shares run on: {reason}");
+        }
+        None => {}
     }
 }
 

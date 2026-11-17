@@ -3739,6 +3739,20 @@ fn sealing_beside_a_daemon_with_another_key_is_refused_on_an_empty_table() {
     let (ok, out, err) = run_vars(&env, &["connect", "github"], &with);
     assert!(!ok, "{out}{err}");
     assert!(err.contains(&test_key_id()), "the daemon's key id: {err}");
+    assert!(err.contains("CRYSTALLINE_SECRET_KEY here is key"), "{err}");
+    // A key from the file variable is named as such.
+    let file = env.state_dir().join("../other.key");
+    std::fs::write(&file, &other).unwrap();
+    let file = file.to_str().unwrap().to_string();
+    with.pop();
+    with.push(("CRYSTALLINE_SECRET_KEY", ""));
+    with.push(("CRYSTALLINE_SECRET_KEY_FILE", &file));
+    let (ok, out, err) = run_vars(&env, &["connect", "github"], &with);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains("CRYSTALLINE_SECRET_KEY_FILE here is key"),
+        "{err}"
+    );
     assert!(
         github.users_asked_with.lock().unwrap().is_empty(),
         "no sign-in"
@@ -3806,4 +3820,67 @@ fn reports_on_postgres_read_no_local_store() {
     let text = format!("{out}{err}");
     assert!(!text.contains("planted-user"), "{text}");
     assert!(!text.contains(r#""credential_store":"file""#), "{text}");
+    // The default share identity depends on an App that would be sealed in
+    // the database: not checked, and said so.
+    let (ok, out, err) = run_vars(&env, &["--json", "config", "show"], &github);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(r#""key":"github.share_identity","source":"default","value":"sealed in the database (not checked)""#),
+        "{out}"
+    );
+}
+
+/// `--config` decides the backend for the whole process: with the default
+/// configuration on Postgres, a command run with `--config` naming a Turso
+/// file keeps its credentials where Turso keeps them, and nothing is
+/// refused for a vault that is not there.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn a_turso_config_flag_wins_over_a_postgres_default() {
+    let github = PodGithub::start();
+    let env = Env::new("vtflag");
+    let default = env.config_path();
+    std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+    std::fs::write(
+        &default,
+        "database:\n  backend: postgres\n  url: postgres://u@127.0.0.1:1/none\n",
+    )
+    .unwrap();
+    let turso = default.parent().unwrap().join("turso.yaml");
+    std::fs::write(&turso, format!("github:\n  api_url: {}\n", github.url)).unwrap();
+    let tokens = default.parent().unwrap().join("tokens");
+    let tokens_var = tokens.to_str().unwrap().to_string();
+    let (ok, out, err) = run_vars(
+        &env,
+        &[
+            "connect",
+            "github",
+            "--token",
+            "ghp_flag",
+            "--config",
+            turso.to_str().unwrap(),
+        ],
+        &[("CRYSTALLINE_TEST_TOKEN_STORE_DIR", &tokens_var)],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(!err.contains("vault"), "{err}");
+    let saved: Vec<_> = std::fs::read_dir(&tokens)
+        .map(|dir| dir.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(!saved.is_empty(), "the token is in the Turso file store");
+}
+
+/// The main-level look at the configuration is quiet: a warning the
+/// command's own load gives about the file is said once, not twice.
+#[test]
+fn a_config_warning_is_said_once_per_command() {
+    let env = Env::new("vtwarn");
+    let (_, out, err) = run_vars(
+        &env,
+        &["users", "list"],
+        &[("CRYSTALLINE_SERVICE_PUBLIC_URL", "http://0.0.0.0:7411")],
+    );
+    let text = format!("{out}{err}");
+    let warning = "must be an address a browser can open";
+    assert_eq!(text.matches(warning).count(), 1, "{text}");
 }
