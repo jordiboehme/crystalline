@@ -2650,9 +2650,12 @@ impl McpServer {
         // lock reason as the neighbours advisory, and at the same time as that
         // advisory rather than after it, so the write waits for the slower of
         // the two and the hint's own short budget adds nothing beyond it.
+        // The probe reads the body the write stored, without a frontmatter
+        // block the content opened with.
+        let merged = p.with_content_frontmatter_merged();
         let folders = Engine::close_folder_probe(&receipt);
         let (mut receipt, close) = tokio::join!(
-            self.with_similar(receipt, SimilarProbe::for_write(&p), scope),
+            self.with_similar(receipt, SimilarProbe::for_write(&merged), scope),
             self.engine.close_folders_for(folders.as_ref(), scope),
         );
         Engine::attach_close_folders(&mut receipt, &close);

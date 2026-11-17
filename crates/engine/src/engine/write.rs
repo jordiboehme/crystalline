@@ -365,10 +365,11 @@ impl Engine {
         let p = self.localized_for(p, scope).await?.lf_only();
         // A frontmatter block at the top of `content` goes into this write's
         // own parameters, ahead of the defaults below, so a parameter left
-        // out can still be told from one set. A block that cannot be read is
-        // refused where `build_markdown` refuses unbuildable content, so that
-        // refusal never hides a collision answer.
-        let (p, lifted, unreadable_block) =
+        // out can still be told from one set. A block whose title, type,
+        // status or tags is not plain text is refused where `build_markdown`
+        // refuses unbuildable content, so that refusal never hides a
+        // collision answer.
+        let (p, lifted, unbuildable_block) =
             match super::content_frontmatter::lift_content_frontmatter(&p) {
                 Ok((lifted_params, lifted)) => (lifted_params, Some(lifted), None),
                 Err(refused) => (p, None, Some(refused)),
@@ -491,7 +492,7 @@ impl Engine {
         // The model the agent reported, held against the actor this write
         // records: a person's write never carries one (`stamped_model`).
         let model = stamped_model(&actor, p.model.as_deref());
-        if let Some(refused) = unreadable_block {
+        if let Some(refused) = unbuildable_block {
             return Err(refused);
         }
         let markdown = build_markdown(

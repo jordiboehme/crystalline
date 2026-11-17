@@ -64,12 +64,25 @@ impl Lifted {
     }
 }
 
+impl WriteParams {
+    /// These parameters as the write reads them: a leading frontmatter block
+    /// in `content` lifted into the parameters, or these parameters unchanged
+    /// when there is none or it cannot be lifted (the write refuses that one
+    /// itself). For what a surface does after the write, such as the
+    /// similar-engrams probe, so it sees the body without the block.
+    pub fn with_content_frontmatter_merged(&self) -> WriteParams {
+        lift_content_frontmatter(self)
+            .map(|(merged, _)| merged)
+            .unwrap_or_else(|_| self.clone())
+    }
+}
+
 /// `p` with a leading frontmatter block in its `content` lifted into its
 /// parameters, and what that did. A content without a block, or with one
-/// that holds no mapping (a thematic break, a line, a thematic break), comes
-/// back unchanged. A block that is not YAML at all is refused: written as
-/// body it would be the second block this exists to prevent, and dropping it
-/// would lose what the agent wrote.
+/// that holds no mapping or is not YAML at all (a thematic break, some text,
+/// a thematic break), comes back unchanged: that is markdown, and no reader
+/// takes it for frontmatter. A mapping whose title, type, status or tags is
+/// not plain text is refused by key.
 pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, Lifted)> {
     let mut out = p.clone();
     let mut lifted = Lifted::default();
@@ -88,13 +101,10 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
             out.content = Some(parts.body.to_string());
             return Ok((out, lifted));
         }
-        Ok(_) => return Ok((out, lifted)),
-        Err(e) => {
-            return Err(EngineError::Invalid(format!(
-                "content opens with a frontmatter block that is not valid YAML ({e}). Fix the \
-                 block, or leave it out and pass its keys as type, tags, status and metadata"
-            )));
-        }
+        // Not a mapping, or not YAML at all: a thematic break, some text and
+        // a thematic break is ordinary markdown, and no reader ever took it
+        // for frontmatter, so it stays body text as it always did.
+        Ok(_) | Err(_) => return Ok((out, lifted)),
     };
 
     // The caller's own metadata, decoded the way `build_markdown` decodes it.
@@ -154,15 +164,15 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
 }
 
 /// Whether `content` opens with what reads as a frontmatter block: a block
-/// whose YAML is a mapping, or is not YAML at all. A prepend puts its content
-/// right under the engram's frontmatter, where such a block is a second one
-/// that every reader takes for body text, so a prepend refuses it.
+/// whose YAML is a mapping. A block that is not YAML is text. A prepend puts
+/// its content right under the engram's frontmatter, where such a block is a
+/// second one that every reader takes for body text, so a prepend refuses it.
 pub(super) fn opens_with_frontmatter(content: &str) -> bool {
     crystalline_core::frontmatter::split_frontmatter(content.trim_start_matches('\n')).is_some_and(
         |parts| {
             matches!(
                 serde_yaml_ng::from_str::<Yaml>(parts.yaml),
-                Ok(Yaml::Mapping(_)) | Err(_)
+                Ok(Yaml::Mapping(_))
             )
         },
     )
@@ -311,13 +321,29 @@ mod tests {
     }
 
     #[test]
-    fn only_a_mapping_or_broken_yaml_reads_as_a_block_for_a_prepend() {
+    fn only_a_mapping_reads_as_a_block_for_a_prepend() {
         assert!(opens_with_frontmatter("---\nstatus: draft\n---\nIntro"));
-        assert!(opens_with_frontmatter("\n---\ntags: [x\n---\nIntro"));
+        assert!(opens_with_frontmatter("\n---\nstatus: draft\n---\nIntro"));
+        assert!(!opens_with_frontmatter("---\ntags: [x\n---\nIntro"));
         assert!(!opens_with_frontmatter("---\nJust a line\n---\nIntro"));
         assert!(!opens_with_frontmatter(
             "Intro\n\n---\nstatus: draft\n---\n"
         ));
+    }
+
+    #[test]
+    fn a_block_that_is_not_yaml_is_left_as_body() {
+        let p = params("---\nNot: [yaml\n---\nBody\n");
+        let (out, lifted) = lift_content_frontmatter(&p).unwrap();
+        assert_eq!(out.content, p.content);
+        assert_eq!(lifted, Lifted::default());
+    }
+
+    #[test]
+    fn the_merged_params_carry_the_body_without_the_block() {
+        let merged = params("---\nstatus: draft\n---\nBody\n").with_content_frontmatter_merged();
+        assert_eq!(merged.body(), "Body\n");
+        assert_eq!(merged.status.as_deref(), Some("draft"));
     }
 
     #[test]

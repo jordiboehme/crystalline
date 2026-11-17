@@ -184,21 +184,23 @@ async fn explicit_metadata_wins_over_the_same_key_in_the_block() {
     assert_eq!(receipt["status"], "stable");
 }
 
+/// Two `---` lines with text between them that is not YAML is markdown (a
+/// thematic break, some text, a thematic break) and no reader takes it for
+/// frontmatter, so it stays body text as it always did.
 #[tokio::test]
-async fn a_block_that_is_not_yaml_is_refused_and_nothing_is_written() {
-    let (tmp, engine) = fixture().await;
-    let err = engine
+async fn a_block_that_is_not_yaml_stays_body_text() {
+    let (_tmp, engine) = fixture().await;
+    engine
         .write_engram(&capture(
             "eng",
             "Broken",
             "---\ntags: [unclosed\n---\n\nBody.\n",
         ))
         .await
-        .unwrap_err();
-    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
-    let text = err.to_string();
-    assert!(text.contains("frontmatter"), "{text}");
-    assert!(!tmp.path().join("eng/broken.md").exists());
+        .unwrap();
+    let engram = parse_engram(&stored(&engine, "eng", "broken").await).unwrap();
+    assert!(engram.body.contains("tags: [unclosed"), "{}", engram.body);
+    assert!(engram.frontmatter.tags.is_empty());
 }
 
 /// A thematic break, a line and a thematic break is markdown, not a
@@ -253,6 +255,28 @@ async fn a_prepend_that_opens_with_a_frontmatter_block_is_refused() {
     assert!(matches!(err, EngineError::Invalid(_)), "{err}");
     assert!(err.to_string().contains("set_frontmatter"), "{err}");
     assert_eq!(stored(&engine, "eng", "plain").await, before);
+}
+
+/// A prepend whose leading block is not YAML is text and lands as sent.
+#[tokio::test]
+async fn a_prepend_whose_block_is_not_yaml_lands_as_text() {
+    let (_tmp, engine) = fixture().await;
+    engine
+        .write_engram(&capture("eng", "Plain", "Body."))
+        .await
+        .unwrap();
+    engine
+        .edit_engram(&EditParams {
+            identifier: "plain".to_string(),
+            domain: "eng".to_string(),
+            operation: "prepend".to_string(),
+            content: Some("---\nNot: [yaml\n---\n\nIntro.".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let engram = parse_engram(&stored(&engine, "eng", "plain").await).unwrap();
+    assert!(engram.body.contains("Not: [yaml"), "{}", engram.body);
 }
 
 /// An upload is a file, not an engram: a YAML file that opens with `---` is
