@@ -584,7 +584,13 @@ pub async fn run_serve(
             // (spec section C). A failed read stops the start: an instance
             // that went on with config.yaml alone would save over the stored
             // settings.
+            let early_base = crate::settings::base_path(&loaded.effective);
             let document = read_document_at_takeover(&mut loaded, pg).await?;
+            if let Some(line) =
+                base_path_moved_warning(&early_base, &crate::settings::base_path(&loaded.effective))
+            {
+                tracing::warn!("{line}");
+            }
             if let Some(line) = http_addr
                 .as_deref()
                 .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
@@ -1325,6 +1331,39 @@ async fn read_document_at_takeover(
         .map_err(|e| fatal(format!("{e:#}")))?;
     start_step("configuration read");
     Ok(state)
+}
+
+/// The start's warning when the configuration document moves the base path:
+/// the early HTTP endpoint answered its probes under `early`, the base path
+/// config.yaml and the environment give, and the full router serves under
+/// `after`, the one the document's `service.public_url` gives. A document
+/// saved before config.yaml or the environment changed can do this; a save
+/// that would do it is refused.
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres start reads a document")
+)]
+fn base_path_moved_warning(
+    early: &crystalline_core::base::BasePath,
+    after: &crystalline_core::base::BasePath,
+) -> Option<String> {
+    if early == after {
+        return None;
+    }
+    let shown = |path: &crystalline_core::base::BasePath| {
+        if path.is_root() {
+            "/".to_string()
+        } else {
+            path.as_str().to_string()
+        }
+    };
+    Some(format!(
+        "the configuration in the database sets service.public_url with the base path {}, but config.yaml and the environment give {}; the health and readiness probes answered under {} until now and everything answers under {} from here on. Set the same service.public_url in config.yaml or CRYSTALLINE_SERVICE_PUBLIC_URL, or remove it from the database with `crystalline config unset service.public_url`",
+        shown(after),
+        shown(early),
+        shown(early),
+        shown(after)
+    ))
 }
 
 /// Warn once at the start about each domain from the environment that
@@ -4494,6 +4533,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A base path the document moves is said at the start, with both
+    /// paths; the same path is not.
+    #[test]
+    fn a_moved_base_path_is_said_at_the_start() {
+        use crystalline_core::base::BasePath;
+        let root = BasePath::parse("/").unwrap();
+        let kb = BasePath::parse("/crystalline").unwrap();
+        assert_eq!(super::base_path_moved_warning(&kb, &kb), None);
+        assert_eq!(super::base_path_moved_warning(&root, &root), None);
+        let line = super::base_path_moved_warning(&root, &kb).unwrap();
+        assert!(
+            line.starts_with(
+                "the configuration in the database sets service.public_url with the base path /crystalline, but config.yaml and the environment give /;"
+            ),
+            "{line}"
+        );
+        let line = super::base_path_moved_warning(&kb, &root).unwrap();
+        assert!(
+            line.contains("base path /, but config.yaml and the environment give /crystalline"),
+            "{line}"
+        );
+    }
+
     use super::*;
 
     /// A domain the watcher already watches, handed to it again because
