@@ -221,11 +221,50 @@ impl Engine {
 
     /// Whether this engine keeps its configuration in a database document
     /// over a read-only `config.yaml` base.
-    pub(crate) fn config_in_document(&self) -> bool {
+    pub fn config_in_document(&self) -> bool {
         matches!(
             self.persisted,
             Some(crate::persisted::PersistedConfig::Document { .. })
         )
+    }
+
+    /// In document mode, run the registration `register` (one of
+    /// [`crate::registration`]'s `_saving` functions) over this engine's own
+    /// configuration: under the `file_config` write guard, checked against
+    /// the base and the held document, and saved through
+    /// `Engine::commit_config`, so memory moves with the saved document and
+    /// a later lookup finds the domain. This engine is the document's only
+    /// writer, so a registration a client asks of it (the ctl
+    /// `domain_register`) must never write the document beside it.
+    ///
+    /// `None` in file mode: there a registration loads and writes
+    /// `config.yaml` itself, as it always did.
+    pub fn register_in_document(
+        &self,
+        register: impl FnOnce(
+            crate::overlay::LoadedConfig,
+            crate::registration::SaveRegistration<'_>,
+        ) -> anyhow::Result<crate::registration::Registered>,
+    ) -> Option<anyhow::Result<crate::registration::Registered>> {
+        let Some(crate::persisted::PersistedConfig::Document { doc, .. }) = &self.persisted else {
+            return None;
+        };
+        let mut guard = self.file_config.write().unwrap();
+        let loaded = crate::overlay::LoadedConfig {
+            path: self.config_file_path().unwrap_or_default(),
+            file: guard.clone(),
+            effective: self.config(),
+            overlay: self.overlay.clone(),
+            mode: crate::overlay::ConfigMode::Document,
+            base: Some(self.config_base.clone().unwrap_or_default()),
+            document: Some(doc.clone()),
+        };
+        let held = &mut *guard;
+        let mut save = |cfg: GlobalConfig, _name: &str| -> anyhow::Result<()> {
+            self.commit_config(held, cfg)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        };
+        Some(register(loaded, &mut save))
     }
 
     /// The persisted layers of `file` together, without the environment: the
@@ -702,6 +741,66 @@ mod document_tests {
             key: key.into(),
             value: value.into(),
         }
+    }
+
+    /// A registration run through the engine in document mode saves the
+    /// document, moves memory with it (the domain resolves at once) and
+    /// leaves config.yaml alone; a name the base registers is adopted with
+    /// no save. In file mode the engine has nothing to run.
+    #[tokio::test]
+    async fn a_registration_through_the_engine_lands_in_document() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, bytes, tmp) = engine_on(doc.clone()).await;
+        let done = engine
+            .register_in_document(|loaded, save| {
+                crate::registration::register_virtual_domain_saving(loaded, "fresh", None, save)
+            })
+            .expect("document mode")
+            .unwrap();
+        assert!(!done.adopted);
+        let (stored, _) = crate::persisted::config_from_document(doc.stored().unwrap()).unwrap();
+        assert!(stored.domains.contains_key("fresh"), "{stored:?}");
+        assert!(!stored.domains.contains_key("base-only"));
+        assert!(engine.config().domains.contains_key("fresh"));
+        assert!(engine.discover_registered_domain("fresh"));
+        assert_eq!(
+            std::fs::read(tmp.path().join("config.yaml")).unwrap(),
+            bytes
+        );
+
+        let before = doc.stored();
+        let done = engine
+            .register_in_document(|loaded, save| {
+                crate::registration::register_virtual_domain_saving(loaded, "base-only", None, save)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(done.adopted);
+        assert_eq!(doc.stored(), before);
+
+        // A failed save changes nothing in memory.
+        *doc.fail.lock().unwrap() = Some(EngineError::Internal("the database is gone".into()));
+        let err = engine
+            .register_in_document(|loaded, save| {
+                crate::registration::register_virtual_domain_saving(loaded, "other", None, save)
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("the database is gone"), "{err}");
+        assert!(!engine.config().domains.contains_key("other"));
+
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let file_engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(tmp.path().join("other.yaml")),
+        );
+        assert!(
+            file_engine
+                .register_in_document(|_, _| unreachable!("file mode runs nothing"))
+                .is_none()
+        );
     }
 
     #[tokio::test]

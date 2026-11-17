@@ -10343,7 +10343,14 @@ pub async fn open_standalone_with_store(
     want_embeddings: bool,
 ) -> anyhow::Result<Engine> {
     // A configuration document the caller attached is where this engine
-    // persists; without one it is the config file, as it always was.
+    // persists; in file mode it is the config file, as it always was. Document
+    // mode without the document is refused: such an engine would save into
+    // the read-only base beside the instance that owns the document.
+    if loaded.mode == crate::overlay::ConfigMode::Document && loaded.document.is_none() {
+        anyhow::bail!(
+            "the configuration is kept in the database and was not read yet, so no engine is opened over config.yaml alone"
+        );
+    }
     let persisted = loaded
         .document
         .is_some()

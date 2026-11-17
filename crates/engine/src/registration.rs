@@ -44,8 +44,12 @@ pub fn register_file_domain(
     config_override: Option<&Path>,
     kept_root: Option<&Path>,
 ) -> Result<Registered> {
-    let loaded = file_until_attached(crate::overlay::load(config_override)?);
-    register_file_domain_in(loaded, name, path, kept_root)
+    register_file_domain_in(
+        crate::overlay::load(config_override)?,
+        name,
+        path,
+        kept_root,
+    )
 }
 
 /// [`register_file_domain`] over a configuration the caller loaded, with a
@@ -59,9 +63,29 @@ pub fn register_file_domain_in(
     path: Option<&Path>,
     kept_root: Option<&Path>,
 ) -> Result<Registered> {
+    let persisted = loaded.persisted()?;
+    register_file_domain_saving(loaded, name, path, kept_root, &mut |cfg, name| {
+        save_registration(&persisted, &cfg, name)
+    })
+}
+
+/// What saves a registration: it gets the persisted truth with the new entry
+/// in it and the name registered, and answers whether the save landed.
+pub type SaveRegistration<'a> = &'a mut dyn FnMut(GlobalConfig, &str) -> Result<()>;
+
+/// [`register_file_domain_in`] with the save handed in, for a caller that
+/// persists the configuration its own way: the daemon's engine in document
+/// mode, which saves under its own configuration lock and takes the saved
+/// document into memory (`Engine::register_in_document`).
+pub fn register_file_domain_saving(
+    loaded: LoadedConfig,
+    name: Option<&str>,
+    path: Option<&Path>,
+    kept_root: Option<&Path>,
+    save: SaveRegistration<'_>,
+) -> Result<Registered> {
     // Mutate the persisted truth and save it back; the environment overlay
     // is never written.
-    let persisted = loaded.persisted()?;
     let registered = loaded.persisted_view()?.into_owned();
     let mut notes = Vec::new();
 
@@ -119,7 +143,7 @@ pub fn register_file_domain_in(
                         DomainEntry::file(abs.clone()).with_name_origin(NameOrigin::Explicit);
                     let mut cfg = loaded.file;
                     cfg.domains.insert(name.to_string(), entry.clone());
-                    save_registration(&persisted, &cfg, name)?;
+                    save(cfg, name)?;
                     notes.extend(write_back_manifest_name_if_needed(&entry, &abs, name));
                     Ok(Registered {
                         name: name.to_string(),
@@ -175,7 +199,7 @@ pub fn register_file_domain_in(
                     let entry = DomainEntry::file(abs.clone()).with_name_origin(choice.origin);
                     let mut cfg = loaded.file;
                     cfg.domains.insert(choice.name.clone(), entry.clone());
-                    save_registration(&persisted, &cfg, &choice.name)?;
+                    save(cfg, &choice.name)?;
                     notes.extend(write_back_manifest_name_if_needed(
                         &entry,
                         &abs,
@@ -208,8 +232,7 @@ pub fn register_virtual_domain(
     config_override: Option<&Path>,
     kept_root: Option<&Path>,
 ) -> Result<Registered> {
-    let loaded = file_until_attached(crate::overlay::load(config_override)?);
-    register_virtual_domain_in(loaded, name, kept_root)
+    register_virtual_domain_in(crate::overlay::load(config_override)?, name, kept_root)
 }
 
 /// [`register_virtual_domain`] over a configuration the caller loaded, as
@@ -220,6 +243,19 @@ pub fn register_virtual_domain_in(
     kept_root: Option<&Path>,
 ) -> Result<Registered> {
     let persisted = loaded.persisted()?;
+    register_virtual_domain_saving(loaded, name, kept_root, &mut |cfg, name| {
+        save_registration(&persisted, &cfg, name)
+    })
+}
+
+/// [`register_virtual_domain_in`] with the save handed in, as
+/// [`register_file_domain_saving`] is to [`register_file_domain_in`].
+pub fn register_virtual_domain_saving(
+    loaded: LoadedConfig,
+    name: &str,
+    kept_root: Option<&Path>,
+    save: SaveRegistration<'_>,
+) -> Result<Registered> {
     let registered = loaded.persisted_view()?.into_owned();
     if let Some(env) = loaded.overlay.env_domain(name) {
         bail!(
@@ -250,7 +286,7 @@ pub fn register_virtual_domain_in(
             name.to_string(),
             DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
         );
-        save_registration(&persisted, &cfg, name)?;
+        save(cfg, name)?;
     }
     let today = chrono::Utc::now()
         .date_naive()
@@ -264,21 +300,6 @@ pub fn register_virtual_domain_in(
         manifest: Some(crystalline_core::manifest_template(name, &today)),
         notes,
     })
-}
-
-/// A configuration loaded here never has a document attached, so it is
-/// persisted in the config file as it always was, like an engine opened
-/// without one (`open_standalone_with_store`). This holds only until the
-/// callers attach the document and call the `_in` registrations themselves.
-fn file_until_attached(mut loaded: LoadedConfig) -> LoadedConfig {
-    if loaded.document.is_none() && loaded.mode == crate::overlay::ConfigMode::Document {
-        tracing::warn!(
-            path = %loaded.path.display(),
-            "the configuration is kept in the database, but no document is attached here, so this registration is saved in config.yaml"
-        );
-        loaded.mode = crate::overlay::ConfigMode::File;
-    }
-    loaded
 }
 
 /// Save `cfg`, the persisted truth with the registration of `name` in it.
