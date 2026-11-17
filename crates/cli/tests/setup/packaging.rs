@@ -103,37 +103,65 @@ fn the_formula_writes_the_marker() {
     );
 }
 
+/// The lines of one Dockerfile stage that start with `COPY `.
+fn copies(stage: &str) -> Vec<&str> {
+    stage
+        .lines()
+        .filter(|line| line.starts_with("COPY "))
+        .collect()
+}
+
 /// The image copies `docker/install-source`, saying `docker`, to
 /// `/usr/local/lib/crystalline/`, beside the `/usr/local/bin` the binary
 /// goes to: in the `runtime` stage (so the model variant inherits it),
-/// owned by root (no `--chown`) and read-only, with no `RUN` step.
+/// owned by root (no `--chown`) and read-only, with no `RUN` step. The
+/// Kubernetes runner image, which copies that binary into a Node image,
+/// ships its own copy of the marker in the same place.
 #[test]
 fn the_dockerfile_ships_the_marker() {
+    let target = format!("/usr/local/lib/crystalline/{MARKER_FILE}");
     let dockerfile = repo_file("Dockerfile");
     let runtime = dockerfile
         .split_once(" AS runtime\n")
         .and_then(|(_, rest)| rest.split("\nFROM ").next())
         .expect("the Dockerfile has a runtime stage");
-    let copies: Vec<&str> = runtime
-        .lines()
-        .filter(|line| line.starts_with("COPY "))
-        .collect();
-    assert!(
-        copies
-            .iter()
-            .any(|line| line.ends_with(" /usr/local/bin/crystalline")),
-        "the binary goes to /usr/local/bin, which the marker path below assumes"
-    );
-    let line =
-        format!("COPY --chmod=0444 docker/{MARKER_FILE} /usr/local/lib/crystalline/{MARKER_FILE}");
-    assert!(copies.contains(&line.as_str()), "no `{line}` in {copies:?}");
+    let runner = repo_file("examples/kubernetes/Dockerfile");
+    let images = [
+        (
+            "Dockerfile",
+            copies(runtime),
+            format!("docker/{MARKER_FILE}"),
+        ),
+        (
+            "examples/kubernetes/Dockerfile",
+            copies(&runner),
+            format!("examples/kubernetes/{MARKER_FILE}"),
+        ),
+    ];
+    for (file, copies, source) in images {
+        assert!(
+            copies
+                .iter()
+                .any(|line| line.ends_with(" /usr/local/bin/crystalline")),
+            "{file}: the binary goes to /usr/local/bin, which the marker path assumes"
+        );
+        // The source is relative to the build context: the repository root
+        // for the image, the example's folder for the runner.
+        let relative = if file == "Dockerfile" {
+            source.as_str()
+        } else {
+            MARKER_FILE
+        };
+        let line = format!("COPY --chmod=0444 {relative} {target}");
+        assert!(
+            copies.contains(&line.as_str()),
+            "{file}: no `{line}` in {copies:?}"
+        );
+        assert_eq!(marker(&source).as_deref(), Some("docker\n"), "{source}");
+    }
     assert!(
         !dockerfile.lines().any(|line| line.starts_with("RUN ")),
         "the image has no RUN step"
-    );
-    assert_eq!(
-        marker(&format!("docker/{MARKER_FILE}")).as_deref(),
-        Some("docker\n")
     );
     let ignored = repo_file(".dockerignore");
     assert!(
