@@ -7994,9 +7994,10 @@ fn every_instance_write_guard_meets_the_domain_flag() {
     .flat_map(|needle| call_sites(needle))
     .collect();
     let instance_wide: &[(&str, &str)] = &[
-        // The configuration and the harness decisions it records.
-        ("engine.rs", "configure"),
-        ("engine.rs", "provision"),
+        // The configuration and the harness decisions it records (the
+        // bodies behind `configure`, `provision` and their operator forms).
+        ("engine.rs", "configure_frozen"),
+        ("engine.rs", "provision_frozen"),
         // A registration, which writes the config and a MANIFEST scaffold
         // for a domain that is not read-only yet.
         ("engine.rs", "domain_add_local_as"),
