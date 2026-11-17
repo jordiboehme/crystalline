@@ -261,7 +261,8 @@ pub(crate) fn holder_config_path() -> Option<String> {
 }
 
 pub use crate::serving::{
-    HttpBinding, ServeIntent, StartMode, loopback_connect_addr, record_serve_intent, serve_intent,
+    HttpBinding, ServeIntent, StartMode, loopback_connect_addr, record_serve_intent,
+    refresh_allowed_hosts, serve_intent,
 };
 
 /// The option token that tells the daemon this stdio session's harness is

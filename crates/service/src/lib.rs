@@ -69,7 +69,7 @@ pub use claim::{
 };
 pub use client::{
     ROUTING_READ_ONLY_KEY, VirtualRouting, adopt_domain_names_direct, collect_orphaned_domains,
-    configure, ctl_if_running, ctl_if_running_passive, ctl_required, ctl_routed,
+    config_for_report, configure, ctl_if_running, ctl_if_running_passive, ctl_required, ctl_routed,
     ctl_routed_waiting, discard_rename_journal, domain_export, domain_export_from_copy,
     domain_import, domain_remove, domain_rename, domain_review, machine_rename_owner, name_report,
     origin_add, origin_changes, origin_discard, origin_resolve, origin_share, origin_status,

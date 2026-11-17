@@ -142,7 +142,8 @@ impl Engine {
     /// Set (`Some`) or unset (`None`) the setting `key` in `file`, with the
     /// pair rule of [`settings::apply_checked`]. In document mode a
     /// `database.*` key is refused (where the configuration lives is decided
-    /// by that block, so it stays in config.yaml and the environment) and the
+    /// by that block, so it stays in config.yaml and the environment), so is
+    /// `service.http` (bound before the document is read), and the
     /// pair rule is checked over the document merged with its base, the way
     /// the running server reads it.
     fn apply_setting(&self, file: &mut GlobalConfig, key: &str, value: Option<&str>) -> Result<()> {
@@ -154,6 +155,7 @@ impl Engine {
             return Ok(());
         }
         settings::refuse_database_key_in_document(key)
+            .and_then(|()| settings::refuse_bind_key_in_document(key))
             .map_err(|e| EngineError::Refused(e.to_string()))?;
         let mut next = file.clone();
         match value {
@@ -821,6 +823,40 @@ mod document_tests {
             assert!(matches!(err, EngineError::Refused(_)), "{key}: {err}");
         }
         assert_eq!(doc.stored(), None, "nothing was saved");
+    }
+
+    /// `service.http` is bound before the document is read, so a document
+    /// value could never apply: set and unset are refused, naming where it
+    /// belongs.
+    #[tokio::test]
+    async fn config_set_service_http_refused_in_document_mode() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, _tmp) = engine_on(doc.clone()).await;
+        let err = engine
+            .configure(&set("service.http", "0.0.0.0:7411"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert!(
+            err.to_string().contains("CRYSTALLINE_SERVICE_HTTP"),
+            "{err}"
+        );
+        let err = engine
+            .configure(&ConfigureAction::Unset {
+                key: "service.http".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        // service.allowed_hosts is read after the takeover and stays allowed.
+        engine
+            .configure(&set("service.allowed_hosts", "example.org"))
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["http"],
+            serde_json::Value::Null
+        );
     }
 
     /// A save stores the document alone: no base domain, no base setting,

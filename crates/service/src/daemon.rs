@@ -418,9 +418,12 @@ pub async fn run_serve(
     // An open MCP tier on a reachable bind is said out loud at every start,
     // through the same channel as the notices above: stderr for a foreground
     // serve (and so `docker logs`), daemon.log for a daemonized one.
-    if let Some(line) = http_addr
-        .as_deref()
-        .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
+    // On Postgres `auth.mcp` may come from the configuration document, so
+    // the warning waits for the takeover read (below).
+    if overlay::config_mode(&loaded.effective) == overlay::ConfigMode::File
+        && let Some(line) = http_addr
+            .as_deref()
+            .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
     {
         tracing::warn!("{line}");
     }
@@ -557,7 +560,30 @@ pub async fn run_serve(
         // section C). A failed read stops the start: an instance that went
         // on with config.yaml alone would save over the stored settings.
         read_document_at_takeover(&mut loaded, pg).await?;
+        if let Some(line) = http_addr
+            .as_deref()
+            .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
+        {
+            tracing::warn!("{line}");
+        }
     }
+    // `service.allowed_hosts` may come from the document too, and the router
+    // is built after the read (the `--allowed-host` flag still wins), so the
+    // recorded intent, `/health` and the record say what it accepts.
+    #[cfg(feature = "postgres")]
+    let allowed_hosts = match &pg_start {
+        Some(_) => {
+            let hosts = resolve_allowed_hosts(&allowed_host_flag, &loaded.effective);
+            if hosts != allowed_hosts {
+                crate::instance::refresh_allowed_hosts(hosts.clone());
+                if let Err(e) = owned(&ownership, |o| o.publish()).and_then(|r| Ok(r?)) {
+                    tracing::warn!("could not publish the record again ({e:#})");
+                }
+            }
+            hosts
+        }
+        None => allowed_hosts,
+    };
     // The document can set `service.read_only` too.
     let read_only = read_only || loaded.effective.read_only();
     // The owner of a Postgres database is its only active instance, so the

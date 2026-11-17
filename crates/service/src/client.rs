@@ -2708,9 +2708,14 @@ async fn configure_document(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use crate::engine::ConfigureAction;
+    if let Some(key) = key.filter(|_| action != "show") {
+        crate::settings::refuse_bind_key_in_document(key).map_err(anyhow::Error::msg)?;
+    }
     let action = match action {
         "show" => {
-            let view = document_view(&loaded).await?;
+            let mut loaded = loaded;
+            attach_viewed_document(&mut loaded).await?;
+            let view = loaded.persisted_view()?;
             return Ok(serde_json::json!({
                 "settings": standalone_snapshot(&view, &loaded.overlay)
             }));
@@ -2736,14 +2741,12 @@ async fn configure_document(
     Ok(engine.configure(&action).await?)
 }
 
-/// The persisted configuration `loaded` stands for when it lives in the
-/// database: the stored document over config.yaml, read on a lock-free
-/// probe connection. A document that cannot be read is an error, never a
-/// view of config.yaml alone.
+/// The configuration document of `loaded`'s database, read on a lock-free
+/// probe connection, for a view that runs without the active instance.
 #[cfg(feature = "postgres")]
-async fn document_view(
+async fn read_document_lock_free(
     loaded: &overlay::LoadedConfig,
-) -> anyhow::Result<crystalline_core::config::GlobalConfig> {
+) -> anyhow::Result<Option<serde_json::Value>> {
     let target = crystalline_index::postgres::PgTarget::from_config(&loaded.effective.database())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let doc = crystalline_index::postgres::read_config_document(&target)
@@ -2754,23 +2757,61 @@ async fn document_view(
                 target.describe()
             )
         })?;
-    let document = match doc {
-        Some(doc) => crystalline_engine::persisted::config_from_document(doc.body)?.0,
-        None => crystalline_core::config::GlobalConfig::default(),
-    };
-    Ok(crystalline_engine::persisted::merge(
-        &loaded.file,
-        &document,
-    )?)
+    Ok(doc.map(|d| d.body))
 }
 
 #[cfg(not(feature = "postgres"))]
-async fn document_view(
+async fn read_document_lock_free(
     _loaded: &overlay::LoadedConfig,
-) -> anyhow::Result<crystalline_core::config::GlobalConfig> {
+) -> anyhow::Result<Option<serde_json::Value>> {
     anyhow::bail!(
         "the configuration lives in a Postgres database, and this build of Crystalline has no Postgres backend"
     )
+}
+
+/// A document read without the lock: what it held at the read, for a view.
+/// It saves nothing, so a view can never write beside the active instance.
+struct ViewedDocument;
+
+impl crystalline_engine::persisted::ConfigDocument for ViewedDocument {
+    fn load(&self) -> crate::engine::Result<Option<serde_json::Value>> {
+        Err(crate::engine::EngineError::Refused(
+            "this view of the configuration was read without owning the database".to_string(),
+        ))
+    }
+
+    fn save(&self, _body: &serde_json::Value, _by: &str) -> crate::engine::Result<()> {
+        Err(crate::engine::EngineError::Refused(
+            "this view of the configuration was read without owning the database, so it saves nothing".to_string(),
+        ))
+    }
+}
+
+/// Attach the document of `loaded`'s database, read lock-free, as a view
+/// that saves nothing. Nothing to do in file mode. A failed read is an
+/// error.
+async fn attach_viewed_document(loaded: &mut overlay::LoadedConfig) -> anyhow::Result<()> {
+    if loaded.mode != overlay::ConfigMode::Document || loaded.document.is_some() {
+        return Ok(());
+    }
+    let body = read_document_lock_free(loaded).await?;
+    loaded.attach_document(Arc::new(ViewedDocument), body)
+}
+
+/// The configuration a report without a daemon reads (`status`, `doctor`,
+/// `domain list`): [`overlay::load`], with the configuration document read
+/// lock-free and attached as a view in document mode, so the registrations
+/// in the database are listed while another instance owns it. A report
+/// always answers: a document that cannot be read is a warning, and the
+/// view is config.yaml's alone.
+pub async fn config_for_report(
+    config_path: Option<&Path>,
+) -> anyhow::Result<overlay::LoadedConfig> {
+    let mut loaded = overlay::load(config_path)?;
+    if let Err(e) = attach_viewed_document(&mut loaded).await {
+        tracing::warn!("{e:#}; the registrations shown are config.yaml's alone");
+    }
+    Ok(loaded)
 }
 
 /// [`configure`] against config.yaml itself: the whole configuration in file
@@ -2890,13 +2931,17 @@ pub async fn provision(
         return Ok(data);
     }
 
-    let loaded = overlay::load(config_path)?;
-    // With the configuration in the database, a decision is saved in the
-    // document, so the command takes the database and asks the engine,
-    // which reads and saves it (spec section C).
-    if loaded.mode == overlay::ConfigMode::Document {
+    let mut loaded = overlay::load(config_path)?;
+    // With the configuration in the database, `status` reads the document
+    // lock-free, as `config show` does.
+    if action == "status" {
+        attach_viewed_document(&mut loaded).await?;
+    }
+    // A decision is saved in the document, so the command takes the
+    // database and asks the engine, which reads and saves it (spec section
+    // C).
+    if loaded.mode == overlay::ConfigMode::Document && action != "status" {
         let action = match action {
-            "status" => crate::engine::ProvisionAction::Status,
             "apply" => crate::engine::ProvisionAction::Apply,
             "allow" | "deny" => {
                 let domain = domain

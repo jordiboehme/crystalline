@@ -2775,6 +2775,18 @@ pub fn refuse_database_key_in_document(key: &str) -> Result<(), SettingsError> {
     Ok(())
 }
 
+/// Refuse `service.http` while the configuration is kept in the database:
+/// on Postgres the endpoint is bound before the instance takes the database
+/// over and reads the document, so a value saved there could never apply.
+pub fn refuse_bind_key_in_document(key: &str) -> Result<(), SettingsError> {
+    if key == "service.http" {
+        return Err(SettingsError(format!(
+            "{key} cannot be changed while the configuration is kept in the database: the endpoint is bound before the database is read, so a value saved there never applies; set CRYSTALLINE_SERVICE_HTTP or service.http in config.yaml and restart"
+        )));
+    }
+    Ok(())
+}
+
 /// [`unset`] with the same pair rule as [`apply_checked`]: taking
 /// `service.public_url` away from under a configured redirect uri that
 /// carries a prefix is refused, and changes nothing.
