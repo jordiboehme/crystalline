@@ -31,12 +31,18 @@ pub(super) struct Lifted {
     overridden: Vec<String>,
     /// Engine-owned keys the block held.
     ignored: Vec<String>,
+    /// Keys the block named with no value (`status:`), left out.
+    empty: Vec<String>,
 }
 
 impl Lifted {
     /// The receipt notice, or `None` when the block held no keys at all.
     pub(super) fn notice(&self) -> Option<String> {
-        if self.taken.is_empty() && self.overridden.is_empty() && self.ignored.is_empty() {
+        if self.taken.is_empty()
+            && self.overridden.is_empty()
+            && self.ignored.is_empty()
+            && self.empty.is_empty()
+        {
             return None;
         }
         let mut parts = Vec::new();
@@ -55,6 +61,12 @@ impl Lifted {
                 self.ignored.join(", ")
             ));
         }
+        if !self.empty.is_empty() {
+            parts.push(format!(
+                "left out, they had no value: {}",
+                self.empty.join(", ")
+            ));
+        }
         Some(format!(
             "content opened with a frontmatter block, so its keys went into the engram's \
              frontmatter instead of the body ({}). Pass them as type, tags, status and \
@@ -70,19 +82,23 @@ impl WriteParams {
     /// when there is none or it cannot be lifted (the write refuses that one
     /// itself). For what a surface does after the write, such as the
     /// similar-engrams probe, so it sees the body without the block.
+    ///
+    /// Line endings are made LF first, as the write makes them, so the probe
+    /// finds the block exactly where the write found it.
     pub fn with_content_frontmatter_merged(&self) -> WriteParams {
-        lift_content_frontmatter(self)
+        let lf = self.clone().lf_only();
+        lift_content_frontmatter(&lf)
             .map(|(merged, _)| merged)
-            .unwrap_or_else(|_| self.clone())
+            .unwrap_or(lf)
     }
 }
 
 /// `p` with a leading frontmatter block in its `content` lifted into its
-/// parameters, and what that did. A content without a block, or with one
-/// that holds no mapping or is not YAML at all (a thematic break, some text,
-/// a thematic break), comes back unchanged: that is markdown, and no reader
-/// takes it for frontmatter. A mapping whose title, type, status or tags is
-/// not plain text is refused by key.
+/// parameters, and what that did. Only a block that looks like engram
+/// frontmatter is lifted ([`frontmatter_block`]); an empty block is dropped;
+/// anything else between two rules is markdown and comes back unchanged. A
+/// lifted title, type, status or tags that is a list or a mapping is refused
+/// by key.
 pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, Lifted)> {
     let mut out = p.clone();
     let mut lifted = Lifted::default();
@@ -95,16 +111,13 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
     let Some(parts) = crystalline_core::frontmatter::split_frontmatter(content) else {
         return Ok((out, lifted));
     };
-    let mapping = match serde_yaml_ng::from_str::<Yaml>(parts.yaml) {
-        Ok(Yaml::Mapping(mapping)) => mapping,
-        Ok(Yaml::Null) => {
-            out.content = Some(parts.body.to_string());
-            return Ok((out, lifted));
-        }
-        // Not a mapping, or not YAML at all: a thematic break, some text and
-        // a thematic break is ordinary markdown, and no reader ever took it
-        // for frontmatter, so it stays body text as it always did.
-        Ok(_) | Err(_) => return Ok((out, lifted)),
+    // Two rules with nothing between them carry nothing.
+    if parts.yaml.trim().is_empty() {
+        out.content = Some(parts.body.to_string());
+        return Ok((out, lifted));
+    }
+    let Some(mapping) = frontmatter_block(parts.yaml) else {
+        return Ok((out, lifted));
     };
 
     // The caller's own metadata, decoded the way `build_markdown` decodes it.
@@ -114,6 +127,8 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
         Some(Value::Object(map)) => Some(map.clone()),
         Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
             Ok(Value::Object(map)) => Some(map),
+            // `build_markdown` accepts a metadata of `"null"` as none at all.
+            Ok(Value::Null) => Some(Map::new()),
             _ => None,
         },
         Some(_) => None,
@@ -124,6 +139,11 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
         let set_by_param = match key.as_str() {
             k if ENGINE_OWNED.contains(&k) => {
                 lifted.ignored.push(key);
+                continue;
+            }
+            // A template's `status:` with nothing after it sets nothing.
+            "title" | "type" | "status" | "tags" if value.is_null() => {
+                lifted.empty.push(key);
                 continue;
             }
             "title" => !p.title.trim().is_empty(),
@@ -163,26 +183,42 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
     Ok((out, lifted))
 }
 
-/// Whether `content` opens with what reads as a frontmatter block: a block
-/// whose YAML is a mapping. A block that is not YAML is text. A prepend puts
+/// The block between two rules as frontmatter, when it looks like engram
+/// frontmatter: a YAML mapping, with no `#` comment line (between two rules
+/// that is a markdown heading, which YAML would read as a comment and drop),
+/// that names at least one key the engram schema knows
+/// ([`crystalline_core::frontmatter::RECOGNIZED_FRONTMATTER_KEYS`]). Anything
+/// else, `Note: remember this` among them, is markdown that stays body text.
+fn frontmatter_block(yaml: &str) -> Option<serde_yaml_ng::Mapping> {
+    if yaml.lines().any(|line| line.trim_start().starts_with('#')) {
+        return None;
+    }
+    let Ok(Yaml::Mapping(mapping)) = serde_yaml_ng::from_str::<Yaml>(yaml) else {
+        return None;
+    };
+    mapping
+        .keys()
+        .any(|key| {
+            crystalline_core::frontmatter::RECOGNIZED_FRONTMATTER_KEYS
+                .contains(&key_text(key).as_str())
+        })
+        .then_some(mapping)
+}
+
+/// Whether `content` opens with a block that looks like engram frontmatter,
+/// by the rule a capture lifts one by ([`frontmatter_block`]). A prepend puts
 /// its content right under the engram's frontmatter, where such a block is a
 /// second one that every reader takes for body text, so a prepend refuses it.
 pub(super) fn opens_with_frontmatter(content: &str) -> bool {
-    crystalline_core::frontmatter::split_frontmatter(content.trim_start_matches('\n')).is_some_and(
-        |parts| {
-            matches!(
-                serde_yaml_ng::from_str::<Yaml>(parts.yaml),
-                Ok(Yaml::Mapping(_))
-            )
-        },
-    )
+    crystalline_core::frontmatter::split_frontmatter(content.trim_start_matches('\n'))
+        .is_some_and(|parts| frontmatter_block(parts.yaml).is_some())
 }
 
 /// The refusal a prepend that opens with a frontmatter block gets.
 pub(super) const PREPEND_FRONTMATTER_REFUSAL: &str = "content opens with a frontmatter block, \
-    and a prepend would leave it as a second block under the engram's own. Set each key with \
-    set_frontmatter, or rewrite the whole engram with write_engram and overwrite: true, where \
-    a leading block is merged";
+    and a prepend would leave it as a second block under the engram's own. Set the settable keys \
+    with set_frontmatter, or rewrite the whole engram with write_engram and overwrite: true, \
+    where a leading block is merged, custom keys included";
 
 /// A key as text: `1:` reads `1`.
 fn key_text(key: &Yaml) -> String {
@@ -228,7 +264,8 @@ fn tag_list(value: &Yaml) -> Result<Vec<String>> {
 }
 
 /// A YAML value as the JSON `metadata` carries, so a block key goes through
-/// the same checks a metadata key does.
+/// the same checks a metadata key does. A YAML tag (`!foo bar`) is dropped
+/// for its value, and a float JSON cannot hold (NaN, infinity) becomes null.
 fn to_json(value: &Yaml) -> Value {
     match value {
         Yaml::Null => Value::Null,
@@ -311,7 +348,7 @@ mod tests {
 
     #[test]
     fn a_double_encoded_metadata_still_wins() {
-        let mut p = params("---\nowner: block\nteam: core\n---\nBody\n");
+        let mut p = params("---\nstatus: draft\nowner: block\nteam: core\n---\nBody\n");
         p.metadata = Some(Value::String("{\"owner\":\"param\"}".into()));
         let (out, lifted) = lift_content_frontmatter(&p).unwrap();
         let meta = out.metadata.unwrap();
@@ -329,6 +366,58 @@ mod tests {
         assert!(!opens_with_frontmatter(
             "Intro\n\n---\nstatus: draft\n---\n"
         ));
+    }
+
+    /// Every key `set_frontmatter` writes is one a block is recognized by.
+    #[test]
+    fn every_settable_key_is_a_recognized_key() {
+        for key in crate::engine::SETTABLE_FRONTMATTER_KEYS {
+            assert!(
+                crystalline_core::frontmatter::RECOGNIZED_FRONTMATTER_KEYS.contains(key),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heading_between_rules_stays_body() {
+        for content in [
+            "---\n# Overview\n---\n\nBody\n",
+            "---\n# Heading\n\nSome text: here\n---\nBody\n",
+            "---\nNote: remember X\n---\nBody\n",
+        ] {
+            let p = params(content);
+            let (out, lifted) = lift_content_frontmatter(&p).unwrap();
+            assert_eq!(out.content, p.content, "{content}");
+            assert_eq!(lifted, Lifted::default(), "{content}");
+            assert!(!opens_with_frontmatter(content), "{content}");
+        }
+    }
+
+    #[test]
+    fn a_key_with_no_value_is_left_out_and_named() {
+        let (out, lifted) =
+            lift_content_frontmatter(&params("---\nstatus:\ntitle: T\n---\nBody\n")).unwrap();
+        assert_eq!(out.status, None);
+        assert_eq!(lifted.empty, vec!["status".to_string()]);
+        assert!(lifted.notice().unwrap().contains("status"));
+    }
+
+    #[test]
+    fn a_metadata_of_null_text_takes_the_block_keys() {
+        let mut p = params("---\nstatus: draft\nowner: block\n---\nBody\n");
+        p.metadata = Some(Value::String("null".into()));
+        let (out, lifted) = lift_content_frontmatter(&p).unwrap();
+        assert_eq!(out.metadata.unwrap()["owner"], "block");
+        assert!(lifted.overridden.is_empty());
+    }
+
+    #[test]
+    fn the_merged_params_find_a_block_after_crlf_blank_lines() {
+        let merged = params("\r\n\r\n---\r\nstatus: draft\r\n---\r\nBody\r\n")
+            .with_content_frontmatter_merged();
+        assert_eq!(merged.status.as_deref(), Some("draft"));
+        assert_eq!(merged.body(), "Body\n");
     }
 
     #[test]

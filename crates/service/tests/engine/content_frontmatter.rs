@@ -220,6 +220,38 @@ async fn a_block_that_is_no_mapping_stays_body_text() {
     assert!(engram.body.contains("Just a line between rules"));
 }
 
+/// A rule, a heading and a rule is markdown: YAML would read the heading as
+/// a comment, so the block is not taken for frontmatter and the heading stays.
+#[tokio::test]
+async fn a_heading_between_rules_stays_body_text() {
+    let (_tmp, engine) = fixture().await;
+    engine
+        .write_engram(&capture("eng", "Headed", "---\n# Overview\n---\n\nBody.\n"))
+        .await
+        .unwrap();
+    let engram = parse_engram(&stored(&engine, "eng", "headed").await).unwrap();
+    assert!(engram.body.contains("# Overview"), "{}", engram.body);
+}
+
+/// A line with a colon between two rules names no key the engram schema
+/// knows, so it is a note in the body and not a metadata key.
+#[tokio::test]
+async fn a_note_with_a_colon_between_rules_stays_body_text() {
+    let (_tmp, engine) = fixture().await;
+    let receipt = engine
+        .write_engram(&capture(
+            "eng",
+            "Noted",
+            "---\nNote: remember X\n---\n\nBody.\n",
+        ))
+        .await
+        .unwrap();
+    let engram = parse_engram(&stored(&engine, "eng", "noted").await).unwrap();
+    assert!(engram.body.contains("Note: remember X"), "{}", engram.body);
+    assert!(!engram.frontmatter.extra.contains_key("Note"));
+    assert!(receipt.get("notices").is_none(), "{receipt}");
+}
+
 /// An empty block carries nothing: it is dropped, and the engram keeps one.
 #[tokio::test]
 async fn an_empty_block_is_dropped() {
