@@ -424,6 +424,11 @@ pub enum EngineError {
     /// An error from the storage or parse layer.
     #[error("{0}")]
     Internal(String),
+    /// A configuration document save whose commit went out and whose outcome
+    /// is unknown: the document may or may not be stored. The caller reads the
+    /// document again instead of assuming either outcome.
+    #[error("{0}")]
+    ConfigMaybeStored(String),
     /// A GitHub collaboration error from the remote origin engine, surfaced
     /// with its message verbatim: every `RemoteError` variant is already
     /// actionable product copy (see `crystalline_remote::error`), so this
@@ -951,6 +956,15 @@ pub struct Engine {
     // registered after startup (`domain add` only ever touches the file on
     // disk) can be found by re-reading the same file. See `refresh_domain`.
     config_path: Option<PathBuf>,
+    // Where `persist_config` writes. `None` is the config file at
+    // `config_path` (or the default global path), as it always was; a
+    // `PersistedConfig::Document` keeps `file_config` in a database document
+    // instead. Set with `with_persisted`.
+    persisted: Option<crate::persisted::PersistedConfig>,
+    // The read-only `config.yaml` under the document, in document mode only:
+    // `config` is the overlay applied to this with `file_config` merged on
+    // top. `None` in file mode, where `file_config` is the whole truth.
+    config_base: Option<GlobalConfig>,
     // Domains discovered by re-reading the global config after startup,
     // layered on top of the immutable `config` snapshot taken at construction.
     // The full entry is kept (kind plus optional path) so a virtual domain
@@ -2576,6 +2590,8 @@ impl Engine {
             file_config: std::sync::RwLock::new(file_config),
             overlay: EnvOverlay::default(),
             config_path,
+            persisted: None,
+            config_base: None,
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
             embed_tx: None,
@@ -4653,11 +4669,49 @@ impl Engine {
     /// take `self` by value and the engine is then shared behind an `Arc`, so
     /// the value is still frozen for the engine's lifetime.
     pub fn with_env_overlay(mut self, overlay: EnvOverlay) -> Engine {
-        let effective = overlay.apply(&self.file_config.read().unwrap());
+        self.overlay = overlay;
+        self.retake_effective();
+        self
+    }
+
+    /// Persist the configuration through `persisted` instead of the config
+    /// file this engine was started with. For a
+    /// [`crate::persisted::PersistedConfig::Document`], the configuration this
+    /// engine was built with is the document and `base` is the parsed
+    /// read-only `config.yaml` under it (`None` when there is no file); the
+    /// effective configuration is recomputed over both. Reads nothing: the
+    /// caller hands over what it already read. Like
+    /// [`Engine::with_env_overlay`], it retakes the `skills.serve` snapshot,
+    /// so the two builders may come in either order.
+    pub fn with_persisted(
+        mut self,
+        persisted: crate::persisted::PersistedConfig,
+        base: Option<GlobalConfig>,
+    ) -> Result<Engine> {
+        self.config_base = match &persisted {
+            crate::persisted::PersistedConfig::File(_) => None,
+            crate::persisted::PersistedConfig::Document { .. } => Some(base.unwrap_or_default()),
+        };
+        self.persisted = Some(persisted);
+        let effective = self.effective_of(&self.file_config.read().unwrap())?;
         self.skills_serve = effective.skills_serve();
         *self.config.write().unwrap() = effective;
-        self.overlay = overlay;
-        self
+        Ok(self)
+    }
+
+    /// Recompute the effective configuration and the `skills.serve` snapshot
+    /// from `file_config`, for a builder that changed a layer under it. A
+    /// document that no longer merges with its base cannot happen here
+    /// ([`Engine::with_persisted`] merged the same two); should it, the
+    /// configuration without the base is used and the error logged.
+    fn retake_effective(&mut self) {
+        let file = self.file_config.read().unwrap().clone();
+        let effective = self.effective_of(&file).unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            self.overlay.apply(&file)
+        });
+        self.skills_serve = effective.skills_serve();
+        *self.config.write().unwrap() = effective;
     }
 
     /// Inject a fixed provider for every origin operation (`origin_add`,
@@ -8565,6 +8619,10 @@ impl Engine {
     /// deliberately does neither. Keep the two together: they read the same
     /// file the same way and only differ in what they do with the answer.
     fn reread_config(&self) -> Option<GlobalConfig> {
+        if self.config_in_document() {
+            // The document lives in memory; nothing else writes it.
+            return Some(self.config());
+        }
         reread_config_at(self.config_file_path(), &self.overlay)
     }
 
@@ -8841,6 +8899,11 @@ impl Engine {
     /// not a superset of the startup snapshot, and a domain registered in the
     /// snapshot is registered.
     fn registered_domain_names_checked(&self) -> Option<HashSet<String>> {
+        if self.config_in_document() {
+            let mut names: HashSet<String> = self.known_domain_names().into_iter().collect();
+            names.extend(self.config().domains.into_keys());
+            return Some(names);
+        }
         let path = self.config_file_path()?;
         if !path.is_file() {
             return None;
@@ -10279,11 +10342,27 @@ pub async fn open_standalone_with_store(
     store: Arc<Mutex<dyn Store>>,
     want_embeddings: bool,
 ) -> anyhow::Result<Engine> {
+    // A configuration document the caller attached is where this engine
+    // persists; in file mode it is the config file, as it always was. Document
+    // mode without the document is refused: such an engine would save into
+    // the read-only base beside the instance that owns the document.
+    if loaded.mode == crate::overlay::ConfigMode::Document && loaded.document.is_none() {
+        anyhow::bail!(
+            "the configuration is kept in the database and was not read yet, so no engine is opened over config.yaml alone"
+        );
+    }
+    let persisted = loaded
+        .document
+        .is_some()
+        .then(|| loaded.persisted())
+        .transpose()?;
     let LoadedConfig {
         path,
         file,
         effective,
         overlay,
+        base,
+        ..
     } = loaded;
     // A standalone data command has no `--read-only` flag of its own, so the
     // mode comes purely from the effective `service.read_only` (config or
@@ -10295,6 +10374,9 @@ pub async fn open_standalone_with_store(
     let mut engine = Engine::new(store, file, None, Some(path))
         .with_read_only(read_only)
         .with_env_overlay(overlay);
+    if let Some(persisted) = persisted {
+        engine = engine.with_persisted(persisted, base)?;
+    }
     // A one-shot command does not hold the state directory the way a daemon
     // does; the service's opener sets this while it takes the lock for a
     // recovery.

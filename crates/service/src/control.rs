@@ -439,7 +439,9 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         // Show, set or reset a setting from the settings registry. `set` and
         // `unset` refuse on a read-only daemon (the engine method itself
-        // checks); `show` is always allowed.
+        // checks) unless the configuration is kept in the database, where a
+        // settings change from the operator is no knowledge write; `show` is
+        // always allowed.
         "configure" => {
             let action = req.get("action").and_then(Value::as_str).unwrap_or("show");
             let outcome = match action {
@@ -449,7 +451,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     let value = req.get("value").and_then(Value::as_str).unwrap_or("");
                     shared
                         .engine
-                        .configure(&ConfigureAction::Set {
+                        .configure_as_operator(&ConfigureAction::Set {
                             key: key.to_string(),
                             value: value.to_string(),
                         })
@@ -459,7 +461,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     let key = req.get("key").and_then(Value::as_str).unwrap_or("");
                     shared
                         .engine
-                        .configure(&ConfigureAction::Unset {
+                        .configure_as_operator(&ConfigureAction::Unset {
                             key: key.to_string(),
                         })
                         .await
@@ -876,8 +878,9 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         // Apply, inspect or record a decision for domain-declared artifact
         // provisioning. `status` is always allowed; `allow`, `deny` and
-        // `apply` refuse on a read-only daemon (`Engine::provision` itself
-        // checks).
+        // `apply` refuse on a read-only daemon (the engine itself checks)
+        // unless the configuration is kept in the database, as for
+        // `configure`.
         "provision" => {
             let action_str = req
                 .get("action")
@@ -903,7 +906,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             match action {
                 Ok(action) => match shared
                     .engine
-                    .provision(&action, &crate::scope::Scope::Unrestricted)
+                    .provision_as_operator(&action, &crate::scope::Scope::Unrestricted)
                     .await
                 {
                     Ok(data) => (envelope_ok(data), false),
@@ -997,31 +1000,68 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .config_override()
                 .map(std::path::Path::to_path_buf);
             let kept = shared.engine.kept_folder();
-            let registered = match kind {
-                "file" => crystalline_engine::registration::register_file_domain(
-                    name,
-                    path.as_deref(),
-                    config.as_deref(),
-                    kept.as_deref(),
-                ),
-                "virtual" => match name {
-                    Some(name) => crystalline_engine::registration::register_virtual_domain(
+            let unknown = |other: &str| {
+                anyhow::anyhow!("unknown domain_register kind '{other}'; expected file or virtual")
+            };
+            let no_name = || {
+                anyhow::anyhow!(
+                    "`domain add --virtual` needs a name; there is no folder to derive one from"
+                )
+            };
+            // On Postgres this engine holds the configuration document and is
+            // its only writer: the registration runs over it, under its lock.
+            let in_document = shared
+                .engine
+                .register_in_document(|loaded, save| match kind {
+                    "file" => crystalline_engine::registration::register_file_domain_saving(
+                        loaded,
                         name,
+                        path.as_deref(),
+                        kept.as_deref(),
+                        save,
+                    ),
+                    "virtual" => match name {
+                        Some(name) => {
+                            crystalline_engine::registration::register_virtual_domain_saving(
+                                loaded,
+                                name,
+                                kept.as_deref(),
+                                save,
+                            )
+                        }
+                        None => Err(no_name()),
+                    },
+                    other => Err(unknown(other)),
+                });
+            let registered = match in_document {
+                Some(registered) => registered,
+                None => match kind {
+                    "file" => crystalline_engine::registration::register_file_domain(
+                        name,
+                        path.as_deref(),
                         config.as_deref(),
                         kept.as_deref(),
                     ),
-                    None => Err(anyhow::anyhow!(
-                        "`domain add --virtual` needs a name; there is no folder to derive one from"
-                    )),
+                    "virtual" => match name {
+                        Some(name) => crystalline_engine::registration::register_virtual_domain(
+                            name,
+                            config.as_deref(),
+                            kept.as_deref(),
+                        ),
+                        None => Err(no_name()),
+                    },
+                    other => Err(unknown(other)),
                 },
-                other => Err(anyhow::anyhow!(
-                    "unknown domain_register kind '{other}'; expected file or virtual"
-                )),
             };
             match registered {
                 Ok(done) => {
                     if !done.adopted {
                         shared.engine.discover_registered_domain(&done.name);
+                        // The sources look at config.yaml's stamp for a new
+                        // registration, and a document one never moves it.
+                        if shared.engine.config_in_document() {
+                            shared.engine.sync_sources_local();
+                        }
                     }
                     match serde_json::to_value(&done) {
                         Ok(data) => (envelope_ok(data), false),

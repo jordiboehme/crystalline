@@ -7509,12 +7509,23 @@ async fn standalone_on_postgres(
     });
     let config_path = tmp.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
-    let loaded = crystalline_service::LoadedConfig {
+    let mut loaded = crystalline_service::LoadedConfig {
         path: config_path,
         file: cfg.clone(),
+        mode: crystalline_service::overlay::config_mode(&cfg),
         effective: cfg,
         overlay: EnvOverlay::default(),
+        base: None,
+        document: None,
     };
+    // On Postgres the configuration is a document; an empty one in memory
+    // stands in for the database's.
+    loaded
+        .attach_document(
+            Arc::new(crystalline_engine::persisted::MemoryDocument::default()),
+            None,
+        )
+        .unwrap();
     let engine =
         crystalline_service::engine::open_standalone(loaded, &tmp.join("unused.db"), false)
             .await

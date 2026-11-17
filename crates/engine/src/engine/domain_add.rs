@@ -177,10 +177,7 @@ impl Engine {
                 domain_name.clone(),
                 DomainEntry::file(canonical.clone()).with_name_origin(origin),
             );
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
         }
         if !adopted {
             self.sync_sources_local();
@@ -298,23 +295,26 @@ impl Engine {
             // process may have registered this name since the snapshot above
             // was read. A file domain there is refused, not overwritten; a
             // virtual one is the same registration and is kept as it is.
-            match decide_registration(name, file.domains.get(name), &RegistrationRequest::Virtual) {
+            // In document mode the base's domains are registered too.
+            let registered = self.persisted_view(&file)?.into_owned();
+            match decide_registration(
+                name,
+                registered.domains.get(name),
+                &RegistrationRequest::Virtual,
+            ) {
                 Registration::Conflict(msg) => return Err(EngineError::Conflict(msg)),
-                Registration::Adopt => {}
+                Registration::Adopt => self.adopt_config(&mut file_guard, file)?,
                 Registration::Register => {
-                    if let Some(twin) = case_twin(name, None, file.domains.iter()) {
+                    if let Some(twin) = case_twin(name, None, registered.domains.iter()) {
                         return Err(EngineError::Conflict(case_twin_refusal(name, &twin)));
                     }
                     file.domains.insert(
                         name.to_string(),
                         DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
                     );
-                    self.persist_config(&file)?;
+                    self.commit_config(&mut file_guard, file)?;
                 }
             }
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
         }
         if is_new {
             self.sync_sources_local();
@@ -1054,6 +1054,9 @@ impl Engine {
         if let Some(conflict) = self.env_domain_conflict(name) {
             return Err(conflict);
         }
+        // A domain the read-only config.yaml registers stays there, refused
+        // before anything below purges or sweeps.
+        self.refuse_base_domain(name)?;
         // Before the sweep, not after: a removal that is going to refuse must
         // not have closed somebody's co-editing room on the way to refusing.
         let entry = self.domain_entry(name)?;

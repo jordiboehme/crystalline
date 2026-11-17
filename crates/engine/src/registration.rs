@@ -13,9 +13,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::overlay::LoadedConfig;
+use crate::persisted::PersistedConfig;
 use anyhow::{Result, anyhow, bail};
 use crystalline_core::config::{
-    self, DomainEntry, GlobalConfig, NameOrigin,
+    DomainEntry, GlobalConfig, NameOrigin,
     registration::{
         Registration, RegistrationRequest, canonical_root, case_twin, case_twin_refusal,
         choose_domain_name, decide_registration, derive_domain_name, fold_domain_name,
@@ -43,9 +44,49 @@ pub fn register_file_domain(
     config_override: Option<&Path>,
     kept_root: Option<&Path>,
 ) -> Result<Registered> {
-    // Mutate the file truth and save it back to the resolved path; the
-    // environment overlay is never written.
-    let loaded = crate::overlay::load(config_override)?;
+    register_file_domain_in(
+        crate::overlay::load(config_override)?,
+        name,
+        path,
+        kept_root,
+    )
+}
+
+/// [`register_file_domain`] over a configuration the caller loaded, with a
+/// configuration document attached when it lives in the database: the
+/// registration is checked against every persisted domain (the read-only
+/// base's included) and saved through [`LoadedConfig::persisted`], so in
+/// document mode only the document changes.
+pub fn register_file_domain_in(
+    loaded: LoadedConfig,
+    name: Option<&str>,
+    path: Option<&Path>,
+    kept_root: Option<&Path>,
+) -> Result<Registered> {
+    let persisted = loaded.persisted()?;
+    register_file_domain_saving(loaded, name, path, kept_root, &mut |cfg, name| {
+        save_registration(&persisted, &cfg, name)
+    })
+}
+
+/// What saves a registration: it gets the persisted truth with the new entry
+/// in it and the name registered, and answers whether the save landed.
+pub type SaveRegistration<'a> = &'a mut dyn FnMut(GlobalConfig, &str) -> Result<()>;
+
+/// [`register_file_domain_in`] with the save handed in, for a caller that
+/// persists the configuration its own way: the daemon's engine in document
+/// mode, which saves under its own configuration lock and takes the saved
+/// document into memory (`Engine::register_in_document`).
+pub fn register_file_domain_saving(
+    loaded: LoadedConfig,
+    name: Option<&str>,
+    path: Option<&Path>,
+    kept_root: Option<&Path>,
+    save: SaveRegistration<'_>,
+) -> Result<Registered> {
+    // Mutate the persisted truth and save it back; the environment overlay
+    // is never written.
+    let registered = loaded.persisted_view()?.into_owned();
     let mut notes = Vec::new();
 
     match name {
@@ -64,7 +105,7 @@ pub fn register_file_domain(
             // refused naming what holds it, and only a new name is checked
             // against the naming rules - so a name registered before the
             // rules existed can still be re-added.
-            let existing = loaded.file.domains.get(name).cloned();
+            let existing = registered.domains.get(name).cloned();
             if existing.is_none() {
                 validate_domain_name(name)
                     .map_err(|e| anyhow!("{e}, or point at a folder with --path <dir>"))?;
@@ -94,21 +135,15 @@ pub fn register_file_domain(
                 }),
                 Registration::Conflict(message) => bail!("{message}"),
                 Registration::Register => {
-                    if let Some(twin) = case_twin(name, None, loaded.file.domains.iter()) {
+                    if let Some(twin) = case_twin(name, None, registered.domains.iter()) {
                         bail!("{}", case_twin_refusal(name, &twin));
                     }
-                    notes.extend(set_aside_orphan(
-                        kept_root,
-                        name,
-                        loaded.file.domains.keys(),
-                    ));
+                    notes.extend(set_aside_orphan(kept_root, name, registered.domains.keys()));
                     let entry =
                         DomainEntry::file(abs.clone()).with_name_origin(NameOrigin::Explicit);
                     let mut cfg = loaded.file;
                     cfg.domains.insert(name.to_string(), entry.clone());
-                    config::save_yaml(&loaded.path, &cfg).map_err(|e| {
-                        anyhow!("failed to save config {}: {e}", loaded.path.display())
-                    })?;
+                    save(cfg, name)?;
                     notes.extend(write_back_manifest_name_if_needed(&entry, &abs, name));
                     Ok(Registered {
                         name: name.to_string(),
@@ -127,7 +162,7 @@ pub fn register_file_domain(
 
             let abs = domain_root_with_manifest(path)?;
 
-            match existing_file_domain_at(&abs, &loaded.file) {
+            match existing_file_domain_at(&abs, &registered) {
                 Some(existing_name) => Ok(Registered {
                     name: existing_name,
                     root: Some(abs),
@@ -148,7 +183,7 @@ pub fn register_file_domain(
                     // case.
                     let taken = |c: &str| {
                         table.resolve(c).is_some()
-                            || case_twin(c, None, loaded.file.domains.iter()).is_some()
+                            || case_twin(c, None, registered.domains.iter()).is_some()
                     };
                     let choice = choose_domain_name(
                         None,
@@ -159,14 +194,12 @@ pub fn register_file_domain(
                     notes.extend(set_aside_orphan(
                         kept_root,
                         &choice.name,
-                        loaded.file.domains.keys(),
+                        registered.domains.keys(),
                     ));
                     let entry = DomainEntry::file(abs.clone()).with_name_origin(choice.origin);
                     let mut cfg = loaded.file;
                     cfg.domains.insert(choice.name.clone(), entry.clone());
-                    config::save_yaml(&loaded.path, &cfg).map_err(|e| {
-                        anyhow!("failed to save config {}: {e}", loaded.path.display())
-                    })?;
+                    save(cfg, &choice.name)?;
                     notes.extend(write_back_manifest_name_if_needed(
                         &entry,
                         &abs,
@@ -199,7 +232,31 @@ pub fn register_virtual_domain(
     config_override: Option<&Path>,
     kept_root: Option<&Path>,
 ) -> Result<Registered> {
-    let loaded = crate::overlay::load(config_override)?;
+    register_virtual_domain_in(crate::overlay::load(config_override)?, name, kept_root)
+}
+
+/// [`register_virtual_domain`] over a configuration the caller loaded, as
+/// [`register_file_domain_in`] is to [`register_file_domain`].
+pub fn register_virtual_domain_in(
+    loaded: LoadedConfig,
+    name: &str,
+    kept_root: Option<&Path>,
+) -> Result<Registered> {
+    let persisted = loaded.persisted()?;
+    register_virtual_domain_saving(loaded, name, kept_root, &mut |cfg, name| {
+        save_registration(&persisted, &cfg, name)
+    })
+}
+
+/// [`register_virtual_domain_in`] with the save handed in, as
+/// [`register_file_domain_saving`] is to [`register_file_domain_in`].
+pub fn register_virtual_domain_saving(
+    loaded: LoadedConfig,
+    name: &str,
+    kept_root: Option<&Path>,
+    save: SaveRegistration<'_>,
+) -> Result<Registered> {
+    let registered = loaded.persisted_view()?.into_owned();
     if let Some(env) = loaded.overlay.env_domain(name) {
         bail!(
             "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
@@ -208,14 +265,14 @@ pub fn register_virtual_domain(
     }
     let adopted = match decide_registration(
         name,
-        loaded.file.domains.get(name),
+        registered.domains.get(name),
         &RegistrationRequest::Virtual,
     ) {
         Registration::Adopt => true,
         Registration::Conflict(message) => bail!("{message}"),
         Registration::Register => {
             validate_domain_name(name).map_err(|e| anyhow!(e))?;
-            if let Some(twin) = case_twin(name, None, loaded.file.domains.iter()) {
+            if let Some(twin) = case_twin(name, None, registered.domains.iter()) {
                 bail!("{}", case_twin_refusal(name, &twin));
             }
             false
@@ -223,18 +280,13 @@ pub fn register_virtual_domain(
     };
     let mut notes = Vec::new();
     if !adopted {
-        notes.extend(set_aside_orphan(
-            kept_root,
-            name,
-            loaded.file.domains.keys(),
-        ));
+        notes.extend(set_aside_orphan(kept_root, name, registered.domains.keys()));
         let mut cfg = loaded.file;
         cfg.domains.insert(
             name.to_string(),
             DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
         );
-        config::save_yaml(&loaded.path, &cfg)
-            .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
+        save(cfg, name)?;
     }
     let today = chrono::Utc::now()
         .date_naive()
@@ -248,6 +300,20 @@ pub fn register_virtual_domain(
         manifest: Some(crystalline_core::manifest_template(name, &today)),
         notes,
     })
+}
+
+/// Save `cfg`, the persisted truth with the registration of `name` in it.
+/// A database that did not confirm the save is said as such: the domain may
+/// or may not be registered.
+fn save_registration(persisted: &PersistedConfig, cfg: &GlobalConfig, name: &str) -> Result<()> {
+    persisted
+        .save(cfg, "domain add")
+        .map_err(|e| match e {
+            crate::engine::EngineError::ConfigMaybeStored(detail) => anyhow!(
+                "the database did not confirm saving the registration of '{name}' ({detail}); it may or may not be registered, so check `crystalline domain list` before trying again"
+            ),
+            other => anyhow!("{other}"),
+        })
 }
 
 /// Before `name` becomes a new domain's name, set aside a `kept/<name>`
@@ -364,4 +430,123 @@ fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
             .map_err(|e| anyhow!("writing {}: {e}", manifest.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::overlay::{ConfigMode, EnvOverlay};
+    use crate::persisted::MemoryDocument;
+    use crystalline_core::config;
+
+    /// A configuration in document mode loaded from a config.yaml holding
+    /// `base`, with a setting and a domain from the environment, and the
+    /// document `doc` attached.
+    fn loaded_in_document(
+        dir: &Path,
+        base: &GlobalConfig,
+        doc: Arc<MemoryDocument>,
+    ) -> LoadedConfig {
+        let path = dir.join("config.yaml");
+        config::save_yaml(&path, base).unwrap();
+        let overlay = EnvOverlay::from_vars([
+            (
+                "CRYSTALLINE_SEARCH_SALIENCE_WEIGHT".to_string(),
+                "0.3".to_string(),
+            ),
+            (
+                "CRYSTALLINE_DOMAIN_FROM_ENV".to_string(),
+                dir.display().to_string(),
+            ),
+        ])
+        .unwrap();
+        let mut loaded = LoadedConfig {
+            path,
+            effective: overlay.apply(base),
+            file: base.clone(),
+            overlay,
+            mode: ConfigMode::Document,
+            base: None,
+            document: None,
+        };
+        let body = doc.stored();
+        loaded.attach_document(doc, body).unwrap();
+        loaded
+    }
+
+    #[test]
+    fn register_virtual_domain_lands_in_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut base = GlobalConfig::default();
+        base.domains
+            .insert("base-only".into(), DomainEntry::virtual_domain());
+        let mut held = GlobalConfig::default();
+        held.domains
+            .insert("doc-one".into(), DomainEntry::virtual_domain());
+        let doc = Arc::new(MemoryDocument::holding(
+            crate::persisted::document_body(&held).unwrap(),
+        ));
+        let yaml = tmp.path().join("config.yaml");
+
+        let done = register_virtual_domain_in(
+            loaded_in_document(tmp.path(), &base, doc.clone()),
+            "fresh",
+            None,
+        )
+        .unwrap();
+        assert!(!done.adopted);
+        let stored = doc.stored().unwrap();
+        let (cfg, _) = crate::persisted::config_from_document(stored.clone()).unwrap();
+        let names: Vec<_> = cfg.domains.keys().map(String::as_str).collect();
+        assert_eq!(names, ["doc-one", "fresh"], "{stored}");
+        assert!(stored.get("search").is_none(), "{stored}");
+        assert!(stored.get("database").is_none(), "{stored}");
+        // The base file is never written.
+        assert_eq!(config::load_yaml::<GlobalConfig>(&yaml).unwrap(), base);
+
+        // A base domain is registered already: adopted, nothing written.
+        let before = doc.stored();
+        let done = register_virtual_domain_in(
+            loaded_in_document(tmp.path(), &base, doc.clone()),
+            "base-only",
+            None,
+        )
+        .unwrap();
+        assert!(done.adopted);
+        assert_eq!(doc.stored(), before);
+
+        // An environment domain stays the variable's.
+        let err = register_virtual_domain_in(
+            loaded_in_document(tmp.path(), &base, doc.clone()),
+            "from-env",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("environment variable"), "{err}");
+    }
+
+    #[test]
+    fn a_registration_in_document_mode_without_the_document_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        config::save_yaml(&path, &GlobalConfig::default()).unwrap();
+        let loaded = LoadedConfig {
+            path: path.clone(),
+            file: GlobalConfig::default(),
+            effective: GlobalConfig::default(),
+            overlay: EnvOverlay::default(),
+            mode: ConfigMode::Document,
+            base: None,
+            document: None,
+        };
+        let err = register_virtual_domain_in(loaded, "fresh", None).unwrap_err();
+        assert!(err.to_string().contains("was not read yet"), "{err}");
+        assert_eq!(
+            config::load_yaml::<GlobalConfig>(&path).unwrap(),
+            GlobalConfig::default(),
+            "nothing written into the base"
+        );
+    }
 }

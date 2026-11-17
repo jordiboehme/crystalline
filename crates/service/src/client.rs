@@ -941,8 +941,7 @@ async fn build_embedded(
 ) -> anyhow::Result<EmbeddedStack> {
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
-    let loaded = overlay::load(config_path)?;
-    let read_only = read_only || loaded.effective.read_only();
+    let mut loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     // On Postgres this stack is the database's owner for the session, as a
     // command is for its run: claimed once, or refused with the owner's name
@@ -952,6 +951,11 @@ async fn build_embedded(
     let store =
         crate::claim::open_store_as(claim.as_ref(), &loaded.effective, Some(&db_path), false)
             .await?;
+    // The configuration document, read under the claim once the store open
+    // made sure its table exists: the configure and add_domain tools of this
+    // stack write there (spec section C).
+    crate::claim::attach_owned_document(&mut loaded, claim.as_ref()).await?;
+    let read_only = read_only || loaded.effective.read_only();
     // A channel the embed worker (spawned below) listens on: connecting an
     // origin mid-session schedules its embedding pass here instead of running
     // it inline, so the connect request returns without waiting on the model.
@@ -967,6 +971,9 @@ async fn build_embedded(
         .with_read_only(read_only)
         .with_env_overlay(loaded.overlay.clone())
         .with_machine_owner_lookup(machine_owner_for_engine());
+    if loaded.document.is_some() {
+        engine = engine.with_persisted(loaded.persisted()?, loaded.base.clone())?;
+    }
     // Told where the state directory is, as the daemon and the standalone
     // opener are; see `open_standalone`.
     if let Ok(state) = crystalline_core::config::state_dir() {
@@ -1239,6 +1246,10 @@ async fn open_standalone_noting(
         crate::claim::open_store_as(claim.as_ref(), &loaded.effective, Some(db_path), false)
             .await
             .map_err(unreachable)?;
+    // On Postgres the configuration document is read now, under the claim
+    // and after the store open made sure its table exists (spec section C).
+    let mut loaded = loaded;
+    crate::claim::attach_owned_document(&mut loaded, claim.as_ref()).await?;
     let engine = open_standalone_with_store(loaded, store, want_embeddings)
         .await
         .map_err(unreachable)?
@@ -2204,12 +2215,24 @@ pub async fn adopt_domain_names_direct(
         );
         return Ok(Value::Array(Vec::new()));
     };
-    let loaded = overlay::load(config_path)?;
+    let mut loaded = overlay::load(config_path)?;
+    // The adoption renames configuration keys: on Postgres in the document
+    // this command's claim (taken by the sync) reads.
+    crate::claim::attach_owned_document(&mut loaded, crate::claim::held_claim().await.as_ref())
+        .await?;
+    let persisted = loaded
+        .document
+        .is_some()
+        .then(|| loaded.persisted())
+        .transpose()?;
     let read_only = loaded.effective.read_only();
     let mut engine = Engine::new(store, loaded.file, None, Some(loaded.path))
         .with_read_only(read_only)
         .with_env_overlay(loaded.overlay)
         .with_machine_owner_lookup(machine_owner_for_engine());
+    if let Some(persisted) = persisted {
+        engine = engine.with_persisted(persisted, loaded.base)?;
+    }
     // Where a rename keeps its journal, as every other opener says.
     if let Ok(state) = crystalline_core::config::state_dir() {
         engine = engine.with_state_dir(state);
@@ -2549,6 +2572,16 @@ pub async fn origin_resolve(
 /// either way, unlike every data command above). `action` is `show`, `set` or
 /// `unset`; `key` and `value` are required for `set`, `key` alone for
 /// `unset`, and both are ignored for `show`.
+///
+/// With Postgres configured the settings are the database's configuration
+/// document (spec section C): without a daemon, `show` reads it lock-free
+/// and a change takes the database for the command or is refused while
+/// another instance owns it. A `database.*` key stays config.yaml's either
+/// way and is written there without asking anyone. `--config` skips the
+/// daemon there too, so with a daemon of this machine running in document
+/// mode a change with `--config` claims the database and is refused naming
+/// that daemon as the owner, where the same command without the flag goes
+/// through it.
 pub async fn configure(
     action: &str,
     key: Option<&str>,
@@ -2556,6 +2589,21 @@ pub async fn configure(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
+    // With the configuration in the database, a `database.*` key is still
+    // config.yaml's (the bootstrap block decides where the configuration
+    // lives): written there and nowhere else, with no daemon asked and no
+    // claim on the database, so a machine can always be pointed away from a
+    // database another instance owns.
+    let mut preloaded = None;
+    if matches!(action, "set" | "unset")
+        && key.is_some_and(|k| crate::settings::refuse_database_key_in_document(k).is_err())
+        && let Ok(loaded) = overlay::load(config_path)
+    {
+        if loaded.mode == overlay::ConfigMode::Document {
+            return configure_file(loaded, action, key, value);
+        }
+        preloaded = Some(loaded);
+    }
     // An explicit --config override names the exact file to operate on. A
     // running daemon answers for ITS config file, which may be a different
     // one entirely, so the override always takes the direct path and the
@@ -2573,7 +2621,228 @@ pub async fn configure(
     // environment overlay: `show` reads the file config plus the overlay, and a
     // write mutates a clone of the file config and saves it to the resolved
     // path, so no environment value ever bakes into the saved file.
-    let loaded = overlay::load(config_path)?;
+    let loaded = match preloaded {
+        Some(loaded) => loaded,
+        None => overlay::load(config_path)?,
+    };
+    if loaded.mode == overlay::ConfigMode::Document {
+        return configure_document(loaded, action, key, value, config_path).await;
+    }
+    configure_file(loaded, action, key, value)
+}
+
+/// `domain add`'s registration when the configuration lives in the database
+/// (spec section C); `None` in file mode, where the caller registers in
+/// config.yaml as it always did.
+///
+/// The document has one writer, the instance that owns the database. So
+/// the registration goes to the daemon (its ctl `domain_register`, which
+/// runs it over the engine's own document) when one answers, and otherwise
+/// takes the database for this command, reads the document and saves the
+/// registration there; while another instance owns the database that is
+/// refused naming it. `kind` is `file` or `virtual`; `kept_root` is this
+/// machine's `<state>/kept` folder.
+pub async fn register_in_document(
+    kind: &str,
+    name: Option<&str>,
+    path: Option<&Path>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    kept_root: Option<&Path>,
+) -> anyhow::Result<Option<crate::registration::Registered>> {
+    use serde_json::json;
+    let mut loaded = overlay::load(config_path)?;
+    if loaded.mode != overlay::ConfigMode::Document {
+        return Ok(None);
+    }
+    if use_daemon(db, config_path) {
+        // The daemon works in a folder of its own.
+        let absolute = path
+            .map(|p| {
+                std::path::absolute(p)
+                    .map_err(|e| anyhow::anyhow!("could not resolve {}: {e}", p.display()))
+            })
+            .transpose()?;
+        let request = json!({
+            "v": 1,
+            "cmd": "domain_register",
+            "kind": kind,
+            "name": name,
+            "path": absolute.map(|p| p.to_string_lossy().into_owned()),
+        });
+        if let Some(data) = ctl_routed(request)
+            .await
+            .map_err(|e| older_daemon_words(e, "domain_register"))?
+        {
+            let done = serde_json::from_value(data).map_err(|e| {
+                anyhow::anyhow!("could not read the daemon's registration answer: {e}")
+            })?;
+            return Ok(Some(done));
+        }
+    }
+    let claim = crate::claim::claim_for_this_command(&loaded.effective).await?;
+    // The store open migrates the document's table on a fresh schema; the
+    // store itself is not needed here.
+    let db_path = resolve_db(db)?;
+    drop(
+        crate::claim::open_store_as(claim.as_ref(), &loaded.effective, Some(&db_path), false)
+            .await?,
+    );
+    crate::claim::attach_owned_document(&mut loaded, claim.as_ref()).await?;
+    let done = match kind {
+        "file" => crate::registration::register_file_domain_in(loaded, name, path, kept_root)?,
+        "virtual" => {
+            let name = name.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`domain add --virtual` needs a name; there is no folder to derive one from"
+                )
+            })?;
+            crate::registration::register_virtual_domain_in(loaded, name, kept_root)?
+        }
+        other => anyhow::bail!("unknown domain_register kind '{other}'; expected file or virtual"),
+    };
+    Ok(Some(done))
+}
+
+/// [`configure`] without a daemon when the configuration lives in the
+/// database (spec section C). `show` reads the document over a lock-free
+/// probe connection, so it works while another instance owns the database.
+/// A change takes the database for this command and goes through the
+/// engine, which saves the document; while another instance owns the
+/// database it is refused naming that instance.
+async fn configure_document(
+    loaded: overlay::LoadedConfig,
+    action: &str,
+    key: Option<&str>,
+    value: Option<&str>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use crate::engine::ConfigureAction;
+    if let Some(key) = key.filter(|_| action != "show") {
+        crate::settings::refuse_bind_key_in_document(key)
+            .and_then(|()| {
+                crate::settings::refuse_public_url_in_document(
+                    loaded.base.as_ref().unwrap_or(&loaded.file),
+                    &loaded.overlay,
+                    key,
+                    value.filter(|_| action == "set"),
+                )
+            })
+            .map_err(anyhow::Error::msg)?;
+    }
+    let action = match action {
+        "show" => {
+            let mut loaded = loaded;
+            attach_viewed_document(&mut loaded).await?;
+            let view = loaded.persisted_view()?;
+            return Ok(serde_json::json!({
+                "settings": standalone_snapshot(&view, &loaded.overlay)
+            }));
+        }
+        "set" => ConfigureAction::Set {
+            key: key
+                .ok_or_else(|| anyhow::anyhow!("configure set requires a key"))?
+                .to_string(),
+            value: value
+                .ok_or_else(|| anyhow::anyhow!("configure set requires a value"))?
+                .to_string(),
+        },
+        "unset" => ConfigureAction::Unset {
+            key: key
+                .ok_or_else(|| anyhow::anyhow!("configure unset requires a key"))?
+                .to_string(),
+        },
+        other => anyhow::bail!("unknown configure action '{other}'; expected show, set or unset"),
+    };
+    let db_path = resolve_db(None)?;
+    let (engine, _) =
+        open_standalone_noting(loaded, &db_path, false, None, config_path, false).await?;
+    // A settings change, so a read-only instance takes it from the operator.
+    Ok(engine.configure_as_operator(&action).await?)
+}
+
+/// The configuration document of `loaded`'s database, read on a lock-free
+/// probe connection, for a view that runs without the active instance.
+#[cfg(feature = "postgres")]
+async fn read_document_lock_free(
+    loaded: &overlay::LoadedConfig,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let target = crystalline_index::postgres::PgTarget::from_config(&loaded.effective.database())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let doc = crystalline_index::postgres::read_config_document(&target)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not read the configuration in the database {} ({e}); on Postgres the configuration lives in the database",
+                target.describe()
+            )
+        })?;
+    Ok(doc.map(|d| d.body))
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn read_document_lock_free(
+    _loaded: &overlay::LoadedConfig,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    anyhow::bail!(
+        "the configuration lives in a Postgres database, and this build of Crystalline has no Postgres backend"
+    )
+}
+
+/// A document read without the lock: what it held at the read, for a view.
+/// It saves nothing, so a view can never write beside the active instance.
+struct ViewedDocument;
+
+impl crystalline_engine::persisted::ConfigDocument for ViewedDocument {
+    fn load(&self) -> crate::engine::Result<Option<serde_json::Value>> {
+        Err(crate::engine::EngineError::Refused(
+            "this view of the configuration was read without owning the database".to_string(),
+        ))
+    }
+
+    fn save(&self, _body: &serde_json::Value, _by: &str) -> crate::engine::Result<()> {
+        Err(crate::engine::EngineError::Refused(
+            "this view of the configuration was read without owning the database, so it saves nothing".to_string(),
+        ))
+    }
+}
+
+/// Attach the document of `loaded`'s database, read lock-free, as a view
+/// that saves nothing. Nothing to do in file mode. A failed read is an
+/// error.
+async fn attach_viewed_document(loaded: &mut overlay::LoadedConfig) -> anyhow::Result<()> {
+    if loaded.mode != overlay::ConfigMode::Document || loaded.document.is_some() {
+        return Ok(());
+    }
+    let body = read_document_lock_free(loaded).await?;
+    loaded.attach_document(Arc::new(ViewedDocument), body)
+}
+
+/// The configuration a report without a daemon reads (`status`, `doctor`,
+/// `domain list`): [`overlay::load`], with the configuration document read
+/// lock-free and attached as a view in document mode, so the registrations
+/// in the database are listed while another instance owns it. A report
+/// always answers: a document that cannot be read is a warning, and the
+/// view is config.yaml's alone.
+pub async fn config_for_report(
+    config_path: Option<&Path>,
+) -> anyhow::Result<overlay::LoadedConfig> {
+    let mut loaded = overlay::load(config_path)?;
+    if let Err(e) = attach_viewed_document(&mut loaded).await {
+        tracing::warn!("{e:#}; the registrations shown are config.yaml's alone");
+    }
+    Ok(loaded)
+}
+
+/// [`configure`] against config.yaml itself: the whole configuration in file
+/// mode, a `database.*` key in document mode.
+fn configure_file(
+    loaded: overlay::LoadedConfig,
+    action: &str,
+    key: Option<&str>,
+    value: Option<&str>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
     match action {
         "show" => Ok(json!({ "settings": standalone_snapshot(&loaded.file, &loaded.overlay) })),
         "set" => {
@@ -2682,7 +2951,41 @@ pub async fn provision(
         return Ok(data);
     }
 
-    let loaded = overlay::load(config_path)?;
+    let mut loaded = overlay::load(config_path)?;
+    // With the configuration in the database, `status` reads the document
+    // lock-free, as `config show` does.
+    if action == "status" {
+        attach_viewed_document(&mut loaded).await?;
+    }
+    // A decision is saved in the document, so the command takes the
+    // database and asks the engine, which reads and saves it (spec section
+    // C).
+    if loaded.mode == overlay::ConfigMode::Document && action != "status" {
+        let action = match action {
+            "apply" => crate::engine::ProvisionAction::Apply,
+            "allow" | "deny" => {
+                let domain = domain
+                    .ok_or_else(|| anyhow::anyhow!("provision {action} requires a domain"))?
+                    .to_string();
+                if action == "allow" {
+                    crate::engine::ProvisionAction::Allow { domain }
+                } else {
+                    crate::engine::ProvisionAction::Deny { domain }
+                }
+            }
+            other => anyhow::bail!(
+                "unknown provision action '{other}'; expected status, allow, deny or apply"
+            ),
+        };
+        let db_path = resolve_db(None)?;
+        let (engine, _) =
+            open_standalone_noting(loaded, &db_path, false, None, config_path, false).await?;
+        // A decision is a settings write, so a read-only instance takes it
+        // from the operator.
+        return Ok(engine
+            .provision_as_operator(&action, &crate::scope::Scope::Unrestricted)
+            .await?);
+    }
     // `provision` opens no engine at all (see the doc comment above), so it
     // has no [`localize_standalone`] to call: a canonical name or alias is
     // resolved straight from the loaded configuration instead, the same
@@ -2846,6 +3149,9 @@ pub async fn virtual_routing_bullets(
         file: config.clone(),
         effective: config.clone(),
         overlay: overlay::EnvOverlay::default(),
+        mode: overlay::config_mode(config),
+        base: None,
+        document: None,
     };
     // No rename recovery here: this read-only render takes no ownership of
     // the state directory, so a rename left half done waits for the next

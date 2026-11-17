@@ -261,7 +261,8 @@ pub(crate) fn holder_config_path() -> Option<String> {
 }
 
 pub use crate::serving::{
-    HttpBinding, ServeIntent, StartMode, loopback_connect_addr, record_serve_intent, serve_intent,
+    HttpBinding, ServeIntent, StartMode, loopback_connect_addr, record_serve_intent,
+    refresh_allowed_hosts, serve_intent,
 };
 
 /// The option token that tells the daemon this stdio session's harness is
@@ -509,7 +510,9 @@ impl Ownership {
             // Recorded by `run_serve` only; `hold-lock` records none.
             start: START_OPTIONS.get().cloned(),
         };
-        let _ = PUBLISHED.set(info.clone());
+        // The latest record wins, so a publish after the takeover (with the
+        // allowed hosts the document gave) is what `ctl holder` answers.
+        *PUBLISHED.write().unwrap_or_else(|e| e.into_inner()) = Some(info.clone());
         self.write_record(&info)
     }
 
@@ -820,13 +823,13 @@ async fn connect_socket_at(sock: &Path, mcp_line_options: bool) -> Option<Connec
         })
 }
 
-/// The record this process published, kept for `ctl holder`.
-static PUBLISHED: std::sync::OnceLock<LockInfo> = std::sync::OnceLock::new();
+/// The record this process published last, kept for `ctl holder`.
+static PUBLISHED: std::sync::RwLock<Option<LockInfo>> = std::sync::RwLock::new(None);
 
-/// The record this daemon published, `None` before `publish` ran (and in a
-/// test that drives the ctl handler without a daemon).
+/// The record this daemon published last, `None` before `publish` ran (and
+/// in a test that drives the ctl handler without a daemon).
 pub(crate) fn published_record() -> Option<LockInfo> {
-    PUBLISHED.get().cloned()
+    PUBLISHED.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// What the daemon on the pipe says about itself: the facts a client used to

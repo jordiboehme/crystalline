@@ -100,6 +100,7 @@ impl Engine {
         let answered = {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;
+            self.shadow_base_entry(&mut file, domain);
             let question = file
                 .domains
                 .get_mut(domain)
@@ -110,10 +111,7 @@ impl Engine {
             match question {
                 Some(question) => {
                     question.answered = Some(answer);
-                    self.persist_config(&file)?;
-                    let effective = self.overlay.apply(&file);
-                    *file_guard = file;
-                    *self.config.write().unwrap() = effective;
+                    self.commit_config(&mut file_guard, file)?;
                     true
                 }
                 None => false,
@@ -134,6 +132,7 @@ impl Engine {
         {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;
+            self.shadow_base_entry(&mut file, domain);
             let Some(entry) = file.domains.get_mut(domain) else {
                 return Ok(());
             };
@@ -155,10 +154,7 @@ impl Engine {
                 seen_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 answered: Some(RenameAnswer::Keep),
             });
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
         }
         self.forget_rename_nudges(domain);
         Ok(())
@@ -500,10 +496,7 @@ impl Engine {
             inferred.push((name.clone(), origin));
         }
         if !inferred.is_empty() {
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
         }
         Ok(inferred)
     }
@@ -603,10 +596,7 @@ impl Engine {
             changed = true;
         }
         if changed {
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
         }
         Ok(planned)
     }

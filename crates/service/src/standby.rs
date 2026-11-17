@@ -101,6 +101,13 @@ impl PgStart {
         })
     }
 
+    /// The owner's side channel, which reads and saves the configuration
+    /// document on the owner thread's own connection.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn side(&self) -> crystalline_index::postgres::SideChannel {
+        self.owner.side()
+    }
+
     /// The database, as the log names it.
     #[cfg(feature = "postgres")]
     pub(crate) fn database(&self) -> &str {

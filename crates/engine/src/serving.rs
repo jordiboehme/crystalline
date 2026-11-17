@@ -93,16 +93,37 @@ pub struct ServeIntent {
     pub allowed_hosts: Vec<String>,
 }
 
-static SERVE_INTENT: std::sync::OnceLock<ServeIntent> = std::sync::OnceLock::new();
+static SERVE_INTENT: std::sync::RwLock<Option<&'static ServeIntent>> = std::sync::RwLock::new(None);
 
 /// Record what this process asked to serve. The first call wins; a later one
 /// is ignored, so a record and a `/health` body can never disagree.
 pub fn record_serve_intent(intent: ServeIntent) {
-    let _ = SERVE_INTENT.set(intent);
+    let mut slot = SERVE_INTENT.write().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(Box::leak(Box::new(intent)));
+    }
+}
+
+/// Replace the recorded `allowed_hosts`, for a Postgres daemon whose
+/// configuration document, read at the takeover, sets them: the router is
+/// built after that read, and `/health` and the record must say what it
+/// accepts. Nothing happens before an intent is recorded or when the list
+/// did not change. Each change keeps one small intent for the life of the
+/// process, which happens at most once per start.
+pub fn refresh_allowed_hosts(allowed_hosts: Vec<String>) {
+    let mut slot = SERVE_INTENT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = *slot
+        && current.allowed_hosts != allowed_hosts
+    {
+        *slot = Some(Box::leak(Box::new(ServeIntent {
+            allowed_hosts,
+            ..current.clone()
+        })));
+    }
 }
 
 /// What this process asked to serve, when it is a daemon that recorded it.
 /// `None` in every process that is not serving.
 pub fn serve_intent() -> Option<&'static ServeIntent> {
-    SERVE_INTENT.get()
+    *SERVE_INTENT.read().unwrap_or_else(|e| e.into_inner())
 }

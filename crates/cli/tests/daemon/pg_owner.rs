@@ -707,11 +707,17 @@ fn paused_owner_cannot_write_after_takeover() {
         return;
     };
     let active_env = Env::new("hopa").on_postgres(&pg);
-    active_env.setup_domain("notes");
+    // Defined by a variable of the paused owner alone, not in the
+    // configuration document: the new owner must not index the late file
+    // itself, so a row more can only come from the paused owner.
+    let domain_dir = active_env.domain_folder("notes");
     let mut active = Serve::start_with(
         &active_env,
         None,
-        &[("CRYSTALLINE_TEST_FENCE_EXIT_HOLD_MS", FENCE_EXIT_HOLD_MS)],
+        &[
+            ("CRYSTALLINE_TEST_FENCE_EXIT_HOLD_MS", FENCE_EXIT_HOLD_MS),
+            ("CRYSTALLINE_DOMAIN_NOTES", domain_dir.to_str().unwrap()),
+        ],
     );
     active.wait_ready();
     let engrams = || pg.text(&format!("SELECT count(*)::text FROM {}.engram", pg.schema));
@@ -734,14 +740,6 @@ fn paused_owner_cannot_write_after_takeover() {
     standby.wait_role("standby");
 
     let paused = Paused::new(active.pid());
-    // `setup_domain` put the domain beside the state folder's base.
-    let domain_dir = active_env
-        .state_dir()
-        .ancestors()
-        .nth(2)
-        .unwrap()
-        .join("kb-notes");
-    assert!(domain_dir.is_dir(), "{}", domain_dir.display());
     std::fs::write(
         domain_dir.join("late.md"),
         "---\ntype: engram\ntitle: Late\npermalink: late\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nwritten while the owner was paused\n",
@@ -801,8 +799,9 @@ fn new_owner_takes_host_locks_at_once_after_kill() {
     let stale: &[(&str, &str)] = &[("CRYSTALLINE_STALE_SECS", "600")];
     let active_env = Env::new("hoha").on_postgres(&pg);
     active_env.setup_domain("notes");
+    // The registration is the database's configuration document, so the
+    // second instance serves the same domain without adding it.
     let standby_env = Env::new("hohs").on_postgres(&pg);
-    standby_env.setup_domain("notes");
     let holder = || {
         pg.text(&format!(
             "SELECT l.holder_instance_id FROM {s}.domain_lock l JOIN {s}.domain d ON d.id = l.domain_id \
@@ -1044,7 +1043,8 @@ fn initialize_error(stdout: &str) -> String {
 /// database another instance owns is refused before anything opens, on
 /// both openers (the CLI's index route and the engine of a data verb): the
 /// sentence names the active instance and how to run the command there.
-/// `config set` touches no database in this release and still works.
+/// `config set` of a setting needs the owner too; one of a `database.*` key
+/// does not.
 #[test]
 fn engine_command_without_daemon_refused_when_owned() {
     let Some(pg) = PgScratch::new("clown") else {
@@ -1075,8 +1075,23 @@ fn engine_command_without_daemon_refused_when_owned() {
         );
         assert!(!err.contains("could not reach"), "{err}");
     }
+    // A setting lives in the configuration document the owner writes, so a
+    // change without it is refused like any engine command (spec section C).
     let (ok, out, err) = env.run_full(&["config", "set", "service.response_format", "json"]);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains(&format!(
+            "is owned by the active instance {label} (pid {},",
+            owner.pid()
+        )),
+        "{err}"
+    );
+    // A `database.*` key stays config.yaml's and needs no owner: it is how
+    // a machine is pointed away from a database another instance owns.
+    let (ok, out, err) = env.run_full(&["config", "set", "database.schema", "elsewhere"]);
     assert!(ok, "{out}{err}");
+    let yaml = std::fs::read_to_string(env.config_path()).unwrap();
+    assert!(yaml.contains("elsewhere"), "{yaml}");
 
     assert_eq!(owner_command(&pg), "|false", "the owner row changed");
     assert_eq!(owner.get("/ready").unwrap().status().as_u16(), 200);
@@ -1935,6 +1950,10 @@ fn startup_line_names_owner_and_accounts() {
         "{line}"
     );
     assert!(line.contains(" since "), "{line}");
+    assert!(
+        line.contains("configuration document (") && line.contains("config.yaml "),
+        "{line}"
+    );
     let credentials = pg
         .url
         .split('@')
@@ -2071,4 +2090,619 @@ fn status_on_a_free_database_says_free() {
     assert_eq!(status["durable_state"]["owner_state"], "free");
     assert!(!format!("{out}{err}").contains(&url_credentials(&pg)));
     assert_eq!(schema_objects(&pg), "0", "status opened the store");
+}
+
+// --- the configuration document (spec section C) -----------------------------
+
+/// The effective value of setting `key` in `config show --json`, as `env`
+/// sees it, or panics with the output.
+fn shown_setting(env: &Env, key: &str) -> String {
+    let (ok, out, err) = env.run_full(&["--json", "config", "show"]);
+    assert!(ok, "{out}{err}");
+    let shown: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+    shown["settings"]
+        .as_array()
+        .and_then(|views| views.iter().find(|v| v["key"] == key))
+        .and_then(|v| v["value"].as_str())
+        .unwrap_or_else(|| panic!("no {key} in {out}{err}"))
+        .to_string()
+}
+
+/// With a daemon owning the database, `domain add` registers through it: the
+/// domain lands in the configuration document, config.yaml is never
+/// written, and the daemon serves the domain at once.
+#[test]
+fn domain_add_via_ctl_lands_in_document() {
+    let Some(pg) = PgScratch::new("cdctl") else {
+        return;
+    };
+    let env = Env::new("cdctl").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let dir = env.domain_folder("notes");
+    // A standalone registration would be refused here: the daemon owns the
+    // database, so success means the daemon registered it.
+    let (ok, out, err) = env.run_full(&["domain", "add", "notes", dir.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_domains(), "notes");
+    assert!(
+        !env.config_path().exists(),
+        "a Postgres registration wrote config.yaml"
+    );
+    let (ok, out, err) = env.run_full(&["--json", "search", "seed body token"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("seed"), "{out}{err}");
+    // A virtual domain takes the same way.
+    let (ok, out, err) = env.run_full(&["domain", "add", "--virtual", "scratch"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_domains(), "notes,scratch");
+    assert!(!env.config_path().exists());
+    assert!(serve.alive(), "{}", serve.log());
+}
+
+/// Without a daemon on a free database, `domain add` takes the database for
+/// the command, reads the document and saves the registration there, never
+/// in config.yaml. A daemonless reindex then finds the domain in the
+/// document.
+#[cfg(feature = "postgres")]
+#[test]
+fn domain_add_standalone_lands_in_document() {
+    let Some(pg) = PgScratch::new("cdalone") else {
+        return;
+    };
+    let env = Env::new("cdalone").on_postgres(&pg);
+    let dir = env.domain_folder("notes");
+    let (ok, out, err) = env.run_full(&["domain", "add", "notes", dir.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_domains(), "notes");
+    assert!(
+        !env.config_path().exists(),
+        "a Postgres registration wrote config.yaml"
+    );
+    assert_eq!(owner_command(&pg), "crystalline domain add|true");
+    let (ok, out, err) = env.run_full(&["domain", "add", "--virtual", "scratch"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_domains(), "notes,scratch");
+    let (ok, out, err) = env.run_full(&["reindex"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("notes"), "{out}{err}");
+    assert!(!env.config_path().exists());
+}
+
+/// Without a daemon on a free database, `config set` takes the database for
+/// the command and saves the setting in the document; config.yaml stays
+/// untouched and the database is released afterwards.
+#[cfg(feature = "postgres")]
+#[test]
+fn configure_set_without_daemon_writes_document_when_free() {
+    let Some(pg) = PgScratch::new("cdset") else {
+        return;
+    };
+    let env = Env::new("cdset").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["config", "set", "service.response_format", "json"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,response_format}"), "json");
+    assert!(!env.config_path().exists(), "config set wrote config.yaml");
+    assert!(
+        owner_command(&pg).ends_with("|true"),
+        "{}",
+        owner_command(&pg)
+    );
+    let (ok, out, err) = env.run_full(&["config", "unset", "service.response_format"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,response_format}"), "");
+    // A `database.*` key is config.yaml's, never the document's.
+    let (ok, out, err) = env.run_full(&["config", "set", "database.schema", &pg.schema]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        std::fs::read_to_string(env.config_path())
+            .unwrap()
+            .contains(&pg.schema)
+    );
+    assert_eq!(pg.document_value("{database}"), "");
+}
+
+/// Without a daemon of its own, `config show` reads the document over a
+/// lock-free connection: it shows what the active instance of another
+/// machine saved while that instance keeps the database.
+#[test]
+fn config_show_without_daemon_reads_document_lock_free() {
+    let Some(pg) = PgScratch::new("cdshow") else {
+        return;
+    };
+    let owner_env = Env::new("cdshowa").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let (ok, out, err) = owner_env.run_full(&["config", "set", "service.response_format", "json"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,response_format}"), "json");
+
+    let env = Env::new("cdshowb").on_postgres(&pg);
+    assert_eq!(shown_setting(&env, "service.response_format"), "json");
+    assert_eq!(
+        owner_command(&pg),
+        "|false",
+        "config show took the database"
+    );
+    assert_eq!(owner.get("/ready").unwrap().status().as_u16(), 200);
+}
+
+/// A TCP listener that counts the connections it accepts and drops each at
+/// once: a database address any Postgres connect reaches and fails on.
+struct CountingListener {
+    url: String,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingListener {
+    fn start() -> CountingListener {
+        // Never the port of the local test Postgres: a listener there would
+        // sit in front of the real database and break every other test.
+        let test_port = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL")
+            .ok()
+            .and_then(|url| {
+                let rest = url.split_once("://")?.1;
+                let host = rest.split(['/', '?']).next()?.rsplit('@').next()?;
+                host.rsplit_once(':')?.1.parse::<u16>().ok()
+            });
+        let (listener, port) = loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if Some(port) != test_port {
+                break (listener, port);
+            }
+        };
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        CountingListener {
+            url: format!("postgres://nobody:s3cretpw@127.0.0.1:{port}/nothing"),
+            accepted,
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A `crystalline mcp` bridge that reaches a daemon never reads the
+/// document itself: its database address is a listener of the test, which
+/// accepts no connection over the bridge's whole session (an initialize, a
+/// tools/list and a pause), while the daemon serves from the real database.
+/// A daemonless `config show` with the same address does reach the
+/// listener, so the count is a real witness.
+#[test]
+fn mcp_bridge_reaching_daemon_never_fetches_document() {
+    let Some(pg) = PgScratch::new("cdbridge") else {
+        return;
+    };
+    let env = Env::new("cdbridge").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let watch = CountingListener::start();
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let log = env.state_dir().with_file_name("bridge.log");
+    let mut bridge = cmd
+        .env("CRYSTALLINE_DATABASE_URL", &watch.url)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut stdin = bridge.stdin.take().unwrap();
+    let stdout = bridge.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let err = || std::fs::read_to_string(&log).unwrap_or_default();
+    let ask = |stdin: &mut std::process::ChildStdin, request: Value| -> Value {
+        writeln!(stdin, "{request}").unwrap();
+        let line = rx
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("the bridge did not answer: {}", err()));
+        serde_json::from_str(line.trim()).unwrap_or(Value::Null)
+    };
+    let reply = ask(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "it", "version": "0" },
+            },
+        }),
+    );
+    assert!(reply["result"].is_object(), "{reply} {}", err());
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    )
+    .unwrap();
+    let reply = ask(
+        &mut stdin,
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    );
+    assert!(reply["result"]["tools"].is_array(), "{reply} {}", err());
+    std::thread::sleep(Duration::from_secs(2));
+    drop(stdin);
+    let _ = bridge.wait();
+    assert_eq!(
+        watch.accepted(),
+        0,
+        "the bridge reached the database: {}",
+        err()
+    );
+    assert!(serve.alive(), "{}", serve.log());
+
+    // The witness: a command without a daemon does reach the address.
+    let other = Env::new("cdbridgeb").on_postgres(&pg);
+    let mut show = Command::new(bin());
+    other.apply(&mut show);
+    let out = show
+        .env("CRYSTALLINE_DATABASE_URL", &watch.url)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(watch.accepted() > 0, "the listener saw no connect at all");
+}
+
+/// A report never fails on the configuration document: when it cannot be
+/// read, `status` and `domain list` warn on stderr that the registrations
+/// shown are config.yaml's alone, and still answer.
+#[test]
+fn a_report_warns_and_answers_when_the_document_cannot_be_read() {
+    let Some(pg) = PgScratch::new("cdwarn") else {
+        return;
+    };
+    let env = Env::new("cdwarn").on_postgres(&pg);
+    let watch = CountingListener::start();
+    for args in [&["status", "--json"][..], &["domain", "list", "--json"][..]] {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        let out = cmd
+            .env("CRYSTALLINE_DATABASE_URL", &watch.url)
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            stderr.contains("the registrations shown are config.yaml's alone"),
+            "{args:?}: no warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("could not read the configuration in the database"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("s3cretpw")
+                && !String::from_utf8_lossy(&out.stdout).contains("s3cretpw"),
+            "{args:?} leaked the password: {stderr}"
+        );
+        assert!(
+            serde_json::from_slice::<Value>(&out.stdout).is_ok(),
+            "{args:?} did not answer: {} {stderr}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    assert!(watch.accepted() > 0, "the listener saw no connect at all");
+}
+
+/// A takeover that cannot read the configuration document stops the start
+/// with a sentence that says so, and leaves the database free: the instance
+/// never goes on with config.yaml alone.
+#[cfg(feature = "postgres")]
+#[test]
+fn unreachable_document_at_takeover_fails_start() {
+    let Some(pg) = PgScratch::new("cdgone") else {
+        return;
+    };
+    let env = Env::new("cdgone").on_postgres(&pg);
+    let mut first = Serve::start(&env, None);
+    first.wait_ready();
+    first.terminate();
+    assert_eq!(first.wait_exit(Duration::from_secs(15)), Some(0));
+    // The table is gone while the migration ledger says it is there, so the
+    // store open does not make it again and the read fails.
+    assert!(pg.sql(&format!("DROP TABLE {}.instance_config", pg.schema)));
+
+    let mut serve = Serve::start(&env, None);
+    let code = serve.wait_exit(Duration::from_secs(30));
+    assert!(
+        matches!(code, Some(c) if c != 0),
+        "{code:?}: {}",
+        serve.log()
+    );
+    let log = serve.log();
+    assert!(
+        log.contains("could not read the configuration in the database")
+            && log.contains("does not start without it"),
+        "{log}"
+    );
+    let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
+    assert_eq!(
+        pg.text(&format!(
+            "SELECT (count(*) = 0)::text FROM pg_locks WHERE locktype = 'advisory' \
+             AND objid::bigint = ({key} & 4294967295)"
+        )),
+        "true",
+        "the database is still held"
+    );
+}
+
+/// A configuration document that does not read as a configuration stops
+/// the start too: the instance never saves an empty document over it.
+#[cfg(feature = "postgres")]
+#[test]
+fn invalid_document_at_takeover_fails_start() {
+    let Some(pg) = PgScratch::new("cdbad") else {
+        return;
+    };
+    let env = Env::new("cdbad").on_postgres(&pg);
+    let mut first = Serve::start(&env, None);
+    first.wait_ready();
+    first.terminate();
+    assert_eq!(first.wait_exit(Duration::from_secs(15)), Some(0));
+    assert!(pg.sql(&format!(
+        "INSERT INTO {}.instance_config (id, body, updated_at, updated_by) \
+         VALUES (1, '{{\"domains\": 7}}', now(), 'test') \
+         ON CONFLICT (id) DO UPDATE SET body = excluded.body",
+        pg.schema
+    )));
+
+    let mut serve = Serve::start(&env, None);
+    let code = serve.wait_exit(Duration::from_secs(30));
+    assert!(
+        matches!(code, Some(c) if c != 0),
+        "{code:?}: {}",
+        serve.log()
+    );
+    let log = serve.log();
+    assert!(
+        log.contains("could not read the configuration in the database") && log.contains("invalid"),
+        "{log}"
+    );
+    assert_eq!(
+        pg.document_value("{domains}"),
+        "7",
+        "the document was replaced"
+    );
+}
+
+/// `service.allowed_hosts` saved in the document applies after a redeploy:
+/// the router, which is built after the takeover read, answers the host,
+/// and the ctl status and the ctl holder answer say it. Another host is
+/// still refused.
+#[test]
+fn config_allowed_hosts_from_document_apply_after_redeploy() {
+    let Some(pg) = PgScratch::new("cdhosts") else {
+        return;
+    };
+    let env = Env::new("cdhosts").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "set", "service.allowed_hosts", "kb.example"]);
+    assert!(ok, "{out}{err}");
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+    std::fs::remove_dir_all(env.state_dir()).unwrap();
+
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["ctl", "status", "--json"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("kb.example"), "{out}");
+    #[cfg(unix)]
+    {
+        let holder = crate::service::ctl_over_the_socket(
+            &env,
+            &serde_json::json!({ "v": 1, "cmd": "holder" }),
+        );
+        assert!(
+            holder["data"]["allowed_hosts"]
+                .as_array()
+                .is_some_and(|hosts| hosts.iter().any(|h| h == "kb.example")),
+            "{holder}"
+        );
+    }
+    let ask = |host: &str| {
+        reqwest::blocking::Client::new()
+            .get(format!("http://{}/api/v1/me", serve.addr))
+            .header("Host", host)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .unwrap()
+    };
+    let refused = ask("evil.example");
+    assert_eq!(refused.status().as_u16(), 403);
+    let answered = ask("kb.example");
+    let status = answered.status().as_u16();
+    let body = answered.text().unwrap_or_default();
+    assert!(
+        !body.contains("Host is not one this instance answers to"),
+        "{status}: {body}"
+    );
+}
+
+/// `service.http` is bound before the takeover reads the document, so a
+/// value saved there could never apply: `config set service.http` is
+/// refused in document mode, through the daemon and without one, and names
+/// where the value belongs.
+#[cfg(feature = "postgres")]
+#[test]
+fn config_set_service_http_refused_in_document_mode() {
+    let Some(pg) = PgScratch::new("cdhttp") else {
+        return;
+    };
+    let alone = Env::new("cdhttpb").on_postgres(&pg);
+    let (ok, out, err) = alone.run_full(&["config", "set", "service.http", "0.0.0.0:7411"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_HTTP"), "{err}");
+    assert_eq!(schema_objects(&pg), "0", "the refusal opened the database");
+
+    let env = Env::new("cdhttp").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "set", "service.http", "0.0.0.0:7411"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_HTTP"), "{err}");
+    assert_eq!(pg.document_value("{service,http}"), "");
+}
+
+/// A `service.public_url` with a path would split the base path between
+/// the early probes and the full router, so a set of one is refused in
+/// document mode, through the daemon and without one, naming where it
+/// belongs; nothing reaches the document.
+#[cfg(feature = "postgres")]
+#[test]
+fn config_set_public_url_with_path_refused_in_document_mode() {
+    let Some(pg) = PgScratch::new("cdpub") else {
+        return;
+    };
+    let url = "https://kb.example/crystalline";
+    let alone = Env::new("cdpubb").on_postgres(&pg);
+    let (ok, out, err) = alone.run_full(&["config", "set", "service.public_url", url]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_PUBLIC_URL"), "{err}");
+    assert_eq!(schema_objects(&pg), "0", "the refusal opened the database");
+
+    let env = Env::new("cdpub").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "set", "service.public_url", url]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SERVICE_PUBLIC_URL"), "{err}");
+    assert_eq!(pg.document_value("{service,public_url}"), "");
+}
+
+/// `service.read_only` saved in the document does not lock the settings:
+/// `config unset service.read_only` takes it out again with no environment
+/// override, without a daemon and through a read-only daemon.
+#[cfg(feature = "postgres")]
+#[test]
+fn read_only_in_document_can_be_unset() {
+    let Some(pg) = PgScratch::new("cdro") else {
+        return;
+    };
+    let env = Env::new("cdro").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["config", "set", "service.read_only", "true"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,read_only}"), "true");
+    let (ok, out, err) = env.run_full(&["config", "unset", "service.read_only"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,read_only}"), "");
+
+    let (ok, out, err) = env.run_full(&["config", "set", "service.read_only", "true"]);
+    assert!(ok, "{out}{err}");
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "unset", "service.read_only"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(pg.document_value("{service,read_only}"), "");
+}
+
+/// Without a daemon of its own, `domain list`, `status` and `doctor` read
+/// the registrations from the document lock-free, while the active
+/// instance of another machine keeps the database.
+#[test]
+fn reports_without_daemon_read_document_registrations() {
+    let Some(pg) = PgScratch::new("cdlist") else {
+        return;
+    };
+    let owner_env = Env::new("cdlista").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let dir = owner_env.domain_folder("notes");
+    let (ok, out, err) = owner_env.run_full(&["domain", "add", "notes", dir.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+
+    let env = Env::new("cdlistb").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["--json", "domain", "list"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("notes"), "{out}{err}");
+    let (_, out, err) = env.run_full(&["status", "--json"]);
+    let status: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+    assert_eq!(
+        status["registered"],
+        serde_json::json!(["notes"]),
+        "{out}{err}"
+    );
+    let (_, out, err) = env.run_full(&["doctor"]);
+    assert!(format!("{out}{err}").contains("notes"), "{out}{err}");
+    assert_eq!(owner_command(&pg), "|false", "a report took the database");
+    assert!(owner.alive());
+}
+
+/// A redeploy keeps the configuration: a setting and a domain saved through
+/// the daemon survive a stop and a start with fresh state and config
+/// folders, because they live in the database.
+#[test]
+fn config_survives_redeploy() {
+    let Some(pg) = PgScratch::new("cdredeploy") else {
+        return;
+    };
+    let env = Env::new("cdredeploy").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["config", "set", "service.response_format", "json"]);
+    assert!(ok, "{out}{err}");
+    let dir = env.domain_folder("notes");
+    let (ok, out, err) = env.run_full(&["domain", "add", "notes", dir.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+
+    std::fs::remove_dir_all(env.state_dir()).unwrap();
+    let config_dir = env.config_path().parent().unwrap().to_path_buf();
+    if config_dir.exists() {
+        std::fs::remove_dir_all(&config_dir).unwrap();
+    }
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    assert_eq!(shown_setting(&env, "service.response_format"), "json");
+    let (ok, out, err) = env.run_full(&["--json", "search", "seed body token"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("seed"), "{out}{err}");
+    assert!(!env.config_path().exists());
+}
+
+/// On Turso nothing moves: without a daemon `config set` and `domain add`
+/// write config.yaml as they always did.
+#[test]
+fn config_writes_unchanged_on_turso() {
+    let env = Env::new("cdturso");
+    let (ok, out, err) = env.run_full(&["config", "set", "service.response_format", "json"]);
+    assert!(ok, "{out}{err}");
+    let dir = env.domain_folder("notes");
+    let (ok, out, err) = env.run_full(&["domain", "add", "notes", dir.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    let cfg: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(&env.config_path()).unwrap();
+    assert_eq!(
+        cfg.service.and_then(|s| s.response_format),
+        Some(crystalline_core::config::ResponseFormat::Json)
+    );
+    assert!(cfg.domains.contains_key("notes"), "{:?}", cfg.domains);
 }

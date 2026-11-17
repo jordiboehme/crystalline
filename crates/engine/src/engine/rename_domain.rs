@@ -292,8 +292,10 @@ impl Engine {
             ));
         }
         // Before any step: the Config step at the end would refuse a file
-        // that does not parse, after the domain was moved and paused.
+        // that does not parse, after the domain was moved and paused, and a
+        // domain the read-only config.yaml registers.
         self.refuse_a_config_that_does_not_parse()?;
+        self.refuse_base_domain(old)?;
         let reviewing_draft = if local_only {
             false
         } else {
@@ -1750,6 +1752,8 @@ impl Engine {
         let entry = {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;
+            // A domain the read-only config.yaml registers is renamed there.
+            self.refuse_base_domain(old)?;
             let (index, mut entry) = match (
                 file.domains.get_index_of(old),
                 file.domains.get_index_of(new),
@@ -1787,10 +1791,7 @@ impl Engine {
             }
             file.domains
                 .shift_insert(index, new.to_string(), entry.clone());
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
             entry
         };
         self.discovered_domains.write().unwrap().remove(old);

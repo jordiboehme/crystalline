@@ -139,7 +139,7 @@ pub(crate) enum IndexRoute {
 /// CLI applies it to the index.
 pub(crate) async fn reach_index(
     request: Option<serde_json::Value>,
-    cfg: &GlobalConfig,
+    cfg: &mut GlobalConfig,
     config_override: Option<&Path>,
     db_override: Option<&Path>,
     open_as: OpenAs,
@@ -177,7 +177,19 @@ pub(crate) async fn reach_index(
     match crystalline_service::open_store_for_command(cfg, db_override, open_as == OpenAs::Rebuild)
         .await
     {
-        Ok(store) => Ok(IndexRoute::Direct(store)),
+        Ok(store) => {
+            // With the configuration in the database, the domains this
+            // command walks are the document's too: read under the claim the
+            // open just took.
+            if crystalline_service::overlay::config_mode(cfg)
+                == crystalline_service::overlay::ConfigMode::Document
+            {
+                *cfg = crystalline_service::claim::owned_config(config_override)
+                    .await?
+                    .effective;
+            }
+            Ok(IndexRoute::Direct(store))
+        }
         Err(e) if crystalline_service::claim::refused_by_cli_rule(&e) => match open_as {
             OpenAs::Read => Ok(IndexRoute::Unreachable(e.to_string())),
             OpenAs::Write | OpenAs::Rebuild => Err(e),
@@ -199,15 +211,17 @@ pub(crate) async fn reach_index(
 pub(crate) async fn durable_state_block(
     cfg: &GlobalConfig,
     role: &str,
+    config_path: Option<&Path>,
 ) -> Option<(Vec<String>, serde_json::Value)> {
     #[cfg(feature = "postgres")]
     {
-        let report = crystalline_service::durable::durable_state_for_command(cfg, role).await?;
+        let report =
+            crystalline_service::durable::durable_state_for_command(cfg, role, config_path).await?;
         Some((report.block_lines(), report.to_json()))
     }
     #[cfg(not(feature = "postgres"))]
     {
-        let _ = (cfg, role);
+        let _ = (cfg, role, config_path);
         None
     }
 }
@@ -513,6 +527,34 @@ pub(crate) async fn register_through_daemon(
     Ok(done)
 }
 
+/// `domain add`'s registration when the configuration lives in the
+/// database: over the daemon when one answers, else under this command's
+/// claim on the database (see [`crystalline_service::register_in_document`]),
+/// with the notes printed as the local path prints them. `None` in file
+/// mode.
+pub(crate) async fn register_in_document(
+    kind: &str,
+    name: Option<&str>,
+    path: Option<&Path>,
+    db: Option<&Path>,
+    config_override: Option<&Path>,
+) -> Result<Option<crystalline_service::registration::Registered>> {
+    let kept = crate::kept::root().ok();
+    let done = crystalline_service::register_in_document(
+        kind,
+        name,
+        path,
+        db,
+        config_override,
+        kept.as_deref(),
+    )
+    .await?;
+    if let Some(done) = &done {
+        print_notes(&done.notes);
+    }
+    Ok(done)
+}
+
 /// Register a virtual domain in the global config (database-backed, no path).
 /// Returns the MANIFEST markdown to scaffold into the database and whether an
 /// existing registration of this name was adopted rather than written. The
@@ -582,8 +624,8 @@ pub(crate) async fn sync_domain_direct(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
 ) -> Result<crystalline_index::SyncReport> {
-    let cfg = load(config_override)?.effective;
-    let route = reach_index(None, &cfg, config_override, db_override, OpenAs::Write).await?;
+    let mut cfg = load(config_override)?.effective;
+    let route = reach_index(None, &mut cfg, config_override, db_override, OpenAs::Write).await?;
     let store = local_store(route, "domain add")?;
     let params = chunk_params(&cfg);
     let host = DirectHost::of(&store, &cfg).await?;
@@ -2354,8 +2396,11 @@ pub async fn domain_list(
 ) -> Result<()> {
     // Keep the whole `LoadedConfig`: reads use the effective config, and the
     // overlay marks which rows an environment variable defines.
-    let loaded = load(config_override)?;
-    let cfg = loaded.effective;
+    // On Postgres the registrations are read from the configuration
+    // document without the lock, so the list answers while another instance
+    // owns the database.
+    let loaded = crystalline_service::config_for_report(config_override).await?;
+    let mut cfg = loaded.effective;
     // Why the counts are missing when they are, in the helper's words; `None`
     // once they were read, whichever route delivered them.
     let mut not_read: Option<String> = None;
@@ -2376,7 +2421,7 @@ pub async fn domain_list(
     // virtual domain's declared name (`virtual_names`).
     let route = match reach_index(
         Some(serde_json::json!({ "v": 1, "cmd": "status" })),
-        &cfg,
+        &mut cfg,
         config_override,
         db_override,
         OpenAs::Read,

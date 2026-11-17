@@ -457,7 +457,12 @@ impl Engine {
         let discovered = self.discovered_domains.read().unwrap().clone();
         let path = self.config_file_path();
         let overlay = self.overlay.clone();
-        move || union_registrations(snapshot, &discovered, reread_config_at(path, &overlay))
+        // In document mode the configuration lives in memory: no file read.
+        let in_memory = self.config_in_document().then(|| self.config());
+        move || {
+            let fresh = in_memory.or_else(|| reread_config_at(path, &overlay));
+            union_registrations(snapshot, &discovered, fresh)
+        }
     }
 
     /// [`Engine::registered_domain_entries`], with the file read on the
@@ -1060,7 +1065,8 @@ mod tests {
         let mut entry = DomainEntry::virtual_domain();
         entry.aliases = vec!["fresh-alias".to_string()];
         saved.domains.insert("fresh".to_string(), entry);
-        engine.persist_config(&saved).unwrap();
+        let mut held = GlobalConfig::default();
+        engine.persist_config(&mut held, &saved).unwrap();
 
         assert_eq!(
             engine.name_table_now().await.resolve("fresh-alias"),

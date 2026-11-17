@@ -224,6 +224,13 @@ impl CommandDbOwner {
         crate::standby::owner_session_options(&self.inner.instance_id, self.inner.owner.fence())
     }
 
+    /// The side channel of the claim, which reads and saves the
+    /// configuration document on the owner thread's own connection.
+    #[cfg(feature = "postgres")]
+    pub fn side(&self) -> crystalline_index::postgres::SideChannel {
+        self.inner.owner.side()
+    }
+
     /// Write the owner row again: on a schema the store open just created
     /// the table in, the announce after the lock found none.
     #[cfg(feature = "postgres")]
@@ -364,6 +371,59 @@ async fn claim(cfg: &GlobalConfig, command: &str) -> anyhow::Result<Claim> {
     };
     *slot = Some(held.clone());
     Ok(Claim::Held(held))
+}
+
+/// Attach the configuration document to `loaded` under `claim` (spec
+/// section C): a command that owns the database reads the document once,
+/// after its store open migrated the table, and every configuration write
+/// it makes goes there. Nothing to do in file mode or when a document is
+/// attached already.
+///
+/// A document that cannot be read is an error, and so is document mode
+/// without a claim: a command that went on with `config.yaml` alone would
+/// save the settings it does not know over the stored ones, or into the
+/// read-only base.
+pub(crate) async fn attach_owned_document(
+    loaded: &mut crystalline_engine::overlay::LoadedConfig,
+    claim: Option<&CommandDbOwner>,
+) -> anyhow::Result<()> {
+    if loaded.mode != crystalline_engine::overlay::ConfigMode::Document || loaded.document.is_some()
+    {
+        return Ok(());
+    }
+    #[cfg(feature = "postgres")]
+    if let Some(claim) = claim {
+        let side = claim.side();
+        let body = side.load_config().await.map_err(|e| {
+            anyhow::anyhow!(
+                "could not read the configuration in the database {} ({e}); on Postgres the configuration lives in the database, so this command does not run without it",
+                claim.inner.database
+            )
+        })?;
+        return loaded.attach_document(std::sync::Arc::new(side), body.map(|d| d.body));
+    }
+    let _ = claim;
+    anyhow::bail!(
+        "the configuration is kept in the database, and this command does not own the database, so it cannot read it"
+    )
+}
+
+/// The configuration of a command that opened the database under its claim:
+/// [`crystalline_engine::overlay::load`], with the configuration document
+/// attached in document mode. What a command that walks the registered
+/// domains itself (a daemonless `sync` or `reindex`) reads once its store is
+/// open, so the domains registered in the database are among them.
+pub async fn owned_config(
+    config_path: Option<&Path>,
+) -> anyhow::Result<crystalline_engine::overlay::LoadedConfig> {
+    let mut loaded = crystalline_engine::overlay::load(config_path)?;
+    attach_owned_document(&mut loaded, held_claim().await.as_ref()).await?;
+    Ok(loaded)
+}
+
+/// The claim this process holds for its command, if any.
+pub(crate) async fn held_claim() -> Option<CommandDbOwner> {
+    CLAIM.lock().await.clone()
 }
 
 /// Claim the database for `command` the way an embedded MCP stack does: as

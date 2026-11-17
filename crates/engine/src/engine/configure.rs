@@ -17,18 +17,39 @@ impl Engine {
     /// `Engine::announce_a_moved_tool_list`, because this method is the one
     /// seam all three settings callers share.
     pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
+        self.configure_frozen(action, self.read_only).await
+    }
+
+    /// [`Engine::configure`] for the person who runs this instance, over the
+    /// control socket or as a command without a daemon. While the
+    /// configuration is kept in the database a read-only instance still takes
+    /// a settings change from them: a settings write is not a knowledge
+    /// write, and with `service.read_only` saved in the document this is the
+    /// only way to take it out again. In file mode it is [`Engine::configure`].
+    pub async fn configure_as_operator(&self, action: &ConfigureAction) -> Result<Value> {
+        self.configure_frozen(action, self.settings_frozen_for_operator())
+            .await
+    }
+
+    /// Whether the settings are frozen for the operator: on a read-only
+    /// instance in file mode, never in document mode.
+    fn settings_frozen_for_operator(&self) -> bool {
+        self.read_only && !self.config_in_document()
+    }
+
+    async fn configure_frozen(&self, action: &ConfigureAction, frozen: bool) -> Result<Value> {
         match action {
             ConfigureAction::Show => {
                 let views = {
                     let file = self.file_config.read().unwrap();
-                    settings::snapshot(&file, &self.overlay)
+                    settings::snapshot(&*self.persisted_view(&file)?, &self.overlay)
                 };
                 let views =
                     settings::with_effective_share_identity(views, self.share_identity_effective());
                 Ok(json!({ "settings": views }))
             }
             ConfigureAction::Set { key, value } => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
@@ -42,15 +63,13 @@ impl Engine {
                     // safe. Lock order is always file_config then config.
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard)?;
-                    settings::apply_checked(&mut file, &self.overlay, key, value)?;
-                    self.persist_config(&file)?;
-                    // Recompute the effective config from the freshly saved file
-                    // plus the overlay, so an env-overridden key keeps reading its
-                    // env value even after the file value changes underneath it.
-                    let effective = self.overlay.apply(&file);
-                    let view = self.setting_view_json(&file, key);
-                    *file_guard = file;
-                    *self.config.write().unwrap() = effective;
+                    self.apply_setting(&mut file, key, Some(value))?;
+                    let view = self.setting_view_json(&file, key)?;
+                    // The effective config is recomputed from the freshly saved
+                    // file plus the overlay, so an env-overridden key keeps
+                    // reading its env value even after the file value changes
+                    // underneath it.
+                    self.commit_config(&mut file_guard, file)?;
                     view
                 };
                 self.contradiction_setting_touched(key);
@@ -58,7 +77,7 @@ impl Engine {
                 Ok(view)
             }
             ConfigureAction::Unset { key } => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
@@ -66,12 +85,9 @@ impl Engine {
                     // Same write-lock-first discipline and lock order as Set above.
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard)?;
-                    settings::unset_checked(&mut file, &self.overlay, key)?;
-                    self.persist_config(&file)?;
-                    let effective = self.overlay.apply(&file);
-                    let view = self.setting_view_json(&file, key);
-                    *file_guard = file;
-                    *self.config.write().unwrap() = effective;
+                    self.apply_setting(&mut file, key, None)?;
+                    let view = self.with_base_note(self.setting_view_json(&file, key)?);
+                    self.commit_config(&mut file_guard, file)?;
                     view
                 };
                 self.contradiction_setting_touched(key);
@@ -121,12 +137,13 @@ impl Engine {
     /// env-overridden key reports its env value with `source: env`. `key` has
     /// already been validated against the registry by `apply`/`unset`, so it is
     /// always found.
-    fn setting_view_json(&self, file: &GlobalConfig, key: &str) -> Value {
+    fn setting_view_json(&self, file: &GlobalConfig, key: &str) -> Result<Value> {
         // The config moves only after this answers, so the mode is worked out
         // from the file being saved.
-        let setting = self.overlay.apply(file).github_share_identity_setting();
-        settings::with_effective_share_identity(
-            settings::snapshot(file, &self.overlay),
+        let view = self.persisted_view(file)?;
+        let setting = self.overlay.apply(&view).github_share_identity_setting();
+        Ok(settings::with_effective_share_identity(
+            settings::snapshot(&view, &self.overlay),
             self.share_identity_given(setting),
         )
         .into_iter()
@@ -140,7 +157,71 @@ impl Engine {
             }
             value
         })
-        .unwrap_or(Value::Null)
+        .unwrap_or(Value::Null))
+    }
+
+    /// `view` (an unset key's [`Engine::setting_view_json`]) with one more
+    /// sentence in its `note` when the configuration is kept in the database
+    /// and the value still comes from config.yaml: the unset cleared the
+    /// document, and the base, which it never writes, still holds the key.
+    fn with_base_note(&self, mut view: Value) -> Value {
+        let Some(base) = self.persisted.as_ref().and_then(|p| p.base_path()) else {
+            return view;
+        };
+        if view.get("source") != Some(&json!(settings::SettingSource::Config)) {
+            return view;
+        }
+        let sentence = format!(
+            "the value comes from config.yaml at {}, which this command does not change",
+            base.display()
+        );
+        if let Value::Object(map) = &mut view {
+            let note = match map.get("note").and_then(Value::as_str) {
+                Some(note) => format!("{note}; {sentence}"),
+                None => sentence,
+            };
+            map.insert("note".to_string(), Value::String(note));
+        }
+        view
+    }
+
+    /// Set (`Some`) or unset (`None`) the setting `key` in `file`, with the
+    /// pair rule of [`settings::apply_checked`]. In document mode a
+    /// `database.*` key is refused (where the configuration lives is decided
+    /// by that block, so it stays in config.yaml and the environment), so are
+    /// `service.http` and a `service.public_url` that moves the base path
+    /// (both read before the document is read), and the
+    /// pair rule is checked over the document merged with its base, the way
+    /// the running server reads it.
+    fn apply_setting(&self, file: &mut GlobalConfig, key: &str, value: Option<&str>) -> Result<()> {
+        if !self.config_in_document() {
+            match value {
+                Some(value) => settings::apply_checked(file, &self.overlay, key, value)?,
+                None => settings::unset_checked(file, &self.overlay, key)?,
+            }
+            return Ok(());
+        }
+        settings::refuse_database_key_in_document(key)
+            .and_then(|()| settings::refuse_bind_key_in_document(key))
+            .and_then(|()| {
+                settings::refuse_public_url_in_document(
+                    self.config_base
+                        .as_ref()
+                        .unwrap_or(&GlobalConfig::default()),
+                    &self.overlay,
+                    key,
+                    value,
+                )
+            })
+            .map_err(|e| EngineError::Refused(e.to_string()))?;
+        let mut next = file.clone();
+        match value {
+            Some(value) => settings::apply(&mut next, key, value)?,
+            None => settings::unset(&mut next, key)?,
+        }
+        settings::check_pair(&*self.persisted_view(&next)?, &self.overlay, key)?;
+        *file = next;
+        Ok(())
     }
 
     /// The file config a mutation starts from, read under the `file_config`
@@ -164,7 +245,13 @@ impl Engine {
     /// away whatever somebody is editing by hand, and a daemon that did so
     /// put a good file back under a broken one `crystalline status` was about
     /// to report. The write is refused and the file stays as it is.
+    ///
+    /// In document mode the in-memory document is the truth (this engine is
+    /// its only writer), so it is the answer and nothing is read.
     pub(super) fn fresh_file_config(&self, snapshot: &GlobalConfig) -> Result<GlobalConfig> {
+        if self.config_in_document() {
+            return Ok(snapshot.clone());
+        }
         match self.config_file_path() {
             Some(path) if path.is_file() => overlay::load_file(&path).map_err(config_left_as_it_is),
             _ => Ok(snapshot.clone()),
@@ -180,6 +267,9 @@ impl Engine {
     /// scaffolds anything instead of at the end, with the work half done.
     /// The write itself still loads the file again under the lock.
     pub(super) fn refuse_a_config_that_does_not_parse(&self) -> Result<()> {
+        if self.config_in_document() {
+            return Ok(());
+        }
         match self.config_file_path() {
             Some(path) if path.is_file() => overlay::load_file(&path)
                 .map(drop)
@@ -188,27 +278,150 @@ impl Engine {
         }
     }
 
-    /// Persist a config to the path this engine was started with (its
-    /// `--config` override), or the default global config path when none was
-    /// given. Never touches unrelated content: the caller always passes the
-    /// current, load-modify-save typed config (see
-    /// [`Engine::fresh_file_config`] for the load), so the serde round trip
-    /// keeps every other key byte-for-byte.
+    /// Whether this engine keeps its configuration in a database document
+    /// over a read-only `config.yaml` base.
+    pub fn config_in_document(&self) -> bool {
+        matches!(
+            self.persisted,
+            Some(crate::persisted::PersistedConfig::Document { .. })
+        )
+    }
+
+    /// In document mode, run the registration `register` (one of
+    /// [`crate::registration`]'s `_saving` functions) over this engine's own
+    /// configuration: under the `file_config` write guard, checked against
+    /// the base and the held document, and saved through
+    /// `Engine::commit_config`, so memory moves with the saved document and
+    /// a later lookup finds the domain. This engine is the document's only
+    /// writer, so a registration a client asks of it (the ctl
+    /// `domain_register`) must never write the document beside it.
+    ///
+    /// `None` in file mode: there a registration loads and writes
+    /// `config.yaml` itself, as it always did.
+    pub fn register_in_document(
+        &self,
+        register: impl FnOnce(
+            crate::overlay::LoadedConfig,
+            crate::registration::SaveRegistration<'_>,
+        ) -> anyhow::Result<crate::registration::Registered>,
+    ) -> Option<anyhow::Result<crate::registration::Registered>> {
+        let Some(crate::persisted::PersistedConfig::Document { doc, .. }) = &self.persisted else {
+            return None;
+        };
+        let mut guard = self.file_config.write().unwrap();
+        let loaded = crate::overlay::LoadedConfig {
+            path: self.config_file_path().unwrap_or_default(),
+            file: guard.clone(),
+            effective: self.config(),
+            overlay: self.overlay.clone(),
+            mode: crate::overlay::ConfigMode::Document,
+            base: Some(self.config_base.clone().unwrap_or_default()),
+            document: Some(doc.clone()),
+        };
+        let held = &mut *guard;
+        let mut save = |cfg: GlobalConfig, _name: &str| -> anyhow::Result<()> {
+            self.commit_config(held, cfg)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        };
+        Some(register(loaded, &mut save))
+    }
+
+    /// The persisted layers of `file` together, without the environment: the
+    /// file itself in file mode, the base with `file` (the document) merged on
+    /// top in document mode. What a check that must see every registered
+    /// domain or setting reads.
+    pub(crate) fn persisted_view<'a>(
+        &self,
+        file: &'a GlobalConfig,
+    ) -> Result<std::borrow::Cow<'a, GlobalConfig>> {
+        Ok(match &self.config_base {
+            Some(base) => std::borrow::Cow::Owned(crate::persisted::merge(base, file)?),
+            None => std::borrow::Cow::Borrowed(file),
+        })
+    }
+
+    /// The effective configuration `file` gives: the environment overlay
+    /// applied to [`Engine::persisted_view`]. In file mode exactly
+    /// `overlay.apply(file)`, as it always was.
+    pub(crate) fn effective_of(&self, file: &GlobalConfig) -> Result<GlobalConfig> {
+        Ok(self.overlay.apply(&*self.persisted_view(file)?))
+    }
+
+    /// Make `file` the configuration without persisting it, for a caller
+    /// that found the persisted truth already says it: `held` (the
+    /// `file_config` write guard the caller holds) and the effective config
+    /// both move to it.
+    pub(super) fn adopt_config(&self, held: &mut GlobalConfig, file: GlobalConfig) -> Result<()> {
+        let effective = self.effective_of(&file)?;
+        *held = file;
+        *self.config.write().unwrap() = effective;
+        Ok(())
+    }
+
+    /// Persist `file` (see [`Engine::persist_config`]) and then make it the
+    /// configuration, `held` being the `file_config` write guard the caller
+    /// holds across the whole load-modify-save. A failed save changes nothing
+    /// in memory.
+    #[track_caller]
+    pub(super) fn commit_config(&self, held: &mut GlobalConfig, file: GlobalConfig) -> Result<()> {
+        let effective = self.effective_of(&file)?;
+        self.persist_config(held, &file)?;
+        *held = file;
+        *self.config.write().unwrap() = effective;
+        Ok(())
+    }
+
+    /// Persist a config to where this engine keeps it: the path this engine
+    /// was started with (its `--config` override), or the default global
+    /// config path when none was given, or the database document in document
+    /// mode (see [`Engine::with_persisted`]). Never touches unrelated
+    /// content: the caller always passes the current, load-modify-save typed
+    /// config (see [`Engine::fresh_file_config`] for the load), so the serde
+    /// round trip keeps every other key byte-for-byte. In document mode
+    /// `config` is the document alone, never merged with its base or the
+    /// environment.
+    ///
+    /// `held` is the `file_config` write guard the caller holds. It is
+    /// touched only when the database cannot say whether a document save
+    /// landed: the document is read back and this engine takes what is
+    /// stored, and the error says which way it went (see
+    /// [`Engine::settle_an_unknown_save`]).
     ///
     /// Every write logs one line naming its caller, so a daemon log says
     /// which path saved the file when it changed under somebody's feet.
     #[track_caller]
-    pub(super) fn persist_config(&self, config: &GlobalConfig) -> Result<()> {
+    pub(super) fn persist_config(
+        &self,
+        held: &mut GlobalConfig,
+        config: &GlobalConfig,
+    ) -> Result<()> {
         let caller = std::panic::Location::caller();
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
-            None => crystalline_core::config::global_config_path()
-                .map_err(|e| EngineError::Internal(e.to_string()))?,
-        };
-        tracing::info!(caller = %caller, path = %path.display(), "saving the configuration");
-        crystalline_core::config::save_yaml(&path, config).map_err(|e| {
-            EngineError::Internal(format!("failed to save config {}: {e}", path.display()))
-        })?;
+        match &self.persisted {
+            None => {
+                let path = match &self.config_path {
+                    Some(p) => p.clone(),
+                    None => crystalline_core::config::global_config_path()
+                        .map_err(|e| EngineError::Internal(e.to_string()))?,
+                };
+                tracing::info!(caller = %caller, path = %path.display(), "saving the configuration");
+                crate::persisted::PersistedConfig::File(path).save(config, &caller.to_string())?;
+            }
+            Some(crate::persisted::PersistedConfig::File(path)) => {
+                tracing::info!(caller = %caller, path = %path.display(), "saving the configuration");
+                crate::persisted::PersistedConfig::File(path.clone())
+                    .save(config, &caller.to_string())?;
+            }
+            Some(persisted @ crate::persisted::PersistedConfig::Document { .. }) => {
+                tracing::info!(caller = %caller, "saving the configuration document");
+                match persisted.save(config, &caller.to_string()) {
+                    Ok(()) => {}
+                    Err(EngineError::ConfigMaybeStored(detail)) => {
+                        return Err(self.settle_an_unknown_save(held, config, &detail));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         // A saved configuration may register, remove or re-alias a domain,
         // and the name table is built from the registrations. Marked here,
         // the one place every configuration write goes through, so a verb
@@ -216,6 +429,91 @@ impl Engine {
         // leaves the next lookup building from what the file says.
         self.mark_names_stale();
         Ok(())
+    }
+
+    /// After a document save whose outcome the database did not confirm:
+    /// read the document back, make what is stored this engine's
+    /// configuration (`held` and the effective config) and answer an error
+    /// that says whether `intended` landed. When the read back fails too,
+    /// memory stays as it was and the error says the outcome is unknown.
+    /// Never a plain success or a plain failure: the caller's verb did not
+    /// run to its end either way.
+    fn settle_an_unknown_save(
+        &self,
+        held: &mut GlobalConfig,
+        intended: &GlobalConfig,
+        detail: &str,
+    ) -> EngineError {
+        let Some(crate::persisted::PersistedConfig::Document { doc, .. }) = &self.persisted else {
+            return EngineError::ConfigMaybeStored(detail.to_string());
+        };
+        let unknown = |why: String| {
+            EngineError::ConfigMaybeStored(format!(
+                "the database did not confirm saving the configuration ({detail}), and reading it back failed ({why}); the change may or may not be stored, and this instance keeps the configuration it had"
+            ))
+        };
+        let stored = match doc.load().and_then(|body| match body {
+            Some(body) => crate::persisted::config_from_document(body).map(|(cfg, _)| cfg),
+            None => Ok(GlobalConfig::default()),
+        }) {
+            Ok(stored) => stored,
+            Err(e) => return unknown(e.to_string()),
+        };
+        let landed = match (
+            crate::persisted::document_body(&stored),
+            crate::persisted::document_body(intended),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        let effective = match self.effective_of(&stored) {
+            Ok(effective) => effective,
+            Err(e) => return unknown(e.to_string()),
+        };
+        *held = stored;
+        *self.config.write().unwrap() = effective;
+        self.mark_names_stale();
+        EngineError::ConfigMaybeStored(if landed {
+            format!(
+                "the database did not confirm saving the configuration ({detail}); reading it back shows the change was stored, and this instance now uses it"
+            )
+        } else {
+            format!(
+                "the database did not confirm saving the configuration ({detail}); reading it back shows the change was not stored, so this instance uses the stored configuration; try again"
+            )
+        })
+    }
+
+    /// In document mode, refuse removing, purging or renaming `name` when the
+    /// read-only base registers it, shadowed by the document or not (see
+    /// [`crate::persisted::refuse_base_domain`]). Nothing to refuse in file
+    /// mode.
+    pub(super) fn refuse_base_domain(&self, name: &str) -> Result<()> {
+        match (&self.config_base, &self.persisted) {
+            (Some(base), Some(persisted)) => {
+                let path = persisted
+                    .base_path()
+                    .map(Path::to_path_buf)
+                    .or_else(|| self.config_file_path())
+                    .unwrap_or_default();
+                crate::persisted::refuse_base_domain(base, name, &path)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// In document mode, give the document its own copy of the base entry of
+    /// `name` when it has none, so an edit of that one entry (its review
+    /// mode, a provisioning decision, a rename question) lands in the
+    /// document and shadows the base entry whole. Nothing to do in file mode
+    /// or when the document already has the entry.
+    pub(super) fn shadow_base_entry(&self, file: &mut GlobalConfig, name: &str) {
+        if let Some(base) = &self.config_base
+            && !file.domains.contains_key(name)
+            && let Some(entry) = base.domains.get(name)
+        {
+            file.domains.insert(name.to_string(), entry.clone());
+        }
     }
 
     // --- provision ---------------------------------------------------------
@@ -259,6 +557,28 @@ impl Engine {
         &self,
         action: &ProvisionAction,
         scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.provision_frozen(action, scope, self.read_only).await
+    }
+
+    /// [`Engine::provision`] for the person who runs this instance, as
+    /// [`Engine::configure_as_operator`] is for `configure`: while the
+    /// configuration is kept in the database a decision is a settings write,
+    /// so a read-only instance takes it from them.
+    pub async fn provision_as_operator(
+        &self,
+        action: &ProvisionAction,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.provision_frozen(action, scope, self.settings_frozen_for_operator())
+            .await
+    }
+
+    async fn provision_frozen(
+        &self,
+        action: &ProvisionAction,
+        scope: &crate::scope::Scope,
+        frozen: bool,
     ) -> Result<Value> {
         // Resolved once, and used two different ways below because the two
         // arms owe different things. `Status` is a pure read, so it must not
@@ -310,7 +630,7 @@ impl Engine {
                 Ok(status_report_json(&report))
             }
             ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 // Deciding about a domain is a way of asking whether it exists,
@@ -344,6 +664,7 @@ impl Engine {
                     // The name was resolved above; a domain removed from the
                     // file since is refused through the same helper, so even
                     // that race lists only what this caller may see.
+                    self.shadow_base_entry(&mut file, domain);
                     set_domain_provision_decision(&mut file, domain, allow).map_err(
                         |e| match e {
                             EngineError::UnknownDomain { domain, .. } => {
@@ -352,15 +673,12 @@ impl Engine {
                             other => other,
                         },
                     )?;
-                    self.persist_config(&file)?;
-                    let effective = self.overlay.apply(&file);
-                    *file_guard = file;
-                    *self.config.write().unwrap() = effective;
+                    self.commit_config(&mut file_guard, file)?;
                 }
                 self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
             ProvisionAction::Apply => {
-                if self.read_only {
+                if frozen {
                     return Err(EngineError::ReadOnly);
                 }
                 self.run_provision_apply(&receipt_path, &harnesses, &hidden)
@@ -433,4 +751,614 @@ fn config_left_as_it_is(e: impl std::fmt::Display) -> EngineError {
     EngineError::Invalid(format!(
         "{e}; the configuration file is left as it is until it parses again"
     ))
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+    use crate::persisted::{MemoryDocument, PersistedConfig};
+    use crystalline_core::config::SearchConfig;
+    use crystalline_index::TursoStore;
+
+    /// The read-only base: one virtual domain and one search weight.
+    fn base() -> GlobalConfig {
+        let mut base = GlobalConfig {
+            search: Some(SearchConfig {
+                salience_weight: None,
+                retired_weight: Some(0.1),
+            }),
+            ..Default::default()
+        };
+        base.domains
+            .insert("base-only".into(), DomainEntry::virtual_domain());
+        base
+    }
+
+    /// An engine in document mode over `doc` and [`base`], with a setting and
+    /// a domain from the environment, and a config.yaml on disk holding the
+    /// base. Answers the engine and the bytes of that file.
+    async fn engine_on(doc: Arc<MemoryDocument>) -> (Engine, Vec<u8>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        crystalline_core::config::save_yaml(&path, &base()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let overlay = EnvOverlay::from_vars([
+            (
+                "CRYSTALLINE_SEARCH_SALIENCE_WEIGHT".to_string(),
+                "0.3".to_string(),
+            ),
+            (
+                "CRYSTALLINE_DOMAIN_FROM_ENV".to_string(),
+                tmp.path().display().to_string(),
+            ),
+        ])
+        .unwrap();
+        let document = match doc.stored() {
+            Some(body) => crate::persisted::config_from_document(body).unwrap().0,
+            None => GlobalConfig::default(),
+        };
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            document,
+            None,
+            Some(path.clone()),
+        )
+        .with_env_overlay(overlay)
+        .with_state_dir(tmp.path().join("state"))
+        .with_persisted(
+            PersistedConfig::Document {
+                doc,
+                base: Some(path),
+            },
+            Some(base()),
+        )
+        .unwrap();
+        (engine, bytes, tmp)
+    }
+
+    fn set(key: &str, value: &str) -> ConfigureAction {
+        ConfigureAction::Set {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    /// A registration run through the engine in document mode saves the
+    /// document, moves memory with it (the domain resolves at once) and
+    /// leaves config.yaml alone; a name the base registers is adopted with
+    /// no save. In file mode the engine has nothing to run.
+    #[tokio::test]
+    async fn a_registration_through_the_engine_lands_in_document() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, bytes, tmp) = engine_on(doc.clone()).await;
+        let done = engine
+            .register_in_document(|loaded, save| {
+                crate::registration::register_virtual_domain_saving(loaded, "fresh", None, save)
+            })
+            .expect("document mode")
+            .unwrap();
+        assert!(!done.adopted);
+        let (stored, _) = crate::persisted::config_from_document(doc.stored().unwrap()).unwrap();
+        assert!(stored.domains.contains_key("fresh"), "{stored:?}");
+        assert!(!stored.domains.contains_key("base-only"));
+        assert!(engine.config().domains.contains_key("fresh"));
+        assert!(engine.discover_registered_domain("fresh"));
+        assert_eq!(
+            std::fs::read(tmp.path().join("config.yaml")).unwrap(),
+            bytes
+        );
+
+        let before = doc.stored();
+        let done = engine
+            .register_in_document(|loaded, save| {
+                crate::registration::register_virtual_domain_saving(loaded, "base-only", None, save)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(done.adopted);
+        assert_eq!(doc.stored(), before);
+
+        // A failed save changes nothing in memory.
+        *doc.fail.lock().unwrap() = Some(EngineError::Internal("the database is gone".into()));
+        let err = engine
+            .register_in_document(|loaded, save| {
+                crate::registration::register_virtual_domain_saving(loaded, "other", None, save)
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("the database is gone"), "{err}");
+        assert!(!engine.config().domains.contains_key("other"));
+
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let file_engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(tmp.path().join("other.yaml")),
+        );
+        assert!(
+            file_engine
+                .register_in_document(|_, _| unreachable!("file mode runs nothing"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_database_url_refused_in_document_mode() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, _tmp) = engine_on(doc.clone()).await;
+        for key in ["database.url", "database.schema", "database.backend"] {
+            let err = engine
+                .configure(&set(key, "postgres://elsewhere/db"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, EngineError::Refused(_)), "{key}: {err}");
+            assert!(err.to_string().contains("kept in the database"), "{err}");
+            let err = engine
+                .configure(&ConfigureAction::Unset { key: key.into() })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, EngineError::Refused(_)), "{key}: {err}");
+        }
+        assert_eq!(doc.stored(), None, "nothing was saved");
+    }
+
+    /// `service.http` is bound before the document is read, so a document
+    /// value could never apply: set and unset are refused, naming where it
+    /// belongs.
+    #[tokio::test]
+    async fn config_set_service_http_refused_in_document_mode() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, _tmp) = engine_on(doc.clone()).await;
+        let err = engine
+            .configure(&set("service.http", "0.0.0.0:7411"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert!(
+            err.to_string().contains("CRYSTALLINE_SERVICE_HTTP"),
+            "{err}"
+        );
+        let err = engine
+            .configure(&ConfigureAction::Unset {
+                key: "service.http".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        // service.allowed_hosts is read after the takeover and stays allowed.
+        engine
+            .configure(&set("service.allowed_hosts", "example.org"))
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["http"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A `service.public_url` with a path splits the base path between the
+    /// early probes and the full router, so a set of one is refused in
+    /// document mode, naming where it belongs. A url at the root is saved,
+    /// and an unset is always allowed. In file mode a path is saved as
+    /// before.
+    #[tokio::test]
+    async fn a_public_url_with_a_path_is_refused_in_document_mode() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        let err = engine
+            .configure(&set("service.public_url", "https://kb.example/crystalline"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert!(
+            err.to_string().contains("CRYSTALLINE_SERVICE_PUBLIC_URL"),
+            "{err}"
+        );
+        assert_eq!(doc.stored(), None, "nothing was saved");
+        engine
+            .configure(&set("service.public_url", "https://kb.example/"))
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["public_url"],
+            serde_json::json!("https://kb.example")
+        );
+        engine
+            .configure(&ConfigureAction::Unset {
+                key: "service.public_url".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["public_url"],
+            serde_json::Value::Null
+        );
+
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let path = tmp.path().join("file-mode.yaml");
+        let file_engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(path.clone()),
+        );
+        file_engine
+            .configure(&set("service.public_url", "https://kb.example/crystalline"))
+            .await
+            .unwrap();
+        let saved: GlobalConfig = crystalline_core::config::load_yaml(&path).unwrap();
+        assert_eq!(
+            saved.service_public_url(),
+            Some("https://kb.example/crystalline")
+        );
+    }
+
+    /// With `service.read_only` saved in the document, the operator can still
+    /// change the settings (that is how the flag is taken out again), while
+    /// an agent's settings change and every knowledge write stay refused. In
+    /// file mode a read-only instance refuses the operator too, as before.
+    #[tokio::test]
+    async fn a_read_only_document_takes_settings_from_the_operator() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        engine
+            .configure(&set("service.read_only", "true"))
+            .await
+            .unwrap();
+        let engine = engine.with_read_only(true);
+        let err = engine
+            .configure(&set("service.response_format", "json"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+        let err = engine
+            .provision(&ProvisionAction::Apply, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+        let err = engine
+            .delete_engram_as(
+                &DeleteParams {
+                    identifier: "anything".into(),
+                    domain: "base-only".into(),
+                    expected_checksum: None,
+                },
+                None,
+                &crate::scope::Scope::Unrestricted,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+
+        engine
+            .configure_as_operator(&ConfigureAction::Unset {
+                key: "service.read_only".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.stored().unwrap()["service"]["read_only"],
+            serde_json::Value::Null
+        );
+        assert!(engine.read_only(), "the running engine keeps its mode");
+
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let file_engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(tmp.path().join("file-mode.yaml")),
+        )
+        .with_read_only(true);
+        let err = file_engine
+            .configure_as_operator(&set("service.response_format", "json"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+        let err = file_engine
+            .provision_as_operator(&ProvisionAction::Apply, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+    }
+
+    /// An unset in document mode clears the document only; when config.yaml
+    /// still holds the key, the answer says the value comes from there.
+    #[tokio::test]
+    async fn an_unset_of_a_base_key_names_config_yaml() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        let view = engine
+            .configure(&ConfigureAction::Unset {
+                key: "search.retired_weight".into(),
+            })
+            .await
+            .unwrap();
+        let note = view["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains(&format!(
+                "the value comes from config.yaml at {}",
+                tmp.path().join("config.yaml").display()
+            )),
+            "{view}"
+        );
+        // A key config.yaml does not hold gets no such sentence.
+        let view = engine
+            .configure(&ConfigureAction::Unset {
+                key: "service.response_format".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !view["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("config.yaml"),
+            "{view}"
+        );
+    }
+
+    /// A save stores the document alone: no base domain, no base setting,
+    /// no environment value or domain, no database block. The effective
+    /// configuration still has all of them, and config.yaml is untouched.
+    #[tokio::test]
+    async fn a_document_save_stores_document_only_state() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, bytes, tmp) = engine_on(doc.clone()).await;
+        engine
+            .configure(&set("service.response_format", "json"))
+            .await
+            .unwrap();
+        engine.domain_add_virtual("fresh").await.unwrap();
+        let stored = doc.stored().unwrap();
+        assert_eq!(stored["service"]["response_format"], "json", "{stored}");
+        let names: Vec<_> = stored["domains"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["fresh"], "{stored}");
+        assert!(stored.get("search").is_none(), "{stored}");
+        assert!(stored.get("database").is_none(), "{stored}");
+
+        let effective = engine.config();
+        assert!(effective.domains.contains_key("base-only"));
+        assert!(effective.domains.contains_key("fresh"));
+        assert!(effective.domains.contains_key("from-env"));
+        let search = effective.search.unwrap();
+        assert_eq!(search.salience_weight, Some(0.3));
+        assert_eq!(search.retired_weight, Some(0.1));
+        assert_eq!(
+            std::fs::read(tmp.path().join("config.yaml")).unwrap(),
+            bytes
+        );
+    }
+
+    /// Document mode never reads config.yaml again: an edit of the file
+    /// after start is not seen, and the document in memory is the truth.
+    #[tokio::test]
+    async fn document_mode_reads_memory_not_the_file() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc).await;
+        let mut edited = base();
+        edited
+            .domains
+            .insert("added-by-hand".into(), DomainEntry::virtual_domain());
+        crystalline_core::config::save_yaml(&tmp.path().join("config.yaml"), &edited).unwrap();
+        let names = engine.registered_domain_names();
+        assert!(names.contains("base-only"));
+        assert!(!names.contains("added-by-hand"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_document_save_changes_nothing() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, _tmp) = engine_on(doc.clone()).await;
+        let before = engine.config();
+        *doc.fail.lock().unwrap() = Some(EngineError::Internal("down".into()));
+        let err = engine
+            .configure(&set("service.response_format", "json"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Internal(_)), "{err}");
+        assert_eq!(engine.config(), before);
+        assert_eq!(doc.stored(), None);
+    }
+
+    /// A save the database did not confirm: memory becomes what is stored,
+    /// and the answer says which way it went, never a plain outcome.
+    #[tokio::test]
+    async fn an_unconfirmed_save_takes_what_is_stored() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, _tmp) = engine_on(doc.clone()).await;
+
+        // Stored after all.
+        *doc.fail_after_store.lock().unwrap() =
+            Some(EngineError::ConfigMaybeStored("no answer".into()));
+        let err = engine
+            .configure(&set("service.response_format", "json"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ConfigMaybeStored(_)), "{err}");
+        assert!(err.to_string().contains("the change was stored"), "{err}");
+        assert_eq!(
+            engine.config().service.unwrap().response_format,
+            Some(crystalline_core::config::ResponseFormat::Json)
+        );
+        assert!(engine.config().domains.contains_key("base-only"));
+
+        // Not stored: memory is what is stored, the earlier change.
+        *doc.fail.lock().unwrap() = Some(EngineError::ConfigMaybeStored("no answer".into()));
+        let err = engine
+            .configure(&set("service.response_format", "toon"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("was not stored"), "{err}");
+        assert_eq!(
+            engine.config().service.unwrap().response_format,
+            Some(crystalline_core::config::ResponseFormat::Json)
+        );
+
+        // The read back fails too: memory stays as it was.
+        *doc.fail.lock().unwrap() = Some(EngineError::ConfigMaybeStored("no answer".into()));
+        *doc.fail_load.lock().unwrap() = Some(EngineError::Internal("down".into()));
+        let err = engine
+            .configure(&set("service.response_format", "toon"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ConfigMaybeStored(_)), "{err}");
+        assert!(
+            err.to_string().contains("may or may not be stored"),
+            "{err}"
+        );
+        assert_eq!(
+            engine.config().service.unwrap().response_format,
+            Some(crystalline_core::config::ResponseFormat::Json)
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_base_only_domain_is_refused() {
+        let doc = Arc::new(MemoryDocument::default());
+        let (engine, _, tmp) = engine_on(doc.clone()).await;
+        let err = engine.domain_remove("base-only").await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "domain 'base-only' comes from config.yaml at {}; edit that file",
+                tmp.path().join("config.yaml").display()
+            )
+        );
+        // A rename of it refuses before its first step.
+        let err = engine
+            .rename_domain_local(
+                "base-only",
+                "renamed",
+                NameOrigin::Explicit,
+                &crate::scope::Scope::Unrestricted,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        // The whole removal refuses before it purges or sweeps anything.
+        let err = engine
+            .unregister_domain("base-only", &crate::scope::Scope::Unrestricted, true, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert_eq!(doc.stored(), None);
+        assert!(engine.config().domains.contains_key("base-only"));
+    }
+
+    /// A base domain the document shadows (its review mode was changed, which
+    /// copies the entry into the document) is still the base's: removing,
+    /// purging and renaming it are refused, and nothing is dropped, purged or
+    /// moved.
+    #[tokio::test]
+    async fn a_shadowed_base_domain_is_not_removed_or_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("team");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("MANIFEST.md"),
+            "---\ntitle: team\ntype: manifest\nstatus: active\n---\n# team\n",
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join("note.md"),
+            "---\ntitle: note\ntype: note\nstatus: active\n---\nbody\n",
+        )
+        .unwrap();
+        let mut entry = DomainEntry::file(folder.clone());
+        entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+        entry.origin = Some(crystalline_core::config::OriginConfig {
+            repo: "acme/team".into(),
+            path: None,
+            branch: Some("main".into()),
+            poll_secs: None,
+        });
+        let mut base = GlobalConfig::default();
+        base.domains.insert("team".into(), entry);
+        let path = tmp.path().join("config.yaml");
+        crystalline_core::config::save_yaml(&path, &base).unwrap();
+        let doc = Arc::new(MemoryDocument::default());
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(path.clone()),
+        )
+        .with_state_dir(tmp.path().join("state"))
+        .with_persisted(
+            PersistedConfig::Document {
+                doc: doc.clone(),
+                base: Some(path),
+            },
+            Some(base),
+        )
+        .unwrap();
+        let scope = crate::scope::Scope::Unrestricted;
+
+        // Leaving review mode shadows the base entry in the document.
+        engine
+            .set_review_mode(
+                "team",
+                None,
+                ReviewModeConfirm::Confirmed { folds: Vec::new() },
+                &scope,
+            )
+            .await
+            .unwrap();
+        let shadowed = doc.stored().unwrap();
+        assert!(shadowed["domains"]["team"].is_object(), "{shadowed}");
+        assert!(engine.config().domains["team"].review.is_none());
+
+        let err = engine.domain_remove("team").await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        assert!(err.to_string().contains("comes from config.yaml"), "{err}");
+        let err = engine
+            .unregister_domain("team", &scope, true, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+        let err = engine
+            .rename_domain_local("team", "renamed", NameOrigin::Explicit, &scope)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)), "{err}");
+
+        // Nothing dropped, purged or moved.
+        assert_eq!(doc.stored().unwrap(), shadowed);
+        assert!(engine.config().domains.contains_key("team"));
+        assert!(engine.registered_domain_names().contains("team"));
+        assert!(folder.join("note.md").is_file());
+        assert!(!tmp.path().join("renamed").exists());
+    }
+
+    /// File mode is what it always was: no document, the file written.
+    #[tokio::test]
+    async fn file_mode_writes_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(path.clone()),
+        );
+        assert!(!engine.config_in_document());
+        engine
+            .configure(&set("service.response_format", "json"))
+            .await
+            .unwrap();
+        let mut expected = GlobalConfig::default();
+        settings::apply(&mut expected, "service.response_format", "json").unwrap();
+        let theirs = tmp.path().join("theirs.yaml");
+        crystalline_core::config::save_yaml(&theirs, &expected).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&theirs).unwrap()
+        );
+    }
 }

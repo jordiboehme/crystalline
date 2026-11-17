@@ -2763,6 +2763,72 @@ pub fn apply_checked(
     Ok(())
 }
 
+/// Refuse a `database.*` key while the configuration is kept in the
+/// database: that block decides where the configuration lives, so it comes
+/// from config.yaml and the environment only and never from the document.
+pub fn refuse_database_key_in_document(key: &str) -> Result<(), SettingsError> {
+    if key == "database" || key.starts_with("database.") {
+        return Err(SettingsError(format!(
+            "{key} cannot be changed while the configuration is kept in the database; the database settings come from config.yaml and the environment only, so edit config.yaml or the variable and restart"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse `service.http` while the configuration is kept in the database:
+/// on Postgres the endpoint is bound before the instance takes the database
+/// over and reads the document, so a value saved there could never apply.
+pub fn refuse_bind_key_in_document(key: &str) -> Result<(), SettingsError> {
+    if key == "service.http" {
+        return Err(SettingsError(format!(
+            "{key} cannot be changed while the configuration is kept in the database: the endpoint is bound before the database is read, so a value saved there never applies; set CRYSTALLINE_SERVICE_HTTP or service.http in config.yaml and restart"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a `service.public_url` set while the configuration is kept in the
+/// database when it would move the base path away from the one the instance
+/// works out before the takeover, from `base` (config.yaml) and the
+/// environment: the early probes are served under that one and the full
+/// router under the one read after the takeover, so a different path saved
+/// in the document would split the two. A url with the same path, or none
+/// where there is none, stays settable. `value` is the value a set writes,
+/// `None` for an unset, which is always allowed: the document then holds no
+/// url and the base's is the one read on both sides. A value the setter
+/// refuses is left to the setter's own error.
+pub fn refuse_public_url_in_document(
+    base: &GlobalConfig,
+    overlay: &EnvOverlay,
+    key: &str,
+    value: Option<&str>,
+) -> Result<(), SettingsError> {
+    let (PUBLIC_URL_KEY, Some(value)) = (key, value) else {
+        return Ok(());
+    };
+    let mut next = base.clone();
+    if apply(&mut next, key, value).is_err() {
+        return Ok(());
+    }
+    let before = base_path(&overlay.apply(base));
+    let after = base_path(&overlay.apply(&next));
+    if before != after {
+        let shown = |path: &BasePath| {
+            if path.is_root() {
+                "/".to_string()
+            } else {
+                path.as_str().to_string()
+            }
+        };
+        return Err(SettingsError(format!(
+            "{key} cannot be set to '{value}' while the configuration is kept in the database: it would move the base path from {} to {}, and the base path is read before the database is read, so it would apply to only part of the server; set CRYSTALLINE_SERVICE_PUBLIC_URL or service.public_url in config.yaml and restart",
+            shown(&before),
+            shown(&after)
+        )));
+    }
+    Ok(())
+}
+
 /// [`unset`] with the same pair rule as [`apply_checked`]: taking
 /// `service.public_url` away from under a configured redirect uri that
 /// carries a prefix is refused, and changes nothing.
@@ -2778,7 +2844,15 @@ pub fn unset_checked(
     Ok(())
 }
 
-fn check_pair(next: &GlobalConfig, overlay: &EnvOverlay, key: &str) -> Result<(), SettingsError> {
+/// The pair rule of [`apply_checked`] on its own, over `next` as the
+/// persisted layers give it (the engine passes a document merged with its
+/// base): a write of `service.public_url` or `auth.oidc.redirect_uri` that
+/// leaves the effective pair inconsistent is refused.
+pub fn check_pair(
+    next: &GlobalConfig,
+    overlay: &EnvOverlay,
+    key: &str,
+) -> Result<(), SettingsError> {
     if (key == PUBLIC_URL_KEY || key == OIDC_REDIRECT_URI_KEY)
         && let Some(problem) = oidc_pair_problem(&overlay.apply(next))
     {
@@ -2821,6 +2895,60 @@ mod tests {
 
     fn known_keys() -> Vec<&'static str> {
         registry().iter().map(|s| s.key).collect()
+    }
+
+    /// In document mode a `service.public_url` set must leave the base path
+    /// the instance works out before the takeover (config.yaml and the
+    /// environment) as it is, both ways round; the same path stays settable
+    /// and an unset is always allowed.
+    #[test]
+    fn a_public_url_in_document_keeps_the_pre_takeover_base_path() {
+        let with_path = |url: &str| {
+            let mut cfg = GlobalConfig::default();
+            apply(&mut cfg, PUBLIC_URL_KEY, url).unwrap();
+            cfg
+        };
+        let none = EnvOverlay::default();
+        let refuse = |base: &GlobalConfig, overlay: &EnvOverlay, value: Option<&str>| {
+            refuse_public_url_in_document(base, overlay, PUBLIC_URL_KEY, value)
+        };
+
+        // A document without a path over a base with one.
+        let base = with_path("https://kb.example/crystalline");
+        let err = refuse(&base, &none, Some("https://kb.example")).unwrap_err();
+        assert!(
+            err.0.contains("from /crystalline to /")
+                && err.0.contains("CRYSTALLINE_SERVICE_PUBLIC_URL"),
+            "{err}"
+        );
+        refuse(&base, &none, Some("https://other.example/crystalline/")).unwrap();
+        refuse(&base, &none, None).unwrap();
+
+        // A document with a path over a base without one.
+        let base = with_path("https://kb.example");
+        let err = refuse(&base, &none, Some("https://kb.example/crystalline")).unwrap_err();
+        assert!(err.0.contains("from / to /crystalline"), "{err}");
+        refuse(&base, &none, Some("https://other.example/")).unwrap();
+        let err = refuse(
+            &GlobalConfig::default(),
+            &none,
+            Some("https://kb.example/kb"),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("from / to /kb"), "{err}");
+        refuse(&GlobalConfig::default(), &none, Some("https://kb.example")).unwrap();
+
+        // The environment wins over both, so nothing a set saves moves it.
+        let env = EnvOverlay::from_vars([(
+            "CRYSTALLINE_SERVICE_PUBLIC_URL".to_string(),
+            "https://kb.example/team".to_string(),
+        )])
+        .unwrap();
+        refuse(&base, &env, Some("https://kb.example/crystalline")).unwrap();
+
+        // Other keys and values the setter refuses are not this check's.
+        refuse_public_url_in_document(&base, &none, "service.allowed_hosts", Some("x")).unwrap();
+        refuse(&base, &none, Some("not a url")).unwrap();
     }
 
     #[test]

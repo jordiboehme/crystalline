@@ -6,8 +6,9 @@
 //! Every connection carries an `application_name` that names the database
 //! owner key, the instance and the role ([`application_name`]), and TCP
 //! keepalives as startup options. The lock connection also gets an
-//! `idle_session_timeout` and a `statement_timeout`, set at connect through
-//! startup options, because a `SET LOCAL` outside a transaction does nothing.
+//! `idle_session_timeout` and a `statement_timeout`, and the side channel a
+//! `statement_timeout`, set at connect through startup options, because a
+//! `SET LOCAL` outside a transaction does nothing.
 //!
 //! When the options carry an [`OwnerFence`], every connection in the roles
 //! `pool`, `read`, `auth` and `side` checks at connect that the recorded lock
@@ -210,7 +211,8 @@ const KEEPALIVES: [(&str, &str); 3] = [
 /// The connect options of a `role` connection to `t`: the URL's own options,
 /// then the `application_name`, the keepalives and, for [`PgRole::Lock`], the
 /// idle session and statement timeouts at the current owner timings
-/// ([`super::owner::lock_session_settings`]).
+/// ([`super::owner::lock_session_settings`]); for [`PgRole::Side`], the side
+/// channel's statement timeout ([`super::owner::SIDE_STATEMENT_TIMEOUT`]).
 pub(crate) fn connect_options(
     t: &PgTarget,
     role: PgRole,
@@ -222,10 +224,14 @@ pub(crate) fn connect_options(
         .map_err(IndexError::from)?
         .application_name(&name)
         .options(KEEPALIVES);
-    if role == PgRole::Lock {
-        opts = opts.options(super::owner::lock_session_settings(
-            &super::owner::OwnerTimings::current(),
-        ));
+    match role {
+        PgRole::Lock => {
+            opts = opts.options(super::owner::lock_session_settings(
+                &super::owner::OwnerTimings::current(),
+            ));
+        }
+        PgRole::Side => opts = opts.options([super::owner::side_session_setting()]),
+        _ => {}
     }
     Ok(opts)
 }
@@ -407,8 +413,8 @@ mod tests {
     }
 
     /// The application name and the keepalives go into every role's connect
-    /// options, the URL's own options are kept, and only the lock connection
-    /// gets the timeouts.
+    /// options, the URL's own options are kept, only the lock connection gets
+    /// the idle timeout and only it and the side channel a statement timeout.
     #[test]
     fn connect_options_carry_the_name_keepalives_and_lock_timeouts() {
         let t = PgTarget {
@@ -440,6 +446,11 @@ mod tests {
             "{lock_opts}"
         );
         assert!(lock_opts.contains("statement_timeout=3s"), "{lock_opts}");
+        let side = connect_options(&t, PgRole::Side, &o).unwrap();
+        let side_opts = side.get_options().unwrap();
+        assert!(side_opts.contains("statement_timeout=5s"), "{side_opts}");
+        assert!(!side_opts.contains("idle_session_timeout"), "{side_opts}");
+        assert!(side_opts.contains("tcp_keepalives_idle=10"), "{side_opts}");
         let untagged = connect_options(&t, PgRole::Cli, &PgSessionOptions::default()).unwrap();
         assert!(
             untagged

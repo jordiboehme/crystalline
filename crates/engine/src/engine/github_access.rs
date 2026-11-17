@@ -2736,16 +2736,11 @@ impl super::Engine {
                         .is_some_and(|origin| repo_key(&origin.repo) == old_key)
                 });
                 if stale {
-                    let effective = self.overlay.apply(&file);
-                    *file_guard = file;
-                    *self.config.write().unwrap() = effective;
+                    self.adopt_config(&mut file_guard, file)?;
                 }
                 return Ok(moved);
             }
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
             moved
         };
         for domain in &moved {

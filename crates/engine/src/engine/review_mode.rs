@@ -1485,6 +1485,7 @@ impl Engine {
     ) -> Result<()> {
         let mut file_guard = self.file_config.write().unwrap();
         let mut file = self.fresh_file_config(&file_guard)?;
+        self.shadow_base_entry(&mut file, domain);
         let Some(entry) = file.domains.get_mut(domain) else {
             return Err(EngineError::UnknownDomain {
                 domain: domain.to_string(),
@@ -1492,10 +1493,7 @@ impl Engine {
             });
         };
         entry.review = review;
-        self.persist_config(&file)?;
-        let effective = self.overlay.apply(&file);
-        *file_guard = file;
-        *self.config.write().unwrap() = effective;
+        self.commit_config(&mut file_guard, file)?;
         // A domain discovered after this engine started keeps a cached entry of
         // its own beside the two configs above, and `domain_entry` falls back
         // to it when `self.config` has no such name. The effective config just
@@ -1594,6 +1592,8 @@ impl Engine {
         let removed = {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;
+            // A domain the read-only config.yaml registers stays there.
+            self.refuse_base_domain(name)?;
             let removed = match file.domains.shift_remove(name) {
                 Some(entry) => entry,
                 None => {
@@ -1612,10 +1612,7 @@ impl Engine {
                     });
                 }
             };
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
             removed
         };
         // Record whether the entry was a file domain before removing it.
