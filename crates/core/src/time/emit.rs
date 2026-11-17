@@ -1,8 +1,8 @@
 //! Dates printed by hand from plain numbers, byte for byte as chrono printed
-//! them: RFC 3339 (`to_rfc3339`), the `Debug` forms and chrono's `Display`
-//! of a UTC instant.
+//! them: RFC 3339 (`to_rfc3339`), the `Debug` forms, chrono's `Display` of
+//! a UTC instant and the HTTP date.
 
-use super::calendar::civil_from_days;
+use super::calendar::{civil_from_days, weekday_from_monday};
 use std::fmt::Write;
 
 /// A year, month and day as `YYYY-MM-DD`: four digits within 0000 to 9999,
@@ -101,4 +101,27 @@ pub(super) fn display_utc(secs: i64, nanos: u32) -> String {
     let mut out = local(secs, nanos, 0, ' ');
     out.push_str(" UTC");
     out
+}
+
+/// The HTTP date, as chrono's `format("%a, %d %b %Y %H:%M:%S GMT")` writes
+/// it for a UTC instant: `Mon, 05 Jan 2026 10:17:19 GMT`. A leap second is
+/// written as `:60`; the fraction is dropped.
+pub(super) fn http_date(secs: i64, nanos: u32) -> String {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = secs.div_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let second_of_day = secs.rem_euclid(86_400);
+    let (hour, minute) = (second_of_day / 3600, second_of_day / 60 % 60);
+    let second = second_of_day % 60 + i64::from(nanos >= 1_000_000_000);
+    let weekday = WEEKDAYS[usize::from(weekday_from_monday(days))];
+    let month = MONTHS[usize::from(month - 1)];
+    let year = if (0..=9999).contains(&year) {
+        format!("{year:04}")
+    } else {
+        format!("{year:+05}")
+    };
+    format!("{weekday}, {day:02} {month} {year} {hour:02}:{minute:02}:{second:02} GMT")
 }

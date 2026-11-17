@@ -314,6 +314,12 @@ impl Stamp {
         emit::display_utc(self.unix_seconds(), self.subsec_nanos())
     }
 
+    /// The HTTP date (RFC 9110's IMF-fixdate): `Mon, 05 Jan 2026 10:17:19
+    /// GMT`, as chrono's `%a, %d %b %Y %H:%M:%S GMT` writes it.
+    pub fn http_date(&self) -> String {
+        emit::http_date(self.unix_seconds(), self.subsec_nanos())
+    }
+
     /// `2026-01-05 10:17 UTC`.
     pub fn ymd_hm_utc(&self) -> String {
         self.0.format("%Y-%m-%d %H:%M UTC").to_string()
@@ -1578,6 +1584,67 @@ mod tests {
             assert_eq!(millis_z, reference.format("%Y%m%dT%H%M%S%.3fZ").to_string());
             assert_eq!(z, reference.format("%Y%m%dT%H%M%SZ").to_string());
             assert_eq!(short, reference.format("%y%m%d%H%M%S").to_string());
+        }
+    }
+
+    #[test]
+    fn http_date_matches_chrono() {
+        assert_eq!(
+            Stamp::from_unix(BASE_SECS, 0).unwrap().http_date(),
+            "Mon, 05 Jan 2026 10:17:19 GMT"
+        );
+        assert_eq!(
+            Stamp::from_ymd_hms(2026, 12, 31, 23, 59, 59)
+                .unwrap()
+                .http_date(),
+            "Thu, 31 Dec 2026 23:59:59 GMT"
+        );
+        assert_eq!(
+            Stamp::UNIX_EPOCH.http_date(),
+            "Thu, 01 Jan 1970 00:00:00 GMT"
+        );
+        let mut instants: Vec<DateTime<Utc>> = (0..400)
+            .map(|i| {
+                chrono_utc(
+                    -2_208_988_800 + i * 31_622_401 + i * i * 7_919,
+                    (i as u32) * 2_500_001,
+                )
+            })
+            .collect();
+        instants.extend([
+            chrono_utc(-1, 999_999_999),
+            NaiveDate::from_ymd_opt(2026, 12, 31)
+                .unwrap()
+                .and_hms_nano_opt(23, 59, 59, 1_000_000_000)
+                .unwrap()
+                .and_utc(),
+            NaiveDate::from_ymd_opt(0, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+            NaiveDate::from_ymd_opt(9999, 12, 31)
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap()
+                .and_utc(),
+            NaiveDate::from_ymd_opt(10000, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+            NaiveDate::from_ymd_opt(-1, 6, 30)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc(),
+        ]);
+        for instant in instants {
+            assert_eq!(
+                Stamp::from_chrono(instant).http_date(),
+                instant.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                "{instant:?}"
+            );
         }
     }
 
