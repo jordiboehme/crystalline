@@ -7122,6 +7122,11 @@ fn no_test_selects_a_schema_through_url_options() {
     assert!(hits.is_empty(), "URL options select a schema in {hits:?}");
 }
 
+/// The secret key every Postgres process test runs with: fixed, so a test
+/// can seal or read a row the way the process does.
+pub(crate) const TEST_SECRET_KEY: &str =
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
 /// A Postgres schema of its own for a test against the database at
 /// `CRYSTALLINE_TEST_POSTGRES_URL`, made and dropped through the test's own
 /// connection (no `psql` needed). `None`, with a note, when the variable is
@@ -7160,21 +7165,23 @@ impl PgScratch {
     }
 
     /// The variables that point a process at this scratch schema: the
-    /// backend, the plain URL (no `options`) and the schema. The owner
-    /// timings are divided by 10, so a first start on the empty schema,
-    /// which has no owner row and so waits out the takeover grace, waits
-    /// 1.5 s and not 15 s.
+    /// backend, the plain URL (no `options`), the schema and the fixed test
+    /// secret key, which a start on Postgres requires. The owner timings are
+    /// divided by 10, so a first start on the empty schema, which has no
+    /// owner row and so waits out the takeover grace, waits 1.5 s and not
+    /// 15 s.
     fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("CRYSTALLINE_DATABASE_BACKEND", "postgres".to_string()),
             ("CRYSTALLINE_DATABASE_URL", self.url.clone()),
             ("CRYSTALLINE_DATABASE_SCHEMA", self.schema.clone()),
             ("CRYSTALLINE_TEST_OWNER_TIMING_SCALE", "10".to_string()),
+            ("CRYSTALLINE_SECRET_KEY", TEST_SECRET_KEY.to_string()),
         ]
     }
 
     /// Run `sql` (one or more statements) on a fresh connection.
-    fn run(&self, sql: &str) -> Result<(), sqlx::Error> {
+    pub(crate) fn run(&self, sql: &str) -> Result<(), sqlx::Error> {
         use sqlx::Connection;
         self.runtime.block_on(async {
             let mut conn = sqlx::PgConnection::connect(&self.url).await?;

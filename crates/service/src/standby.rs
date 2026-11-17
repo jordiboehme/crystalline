@@ -68,6 +68,12 @@ pub(crate) struct PgHeld {
 }
 
 impl PgHeld {
+    /// The owner a test holds, as the daemon keeps it after the handover.
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) fn holding(owner: Arc<crystalline_index::postgres::PgOwner>) -> PgHeld {
+        PgHeld { owner }
+    }
+
     /// Give the database back: record `released_at` in the owner row and
     /// unlock, so a standby takes over without waiting out the grace. The
     /// last step of a graceful stop; a failure is said in the log, and the

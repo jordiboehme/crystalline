@@ -418,6 +418,218 @@ fn turso_order_unchanged() {
     );
 }
 
+/// The variables that take the secret key away from a child: a blank value
+/// counts as unset, whatever the shell running the tests has set.
+#[cfg(feature = "postgres")]
+const NO_SECRET_KEY: [(&str, &str); 2] = [
+    ("CRYSTALLINE_SECRET_KEY", ""),
+    ("CRYSTALLINE_SECRET_KEY_FILE", ""),
+];
+
+/// How many rows `pg`'s `instance_secret` holds.
+#[cfg(feature = "postgres")]
+fn secret_rows(pg: &PgScratch) -> String {
+    pg.text(&format!(
+        "SELECT count(*)::text FROM {}.instance_secret",
+        pg.schema
+    ))
+}
+
+/// A start of `env` that stops by itself: its exit code and its log.
+#[cfg(feature = "postgres")]
+fn failed_start(env: &Env, extra: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut serve = Serve::start_with(env, Some("info"), extra);
+    let code = serve.wait_exit(Duration::from_secs(60));
+    (code, serve.log())
+}
+
+/// A first start with the key, which migrates the schema; answers the id of
+/// the key from its log.
+#[cfg(feature = "postgres")]
+fn migrated_by_a_start(env: &Env) -> String {
+    let mut serve = Serve::start(env, Some("info"));
+    serve.wait_ready();
+    let log = serve.log();
+    let marker = "secrets sealed in postgres with key ";
+    let at = log.find(marker).expect(&log) + marker.len();
+    let key_id: String = log[at..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+    key_id
+}
+
+/// On Postgres the secret key is required: a start without it stops before
+/// it takes the lock, with a sentence naming the variable and how to make a
+/// key, on an empty schema (nothing is created) and on one with sealed rows
+/// (they are kept).
+#[cfg(feature = "postgres")]
+#[test]
+fn missing_key_fails_start() {
+    let Some(pg) = PgScratch::new("skmiss") else {
+        return;
+    };
+    let env = Env::new("skmiss").on_postgres(&pg);
+    let (code, log) = failed_start(&env, &NO_SECRET_KEY);
+    assert_ne!(code, Some(0), "{log}");
+    assert!(log.contains("CRYSTALLINE_SECRET_KEY"), "{log}");
+    assert!(log.contains("openssl rand -base64 32"), "{log}");
+    assert_eq!(schema_objects(&pg), "0", "nothing was created:\n{log}");
+
+    migrated_by_a_start(&env);
+    pg.run(&format!(
+        "INSERT INTO {}.instance_secret VALUES ('github', '\\x01'::bytea, 'k', now())",
+        pg.schema
+    ))
+    .unwrap();
+    let (code, log) = failed_start(&env, &NO_SECRET_KEY);
+    assert_ne!(code, Some(0), "{log}");
+    assert!(log.contains("CRYSTALLINE_SECRET_KEY"), "{log}");
+    assert!(
+        owner_command(&pg).ends_with("|true"),
+        "the keyless start never took the database"
+    );
+    assert_eq!(secret_rows(&pg), "1", "the row is kept");
+}
+
+/// Rows sealed with another key stop the start after the takeover, naming
+/// both key ids, and every row is kept.
+#[cfg(feature = "postgres")]
+#[test]
+fn key_id_mismatch_fails_start_and_keeps_rows() {
+    let Some(pg) = PgScratch::new("skwrong") else {
+        return;
+    };
+    let env = Env::new("skwrong").on_postgres(&pg);
+    let mine = migrated_by_a_start(&env);
+    assert_eq!(mine.len(), 16, "the key id is logged");
+    pg.run(&format!(
+        "INSERT INTO {s}.instance_secret VALUES ('github', '\\x01'::bytea, '0123456789abcdef', now()); \
+         INSERT INTO {s}.instance_secret VALUES ('github-app', '\\x01'::bytea, '0123456789abcdef', now())",
+        s = pg.schema
+    ))
+    .unwrap();
+    let (code, log) = failed_start(&env, &[]);
+    assert_ne!(code, Some(0), "{log}");
+    assert!(log.contains("0123456789abcdef"), "{log}");
+    assert!(log.contains(&mine), "{log}");
+    assert_eq!(secret_rows(&pg), "2", "the rows are kept:\n{log}");
+}
+
+/// A credential the daemon reads right after its start comes from the
+/// vault: an instance token sealed in the database is what the GitHub
+/// settings report, and a leftover token file in the state folder is not
+/// read.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn a_credential_read_after_start_comes_from_the_vault() {
+    use crystalline_remote::sealed::{SealKey, seal};
+    use crystalline_remote::{StoredToken, TokenIdentity, TokenStore};
+
+    use crate::service::TEST_SECRET_KEY;
+
+    let Some(pg) = PgScratch::new("skread") else {
+        return;
+    };
+    let env = Env::new("skread").on_postgres(&pg);
+    migrated_by_a_start(&env);
+    let token = |user: &str| StoredToken {
+        access_token: format!("{user}-secret"),
+        host: "github.com".to_string(),
+        user: user.to_string(),
+        created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_expires_at: None,
+    };
+    let bytes: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&TEST_SECRET_KEY[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    let key = SealKey::from_bytes(bytes.try_into().unwrap());
+    let sealed = seal(
+        &key,
+        "github",
+        &serde_json::to_vec(&token("vault-user")).unwrap(),
+    );
+    let hex: String = sealed.iter().map(|b| format!("{b:02x}")).collect();
+    pg.run(&format!(
+        "INSERT INTO {}.instance_secret VALUES ('github', decode('{hex}', 'hex'), '{}', now())",
+        pg.schema,
+        key.key_id()
+    ))
+    .unwrap();
+    let origins = env.state_dir().join("origins");
+    TokenStore::file_fallback_for(&TokenIdentity::Instance, &origins)
+        .unwrap()
+        .save(&token("file-user"))
+        .unwrap();
+
+    let mut serve = Serve::start_bound(
+        &env,
+        "0.0.0.0",
+        Some("info"),
+        &[
+            ("CRYSTALLINE_GITHUB_ENABLED", "true"),
+            ("CRYSTALLINE_ADMIN_NAME", "root"),
+            ("CRYSTALLINE_ADMIN_PASSWORD", "root-password"),
+        ],
+    );
+    serve.wait_ready();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let login = client
+        .post(format!("http://{}/api/v1/auth/login", serve.addr))
+        .json(&serde_json::json!({ "name": "root", "password": "root-password" }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .unwrap();
+    assert_eq!(login.status().as_u16(), 200);
+    let cookies: Vec<String> = login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok()?.split(';').next().map(str::to_string))
+        .collect();
+    let github: Value = client
+        .get(format!("http://{}/api/v1/settings/github", serve.addr))
+        .header("cookie", cookies.join("; "))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(github["token_store"], "vault", "{github}");
+    assert_eq!(github["user"], "vault-user", "{github}");
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+}
+
+/// On Turso the secret key is ignored with one warning, even one that
+/// would not parse, and the instance serves.
+#[test]
+fn turso_start_with_a_secret_key_warns_once_and_serves() {
+    let env = Env::new("tursokey");
+    let mut serve = Serve::start_with(
+        &env,
+        Some("info"),
+        &[("CRYSTALLINE_SECRET_KEY", "not-a-key")],
+    );
+    serve.wait_ready();
+    let log = serve.log();
+    assert_eq!(
+        log.matches("The key is ignored").count(),
+        1,
+        "one warning:\n{log}"
+    );
+    assert!(!log.contains("not-a-key"), "the value is never logged");
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+}
+
 /// The log line a former standby writes when the start hold begins.
 const HOLDING: &str = "test hook: holding the start";
 

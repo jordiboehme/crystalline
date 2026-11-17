@@ -379,6 +379,14 @@ pub async fn run_serve(
     let configured_setup =
         configured_setup_token(|k| std::env::var(k).ok(), |p| std::fs::read_to_string(p))
             .map_err(anyhow::Error::msg)?;
+    // The secret key (spec D): on Postgres it is required, so a start
+    // without it stops here, before the lock, and a standby without it
+    // never takes the database. From here on this process keeps its secrets
+    // in the vault, installed after the takeover. On Turso the key is
+    // ignored, with one warning.
+    let secret_key = crate::secret_start::read_for_start(loaded.effective.database().backend)?;
+    #[cfg(not(feature = "postgres"))]
+    let _ = secret_key;
     let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
@@ -555,6 +563,12 @@ pub async fn run_serve(
     let takeover_document = match &pg_start {
         Some(pg) => {
             pg.announce().await?;
+            // The sealed secrets: the key checked against the rows the
+            // migrated database holds, and the vault installed, before the
+            // engine is built and so before any credential is read.
+            if let Some(key) = secret_key {
+                crate::secret_start::open_vault(pg, key).await?;
+            }
             // The configuration document, read once now that this instance
             // owns the database and the store open made sure its table exists
             // (spec section C). A failed read stops the start: an instance
@@ -1223,19 +1237,29 @@ pub async fn run_serve(
 
     // With the store held: a sign-in refresh a source call started is
     // waited for, with what is left of the deadline, so a token pair a
-    // server rotated is saved. The refresh touches no store.
-    departure.settle_sign_ins().await;
+    // server rotated is saved, and then the database is released.
+    settle_sign_ins_then_release(&departure, database.as_ref()).await;
 
-    // Last, so everything above still wrote as the owner (a saved sign-in
-    // included): `released_at` and the unlock, and a standby takes over
-    // without the grace. Bounded by the same watchdog; a release that never
-    // ends is cut by the exit, which frees the lock without `released_at`.
-    if let Some(database) = &database {
+    departure.finish((!daemon_flag).then_some("crystalline stopped"))
+}
+
+/// The last two steps of a stop. A sign-in refresh a source call started is
+/// waited for first, so a token pair a server rotated is saved while this
+/// instance still owns the database: on Postgres the pair goes to the
+/// vault, which answers only while the lock is held. The refresh touches no
+/// index store. Then the database: last, so everything above still wrote as
+/// the owner, `released_at` and the unlock, and a standby takes over without
+/// the grace. Bounded by the departure's watchdog; a release that never ends
+/// is cut by the exit, which frees the lock without `released_at`.
+async fn settle_sign_ins_then_release(
+    departure: &Departure,
+    database: Option<&crate::standby::PgHeld>,
+) {
+    departure.settle_sign_ins().await;
+    if let Some(database) = database {
         departure.step("releasing the database");
         database.release().await;
     }
-
-    departure.finish((!daemon_flag).then_some("crystalline stopped"))
 }
 
 /// Open the index store for the daemon's start: on Postgres with the owner's
@@ -6749,5 +6773,181 @@ mod tests {
             "an output call's parentheses never balance, so this guard cannot read it: {}",
             &rest[..rest.len().min(200)]
         );
+    }
+
+    /// A sign-in a server rotates while the daemon stops lands in the vault
+    /// before the database is released: after the stop the row holds the
+    /// rotated pair. The side channel answers only while the lock is held,
+    /// so a save after the release would have been lost.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotated_server_credential_saved_before_release() {
+        use crystalline_index::postgres::{
+            Acquired, OwnerIdentity, PgOwner, PgTarget, PostgresStore, ScratchSchema,
+        };
+        use crystalline_remote::sealed::SealKey;
+        use crystalline_remote::{
+            Connection, CredentialKind, ServerCredential, ServerCredentialStore, SourceRecord,
+            vault,
+        };
+
+        let Some(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        else {
+            eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let scratch = ScratchSchema::new(&url, "rotsave");
+        drop(
+            PostgresStore::open_in_schema_with_readers(&url, scratch.name(), 0)
+                .await
+                .unwrap(),
+        );
+        let target = PgTarget {
+            url: url.clone(),
+            schema: Some(scratch.name().to_string()),
+        };
+        let identity = |tag: &str| OwnerIdentity {
+            instance_id: format!("{tag}-0000-4000-8000-000000000000"),
+            label: tag.to_string(),
+            command: None,
+            version: "0.33.0-test".to_string(),
+        };
+        let key = || SealKey::from_bytes([9; 32]);
+        let owner = Arc::new(PgOwner::start(target.clone(), identity("rotsavea")).unwrap());
+        assert!(matches!(
+            owner.try_acquire().await.unwrap(),
+            Acquired::Held { .. }
+        ));
+        vault::clear();
+        vault::install(
+            Arc::new(crystalline_engine::vault::PgVault::new(
+                owner.side(),
+                key().key_id(),
+            )),
+            key(),
+        );
+
+        // A token endpoint that rotates the pair, slowly enough that the
+        // call which started the refresh gives up first.
+        let live = Arc::new(std::sync::Mutex::new("cor_0".to_string()));
+        let fake_live = live.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/oauth/token",
+            axum::routing::post(move |body: String| {
+                let live = fake_live.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let presented = body
+                        .split('&')
+                        .find_map(|p| p.strip_prefix("refresh_token="))
+                        .unwrap_or("")
+                        .to_string();
+                    let mut live = live.lock().unwrap();
+                    if presented != *live {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({ "error": "invalid_grant" })),
+                        );
+                    }
+                    *live = "cor_1".to_string();
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "access_token": "coa_1",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "refresh_token": "cor_1",
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let record = SourceRecord {
+            url: server.clone(),
+            name: "acme".to_string(),
+            account: "keeper".to_string(),
+            kind: CredentialKind::Oauth,
+            token_endpoint: Some(format!("{server}/api/v1/oauth/token")),
+            revocation_endpoint: None,
+            connected_at: chrono::Utc::now(),
+            mounts: Vec::new(),
+            domains: None,
+            from_env: false,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_dir = tmp.path().to_path_buf();
+        let expired = ServerCredential::oauth(
+            "coa_0".to_string(),
+            "cor_0".to_string(),
+            3600,
+            "coc_test".to_string(),
+            server.clone(),
+            "keeper".to_string(),
+            chrono::Utc::now() - chrono::TimeDelta::hours(2),
+        );
+        let (opened, dir) = (record.clone(), remote_dir.clone());
+        let connection = tokio::task::spawn_blocking(move || {
+            ServerCredentialStore::save_resolving(&opened.key(), &opened.host_dir(&dir), &expired)
+                .unwrap();
+            Connection::open(opened, &dir).unwrap()
+        })
+        .await
+        .unwrap();
+
+        // The call gives up; its refresh goes on and is still running when
+        // the stop begins.
+        let gave_up = connection
+            .ctl_within(
+                serde_json::json!({ "v": 1, "cmd": "status" }),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(gave_up.is_err(), "{gave_up:?}");
+        let departure = Departure::begin_held(
+            Arc::new(std::sync::Mutex::new(None)),
+            Duration::from_secs(3600),
+        );
+        settle_sign_ins_then_release(
+            &departure,
+            Some(&crate::standby::PgHeld::holding(owner.clone())),
+        )
+        .await;
+        assert_eq!(*live.lock().unwrap(), "cor_1", "the server rotated");
+        drop(owner);
+
+        // After the stop, the next owner reads the rotated pair.
+        let next = PgOwner::start(target, identity("rotsaveb")).unwrap();
+        for _ in 0..100 {
+            if matches!(next.try_acquire().await.unwrap(), Acquired::Held { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        vault::install(
+            Arc::new(crystalline_engine::vault::PgVault::new(
+                next.side(),
+                key().key_id(),
+            )),
+            key(),
+        );
+        let saved = tokio::task::spawn_blocking(move || {
+            ServerCredentialStore::resolve_and_load(&record.key(), &record.host_dir(&remote_dir))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        vault::clear();
+        assert_eq!(saved.0.kind(), "vault");
+        let saved = saved.1.expect("the row exists after the stop");
+        assert_eq!(saved.refresh_token.as_deref(), Some("cor_1"));
+        assert_eq!(saved.access_token, "coa_1");
+        next.release().await.unwrap();
     }
 }

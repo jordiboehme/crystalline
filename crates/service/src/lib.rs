@@ -32,6 +32,7 @@ pub mod mcp_gate;
 pub mod remote_ctl;
 pub mod route;
 pub mod runs_in;
+mod secret_start;
 mod session_end;
 #[cfg(windows)]
 mod session_end_windows;
