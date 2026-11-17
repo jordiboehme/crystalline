@@ -186,6 +186,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "instance config",
         sql: SCHEMA_V32,
     },
+    Migration {
+        version: 33,
+        label: "instance secrets",
+        sql: SCHEMA_V33,
+    },
 ];
 
 /// A ledger and the ordered steps that raise it: the index set, and the
@@ -938,6 +943,20 @@ CREATE TABLE IF NOT EXISTS instance_config (
 );
 "#;
 
+// The instance's sealed secrets: GitHub tokens, a saved GitHub App and the
+// connected servers' sign-ins, one row each by keychain account name, sealed
+// under the key from `CRYSTALLINE_SECRET_KEY` (`key_id` names that key).
+// Written only by the active owner over its side channel. An instance table:
+// a wipe empties the index, not the instance's secrets.
+const SCHEMA_V33: &str = r#"
+CREATE TABLE IF NOT EXISTS instance_secret (
+    name TEXT PRIMARY KEY COLLATE "C",
+    sealed BYTEA NOT NULL,
+    key_id TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -999,7 +1018,7 @@ pub const WIPE_TABLES: &[&str] = &[
 
 /// Tables that belong to the instance, not to the index: a wipe must leave
 /// them alone, so none of them may appear in `WIPE_TABLES`.
-pub const INSTANCE_TABLES: &[&str] = &["instance_owner", "instance_config"];
+pub const INSTANCE_TABLES: &[&str] = &["instance_owner", "instance_config", "instance_secret"];
 
 /// The session-level advisory lock every migration run holds, so instances
 /// that start at the same moment take turns: without it two of them on an
@@ -3033,7 +3052,7 @@ mod tests {
     #[test]
     fn config_wipe_and_instance_tables_disjoint() {
         let created: String = MIGRATIONS.iter().map(|m| m.sql).collect();
-        for t in ["instance_owner", "instance_config"] {
+        for t in ["instance_owner", "instance_config", "instance_secret"] {
             assert!(INSTANCE_TABLES.contains(&t), "{t} is an instance table");
         }
         for t in INSTANCE_TABLES {
@@ -3108,6 +3127,11 @@ mod tests {
             .await
             .unwrap();
         assert!(config, "v32 created instance_config");
+        let secret: bool = sqlx::query_scalar("SELECT to_regclass('instance_secret') IS NOT NULL")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap();
+        assert!(secret, "v33 created instance_secret");
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&mut setup)
