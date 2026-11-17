@@ -362,7 +362,18 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let p = &self.localized_for(p, scope).await?.lf_only();
+        let p = self.localized_for(p, scope).await?.lf_only();
+        // A frontmatter block at the top of `content` goes into this write's
+        // own parameters, ahead of the defaults below, so a parameter left
+        // out can still be told from one set. A block that cannot be read is
+        // refused where `build_markdown` refuses unbuildable content, so that
+        // refusal never hides a collision answer.
+        let (p, lifted, unreadable_block) =
+            match super::content_frontmatter::lift_content_frontmatter(&p) {
+                Ok((lifted_params, lifted)) => (lifted_params, Some(lifted), None),
+                Err(refused) => (p, None, Some(refused)),
+            };
+        let p = &p;
         let source = self.content_source(&p.domain)?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
@@ -480,6 +491,9 @@ impl Engine {
         // The model the agent reported, held against the actor this write
         // records: a person's write never carries one (`stamped_model`).
         let model = stamped_model(&actor, p.model.as_deref());
+        if let Some(refused) = unreadable_block {
+            return Err(refused);
+        }
         let markdown = build_markdown(
             &engram_type,
             &p.title,
@@ -522,7 +536,8 @@ impl Engine {
         // Attached here rather than at the end: `write_engram_as` leaves by
         // three exits - the live-room arm, the draft arm and the base arm -
         // and a title reads back the same way whichever one a write took.
-        let notices = Self::title_notices(&p.title, &p.domain, &permalink);
+        let mut notices = Self::title_notices(&p.title, &p.domain, &permalink);
+        notices.extend(lifted.as_ref().and_then(|lifted| lifted.notice()));
         if !notices.is_empty() {
             receipt["notices"] = json!(notices);
         }

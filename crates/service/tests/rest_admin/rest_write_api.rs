@@ -379,6 +379,43 @@ async fn a_created_title_that_will_not_read_back_carries_its_notice() {
     assert!(plain.get("notices").is_none(), "{plain}");
 }
 
+/// A create whose content opens with its own frontmatter block lands with
+/// one block, the keys merged, and the detail names what was merged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_whose_content_opens_with_frontmatter_lands_with_one_block() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Delta",
+        "content": "---\nstatus: draft\nowner: platform\n---\n\n# Delta\n\nBody.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/delta.md")).unwrap();
+    assert_eq!(
+        on_disk.lines().filter(|line| *line == "---").count(),
+        2,
+        "{on_disk}"
+    );
+    assert!(on_disk.contains("status: draft"), "{on_disk}");
+    assert!(on_disk.contains("owner: platform"), "{on_disk}");
+    let notices = body["notices"].to_string();
+    assert!(notices.contains("owner"), "{body}");
+}
+
 /// A create that starts a folder next to a sibling with a close name answers
 /// with the same `close_folders` hint and `folder_guidance` the MCP write
 /// receipt carries, and a create into a folder that already exists carries
