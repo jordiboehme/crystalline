@@ -9495,6 +9495,7 @@ mod attachments;
 mod close_folders;
 pub use close_folders::FolderProbe;
 mod configure;
+mod content_frontmatter;
 mod context;
 mod contradictions;
 pub use contradictions::run_contradiction_worker;
