@@ -1,11 +1,13 @@
 //! The pure parts of `crystalline update`: how this binary was installed,
 //! which release asset fits it, how a download is verified, the check's
-//! cache and the release-age gate. Nothing here touches the network, spawns a
-//! process or needs a runtime; the caller hands in the canonical exe path and
-//! an environment lookup.
+//! cache, the release-age gate and the reading of GitHub's release answers.
+//! Nothing here touches the network, spawns a process or needs a runtime; the
+//! caller hands in the canonical exe path and an environment lookup. The one
+//! exception is the debug-only key seam behind [`trusted_keys`].
 
 pub mod cache;
 pub mod install;
+pub mod release;
 pub mod verify;
 
 pub use cache::{
@@ -15,6 +17,7 @@ pub use install::{
     CHANNEL_ENV, DetectedInstall, Detection, InstallMethod, MARKER_FILE, Refusal, archive_member,
     asset_name, detect, display_path, official_build, release_platform,
 };
+pub use release::{LatestRelease, Lookup};
 pub use verify::{Checks, Sha256Digest, SignedSums, VerifyError, verify_digest, verify_signature};
 
 /// The minisign public keys a release's `SHA256SUMS` signature is checked
@@ -25,6 +28,32 @@ pub const RELEASE_KEYS: [&str; 2] = [
     include_str!("keys/online.pub"),
     include_str!("keys/offline.pub"),
 ];
+
+/// The public keys an update signature is checked with: [`RELEASE_KEYS`]
+/// and, in a debug build only, the key in the `.pub` file
+/// `CRYSTALLINE_TEST_UPDATE_KEY` names, so a test can sign with a throwaway
+/// key. A release build has no such seam: the environment never chooses a
+/// trusted key there (S11). `Err` only when that file cannot be read.
+pub fn trusted_keys() -> std::io::Result<Vec<String>> {
+    #[allow(unused_mut)]
+    let mut keys: Vec<String> = RELEASE_KEYS.iter().map(|key| key.to_string()).collect();
+    #[cfg(debug_assertions)]
+    if let Some(path) = test_update_key() {
+        let path = std::path::PathBuf::from(path);
+        let key = std::fs::read_to_string(&path).map_err(|err| {
+            std::io::Error::new(err.kind(), format!("cannot read {}: {err}", path.display()))
+        })?;
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+/// The test-only seam behind [`trusted_keys`]: the path of an extra trusted
+/// `.pub` file. Compiled into debug builds only.
+#[cfg(debug_assertions)]
+fn test_update_key() -> Option<std::ffi::OsString> {
+    std::env::var_os("CRYSTALLINE_TEST_UPDATE_KEY")
+}
 
 /// The Apple Team ID that signs the macOS release binaries; public in every
 /// signed binary, and part of the code signature requirement an update checks.

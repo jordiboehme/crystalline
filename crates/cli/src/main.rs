@@ -2804,7 +2804,7 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 }
 
 /// `update verify-sums`: exit 0 with one line when the signature over `sums`
-/// verifies with a trusted key ([`trusted_update_keys`]) and names `tag`,
+/// verifies with a trusted key ([`crystalline_core::update::trusted_keys`]) and names `tag`,
 /// else exit 1 with the refusal on stderr.
 fn verify_sums(sums: &std::path::Path, minisig: &std::path::Path, tag: &str) -> anyhow::Result<()> {
     use anyhow::Context;
@@ -2812,7 +2812,7 @@ fn verify_sums(sums: &std::path::Path, minisig: &std::path::Path, tag: &str) -> 
         std::fs::read(sums).with_context(|| format!("cannot read {}", sums.display()))?;
     let signature = std::fs::read_to_string(minisig)
         .with_context(|| format!("cannot read {}", minisig.display()))?;
-    let keys = trusted_update_keys()?;
+    let keys = crystalline_core::update::trusted_keys()?;
     let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
     match crystalline_core::update::verify_signature(&sums_bytes, &signature, &keys, tag) {
         Ok(_) => {
@@ -2824,36 +2824,6 @@ fn verify_sums(sums: &std::path::Path, minisig: &std::path::Path, tag: &str) -> 
             Err(ExitWith(1).into())
         }
     }
-}
-
-/// The public keys an update signature is checked with: the compiled-in
-/// release keys and, in a debug build only, the key in the `.pub` file
-/// [`test_update_key`] names, so a test can sign with a throwaway key. A
-/// release build has no such seam: the environment never chooses a trusted
-/// key there.
-fn trusted_update_keys() -> anyhow::Result<Vec<String>> {
-    #[allow(unused_mut)]
-    let mut keys: Vec<String> = crystalline_core::update::RELEASE_KEYS
-        .iter()
-        .map(|key| key.to_string())
-        .collect();
-    #[cfg(debug_assertions)]
-    if let Some(path) = test_update_key() {
-        use anyhow::Context;
-        let path = std::path::PathBuf::from(path);
-        keys.push(
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("cannot read {}", path.display()))?,
-        );
-    }
-    Ok(keys)
-}
-
-/// The test-only seam behind [`trusted_update_keys`]: the path of an extra
-/// trusted `.pub` file. Compiled into debug builds only.
-#[cfg(debug_assertions)]
-fn test_update_key() -> Option<OsString> {
-    std::env::var_os("CRYSTALLINE_TEST_UPDATE_KEY")
 }
 
 /// Hold the index lock and a published service record without ever binding the

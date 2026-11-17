@@ -44,6 +44,7 @@ pub mod stub;
 mod tool_schema;
 #[cfg(feature = "fluid-ui")]
 pub mod ui;
+pub mod update;
 
 pub use crystalline_engine::{PendingRename, RenameOwner, pending_rename};
 pub use crystalline_engine::{
