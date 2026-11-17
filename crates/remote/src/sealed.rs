@@ -107,7 +107,7 @@ impl SealKey {
         }
     }
 
-    fn parse(text: &str, var: &'static str) -> Result<SealKey, KeyError> {
+    pub(crate) fn parse(text: &str, var: &'static str) -> Result<SealKey, KeyError> {
         let text = text.trim();
         let bad = || KeyError::Malformed { var };
         let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(

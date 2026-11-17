@@ -1,0 +1,369 @@
+//! The sealed vault: where the credential stores keep their secrets when the
+//! instance runs on Postgres.
+//!
+//! [`SecretVault`] is the seam: it moves sealed bytes by row name and knows
+//! nothing about what they hold. This crate never depends on the index, so
+//! the implementation over the database lives in the engine, which installs
+//! it here with [`install`]. The three credential stores
+//! ([`crate::TokenStore`], [`crate::AppStore`] and
+//! [`crate::ServerCredentialStore`]) each have a `Vault { name }` arm and ask
+//! the registry on every call.
+//!
+//! The resolution order is Env > Vault > Keyring > File. A caller that holds
+//! an environment-supplied credential builds the `Env` store itself, so the
+//! vault is never asked. Otherwise an installed vault answers, and the
+//! keychain and the file store are not touched at all.
+//!
+//! The backend decides where secrets live, never the key: a process on
+//! Postgres calls [`require`], and from then on a store call with no
+//! installed vault fails with [`RemoteError::VaultUnavailable`] instead of
+//! falling back to the keychain or a file. A process without the key
+//! therefore never reads, writes, deletes or checks a vault row, and never
+//! writes a secret to local disk either.
+//!
+//! The registry is a resettable `RwLock` rather than a `OnceLock`, so one
+//! test's vault does not leak into the next under `cargo test`.
+
+use std::sync::{Arc, RwLock};
+
+use zeroize::Zeroizing;
+
+use crate::error::RemoteError;
+use crate::sealed::{self, SealKey};
+
+/// One sealed row as the vault keeps it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SealedRow {
+    /// `0x01 || nonce || ciphertext and tag`, see [`crate::sealed`].
+    pub sealed: Vec<u8>,
+    /// The id of the key the row was sealed with ([`SealKey::key_id`]).
+    pub key_id: String,
+}
+
+/// Keeps the sealed bytes out of `Debug` output.
+impl std::fmt::Debug for SealedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedRow")
+            .field("sealed", &format_args!("<{} bytes>", self.sealed.len()))
+            .field("key_id", &self.key_id)
+            .finish()
+    }
+}
+
+/// What the vault holds, without a single row name: what `status` and
+/// `doctor` report and what the start checks compare with the key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VaultSummary {
+    /// How many rows the vault holds.
+    pub rows: usize,
+    /// The distinct key ids the rows were sealed with, sorted.
+    pub key_ids: Vec<String>,
+}
+
+/// Sealed secrets by row name. The row names are the keychain account names:
+/// `github`, `github:<host>`, `github-personal:<name>[:<host>]`,
+/// `github-app[:<host>]` and `crystalline-server:<key>`.
+///
+/// Every method blocks; an implementation bounds how long.
+pub trait SecretVault: Send + Sync {
+    /// The row named `name`, or `None` when there is none.
+    fn load(&self, name: &str) -> Result<Option<SealedRow>, RemoteError>;
+    /// Writes the row named `name`, replacing what was there.
+    fn save(&self, name: &str, sealed: &[u8], key_id: &str) -> Result<(), RemoteError>;
+    /// Deletes the row named `name`; `true` when there was one.
+    fn delete(&self, name: &str) -> Result<bool, RemoteError>;
+    /// How many rows there are and which keys sealed them.
+    fn summary(&self) -> Result<VaultSummary, RemoteError>;
+}
+
+/// An installed vault and the key it seals with.
+type Installed = (Arc<dyn SecretVault>, Arc<SealKey>);
+
+struct Registry {
+    required: bool,
+    installed: Option<Installed>,
+}
+
+static REGISTRY: RwLock<Registry> = RwLock::new(Registry {
+    required: false,
+    installed: None,
+});
+
+/// Installs `vault` with the key that seals its rows. Every store call from
+/// now on goes to it.
+pub fn install(vault: Arc<dyn SecretVault>, key: SealKey) {
+    let mut registry = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    registry.installed = Some((vault, Arc::new(key)));
+}
+
+/// Marks this process as one whose secrets live in the vault: from now on a
+/// store call with no installed vault fails with
+/// [`RemoteError::VaultUnavailable`] and never falls back to the keychain or
+/// a file.
+pub fn require() {
+    REGISTRY.write().unwrap_or_else(|e| e.into_inner()).required = true;
+}
+
+/// Removes the installed vault and the requirement.
+pub fn clear() {
+    let mut registry = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    registry.required = false;
+    registry.installed = None;
+}
+
+/// The installed vault and its key; `None` when no vault is required and
+/// none is installed, so the keychain and the file store answer as before.
+pub(crate) fn active() -> Result<Option<Installed>, RemoteError> {
+    let registry = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    match (&registry.installed, registry.required) {
+        (Some(installed), _) => Ok(Some(installed.clone())),
+        (None, true) => Err(RemoteError::VaultUnavailable),
+        (None, false) => Ok(None),
+    }
+}
+
+/// The installed vault for a `Vault { name }` store, which has no other
+/// place to go.
+fn installed() -> Result<Installed, RemoteError> {
+    active()?.ok_or(RemoteError::VaultUnavailable)
+}
+
+/// Opens the row `name` with `key`. A row sealed with another key reads as
+/// absent and is kept; so is a row that does not open although its key id
+/// matches, which is logged by name.
+pub(crate) fn open_row(
+    vault: &dyn SecretVault,
+    key: &SealKey,
+    name: &str,
+) -> Result<Option<Zeroizing<Vec<u8>>>, RemoteError> {
+    let Some(row) = vault.load(name)? else {
+        return Ok(None);
+    };
+    let key_id = key.key_id();
+    if row.key_id != key_id {
+        tracing::warn!(
+            name,
+            row_key_id = %row.key_id,
+            key_id = %key_id,
+            "a sealed secret was sealed with another key; it reads as absent and is kept"
+        );
+        return Ok(None);
+    }
+    match sealed::open(key, name, &row.sealed) {
+        Ok(plain) => Ok(Some(Zeroizing::new(plain))),
+        Err(e) => {
+            tracing::warn!(name, error = %e, "a sealed secret did not open; it reads as absent");
+            Ok(None)
+        }
+    }
+}
+
+/// Seals `plain` for the row `name` and writes it.
+pub(crate) fn seal_row(
+    vault: &dyn SecretVault,
+    key: &SealKey,
+    name: &str,
+    plain: &[u8],
+) -> Result<(), RemoteError> {
+    vault.save(name, &sealed::seal(key, name, plain), &key.key_id())
+}
+
+/// The plain text of the row `name` in the installed vault, for a
+/// `Vault { name }` store's `load`.
+pub(crate) fn load_text(name: &str) -> Result<Option<Zeroizing<String>>, RemoteError> {
+    let (vault, key) = installed()?;
+    open_row(vault.as_ref(), &key, name)?
+        .map(|plain| {
+            String::from_utf8(plain.to_vec())
+                .map(Zeroizing::new)
+                .map_err(|_| RemoteError::Credential {
+                    detail: format!("the sealed secret {name} is not text"),
+                })
+        })
+        .transpose()
+}
+
+/// Seals `text` into the row `name` of the installed vault, for a
+/// `Vault { name }` store's `save`.
+pub(crate) fn save_text(name: &str, text: &str) -> Result<(), RemoteError> {
+    let (vault, key) = installed()?;
+    seal_row(vault.as_ref(), &key, name, text.as_bytes())
+}
+
+/// Deletes the row `name` of the installed vault, for a `Vault { name }`
+/// store's `delete`. A missing row is not an error.
+pub(crate) fn delete_row(name: &str) -> Result<(), RemoteError> {
+    let (vault, _) = installed()?;
+    vault.delete(name).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    //! An in-memory vault and the guard every test that installs a vault, or
+    //! resolves a store, holds.
+
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Serializes the tests that touch the registry and clears it on both
+    /// ends, so no test sees another's vault.
+    pub(crate) struct RegistryGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn guard() -> RegistryGuard {
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        RegistryGuard { _serial: serial }
+    }
+
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
+
+    /// A fixed test key.
+    pub(crate) fn key(byte: u8) -> SealKey {
+        let hex: String = std::iter::repeat_n(format!("{byte:02x}"), 32).collect();
+        SealKey::parse(&hex, sealed::KEY_ENV).unwrap()
+    }
+
+    /// Rows in a map, with every call counted.
+    #[derive(Default)]
+    pub(crate) struct MemoryVault {
+        pub(crate) rows: Mutex<BTreeMap<String, SealedRow>>,
+        pub(crate) calls: AtomicUsize,
+        pub(crate) deletes: AtomicUsize,
+    }
+
+    impl MemoryVault {
+        pub(crate) fn row(&self, name: &str) -> Option<SealedRow> {
+            self.rows.lock().unwrap().get(name).cloned()
+        }
+
+        pub(crate) fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SecretVault for MemoryVault {
+        fn load(&self, name: &str) -> Result<Option<SealedRow>, RemoteError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.row(name))
+        }
+
+        fn save(&self, name: &str, sealed: &[u8], key_id: &str) -> Result<(), RemoteError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.rows.lock().unwrap().insert(
+                name.to_string(),
+                SealedRow {
+                    sealed: sealed.to_vec(),
+                    key_id: key_id.to_string(),
+                },
+            );
+            Ok(())
+        }
+
+        fn delete(&self, name: &str) -> Result<bool, RemoteError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Ok(self.rows.lock().unwrap().remove(name).is_some())
+        }
+
+        fn summary(&self) -> Result<VaultSummary, RemoteError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let rows = self.rows.lock().unwrap();
+            let mut key_ids: Vec<String> = rows.values().map(|r| r.key_id.clone()).collect();
+            key_ids.sort();
+            key_ids.dedup();
+            Ok(VaultSummary {
+                rows: rows.len(),
+                key_ids,
+            })
+        }
+    }
+
+    /// Installs a fresh in-memory vault under `key` and hands it back.
+    pub(crate) fn install_memory(key: SealKey) -> Arc<MemoryVault> {
+        let vault = Arc::new(MemoryVault::default());
+        install(vault.clone(), key);
+        vault
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{guard, install_memory, key};
+    use super::*;
+
+    #[test]
+    fn registry_clear_isolates_tests() {
+        let _guard = guard();
+        assert!(active().unwrap().is_none());
+        require();
+        assert!(matches!(active(), Err(RemoteError::VaultUnavailable)));
+        install_memory(key(1));
+        assert!(active().unwrap().is_some());
+        clear();
+        assert!(active().unwrap().is_none(), "clear drops the vault");
+        // A test that leaves a vault installed and required behind does not
+        // reach the next one.
+        require();
+        install_memory(key(1));
+        drop(_guard);
+        let _next = guard();
+        assert!(active().unwrap().is_none(), "the next test starts clean");
+    }
+
+    #[test]
+    fn a_row_round_trips_sealed_under_the_key_id() {
+        let _guard = guard();
+        let vault = install_memory(key(1));
+        save_text("github", "{\"t\":1}").unwrap();
+        let row = vault.row("github").unwrap();
+        assert_eq!(row.key_id, key(1).key_id());
+        assert!(!row.sealed.windows(5).any(|w| w == b"{\"t\":"));
+        assert_eq!(load_text("github").unwrap().unwrap().as_str(), "{\"t\":1}");
+        let summary = vault.summary().unwrap();
+        assert_eq!(summary.rows, 1);
+        assert_eq!(summary.key_ids, vec![key(1).key_id()]);
+        delete_row("github").unwrap();
+        assert!(load_text("github").unwrap().is_none());
+        delete_row("github").unwrap();
+    }
+
+    #[test]
+    fn a_row_that_does_not_open_reads_absent_and_is_kept() {
+        let _guard = guard();
+        let vault = install_memory(key(1));
+        vault
+            .save("github", b"\x01not a sealed value at all", &key(1).key_id())
+            .unwrap();
+        assert!(load_text("github").unwrap().is_none());
+        assert!(vault.row("github").is_some());
+        assert_eq!(vault.deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_vault_store_call_without_a_vault_is_unavailable() {
+        let _guard = guard();
+        assert!(matches!(
+            load_text("github"),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert!(matches!(
+            save_text("github", "x"),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert!(matches!(
+            delete_row("github"),
+            Err(RemoteError::VaultUnavailable)
+        ));
+    }
+}

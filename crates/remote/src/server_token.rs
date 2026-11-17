@@ -14,6 +14,9 @@
 //! token (`cmt_`, no expiry, nothing to refresh with) or an OAuth pair (`coa_`
 //! access for an hour, `cor_` refresh for thirty days) with the registration
 //! it belongs to and the resource it was minted for.
+//!
+//! On Postgres the credential lives in a sealed row of the database instead
+//! ([`ServerCredentialStore::Vault`], see [`crate::vault`]).
 
 use std::path::{Path, PathBuf};
 
@@ -242,6 +245,12 @@ pub enum ServerCredentialStore {
         /// The server origin it is for.
         resource: String,
     },
+    /// A row of the sealed vault, used whenever one is installed (see
+    /// [`crate::vault`]).
+    Vault {
+        /// The row name: `crystalline-server:<key>`.
+        name: String,
+    },
 }
 
 impl std::fmt::Debug for ServerCredentialStore {
@@ -252,6 +261,9 @@ impl std::fmt::Debug for ServerCredentialStore {
             }
             ServerCredentialStore::File { path } => {
                 f.debug_struct("File").field("path", path).finish()
+            }
+            ServerCredentialStore::Vault { name } => {
+                f.debug_struct("Vault").field("name", name).finish()
             }
             ServerCredentialStore::Env { resource, .. } => f
                 .debug_struct("Env")
@@ -269,6 +281,16 @@ impl ServerCredentialStore {
         key: &str,
         host_dir: &Path,
     ) -> Result<(ServerCredentialStore, Option<ServerCredential>), RemoteError> {
+        // The vault comes first, before the test seam: when one is
+        // installed the keychain and the file are never touched, and when one
+        // is required but missing the call fails rather than fall back.
+        if crate::vault::active()?.is_some() {
+            let store = ServerCredentialStore::Vault {
+                name: server_account(key),
+            };
+            let credential = store.load()?;
+            return Ok((store, credential));
+        }
         if refuse_real_keychain() {
             let store = ServerCredentialStore::file(host_dir);
             let credential = store.load()?;
@@ -310,6 +332,14 @@ impl ServerCredentialStore {
         host_dir: &Path,
         credential: &ServerCredential,
     ) -> Result<ServerCredentialStore, RemoteError> {
+        // The vault first, as in `resolve_and_load`.
+        if crate::vault::active()?.is_some() {
+            let store = ServerCredentialStore::Vault {
+                name: server_account(key),
+            };
+            store.save(credential)?;
+            return Ok(store);
+        }
         if refuse_real_keychain() {
             let store = ServerCredentialStore::file(host_dir);
             store.save(credential)?;
@@ -364,6 +394,9 @@ impl ServerCredentialStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e.into()),
             },
+            ServerCredentialStore::Vault { name } => crate::vault::load_text(name)?
+                .map(|json| from_json(&json))
+                .transpose(),
             ServerCredentialStore::Env { token, resource } => Ok(Some(ServerCredential::token(
                 token.clone(),
                 resource.clone(),
@@ -380,6 +413,9 @@ impl ServerCredentialStore {
                 keyring_write(account, to_json(credential)?).map_err(|e| store_error("save", e))
             }
             ServerCredentialStore::File { path } => write_secret_file(path, &to_json(credential)?),
+            ServerCredentialStore::Vault { name } => {
+                crate::vault::save_text(name, &zeroize::Zeroizing::new(to_json(credential)?))
+            }
             ServerCredentialStore::Env { .. } => Err(env_read_only()),
         }
     }
@@ -395,15 +431,17 @@ impl ServerCredentialStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.into()),
             },
+            ServerCredentialStore::Vault { name } => crate::vault::delete_row(name),
             ServerCredentialStore::Env { .. } => Err(env_read_only()),
         }
     }
 
-    /// `"keyring"`, `"file"` or `"environment"`.
+    /// `"keyring"`, `"file"`, `"vault"` or `"environment"`.
     pub fn kind(&self) -> &'static str {
         match self {
             ServerCredentialStore::Keyring { .. } => "keyring",
             ServerCredentialStore::File { .. } => "file",
+            ServerCredentialStore::Vault { .. } => "vault",
             ServerCredentialStore::Env { .. } => "environment",
         }
     }
@@ -696,6 +734,7 @@ mod tests {
     /// keychain at all: they answer the file store.
     #[test]
     fn the_kill_switch_keeps_the_public_entry_points_off_the_keychain() {
+        let _vault = crate::vault::testing::guard();
         if !refuse_real_keychain() {
             return; // only meaningful with CRYSTALLINE_TEST_NO_KEYCHAIN set
         }
@@ -740,5 +779,63 @@ mod tests {
             !err.is_temporary(),
             "a corrupt file does not heal on its own"
         );
+    }
+
+    #[test]
+    fn vault_wins_over_keyring_and_file_for_a_server() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let dir = tempfile::tempdir().unwrap();
+        ServerCredentialStore::file(dir.path())
+            .save(&sample_oauth())
+            .unwrap();
+        let before = std::fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
+        let vault = install_memory(key(1));
+
+        let (store, loaded) =
+            ServerCredentialStore::resolve_and_load("kb.example/crystalline", dir.path()).unwrap();
+        assert!(
+            matches!(&store, ServerCredentialStore::Vault { name } if name == "crystalline-server:kb.example/crystalline"),
+            "{store:?}"
+        );
+        assert_eq!(loaded, None, "the file's credential is not read");
+        let pasted = ServerCredential::token(
+            "cmt_pasted".to_string(),
+            "https://kb.example".to_string(),
+            "alice".to_string(),
+            now(),
+        );
+        let saved =
+            ServerCredentialStore::save_resolving("kb.example/crystalline", dir.path(), &pasted)
+                .unwrap();
+        assert_eq!(saved.kind(), "vault");
+        let (_, loaded) =
+            ServerCredentialStore::resolve_and_load("kb.example/crystalline", dir.path()).unwrap();
+        assert_eq!(loaded, Some(pasted));
+        saved.delete().unwrap();
+        assert_eq!(vault.row("crystalline-server:kb.example/crystalline"), None);
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn server_required_without_installed_vault_errors_not_falls_back() {
+        let _vault = crate::vault::testing::guard();
+        let dir = tempfile::tempdir().unwrap();
+        crate::vault::require();
+        assert!(matches!(
+            ServerCredentialStore::resolve_and_load("kb.example", dir.path()),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert!(matches!(
+            ServerCredentialStore::save_resolving("kb.example", dir.path(), &sample_oauth()),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let env =
+            ServerCredentialStore::env("cmt_env".to_string(), "https://kb.example".to_string());
+        assert_eq!(env.load().unwrap().unwrap().access_token, "cmt_env");
     }
 }

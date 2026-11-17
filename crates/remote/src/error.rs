@@ -319,6 +319,15 @@ pub enum RemoteError {
         /// The Enterprise Server version, when the server named one.
         ghes_version: Option<String>,
     },
+
+    /// The instance keeps its secrets sealed in the database, and this
+    /// process has no vault to reach them: it runs without the secret key or
+    /// is not the active instance. Never answered by falling back to the
+    /// keychain or a file.
+    #[error(
+        "The secrets of this instance are sealed in the database and this process cannot reach them. Run the command on the active instance, or set CRYSTALLINE_SECRET_KEY."
+    )]
+    VaultUnavailable,
 }
 
 /// The ` (GitHub Enterprise Server x.y.z)` clause of
@@ -373,7 +382,8 @@ impl RemoteError {
             | RemoteError::ServerCredential { .. }
             | RemoteError::AppCredential(_)
             | RemoteError::AppNotInstalled { .. }
-            | RemoteError::EndpointMissing { .. } => false,
+            | RemoteError::EndpointMissing { .. }
+            | RemoteError::VaultUnavailable => false,
         }
     }
 }
