@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crystalline_core::config;
+use crystalline_core::version::Precedence;
 
 /// The owner record, written to service.json after the socket is bound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1073,91 +1074,6 @@ pub fn strictly_newer(candidate: &str, baseline: &str) -> bool {
         _ => false,
     }
 }
-
-/// A version's place in semantic-versioning precedence: the numeric
-/// `major.minor.patch` triple first, then the pre-release identifiers, with
-/// build metadata ignored.
-///
-/// The pre-release part matters for any pre-release: two builds share a
-/// triple (`0.21.0-dev.4817` and `0.21.0-dev.4820`), and comparing the triple
-/// alone would read them as equal, so the newer one would attach to the older
-/// daemon instead of taking over after an upgrade. A release outranks every
-/// pre-release of its own triple, as semantic versioning orders them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Precedence {
-    triple: (u64, u64, u64),
-    /// Empty for a release. Compared identifier by identifier.
-    pre: Vec<PreIdent>,
-}
-
-/// One dot-separated pre-release identifier. A numeric one sorts below an
-/// alphanumeric one, numerics compare as numbers and the rest in ASCII order;
-/// the derived order gets all three from the variant order and the payloads.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum PreIdent {
-    Numeric(u64),
-    Alpha(String),
-}
-
-impl Precedence {
-    /// Parse a version string. Tolerates a two-part `major.minor`; `None`
-    /// when the triple does not parse or a pre-release identifier is empty.
-    fn parse(version: &str) -> Option<Self> {
-        let version = version.trim();
-        let without_build = version.split('+').next().unwrap_or(version);
-        let (core, pre) = match without_build.split_once('-') {
-            Some((core, pre)) => (core, Some(pre)),
-            None => (without_build, None),
-        };
-        let mut parts = core.split('.');
-        let major = parts.next()?.trim().parse().ok()?;
-        let minor = parts.next()?.trim().parse().ok()?;
-        let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
-        let pre = match pre {
-            None => Vec::new(),
-            Some(pre) => pre
-                .split('.')
-                .map(|ident| {
-                    if ident.is_empty() {
-                        None
-                    } else if ident.bytes().all(|b| b.is_ascii_digit()) {
-                        ident.parse().ok().map(PreIdent::Numeric)
-                    } else {
-                        Some(PreIdent::Alpha(ident.to_string()))
-                    }
-                })
-                .collect::<Option<Vec<_>>>()?,
-        };
-        Some(Self {
-            triple: (major, minor, patch),
-            pre,
-        })
-    }
-}
-
-impl Ord for Precedence {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        self.triple.cmp(&other.triple).then_with(|| {
-            match (self.pre.is_empty(), other.pre.is_empty()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                // Slice order goes identifier by identifier, and a shorter
-                // list that is a prefix of the longer one sorts first, which
-                // is the semantic-versioning rule for pre-release fields.
-                (false, false) => self.pre.cmp(&other.pre),
-            }
-        })
-    }
-}
-
-impl PartialOrd for Precedence {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 /// How long each stage of a displacement waits for the old daemon to leave.
 struct DisplaceWaits {
     /// After the graceful `ctl shutdown` ask.
@@ -4141,7 +4057,7 @@ mod tests {
     }
 
     fn triple(version: &str) -> Option<(u64, u64, u64)> {
-        Precedence::parse(version).map(|p| p.triple)
+        Precedence::parse(version).map(|p| p.triple())
     }
 
     #[test]
