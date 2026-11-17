@@ -40,6 +40,8 @@ const SHAPING_NAMES: &[&str] = &[
     "CRYSTALLINE_AUTOMATION_WEBHOOK_SECRET_FILE",
     "CRYSTALLINE_SETUP_TOKEN",
     "CRYSTALLINE_SETUP_TOKEN_FILE",
+    crystalline_remote::sealed::KEY_ENV,
+    crystalline_remote::sealed::KEY_FILE_ENV,
 ];
 
 /// Every name under these prefixes is shaping: env-defined domains and the
@@ -297,6 +299,8 @@ mod tests {
             "CRYSTALLINE_REMOTE_URL",
             "CRYSTALLINE_REMOTE_TOKEN",
             "CRYSTALLINE_ADMIN_PASSWORD_FILE",
+            "CRYSTALLINE_SECRET_KEY",
+            "CRYSTALLINE_SECRET_KEY_FILE",
             "CRYSTALLINE_HEARTBEAT_SECS",
         ] {
             assert_eq!(set(&[(name, "x")]), [name.to_string()], "{name}");

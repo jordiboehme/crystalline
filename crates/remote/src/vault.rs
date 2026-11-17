@@ -230,8 +230,7 @@ pub(crate) mod testing {
 
     /// A fixed test key.
     pub(crate) fn key(byte: u8) -> SealKey {
-        let hex: String = std::iter::repeat_n(format!("{byte:02x}"), 32).collect();
-        SealKey::parse(&hex, sealed::KEY_ENV).unwrap()
+        SealKey::from_bytes([byte; 32])
     }
 
     /// Rows in a map, with every call counted.

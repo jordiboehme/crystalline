@@ -11,6 +11,10 @@ description = "GitHub-backed team collaboration plumbing for Crystalline (the pr
 name = "crystalline_remote"
 path = "src/lib.rs"
 
+[features]
+# Test support for other crates' tests: `SealKey::from_bytes`.
+testing = []
+
 [dependencies]
 crystalline-core = { workspace = true }
 async-trait = { workspace = true }

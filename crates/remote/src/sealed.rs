@@ -107,7 +107,7 @@ impl SealKey {
         }
     }
 
-    pub(crate) fn parse(text: &str, var: &'static str) -> Result<SealKey, KeyError> {
+    fn parse(text: &str, var: &'static str) -> Result<SealKey, KeyError> {
         let text = text.trim();
         let bad = || KeyError::Malformed { var };
         let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
@@ -125,6 +125,13 @@ impl SealKey {
         );
         let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| bad())?;
         Ok(SealKey(key))
+    }
+
+    /// A key from fixed bytes, for tests only (the `testing` feature): a
+    /// real process reads its key with [`SealKey::from_env`].
+    #[cfg(any(test, feature = "testing"))]
+    pub fn from_bytes(bytes: [u8; 32]) -> SealKey {
+        SealKey(bytes)
     }
 
     /// The first 16 hex characters of the key's SHA-256: names the key
