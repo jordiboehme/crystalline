@@ -804,6 +804,39 @@ fn every_recorded_subagent_start_gets_its_block_and_writes_nothing() {
     }
 }
 
+/// A payload Cursor sends carries `cursor_version`: the SubagentStart answer
+/// stays silent and writes nothing, whatever type the value has, and a
+/// value of an unexpected type never breaks the parse the Stop path shares.
+#[test]
+fn a_subagent_start_with_cursor_version_is_silent() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+
+    for (case, version) in [("a string", json!("2.1.0")), ("a number", json!(2))] {
+        let home = work.path().join(format!("home-{}", case.replace(' ', "-")));
+        let mut payload = crate::common::hook_fixture("bg-subagent-SubagentStart.json");
+        payload["cursor_version"] = version;
+        let out = run_stop_hook(&home, &config, &payload.to_string());
+        assert_silent(&out, case);
+        assert!(!state_hooks_dir(&home).exists(), "{case}: no state");
+    }
+
+    let transcript = substantial_transcript(work.path());
+    let mut payload = crate::common::hook_fixture("main-Stop.json");
+    payload["session_id"] = json!("session-cursor-number");
+    payload["transcript_path"] = json!(transcript.display().to_string());
+    payload["cursor_version"] = json!(2);
+    let out = run_stop_hook(
+        &work.path().join("home-stop"),
+        &config,
+        &payload.to_string(),
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(decision["reason"], NUDGE_REASON, "a Stop still parses");
+}
+
 /// With no registered or mounted domain the block is not printed at all.
 #[test]
 fn a_subagent_start_without_a_domain_is_silent() {

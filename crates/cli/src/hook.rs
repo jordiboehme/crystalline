@@ -238,8 +238,10 @@ pub struct StopInput {
     pub agent_type: Option<String>,
     /// Set on a payload Cursor sends when it runs a Claude Code hook it
     /// imported. Its presence alone keeps the SubagentStart answer silent.
+    /// Read as a raw JSON value for the reason the ids are: an unexpected
+    /// type must not fail the parse the Stop path shares.
     #[serde(default)]
-    pub cursor_version: Option<String>,
+    pub cursor_version: Option<serde_json::Value>,
 }
 
 /// Whether a hook payload comes from inside a subagent: either id spelling
@@ -840,17 +842,11 @@ pub fn run_stop(harness: Option<&str>) {
     // Connected servers: their domains count as somewhere to capture into,
     // and a local copy one of them replaces is out of this session's view.
     // Read from the cache files only; this process never talks to a server.
-    let sources = crystalline_remote::remote_dir().ok().map(|dir| {
-        crystalline_remote::SourceSet::load(
-            dir,
-            crate::sources::local_domains_of(&loaded.effective),
-            crystalline_core::secret_env::process_var,
-        )
-    });
-    let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();
-    let mounted = sources
-        .as_ref()
-        .is_some_and(|s| !s.table().mounts.is_empty());
+    let ConnectedSources {
+        sources,
+        shadowed,
+        mounted,
+    } = connected_sources(&loaded.effective);
     // The local domains this session could capture into: neither hidden by a
     // mount nor read-only. A mounted domain still counts as a place to
     // capture (its server refuses a write it does not take), so the nudge
@@ -1003,6 +999,38 @@ pub fn run_stop(harness: Option<&str>) {
     }
 }
 
+/// What the connected servers change about this install's domains, read from
+/// the cache files only: this process never talks to a server.
+struct ConnectedSources {
+    /// The source table, when the remote folder resolves.
+    sources: Option<crystalline_remote::SourceSet>,
+    /// The local domains a mounted one replaces, out of this session's view.
+    shadowed: std::collections::BTreeSet<String>,
+    /// Whether any server domain is mounted.
+    mounted: bool,
+}
+
+/// Load the source table for `effective`, shared by the Stop path and the
+/// SubagentStart branch so both see the same domains.
+fn connected_sources(effective: &crystalline_core::config::GlobalConfig) -> ConnectedSources {
+    let sources = crystalline_remote::remote_dir().ok().map(|dir| {
+        crystalline_remote::SourceSet::load(
+            dir,
+            crate::sources::local_domains_of(effective),
+            crystalline_core::secret_env::process_var,
+        )
+    });
+    let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();
+    let mounted = sources
+        .as_ref()
+        .is_some_and(|s| !s.table().mounts.is_empty());
+    ConnectedSources {
+        sources,
+        shadowed,
+        mounted,
+    }
+}
+
 /// The SubagentStart branch of `hook stop`: one short block for the subagent
 /// that is starting. Static like the rest of this hook, and lighter: only the
 /// config overlay and the cached source table are read, no daemon or network
@@ -1011,17 +1039,9 @@ fn run_subagent_start(input: &StopInput) {
     let Ok(loaded) = crystalline_service::overlay::load(None) else {
         return;
     };
-    let sources = crystalline_remote::remote_dir().ok().map(|dir| {
-        crystalline_remote::SourceSet::load(
-            dir,
-            crate::sources::local_domains_of(&loaded.effective),
-            crystalline_core::secret_env::process_var,
-        )
-    });
-    let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();
-    let mounted = sources
-        .as_ref()
-        .is_some_and(|s| !s.table().mounts.is_empty());
+    let ConnectedSources {
+        shadowed, mounted, ..
+    } = connected_sources(&loaded.effective);
     let visible = || {
         loaded
             .effective
@@ -1442,7 +1462,9 @@ mod tests {
     fn decide_subagent_start_table() {
         use SubagentStartDecision::{Block, Silent};
         let mut cursor = subagent_start(Some("general-purpose"));
-        cursor.cursor_version = Some("2.0.0".to_string());
+        cursor.cursor_version = Some(serde_json::json!("2.0.0"));
+        let mut cursor_number = subagent_start(Some("general-purpose"));
+        cursor_number.cursor_version = Some(serde_json::json!(2));
         let cases: &[(&str, StopInput, bool, bool, SubagentStartDecision)] = &[
             (
                 "a writable domain",
@@ -1495,6 +1517,13 @@ mod tests {
             ),
             ("no agent_type", subagent_start(None), true, false, Silent),
             ("cursor_version", cursor, true, false, Silent),
+            (
+                "a numeric cursor_version",
+                cursor_number,
+                true,
+                false,
+                Silent,
+            ),
         ];
         for (case, i, has_domains, read_only, want) in cases {
             assert_eq!(
