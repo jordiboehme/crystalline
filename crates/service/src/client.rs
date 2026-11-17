@@ -2184,6 +2184,9 @@ pub async fn origin_add(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine =
         Arc::new(open_standalone_reporting(loaded, &db_path, false, db, config_path).await?);
@@ -2270,6 +2273,9 @@ pub async fn origin_update(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = match domain {
@@ -2354,6 +2360,9 @@ pub async fn origin_share(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
@@ -2457,6 +2466,9 @@ pub async fn origin_withdraw(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;

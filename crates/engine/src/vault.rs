@@ -9,20 +9,25 @@
 //! thread; a call made on the owner thread is refused by the side channel
 //! instead of waiting for itself.
 //!
+//! A CLI command that seals a secret while a daemon of its machine owns the
+//! database reaches the same table on a connection of its own instead
+//! ([`PgVault::beside_owner`], a short-lived second writer), with the same
+//! statements.
+//!
 //! Every call waits at most [`VAULT_TIMEOUT`]. A save and a delete carry the
 //! key id in their one statement, so a row sealed with another key is never
 //! replaced or deleted, even by a writer that raced the check: such a row is
 //! answered with [`RemoteError::VaultKeyMismatch`] and kept.
 
 use crystalline_index::IndexError;
-use crystalline_index::postgres::{SecretRow, SideChannel};
+use crystalline_index::postgres::{SecretRow, SecretSummary, SecretTable, SideChannel};
 use crystalline_remote::{RemoteError, SealedRow, SecretVault, VaultSummary};
 
 pub use crystalline_index::postgres::VAULT_TIMEOUT;
 
 /// The sealed secrets in the owner's database.
 pub struct PgVault {
-    side: SideChannel,
+    side: Rows,
     /// The id of the key this process seals with: a delete removes only a
     /// row sealed with it.
     key_id: String,
@@ -32,7 +37,17 @@ impl PgVault {
     /// The vault over `side`, for a process that holds the key `key_id`.
     pub fn new(side: SideChannel, key_id: impl Into<String>) -> PgVault {
         PgVault {
-            side,
+            side: Rows::Side(side),
+            key_id: key_id.into(),
+        }
+    }
+
+    /// The vault over `table`, a connection of its own beside the instance
+    /// that owns the database, for a CLI process that holds the key
+    /// `key_id`.
+    pub fn beside_owner(table: SecretTable, key_id: impl Into<String>) -> PgVault {
+        PgVault {
+            side: Rows::Table(table),
             key_id: key_id.into(),
         }
     }
@@ -42,6 +57,43 @@ impl PgVault {
             name: name.to_string(),
             row_key_id,
             key_id: key_id.to_string(),
+        }
+    }
+}
+
+/// Where the rows are reached: the owner's side channel, or a connection
+/// of its own beside the owner.
+enum Rows {
+    Side(SideChannel),
+    Table(SecretTable),
+}
+
+impl Rows {
+    fn vault_load(&self, name: &str) -> Result<Option<SecretRow>, IndexError> {
+        match self {
+            Rows::Side(side) => side.vault_load(name),
+            Rows::Table(table) => table.vault_load(name),
+        }
+    }
+
+    fn vault_save(&self, name: &str, sealed: &[u8], key_id: &str) -> Result<bool, IndexError> {
+        match self {
+            Rows::Side(side) => side.vault_save(name, sealed, key_id),
+            Rows::Table(table) => table.vault_save(name, sealed, key_id),
+        }
+    }
+
+    fn vault_delete(&self, name: &str, key_id: &str) -> Result<bool, IndexError> {
+        match self {
+            Rows::Side(side) => side.vault_delete(name, key_id),
+            Rows::Table(table) => table.vault_delete(name, key_id),
+        }
+    }
+
+    fn vault_summary(&self) -> Result<SecretSummary, IndexError> {
+        match self {
+            Rows::Side(side) => side.vault_summary(),
+            Rows::Table(table) => table.vault_summary(),
         }
     }
 }

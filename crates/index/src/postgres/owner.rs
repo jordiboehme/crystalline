@@ -758,6 +758,132 @@ async fn summarize_secrets(conn: &mut PgConnection, table: &str) -> Result<Secre
     })
 }
 
+/// The sealed-secret table of a database reached on a connection of its
+/// own, in the role `cli`: for a CLI command that seals a secret itself
+/// while a daemon of its machine owns the database, as a short-lived second
+/// writer beside it (the way `users` writes the accounts). It holds no lock
+/// and needs none: a save and a delete are the same single statements the
+/// owner's side channel runs, so a row sealed with another key is never
+/// replaced or deleted.
+///
+/// Every call blocks the calling thread for at most [`VAULT_TIMEOUT`],
+/// on a thread and runtime of its own, so it may be called from inside any
+/// runtime, and opens and closes its own connection.
+#[derive(Clone)]
+pub struct SecretTable {
+    target: PgTarget,
+    options: PgSessionOptions,
+}
+
+/// One call on a [`SecretTable`].
+enum TableOp {
+    Load(String),
+    Save(String, Vec<u8>, String),
+    Delete(String, String),
+    Summary,
+}
+
+/// What a [`TableOp`] answered.
+enum TableAnswer {
+    Row(Option<SecretRow>),
+    Done(bool),
+    Summary(SecretSummary),
+}
+
+impl SecretTable {
+    /// The table of `target`, its connections tagged with `instance_tag`.
+    pub fn new(target: PgTarget, instance_tag: Option<String>) -> SecretTable {
+        SecretTable {
+            target,
+            options: PgSessionOptions {
+                instance_tag,
+                fence: None,
+            },
+        }
+    }
+
+    fn run(&self, op: TableOp) -> Result<TableAnswer> {
+        let (target, options) = (self.target.clone(), self.options.clone());
+        let table = secret_table(target.schema.as_deref());
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| IndexError::Db(e.to_string()))?;
+            runtime.block_on(async move {
+                let work = async {
+                    let mut conn = connect_one(&target, PgRole::Cli, &options).await?;
+                    let answer = match op {
+                        TableOp::Load(name) => load_secret(&mut conn, &table, &name)
+                            .await
+                            .map(TableAnswer::Row),
+                        TableOp::Save(name, sealed, key_id) => {
+                            save_secret(&mut conn, &table, &name, &sealed, &key_id)
+                                .await
+                                .map(TableAnswer::Done)
+                        }
+                        TableOp::Delete(name, key_id) => {
+                            delete_secret(&mut conn, &table, &name, &key_id)
+                                .await
+                                .map(TableAnswer::Done)
+                        }
+                        TableOp::Summary => summarize_secrets(&mut conn, &table)
+                            .await
+                            .map(TableAnswer::Summary),
+                    };
+                    let _ = conn.close().await;
+                    answer
+                };
+                match tokio::time::timeout(VAULT_TIMEOUT, work).await {
+                    Ok(answer) => answer,
+                    Err(_) => Err(IndexError::Db(format!(
+                        "the sealed secrets did not answer within {}s",
+                        VAULT_TIMEOUT.as_secs()
+                    ))),
+                }
+            })
+        });
+        worker
+            .join()
+            .map_err(|_| IndexError::Db("the sealed-secret call stopped".to_string()))?
+    }
+
+    /// The sealed secret `name`, `None` when there is no such row.
+    pub fn vault_load(&self, name: &str) -> Result<Option<SecretRow>> {
+        match self.run(TableOp::Load(name.to_string()))? {
+            TableAnswer::Row(row) => Ok(row),
+            _ => unreachable!("a load answers a row"),
+        }
+    }
+
+    /// Write the sealed secret `name`, sealed with `key_id`. False, and
+    /// nothing written, when a row of that name was sealed with another key.
+    pub fn vault_save(&self, name: &str, sealed: &[u8], key_id: &str) -> Result<bool> {
+        let op = TableOp::Save(name.to_string(), sealed.to_vec(), key_id.to_string());
+        match self.run(op)? {
+            TableAnswer::Done(done) => Ok(done),
+            _ => unreachable!("a save answers whether it wrote"),
+        }
+    }
+
+    /// Delete the sealed secret `name` when it was sealed with `key_id`.
+    /// True when a row was deleted.
+    pub fn vault_delete(&self, name: &str, key_id: &str) -> Result<bool> {
+        match self.run(TableOp::Delete(name.to_string(), key_id.to_string()))? {
+            TableAnswer::Done(done) => Ok(done),
+            _ => unreachable!("a delete answers whether it deleted"),
+        }
+    }
+
+    /// How many sealed secrets there are and which keys sealed them.
+    pub fn vault_summary(&self) -> Result<SecretSummary> {
+        match self.run(TableOp::Summary)? {
+            TableAnswer::Summary(summary) => Ok(summary),
+            _ => unreachable!("a summary answers a summary"),
+        }
+    }
+}
+
 /// Where the side task sends its answer: a std channel for a blocking
 /// caller, which may sit inside any runtime, or a oneshot for an async one.
 enum SideReply<T> {

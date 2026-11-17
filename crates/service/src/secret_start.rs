@@ -136,12 +136,39 @@ pub(crate) async fn open_vault_over(
     database: &str,
     key: SealKey,
 ) -> anyhow::Result<VaultSummary> {
+    let pg_vault = crystalline_engine::vault::PgVault::new(side, key.key_id());
+    install_checked(pg_vault, database, key).await
+}
+
+/// [`open_vault`] for a CLI command that seals a secret itself while a
+/// daemon of its machine owns `database`: the vault reaches the rows on a
+/// connection of its own, beside the owner, after the same key check, so a
+/// key other than the rows' is refused before anything is written.
+#[cfg(feature = "postgres")]
+pub(crate) async fn open_vault_beside_owner(
+    target: crystalline_index::postgres::PgTarget,
+    database: &str,
+    key: SealKey,
+) -> anyhow::Result<VaultSummary> {
+    let tag = crystalline_core::config::read_or_create_instance_id().ok();
+    let table = crystalline_index::postgres::SecretTable::new(target, tag);
+    let pg_vault = crystalline_engine::vault::PgVault::beside_owner(table, key.key_id());
+    install_checked(pg_vault, database, key).await
+}
+
+/// Check `key` against the rows `pg_vault` reaches and install it.
+#[cfg(feature = "postgres")]
+async fn install_checked(
+    pg_vault: crystalline_engine::vault::PgVault,
+    database: &str,
+    key: SealKey,
+) -> anyhow::Result<VaultSummary> {
     use std::sync::Arc;
 
     use crystalline_remote::SecretVault;
 
     let key_id = key.key_id();
-    let pg_vault = Arc::new(crystalline_engine::vault::PgVault::new(side, &key_id));
+    let pg_vault = Arc::new(pg_vault);
     let reading = pg_vault.clone();
     let summary = tokio::task::spawn_blocking(move || reading.summary())
         .await

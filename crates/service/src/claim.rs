@@ -539,6 +539,12 @@ pub enum SecretRoute {
     /// vault is installed with its key: it changes the secret itself, as
     /// the daemon would.
     Owned(CommandDbOwner),
+    /// A daemon of this machine owns the Postgres database, and this
+    /// command seals the secret itself with its own key, on a connection of
+    /// its own beside the daemon ([`route_sealing_command`]). It tells the
+    /// daemon afterwards, so the daemon reads the secret again from the
+    /// database: the secret never travels over the socket.
+    Beside,
 }
 
 /// Decide where this command changes a secret, before it writes anything.
@@ -552,16 +558,31 @@ pub enum SecretRoute {
 /// sentence naming `kubectl exec` and the key variable, and nothing was
 /// written.
 pub async fn route_secret_command(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
+    route(cfg, false).await
+}
+
+/// [`route_secret_command`] for a command that seals a secret (`connect
+/// github`, a server `connect` and `disconnect`, `github app set` and
+/// `remove`): a token or an App cannot be handed to a daemon over the
+/// socket, so with a daemon of this machine owning the database the command
+/// seals it itself, beside the daemon ([`SecretRoute::Beside`]). That needs
+/// the key here too: without it, or with a key other than the one the rows
+/// were sealed with, it is refused before anything is written.
+pub async fn route_sealing_command(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
+    route(cfg, true).await
+}
+
+async fn route(cfg: &GlobalConfig, seals: bool) -> anyhow::Result<SecretRoute> {
     #[cfg(feature = "postgres")]
     if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
-        return route_on_postgres(cfg).await;
+        return route_on_postgres(cfg, seals).await;
     }
-    let _ = cfg;
+    let _ = (cfg, seals);
     Ok(SecretRoute::Local)
 }
 
 #[cfg(feature = "postgres")]
-async fn route_on_postgres(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
+async fn route_on_postgres(cfg: &GlobalConfig, seals: bool) -> anyhow::Result<SecretRoute> {
     use crystalline_remote::sealed::SealKey;
     use serde_json::Value;
 
@@ -573,7 +594,19 @@ async fn route_on_postgres(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
             if let Some(refusal) = holder.get("standby").and_then(Value::as_str) {
                 anyhow::bail!("{refusal}");
             }
-            return Ok(SecretRoute::Daemon);
+            if !seals {
+                return Ok(SecretRoute::Daemon);
+            }
+            let key = match SealKey::from_env() {
+                Ok(Some(key)) => key,
+                Ok(None) => anyhow::bail!(pg::no_key_beside_daemon()),
+                Err(e) => anyhow::bail!("{e}"),
+            };
+            let target = crystalline_index::postgres::PgTarget::from_config(&cfg.database())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let database = target.describe();
+            crate::secret_start::open_vault_beside_owner(target, &database, key).await?;
+            return Ok(SecretRoute::Beside);
         }
         Ok(None) => {}
         Err(e) => anyhow::bail!(
@@ -597,6 +630,23 @@ async fn route_on_postgres(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
     // among it) and installs the vault with the key.
     drop(open_store_as(Some(&claim), cfg, None, false).await?);
     Ok(SecretRoute::Owned(claim))
+}
+
+/// Refuse, before its first write, a daemonless command on Postgres that
+/// will need a credential (an origin connect, update, share or withdraw
+/// reaches GitHub) when this process has no secret key: its credential
+/// calls would fail half way. Turso, and Postgres with a key, pass.
+pub fn require_key_for_credentials(cfg: &GlobalConfig) -> anyhow::Result<()> {
+    #[cfg(feature = "postgres")]
+    if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+        return match crystalline_remote::sealed::SealKey::from_env() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => anyhow::bail!(pg::no_key_refusal(&command_example())),
+            Err(e) => anyhow::bail!("{e}"),
+        };
+    }
+    let _ = cfg;
+    Ok(())
 }
 
 /// Whether `e` is the CLI rule's refusal to open the database: a
@@ -1005,7 +1055,17 @@ pub(crate) mod pg {
     /// the key and with no daemon of this machine to take the change.
     pub(crate) fn no_key_refusal(example: &str) -> String {
         format!(
-            "this command changes a GitHub token or a server sign-in, and on Postgres they are sealed in the database with the instance's secret key, which this process does not have, so nothing was changed. Run the command on the active instance, for example `kubectl exec <pod> -- {example}`, or set {} (or {}) to the instance's key",
+            "this command reads or changes a GitHub token or a server sign-in, and on Postgres they are sealed in the database with the instance's secret key, which this process does not have, so nothing was changed. Run the command on the active instance, for example `kubectl exec <pod> -- {example}`, or set {} (or {}) to the instance's key",
+            crystalline_remote::sealed::KEY_ENV,
+            crystalline_remote::sealed::KEY_FILE_ENV
+        )
+    }
+
+    /// The refusal of a command that seals a secret beside the daemon of
+    /// its machine without the key.
+    pub(crate) fn no_key_beside_daemon() -> String {
+        format!(
+            "this command seals a GitHub token, a GitHub App or a server sign-in in the database itself, and this process has no secret key, so nothing was changed. Set {} (or {}) to the key of the active instance and run the command again; inside the instance's container it is set already",
             crystalline_remote::sealed::KEY_ENV,
             crystalline_remote::sealed::KEY_FILE_ENV
         )
