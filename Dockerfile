@@ -30,6 +30,11 @@ FROM gcr.io/distroless/static-debian13:nonroot AS runtime
 
 ARG TARGETARCH
 COPY --chown=nonroot:nonroot dist/linux-${TARGETARCH}/crystalline /usr/local/bin/crystalline
+# The install marker `crystalline update` reads at ../lib/crystalline/ from
+# the binary: it says docker, so the binary refuses to replace itself and
+# points at a new image instead. Owned by root (COPY's default whatever USER
+# says) and read-only, so the runtime user cannot change it.
+COPY --chmod=0444 docker/install-source /usr/local/lib/crystalline/install-source
 
 # All XDG paths land under /data so one volume covers config, the disposable
 # search index and the model cache. Engrams themselves are never under

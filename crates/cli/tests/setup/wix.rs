@@ -209,3 +209,81 @@ fn the_task_actions_run_in_the_order_their_anchors_give() {
         "an unregister moved after the new files is caught"
     );
 }
+
+/// The value of `name='...'` in one tag's text.
+fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let start = tag.find(&format!(" {name}='"))? + name.len() + 3;
+    let len = tag[start..].find('\'')?;
+    Some(&tag[start..start + len])
+}
+
+/// Every `File` in the source with its `Name`, the `Id` of the `Directory`
+/// it lies in and the `Id` of its `Component`, read from the nesting.
+fn files(wxs: &str) -> Vec<(String, String, String)> {
+    let mut directories: Vec<String> = Vec::new();
+    let mut component = String::new();
+    let mut found = Vec::new();
+    for piece in wxs.split('<').skip(1) {
+        let Some(end) = piece.find('>') else { continue };
+        let tag = &piece[..end];
+        if tag.starts_with("Directory ") && !tag.ends_with('/') {
+            directories.push(attribute(tag, "Id").unwrap_or_default().to_owned());
+        } else if tag.starts_with("/Directory") {
+            directories.pop();
+        } else if tag.starts_with("Component ") {
+            component = attribute(tag, "Id").unwrap_or_default().to_owned();
+        } else if tag.starts_with("File ") {
+            found.push((
+                attribute(tag, "Name").unwrap_or_default().to_owned(),
+                directories.last().cloned().unwrap_or_default(),
+                component.clone(),
+            ));
+        }
+    }
+    found
+}
+
+/// The marker detection reads beside the canonical exe (`install-source`
+/// in `bin\`, saying `msi`) is installed by a component of the always-on
+/// feature, in the very directory `crystalline.exe` goes to. The
+/// UpgradeCode stays the one every released MSI carries.
+#[test]
+fn the_msi_installs_the_marker_beside_the_exe() {
+    let marker = crystalline_core::update::MARKER_FILE;
+    let shipped = concat!(env!("CARGO_MANIFEST_DIR"), "/wix/install-source");
+    assert_eq!(
+        std::fs::read_to_string(shipped).ok().as_deref(),
+        Some("msi\n"),
+        "{shipped} says msi"
+    );
+    let files = files(WXS);
+    let exe = files
+        .iter()
+        .find(|(name, ..)| name == "crystalline.exe")
+        .expect("main.wxs installs crystalline.exe");
+    let installed = files
+        .iter()
+        .find(|(name, ..)| name == marker)
+        .unwrap_or_else(|| panic!("main.wxs installs no {marker} file"));
+    assert_eq!(installed.1, exe.1, "the marker lies beside the exe");
+    let feature_start = WXS
+        .find("<Feature Id='Binaries'")
+        .expect("the Binaries feature");
+    let feature = &WXS[feature_start..];
+    assert!(
+        feature.contains(&format!("<ComponentRef Id='{}'/>", installed.2)),
+        "the Binaries feature installs the {} component",
+        installed.2
+    );
+    let tag_start = WXS
+        .find(&format!("Name='{marker}'"))
+        .expect("the marker's File tag");
+    let tag_end = tag_start + WXS[tag_start..].find("/>").expect("a closed tag");
+    assert!(
+        WXS[tag_start..tag_end].contains(&format!(
+            "Source='$(var.CargoTargetDir)\\..\\crates\\cli\\wix\\{marker}'"
+        )),
+        "the marker comes from crates/cli/wix, not from the working directory"
+    );
+    assert!(WXS.contains("UpgradeCode='A04060D9-E5E1-4E8E-8751-2DCA3D8896CC'"));
+}

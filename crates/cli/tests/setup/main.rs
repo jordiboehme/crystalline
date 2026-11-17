@@ -43,6 +43,7 @@ mod install;
 #[cfg(all(debug_assertions, any(target_os = "macos", windows)))]
 mod install_desktop;
 mod kept;
+mod packaging;
 mod prompt;
 #[cfg(unix)]
 mod provision;

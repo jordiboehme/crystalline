@@ -152,6 +152,12 @@ jobs:
       LEG_TARGET: ${{ matrix.target }}
       LEG_PLATFORM: ${{ matrix.platform }}
       LEG_DEB_ARCH: ${{ matrix.deb_arch }}
+      # The official-build flag the binary reads at compile time
+      # (crystalline_core::update::official_build): 1 only for a release,
+      # which passes its tag. A dry run passes no tag and gets an empty
+      # value, so its binary refuses `crystalline update now`, like every
+      # build made outside this workflow.
+      CRYSTALLINE_OFFICIAL_BUILD: ${{ inputs.tag != '' && '1' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

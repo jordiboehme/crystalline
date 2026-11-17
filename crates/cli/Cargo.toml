@@ -33,6 +33,9 @@ assets = [
     ["../../docs/**/*.md", "usr/share/doc/crystalline/docs/", "644"],
     ["../../LICENSE", "usr/share/doc/crystalline/LICENSE", "644"],
     ["debian/crystalline.default", "etc/default/crystalline", "644"],
+    # The install marker `crystalline update` reads: usr/bin/crystalline finds
+    # it at ../lib/crystalline/install-source and knows it came from this .deb.
+    ["debian/install-source", "usr/lib/crystalline/install-source", "644"],
 ]
 
 # The unit ships installed but disabled: enable = false leaves activation to
@@ -128,6 +131,10 @@ fs4 = { workspace = true }
 # The Postgres tests make and drop their own schema through a connection of
 # their own, so they need no `psql` on the machine.
 sqlx = { workspace = true }
+# `tests/setup/packaging.rs` reads the .deb assets and the release workflows
+# as data, so a marker row or the official-build guard is checked by shape.
+toml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 
 # The job test in tests/daemon/service_windows.rs puts its own process in a
 # job that forbids breakaway, to see the daemon's refusal path end to end.
