@@ -6061,6 +6061,16 @@ fn run_prompt(
     // per-prompt recall hook's list of already-shown engrams is fair to
     // empty - the block that named them is gone from the agent's context too.
     let session_start = session_start_payload();
+    // Inside a subagent nothing is said and nothing is touched: no routing
+    // block, no update, and a `clear` or `compact` there must not empty the
+    // parent's recall list, which a harness sharing the parent's session id
+    // would otherwise reach.
+    if session_start
+        .as_ref()
+        .is_some_and(SessionStartPayload::in_subagent)
+    {
+        return Ok(());
+    }
     // One routing block per session (spec decision 13): Cursor runs the
     // user's Claude Code hooks too, so with both installs it would get the
     // block twice. The imported hook stays silent when the payload shows it
@@ -6573,6 +6583,21 @@ struct SessionStartPayload {
     /// Claude Code hook gets it too is documented but not yet observed.
     #[serde(default)]
     cursor_version: Option<String>,
+    /// The subagent id a harness puts on a payload sent from inside a
+    /// subagent, read as a raw JSON value like the Stop hook's.
+    #[serde(default)]
+    agent_id: Option<serde_json::Value>,
+    /// The camel-case spelling of `agent_id`, read beside it.
+    #[serde(default, rename = "agentId")]
+    agent_id_camel: Option<serde_json::Value>,
+}
+
+impl SessionStartPayload {
+    /// Whether this start comes from inside a subagent, by
+    /// [`hook::marks_subagent`]'s rule.
+    fn in_subagent(&self) -> bool {
+        hook::marks_subagent(self.agent_id.as_ref(), self.agent_id_camel.as_ref())
+    }
 }
 
 /// The SessionStart payload on stdin, when there is one to read: `None` when

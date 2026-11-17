@@ -17,7 +17,9 @@
 //! never be the reason a harness's turn breaks.
 //!
 //! The bail order, every one of them silent: the stdin payload fails to
-//! parse; the payload names an event other than `Stop`; `stop_hook_active`
+//! parse; the payload names an event other than `Stop`; the payload comes
+//! from inside a subagent (`agent_id` or `agentId` set, see
+//! `marks_subagent`), so the parent's state is never touched; `stop_hook_active`
 //! is set (the loop guard both harnesses attach to a hook-caused
 //! continuation, so a second pass over the same turn never doubles up and
 //! never advances the stop counter); the session id fails
@@ -213,6 +215,37 @@ pub struct StopInput {
     /// not every harness stamps it.
     #[serde(default)]
     pub hook_event_name: Option<String>,
+    /// The subagent id Claude Code and Codex put on a payload sent from
+    /// inside a subagent. Read as a raw JSON value so a number or both
+    /// spellings at once still parse; see `marks_subagent` for what counts.
+    #[serde(default)]
+    pub agent_id: Option<serde_json::Value>,
+    /// The camel-case spelling of `agent_id`, read beside it rather than as
+    /// a serde alias, which would fail on a payload carrying both.
+    #[serde(default, rename = "agentId")]
+    pub agent_id_camel: Option<serde_json::Value>,
+    /// The agent type. Alone it does not mean a subagent: a main session
+    /// started with `claude --agent <name>` carries it without an id.
+    #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "read by the SubagentStart answer, which comes next"
+    )]
+    pub agent_type: Option<String>,
+}
+
+/// Whether a hook payload comes from inside a subagent: either id spelling
+/// is present, not null and not an empty string. Any other value counts as
+/// set, a number too. `agent_type` is deliberately not an input, since a
+/// main session started with `claude --agent <name>` carries it as well.
+pub(crate) fn marks_subagent(
+    agent_id: Option<&serde_json::Value>,
+    agent_id_camel: Option<&serde_json::Value>,
+) -> bool {
+    [agent_id, agent_id_camel]
+        .into_iter()
+        .flatten()
+        .any(|v| !v.is_null() && v.as_str() != Some(""))
 }
 
 /// The persisted state for one session, at
@@ -321,6 +354,9 @@ pub fn decide(
     state: &SessionState,
     transcript: TranscriptStats,
 ) -> StopDecision {
+    if marks_subagent(input.agent_id.as_ref(), input.agent_id_camel.as_ref()) {
+        return StopDecision::Silent;
+    }
     if let Some(name) = input.hook_event_name.as_deref()
         && name != "Stop"
     {
@@ -699,15 +735,20 @@ pub fn run_stop(harness: Option<&str>) {
     let Ok(input) = serde_json::from_str::<StopInput>(&raw) else {
         return;
     };
-    // The two cheap payload checks come before any filesystem or config
-    // work: a miswired event or a hook-caused continuation is a pure no-op
-    // that should neither load the overlay nor advance the stop counter
-    // (continuations are not real stops).
-    if input
-        .hook_event_name
-        .as_deref()
-        .is_some_and(|name| name != "Stop")
-    {
+    // The cheap payload checks come before any filesystem or config work: a
+    // miswired event, a payload from inside a subagent or a hook-caused
+    // continuation is a pure no-op that should neither load the overlay nor
+    // advance the stop counter (continuations are not real stops). The event
+    // is dispatched first, because an event about a subagent carries that
+    // subagent's id without coming from inside it.
+    match input.hook_event_name.as_deref() {
+        None | Some("Stop") => {}
+        Some(_) => return,
+    }
+    // Inside a subagent the parent's session is not this one to nudge, and
+    // a harness that shares the parent's session id must not advance the
+    // parent's counter.
+    if marks_subagent(input.agent_id.as_ref(), input.agent_id_camel.as_ref()) {
         return;
     }
     if input.stop_hook_active {
@@ -1229,7 +1270,94 @@ mod tests {
             transcript_path: None,
             stop_hook_active: false,
             hook_event_name: None,
+            agent_id: None,
+            agent_id_camel: None,
+            agent_type: None,
         }
+    }
+
+    // --- the subagent check --------------------------------------------------
+
+    #[test]
+    fn marks_subagent_table() {
+        let a = serde_json::json!("a");
+        let seven = serde_json::json!(7);
+        let null = serde_json::Value::Null;
+        let empty = serde_json::json!("");
+        let cases: &[(Option<&serde_json::Value>, Option<&serde_json::Value>, bool)] = &[
+            (Some(&a), None, true),
+            (None, Some(&a), true),
+            (Some(&a), Some(&a), true),
+            (Some(&seven), None, true),
+            (None, Some(&seven), true),
+            (Some(&null), None, false),
+            (None, Some(&null), false),
+            (Some(&empty), None, false),
+            (None, Some(&empty), false),
+            (Some(&empty), Some(&null), false),
+            (None, None, false),
+        ];
+        for (id, camel, want) in cases {
+            assert_eq!(
+                marks_subagent(*id, *camel),
+                *want,
+                "agent_id {id:?}, agentId {camel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_input_parses_both_spellings_and_a_number() {
+        let input: StopInput =
+            serde_json::from_str(r#"{"session_id":"s","agent_id":"a","agentId":3}"#)
+                .expect("both spellings and a number parse");
+        assert_eq!(input.agent_id, Some(serde_json::json!("a")));
+        assert_eq!(input.agent_id_camel, Some(serde_json::json!(3)));
+        assert!(marks_subagent(
+            input.agent_id.as_ref(),
+            input.agent_id_camel.as_ref()
+        ));
+    }
+
+    #[test]
+    fn decide_is_silent_inside_a_subagent() {
+        for (id, camel) in [
+            (Some(serde_json::json!("a")), None),
+            (None, Some(serde_json::json!("a"))),
+            (Some(serde_json::json!(7)), None),
+        ] {
+            let mut i = input();
+            i.hook_event_name = Some("Stop".to_string());
+            i.agent_id = id;
+            i.agent_id_camel = camel;
+            let decision = decide(
+                &i,
+                true,
+                false,
+                &SessionState::fresh(),
+                TranscriptStats::Substantial,
+            );
+            assert_eq!(decision, StopDecision::Silent, "{i:?}");
+        }
+    }
+
+    /// `claude --agent <name>` starts a main session that carries
+    /// `agent_type` and no id; it keeps its nudge. The recorded payload, so
+    /// the field spelling is the harness's own.
+    #[test]
+    fn agent_type_alone_is_not_a_subagent() {
+        let i: StopInput =
+            serde_json::from_str(include_str!("../tests/fixtures/hooks/agent-flag-Stop.json"))
+                .expect("the recorded payload parses");
+        assert_eq!(i.agent_type.as_deref(), Some("spike"));
+        let decision = decide(
+            &i,
+            true,
+            false,
+            &SessionState::fresh(),
+            TranscriptStats::Substantial,
+        );
+        assert_eq!(decision, StopDecision::Nudge);
     }
 
     // --- valid_session_id ----------------------------------------------------

@@ -18,15 +18,19 @@
 //!
 //! 1. stdin is unreadable or is not the expected JSON object;
 //! 2. the payload names an event other than `UserPromptSubmit`;
-//! 3. the session id fails [`crate::hook::valid_session_id`] (a traversal
+//! 3. the payload comes from inside a subagent (`agent_id` or `agentId` set,
+//!    see `crate::hook::marks_subagent`), so the parent's list is never
+//!    touched;
+//! 4. the session id fails [`crate::hook::valid_session_id`] (a traversal
 //!    attempt must never turn into a filesystem path);
-//! 4. the prompt fails [`gate_prompt`];
-//! 5. the config overlay fails to load, `recall.enabled` is false, or no
+//! 5. the prompt fails [`gate_prompt`], which also refuses a background
+//!    subagent's task notification;
+//! 6. the config overlay fails to load, `recall.enabled` is false, or no
 //!    domain is registered and no server is connected;
-//! 6. no daemon answers (the attach is passive, see below);
-//! 7. the search fails, answers in text mode, or does not answer inside
+//! 7. no daemon answers (the attach is passive, see below);
+//! 8. the search fails, answers in text mode, or does not answer inside
 //!    [`RECALL_BUDGET`];
-//! 8. nothing survives the floor, the retirement cut and the dedupe.
+//! 9. nothing survives the floor, the retirement cut and the dedupe.
 //!
 //! Read-only is not a bail: `service.read_only` removes the write tools, and
 //! recall is a read. A read-only deployment's knowledge is curated for
@@ -133,6 +137,10 @@ pub const RECALL_HEADER: &str = "Knowledge that may apply, from your Crystalline
 /// together.
 pub const RETIRED: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
 
+/// The opening tag of the prompt Claude Code sends when a background
+/// subagent finishes.
+const TASK_NOTIFICATION: &str = "<task-notification>";
+
 /// The stdin payload a `UserPromptSubmit` hook sends. Every field carries a
 /// serde default, so all three harness payload shapes parse and every field
 /// this handler does not know about is ignored.
@@ -151,6 +159,13 @@ pub struct PromptInput {
     /// The prompt the person submitted.
     #[serde(default)]
     pub prompt: String,
+    /// The subagent id a harness puts on a payload sent from inside a
+    /// subagent, read as a raw JSON value like the Stop hook's.
+    #[serde(default)]
+    pub agent_id: Option<Value>,
+    /// The camel-case spelling of `agent_id`, read beside it.
+    #[serde(default, rename = "agentId")]
+    pub agent_id_camel: Option<Value>,
 }
 
 /// One engram worth naming, already folded, cut and ready to render.
@@ -171,6 +186,12 @@ pub struct Recalled {
 pub fn gate_prompt(prompt: &str) -> Option<String> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+    // A background subagent's completion reaches the main session as a
+    // prompt holding only this block: the harness's words, not the
+    // person's, so nothing in it is worth a search.
+    if trimmed.starts_with(TASK_NOTIFICATION) {
         return None;
     }
     if trimmed.split_whitespace().count() < MIN_PROMPT_WORDS
@@ -362,6 +383,11 @@ pub async fn run_prompt(harness: Option<String>) {
     {
         return;
     }
+    // Inside a subagent: silent, so the parent's `recalled` list is never
+    // touched by a harness that shares the parent's session id.
+    if hook::marks_subagent(input.agent_id.as_ref(), input.agent_id_camel.as_ref()) {
+        return;
+    }
     if !hook::valid_session_id(&input.session_id) {
         return;
     }
@@ -441,6 +467,8 @@ mod tests {
             // already refuses it and a loop that runs for hours costs no
             // search until it says something with a subject in it.
             "<<autonomous-loop>>",
+            // A background subagent's completion, as Claude Code delivers it.
+            "<task-notification>\n<task-id>a0000000000000003</task-id>\n<status>completed</status>\n<summary>Agent \"read the note and report what it says\" completed</summary>\n</task-notification>",
         ] {
             assert_eq!(
                 gate_prompt(prompt),
@@ -457,6 +485,32 @@ mod tests {
             gate_prompt("  how does the vent driver retry \n"),
             Some("how does the vent driver retry".to_string())
         );
+    }
+
+    /// The recorded notification payload parses and is refused by the gate,
+    /// so the hook never searches on it and never writes state for it.
+    #[test]
+    fn a_task_notification_is_no_subject() {
+        let input: PromptInput = serde_json::from_str(include_str!(
+            "../tests/fixtures/hooks/bg-main-UserPromptSubmit-task-notification.json"
+        ))
+        .expect("the recorded payload parses");
+        assert!(!hook::marks_subagent(
+            input.agent_id.as_ref(),
+            input.agent_id_camel.as_ref()
+        ));
+        assert_eq!(gate_prompt(&input.prompt), None, "{:?}", input.prompt);
+    }
+
+    #[test]
+    fn prompt_input_parses_both_spellings_and_a_number() {
+        let input: PromptInput =
+            serde_json::from_str(r#"{"session_id":"s","agent_id":"a","agentId":3,"prompt":"p"}"#)
+                .expect("both spellings and a number parse");
+        assert!(hook::marks_subagent(
+            input.agent_id.as_ref(),
+            input.agent_id_camel.as_ref()
+        ));
     }
 
     /// A pasted wall of text is cut at a character boundary, never a byte one:
