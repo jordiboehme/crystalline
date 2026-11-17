@@ -43,6 +43,10 @@ pub const AUTHOR_EMAIL: &str = "jordi@boehme-lopez.de";
 /// Crystalline binary it was built for. The launcher tries that path first.
 pub const BINARY_ENV: &str = "CRYSTALLINE_BINARY";
 
+/// The install-channel variable. The Claude Desktop only bundle's manifest
+/// sets it to `mcpb`.
+pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
+
 /// The Node launcher the hollow extension runs as `server/shim.js`.
 pub const SHIM_JS: &str = include_str!("../../../packaging/mcpb/shim/shim.js");
 
@@ -212,7 +216,7 @@ pub fn manifest(bundle: Bundle<'_>, version: &str) -> Value {
                 "mcp_config": {
                     "command": "${__dirname}/server/crystalline",
                     "args": ["mcp"],
-                    "env": { "CRYSTALLINE_CHANNEL": "mcpb" },
+                    "env": { CHANNEL_ENV: "mcpb" },
                 },
             }),
             json!(["darwin"]),

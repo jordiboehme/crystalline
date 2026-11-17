@@ -129,7 +129,7 @@ pub const GITHUB_APP_PRIVATE_KEY_ENV: &str = "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY
 pub const GITHUB_APP_WEBHOOK_SECRET_ENV: &str = "CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET";
 
 /// The install-channel marker env var. The mcpb manifest sets it to "mcpb".
-pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
+pub use crystalline_core::desktop_extension::CHANNEL_ENV;
 
 /// The launcher version env var. The standard Claude Desktop extension's
 /// launcher sets it to its own version, so the bridge can tell the agent when

@@ -85,6 +85,11 @@ sha2 = "0.11.1"
 # The webhook signature (`crystalline_core::automation::webhook_signature`):
 # HMAC-SHA256 over the same sha2 line.
 hmac = "0.13.0"
+# The release signature over SHA256SUMS (`crystalline_core::update::verify`):
+# verify only, no dependencies of its own.
+minisign-verify = "0.3.0"
+# Signs test fixtures in core's tests only (a dev-dependency), never shipped.
+minisign = "0.10.0"
 chrono = "0.4.45"
 # The date library behind crystalline_core::time from 0.34.0 on: no serde
 # (every date goes through a named adapter), no system time zone and no tz
