@@ -30,8 +30,13 @@ pub enum KeyError {
     #[error("Both {KEY_ENV} and {KEY_FILE_ENV} are set. Set only one of them.")]
     BothSet,
     /// The key file could not be read.
-    #[error("{KEY_FILE_ENV} points at a file that cannot be read ({0}).")]
-    Unreadable(String),
+    #[error("{KEY_FILE_ENV} names {path}, which cannot be read ({error}).")]
+    Unreadable {
+        /// The path the variable names.
+        path: String,
+        /// Why it could not be read: the kind of the I/O error.
+        error: String,
+    },
     /// The key is not 32 bytes in hex or base64.
     #[error(
         "{var} must hold a 32 byte key as 64 hex characters or as base64 (44 characters). Generate one with: openssl rand -base64 32"
@@ -96,9 +101,11 @@ impl SealKey {
                 Self::parse(&text, KEY_ENV).map(Some)
             }
             (None, Some(path)) => {
-                let bytes = Zeroizing::new(
-                    std::fs::read(&path).map_err(|e| KeyError::Unreadable(e.kind().to_string()))?,
-                );
+                let bytes =
+                    Zeroizing::new(std::fs::read(&path).map_err(|e| KeyError::Unreadable {
+                        path: std::path::Path::new(&path).display().to_string(),
+                        error: e.kind().to_string(),
+                    })?);
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| KeyError::Malformed { var: KEY_FILE_ENV })?;
                 Self::parse(text, KEY_FILE_ENV).map(Some)
@@ -288,6 +295,21 @@ mod tests {
         let err = SealKey::from_vars(Some(zs(HEX)), Some("/x".into())).unwrap_err();
         assert!(matches!(err, KeyError::BothSet));
         assert!(err.to_string().contains("CRYSTALLINE_SECRET_KEY_FILE"));
+    }
+
+    #[test]
+    fn an_unreadable_key_file_is_named_by_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.key");
+        let err = SealKey::from_vars(None, Some(path.clone().into_os_string())).unwrap_err();
+        assert!(matches!(err, KeyError::Unreadable { .. }));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "CRYSTALLINE_SECRET_KEY_FILE names {}, which cannot be read (entity not found).",
+                path.display()
+            )
+        );
     }
 
     #[test]

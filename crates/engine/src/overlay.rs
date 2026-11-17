@@ -2470,11 +2470,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = AppHome::new(None, dir.path().to_path_buf(), false);
         assert!(home.maybe_saved());
+        assert_eq!(vault.calls(), 0, "the vault was asked");
+        // `presence` is off the request path and asks the vault: no App is
+        // sealed, so none is configured.
         assert!(
             home.presence(&EnvOverlay::default())
-                == crystalline_core::config::GithubAppPresence::Configured
+                == crystalline_core::config::GithubAppPresence::None
         );
-        assert_eq!(vault.calls(), 0, "the vault was asked");
+        assert!(vault.calls() > 0, "presence asks the vault");
         crystalline_remote::vault::clear();
         crystalline_remote::vault::require();
         assert!(home.maybe_saved(), "a required vault fails closed too");

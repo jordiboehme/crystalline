@@ -9553,7 +9553,7 @@ pub use github_access::{
 mod github_app;
 pub use github_app::{
     APP_ALREADY_CONFIGURED, APP_FROM_ENV, AppClock, AppHome, AppRemoval, GithubAppStatus,
-    SettledApp, UnusableApp, marker_names_host,
+    SettledApp, UnusableApp, marker_names_host, presence_from_lookup,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use github_app::{AppKeychainSeam, AppLookupFn};

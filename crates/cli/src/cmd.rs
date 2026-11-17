@@ -6056,26 +6056,14 @@ fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
 
 /// The share identity mode in effect for this process, which has no engine:
 /// the App is asked of what is cheap to read. With the vault installed in
-/// this process (a sealing command on Postgres), `presence` cannot tell a
-/// saved App from "may be saved", so the vault is asked; a vault that does
-/// not answer leaves the mode not checked.
+/// this process (a sealing command on Postgres), `presence` asks the vault;
+/// a vault that does not answer leaves the mode not checked.
 fn share_identity_here(
     loaded: &crystalline_service::LoadedConfig,
     cfg: &GlobalConfig,
 ) -> crystalline_core::config::EffectiveShareIdentity {
     use crystalline_core::config::GithubAppPresence;
-    let api_url = loaded
-        .effective
-        .github
-        .as_ref()
-        .and_then(|g| g.api_url.as_deref());
     let app = match app_home(loaded, test_token_store_dir().as_deref()) {
-        Ok(home)
-            if crystalline_remote::vault::installed_key_id().is_some()
-                && loaded.overlay.github_app(api_url).is_none() =>
-        {
-            presence_from_lookup(home.lookup())
-        }
         Ok(home) => home.presence(&loaded.overlay),
         Err(_) => GithubAppPresence::None,
     };
@@ -6083,19 +6071,6 @@ fn share_identity_here(
         cfg.github_share_identity_setting(),
         app,
     )
-}
-
-/// What a vault lookup of the App says about its presence: saved, not saved,
-/// or not checked when the vault did not answer.
-fn presence_from_lookup(
-    lookup: std::result::Result<crystalline_remote::AppLookup, crystalline_remote::RemoteError>,
-) -> crystalline_core::config::GithubAppPresence {
-    use crystalline_core::config::GithubAppPresence;
-    match lookup {
-        Ok(lookup) if lookup.credentials.is_some() => GithubAppPresence::Configured,
-        Ok(_) => GithubAppPresence::None,
-        Err(_) => GithubAppPresence::Sealed,
-    }
 }
 
 /// The line a personal connect prints after it saved: the mode is not
@@ -6403,7 +6378,10 @@ mod share_identity_tests {
         use crystalline_core::config::GithubAppPresence;
         use crystalline_remote::{AppLookup, AppStore, RemoteError};
         let refused = Err(RemoteError::Refused("timed out".to_string()));
-        assert_eq!(presence_from_lookup(refused), GithubAppPresence::Sealed);
+        assert_eq!(
+            crystalline_service::engine::presence_from_lookup(refused),
+            GithubAppPresence::Sealed
+        );
         let empty = Ok(AppLookup {
             store: AppStore::Vault {
                 name: "github-app".to_string(),
@@ -6412,7 +6390,10 @@ mod share_identity_tests {
             keychain_failed: None,
             marker: None,
         });
-        assert_eq!(presence_from_lookup(empty), GithubAppPresence::None);
+        assert_eq!(
+            crystalline_service::engine::presence_from_lookup(empty),
+            GithubAppPresence::None
+        );
     }
 
     /// A share identity that was not checked is said so after a personal

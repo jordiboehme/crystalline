@@ -807,6 +807,10 @@ impl SecretTable {
         }
     }
 
+    /// Run `op` on a thread, a runtime and a connection of its own, all
+    /// gone when it returns. Made for a short-lived CLI process that seals
+    /// a secret or two beside the daemon; a long-lived process goes through
+    /// the owner's side channel instead, which keeps one connection.
     fn run(&self, op: TableOp) -> Result<TableAnswer> {
         let (target, options) = (self.target.clone(), self.options.clone());
         let table = secret_table(target.schema.as_deref());

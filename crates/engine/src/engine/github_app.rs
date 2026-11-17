@@ -231,16 +231,22 @@ impl AppHome {
     /// environment, the keychain marker for this host and the App file. No
     /// keychain read, so a report may ask it. What the CLI feeds
     /// [`EffectiveShareIdentity::resolve`] when it has no engine.
+    ///
+    /// On Postgres the App is sealed in the database. Without an installed
+    /// vault (a CLI report) it is not read and the answer is
+    /// [`GithubAppPresence::Sealed`]; with one (a CLI command that installed
+    /// it) the vault is asked, one database round trip, so this is not for
+    /// a request path. A vault that does not answer leaves it
+    /// [`GithubAppPresence::Sealed`] (not checked).
     pub fn presence(&self, overlay: &EnvOverlay) -> GithubAppPresence {
         if overlay.github_app(self.api_url.as_deref()).is_some() {
             return GithubAppPresence::Configured;
         }
-        // On Postgres without an installed vault (a CLI report): a saved App
-        // would be sealed in the database, which is not read here.
-        if crystalline_remote::vault::engaged()
-            && crystalline_remote::vault::installed_key_id().is_none()
-        {
-            return GithubAppPresence::Sealed;
+        if crystalline_remote::vault::engaged() {
+            if crystalline_remote::vault::installed_key_id().is_none() {
+                return GithubAppPresence::Sealed;
+            }
+            return presence_from_lookup(self.lookup());
         }
         if self.maybe_saved() {
             GithubAppPresence::Configured
@@ -512,6 +518,17 @@ impl AppHome {
                 })
             }
         }
+    }
+}
+
+/// What a vault lookup of the App says about its presence: saved, not saved,
+/// or not checked ([`GithubAppPresence::Sealed`]) when the vault did not
+/// answer.
+pub fn presence_from_lookup(lookup: StdResult<AppLookup, RemoteError>) -> GithubAppPresence {
+    match lookup {
+        Ok(lookup) if lookup.credentials.is_some() => GithubAppPresence::Configured,
+        Ok(_) => GithubAppPresence::None,
+        Err(_) => GithubAppPresence::Sealed,
     }
 }
 
