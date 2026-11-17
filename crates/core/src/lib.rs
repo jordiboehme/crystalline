@@ -60,6 +60,7 @@ pub mod temporal;
 pub mod text;
 pub mod thread_env;
 pub mod threads;
+pub mod time;
 pub mod tree;
 pub mod verify;
 pub mod version;

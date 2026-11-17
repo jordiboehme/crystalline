@@ -23,5 +23,6 @@ mod reflection_asset_corpus;
 mod roundtrip;
 mod schema;
 mod structure;
+mod time_boundary;
 mod translate;
 mod verify_smoke;
