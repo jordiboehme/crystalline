@@ -294,6 +294,7 @@ impl AppStore {
         credentials: &AppCredentials,
         fence: Option<&WriteFence>,
     ) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => {
                 keyring_write(account, to_json(credentials)?, KEYRING_TIMEOUT)
@@ -319,6 +320,7 @@ impl AppStore {
         credentials: &AppCredentials,
         marker_dir: &Path,
     ) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => {
                 save_keyring_marked(account, credentials, marker_dir, |account, json| {
@@ -335,6 +337,7 @@ impl AppStore {
     /// the file copy takes the marker too: a remove means no App at all, and
     /// a marker left behind would keep refusing origin operations.
     pub fn delete_marked(&self, marker_dir: &Path) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => {
                 delete_keyring_marked(account, marker_dir, |account| {
@@ -353,6 +356,7 @@ impl AppStore {
     /// The `Env` backend holds nothing of its own to load: the overlay owns
     /// those values.
     pub fn load(&self) -> Result<Option<AppCredentials>, RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => match keyring_read(account, KEYRING_TIMEOUT) {
                 KeyringRead::Found(json) => from_json(&json).map(Some),
@@ -380,6 +384,7 @@ impl AppStore {
 
     /// [`AppStore::delete`] under `fence`.
     fn delete_in(&self, fence: Option<&WriteFence>) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => keyring_delete(account, KEYRING_TIMEOUT),
             AppStore::File { path } => {
@@ -388,6 +393,15 @@ impl AppStore {
             }
             AppStore::Vault { name } => crate::vault::delete_row(name),
             AppStore::Env => Err(env_read_only()),
+        }
+    }
+
+    /// [`crate::vault::refuse_local`] for the keychain and file arms: in
+    /// vault mode they touch nothing, however the store was built.
+    fn refuse_local(&self) -> Result<(), RemoteError> {
+        match self {
+            AppStore::Keyring { .. } | AppStore::File { .. } => crate::vault::refuse_local(),
+            _ => Ok(()),
         }
     }
 

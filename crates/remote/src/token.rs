@@ -455,6 +455,7 @@ impl TokenStore {
 
     /// Saves `token`, replacing whatever was saved before.
     pub fn save(&self, token: &StoredToken) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             TokenStore::Keyring { account } => {
                 let json = to_json(token)?;
@@ -476,6 +477,7 @@ impl TokenStore {
     /// (never displayed anywhere; only `user`, `kind` and the fact that a
     /// token exists at all ever surface).
     pub fn load(&self) -> Result<Option<StoredToken>, RemoteError> {
+        self.refuse_local()?;
         match self {
             TokenStore::Keyring { account } => match keyring_read(account, KEYRING_TIMEOUT) {
                 KeyringRead::Found(json) => from_json(&json).map(Some),
@@ -501,11 +503,21 @@ impl TokenStore {
     /// Deletes the saved token. Deleting when nothing is saved is not an
     /// error.
     pub fn delete(&self) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             TokenStore::Keyring { account } => keyring_delete(account, KEYRING_TIMEOUT),
             TokenStore::File { path } => delete_file(path),
             TokenStore::Vault { name } => crate::vault::delete_row(name),
             TokenStore::Env { .. } => Err(env_read_only_error()),
+        }
+    }
+
+    /// [`crate::vault::refuse_local`] for the keychain and file arms: in
+    /// vault mode they touch nothing, however the store was built.
+    fn refuse_local(&self) -> Result<(), RemoteError> {
+        match self {
+            TokenStore::Keyring { .. } | TokenStore::File { .. } => crate::vault::refuse_local(),
+            _ => Ok(()),
         }
     }
 
@@ -841,9 +853,11 @@ fn from_json(json: &str) -> Result<StoredToken, RemoteError> {
 }
 
 fn from_json_bytes(json: &[u8]) -> Result<StoredToken, RemoteError> {
-    serde_json::from_slice(json).map_err(|e| RemoteError::Credential {
-        detail: format!("the saved GitHub token is not valid: {e}"),
-    })
+    from_json(
+        std::str::from_utf8(json).map_err(|e| RemoteError::Credential {
+            detail: format!("the saved GitHub token is not valid: {e}"),
+        })?,
+    )
 }
 
 /// Writes `token` to `path` as JSON: a sibling temp file, permissioned

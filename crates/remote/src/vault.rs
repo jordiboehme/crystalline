@@ -158,14 +158,42 @@ pub(crate) fn open_row(
     }
 }
 
-/// Seals `plain` for the row `name` and writes it.
+/// Seals `plain` for the row `name` and writes it. A row already there that
+/// was sealed with another key is refused, never replaced.
 pub(crate) fn seal_row(
     vault: &dyn SecretVault,
     key: &SealKey,
     name: &str,
     plain: &[u8],
 ) -> Result<(), RemoteError> {
-    vault.save(name, &sealed::seal(key, name, plain), &key.key_id())
+    let key_id = key.key_id();
+    refuse_other_key(vault, name, &key_id)?;
+    vault.save(name, &sealed::seal(key, name, plain), &key_id)
+}
+
+/// Refuses a change to the row `name` when it was sealed with a key other
+/// than `key_id`: such a row is kept as it is until the key it was sealed
+/// with is back.
+fn refuse_other_key(vault: &dyn SecretVault, name: &str, key_id: &str) -> Result<(), RemoteError> {
+    match vault.load(name)? {
+        Some(row) if row.key_id != key_id => Err(RemoteError::VaultKeyMismatch {
+            name: name.to_string(),
+            row_key_id: row.key_id,
+            key_id: key_id.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `Ok` when this process keeps its secrets in the keychain or a file;
+/// [`RemoteError::VaultUnavailable`] when a vault is installed or required,
+/// so a keychain or file store built or kept around the vault touches
+/// nothing.
+pub(crate) fn refuse_local() -> Result<(), RemoteError> {
+    match active()? {
+        Some(_) => Err(RemoteError::VaultUnavailable),
+        None => Ok(()),
+    }
 }
 
 /// The plain text of the row `name` in the installed vault, for a
@@ -191,9 +219,11 @@ pub(crate) fn save_text(name: &str, text: &str) -> Result<(), RemoteError> {
 }
 
 /// Deletes the row `name` of the installed vault, for a `Vault { name }`
-/// store's `delete`. A missing row is not an error.
+/// store's `delete`. A missing row is not an error; a row sealed with
+/// another key is refused and kept.
 pub(crate) fn delete_row(name: &str) -> Result<(), RemoteError> {
-    let (vault, _) = installed()?;
+    let (vault, key) = installed()?;
+    refuse_other_key(vault.as_ref(), name, &key.key_id())?;
     vault.delete(name).map(|_| ())
 }
 
@@ -364,5 +394,104 @@ mod tests {
             delete_row("github"),
             Err(RemoteError::VaultUnavailable)
         ));
+    }
+
+    #[test]
+    fn local_stores_refuse_in_vault_mode() {
+        use crate::{AppStore, ServerCredentialStore, TokenIdentity, TokenStore};
+        let _guard = guard();
+        let dir = tempfile::tempdir().unwrap();
+        let token: crate::StoredToken = serde_json::from_str(
+            r#"{"access_token":"gho_x","host":"github.com","user":"u","created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let app: crate::AppCredentials = serde_json::from_str(
+            r#"{"app_id":1,"client_id":"Iv1","private_key":"k","host":"github.com"}"#,
+        )
+        .unwrap();
+        let server = crate::ServerCredential::token(
+            "cmt_x".to_string(),
+            "https://kb.example".to_string(),
+            "alice".to_string(),
+            chrono::Utc::now(),
+        );
+        let unavailable = |r: Result<(), RemoteError>, what: &str| {
+            assert!(
+                matches!(r, Err(RemoteError::VaultUnavailable)),
+                "{what}: {r:?}"
+            );
+        };
+        let check = |mode: &str| {
+            let file = TokenStore::file_fallback_for(&TokenIdentity::Instance, dir.path()).unwrap();
+            unavailable(file.save(&token), mode);
+            unavailable(file.load().map(|_| ()), mode);
+            unavailable(file.delete(), mode);
+            let keyring = TokenStore::Keyring {
+                account: "github".to_string(),
+            };
+            unavailable(keyring.save(&token), mode);
+            unavailable(keyring.load().map(|_| ()), mode);
+            unavailable(keyring.delete(), mode);
+            for store in [AppStore::file_fallback(dir.path()), AppStore::keyring(None)] {
+                unavailable(store.save(&app), mode);
+                unavailable(store.save_marked(&app, dir.path()), mode);
+                unavailable(store.load().map(|_| ()), mode);
+                unavailable(store.delete(), mode);
+                unavailable(store.delete_marked(dir.path()), mode);
+            }
+            for store in [
+                ServerCredentialStore::file(dir.path()),
+                ServerCredentialStore::Keyring {
+                    account: "crystalline-server:kb.example".to_string(),
+                },
+            ] {
+                unavailable(store.save(&server), mode);
+                unavailable(store.load().map(|_| ()), mode);
+                unavailable(store.delete(), mode);
+            }
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "{mode}");
+        };
+        require();
+        check("required");
+        clear();
+        let vault = install_memory(key(1));
+        check("installed");
+        assert_eq!(vault.calls(), 0, "a local store never reaches the vault");
+    }
+
+    #[test]
+    fn a_row_sealed_with_another_key_is_never_replaced_or_deleted() {
+        let _guard = guard();
+        let vault = install_memory(key(1));
+        seal_row(vault.as_ref(), &key(2), "github", b"other").unwrap();
+        let kept = vault.row("github").unwrap();
+
+        let err = save_text("github", "mine").unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, RemoteError::VaultKeyMismatch { .. }),
+            "{err:?}"
+        );
+        assert!(text.contains(&key(1).key_id()), "{text}");
+        assert!(text.contains(&key(2).key_id()), "{text}");
+        assert_eq!(vault.row("github"), Some(kept.clone()), "never overwritten");
+
+        let err = delete_row("github").unwrap_err();
+        assert!(
+            matches!(err, RemoteError::VaultKeyMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(vault.row("github"), Some(kept), "never deleted");
+        assert_eq!(vault.deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Through the stores too.
+        let store = crate::TokenStore::Vault {
+            name: "github".to_string(),
+        };
+        assert!(matches!(
+            store.delete(),
+            Err(RemoteError::VaultKeyMismatch { .. })
+        ));
+        assert!(vault.row("github").is_some());
     }
 }

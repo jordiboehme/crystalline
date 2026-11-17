@@ -328,6 +328,21 @@ pub enum RemoteError {
         "The secrets of this instance are sealed in the database and this process cannot reach them. Run the command on the active instance, or set CRYSTALLINE_SECRET_KEY."
     )]
     VaultUnavailable,
+
+    /// A change to a sealed secret was refused because the row was sealed
+    /// with another key than the one this process holds. The row is kept as
+    /// it is: never overwritten, never deleted.
+    #[error(
+        "The secret {name} is sealed with key {row_key_id}, but this process holds key {key_id}. The secret is kept as it is. Set CRYSTALLINE_SECRET_KEY to the key it was sealed with."
+    )]
+    VaultKeyMismatch {
+        /// The row name.
+        name: String,
+        /// The key id the row was sealed with.
+        row_key_id: String,
+        /// The key id of the key this process holds.
+        key_id: String,
+    },
 }
 
 /// The ` (GitHub Enterprise Server x.y.z)` clause of
@@ -383,7 +398,8 @@ impl RemoteError {
             | RemoteError::AppCredential(_)
             | RemoteError::AppNotInstalled { .. }
             | RemoteError::EndpointMissing { .. }
-            | RemoteError::VaultUnavailable => false,
+            | RemoteError::VaultUnavailable
+            | RemoteError::VaultKeyMismatch { .. } => false,
         }
     }
 }

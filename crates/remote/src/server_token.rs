@@ -381,6 +381,7 @@ impl ServerCredentialStore {
 
     /// The saved credential, or `None` when nothing is saved.
     pub fn load(&self) -> Result<Option<ServerCredential>, RemoteError> {
+        self.refuse_local()?;
         match self {
             ServerCredentialStore::Keyring { account } => {
                 match keyring_read(account, KEYRING_TIMEOUT) {
@@ -408,6 +409,7 @@ impl ServerCredentialStore {
 
     /// Save `credential`, replacing what was there.
     pub fn save(&self, credential: &ServerCredential) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             ServerCredentialStore::Keyring { account } => {
                 keyring_write(account, to_json(credential)?).map_err(|e| store_error("save", e))
@@ -422,6 +424,7 @@ impl ServerCredentialStore {
 
     /// Delete the saved credential. Deleting nothing is not an error.
     pub fn delete(&self) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             ServerCredentialStore::Keyring { account } => {
                 keyring_delete(account).map_err(|e| store_error("delete", e))
@@ -433,6 +436,17 @@ impl ServerCredentialStore {
             },
             ServerCredentialStore::Vault { name } => crate::vault::delete_row(name),
             ServerCredentialStore::Env { .. } => Err(env_read_only()),
+        }
+    }
+
+    /// [`crate::vault::refuse_local`] for the keychain and file arms: in
+    /// vault mode they touch nothing, however the store was built.
+    fn refuse_local(&self) -> Result<(), RemoteError> {
+        match self {
+            ServerCredentialStore::Keyring { .. } | ServerCredentialStore::File { .. } => {
+                crate::vault::refuse_local()
+            }
+            _ => Ok(()),
         }
     }
 
