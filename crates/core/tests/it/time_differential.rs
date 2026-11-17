@@ -15,6 +15,21 @@ use crystalline_core::time::{
 use serde::Deserialize;
 use std::time::Instant;
 
+/// The `_option` adapters, one field each.
+#[derive(Deserialize)]
+struct MaybeStampField(
+    #[serde(default, with = "crystalline_core::time::serde::stamp_option")] Option<Stamp>,
+);
+#[derive(Deserialize)]
+struct MaybeOffsetField(
+    #[serde(default, with = "crystalline_core::time::serde::offset_stamp_option")]
+    Option<OffsetStamp>,
+);
+#[derive(Deserialize)]
+struct MaybeDayField(
+    #[serde(default, with = "crystalline_core::time::serde::day_option")] Option<Day>,
+);
+
 /// The adapters of `crystalline_core::time::serde` on one field each.
 #[derive(Deserialize)]
 struct StampField(#[serde(with = "crystalline_core::time::serde::stamp")] Stamp);
@@ -236,6 +251,45 @@ fn compare(input: &str) -> Vec<(&'static str, Outcome, Outcome)> {
             "serde::day (YAML) / Deserialize",
             our_day(serde_yaml_ng::from_str::<DayField>(&yaml).ok().map(|f| f.0)),
             chrono_day(serde_yaml_ng::from_str::<NaiveDate>(&yaml).ok()),
+        ),
+        (
+            "serde::stamp_option (JSON) / Option<DateTime<Utc>>",
+            our_stamp(
+                serde_json::from_str::<MaybeStampField>(&json)
+                    .ok()
+                    .and_then(|f| f.0),
+            ),
+            utc_outcome(
+                serde_json::from_str::<Option<DateTime<Utc>>>(&json)
+                    .ok()
+                    .flatten(),
+            ),
+        ),
+        (
+            "serde::offset_stamp_option (JSON) / Option<DateTime<FixedOffset>>",
+            our_offset(
+                serde_json::from_str::<MaybeOffsetField>(&json)
+                    .ok()
+                    .and_then(|f| f.0),
+            ),
+            offset_outcome(
+                serde_json::from_str::<Option<DateTime<FixedOffset>>>(&json)
+                    .ok()
+                    .flatten(),
+            ),
+        ),
+        (
+            "serde::day_option (JSON) / Option<NaiveDate>",
+            our_day(
+                serde_json::from_str::<MaybeDayField>(&json)
+                    .ok()
+                    .and_then(|f| f.0),
+            ),
+            chrono_day(
+                serde_json::from_str::<Option<NaiveDate>>(&json)
+                    .ok()
+                    .flatten(),
+            ),
         ),
         (
             "parse_rfc3339 / parse_from_rfc3339",

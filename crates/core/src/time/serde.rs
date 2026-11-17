@@ -374,6 +374,54 @@ mod tests {
             assert!(serde_json::from_str::<Ours>(body).is_err(), "{body}");
             assert!(serde_json::from_str::<Theirs>(body).is_err(), "{body}");
         }
+        let head =
+            r#""at":"2026-01-05T10:17:19Z","written":"2026-01-05T10:17:19Z","on":"2026-01-05""#;
+        for field in ["maybe_at", "maybe_written", "maybe_on"] {
+            for value in [
+                "5",
+                r#""bad""#,
+                "[]",
+                r#""2026-01-05T10:17:19Z""#,
+                r#""2026-01-05""#,
+            ] {
+                let body = format!("{{{head},\"{field}\":{value}}}");
+                assert_eq!(
+                    serde_json::from_str::<Ours>(&body).is_ok(),
+                    serde_json::from_str::<Theirs>(&body).is_ok(),
+                    "{body}"
+                );
+            }
+        }
+        let yaml_head = "at: 2026-01-05T10:17:19Z\nwritten: 2026-01-05T10:17:19Z\non: 2026-01-05\n";
+        for field in [
+            "at",
+            "written",
+            "on",
+            "maybe_at",
+            "maybe_written",
+            "maybe_on",
+        ] {
+            for value in ["5", "[1]", "bad", "{a: 1}", "~"] {
+                let body = format!("{yaml_head}{field}: {value}\n");
+                assert_eq!(
+                    serde_yaml_ng::from_str::<Ours>(&body).is_ok(),
+                    serde_yaml_ng::from_str::<Theirs>(&body).is_ok(),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_option_adapter_without_default_refuses_a_missing_key() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Bare {
+            #[serde(with = "stamp_option")]
+            at: Option<Stamp>,
+        }
+        assert!(serde_json::from_str::<Bare>("{}").is_err());
+        assert!(serde_json::from_str::<Bare>(r#"{"at":null}"#).is_ok());
     }
 
     #[test]
@@ -387,6 +435,13 @@ mod tests {
         let yaml = "at: 2026-01-05T10:17:19Z\nwritten: 2026-01-05T10:17:19Z\non: 2026-01-05\n";
         let loaded: Ours = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(loaded.maybe_at.is_none());
+        assert!(loaded.maybe_written.is_none() && loaded.maybe_on.is_none());
+        for null in ["~", "null"] {
+            let body = format!("{yaml}maybe_at: {null}\nmaybe_written: {null}\nmaybe_on: {null}\n");
+            let loaded: Ours = serde_yaml_ng::from_str(&body).unwrap();
+            assert!(loaded.maybe_at.is_none() && loaded.maybe_written.is_none());
+            assert!(loaded.maybe_on.is_none());
+        }
         // A written null and a missing key mean the same.
         let nulls = r#"{"at":"2026-01-05T10:17:19Z","written":"2026-01-05T10:17:19Z","on":"2026-01-05","maybe_at":null,"maybe_written":null,"maybe_on":null}"#;
         let loaded: Ours = serde_json::from_str(nulls).unwrap();
