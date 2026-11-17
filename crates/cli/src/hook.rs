@@ -695,6 +695,7 @@ pub fn run_stop(harness: Option<&str>) {
     {
         return;
     }
+    crate::hook_log::append("stop", &raw);
     let Ok(input) = serde_json::from_str::<StopInput>(&raw) else {
         return;
     };

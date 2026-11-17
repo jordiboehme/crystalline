@@ -24,6 +24,7 @@ mod harness_command;
 mod harness_files;
 mod hook;
 mod hook_dialect;
+mod hook_log;
 mod install;
 mod install_desktop;
 mod install_profile;
@@ -6592,6 +6593,7 @@ fn session_start_payload() -> Option<SessionStartPayload> {
     }
     let mut raw = String::new();
     stdin.take(1024 * 1024).read_to_string(&mut raw).ok()?;
+    hook_log::append("system", &raw);
     serde_json::from_str(&raw).ok()
 }
 

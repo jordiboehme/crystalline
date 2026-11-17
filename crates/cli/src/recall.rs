@@ -351,6 +351,7 @@ pub async fn run_prompt(harness: Option<String>) {
     {
         return;
     }
+    crate::hook_log::append("prompt", &raw);
     let Ok(input) = serde_json::from_str::<PromptInput>(&raw) else {
         return;
     };
