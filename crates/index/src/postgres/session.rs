@@ -247,10 +247,14 @@ pub(crate) const HOLDS_KEY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM pg_locks \
      AND classid::bigint = (($1 >> 32) & 4294967295) \
      AND objid::bigint = ($1 & 4294967295) AND objsubid = 1)";
 
+/// How the refusal of a fenced connect begins, so the error mapping can
+/// tell it from a real protocol error (see `IndexError`'s `From<sqlx::Error>`).
+pub(crate) const FENCED_PREFIX: &str = "this instance no longer owns the database";
+
 /// The error a connect gets when the fence check finds the lock gone.
 fn fenced_message(fence: &OwnerFence) -> String {
     format!(
-        "this instance no longer owns the database: the lock session {} does not hold the owner lock",
+        "{FENCED_PREFIX}: the lock session {} does not hold the owner lock",
         fence.lock_pid
     )
 }
@@ -609,7 +613,12 @@ mod tests {
             let Err(err) = connect_one(&t, role, &o).await else {
                 panic!("a {} connect went ahead", role.as_str());
             };
-            assert!(err.to_string().contains("no longer owns"), "{err}");
+            assert!(
+                err.to_string().starts_with(
+                    "database error: this instance no longer owns the database: the lock session"
+                ),
+                "{err}"
+            );
         }
         for role in [PgRole::Lock, PgRole::Standby, PgRole::Cli, PgRole::Probe] {
             connect_one(&t, role, &o)

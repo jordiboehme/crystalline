@@ -83,7 +83,7 @@
 mod migrations;
 mod owner;
 mod search;
-mod session;
+pub(crate) mod session;
 
 pub use migrations::{
     INDEX_SET, INSTANCE_TABLES, LockedRun, Migration, MigrationSet, WIPE_TABLES, apply_locked_set,
