@@ -1,0 +1,617 @@
+//! How this binary was installed, read from the marker its package shipped
+//! beside it, with path heuristics as the fallback.
+//!
+//! A file marker is always resolved from the canonical exe, so it speaks
+//! only for the binary it was shipped with: a copy of the same binary in
+//! another folder does not inherit it. An environment marker can only make
+//! the updater refuse, never choose an action.
+
+use std::path::{Component, Path, PathBuf};
+
+use crate::version::Precedence;
+
+/// The marker file name every package writes.
+pub const MARKER_FILE: &str = "install-source";
+
+/// The install-channel variable. The Claude Desktop extension's manifest
+/// sets it to `mcpb`; it is read here only to refuse.
+pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
+
+/// How a Crystalline binary was installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMethod {
+    Homebrew,
+    Deb,
+    Msi,
+    Zip,
+    Tarball,
+    Docker,
+    Mcpb,
+    Unknown,
+}
+
+impl InstallMethod {
+    /// The name shown to a person.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Homebrew => "homebrew",
+            Self::Deb => "deb",
+            Self::Msi => "MSI",
+            Self::Zip => "zip",
+            Self::Tarball => "tar.gz",
+            Self::Docker => "docker",
+            Self::Mcpb => "Claude Desktop extension",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether `update now` has an action for this method.
+    pub fn acts(&self) -> bool {
+        matches!(
+            self,
+            Self::Homebrew | Self::Deb | Self::Msi | Self::Zip | Self::Tarball
+        )
+    }
+
+    /// The method a marker's content names.
+    fn from_marker(value: &str) -> Option<Self> {
+        match value {
+            "homebrew" => Some(Self::Homebrew),
+            "deb" => Some(Self::Deb),
+            "docker" => Some(Self::Docker),
+            "msi" => Some(Self::Msi),
+            _ => None,
+        }
+    }
+}
+
+/// Why `update now` will not act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Not an official release build (see [`official_build`]).
+    NotOfficial,
+    /// Running inside an app package.
+    AppPackage,
+    /// The marker names one method and the path reads as another.
+    MarkerPathMismatch {
+        marker: InstallMethod,
+        path: InstallMethod,
+    },
+    /// A container: pull the new image.
+    Docker,
+    /// The Claude Desktop extension: Claude Desktop updates it.
+    Mcpb,
+    /// No method could be told.
+    Unknown,
+}
+
+/// The detected method and, when `update now` must not act, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Detection {
+    pub method: InstallMethod,
+    pub refusal: Option<Refusal>,
+}
+
+impl Detection {
+    fn acting(method: InstallMethod) -> Self {
+        Self {
+            method,
+            refusal: None,
+        }
+    }
+
+    fn refused(method: InstallMethod, refusal: Refusal) -> Self {
+        Self {
+            method,
+            refusal: Some(refusal),
+        }
+    }
+}
+
+/// Detect how the binary at `canonical_exe` was installed.
+///
+/// `env` looks up an environment variable; `dpkg_list` is the text of
+/// `/var/lib/dpkg/info/crystalline.list`, read by the caller as a file (never
+/// through `dpkg`), or `None` when it is missing.
+///
+/// Markers, relative to the exe's folder: `../libexec/install-source`
+/// (`homebrew`), `../lib/crystalline/install-source` (`deb` or `docker`) and
+/// `install-source` beside the exe (`msi`). Fallbacks: an exe under
+/// `Cellar/crystalline/` is Homebrew, an exe listed as a whole line of
+/// `dpkg_list` is a .deb, on Windows an exe in `%ProgramFiles%\Crystalline\bin`
+/// is the MSI; anything else is the zip on Windows and the tarball elsewhere.
+///
+/// Fails closed: a marker that does not parse or does not belong where it
+/// lies, two markers that disagree, or a marker that a positive fallback
+/// contradicts are refused. `CRYSTALLINE_CHANNEL=mcpb` refuses whatever the
+/// markers say, and no other value of it changes anything. This function
+/// produces only the `MarkerPathMismatch`, `Docker`, `Mcpb` and `Unknown`
+/// refusals; the caller adds `NotOfficial` and `AppPackage`.
+pub fn detect(
+    canonical_exe: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    dpkg_list: Option<&str>,
+) -> Detection {
+    if env(CHANNEL_ENV).is_some_and(|v| v.trim() == "mcpb") {
+        return Detection::refused(InstallMethod::Mcpb, Refusal::Mcpb);
+    }
+    let marker = match marker_method(canonical_exe) {
+        Ok(marker) => marker,
+        Err(()) => return Detection::refused(InstallMethod::Unknown, Refusal::Unknown),
+    };
+    let path = path_method(canonical_exe, env, dpkg_list);
+    match (marker, path) {
+        (Some(marker), Some(path)) if marker != path => Detection::refused(
+            InstallMethod::Unknown,
+            Refusal::MarkerPathMismatch { marker, path },
+        ),
+        (Some(InstallMethod::Docker), _) => {
+            Detection::refused(InstallMethod::Docker, Refusal::Docker)
+        }
+        (Some(method), _) | (None, Some(method)) => Detection::acting(method),
+        (None, None) => Detection::acting(default_method()),
+    }
+}
+
+/// The method the markers beside `exe` name, `Ok(None)` when there is none,
+/// `Err` when one is unreadable, unknown, in the wrong place, or two
+/// disagree.
+fn marker_method(exe: &Path) -> Result<Option<InstallMethod>, ()> {
+    let Some(dir) = exe.parent() else {
+        return Ok(None);
+    };
+    let up = dir.parent();
+    let slots: [(Option<PathBuf>, &[InstallMethod]); 3] = [
+        (
+            up.map(|up| up.join("libexec").join(MARKER_FILE)),
+            &[InstallMethod::Homebrew],
+        ),
+        (
+            up.map(|up| up.join("lib").join("crystalline").join(MARKER_FILE)),
+            &[InstallMethod::Deb, InstallMethod::Docker],
+        ),
+        (Some(dir.join(MARKER_FILE)), &[InstallMethod::Msi]),
+    ];
+    let mut found = None;
+    for (path, allowed) in slots {
+        let Some(path) = path else { continue };
+        let value = match std::fs::read_to_string(&path) {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(()),
+        };
+        let method = InstallMethod::from_marker(value.trim()).ok_or(())?;
+        if !allowed.contains(&method) || found.is_some_and(|f| f != method) {
+            return Err(());
+        }
+        found = Some(method);
+    }
+    Ok(found)
+}
+
+/// The method the exe's path alone points to, `None` when no heuristic
+/// matches (the zip or tarball default is not a positive reading).
+fn path_method(
+    exe: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    dpkg_list: Option<&str>,
+) -> Option<InstallMethod> {
+    if under_cellar(exe) {
+        return Some(InstallMethod::Homebrew);
+    }
+    if dpkg_list.is_some_and(|list| lists(list, exe)) {
+        return Some(InstallMethod::Deb);
+    }
+    if in_default_msi_folder(exe, env) {
+        return Some(InstallMethod::Msi);
+    }
+    None
+}
+
+/// A `Cellar` segment directly followed by `crystalline`.
+fn under_cellar(exe: &Path) -> bool {
+    let segs: Vec<_> = exe
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    segs.windows(2)
+        .any(|w| w[0] == "Cellar" && w[1] == "crystalline")
+}
+
+/// Whether `exe` is a whole line of the package's file list.
+fn lists(list: &str, exe: &Path) -> bool {
+    let Some(exe) = exe.to_str() else {
+        return false;
+    };
+    list.lines().any(|line| line.trim_end_matches('\r') == exe)
+}
+
+#[cfg(windows)]
+fn in_default_msi_folder(exe: &Path, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    /// Without the verbatim prefix `canonicalize` adds and case folded, as
+    /// Windows compares paths.
+    fn plain(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        text.trim_end_matches('\\').to_lowercase()
+    }
+    let (Some(dir), Some(program_files)) = (exe.parent(), env("ProgramFiles")) else {
+        return false;
+    };
+    let default = Path::new(&program_files).join("Crystalline").join("bin");
+    plain(dir) == plain(&default)
+}
+
+#[cfg(not(windows))]
+fn in_default_msi_folder(_exe: &Path, _env: &dyn Fn(&str) -> Option<String>) -> bool {
+    false
+}
+
+/// The method of a binary nothing else speaks for.
+fn default_method() -> InstallMethod {
+    if cfg!(windows) {
+        InstallMethod::Zip
+    } else {
+        InstallMethod::Tarball
+    }
+}
+
+/// Whether this binary was built by the release workflow, which sets
+/// `CRYSTALLINE_OFFICIAL_BUILD=1` at compile time. Any other build refuses
+/// `update now`, so a self-built binary is never replaced.
+pub fn official_build() -> bool {
+    option_env!("CRYSTALLINE_OFFICIAL_BUILD") == Some("1")
+}
+
+/// The release platform name of the compiled target, as the release assets
+/// spell it; `None` for a target Crystalline does not publish.
+pub fn release_platform() -> Option<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("macos-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("macos-intel")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("linux-amd64")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("linux-arm64")
+    } else if cfg!(all(windows, target_arch = "x86_64")) {
+        Some("windows-amd64")
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        Some("windows-arm64")
+    } else {
+        None
+    }
+}
+
+/// The release asset `update now` downloads for `method` on this target.
+/// `None` for a method that downloads nothing (Homebrew, Docker, mcpb,
+/// unknown), a target without that asset, or a version that is not stable.
+pub fn asset_name(method: InstallMethod, version: &Precedence) -> Option<String> {
+    asset_name_for(method, version, release_platform()?)
+}
+
+fn asset_name_for(method: InstallMethod, version: &Precedence, platform: &str) -> Option<String> {
+    if !version.is_stable() {
+        return None;
+    }
+    let ver = version.render();
+    let windows = platform.starts_with("windows-");
+    match method {
+        InstallMethod::Tarball if !windows => Some(format!("crystalline-v{ver}-{platform}.tar.gz")),
+        InstallMethod::Zip if windows => Some(format!("crystalline-v{ver}-{platform}.zip")),
+        InstallMethod::Msi if windows => Some(format!("crystalline-v{ver}-{platform}.msi")),
+        InstallMethod::Deb => {
+            let arch = platform.strip_prefix("linux-")?;
+            Some(format!("crystalline_{ver}_{arch}.deb"))
+        }
+        _ => None,
+    }
+}
+
+/// The member of the downloaded archive that holds the binary:
+/// `crystalline-v<ver>-<platform>/crystalline` in the tar.gz,
+/// `crystalline.exe` at the root of the zip. Only reached after
+/// [`asset_name`] answered, so the target is a published one.
+pub fn archive_member(version: &Precedence) -> String {
+    archive_member_for(version, release_platform().unwrap_or("unknown"))
+}
+
+fn archive_member_for(version: &Precedence, platform: &str) -> String {
+    if platform.starts_with("windows-") {
+        "crystalline.exe".to_string()
+    } else {
+        format!("crystalline-v{}-{platform}/crystalline", version.render())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const EXE: &str = if cfg!(windows) {
+        "crystalline.exe"
+    } else {
+        "crystalline"
+    };
+
+    /// A canonical exe at `rel` under `root`, with its folders.
+    fn exe_at(root: &Path, rel: &str) -> PathBuf {
+        let path = root.join(rel).join(EXE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::canonicalize(&path).unwrap()
+    }
+
+    fn marker(exe: &Path, rel: &str, value: &str) {
+        let path = exe.parent().unwrap().join(rel).join(MARKER_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, value).unwrap();
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn with_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn acting(method: InstallMethod) -> Detection {
+        Detection {
+            method,
+            refusal: None,
+        }
+    }
+
+    fn v(text: &str) -> Precedence {
+        Precedence::parse(text).unwrap()
+    }
+
+    #[test]
+    fn labels_and_actions() {
+        use InstallMethod::*;
+        let all = [Homebrew, Deb, Msi, Zip, Tarball, Docker, Mcpb, Unknown];
+        let labels: Vec<_> = all.iter().map(|m| m.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "homebrew",
+                "deb",
+                "MSI",
+                "zip",
+                "tar.gz",
+                "docker",
+                "Claude Desktop extension",
+                "unknown"
+            ]
+        );
+        let acts: Vec<_> = all.iter().map(|m| m.acts()).collect();
+        assert_eq!(acts, [true, true, true, true, true, false, false, false]);
+    }
+
+    #[test]
+    fn homebrew_marker_in_libexec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "prefix/bin");
+        marker(&exe, "../libexec", "homebrew\n");
+        assert_eq!(detect(&exe, &no_env, None), acting(InstallMethod::Homebrew));
+    }
+
+    #[test]
+    fn cellar_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "Cellar/crystalline/0.33.0/bin");
+        assert_eq!(detect(&exe, &no_env, None), acting(InstallMethod::Homebrew));
+    }
+
+    #[test]
+    fn deb_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "usr/bin");
+        marker(&exe, "../lib/crystalline", "deb\n");
+        assert_eq!(detect(&exe, &no_env, None), acting(InstallMethod::Deb));
+    }
+
+    #[test]
+    fn dpkg_list_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "usr/bin");
+        let list = format!("/.\n/usr\n{}\n/usr/share/doc/crystalline\n", exe.display());
+        assert_eq!(
+            detect(&exe, &no_env, Some(&list)),
+            acting(InstallMethod::Deb)
+        );
+        // A path that only starts with the exe's is not a listing of it.
+        let near = format!("{}-old\n", exe.display());
+        assert_eq!(detect(&exe, &no_env, Some(&near)), acting(default_method()));
+    }
+
+    #[test]
+    fn msi_marker_beside_exe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "Custom/bin");
+        marker(&exe, ".", "msi\r\n");
+        assert_eq!(detect(&exe, &no_env, None), acting(InstallMethod::Msi));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msi_default_folder_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let exe = exe_at(&root, "Crystalline/bin");
+        let env = with_env(&[("ProgramFiles", root.to_str().unwrap())]);
+        assert_eq!(detect(&exe, &env, None), acting(InstallMethod::Msi));
+        // Another folder under Program Files is not the default one.
+        let other = exe_at(&root, "Other/bin");
+        assert_eq!(detect(&other, &env, None), acting(InstallMethod::Zip));
+    }
+
+    #[test]
+    fn docker_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "usr/local/bin");
+        marker(&exe, "../lib/crystalline", "docker\n");
+        assert_eq!(
+            detect(&exe, &no_env, None),
+            Detection {
+                method: InstallMethod::Docker,
+                refusal: Some(Refusal::Docker)
+            }
+        );
+    }
+
+    #[test]
+    fn mcpb_env_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "usr/bin");
+        marker(&exe, "../lib/crystalline", "deb\n");
+        let env = with_env(&[(CHANNEL_ENV, "mcpb")]);
+        assert_eq!(
+            detect(&exe, &env, None),
+            Detection {
+                method: InstallMethod::Mcpb,
+                refusal: Some(Refusal::Mcpb)
+            }
+        );
+    }
+
+    #[test]
+    fn a_deb_marker_does_not_speak_for_a_tarball_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packaged = exe_at(tmp.path(), "usr/bin");
+        marker(&packaged, "../lib/crystalline", "deb\n");
+        let copy = exe_at(tmp.path(), "home/me/.local/bin");
+        assert_eq!(detect(&packaged, &no_env, None), acting(InstallMethod::Deb));
+        assert_eq!(detect(&copy, &no_env, None), acting(default_method()));
+        #[cfg(not(windows))]
+        assert_eq!(default_method(), InstallMethod::Tarball);
+    }
+
+    #[test]
+    fn env_markers_never_choose_an_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = exe_at(tmp.path(), "opt/bin");
+        let cellar = exe_at(tmp.path(), "Cellar/crystalline/0.33.0/bin");
+        for value in ["deb", "homebrew", "msi", "docker", "zip", "MCPB "] {
+            let env = with_env(&[(CHANNEL_ENV, value)]);
+            for exe in [&plain, &cellar] {
+                assert_eq!(
+                    detect(exe, &env, None),
+                    detect(exe, &no_env, None),
+                    "{CHANNEL_ENV}={value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marker_and_path_disagree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "usr/bin");
+        marker(&exe, "../libexec", "homebrew\n");
+        let list = format!("{}\n", exe.display());
+        assert_eq!(
+            detect(&exe, &no_env, Some(&list)),
+            Detection {
+                method: InstallMethod::Unknown,
+                refusal: Some(Refusal::MarkerPathMismatch {
+                    marker: InstallMethod::Homebrew,
+                    path: InstallMethod::Deb,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_marker_that_does_not_fit_is_refused() {
+        let unknown = Detection {
+            method: InstallMethod::Unknown,
+            refusal: Some(Refusal::Unknown),
+        };
+        for (rel, value) in [
+            ("../libexec", "deb"),
+            ("../lib/crystalline", "homebrew"),
+            (".", "deb"),
+            ("../lib/crystalline", "tarball"),
+            ("../libexec", ""),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = exe_at(tmp.path(), "prefix/bin");
+            marker(&exe, rel, value);
+            assert_eq!(detect(&exe, &no_env, None), unknown, "{rel} = {value:?}");
+        }
+        // Two markers that name different methods.
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "prefix/bin");
+        marker(&exe, "../libexec", "homebrew");
+        marker(&exe, "../lib/crystalline", "deb");
+        assert_eq!(detect(&exe, &no_env, None), unknown);
+    }
+
+    #[test]
+    fn asset_names_match_the_release_listing() {
+        use InstallMethod::*;
+        let ver = v("0.33.0");
+        let name = |m, p| asset_name_for(m, &ver, p);
+        assert_eq!(
+            name(Tarball, "linux-amd64").as_deref(),
+            Some("crystalline-v0.33.0-linux-amd64.tar.gz")
+        );
+        assert_eq!(
+            name(Tarball, "macos-intel").as_deref(),
+            Some("crystalline-v0.33.0-macos-intel.tar.gz")
+        );
+        assert_eq!(
+            name(Msi, "windows-arm64").as_deref(),
+            Some("crystalline-v0.33.0-windows-arm64.msi")
+        );
+        assert_eq!(
+            name(Zip, "windows-amd64").as_deref(),
+            Some("crystalline-v0.33.0-windows-amd64.zip")
+        );
+        assert_eq!(
+            name(Deb, "linux-arm64").as_deref(),
+            Some("crystalline_0.33.0_arm64.deb")
+        );
+        assert_eq!(
+            name(Deb, "linux-amd64").as_deref(),
+            Some("crystalline_0.33.0_amd64.deb")
+        );
+        // Methods that download nothing, and assets that are not published.
+        for (m, p) in [
+            (Homebrew, "macos-arm64"),
+            (Docker, "linux-amd64"),
+            (Mcpb, "macos-arm64"),
+            (Unknown, "linux-amd64"),
+            (Deb, "macos-arm64"),
+            (Msi, "linux-amd64"),
+            (Zip, "macos-arm64"),
+            (Tarball, "windows-amd64"),
+        ] {
+            assert_eq!(name(m, p), None, "{m:?} on {p}");
+        }
+        assert_eq!(
+            archive_member_for(&ver, "linux-amd64"),
+            "crystalline-v0.33.0-linux-amd64/crystalline"
+        );
+        assert_eq!(archive_member_for(&ver, "windows-arm64"), "crystalline.exe");
+    }
+
+    #[test]
+    fn a_pre_release_has_no_asset() {
+        let pre = v("0.34.0-dev.12");
+        assert_eq!(
+            asset_name_for(InstallMethod::Tarball, &pre, "linux-amd64"),
+            None
+        );
+    }
+}

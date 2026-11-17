@@ -62,6 +62,7 @@ pub mod thread_env;
 pub mod threads;
 pub mod time;
 pub mod tree;
+pub mod update;
 pub mod verify;
 pub mod version;
 pub mod yaml;
