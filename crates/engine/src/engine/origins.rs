@@ -552,10 +552,7 @@ impl Engine {
                 NameOrigin::Derived => entry.name_origin.or(Some(NameOrigin::Derived)),
             };
             file.domains.insert(domain_name.clone(), entry);
-            self.persist_config(&file)?;
-            let effective = self.overlay.apply(&file);
-            *file_guard = file;
-            *self.config.write().unwrap() = effective;
+            self.commit_config(&mut file_guard, file)?;
             Ok(())
         })();
         if let Err(e) = registered {

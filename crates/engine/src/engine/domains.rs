@@ -993,7 +993,13 @@ impl Engine {
         // (1) The effective config, composed the same way a fresh load would
         // see it. With a config path this is a fresh file read plus the overlay;
         // a read error falls back to the in-memory effective config.
-        let global = match &self.config_path {
+        // In document mode the configuration lives in memory, so there is
+        // nothing to re-read.
+        let path = self
+            .config_path
+            .as_ref()
+            .filter(|_| !self.config_in_document());
+        let global = match path {
             Some(path) => match overlay::load_file(path) {
                 Ok(file) => self.overlay.apply(&file),
                 Err(_) => self.config(),

@@ -2763,6 +2763,18 @@ pub fn apply_checked(
     Ok(())
 }
 
+/// Refuse a `database.*` key while the configuration is kept in the
+/// database: that block decides where the configuration lives, so it comes
+/// from config.yaml and the environment only and never from the document.
+pub fn refuse_database_key_in_document(key: &str) -> Result<(), SettingsError> {
+    if key == "database" || key.starts_with("database.") {
+        return Err(SettingsError(format!(
+            "{key} cannot be changed while the configuration is kept in the database; the database settings come from config.yaml and the environment only, so edit config.yaml or the variable and restart"
+        )));
+    }
+    Ok(())
+}
+
 /// [`unset`] with the same pair rule as [`apply_checked`]: taking
 /// `service.public_url` away from under a configured redirect uri that
 /// carries a prefix is refused, and changes nothing.
@@ -2778,7 +2790,15 @@ pub fn unset_checked(
     Ok(())
 }
 
-fn check_pair(next: &GlobalConfig, overlay: &EnvOverlay, key: &str) -> Result<(), SettingsError> {
+/// The pair rule of [`apply_checked`] on its own, over `next` as the
+/// persisted layers give it (the engine passes a document merged with its
+/// base): a write of `service.public_url` or `auth.oidc.redirect_uri` that
+/// leaves the effective pair inconsistent is refused.
+pub fn check_pair(
+    next: &GlobalConfig,
+    overlay: &EnvOverlay,
+    key: &str,
+) -> Result<(), SettingsError> {
     if (key == PUBLIC_URL_KEY || key == OIDC_REDIRECT_URI_KEY)
         && let Some(problem) = oidc_pair_problem(&overlay.apply(next))
     {
