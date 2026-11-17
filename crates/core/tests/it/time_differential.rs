@@ -12,7 +12,16 @@ use crystalline_core::time::{
     Day, OffsetStamp, Stamp, parse_date, parse_kept_stamp, parse_lenient_date,
     parse_lenient_offset, parse_lenient_stamp, parse_rfc2822, parse_rfc3339,
 };
+use serde::Deserialize;
 use std::time::Instant;
+
+/// The adapters of `crystalline_core::time::serde` on one field each.
+#[derive(Deserialize)]
+struct StampField(#[serde(with = "crystalline_core::time::serde::stamp")] Stamp);
+#[derive(Deserialize)]
+struct OffsetField(#[serde(with = "crystalline_core::time::serde::offset_stamp")] OffsetStamp);
+#[derive(Deserialize)]
+struct DayField(#[serde(with = "crystalline_core::time::serde::day")] Day);
 
 /// The differences a ruling allows, as (name, reason). Empty while chrono
 /// is behind `crystalline_core::time`.
@@ -188,7 +197,46 @@ fn our_day(value: Option<Day>) -> Outcome {
 /// Every (helper, chrono function) pair on `input`, as (name, ours, chrono).
 fn compare(input: &str) -> Vec<(&'static str, Outcome, Outcome)> {
     let json = serde_json::to_string(input).expect("a string serializes");
+    let yaml = serde_yaml_ng::to_string(input).expect("a string serializes");
     vec![
+        (
+            "serde::stamp (JSON) / Deserialize",
+            our_stamp(serde_json::from_str::<StampField>(&json).ok().map(|f| f.0)),
+            utc_outcome(serde_json::from_str::<DateTime<Utc>>(&json).ok()),
+        ),
+        (
+            "serde::stamp (YAML) / Deserialize",
+            our_stamp(
+                serde_yaml_ng::from_str::<StampField>(&yaml)
+                    .ok()
+                    .map(|f| f.0),
+            ),
+            utc_outcome(serde_yaml_ng::from_str::<DateTime<Utc>>(&yaml).ok()),
+        ),
+        (
+            "serde::offset_stamp (JSON) / Deserialize",
+            our_offset(serde_json::from_str::<OffsetField>(&json).ok().map(|f| f.0)),
+            offset_outcome(serde_json::from_str::<DateTime<FixedOffset>>(&json).ok()),
+        ),
+        (
+            "serde::offset_stamp (YAML) / Deserialize",
+            our_offset(
+                serde_yaml_ng::from_str::<OffsetField>(&yaml)
+                    .ok()
+                    .map(|f| f.0),
+            ),
+            offset_outcome(serde_yaml_ng::from_str::<DateTime<FixedOffset>>(&yaml).ok()),
+        ),
+        (
+            "serde::day (JSON) / Deserialize",
+            our_day(serde_json::from_str::<DayField>(&json).ok().map(|f| f.0)),
+            chrono_day(serde_json::from_str::<NaiveDate>(&json).ok()),
+        ),
+        (
+            "serde::day (YAML) / Deserialize",
+            our_day(serde_yaml_ng::from_str::<DayField>(&yaml).ok().map(|f| f.0)),
+            chrono_day(serde_yaml_ng::from_str::<NaiveDate>(&yaml).ok()),
+        ),
         (
             "parse_rfc3339 / parse_from_rfc3339",
             our_offset(parse_rfc3339(input)),

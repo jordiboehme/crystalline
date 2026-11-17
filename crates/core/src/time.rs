@@ -23,6 +23,7 @@
 mod calendar;
 mod emit;
 mod parse;
+pub mod serde;
 
 use chrono::{
     DateTime, Days, FixedOffset, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, TimeZone, Utc,
