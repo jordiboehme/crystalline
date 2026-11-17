@@ -9,8 +9,9 @@ name: Release
 #   (refs/heads/main, push), so they say nothing about the release. The
 #   publish job creates the tag at the tested commit (github.sha) first.
 # - workflow_dispatch: a dry run, from any branch or tag. It builds and
-#   packages everything and publishes nothing (checksums, sign, publish,
-#   images, fluid-image and homebrew skip).
+#   packages everything and publishes nothing (publish, images, fluid-image
+#   and homebrew skip). On main it also makes, signs and checks SHA256SUMS
+#   under a dry-run tag, which proves the signing key before a release.
 #
 # A pushed `v*` tag starts nothing. The `release` environment, which holds
 # the signing keys, admits only main, so a run started by a tag push could
@@ -74,6 +75,13 @@ jobs:
   #   which means another release of this version won the race; then the run
   #   skips everything after this job and stays green.
   # - called: true for a call from CI, which has to create the tag.
+  # - sign: true when the run signs SHA256SUMS: every call that builds, and a
+  #   dry run on main, which proves the secret key and the compiled-in public
+  #   keys together before a release depends on them. A dry run from any
+  #   other ref cannot enter the `release` environment and signs nothing.
+  # - sign_tag: what the trusted comment names: the tag, or for a dry run
+  #   v<version>-dry-run, which no updater ever asks for, so a dry run's
+  #   signature can never pass for a release.
   #
   # workflow_dispatch has no tag and nothing to check, so the notes check is a
   # no-op then and the job stays green, which is what keeps a manual dry run
@@ -86,6 +94,8 @@ jobs:
       publish: ${{ steps.resolve.outputs.publish }}
       build: ${{ steps.resolve.outputs.build }}
       called: ${{ steps.resolve.outputs.called }}
+      sign: ${{ steps.resolve.outputs.sign }}
+      sign_tag: ${{ steps.resolve.outputs.sign_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,7 +103,8 @@ jobs:
 
       # inputs.tag is set only by a call. A dry run has no inputs, and it
       # stays a dry run even when it was started on a tag: the ref never
-      # makes a release.
+      # makes a release. In a call GITHUB_REF is the caller's (main), so the
+      # ref decides only whether a dry run signs.
       - name: Resolve the release tag
         id: resolve
         shell: bash
@@ -123,9 +134,15 @@ jobs:
               build=false
             fi
             # publish follows build: a run that lost the race publishes nothing.
-            { echo "tag=$tag"; echo "publish=$build"; echo "build=$build"; echo "called=true"; } >> "$GITHUB_OUTPUT"
+            { echo "tag=$tag"; echo "publish=$build"; echo "build=$build"; echo "called=true"; echo "sign=$build"; echo "sign_tag=$tag"; } >> "$GITHUB_OUTPUT"
           else
             { echo "tag="; echo "publish=false"; echo "build=true"; echo "called=false"; } >> "$GITHUB_OUTPUT"
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+              { echo "sign=true"; echo "sign_tag=v${version}-dry-run"; } >> "$GITHUB_OUTPUT"
+            else
+              { echo "sign=false"; echo "sign_tag="; } >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: The release notes file exists, is not empty and opens with an H1
@@ -524,13 +541,13 @@ jobs:
   # are the publish job's own download and collect steps, so publish makes
   # the same file again from the same artifacts and compares it with the
   # signed one byte for byte. Only the sums travel to the signing job, never
-  # an archive.
+  # an archive. A dry run on main runs this, sign and check-signature too
+  # (see the notes job's `sign` output); nothing of it is published.
   checksums:
     name: release checksums
     needs: [notes, build, mcpb, sbom]
     runs-on: ubuntu-latest
-    # Same guard as publish: a dry run signs nothing.
-    if: needs.notes.outputs.publish == 'true'
+    if: needs.notes.outputs.sign == 'true'
     permissions:
       contents: read
     steps:
@@ -594,21 +611,22 @@ jobs:
   # is piped in, and stdin is /dev/null so a key that asked for one fails
   # instead of waiting. The trusted comment names the tag (`tag:v0.34.0`),
   # which is what crystalline_core::update::verify_signature checks, so an
-  # old signature cannot pass for a new release. The key file lives under
-  # RUNNER_TEMP, readable only by the runner user, and is shredded whatever
-  # the signing step did.
+  # old signature cannot pass for a new release. A dry run on main signs
+  # with `tag:v<version>-dry-run`. The key file lives under RUNNER_TEMP,
+  # readable only by the runner user, and is shredded whatever the signing
+  # step did.
   sign:
     name: sign the checksums
     needs: [notes, checksums]
     runs-on: ubuntu-latest
-    if: needs.notes.outputs.publish == 'true'
+    if: needs.notes.outputs.sign == 'true'
     # The protected `release` environment (main only) holds the key.
     environment:
       name: release
       deployment: false
     permissions: {}
     env:
-      TAG: ${{ needs.notes.outputs.tag }}
+      TAG: ${{ needs.notes.outputs.sign_tag }}
     steps:
       - name: Install minisign
         run: |
@@ -623,7 +641,7 @@ jobs:
           name: release-sums
           path: signing
 
-      - name: Sign SHA256SUMS
+      - name: ${{ needs.notes.outputs.publish == 'true' && 'Sign SHA256SUMS' || 'Sign SHA256SUMS (dry run, nothing is published)' }}
         working-directory: signing
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -655,9 +673,55 @@ jobs:
           path: signing/SHA256SUMS.minisig
           if-no-files-found: error
 
+  # Proves the key pair before anything is published: the release's own
+  # Linux binary checks the signature with the public keys compiled into it
+  # and the tag in the trusted comment, the check every updater runs. A
+  # missing, bad or wrongly tagged signature, or a secret key that does not
+  # match the compiled-in keys, fails here, before the tag and the release
+  # exist. In a dry run on main it checks the dry run's signature the same
+  # way, so the secret and the keys are proven before a release needs them.
+  check-signature:
+    name: check the signature
+    needs: [notes, build, sign]
+    runs-on: ubuntu-latest
+    if: needs.notes.outputs.sign == 'true'
+    permissions: {}
+    env:
+      TAG: ${{ needs.notes.outputs.sign_tag }}
+    steps:
+      - name: Download the Linux amd64 binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crystalline-linux-amd64
+          path: downloads/linux-amd64
+
+      - name: Download the checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-sums
+          path: signed
+
+      - name: Download the signature
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-signature
+          path: signed
+
+      - name: ${{ needs.notes.outputs.publish == 'true' && 'Check the release signature' || 'Check the release signature (dry run, nothing is published)' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/verify"
+          mkdir -p "$dir"
+          tar xzf downloads/linux-amd64/*.tar.gz -C "$dir"
+          bin=$(find "$dir" -type f -name crystalline | head -n1)
+          [ -n "$bin" ] || { echo "::error::no crystalline binary in the linux-amd64 archive"; exit 1; }
+          chmod +x "$bin"
+          "$bin" update verify-sums --tag "$TAG" signed/SHA256SUMS signed/SHA256SUMS.minisig
+
   publish:
     name: publish release
-    needs: [notes, build, mcpb, sbom, checksums, sign]
+    needs: [notes, build, mcpb, sbom, checksums, sign, check-signature]
     runs-on: ubuntu-latest
     # Only a call from CI produces a real GitHub Release; workflow_dispatch
     # stops after the build matrix above so it can be used as a dry run.
@@ -724,9 +788,10 @@ jobs:
           sha256sum -- * > SHA256SUMS
           ls -la
 
-      # The sums the sign job signed must be the sums made here: the same
-      # artifacts give the same file, and any difference stops the release.
-      # The signature then ships next to them as SHA256SUMS.minisig.
+      # The sums the sign job signed, and check-signature checked, must be
+      # the sums made here: the same artifacts give the same file, and any
+      # difference stops the release. The signature then ships next to them
+      # as SHA256SUMS.minisig.
       - name: Download the signed checksums
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -748,24 +813,6 @@ jobs:
             exit 1
           fi
           cp signed/SHA256SUMS.minisig release/SHA256SUMS.minisig
-
-      # Proves the key pair before anything is published: the release's own
-      # Linux binary checks the signature with the public keys compiled into
-      # it and the tag in the trusted comment, the check every updater runs.
-      # A missing, bad or wrongly tagged signature, or a secret key that does
-      # not match the compiled-in keys, fails here, before the tag and the
-      # release exist.
-      - name: Check the release signature
-        shell: bash
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/verify"
-          mkdir -p "$dir"
-          tar xzf "release/crystalline-${TAG}-linux-amd64.tar.gz" -C "$dir"
-          bin=$(find "$dir" -type f -name crystalline | head -n1)
-          [ -n "$bin" ] || { echo "::error::no crystalline binary in crystalline-${TAG}-linux-amd64.tar.gz"; exit 1; }
-          chmod +x "$bin"
-          "$bin" update verify-sums --tag "$TAG" release/SHA256SUMS release/SHA256SUMS.minisig
 
       # actions/attest fails only when a whole subject list matches nothing,
       # so a single renamed asset would drop out of its attestation without a
