@@ -34,15 +34,26 @@ const USER_AGENT: &str = concat!("crystalline/", env!("CARGO_PKG_VERSION"));
 /// How long a connection may take to open.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The whole lookup, the API request or the fallback, may take this long.
+/// Each request of the lookup, the API request and the fallback, may take
+/// this long, so a lookup that falls back takes at most twice this.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A download has no total limit, since a release archive is tens of MB on
-/// a slow link, but a read that waits this long ends it.
+/// A download may take this long in all: generous, since a release archive
+/// is tens of MB on a slow link.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// A download whose next read waits this long ends.
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest asset a download takes; a release archive is far smaller.
 const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+
+/// The largest API answer the lookup reads; a release object with all its
+/// assets is tens of KB.
+const MAX_API_BODY_BYTES: usize = 1024 * 1024;
+
+/// The most redirects a download follows (GitHub uses one).
+const MAX_REDIRECTS: usize = 3;
 
 /// Why a lookup or a download failed. The messages are fixed text: no tag,
 /// body, ETag or location from the answer is ever part of one.
@@ -66,6 +77,9 @@ pub enum UpdateError {
     BadAsset,
     /// The download is larger than any release asset.
     TooLarge,
+    /// A download was redirected to a place that is not GitHub, or over
+    /// plain http, or too often.
+    Redirect,
 }
 
 impl std::fmt::Display for UpdateError {
@@ -81,6 +95,9 @@ impl std::fmt::Display for UpdateError {
             UpdateError::BadAnswer => f.write_str("GitHub's answer could not be read"),
             UpdateError::BadAsset => f.write_str("not the name of a release asset"),
             UpdateError::TooLarge => f.write_str("the download is larger than any release asset"),
+            UpdateError::Redirect => {
+                f.write_str("the download was redirected to a place that is not GitHub")
+            }
         }
     }
 }
@@ -96,8 +113,14 @@ impl std::error::Error for UpdateError {
 }
 
 impl From<reqwest::Error> for UpdateError {
+    /// The URL is dropped, so no message carries a network-chosen one, such
+    /// as the signed asset URL a download was redirected to (S23).
     fn from(err: reqwest::Error) -> Self {
-        UpdateError::Http(err)
+        if err.is_redirect() {
+            UpdateError::Redirect
+        } else {
+            UpdateError::Http(err.without_url())
+        }
     }
 }
 
@@ -143,7 +166,9 @@ pub async fn latest_release(etag: Option<&str>) -> Result<Lookup, UpdateError> {
         .get(ETAG)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let body = response.bytes().await?;
+    let Some(body) = read_capped(response, MAX_API_BODY_BYTES).await? else {
+        return Err(UpdateError::BadAnswer);
+    };
     match LatestRelease::from_api(&body) {
         Ok(Some(release)) => Ok(Lookup::Fresh(release, etag)),
         Ok(None) => Err(UpdateError::NotARelease),
@@ -154,6 +179,10 @@ pub async fn latest_release(etag: Option<&str>) -> Result<Lookup, UpdateError> {
 /// Download `<web>/<repo>/releases/download/<tag>/<asset>` into the file
 /// `dest` and hand back its bytes, so the checks run on exactly what was
 /// written. `tag` must be exactly `v<x.y.z>` and `asset` a plain file name.
+/// Redirects are followed only over https to `github.com` and
+/// `*.githubusercontent.com`, at most three times. The file is
+/// written beside `dest` and renamed into place, so `dest` is never left
+/// half written; it is still unverified until the caller's checks pass.
 pub async fn download(tag: &str, asset: &str, dest: &Path) -> Result<Vec<u8>, UpdateError> {
     if release_version(tag).is_none() {
         return Err(UpdateError::NotARelease);
@@ -169,8 +198,11 @@ pub async fn download(tag: &str, asset: &str, dest: &Path) -> Result<Vec<u8>, Up
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .timeout(DOWNLOAD_TIMEOUT)
+        .https_only(cfg!(not(debug_assertions)))
+        .redirect(download_redirects())
         .build()?;
-    let mut response = client
+    let response = client
         .get(format!(
             "{}/{REPO}/releases/download/{tag}/{asset}",
             download_base()
@@ -181,21 +213,86 @@ pub async fn download(tag: &str, asset: &str, dest: &Path) -> Result<Vec<u8>, Up
     if !status.is_success() {
         return Err(UpdateError::Status(status.as_u16()));
     }
+    let Some(bytes) = read_capped(response, MAX_DOWNLOAD_BYTES).await? else {
+        return Err(UpdateError::TooLarge);
+    };
+    let part = dest.with_file_name(format!(".{asset}.part-{}", std::process::id()));
+    let written = match tokio::fs::write(&part, &bytes).await {
+        Ok(()) => tokio::fs::rename(&part, dest).await,
+        Err(err) => Err(err),
+    };
+    if let Err(err) = written {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(err.into());
+    }
+    Ok(bytes)
+}
+
+/// The body of `response`, or `None` when it is longer than `cap` bytes.
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, UpdateError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64)
+        .is_some_and(|length| length > cap as u64)
     {
-        return Err(UpdateError::TooLarge);
+        return Ok(None);
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > MAX_DOWNLOAD_BYTES {
-            return Err(UpdateError::TooLarge);
+        if bytes.len() + chunk.len() > cap {
+            return Ok(None);
         }
         bytes.extend_from_slice(&chunk);
     }
-    tokio::fs::write(dest, &bytes).await?;
-    Ok(bytes)
+    Ok(Some(bytes))
+}
+
+/// The redirect policy of a download: [`may_follow`] decides each hop, and
+/// a chain longer than [`MAX_REDIRECTS`] is refused.
+fn download_redirects() -> reqwest::redirect::Policy {
+    let test_origin = test_origin();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if may_follow(attempt.url(), test_origin.as_deref()) {
+            attempt.follow()
+        } else {
+            attempt.error("a redirect away from GitHub")
+        }
+    })
+}
+
+/// Whether a download follows a redirect to `url`: only over https to
+/// `github.com` or a host under `githubusercontent.com`, or, in a debug build
+/// pointed at a fake, to that fake's own origin.
+fn may_follow(url: &reqwest::Url, test_origin: Option<&str>) -> bool {
+    if test_origin.is_some_and(|origin| url.origin().ascii_serialization() == origin) {
+        return true;
+    }
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host == "github.com" || host.ends_with(".githubusercontent.com"))
+}
+
+/// The origin of the download seam when it points away from GitHub, so a
+/// test's fake may redirect within itself.
+#[cfg(debug_assertions)]
+fn test_origin() -> Option<String> {
+    let base = download_base();
+    (base != WEB_BASE)
+        .then(|| reqwest::Url::parse(&base).ok())
+        .flatten()
+        .map(|url| url.origin().ascii_serialization())
+}
+
+/// A release build has no seam, so no origin but GitHub's.
+#[cfg(not(debug_assertions))]
+fn test_origin() -> Option<String> {
+    None
 }
 
 /// The client of the lookup: short timeouts, and redirects not followed, so
@@ -205,6 +302,7 @@ fn lookup_client() -> Result<reqwest::Client, UpdateError> {
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(LOOKUP_TIMEOUT)
+        .https_only(cfg!(not(debug_assertions)))
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
@@ -271,4 +369,44 @@ fn download_base() -> String {
 #[cfg(not(debug_assertions))]
 fn download_base() -> String {
     WEB_BASE.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn follows(url: &str, test_origin: Option<&str>) -> bool {
+        may_follow(&reqwest::Url::parse(url).unwrap(), test_origin)
+    }
+
+    #[test]
+    fn a_download_follows_only_https_to_github() {
+        for url in [
+            "https://github.com/jordiboehme/crystalline/releases/download/v0.34.0/a",
+            "https://release-assets.githubusercontent.com/x?sig=1",
+            "https://objects.githubusercontent.com/x",
+        ] {
+            assert!(follows(url, None), "{url}");
+        }
+        for url in [
+            "http://github.com/x",
+            "http://release-assets.githubusercontent.com/x",
+            "https://example.com/x",
+            "https://githubusercontent.com.example.com/x",
+            "https://evilgithubusercontent.com/x",
+            "https://github.com.example.com/x",
+            "https://github.com:8443/x",
+            "ftp://github.com/x",
+        ] {
+            assert!(!follows(url, None), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_fake_may_redirect_only_within_itself() {
+        let fake = Some("http://127.0.0.1:4000");
+        assert!(follows("http://127.0.0.1:4000/elsewhere", fake));
+        assert!(!follows("http://127.0.0.1:4001/elsewhere", fake));
+        assert!(!follows("http://localhost:4000/elsewhere", fake));
+    }
 }

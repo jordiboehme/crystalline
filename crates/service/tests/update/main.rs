@@ -67,12 +67,23 @@ impl Fake {
 /// them holds this lock until it is done.
 static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Point both seams at `fake`.
+/// Point both seams at `fake`, and drop any proxy the developer's shell
+/// sets, which would otherwise carry the requests to 127.0.0.1 away.
 fn use_fake(fake: &Fake) {
     // SAFETY: every test that touches the environment holds `ENV`.
     unsafe {
         std::env::set_var("CRYSTALLINE_TEST_UPDATE_API", &fake.base);
         std::env::set_var("CRYSTALLINE_TEST_UPDATE_DOWNLOAD", &fake.base);
+        for proxy in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            std::env::remove_var(proxy);
+        }
     }
 }
 
@@ -355,6 +366,109 @@ async fn download_writes_the_asset_and_returns_its_bytes() {
         );
     }
     assert_eq!(fake.seen().len(), before, "no request was made");
+}
+
+#[tokio::test]
+async fn an_api_answer_over_the_cap_is_an_error() {
+    let _env = ENV.lock().await;
+    // 2 MiB of padding around a valid release, once with a length and once
+    // streamed without one.
+    for streamed in [false, true] {
+        let fake = Fake::start(move |_, _, _| {
+            let padding = " ".repeat(2 * 1024 * 1024);
+            let body = format!("{padding}{}", release_body("v0.34.0", false));
+            if streamed {
+                let chunks: Vec<Result<String, std::io::Error>> = body
+                    .as_bytes()
+                    .chunks(64 * 1024)
+                    .map(|chunk| Ok(String::from_utf8(chunk.to_vec()).unwrap()))
+                    .collect();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(futures::stream::iter(chunks)))
+                    .unwrap()
+            } else {
+                respond(StatusCode::OK, &[], &body)
+            }
+        })
+        .await;
+        use_fake(&fake);
+        let err = latest_release(None).await.expect_err("over the cap");
+        assert!(
+            matches!(err, UpdateError::BadAnswer),
+            "streamed={streamed}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_download_follows_redirects_only_within_github() {
+    let _env = ENV.lock().await;
+    const ASSET: &str = "/jordiboehme/crystalline/releases/download/v0.34.0/";
+    let fake = Fake::start(|_, path, headers| {
+        let host = headers.get("host").unwrap().to_str().unwrap().to_string();
+        let port = host.rsplit(':').next().unwrap().to_string();
+        let to = |location: String| respond(StatusCode::FOUND, &[("location", &location)], "");
+        match path.strip_prefix(ASSET) {
+            // Within the fake itself, which a debug build allows.
+            Some("same") => to(format!("http://{host}/stored/same")),
+            // Another host over plain http, and a host that is not GitHub.
+            Some("other-host") => to(format!("http://localhost:{port}/stored/x")),
+            Some("not-github") => to("https://example.com/stored/x".to_string()),
+            Some("github-over-http") => to("http://github.com/stored/x".to_string()),
+            Some("loop") => to(format!("http://{host}{ASSET}loop")),
+            _ if path.starts_with("/stored/") => respond(StatusCode::OK, &[], "stored"),
+            _ => respond(StatusCode::NOT_FOUND, &[], ""),
+        }
+    })
+    .await;
+    use_fake(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = download("v0.34.0", "same", &dir.path().join("same"))
+        .await
+        .expect("a redirect within the fake is followed");
+    assert_eq!(bytes, b"stored");
+
+    for asset in ["other-host", "not-github", "github-over-http", "loop"] {
+        let err = download("v0.34.0", asset, &dir.path().join(asset))
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, UpdateError::Redirect), "{asset}: {err:?}");
+        assert_eq!(
+            err.to_string(),
+            "the download was redirected to a place that is not GitHub"
+        );
+    }
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, ["same"], "a refused download leaves no file");
+    assert!(
+        !fake
+            .seen()
+            .iter()
+            .any(|seen| seen.path.starts_with("/stored/x")),
+        "no refused target was fetched"
+    );
+}
+
+#[tokio::test]
+async fn an_http_error_carries_no_url() {
+    let _env = ENV.lock().await;
+    // Nothing listens on the seam: the connection is refused.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let fake = Fake {
+        base: base.clone(),
+        seen: Arc::default(),
+    };
+    use_fake(&fake);
+    let err = latest_release(None).await.expect_err("no server");
+    assert!(matches!(err, UpdateError::Http(_)), "{err:?}");
+    assert!(!err.to_string().contains("127.0.0.1"), "{err}");
+    assert!(!err.to_string().contains("http://"), "{err}");
 }
 
 /// S11: each `CRYSTALLINE_TEST_UPDATE_*` variable is read only inside an
