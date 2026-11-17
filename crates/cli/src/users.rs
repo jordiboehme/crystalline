@@ -525,7 +525,7 @@ async fn sweep_personal_credential(name: &str, route: &SecretRoute) -> Result<()
     match route {
         SecretRoute::Local => {}
         SecretRoute::Daemon => return crate::cmd::delete_through_daemon(&identity).await,
-        SecretRoute::Owned(_) => {
+        SecretRoute::Owned(_) | SecretRoute::Beside => {
             return crate::cmd::delete_sealed_credential(&identity, host.as_deref());
         }
     }

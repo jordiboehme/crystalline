@@ -206,9 +206,10 @@ pub async fn connect_server(
         Err(other) => return Err(other.into()),
     }
     let loaded = crate::cmd::load(None)?;
-    // On Postgres the sign-in is sealed in the database: where it is
-    // written is decided before anyone signs in.
-    refuse_through_daemon(crystalline_service::route_secret_command(&loaded.effective).await?)?;
+    // On Postgres the sign-in is sealed in the database by this process:
+    // where it is written is decided before anyone signs in, and a daemon
+    // of this machine reads it again at the reload below.
+    crystalline_service::route_sealing_command(&loaded.effective).await?;
     let local = local_domains_of(&loaded.effective);
     let dir = remote_dir()?;
     let connected = if token {
@@ -431,19 +432,6 @@ pub fn open_in_browser(url: &str) {
     }
 }
 
-/// Refuses a server sign-in change while a daemon of this machine owns the
-/// Postgres database: the sign-in is sealed there by that daemon, and this
-/// command has no way to hand it over. The other routes go on, the vault
-/// installed when this command claimed the database.
-fn refuse_through_daemon(route: crystalline_service::SecretRoute) -> anyhow::Result<()> {
-    if matches!(route, crystalline_service::SecretRoute::Daemon) {
-        anyhow::bail!(
-            "on Postgres the server sign-ins are sealed in the database by the active instance, which runs on this machine, and this command cannot hand one to it; stop that instance, then run the command again with CRYSTALLINE_SECRET_KEY set"
-        );
-    }
-    Ok(())
-}
-
 /// `crystalline disconnect <name|url>`.
 pub async fn disconnect_server(target: String, json: bool) -> anyhow::Result<()> {
     // The overlay load first, like every other command: a refused environment
@@ -451,7 +439,7 @@ pub async fn disconnect_server(target: String, json: bool) -> anyhow::Result<()>
     // below.
     let loaded = crate::cmd::load(None)?;
     // On Postgres the sign-in is sealed in the database, as for `connect`.
-    refuse_through_daemon(crystalline_service::route_secret_command(&loaded.effective).await?)?;
+    crystalline_service::route_sealing_command(&loaded.effective).await?;
     let dir = remote_dir()?;
     let Some(gone) = crystalline_remote::disconnect(&dir, &target).await? else {
         let taken = crystalline_remote::load_sources(&dir)

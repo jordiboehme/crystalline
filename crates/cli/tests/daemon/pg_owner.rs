@@ -3316,3 +3316,311 @@ fn credential_paths_unchanged_on_turso() {
     assert!(file.load().unwrap().is_none(), "the token went at remove");
     assert!(env.state_dir().join("web-auth.db").exists());
 }
+
+// --- sealing beside the daemon (in the pod) ---------------------------------
+
+/// A stand-in GitHub on a loopback port: the OAuth device flow (its token
+/// `ghu_new` for the login `ada-gh`), `GET /user`, and the App routes `set`
+/// asks. It records the `Authorization` header of every `GET /user`.
+#[cfg(all(unix, feature = "postgres"))]
+struct PodGithub {
+    url: String,
+    users_asked_with: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(all(unix, feature = "postgres"))]
+impl PodGithub {
+    fn start() -> PodGithub {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buffer = [0u8; 16384];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let path = path.split('?').next().unwrap_or("/").to_string();
+                let (status, body) = match path.as_str() {
+                    "/login/device/code" => (
+                        "200 OK",
+                        r#"{"device_code":"dc-1","user_code":"WDJB-MJHT","verification_uri":"https://github.com/login/device","expires_in":900,"interval":0}"#.to_string(),
+                    ),
+                    "/login/oauth/access_token" => (
+                        "200 OK",
+                        r#"{"access_token":"ghu_new","token_type":"bearer","scope":"repo"}"#
+                            .to_string(),
+                    ),
+                    "/user" => {
+                        let auth = request
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                            .map(|l| l.split_once(':').unwrap().1.trim().to_string())
+                            .unwrap_or_default();
+                        seen.lock().unwrap().push(auth);
+                        ("200 OK", r#"{"login":"ada-gh","id":4242}"#.to_string())
+                    }
+                    "/app" => (
+                        "200 OK",
+                        r#"{"id":7,"slug":"crystalline-pod","owner":{"login":"acme"},"permissions":{"contents":"write","pull_requests":"write","metadata":"read","members":"read"}}"#.to_string(),
+                    ),
+                    p if p.starts_with("/app/installations") => (
+                        "200 OK",
+                        r#"[{"id":1,"account":{"login":"acme"}}]"#.to_string(),
+                    ),
+                    _ => ("404 Not Found", r#"{"message":"Not Found"}"#.to_string()),
+                };
+                let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        PodGithub {
+            url,
+            users_asked_with: asked,
+            _thread: thread,
+        }
+    }
+
+    /// The host part of the URL, which names the rows sealed for it.
+    fn host(&self) -> &str {
+        self.url.trim_start_matches("http://")
+    }
+}
+
+/// The variables the daemon and the CLI share in the pod: collaboration
+/// on, GitHub at `github`, and an admin for the settings API.
+#[cfg(all(unix, feature = "postgres"))]
+fn pod_vars(github: &PodGithub) -> Vec<(&'static str, String)> {
+    vec![
+        ("CRYSTALLINE_GITHUB_ENABLED", "true".to_string()),
+        ("CRYSTALLINE_GITHUB_API_URL", github.url.clone()),
+        ("CRYSTALLINE_ADMIN_NAME", "root".to_string()),
+        ("CRYSTALLINE_ADMIN_PASSWORD", "root-password".to_string()),
+    ]
+}
+
+/// `GET /api/v1/settings/github` of `serve`, signed in as the admin of
+/// [`pod_vars`].
+#[cfg(all(unix, feature = "postgres"))]
+fn github_settings(serve: &Serve) -> Value {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let login = client
+        .post(format!("http://{}/api/v1/auth/login", serve.addr))
+        .json(&serde_json::json!({ "name": "root", "password": "root-password" }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .unwrap();
+    assert_eq!(login.status().as_u16(), 200);
+    let cookies: Vec<String> = login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok()?.split(';').next().map(str::to_string))
+        .collect();
+    client
+        .get(format!("http://{}/api/v1/settings/github", serve.addr))
+        .header("cookie", cookies.join("; "))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap()
+}
+
+/// Every file under the state folder whose name says it holds a GitHub
+/// token or App.
+#[cfg(all(unix, feature = "postgres"))]
+fn local_github_files(env: &Env) -> Vec<PathBuf> {
+    fn walk(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("github"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&env.state_dir(), &mut found);
+    found
+}
+
+/// In the pod: `connect github` while the daemon owns the database seals
+/// the token itself, beside the daemon, with the key of the shared
+/// environment. The row lands in the vault, the daemon drops the token it
+/// cached and reads the new one, and nothing is written to the state
+/// folder.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn connect_github_in_the_pod_seals_beside_the_daemon() {
+    let Some(pg) = PgScratch::new("vtpod") else {
+        return;
+    };
+    let github = PodGithub::start();
+    let env = Env::new("vtpod").on_postgres(&pg);
+    let vars = pod_vars(&github);
+    let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let row = format!("github:{}", github.host());
+    let mut serve = Serve::start_bound(&env, "0.0.0.0", Some("info"), &vars);
+    serve.wait_ready();
+    seal_token_row(&pg, &row, "old-user");
+    assert_eq!(github_settings(&serve)["user"], "old-user", "cached");
+
+    let (ok, out, err) = run_vars(&env, &["connect", "github"], &vars);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("Connected to GitHub as ada-gh (vault token store)"),
+        "{out}"
+    );
+    assert!(has_secret_row(&pg, &row));
+    assert_eq!(secret_rows(&pg), "1");
+    let settings = github_settings(&serve);
+    assert_eq!(settings["token_store"], "vault", "{settings}");
+    assert_eq!(settings["user"], "ada-gh", "the daemon reads the new token");
+    assert!(
+        github
+            .users_asked_with
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|auth| auth.ends_with("ghu_new")),
+        "GitHub was asked with the new token only"
+    );
+    assert_eq!(local_github_files(&env), Vec::<PathBuf>::new());
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+
+    // A disconnect in the pod deletes the row the same way.
+    let (ok, out, err) = run_vars(&env, &["connect", "github", "--disconnect"], &vars);
+    assert!(ok, "{out}{err}");
+    assert!(!has_secret_row(&pg, &row));
+    assert!(serve.alive());
+}
+
+/// In the pod: `github app set` and `github app remove` seal and delete the
+/// App beside the daemon, which picks the change up at once; nothing is
+/// written to the state folder.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn github_app_set_in_the_pod_seals_beside_the_daemon() {
+    let Some(pg) = PgScratch::new("vtpodapp") else {
+        return;
+    };
+    let github = PodGithub::start();
+    let env = Env::new("vtpodapp").on_postgres(&pg);
+    let vars = pod_vars(&github);
+    let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut serve = Serve::start_bound(&env, "0.0.0.0", Some("info"), &vars);
+    serve.wait_ready();
+    let key = env.state_dir().join("../app.pem");
+    std::fs::write(
+        &key,
+        include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem"),
+    )
+    .unwrap();
+    let (ok, out, err) = run_vars(
+        &env,
+        &[
+            "github",
+            "app",
+            "set",
+            "--app-id",
+            "7",
+            "--client-id",
+            "Iv23.pod",
+            "--private-key-file",
+            key.to_str().unwrap(),
+        ],
+        &vars,
+    );
+    assert!(ok, "{out}{err}");
+    assert_eq!(secret_rows(&pg), "1", "the App is sealed");
+    let status = crate::service::ctl_over_the_socket(
+        &env,
+        &serde_json::json!({ "cmd": "github_app_status" }),
+    );
+    assert_eq!(status["data"]["configured"], true, "{status}");
+    assert_eq!(local_github_files(&env), Vec::<PathBuf>::new());
+
+    let (ok, out, err) = run_vars(&env, &["github", "app", "remove"], &vars);
+    assert!(ok, "{out}{err}");
+    assert_eq!(secret_rows(&pg), "0", "the App row is deleted");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+    assert!(serve.alive());
+}
+
+/// In the pod with a key other than the one the rows were sealed with, a
+/// sealing command is refused before it writes, naming both key ids, and
+/// the rows are kept. Without a key it is refused naming the variable.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn sealing_beside_the_daemon_refuses_another_key() {
+    let Some(pg) = PgScratch::new("vtpodkey") else {
+        return;
+    };
+    let github = PodGithub::start();
+    let env = Env::new("vtpodkey").on_postgres(&pg);
+    let vars = pod_vars(&github);
+    let mut with: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut serve = Serve::start_bound(&env, "0.0.0.0", None, &with);
+    serve.wait_ready();
+    seal_token_row(&pg, "github", "old-user");
+    let other = "ff".repeat(32);
+    with.push(("CRYSTALLINE_SECRET_KEY", &other));
+    let (ok, out, err) = run_vars(&env, &["connect", "github"], &with);
+    assert!(!ok, "{out}{err}");
+    let mine = migrated_key_id_of(&pg);
+    assert!(err.contains(&mine), "{err}");
+    assert!(
+        github.users_asked_with.lock().unwrap().is_empty(),
+        "no sign-in"
+    );
+    with.pop();
+    with.extend(NO_SECRET_KEY);
+    let (ok, out, err) = run_vars(&env, &["connect", "github"], &with);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SECRET_KEY"), "{err}");
+    assert_eq!(secret_rows(&pg), "1", "the rows are kept");
+    assert!(has_secret_row(&pg, "github"));
+    assert!(serve.alive());
+}
+
+/// The key id the rows of `pg` were sealed with.
+#[cfg(feature = "postgres")]
+fn migrated_key_id_of(pg: &PgScratch) -> String {
+    pg.text(&format!(
+        "SELECT min(key_id) FROM {}.instance_secret",
+        pg.schema
+    ))
+}
+
+/// Without a daemon and without the key, a daemonless origin command that
+/// will reach GitHub is refused before its first write, naming the key.
+#[cfg(feature = "postgres")]
+#[test]
+fn origin_update_without_key_refused_before_any_write() {
+    let Some(pg) = PgScratch::new("vtorigin") else {
+        return;
+    };
+    let env = Env::new("vtorigin").on_postgres(&pg);
+    let (ok, out, err) = run_vars(&env, &["origin", "update"], &NO_SECRET_KEY);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("CRYSTALLINE_SECRET_KEY"), "{err}");
+    assert_eq!(schema_objects(&pg), "0", "nothing was opened");
+}

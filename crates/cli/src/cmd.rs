@@ -4003,20 +4003,16 @@ pub async fn connect_github(
         );
     }
     let cfg = &loaded.effective;
-    // On Postgres the token is sealed in the database: where it is written
-    // is decided before any sign-in, and the test seam's folder gives way
-    // to the vault.
-    let route = crystalline_service::route_secret_command(cfg).await?;
+    // On Postgres the token is sealed in the database, by this process
+    // itself (under its own claim, or beside the daemon of this machine,
+    // with the key): where it is written is decided before any sign-in, and
+    // the test seam's folder gives way to the vault.
+    let route = crystalline_service::route_sealing_command(cfg).await?;
+    let beside_daemon = matches!(route, crystalline_service::SecretRoute::Beside);
     let token_store_dir = match route {
         crystalline_service::SecretRoute::Local => token_store_dir,
         _ => None,
     };
-    if matches!(route, crystalline_service::SecretRoute::Daemon) {
-        if !disconnect {
-            bail!("{CONNECT_THROUGH_THE_INSTANCE}");
-        }
-        return disconnect_through_daemon(identity, cfg, json).await;
-    }
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
@@ -4138,9 +4134,11 @@ pub async fn connect_github(
     // actionable. `github.enabled` is left to the instance connect to hint at:
     // turning collaboration on is an instance-wide decision, not something a
     // person connecting their own identity is making.
-    if !instance {
-        // A running daemon remembers for a short time that this token was
-        // missing; this ends that.
+    // A running daemon remembers for a short time that this token was
+    // missing; this ends that. Beside a daemon that owns the Postgres
+    // database it also drops this machine's cached token, so the daemon
+    // reads the one just sealed.
+    if !instance || beside_daemon {
         let _ = notify_daemon_forgot(identity).await;
     }
     let share_identity = share_identity_here(&loaded, cfg);
@@ -4269,46 +4267,6 @@ fn save_credential(
         )
         .map_err(|e| anyhow!("{e}")),
     }
-}
-
-/// The refusal of `connect github` while a daemon of this machine owns the
-/// Postgres database: the token would be sealed by that daemon, and this
-/// command has no way to hand it over yet.
-const CONNECT_THROUGH_THE_INSTANCE: &str = "on Postgres the GitHub tokens are sealed in the database by the active instance, which runs on this machine, and this command cannot hand a token to it; connect GitHub in the instance's web UI (the GitHub settings for this machine's identity, your own page for a personal one)";
-
-/// `connect github --disconnect` while a daemon of this machine owns the
-/// Postgres database: the GitHub link of the account goes first (the
-/// accounts are written beside the daemon), then the daemon deletes the
-/// sealed token, revoking a person's at GitHub when its App can. Nothing in
-/// the state folder is touched.
-async fn disconnect_through_daemon(
-    identity: &crystalline_remote::TokenIdentity,
-    cfg: &crystalline_core::config::GlobalConfig,
-    json: bool,
-) -> Result<()> {
-    let mut unlinked = false;
-    if let crystalline_remote::TokenIdentity::Personal(name) = identity
-        && name != crystalline_service::engine::OWNER_IDENTITY_NAME
-        && let Some(accounts) = crystalline_service::existing_accounts_for_cli(cfg).await?
-        && accounts.github_link_of(name).await?.is_some()
-    {
-        accounts.unlink_github(name).await?;
-        unlinked = true;
-    }
-    delete_through_daemon(identity).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "disconnected": identity_label(identity),
-                "unlinked": unlinked,
-                "daemon": DaemonNotice::Notified.as_str(),
-            })
-        );
-    } else {
-        println!("Disconnected {}.", identity_phrase(identity));
-    }
-    Ok(())
 }
 
 /// What `connect github --personal` prints when GitHub answers the App's
@@ -6221,6 +6179,7 @@ pub async fn github_app_set(
         slug: None,
         host: String::new(),
     };
+    let token_store_dir = sealing_route(&loaded, token_store_dir).await?;
     let status = app_home(&loaded, token_store_dir)?
         .save(&loaded.overlay, credentials)
         .await?;
@@ -6243,6 +6202,7 @@ pub async fn github_app_remove(
     if loaded.effective.read_only() {
         bail!("{}", crystalline_service::engine::EngineError::ReadOnly);
     }
+    let token_store_dir = sealing_route(&loaded, token_store_dir).await?;
     let removal = app_home(&loaded, token_store_dir)?.remove(&loaded.overlay)?;
     let told = notify_daemon_app_changed().await;
     if json {
@@ -6267,6 +6227,23 @@ pub async fn github_app_remove(
         report_daemon_notice(&told);
     }
     Ok(())
+}
+
+/// Where `github app set` and `remove` keep the App: on Postgres it is
+/// sealed in the database by this process ([`route_sealing_command`]),
+/// refused before anything is written without the key or while another
+/// instance owns the database, and the test seam's folder gives way to the
+/// vault. On Turso `token_store_dir` as given.
+///
+/// [`route_sealing_command`]: crystalline_service::route_sealing_command
+async fn sealing_route<'a>(
+    loaded: &crystalline_service::LoadedConfig,
+    token_store_dir: Option<&'a Path>,
+) -> Result<Option<&'a Path>> {
+    match crystalline_service::route_sealing_command(&loaded.effective).await? {
+        crystalline_service::SecretRoute::Local => Ok(token_store_dir),
+        _ => Ok(None),
+    }
 }
 
 /// The line a person reads when a running daemon could not be told.
