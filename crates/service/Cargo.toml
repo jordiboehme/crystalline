@@ -127,6 +127,8 @@ crystalline-service = { path = ".", default-features = false, features = [
     "testing",
 ] }
 tempfile = { workspace = true }
+# The fixed-key constructor (`SealKey::from_bytes`) for the vault tests.
+crystalline-remote = { workspace = true, features = ["testing"] }
 # `rest_events` removes its scratch home in an `atexit` hook, on every
 # platform (the `[dependencies]` entry is unix only).
 libc = { workspace = true }

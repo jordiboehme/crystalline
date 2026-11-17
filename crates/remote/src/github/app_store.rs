@@ -11,6 +11,9 @@
 //!
 //! The private key and the secrets are stored as one JSON document, so a
 //! single keychain item (or one file) holds a whole App.
+//!
+//! On Postgres the App lives in a sealed row of the database instead
+//! ([`AppStore::Vault`], see [`crate::vault`]), and no marker is written.
 
 use std::path::{Path, PathBuf};
 
@@ -43,15 +46,34 @@ const LOCK_FILE_NAME: &str = "github-app.lock";
 
 /// An exclusive lock on a state directory's App store, held until dropped.
 /// It holds no secret; the file it locks stays empty.
+///
+/// While this process keeps its secrets in the vault ([`crate::vault::engaged`])
+/// the lock is one inside the process and nothing is written to `dir`: only
+/// the active instance writes the vault, so no other process takes part.
 #[derive(Debug)]
 pub struct AppStoreLock {
-    file: std::fs::File,
+    held: Held,
 }
+
+#[derive(Debug)]
+enum Held {
+    File(std::fs::File),
+    Process(#[allow(dead_code, reason = "held for its drop")] std::sync::MutexGuard<'static, ()>),
+}
+
+/// The App store lock of a process whose secrets are in the vault.
+static VAULT_APP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl AppStoreLock {
     /// Waits for and takes the lock of the App store in `dir`. Blocking: the
     /// holders are short (a store read and a write).
     pub fn acquire(dir: &Path) -> Result<AppStoreLock, RemoteError> {
+        if crate::vault::engaged() {
+            let guard = VAULT_APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            return Ok(AppStoreLock {
+                held: Held::Process(guard),
+            });
+        }
         AppStoreLock::acquire_in(dir, process_fence())
     }
 
@@ -67,13 +89,17 @@ impl AppStoreLock {
             .write(true)
             .open(path)?;
         fs4::FileExt::lock(&file)?;
-        Ok(AppStoreLock { file })
+        Ok(AppStoreLock {
+            held: Held::File(file),
+        })
     }
 }
 
 impl Drop for AppStoreLock {
     fn drop(&mut self) {
-        let _ = fs4::FileExt::unlock(&self.file);
+        if let Held::File(file) = &self.held {
+            let _ = fs4::FileExt::unlock(file);
+        }
     }
 }
 
@@ -147,6 +173,13 @@ pub enum AppStore {
     /// caller that holds the overlay's credentials uses them directly, so
     /// this backend only exists to say "environment" and to refuse changes.
     Env,
+    /// A row of the sealed vault, used whenever one is installed (see
+    /// [`crate::vault`]). No marker goes with it: the vault either answers or
+    /// the call fails.
+    Vault {
+        /// The row name: `github-app` or `github-app:<host>`.
+        name: String,
+    },
 }
 
 /// What [`AppStore::lookup`] found, and where.
@@ -189,6 +222,21 @@ impl AppStore {
     /// that caches "no App" must not cache it then: an App saved in a
     /// keychain that was locked or slow at that moment would read as none.
     pub fn lookup(host: Option<&str>, fallback_dir: &Path) -> Result<AppLookup, RemoteError> {
+        // The vault comes first, before the test seam: when one is
+        // installed the keychain and the file are never touched, and when one
+        // is required but missing the call fails rather than fall back.
+        if crate::vault::active()?.is_some() {
+            let store = AppStore::Vault {
+                name: account_for(host),
+            };
+            let credentials = store.load()?;
+            return Ok(AppLookup {
+                store,
+                credentials,
+                keychain_failed: None,
+                marker: None,
+            });
+        }
         // The test seam: never construct the real keychain backend, see
         // `token::refuse_real_keychain`. The file is then the only store
         // there is, so nothing failed.
@@ -269,6 +317,7 @@ impl AppStore {
         credentials: &AppCredentials,
         fence: Option<&WriteFence>,
     ) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => {
                 keyring_write(account, to_json(credentials)?, KEYRING_TIMEOUT)
@@ -276,6 +325,9 @@ impl AppStore {
             AppStore::File { path } => {
                 fenced(fence, path)?;
                 write_secret_file(path, &to_json(credentials)?)
+            }
+            AppStore::Vault { name } => {
+                crate::vault::save_text(name, &zeroize::Zeroizing::new(to_json(credentials)?))
             }
             AppStore::Env => Err(env_read_only()),
         }
@@ -291,6 +343,7 @@ impl AppStore {
         credentials: &AppCredentials,
         marker_dir: &Path,
     ) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => {
                 save_keyring_marked(account, credentials, marker_dir, |account, json| {
@@ -307,6 +360,7 @@ impl AppStore {
     /// the file copy takes the marker too: a remove means no App at all, and
     /// a marker left behind would keep refusing origin operations.
     pub fn delete_marked(&self, marker_dir: &Path) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => {
                 delete_keyring_marked(account, marker_dir, |account| {
@@ -317,7 +371,7 @@ impl AppStore {
                 self.delete()?;
                 delete_marker(marker_dir)
             }
-            AppStore::Env => self.delete(),
+            AppStore::Env | AppStore::Vault { .. } => self.delete(),
         }
     }
 
@@ -325,6 +379,7 @@ impl AppStore {
     /// The `Env` backend holds nothing of its own to load: the overlay owns
     /// those values.
     pub fn load(&self) -> Result<Option<AppCredentials>, RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => match keyring_read(account, KEYRING_TIMEOUT) {
                 KeyringRead::Found(json) => from_json(&json).map(Some),
@@ -337,6 +392,9 @@ impl AppStore {
                 Some(json) => from_json(&json).map(Some),
                 None => Ok(None),
             },
+            AppStore::Vault { name } => crate::vault::load_text(name)?
+                .map(|json| from_json(&json))
+                .transpose(),
             AppStore::Env => Ok(None),
         }
     }
@@ -349,21 +407,34 @@ impl AppStore {
 
     /// [`AppStore::delete`] under `fence`.
     fn delete_in(&self, fence: Option<&WriteFence>) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             AppStore::Keyring { account } => keyring_delete(account, KEYRING_TIMEOUT),
             AppStore::File { path } => {
                 fenced(fence, path)?;
                 delete_file(path)
             }
+            AppStore::Vault { name } => crate::vault::delete_row(name),
             AppStore::Env => Err(env_read_only()),
         }
     }
 
-    /// `"keyring"`, `"file"` or `"environment"`, for doctor and status.
+    /// [`crate::vault::refuse_local`] for the keychain and file arms: in
+    /// vault mode they touch nothing, however the store was built.
+    fn refuse_local(&self) -> Result<(), RemoteError> {
+        match self {
+            AppStore::Keyring { .. } | AppStore::File { .. } => crate::vault::refuse_local(),
+            _ => Ok(()),
+        }
+    }
+
+    /// `"keyring"`, `"file"`, `"vault"` or `"environment"`, for doctor and
+    /// status.
     pub fn kind(&self) -> &'static str {
         match self {
             AppStore::Keyring { .. } => "keyring",
             AppStore::File { .. } => "file",
+            AppStore::Vault { .. } => "vault",
             AppStore::Env => "environment",
         }
     }
@@ -523,6 +594,7 @@ mod tests {
 
     #[test]
     fn app_credentials_round_trip_through_the_file_store_with_mode_0600() {
+        let _vault = crate::vault::testing::guard();
         let dir = tempfile::tempdir().unwrap();
         // Through the resolver, under the no-keychain seam every test runs in.
         let (store, loaded) = AppStore::resolve_and_load(None, dir.path()).unwrap();
@@ -606,6 +678,7 @@ mod tests {
 
     #[test]
     fn app_lookup_under_the_no_keychain_seam_reads_the_file_and_reports_no_failure() {
+        let _vault = crate::vault::testing::guard();
         let dir = tempfile::tempdir().unwrap();
         let found = AppStore::lookup(Some("ghes.example"), dir.path()).unwrap();
         assert_eq!(found.store.kind(), "file");
@@ -764,5 +837,91 @@ mod tests {
         let msg = store.save(&sample()).unwrap_err().to_string();
         assert!(msg.contains("CRYSTALLINE_GITHUB_APP_"), "{msg}");
         assert!(store.delete().is_err());
+    }
+
+    #[test]
+    fn vault_wins_over_keyring_and_file_for_the_app() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let dir = tempfile::tempdir().unwrap();
+        AppStore::file_fallback(dir.path()).save(&sample()).unwrap();
+        let vault = install_memory(key(1));
+
+        let found = AppStore::lookup(Some("ghes.example"), dir.path()).unwrap();
+        assert!(
+            matches!(&found.store, AppStore::Vault { name } if name == "github-app:ghes.example"),
+            "{:?}",
+            found.store
+        );
+        assert_eq!(found.store.kind(), "vault");
+        assert_eq!(found.credentials, None, "the file's App is not read");
+        assert_eq!(found.keychain_failed, None);
+        assert_eq!(found.marker, None);
+
+        found.store.save_marked(&sample(), dir.path()).unwrap();
+        assert!(vault.row("github-app:ghes.example").is_some());
+        assert_eq!(
+            read_marker(dir.path()),
+            None,
+            "a vault save leaves no marker"
+        );
+        let (store, loaded) = AppStore::resolve_and_load(None, dir.path()).unwrap();
+        assert_eq!(store.kind(), "vault");
+        assert_eq!(loaded, None, "github.com is its own row");
+        let again = AppStore::lookup(Some("ghes.example"), dir.path()).unwrap();
+        assert_eq!(again.credentials, Some(sample()));
+
+        again.store.delete_marked(dir.path()).unwrap();
+        assert!(vault.row("github-app:ghes.example").is_none());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(APP_FILE_NAME)]);
+    }
+
+    #[test]
+    fn env_app_still_wins_over_vault() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let dir = tempfile::tempdir().unwrap();
+        let vault = install_memory(key(1));
+        AppStore::lookup(None, dir.path())
+            .unwrap()
+            .store
+            .save(&sample())
+            .unwrap();
+        let calls = vault.calls();
+
+        // The caller hands the environment's App in directly and uses this
+        // store only to say "environment" and to refuse changes; none of
+        // that asks the vault, and nothing the vault holds shows through.
+        let store = AppStore::Env;
+        assert_eq!(store.load().unwrap(), None);
+        assert!(store.save(&sample()).is_err());
+        assert!(store.delete_marked(dir.path()).is_err());
+        assert_eq!(store.kind(), "environment");
+        assert_eq!(vault.calls(), calls);
+        assert!(vault.row("github-app").is_some());
+    }
+
+    #[test]
+    fn app_required_without_installed_vault_errors_not_falls_back() {
+        let _vault = crate::vault::testing::guard();
+        let dir = tempfile::tempdir().unwrap();
+        crate::vault::require();
+        assert!(matches!(
+            AppStore::lookup(None, dir.path()),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        let store = AppStore::Vault {
+            name: "github-app".to_string(),
+        };
+        assert!(matches!(
+            store.save_marked(&sample(), dir.path()),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert!(matches!(store.load(), Err(RemoteError::VaultUnavailable)));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

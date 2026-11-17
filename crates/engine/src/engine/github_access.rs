@@ -477,7 +477,9 @@ impl Outcome {
             | RemoteError::Credential { .. }
             | RemoteError::ServerCredential { .. }
             | RemoteError::AppCredential(_)
-            | RemoteError::EndpointMissing { .. } => Outcome::Failed,
+            | RemoteError::EndpointMissing { .. }
+            | RemoteError::VaultUnavailable
+            | RemoteError::VaultKeyMismatch { .. } => Outcome::Failed,
         }
     }
 }

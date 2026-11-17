@@ -7287,6 +7287,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::ServerCredential { .. }
         | RemoteError::AppCredential(_)
         | RemoteError::EndpointMissing { .. }
+        | RemoteError::VaultUnavailable
+        | RemoteError::VaultKeyMismatch { .. }
         | RemoteError::BaseUnavailable => ErrorData::internal_error(message, None),
         RemoteError::NotEnabled
         | RemoteError::NotConnected

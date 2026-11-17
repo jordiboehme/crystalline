@@ -651,11 +651,33 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // happened in the process that sent this - and nothing is refused on a
         // read-only instance, since dropping a cached secret is not a mutation
         // this instance serves.
+        //
+        // Except with `"delete": true`, from a CLI that cannot delete the
+        // credential itself: on Postgres it is sealed in the database this
+        // daemon owns. The daemon deletes it and drops its cache, and answers
+        // `deleted` (whether there was one); an answer without an error means
+        // no token is left.
         "forget_credential" => {
             let account = match optional_account(req, "account") {
                 Ok(account) => account,
                 Err(message) => return (envelope_err(message), false),
             };
+            if req.get("delete").and_then(Value::as_bool) == Some(true) {
+                return match shared
+                    .engine
+                    .delete_saved_credential(account.as_deref())
+                    .await
+                {
+                    Ok(deleted) => (
+                        envelope_ok(json!({
+                            "forgotten": account.as_deref().unwrap_or("instance"),
+                            "deleted": deleted,
+                        })),
+                        false,
+                    ),
+                    Err(e) => (envelope_err(e.to_string()), false),
+                };
+            }
             match shared
                 .engine
                 .forget_cached_credential_settled(account.as_deref())
@@ -1366,6 +1388,10 @@ pub(crate) fn holder_data(pid: u32) -> Value {
     // The config file it loaded, spelled the way a client spells its
     // own, so `status` and `doctor` can compare the two.
     data["config_path"] = json!(crate::instance::holder_config_path());
+    // The id of the key its sealed vault uses, null without one: a CLI that
+    // seals beside this daemon compares its own (spec section D). An id,
+    // never the key.
+    data["secret_key_id"] = json!(crystalline_remote::vault::installed_key_id());
     data
 }
 

@@ -336,9 +336,13 @@ pub async fn run_mcp(
     // the chain for the Desktop log).
     match build_embedded(db, config_path, read_only, harness_gate).await {
         Ok(stack) => run_embedded_stdio(stack, stdin).await,
-        // Another instance owns the Postgres database: no status server
-        // would help, the client gets the sentence as the initialize error.
-        Err(e) if e.is::<crate::claim::DatabaseOwned>() => {
+        // Another instance owns the Postgres database, or this process has
+        // no secret key for it: no status server would help, the client gets
+        // the sentence as the initialize error.
+        Err(e)
+            if e.is::<crate::claim::DatabaseOwned>()
+                || e.is::<crate::secret_start::KeyRefusal>() =>
+        {
             let refusal = e.to_string();
             refuse_session(&mut stdout, opener_line.as_deref(), refusal).await
         }
@@ -943,9 +947,18 @@ async fn build_embedded(
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
     let mut loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
+    // On Postgres this stack reads and writes secrets as the daemon it
+    // stands in for does, sealed in the database, so the key is required
+    // before anything is claimed: without it the session is refused with the
+    // daemon's sentence (spec section D, owner decision of 2026-11-16).
+    let backend = loaded.effective.database().backend;
+    if backend == crystalline_core::config::DatabaseBackend::Postgres {
+        crate::secret_start::read_for_start(backend)?;
+    }
     // On Postgres this stack is the database's owner for the session, as a
     // command is for its run: claimed once, or refused with the owner's name
-    // when another instance has it (spec section O).
+    // when another instance has it (spec section O). The store open below
+    // installs the sealed vault, before any credential is read.
     let claim =
         crate::claim::claim_database_for_session(&loaded.effective, EMBEDDED_COMMAND).await?;
     let store =
@@ -2171,6 +2184,9 @@ pub async fn origin_add(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine =
         Arc::new(open_standalone_reporting(loaded, &db_path, false, db, config_path).await?);
@@ -2257,6 +2273,9 @@ pub async fn origin_update(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = match domain {
@@ -2341,6 +2360,9 @@ pub async fn origin_share(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
@@ -2444,6 +2466,9 @@ pub async fn origin_withdraw(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    // GitHub is reached with a credential: on Postgres without the key
+    // the command stops here, before its first write.
+    crate::claim::require_key_for_credentials(&loaded.effective)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
@@ -2828,6 +2853,7 @@ pub async fn config_for_report(
     config_path: Option<&Path>,
 ) -> anyhow::Result<overlay::LoadedConfig> {
     let mut loaded = overlay::load(config_path)?;
+    crate::claim::keep_secrets_off_local_stores(&loaded.effective);
     if let Err(e) = attach_viewed_document(&mut loaded).await {
         tracing::warn!("{e:#}; the registrations shown are config.yaml's alone");
     }

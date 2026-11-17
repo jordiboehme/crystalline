@@ -125,7 +125,17 @@ On macOS and Linux the `XDG_*` variables move these folders. On Windows, config 
   On macOS and Linux the state folder is readable by its owner only (mode `0700`), and so are both databases with their `-wal` and `-shm` files and `daemon.log` (mode `0600`). The daemon sets these modes when it starts, so an older install is tightened on its first start after an upgrade. On Windows nothing is changed.
 - The GitHub tokens and a saved GitHub App are otherwise kept in the OS keychain (Credential Manager on Windows). An App from the `CRYSTALLINE_GITHUB_APP_*` variables is never written down, and the App's installation tokens are kept in memory only.
 
-Nothing is encrypted at rest. Use disk encryption.
+With a PostgreSQL database the secrets are not kept on this machine. The GitHub tokens, a saved GitHub App and the sign-ins to connected servers are rows of the table `instance_secret`, and the keychain and the token files above are not used. See [Run on PostgreSQL](deployment.md#run-on-postgresql).
+
+- Each row is sealed with XChaCha20-Poly1305 under a 32 byte key from `CRYSTALLINE_SECRET_KEY` or `CRYSTALLINE_SECRET_KEY_FILE`. The key never enters the database. A row stores only the id of its key, the first 16 hex characters of the key's SHA-256, and the name of the row is bound to the sealed bytes, so a row copied to another name does not open.
+- The key is never logged. The start line names its id and the number of sealed rows, never a row name. A row that does not open with the key is warned about by its name (never its content). `status` and `doctor` say only whether a key is configured and how many rows are sealed.
+- A lost key means lost secrets: nothing can open the rows without it. A start with a new key stops while rows of the old key remain, so delete them first (`DELETE FROM instance_secret`), then save the App and link GitHub again.
+- Keep the key apart from the database backups. A backup together with its key gives away every secret in it.
+- There is no key rotation yet. The key id in each row keeps it possible for a later version.
+- A Crystalline process without the key never touches the sealed rows: it does not read, write or delete them. `status` and `doctor` only count them. Commands that change a secret run where the key is set, for example inside the active instance.
+- Someone with direct SQL access to the database can delete rows, but cannot read them. The database permissions guard the rows against deletion.
+
+Apart from these sealed secrets, nothing is encrypted at rest. Use disk encryption, and the encryption of your database server.
 
 `crystalline install claude-code` registers the MCP server with the `claude` CLI, adds three hooks to `~/.claude/settings.json` (`SessionStart`, `Stop` and `UserPromptSubmit`) and copies six skills into `~/.claude/skills`. With `--project` it writes the hooks and skills into the project's `.claude/` folder and registers the MCP server with project scope instead. Hook entries of other tools are kept. `crystalline uninstall claude-code` removes what install added.
 

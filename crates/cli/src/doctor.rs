@@ -947,6 +947,30 @@ fn render_durable_state(out: &mut String, block: &serde_json::Value) {
             base_domains.join(", ")
         );
     }
+    let secrets = &block["secrets"];
+    let sealed = match secrets["sealed"].as_u64() {
+        Some(n) => format!("{n} sealed in the database"),
+        None => format!(
+            "not counted ({})",
+            secrets["error"].as_str().unwrap_or("unknown")
+        ),
+    };
+    let key = if secrets["key_configured"].as_bool() == Some(true) {
+        "a key is configured"
+    } else {
+        "no key is configured here, so a GitHub token changes only on the active instance"
+    };
+    let _ = writeln!(out, "  secrets: {sealed}; {key}");
+    let app_error = block["github_app"]["error"].as_str().unwrap_or("unknown");
+    let app = match block["github_app"]["source"].as_str() {
+        Some("env") => "from the environment".to_string(),
+        Some("env_error") => format!("from the environment, but it cannot be used ({app_error})"),
+        Some("vault") => "sealed in the database".to_string(),
+        Some("none") => "none".to_string(),
+        Some("unread") => format!("not read ({app_error})"),
+        _ => "not checked (a saved App would be sealed in the database)".to_string(),
+    };
+    let _ = writeln!(out, "  github app: {app}");
     for warning in block["warnings"].as_array().into_iter().flatten() {
         let _ = writeln!(out, "  [warning] {}", text(warning));
     }
@@ -4478,13 +4502,18 @@ async fn check_github(
 ) -> Result<GithubDoctor> {
     let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
     let host = cmd::bare_host(&auth_base(api_url.as_deref()));
-    let (store, token) = match overlay.github_token() {
+    // On Postgres the tokens and a saved App are sealed in the database,
+    // which a report never opens: neither the keychain nor the state folder
+    // is read, since neither holds them.
+    let sealed = cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres;
+    let (token_store, token) = match overlay.github_token() {
+        None if sealed => ("vault", None),
         Some(token) => {
             let store = TokenStore::env(token, host.as_deref());
             let stored = store
                 .load()
                 .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?;
-            (store, stored)
+            (store.kind(), stored)
         }
         // The non-env doctor read fuses the backend probe and the token load
         // into a single keychain access (down from two), the same one-read
@@ -4492,8 +4521,9 @@ async fn check_github(
         None => {
             let state_base = config::origins_state_dir()
                 .map_err(|e| anyhow!("could not resolve the origins state directory: {e}"))?;
-            TokenStore::resolve_and_load(host.as_deref(), &state_base)
-                .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?
+            let (store, token) = TokenStore::resolve_and_load(host.as_deref(), &state_base)
+                .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?;
+            (store.kind(), token)
         }
     };
 
@@ -4541,7 +4571,7 @@ async fn check_github(
         });
     }
 
-    let app = check_github_app(cfg, overlay).await;
+    let app = check_github_app(cfg, overlay, sealed).await;
     let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
         cfg.github_share_identity_setting(),
         if app.is_some() {
@@ -4558,6 +4588,7 @@ async fn check_github(
     let owner_identity_missing = share_identity.mode
         == crystalline_core::config::ShareIdentityMode::Personal
         && !share_identity.is_default()
+        && !sealed
         && config::origins_state_dir().is_ok_and(|dir| {
             let owner = crystalline_remote::TokenIdentity::Personal(
                 crystalline_service::engine::OWNER_IDENTITY_NAME.to_string(),
@@ -4575,7 +4606,7 @@ async fn check_github(
             .as_ref()
             .and_then(|t| t.user_display())
             .map(str::to_string),
-        token_store: store.kind().to_string(),
+        token_store: token_store.to_string(),
         origins,
         app,
     })
@@ -4630,7 +4661,11 @@ const MAX_CLOCK_SKEW_SECS: i64 = 60;
 /// the installations can be listed, the clocks
 /// agree within a minute, and a webhook secret is set when
 /// `service.public_url` lets webhooks in. `None` when no App is configured.
-async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<AppDoctor> {
+async fn check_github_app(
+    cfg: &GlobalConfig,
+    overlay: &EnvOverlay,
+    sealed: bool,
+) -> Option<AppDoctor> {
     use crystalline_remote::{GithubApp, RemoteError};
 
     let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
@@ -4643,6 +4678,8 @@ async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<Ap
                 ..AppDoctor::default()
             });
         }
+        // A saved App is sealed in the database on Postgres: not read here.
+        None if sealed => return None,
         None => {
             let home = crystalline_service::engine::AppHome::new(
                 api_url.clone(),
@@ -5784,6 +5821,11 @@ pub fn render_human(report: &DoctorReport) -> String {
                 "  connected as {} ({} token store)",
                 g.user.as_deref().unwrap_or("?"),
                 g.token_store
+            );
+        } else if g.token_store == "vault" {
+            let _ = writeln!(
+                out,
+                "  the GitHub tokens are sealed in the database; the active instance reports them (crystalline status there)"
             );
         } else {
             let _ = writeln!(

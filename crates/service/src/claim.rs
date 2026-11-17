@@ -214,6 +214,9 @@ struct Held {
     owner: crystalline_index::postgres::PgOwner,
     instance_id: String,
     database: String,
+    /// Set once the sealed vault is installed over this claim's side
+    /// channel ([`CommandDbOwner::open_vault`]).
+    vault: tokio::sync::OnceCell<()>,
 }
 
 impl CommandDbOwner {
@@ -229,6 +232,39 @@ impl CommandDbOwner {
     #[cfg(feature = "postgres")]
     pub fn side(&self) -> crystalline_index::postgres::SideChannel {
         self.inner.owner.side()
+    }
+
+    /// Install the sealed vault over this claim's side channel, once, when
+    /// this process has the secret key: the command then seals and opens
+    /// its secrets in the database as the daemon does (spec section D). The
+    /// key is checked against the rows first, as at a start. Without the key
+    /// nothing is installed, and since the claim marked this process as one
+    /// whose secrets live in the vault, every credential call fails instead
+    /// of reaching the keychain or a file. Call it after the store open
+    /// migrated the database.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn open_vault(&self) -> anyhow::Result<()> {
+        use crystalline_remote::sealed::SealKey;
+        self.inner
+            .vault
+            .get_or_try_init(|| async {
+                match SealKey::from_env().map_err(|e| anyhow::anyhow!("{e}"))? {
+                    Some(key) => {
+                        crate::secret_start::open_vault_over(
+                            self.side(),
+                            &self.inner.database,
+                            key,
+                        )
+                        .await?;
+                    }
+                    None => tracing::debug!(
+                        "no secret key: this command reads and writes no sealed secret"
+                    ),
+                }
+                anyhow::Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// Write the owner row again: on a schema the store open just created
@@ -312,6 +348,11 @@ async fn claim(cfg: &GlobalConfig, command: &str) -> anyhow::Result<Claim> {
     if database.backend != DatabaseBackend::Postgres {
         return Ok(Claim::NotPostgres);
     }
+    // On Postgres the secrets of this process live in the sealed vault
+    // (spec section D), installed once the store is open; until then, and
+    // for good without the key, a credential call fails rather than fall
+    // back to the keychain or a file.
+    crystalline_remote::vault::require();
     let mut slot = CLAIM.lock().await;
     if let Some(held) = slot.as_ref() {
         return Ok(Claim::Held(held.clone()));
@@ -367,6 +408,7 @@ async fn claim(cfg: &GlobalConfig, command: &str) -> anyhow::Result<Claim> {
             owner,
             instance_id,
             database: described,
+            vault: tokio::sync::OnceCell::new(),
         }),
     };
     *slot = Some(held.clone());
@@ -463,6 +505,7 @@ pub(crate) async fn open_store_as(
         )
         .await?;
         claim.announce().await?;
+        claim.open_vault().await?;
         return Ok(store);
     }
     #[cfg(not(feature = "postgres"))]
@@ -481,6 +524,274 @@ pub async fn open_store_for_command(
 ) -> anyhow::Result<Arc<TokioMutex<dyn Store>>> {
     let claim = claim_for_this_command(cfg).await?;
     open_store_as(claim.as_ref(), cfg, db, resilient).await
+}
+
+/// Mark this process as one whose secrets live in the sealed vault when
+/// `cfg` says Postgres (spec section D): from then on no credential call
+/// reads or writes the keychain or the state folder, whatever path asks.
+/// Without an installed vault such a call fails with
+/// [`crystalline_remote::RemoteError::VaultUnavailable`], and a report shows
+/// the secret as sealed instead. Turso: nothing changes.
+pub fn keep_secrets_off_local_stores(cfg: &GlobalConfig) {
+    if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+        crystalline_remote::vault::require();
+    }
+}
+
+/// [`keep_secrets_off_local_stores`] for the configuration this process's
+/// command reads: the file its `--config` names, else `CRYSTALLINE_CONFIG`
+/// or the default one. Read once at a CLI process's start, after
+/// [`set_command_line`], and quietly: the command's own load says what is
+/// wrong with the file. A configuration that does not load changes nothing
+/// here.
+pub fn keep_secrets_off_local_stores_for_command() {
+    let config_path = command_config_path();
+    let loaded =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            crystalline_engine::overlay::load(config_path.as_deref())
+        });
+    if let Ok(loaded) = loaded {
+        keep_secrets_off_local_stores(&loaded.effective);
+    }
+}
+
+/// The value of the `--config` flag among the command's words (as
+/// `--config x` or `--config=x`), the last one when it is given twice.
+fn command_config_path() -> Option<std::path::PathBuf> {
+    config_flag(&COMMAND.get()?.words)
+}
+
+fn config_flag(words: &[String]) -> Option<std::path::PathBuf> {
+    let mut found = None;
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if word == "--config" {
+            found = words.next().map(std::path::PathBuf::from);
+        } else if let Some(value) = word.strip_prefix("--config=") {
+            found = Some(std::path::PathBuf::from(value));
+        }
+    }
+    found
+}
+
+/// Where a CLI command that changes a secret (a GitHub token, a server
+/// sign-in) makes the change (spec section D and the owner decision of
+/// 2026-11-16).
+pub enum SecretRoute {
+    /// Turso: the keychain or the state folder, as before.
+    Local,
+    /// A daemon of this machine owns the Postgres database: the change goes
+    /// to it over the control socket, and this process needs no key.
+    Daemon,
+    /// This command claimed the free Postgres database, and the sealed
+    /// vault is installed with its key: it changes the secret itself, as
+    /// the daemon would.
+    Owned(CommandDbOwner),
+    /// A daemon of this machine owns the Postgres database, and this
+    /// command seals the secret itself with its own key, on a connection of
+    /// its own beside the daemon ([`route_sealing_command`]). It tells the
+    /// daemon before and after the write, so the daemon reads the secret
+    /// again from the database: the secret never travels over the socket.
+    ///
+    /// Two writers, one row: a save of the daemon (a token it refreshes)
+    /// and this command's land in the order they commit, and the last one
+    /// wins. Each is a whole row sealed with the same key, so nothing is
+    /// torn; at worst a refresh that lost the race is asked for again.
+    Beside,
+}
+
+/// Decide where this command changes a secret, before it writes anything.
+///
+/// Turso is [`SecretRoute::Local`]. On Postgres no process without the key
+/// touches the vault: when the owner row names a daemon of this machine,
+/// that daemon takes the change ([`SecretRoute::Daemon`]; a standby refuses
+/// with its own sentence, and a daemon without a sealed vault is refused);
+/// when no instance owns the database the key is required, and the
+/// database is claimed for the command, migrated and the vault installed
+/// ([`SecretRoute::Owned`]). A daemon of this machine that does not own the
+/// database (a Turso one, or one on another schema) is never asked. A
+/// missing key, or a database another instance owns, is refused with a
+/// sentence naming `kubectl exec` and the key variable, and nothing was
+/// written.
+pub async fn route_secret_command(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
+    route(cfg, false, false).await
+}
+
+/// [`route_secret_command`] for a command that seals a secret (`connect
+/// github`, a server `connect` and `disconnect`, `github app set` and
+/// `remove`): a token or an App cannot be handed to a daemon over the
+/// socket, so with a daemon of this machine owning the database the command
+/// seals it itself, beside the daemon ([`SecretRoute::Beside`]). That needs
+/// the key here too: without it, or with a key other than the one the rows
+/// were sealed with, it is refused before anything is written.
+pub async fn route_sealing_command(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
+    route(cfg, true, false).await
+}
+
+/// [`route_sealing_command`] for a server sign-in (`connect <url>`,
+/// `disconnect <name>`): never [`SecretRoute::Owned`]. The sign-in's record
+/// (`sources.json`) lives in the state folder of the instance that serves
+/// it and its credential in the database, so a command away from that
+/// instance (on a free database) is refused before anyone signs in: server
+/// sign-ins are made in the pod, beside its daemon.
+pub async fn route_server_sign_in(cfg: &GlobalConfig) -> anyhow::Result<SecretRoute> {
+    route(cfg, true, true).await
+}
+
+async fn route(
+    cfg: &GlobalConfig,
+    seals: bool,
+    server_sign_in: bool,
+) -> anyhow::Result<SecretRoute> {
+    #[cfg(feature = "postgres")]
+    if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+        return route_on_postgres(cfg, seals, server_sign_in).await;
+    }
+    let _ = (cfg, seals, server_sign_in);
+    Ok(SecretRoute::Local)
+}
+
+#[cfg(feature = "postgres")]
+async fn route_on_postgres(
+    cfg: &GlobalConfig,
+    seals: bool,
+    server_sign_in: bool,
+) -> anyhow::Result<SecretRoute> {
+    use crystalline_remote::sealed::SealKey;
+
+    // No credential call of this process reaches the keychain or a file
+    // from here on, whichever way it goes.
+    crystalline_remote::vault::require();
+    // Who owns this configuration's database decides, not whether a daemon
+    // of this machine answers: that daemon may serve another database (a
+    // Turso one, or another schema), and a change handed to it would land
+    // in the wrong place.
+    match holder(cfg).await {
+        Holder::Here {
+            owner: Some(row), ..
+        } if row.command.is_none() => {
+            if let Some(route) = route_beside_owner(cfg, seals, row.pid).await? {
+                return Ok(route);
+            }
+        }
+        Holder::Elsewhere { database, owner } => {
+            let owned = DatabaseOwned {
+                message: pg::command_refusal(&database, owner.as_ref(), &command_example()),
+            };
+            anyhow::bail!(pg::sealed_elsewhere(&owned));
+        }
+        // Who owns it could not be read: nothing can be routed safely.
+        Holder::Unknown { database, error } => {
+            anyhow::bail!(pg::secret_owner_unknown(&database, &error));
+        }
+        _ => {}
+    }
+    // No daemon of this machine owns it: the command claims the database
+    // for itself, which a server sign-in may not do (its record lives in
+    // the state folder of the instance that serves it).
+    if server_sign_in {
+        anyhow::bail!(pg::server_sign_in_in_the_pod(&command_example()));
+    }
+    match SealKey::from_env() {
+        Ok(Some(_)) => {}
+        Ok(None) => anyhow::bail!(pg::no_key_refusal(&command_example())),
+        Err(e) => anyhow::bail!("{e}"),
+    }
+    let claim = match claim_database_for_command(cfg, &command_label()).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => anyhow::bail!("the database is not on Postgres"),
+        Err(e) => match e.downcast_ref::<DatabaseOwned>() {
+            Some(owned) => anyhow::bail!(pg::sealed_elsewhere(owned)),
+            None => return Err(e),
+        },
+    };
+    // The store open migrates the database (the sealed secrets' table
+    // among it) and installs the vault with the key.
+    drop(open_store_as(Some(&claim), cfg, None, false).await?);
+    // The claim lives in this process's slot until `main` releases it
+    // (`release_command_database`), so it holds for the whole command
+    // whatever the caller does with this handle.
+    Ok(SecretRoute::Owned(claim))
+}
+
+/// The route of a command while the owner row names a daemon of this
+/// machine: the change goes to it ([`SecretRoute::Daemon`]) or is sealed
+/// beside it ([`SecretRoute::Beside`]). `None` when no daemon answers on
+/// this machine's control socket, or when the daemon that answers is not
+/// the process the owner row names (`owner_pid`: the row of an earlier
+/// daemon of this state folder, before the next owner announced itself):
+/// the command then goes on as if there were none, and its claim is
+/// refused while the lock is held.
+///
+/// A standby answers with its own refusal (the restart window, while the
+/// row still names a predecessor of this state folder).
+///
+/// Only a daemon with a sealed vault takes either route: one without (a
+/// Turso daemon, or one older than this command) cannot delete a sealed
+/// row or say which key it seals with.
+#[cfg(feature = "postgres")]
+async fn route_beside_owner(
+    cfg: &GlobalConfig,
+    seals: bool,
+    owner_pid: i64,
+) -> anyhow::Result<Option<SecretRoute>> {
+    use crystalline_remote::sealed::SealKey;
+    use serde_json::Value;
+
+    let holder = match crate::client::ctl_if_running(serde_json::json!({ "cmd": "holder" })).await {
+        Ok(Some(holder)) => holder,
+        Ok(None) => return Ok(None),
+        Err(e) => anyhow::bail!(
+            "the daemon of this machine did not answer ({e}), so nothing was changed; run the command again once it answers"
+        ),
+    };
+    if let Some(refusal) = holder.get("standby").and_then(Value::as_str) {
+        anyhow::bail!("{refusal}");
+    }
+    // Both pids are the daemon's own, so they compare inside a container
+    // too.
+    if holder.get("pid").and_then(Value::as_i64) != Some(owner_pid) {
+        return Ok(None);
+    }
+    let Some(theirs) = holder.get("secret_key_id").and_then(Value::as_str) else {
+        anyhow::bail!(pg::daemon_without_vault());
+    };
+    if !seals {
+        return Ok(Some(SecretRoute::Daemon));
+    }
+    let key = match SealKey::from_env() {
+        Ok(Some(key)) => key,
+        Ok(None) => anyhow::bail!(pg::no_key_beside_daemon()),
+        Err(e) => anyhow::bail!("{e}"),
+    };
+    // The daemon's key decides, also while no row is sealed yet: a row this
+    // process sealed with another key would be one the daemon cannot open.
+    let mine = key.key_id();
+    if theirs != mine {
+        anyhow::bail!(pg::other_key_than_daemon(theirs, &mine));
+    }
+    let target = crystalline_index::postgres::PgTarget::from_config(&cfg.database())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let database = target.describe();
+    crate::secret_start::open_vault_beside_owner(target, &database, key).await?;
+    Ok(Some(SecretRoute::Beside))
+}
+
+/// Refuse, before its first write, a daemonless command on Postgres that
+/// will need a credential (an origin connect, update, share or withdraw
+/// reaches GitHub) when this process has no secret key: its credential
+/// calls would fail half way. Turso, and Postgres with a key, pass.
+pub fn require_key_for_credentials(cfg: &GlobalConfig) -> anyhow::Result<()> {
+    #[cfg(feature = "postgres")]
+    if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+        return match crystalline_remote::sealed::SealKey::from_env() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => anyhow::bail!(pg::no_key_refusal(&command_example())),
+            Err(e) => anyhow::bail!("{e}"),
+        };
+    }
+    let _ = cfg;
+    Ok(())
 }
 
 /// Whether `e` is the CLI rule's refusal to open the database: a
@@ -582,7 +893,11 @@ pub async fn open_accounts_for_cli(cfg: &GlobalConfig) -> anyhow::Result<AuthSto
     match &loc {
         AccountsLocation::File(path) => AuthStore::open(path).await,
         #[cfg(feature = "postgres")]
-        AccountsLocation::Postgres(_) => open_cli_accounts_on_postgres(cfg, &loc).await,
+        AccountsLocation::Postgres(_) => match held_claim().await {
+            // A command that claimed the database opens as its owner.
+            Some(claim) => AuthStore::open_at(&loc, &claim.session_options()).await,
+            None => open_cli_accounts_on_postgres(cfg, &loc).await,
+        },
         #[cfg(not(feature = "postgres"))]
         AccountsLocation::Postgres(_) => Err(no_postgres_backend()),
     }
@@ -881,6 +1196,67 @@ pub(crate) mod pg {
         )
     }
 
+    /// The refusal of a command that changes a secret on Postgres without
+    /// the key and with no daemon of this machine to take the change.
+    pub(crate) fn no_key_refusal(example: &str) -> String {
+        format!(
+            "this command reads or changes a GitHub token or a server sign-in, and on Postgres they are sealed in the database with the instance's secret key, which this process does not have, so nothing was changed. Run the command on the active instance, for example `kubectl exec <pod> -- {example}`, or set {} (or {}) to the instance's key",
+            crystalline_remote::sealed::KEY_ENV,
+            crystalline_remote::sealed::KEY_FILE_ENV
+        )
+    }
+
+    /// The refusal of a command that seals a secret beside the daemon of
+    /// its machine without the key.
+    pub(crate) fn no_key_beside_daemon() -> String {
+        format!(
+            "this command seals a GitHub token, a GitHub App or a server sign-in in the database itself, and this process has no secret key, so nothing was changed. Set {} (or {}) to the key of the active instance and run the command again; inside the instance's container it is set already",
+            crystalline_remote::sealed::KEY_ENV,
+            crystalline_remote::sealed::KEY_FILE_ENV
+        )
+    }
+
+    /// The refusal of a command whose database is owned by the daemon of its
+    /// machine, when that daemon has no sealed vault to change the secret
+    /// in.
+    pub(crate) fn daemon_without_vault() -> String {
+        "the daemon of this machine has no sealed vault, so nothing was changed: it is not the instance that owns this database, or it is older than this command. Run the command where the instance that owns the database runs, or update this machine's daemon and run it again".to_string()
+    }
+
+    /// The refusal of a command that changes a secret while who owns its
+    /// database could not be read.
+    pub(crate) fn secret_owner_unknown(database: &str, error: &str) -> String {
+        format!(
+            "could not check who owns the database {database} ({error}), so nothing was changed; run the command again once the database answers"
+        )
+    }
+
+    /// The refusal of a server sign-in (`connect <url>`, `disconnect`) on
+    /// Postgres away from the instance that serves it.
+    pub(crate) fn server_sign_in_in_the_pod(example: &str) -> String {
+        format!(
+            "a server sign-in on Postgres is made in the pod, where the daemon keeps sources.json and the sealed vault together, so nothing was changed. Run the command there, for example `kubectl exec <pod> -- {example}`"
+        )
+    }
+
+    /// The refusal of a command whose key is not the one the daemon of its
+    /// machine seals with.
+    pub(crate) fn other_key_than_daemon(theirs: &str, mine: &str) -> String {
+        format!(
+            "the active instance on this machine seals its secrets with key {theirs}, but {var} here is key {mine}, so nothing was changed. Set {var} to the instance's key",
+            var = crate::secret_start::key_variable_in_use()
+        )
+    }
+
+    /// The refusal of a command that changes a secret on a database another
+    /// instance owns.
+    pub(crate) fn sealed_elsewhere(owned: &super::DatabaseOwned) -> String {
+        format!(
+            "the GitHub tokens and server sign-ins of this instance are sealed in the database with {}, and only the instance that owns the database can change them, so nothing was changed: {owned}",
+            crystalline_remote::sealed::KEY_ENV
+        )
+    }
+
     /// A read-only report that could not read who owns the database.
     pub(crate) fn owner_unknown(database: &str, error: &str, example: &str) -> String {
         format!(
@@ -905,6 +1281,25 @@ pub(crate) mod pg {
                 released_at: released
                     .then(|| Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap()),
             }
+        }
+
+        /// A daemon of this machine without a sealed vault cannot take a
+        /// secret change: the refusal says nothing was changed and why,
+        /// and no longer blames only the daemon's age.
+        #[test]
+        fn a_daemon_without_a_vault_is_refused_with_both_reasons() {
+            let said = daemon_without_vault();
+            assert!(
+                said.starts_with(
+                    "the daemon of this machine has no sealed vault, so nothing was changed"
+                ),
+                "{said}"
+            );
+            assert!(
+                said.contains("it is not the instance that owns this database"),
+                "{said}"
+            );
+            assert!(said.contains("or it is older than this command"), "{said}");
         }
 
         /// The command refusal names the owner, the command it runs if any,
@@ -978,6 +1373,22 @@ pub(crate) mod pg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `--config` of a command is read in both spellings, the last one
+    /// winning; without one there is none.
+    #[test]
+    fn the_config_flag_is_read_from_the_words() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            config_flag(&words(&["serve", "--config", "/a.yaml"])),
+            Some(std::path::PathBuf::from("/a.yaml"))
+        );
+        assert_eq!(
+            config_flag(&words(&["--config=/a.yaml", "sync", "--config", "/b.yaml"])),
+            Some(std::path::PathBuf::from("/b.yaml"))
+        );
+        assert_eq!(config_flag(&words(&["status", "--json"])), None);
+    }
 
     /// The example for another machine leaves this machine's paths out.
     #[test]

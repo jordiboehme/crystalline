@@ -949,6 +949,71 @@ impl Engine {
         self.forget_cached_credential(account)
     }
 
+    /// Deletes the saved GitHub credential of `account` (`None` for this
+    /// machine's own) and drops every cached copy, for a CLI that cannot
+    /// reach the store itself: on Postgres the tokens are sealed in the
+    /// database, and only the instance that owns it opens them. A person's
+    /// token goes the way an account's does at its removal (revoked when a
+    /// GitHub App can, then deleted). The store is asked again at the end, so
+    /// `Ok` means no token is left. `true` when there was one to delete.
+    pub async fn delete_saved_credential(&self, account: Option<&str>) -> Result<bool> {
+        let identity = match account {
+            None => TokenIdentity::Instance,
+            Some(name) => personal_identity(name)?,
+        };
+        let host = self.github_token_host();
+        let found = {
+            let _settled = self.token_writes.lock().await;
+            self.forget_cached_credential(account)?;
+            self.saved_credential_for(&identity, host.as_deref())?
+                .1
+                .is_some()
+        };
+        match account {
+            Some(name) => self.sweep_account_credential(name).await?,
+            None => {
+                let _settled = self.token_writes.lock().await;
+                let (store, token) = self.saved_credential_for(&identity, host.as_deref())?;
+                if token.is_some() {
+                    store.delete().map_err(EngineError::Remote)?;
+                }
+                if self
+                    .saved_credential_for(&identity, host.as_deref())?
+                    .1
+                    .is_some()
+                {
+                    return Err(EngineError::Internal(
+                        "a GitHub token is still saved for this machine".to_string(),
+                    ));
+                }
+                self.forget_cached_credential(None)?;
+            }
+        }
+        Ok(found)
+    }
+
+    /// What the store saves for `identity`, read past the cache and past the
+    /// environment variable that fixes this machine's identity: the token a
+    /// delete removes.
+    fn saved_credential_for(
+        &self,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> Result<(TokenStore, Option<crystalline_remote::StoredToken>)> {
+        match &self.token_store_dir_override {
+            Some(dir) => {
+                let store = TokenStore::file_fallback_for(identity, dir)?;
+                let token = store.load()?;
+                Ok((store, token))
+            }
+            None => Ok(TokenStore::resolve_and_load_for(
+                identity,
+                host,
+                &self.origins_base_dir()?,
+            )?),
+        }
+    }
+
     // --- one account's GitHub link (GitHub App) -----------------------------
 
     /// Refuses the OAuth App way of connecting a person's GitHub identity

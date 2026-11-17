@@ -74,7 +74,11 @@ async fn embed_pass(store: &dyn Store, cfg: &GlobalConfig) -> Result<()> {
 /// `domain remove`) mutate `loaded.file` and save it back to `loaded.path`, so
 /// no environment value ever bakes into `config.yaml`.
 pub(crate) fn load(config_override: Option<&Path>) -> Result<crystalline_service::LoadedConfig> {
-    crystalline_service::overlay::load(config_override)
+    let loaded = crystalline_service::overlay::load(config_override)?;
+    // On Postgres no CLI path reads the keychain or the state folder for a
+    // secret (spec section D).
+    crystalline_service::keep_secrets_off_local_stores(&loaded.effective);
+    Ok(loaded)
 }
 
 /// Resolve the index database path from an optional override.
@@ -3318,7 +3322,8 @@ fn share_identity_report(cfg: &GlobalConfig) -> Option<serde_json::Value> {
         app,
     );
     Some(serde_json::json!({
-        "mode": share_identity.mode.as_str(),
+        // Unknown while it would depend on an App sealed in the database.
+        "mode": share_identity.is_checked().then(|| share_identity.mode.as_str()),
         "default": share_identity.is_default(),
         "reason": share_identity.reason_text(),
     }))
@@ -3326,11 +3331,13 @@ fn share_identity_report(cfg: &GlobalConfig) -> Option<serde_json::Value> {
 
 /// One human line for a report's `share_identity` block, when it has one.
 fn print_share_identity(data: &serde_json::Value) {
-    if let Some(mode) = data["share_identity"]["mode"].as_str() {
-        println!(
-            "Shares run on: {mode} identity ({})",
-            data["share_identity"]["reason"].as_str().unwrap_or("?")
-        );
+    let reason = data["share_identity"]["reason"].as_str().unwrap_or("?");
+    match data["share_identity"]["mode"].as_str() {
+        Some(mode) => println!("Shares run on: {mode} identity ({reason})"),
+        None if data["share_identity"].is_object() => {
+            println!("Shares run on: {reason}");
+        }
+        None => {}
     }
 }
 
@@ -4003,6 +4010,16 @@ pub async fn connect_github(
         );
     }
     let cfg = &loaded.effective;
+    // On Postgres the token is sealed in the database, by this process
+    // itself (under its own claim, or beside the daemon of this machine,
+    // with the key): where it is written is decided before any sign-in, and
+    // the test seam's folder gives way to the vault.
+    let route = crystalline_service::route_sealing_command(cfg).await?;
+    let beside_daemon = matches!(route, crystalline_service::SecretRoute::Beside);
+    let token_store_dir = match route {
+        crystalline_service::SecretRoute::Local => token_store_dir,
+        _ => None,
+    };
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
@@ -4041,6 +4058,7 @@ pub async fn connect_github(
                 state_dir: &state_dir,
                 token_store_dir,
                 cfg,
+                beside_daemon,
             };
             if disconnect {
                 return person.disconnect(json).await;
@@ -4110,6 +4128,11 @@ pub async fn connect_github(
         refresh_expires_at: None,
     };
     account_then.refuse_if_changed().await?;
+    // Beside the daemon its cache is dropped before the write as well (see
+    // the notice after it).
+    if beside_daemon {
+        let _ = notify_daemon_forgot(identity).await;
+    }
     let store = save_credential(
         identity,
         token_host.as_deref(),
@@ -4124,16 +4147,14 @@ pub async fn connect_github(
     // actionable. `github.enabled` is left to the instance connect to hint at:
     // turning collaboration on is an instance-wide decision, not something a
     // person connecting their own identity is making.
-    if !instance {
-        // A running daemon remembers for a short time that this token was
-        // missing; this ends that.
+    // A running daemon remembers for a short time that this token was
+    // missing; this ends that. Beside a daemon that owns the Postgres
+    // database it also drops this machine's cached token, so the daemon
+    // reads the one just sealed.
+    if !instance || beside_daemon {
         let _ = notify_daemon_forgot(identity).await;
     }
     let share_identity = share_identity_here(&loaded, cfg);
-    let personal_mode = matches!(
-        share_identity.mode,
-        crystalline_core::config::ShareIdentityMode::Personal
-    );
     if json {
         let mut report = serde_json::json!({
             "connected": login,
@@ -4143,7 +4164,13 @@ pub async fn connect_github(
         if !instance {
             report["identity"] = serde_json::json!("personal");
             report["account"] = serde_json::json!(identity_label(identity));
-            report["share_identity"] = serde_json::json!(share_identity.mode.as_str());
+            // Unknown while it would depend on an App sealed in the
+            // database that was not read.
+            report["share_identity"] = serde_json::json!(
+                share_identity
+                    .is_checked()
+                    .then(|| share_identity.mode.as_str())
+            );
         }
         println!("{report}");
     } else if instance {
@@ -4160,10 +4187,8 @@ pub async fn connect_github(
             identity_phrase(identity),
             store.kind()
         );
-        if !personal_mode {
-            println!(
-                "Run: crystalline config set github.share_identity personal to share with personal identities"
-            );
+        if let Some(note) = share_identity_note(&share_identity) {
+            println!("{note}");
         }
     }
     Ok(())
@@ -4282,6 +4307,9 @@ struct PersonalApp<'a> {
     state_dir: &'a Path,
     token_store_dir: Option<&'a Path>,
     cfg: &'a crystalline_core::config::GlobalConfig,
+    /// The token is sealed beside a daemon of this machine that owns the
+    /// Postgres database ([`crystalline_service::SecretRoute::Beside`]).
+    beside_daemon: bool,
 }
 
 impl PersonalApp<'_> {
@@ -4363,6 +4391,12 @@ impl PersonalApp<'_> {
             expires_at: grant.expires_at,
             refresh_expires_at: grant.refresh_expires_at,
         };
+        // Beside the daemon the cache is dropped before the write as well,
+        // so a read of the daemon racing the write never keeps the old
+        // token past the notice after it.
+        if self.beside_daemon {
+            let _ = notify_daemon_forgot(self.identity).await;
+        }
         let saved = save_credential(
             self.identity,
             self.token_host,
@@ -4391,10 +4425,6 @@ impl PersonalApp<'_> {
         let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
             self.cfg.github_share_identity_setting(),
             crystalline_core::config::GithubAppPresence::Configured,
-        );
-        let personal_mode = matches!(
-            share_identity.mode,
-            crystalline_core::config::ShareIdentityMode::Personal
         );
         if json {
             let mut report = serde_json::json!({
@@ -4428,10 +4458,8 @@ impl PersonalApp<'_> {
             )
         };
         println!("{how} ({} token store).", store.kind());
-        if !personal_mode {
-            println!(
-                "Run: crystalline config set github.share_identity personal to share with personal identities"
-            );
+        if let Some(note) = share_identity_note(&share_identity) {
+            println!("{note}");
         }
         if let DaemonNotice::Refused(e) = &told {
             println!(
@@ -4493,8 +4521,9 @@ impl PersonalApp<'_> {
             })?;
         }
         // The file a keychain failure at connect time left behind, which a
-        // keychain that works again would not resolve to.
-        if self.token_store_dir.is_none() {
+        // keychain that works again would not resolve to. With the sealed
+        // vault there is none, and the state folder is not touched.
+        if self.token_store_dir.is_none() && !crystalline_remote::vault::engaged() {
             crystalline_remote::TokenStore::file_fallback_for(self.identity, self.state_dir)
                 .and_then(|file| file.delete())
                 .map_err(|e| {
@@ -4599,6 +4628,11 @@ pub(crate) fn forget_credential(
         }
         Err(e) => tracing::debug!("could not resolve the credential to forget: {e}"),
     }
+    // With the sealed vault there is no file beside it: the state folder is
+    // not touched at all.
+    if crystalline_remote::vault::engaged() {
+        return;
+    }
     match crystalline_remote::TokenStore::file_fallback_for(identity, state_dir) {
         Ok(store) => {
             if let Err(e) = store.delete() {
@@ -4606,6 +4640,68 @@ pub(crate) fn forget_credential(
             }
         }
         Err(e) => tracing::debug!("could not resolve the file credential to forget: {e}"),
+    }
+}
+
+/// Deletes `identity`'s sealed credential under this command's own claim of
+/// the database, with the vault installed ([`SecretRoute::Owned`]). Not best
+/// effort: an error means the token may still be there, and the store is
+/// asked again at the end, so `Ok` means none is left.
+///
+/// [`SecretRoute::Owned`]: crystalline_service::SecretRoute::Owned
+pub(crate) fn delete_sealed_credential(
+    identity: &crystalline_remote::TokenIdentity,
+    host: Option<&str>,
+) -> Result<()> {
+    let dir = config::origins_state_dir()
+        .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+    let (store, token) = crystalline_remote::TokenStore::resolve_and_load_for(identity, host, &dir)
+        .map_err(|e| anyhow!("{e}"))?;
+    if token.is_some() {
+        store.delete().map_err(|e| anyhow!("{e}"))?;
+    }
+    let (_, left) = crystalline_remote::TokenStore::resolve_and_load_for(identity, host, &dir)
+        .map_err(|e| anyhow!("{e}"))?;
+    if left.is_some() {
+        bail!("the GitHub token is still saved in the database");
+    }
+    Ok(())
+}
+
+/// Has the daemon that owns the Postgres database delete `identity`'s sealed
+/// credential ([`SecretRoute::Daemon`]): the `forget_credential` message with
+/// `"delete": true`. `Ok` when the daemon answered that no token is left. A
+/// daemon that answers without `deleted` is older and deleted nothing, and
+/// one that went away deleted nothing either: both are errors.
+///
+/// [`SecretRoute::Daemon`]: crystalline_service::SecretRoute::Daemon
+pub(crate) async fn delete_through_daemon(
+    identity: &crystalline_remote::TokenIdentity,
+) -> Result<()> {
+    let account = match identity {
+        crystalline_remote::TokenIdentity::Instance => serde_json::Value::Null,
+        crystalline_remote::TokenIdentity::Personal(name) => serde_json::json!(name),
+    };
+    let answer = crystalline_service::client::ctl_if_running(serde_json::json!({
+        "cmd": "forget_credential",
+        "account": account,
+        "delete": true,
+    }))
+    .await?;
+    match answer {
+        Some(data)
+            if data
+                .get("deleted")
+                .is_some_and(serde_json::Value::is_boolean) =>
+        {
+            Ok(())
+        }
+        Some(_) => bail!(
+            "the daemon of this machine is older than this command and deleted no sealed GitHub token; update it and run the command again"
+        ),
+        None => bail!(
+            "the daemon of this machine stopped before it deleted the GitHub token; run the command again"
+        ),
     }
 }
 
@@ -5959,19 +6055,43 @@ fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
 }
 
 /// The share identity mode in effect for this process, which has no engine:
-/// the App is asked of what is cheap to read.
+/// the App is asked of what is cheap to read. With the vault installed in
+/// this process (a sealing command on Postgres), `presence` asks the vault;
+/// a vault that does not answer leaves the mode not checked.
 fn share_identity_here(
     loaded: &crystalline_service::LoadedConfig,
     cfg: &GlobalConfig,
 ) -> crystalline_core::config::EffectiveShareIdentity {
+    use crystalline_core::config::GithubAppPresence;
     let app = match app_home(loaded, test_token_store_dir().as_deref()) {
         Ok(home) => home.presence(&loaded.overlay),
-        Err(_) => crystalline_core::config::GithubAppPresence::None,
+        Err(_) => GithubAppPresence::None,
     };
     crystalline_core::config::EffectiveShareIdentity::resolve(
         cfg.github_share_identity_setting(),
         app,
     )
+}
+
+/// The line a personal connect prints after it saved: the mode is not
+/// checked (it would depend on an App sealed in the database that was not
+/// read), or the hint to turn on personal sharing, or nothing.
+fn share_identity_note(
+    share_identity: &crystalline_core::config::EffectiveShareIdentity,
+) -> Option<String> {
+    if !share_identity.is_checked() {
+        Some(format!("Shares run on: {}", share_identity.reason_text()))
+    } else if !matches!(
+        share_identity.mode,
+        crystalline_core::config::ShareIdentityMode::Personal
+    ) {
+        Some(
+            "Run: crystalline config set github.share_identity personal to share with personal identities"
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 /// Where this CLI process finds and keeps the GitHub App: the effective
@@ -6099,6 +6219,7 @@ pub async fn github_app_set(
         slug: None,
         host: String::new(),
     };
+    let token_store_dir = sealing_route(&loaded, token_store_dir).await?;
     let status = app_home(&loaded, token_store_dir)?
         .save(&loaded.overlay, credentials)
         .await?;
@@ -6121,6 +6242,7 @@ pub async fn github_app_remove(
     if loaded.effective.read_only() {
         bail!("{}", crystalline_service::engine::EngineError::ReadOnly);
     }
+    let token_store_dir = sealing_route(&loaded, token_store_dir).await?;
     let removal = app_home(&loaded, token_store_dir)?.remove(&loaded.overlay)?;
     let told = notify_daemon_app_changed().await;
     if json {
@@ -6145,6 +6267,23 @@ pub async fn github_app_remove(
         report_daemon_notice(&told);
     }
     Ok(())
+}
+
+/// Where `github app set` and `remove` keep the App: on Postgres it is
+/// sealed in the database by this process ([`route_sealing_command`]),
+/// refused before anything is written without the key or while another
+/// instance owns the database, and the test seam's folder gives way to the
+/// vault. On Turso `token_store_dir` as given.
+///
+/// [`route_sealing_command`]: crystalline_service::route_sealing_command
+async fn sealing_route<'a>(
+    loaded: &crystalline_service::LoadedConfig,
+    token_store_dir: Option<&'a Path>,
+) -> Result<Option<&'a Path>> {
+    match crystalline_service::route_sealing_command(&loaded.effective).await? {
+        crystalline_service::SecretRoute::Local => Ok(token_store_dir),
+        _ => Ok(None),
+    }
 }
 
 /// The line a person reads when a running daemon could not be told.
@@ -6225,5 +6364,60 @@ mod register_request_tests {
         let request = register_request("virtual", Some("notes"), None).unwrap();
         assert!(request["path"].is_null(), "{request}");
         assert_eq!(request["kind"], "virtual");
+    }
+}
+
+#[cfg(test)]
+mod share_identity_tests {
+    use super::*;
+
+    /// A vault lookup that failed leaves the App not checked; one that
+    /// answered says whether an App is saved.
+    #[test]
+    fn a_failed_vault_lookup_leaves_the_app_not_checked() {
+        use crystalline_core::config::GithubAppPresence;
+        use crystalline_remote::{AppLookup, AppStore, RemoteError};
+        let refused = Err(RemoteError::Refused("timed out".to_string()));
+        assert_eq!(
+            crystalline_service::engine::presence_from_lookup(refused),
+            GithubAppPresence::Sealed
+        );
+        let empty = Ok(AppLookup {
+            store: AppStore::Vault {
+                name: "github-app".to_string(),
+            },
+            credentials: None,
+            keychain_failed: None,
+            marker: None,
+        });
+        assert_eq!(
+            crystalline_service::engine::presence_from_lookup(empty),
+            GithubAppPresence::None
+        );
+    }
+
+    /// A share identity that was not checked is said so after a personal
+    /// connect; a checked one gives the hint only outside personal mode.
+    #[test]
+    fn the_share_identity_note_after_a_personal_connect() {
+        use crystalline_core::config::{
+            EffectiveShareIdentity, GithubAppPresence, ShareIdentityMode,
+        };
+        let sealed = EffectiveShareIdentity::resolve(None, GithubAppPresence::Sealed);
+        assert_eq!(
+            share_identity_note(&sealed).as_deref(),
+            Some("Shares run on: sealed in the database (not checked)")
+        );
+        let no_app = EffectiveShareIdentity::resolve(None, GithubAppPresence::None);
+        assert!(
+            share_identity_note(&no_app)
+                .unwrap()
+                .starts_with("Run: crystalline config set github.share_identity personal")
+        );
+        let personal = EffectiveShareIdentity::resolve(
+            Some(ShareIdentityMode::Personal),
+            GithubAppPresence::None,
+        );
+        assert_eq!(share_identity_note(&personal), None);
     }
 }

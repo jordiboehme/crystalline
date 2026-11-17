@@ -32,6 +32,7 @@ pub mod mcp_gate;
 pub mod remote_ctl;
 pub mod route;
 pub mod runs_in;
+mod secret_start;
 mod session_end;
 #[cfg(windows)]
 mod session_end_windows;
@@ -63,9 +64,11 @@ pub use crystalline_rest::collab;
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use claim::{
-    CommandDbOwner, DatabaseOwned, claim_database_for_command, existing_accounts_for_cli,
-    open_accounts_for_cli, open_store_for_command, refuse_fix_when_owned, release_command_database,
-    set_command_line,
+    CommandDbOwner, DatabaseOwned, SecretRoute, claim_database_for_command,
+    existing_accounts_for_cli, keep_secrets_off_local_stores,
+    keep_secrets_off_local_stores_for_command, open_accounts_for_cli, open_store_for_command,
+    refuse_fix_when_owned, release_command_database, route_sealing_command, route_secret_command,
+    route_server_sign_in, set_command_line,
 };
 pub use client::{
     ROUTING_READ_ONLY_KEY, VirtualRouting, adopt_domain_names_direct, collect_orphaned_domains,

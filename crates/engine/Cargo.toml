@@ -59,6 +59,8 @@ walkdir = { workspace = true }
 yrs = { workspace = true }
 
 [dev-dependencies]
+# The fixed-key constructor for the vault tests.
+crystalline-remote = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serde_yaml_ng = { workspace = true }

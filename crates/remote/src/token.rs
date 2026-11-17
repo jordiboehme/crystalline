@@ -18,6 +18,10 @@
 //! (`CRYSTALLINE_GITHUB_TOKEN` is read exactly once, in
 //! `crystalline_service::overlay::EnvOverlay::from_process_env`), so a caller
 //! that already has the value in hand constructs the store explicitly.
+//!
+//! On Postgres the token lives in a sealed row of the database instead
+//! ([`TokenStore::Vault`], see [`crate::vault`]): the resolving functions ask
+//! the vault first and then never touch the keychain or the file.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -206,6 +210,16 @@ pub enum TokenStore {
         /// or a GitHub Enterprise Server hostname.
         host: String,
     },
+    /// A row of the sealed vault, used whenever one is installed: the
+    /// instance runs on Postgres and keeps its secrets in the database (see
+    /// [`crate::vault`]). Every call asks the registry afresh, so a store
+    /// kept past [`crate::vault::clear`] answers
+    /// [`RemoteError::VaultUnavailable`].
+    Vault {
+        /// The row name: the keychain account name the keyring arm would
+        /// use (`github`, `github:<host>`, `github-personal:<name>[:<host>]`).
+        name: String,
+    },
 }
 
 /// Redacts the `token` field of [`TokenStore::Env`] the same way
@@ -218,6 +232,7 @@ impl std::fmt::Debug for TokenStore {
                 f.debug_struct("Keyring").field("account", account).finish()
             }
             TokenStore::File { path } => f.debug_struct("File").field("path", path).finish(),
+            TokenStore::Vault { name } => f.debug_struct("Vault").field("name", name).finish(),
             TokenStore::Env { host, .. } => f
                 .debug_struct("Env")
                 .field("token", &"<redacted>")
@@ -281,6 +296,17 @@ impl TokenStore {
         fallback_dir: &Path,
         read: impl FnOnce(&str) -> KeyringRead,
     ) -> Result<(TokenStore, Option<StoredToken>), RemoteError> {
+        // The vault comes first, before the test seam: when one is
+        // installed the keychain and the file store are never touched, and
+        // when one is required but missing the call fails rather than fall
+        // back to them.
+        if let Some((vault, key)) = crate::vault::active()? {
+            let name = account_for_identity_checked(identity, host)?;
+            let token = crate::vault::open_row(vault.as_ref(), &key, &name)?
+                .map(|plain| from_json_bytes(&plain))
+                .transpose()?;
+            return Ok((TokenStore::Vault { name }, token));
+        }
         // The test seam: use the file store at the caller's own
         // `fallback_dir` and never call `read`, so the real OS keychain
         // backend is never even constructed. Checked before
@@ -359,6 +385,13 @@ impl TokenStore {
         token: &StoredToken,
         write: impl FnOnce(&str, String) -> Result<(), RemoteError>,
     ) -> Result<TokenStore, RemoteError> {
+        // The vault first, as in `resolve_and_load_bounded`.
+        if let Some((vault, key)) = crate::vault::active()? {
+            let name = account_for_identity_checked(identity, host)?;
+            let json = zeroize::Zeroizing::new(to_json(token)?);
+            crate::vault::seal_row(vault.as_ref(), &key, &name, json.as_bytes())?;
+            return Ok(TokenStore::Vault { name });
+        }
         // The test seam: write straight to the file store at the caller's
         // own `fallback_dir` and never call `write`, so the real OS
         // keychain backend is never even constructed. See
@@ -422,12 +455,16 @@ impl TokenStore {
 
     /// Saves `token`, replacing whatever was saved before.
     pub fn save(&self, token: &StoredToken) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             TokenStore::Keyring { account } => {
                 let json = to_json(token)?;
                 keyring_write(account, json, KEYRING_TIMEOUT)
             }
             TokenStore::File { path } => save_file(path, token),
+            TokenStore::Vault { name } => {
+                crate::vault::save_text(name, &zeroize::Zeroizing::new(to_json(token)?))
+            }
             TokenStore::Env { .. } => Err(env_read_only_error()),
         }
     }
@@ -440,6 +477,7 @@ impl TokenStore {
     /// (never displayed anywhere; only `user`, `kind` and the fact that a
     /// token exists at all ever surface).
     pub fn load(&self) -> Result<Option<StoredToken>, RemoteError> {
+        self.refuse_local()?;
         match self {
             TokenStore::Keyring { account } => match keyring_read(account, KEYRING_TIMEOUT) {
                 KeyringRead::Found(json) => from_json(&json).map(Some),
@@ -447,6 +485,9 @@ impl TokenStore {
                 KeyringRead::Failed(e) => Err(credential_error("load", e)),
             },
             TokenStore::File { path } => load_file(path),
+            TokenStore::Vault { name } => crate::vault::load_text(name)?
+                .map(|json| from_json(&json))
+                .transpose(),
             TokenStore::Env { token, host } => Ok(Some(StoredToken {
                 access_token: token.clone(),
                 host: host.clone(),
@@ -462,19 +503,31 @@ impl TokenStore {
     /// Deletes the saved token. Deleting when nothing is saved is not an
     /// error.
     pub fn delete(&self) -> Result<(), RemoteError> {
+        self.refuse_local()?;
         match self {
             TokenStore::Keyring { account } => keyring_delete(account, KEYRING_TIMEOUT),
             TokenStore::File { path } => delete_file(path),
+            TokenStore::Vault { name } => crate::vault::delete_row(name),
             TokenStore::Env { .. } => Err(env_read_only_error()),
         }
     }
 
-    /// `"keyring"`, `"file"` or `"environment"`, for doctor and status to
-    /// report which backend is in play.
+    /// [`crate::vault::refuse_local`] for the keychain and file arms: in
+    /// vault mode they touch nothing, however the store was built.
+    fn refuse_local(&self) -> Result<(), RemoteError> {
+        match self {
+            TokenStore::Keyring { .. } | TokenStore::File { .. } => crate::vault::refuse_local(),
+            _ => Ok(()),
+        }
+    }
+
+    /// `"keyring"`, `"file"`, `"vault"` or `"environment"`, for doctor and
+    /// status to report which backend is in play.
     pub fn kind(&self) -> &'static str {
         match self {
             TokenStore::Keyring { .. } => "keyring",
             TokenStore::File { .. } => "file",
+            TokenStore::Vault { .. } => "vault",
             TokenStore::Env { .. } => "environment",
         }
     }
@@ -799,6 +852,14 @@ fn from_json(json: &str) -> Result<StoredToken, RemoteError> {
     })
 }
 
+fn from_json_bytes(json: &[u8]) -> Result<StoredToken, RemoteError> {
+    from_json(
+        std::str::from_utf8(json).map_err(|e| RemoteError::Credential {
+            detail: format!("the saved GitHub token is not valid: {e}"),
+        })?,
+    )
+}
+
 /// Writes `token` to `path` as JSON: a sibling temp file, permissioned
 /// owner-only, then renamed into place, so a reader never sees a partial
 /// file and no other local account can read the token in between.
@@ -1031,6 +1092,7 @@ mod tests {
     /// token is saved, not lost, and the returned store says where.
     #[test]
     fn a_keyring_save_past_the_bound_lands_in_the_file_store() {
+        let _vault = crate::vault::testing::guard();
         let dir = tempfile::tempdir().unwrap();
         let token = sample_token();
         let store = TokenStore::save_resolving_bounded(
@@ -1059,6 +1121,7 @@ mod tests {
     /// hanging it.
     #[test]
     fn a_keyring_read_past_the_bound_falls_back_to_the_file_store() {
+        let _vault = crate::vault::testing::guard();
         let dir = tempfile::tempdir().unwrap();
         let token = sample_token();
         let file = TokenStore::file_fallback_for(&TokenIdentity::Instance, dir.path()).unwrap();
@@ -1143,6 +1206,7 @@ mod tests {
 
     #[test]
     fn a_path_escaping_identity_is_refused() {
+        let _vault = crate::vault::testing::guard();
         // `../x` escapes the fallback directory; `alice:ghes.example` would
         // collide with `Personal("alice")` at the host `ghes.example` as the
         // very same keyring account (and names an NTFS data stream on
@@ -1182,6 +1246,7 @@ mod tests {
 
     #[test]
     fn a_refused_name_is_sanitized_before_it_is_quoted_back() {
+        let _vault = crate::vault::testing::guard();
         // The name in this refusal is one the allowlist just rejected, so it
         // carries whatever the caller sent: a terminal escape that would
         // repaint a log line, a newline that would forge a second line, a NUL
@@ -1457,5 +1522,242 @@ mod tests {
         let token_debugged = format!("{token:?}");
         assert!(!token_debugged.contains("SECRET"), "{token_debugged}");
         assert!(token_debugged.contains("<redacted>"), "{token_debugged}");
+    }
+
+    /// A dir the vault branch must leave exactly as it found it.
+    fn assert_empty(dir: &Path) {
+        let left: Vec<_> = std::fs::read_dir(dir)
+            .map(|entries| entries.map(|e| e.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "nothing lands on disk: {left:?}");
+    }
+
+    #[test]
+    fn vault_wins_over_keyring_and_file() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let dir = tempfile::tempdir().unwrap();
+        let mut on_disk = sample_token();
+        on_disk.access_token = "gho_ON_DISK".to_string();
+        TokenStore::file_fallback_for(&TokenIdentity::Instance, dir.path())
+            .unwrap()
+            .save(&on_disk)
+            .unwrap();
+        let before = std::fs::read(dir.path().join(TOKEN_FILE_NAME)).unwrap();
+        let vault = install_memory(key(1));
+
+        let token = sample_token();
+        let alice = TokenIdentity::Personal("alice".to_string());
+        for (identity, host, name) in [
+            (&TokenIdentity::Instance, None, "github"),
+            (
+                &TokenIdentity::Instance,
+                Some("ghes.example"),
+                "github:ghes.example",
+            ),
+            (&alice, None, "github-personal:alice"),
+            (
+                &alice,
+                Some("ghes.example"),
+                "github-personal:alice:ghes.example",
+            ),
+        ] {
+            let saved =
+                TokenStore::save_resolving_bounded(identity, host, dir.path(), &token, |_, _| {
+                    panic!("the keychain is never written while a vault is installed")
+                })
+                .unwrap();
+            assert!(
+                matches!(&saved, TokenStore::Vault { name: n } if n == name),
+                "{saved:?}"
+            );
+            assert_eq!(saved.kind(), "vault");
+            assert_eq!(vault.row(name).unwrap().key_id, key(1).key_id());
+
+            let (store, loaded) =
+                TokenStore::resolve_and_load_bounded(identity, host, dir.path(), |_| {
+                    panic!("the keychain is never read while a vault is installed")
+                })
+                .unwrap();
+            assert!(matches!(&store, TokenStore::Vault { name: n } if n == name));
+            assert_eq!(loaded.unwrap().access_token, token.access_token);
+        }
+
+        let store = TokenStore::Vault {
+            name: "github".to_string(),
+        };
+        assert_eq!(store.load().unwrap().unwrap(), token);
+        store.delete().unwrap();
+        assert!(vault.row("github").is_none());
+        assert_eq!(store.load().unwrap(), None);
+        assert_eq!(
+            std::fs::read(dir.path().join(TOKEN_FILE_NAME)).unwrap(),
+            before,
+            "the file store is neither read for the answer nor written"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_path_escaping_identity_is_refused_before_the_vault() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let dir = tempfile::tempdir().unwrap();
+        let vault = install_memory(key(1));
+        let bad = TokenIdentity::Personal("../alice".to_string());
+        let err =
+            TokenStore::save_resolving_for(&bad, None, dir.path(), &sample_token()).unwrap_err();
+        assert!(matches!(err, RemoteError::Refused(_)), "{err:?}");
+        assert!(TokenStore::resolve_and_load_for(&bad, None, dir.path()).is_err());
+        assert_eq!(vault.calls(), 0);
+    }
+
+    #[test]
+    fn required_without_installed_vault_errors_not_falls_back() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let dir = tempfile::tempdir().unwrap();
+        crate::vault::require();
+
+        let err = TokenStore::resolve_and_load_bounded(
+            &TokenIdentity::Instance,
+            None,
+            dir.path(),
+            |_| panic!("no keychain read in vault mode"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RemoteError::VaultUnavailable), "{err:?}");
+        let err = TokenStore::save_resolving_bounded(
+            &TokenIdentity::Instance,
+            None,
+            dir.path(),
+            &sample_token(),
+            |_, _| panic!("no keychain write in vault mode"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RemoteError::VaultUnavailable), "{err:?}");
+        // The public entry points too, which the test seam would otherwise
+        // send to the file store.
+        assert!(matches!(
+            TokenStore::save_resolving(None, dir.path(), &sample_token()),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert!(matches!(
+            TokenStore::resolve_and_load(None, dir.path()),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert_empty(dir.path());
+
+        // A vault store kept past a clear does not reach a vault either.
+        install_memory(key(1));
+        let store = TokenStore::save_resolving(None, dir.path(), &sample_token()).unwrap();
+        crate::vault::clear();
+        crate::vault::require();
+        assert!(matches!(store.load(), Err(RemoteError::VaultUnavailable)));
+        assert!(matches!(
+            store.save(&sample_token()),
+            Err(RemoteError::VaultUnavailable)
+        ));
+        assert!(matches!(store.delete(), Err(RemoteError::VaultUnavailable)));
+        crate::vault::clear();
+        assert!(matches!(store.load(), Err(RemoteError::VaultUnavailable)));
+        assert_empty(dir.path());
+    }
+
+    #[test]
+    fn refuse_real_keychain_untouched_without_vault() {
+        let _vault = crate::vault::testing::guard();
+        let dir = tempfile::tempdir().unwrap();
+        let token = sample_token();
+        TokenStore::file_fallback_for(&TokenIdentity::Instance, dir.path())
+            .unwrap()
+            .save(&token)
+            .unwrap();
+        let mut reached = false;
+        let (store, loaded) = TokenStore::resolve_and_load_bounded(
+            &TokenIdentity::Instance,
+            None,
+            dir.path(),
+            |_| {
+                reached = true;
+                KeyringRead::Failed("no keychain here".to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(store.kind(), "file");
+        assert_eq!(loaded.unwrap().access_token, token.access_token);
+        // With the seam set the keychain is never asked; without it the
+        // injected keychain is, and no vault is in the way either time.
+        assert_eq!(reached, !refuse_real_keychain());
+
+        let mut wrote = false;
+        let saved = TokenStore::save_resolving_bounded(
+            &TokenIdentity::Instance,
+            None,
+            dir.path(),
+            &token,
+            |_, _| {
+                wrote = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(wrote, !refuse_real_keychain());
+        assert_eq!(
+            saved.kind(),
+            if refuse_real_keychain() {
+                "file"
+            } else {
+                "keyring"
+            }
+        );
+    }
+
+    #[test]
+    fn mismatched_row_reads_absent_and_is_kept() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let dir = tempfile::tempdir().unwrap();
+        let vault = install_memory(key(1));
+        let json = to_json(&sample_token()).unwrap();
+        crate::vault::seal_row(vault.as_ref(), &key(2), "github", json.as_bytes()).unwrap();
+        let kept = vault.row("github").unwrap();
+
+        let (store, loaded) = TokenStore::resolve_and_load_bounded(
+            &TokenIdentity::Instance,
+            None,
+            dir.path(),
+            |_| panic!("no keychain read while a vault is installed"),
+        )
+        .unwrap();
+        assert_eq!(store.kind(), "vault");
+        assert_eq!(
+            loaded, None,
+            "a row sealed with another key reads as absent"
+        );
+        assert_eq!(store.load().unwrap(), None);
+        assert_eq!(vault.row("github"), Some(kept), "and is kept as it was");
+        assert_eq!(vault.deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_empty(dir.path());
+    }
+
+    #[test]
+    fn env_token_still_wins_over_vault() {
+        use crate::vault::testing::{guard, install_memory, key};
+        let _vault = guard();
+        let vault = install_memory(key(1));
+        crate::vault::save_text("github", &to_json(&sample_token()).unwrap()).unwrap();
+        let calls = vault.calls();
+        let store = TokenStore::env("ghp_FROM_ENV", None);
+        assert_eq!(store.load().unwrap().unwrap().access_token, "ghp_FROM_ENV");
+        assert!(store.save(&sample_token()).is_err());
+        assert!(store.delete().is_err());
+        assert_eq!(vault.calls(), calls, "the environment never asks the vault");
+        assert!(vault.row("github").is_some());
+
+        // Nor when the vault is required and missing.
+        crate::vault::clear();
+        crate::vault::require();
+        assert_eq!(store.load().unwrap().unwrap().access_token, "ghp_FROM_ENV");
     }
 }

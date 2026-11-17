@@ -206,6 +206,12 @@ pub async fn connect_server(
         Err(other) => return Err(other.into()),
     }
     let loaded = crate::cmd::load(None)?;
+    // On Postgres the sign-in is sealed in the database by this process,
+    // beside the daemon that owns it: where it is written is decided before
+    // anyone signs in, and that daemon reads it again at the reload below.
+    // Away from that daemon the command is refused: the daemon keeps
+    // sources.json and the vault together.
+    crystalline_service::route_server_sign_in(&loaded.effective).await?;
     let local = local_domains_of(&loaded.effective);
     let dir = remote_dir()?;
     let connected = if token {
@@ -433,7 +439,10 @@ pub async fn disconnect_server(target: String, json: bool) -> anyhow::Result<()>
     // The overlay load first, like every other command: a refused environment
     // (both forms of a secret set) surfaces here instead of reading as unset
     // below.
-    crate::cmd::load(None)?;
+    let loaded = crate::cmd::load(None)?;
+    // On Postgres the sign-in is sealed in the database, as for `connect`,
+    // and changed only beside the daemon that owns it.
+    crystalline_service::route_server_sign_in(&loaded.effective).await?;
     let dir = remote_dir()?;
     let Some(gone) = crystalline_remote::disconnect(&dir, &target).await? else {
         let taken = crystalline_remote::load_sources(&dir)
@@ -711,6 +720,18 @@ async fn ask_one(record: SourceRecord, dir: std::path::PathBuf) -> SourceRow {
     if let Some(cached) = read_cached(&record.host_dir(&dir), ROUTING_FILE, &record.account) {
         row.fetched_at = Some(cached.fetched_at.to_rfc3339());
         row.failure = cached.last_failure;
+    }
+    // On Postgres the sign-in is sealed in the database, which a report
+    // never opens: the source is not asked, and no local store is read.
+    if !record.from_env
+        && crystalline_remote::vault::engaged()
+        && crystalline_remote::vault::installed_key_id().is_none()
+    {
+        row.credential_store = Some("vault".to_string());
+        row.error = Some(
+            "its sign-in is sealed in the database, so only the active instance asks it; run crystalline status there".to_string(),
+        );
+        return row;
     }
     let timed_out = RemoteFailure::TimedOut {
         source: record.name.clone(),

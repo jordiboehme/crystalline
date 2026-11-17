@@ -1043,7 +1043,13 @@ pub fn with_effective_share_identity(
 ) -> Vec<SettingView> {
     for view in &mut views {
         if view.key == "github.share_identity" && view.source == SettingSource::Default {
-            view.value = effective.mode.as_str().to_string();
+            // A default that would depend on an App sealed in the database
+            // was not checked, and is said so instead of naming a mode.
+            view.value = if effective.is_checked() {
+                effective.mode.as_str().to_string()
+            } else {
+                effective.reason_text().to_string()
+            };
         }
     }
     views

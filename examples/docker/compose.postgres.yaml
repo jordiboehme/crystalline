@@ -1,10 +1,16 @@
-# Crystalline on PostgreSQL - the accounts, sessions, tokens and the search
-# index live in the database, so a redeploy keeps everyone signed in.
+# Crystalline on PostgreSQL - the accounts, sessions, tokens, settings, sealed
+# secrets and the search index live in the database, so a redeploy keeps
+# everyone signed in.
 #
 # The `db` service runs Postgres with pgvector; Crystalline points at it purely
 # through CRYSTALLINE_DATABASE_BACKEND and CRYSTALLINE_DATABASE_URL, no mounted
-# config file needed. Exactly one Crystalline instance is active on a database
-# (or on a schema, see CRYSTALLINE_DATABASE_SCHEMA). A second instance waits as
+# config file needed. The GitHub tokens, a saved GitHub App and server sign-ins
+# are sealed in the database with the key in CRYSTALLINE_SECRET_KEY, which is
+# required on Postgres. Make one and keep it safe, it cannot be recovered:
+#   export CRYSTALLINE_SECRET_KEY="$(openssl rand -base64 32)"
+#
+# Exactly one Crystalline instance is active on a database (or on a schema,
+# see CRYSTALLINE_DATABASE_SCHEMA). A second instance waits as
 # a standby, with no time limit, and takes over when the active one stops. A
 # commented standby is included below. Several active instances on one database
 # are not supported. The accounts start empty: sign in once, with the first
@@ -78,6 +84,9 @@ services:
       CRYSTALLINE_AUTH_MCP: "true"
       CRYSTALLINE_DATABASE_BACKEND: postgres
       CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
+      # Required on Postgres. Prefer CRYSTALLINE_SECRET_KEY_FILE with a Docker
+      # secret where you can.
+      CRYSTALLINE_SECRET_KEY: ${CRYSTALLINE_SECRET_KEY:?set CRYSTALLINE_SECRET_KEY, for example with openssl rand -base64 32}
     depends_on:
       db:
         condition: service_healthy
@@ -103,6 +112,7 @@ services:
   #     CRYSTALLINE_AUTH_MCP: "true"
   #     CRYSTALLINE_DATABASE_BACKEND: postgres
   #     CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
+  #     CRYSTALLINE_SECRET_KEY: ${CRYSTALLINE_SECRET_KEY:?set CRYSTALLINE_SECRET_KEY}
   #   depends_on:
   #     db:
   #       condition: service_healthy

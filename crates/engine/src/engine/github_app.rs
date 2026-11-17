@@ -208,8 +208,15 @@ impl AppHome {
     }
 
     /// Whether an App may be saved here, from the file and the keychain
-    /// marker alone (no keychain read).
+    /// marker alone (no keychain read). While this process keeps its secrets
+    /// in the vault, the state folder is not looked at and the vault is not
+    /// asked either (its callers sit on the request path, and a vault call
+    /// is a database round trip): the answer is "may be saved", so a caller
+    /// fails closed until the App load settles the slot.
     pub fn maybe_saved(&self) -> bool {
+        if crystalline_remote::vault::engaged() {
+            return true;
+        }
         if let AppStore::File { path } = AppStore::file_fallback(&self.dir)
             && path.exists()
         {
@@ -224,8 +231,24 @@ impl AppHome {
     /// environment, the keychain marker for this host and the App file. No
     /// keychain read, so a report may ask it. What the CLI feeds
     /// [`EffectiveShareIdentity::resolve`] when it has no engine.
+    ///
+    /// On Postgres the App is sealed in the database. Without an installed
+    /// vault (a CLI report) it is not read and the answer is
+    /// [`GithubAppPresence::Sealed`]; with one (a CLI command that installed
+    /// it) the vault is asked, one database round trip, so this is not for
+    /// a request path. A vault that does not answer leaves it
+    /// [`GithubAppPresence::Sealed`] (not checked).
     pub fn presence(&self, overlay: &EnvOverlay) -> GithubAppPresence {
-        if overlay.github_app(self.api_url.as_deref()).is_some() || self.maybe_saved() {
+        if overlay.github_app(self.api_url.as_deref()).is_some() {
+            return GithubAppPresence::Configured;
+        }
+        if crystalline_remote::vault::engaged() {
+            if crystalline_remote::vault::installed_key_id().is_none() {
+                return GithubAppPresence::Sealed;
+            }
+            return presence_from_lookup(self.lookup());
+        }
+        if self.maybe_saved() {
             GithubAppPresence::Configured
         } else {
             GithubAppPresence::None
@@ -238,7 +261,9 @@ impl AppHome {
         if let Some(seam) = &self.seam {
             return (seam.lookup)();
         }
-        if self.file_only {
+        // In vault mode the store lookup goes to the vault first, whatever
+        // `file_only` says: the file is not where the App lives.
+        if self.file_only && !crystalline_remote::vault::engaged() {
             let store = AppStore::file_fallback(&self.dir);
             let credentials = store.load()?;
             return Ok(AppLookup {
@@ -467,6 +492,11 @@ impl AppHome {
             return Err(EngineError::Conflict(APP_FROM_ENV.to_string()));
         }
         let found = self.lookup()?;
+        // A vault holds the App alone: no file copy or marker to clear.
+        if matches!(found.store, AppStore::Vault { .. }) {
+            found.store.delete_marked(&self.dir)?;
+            return Ok(AppRemoval::default());
+        }
         let file = AppStore::file_fallback(&self.dir);
         match found.keychain_failed {
             None => {
@@ -488,6 +518,17 @@ impl AppHome {
                 })
             }
         }
+    }
+}
+
+/// What a vault lookup of the App says about its presence: saved, not saved,
+/// or not checked ([`GithubAppPresence::Sealed`]) when the vault did not
+/// answer.
+pub fn presence_from_lookup(lookup: StdResult<AppLookup, RemoteError>) -> GithubAppPresence {
+    match lookup {
+        Ok(lookup) if lookup.credentials.is_some() => GithubAppPresence::Configured,
+        Ok(_) => GithubAppPresence::None,
+        Err(_) => GithubAppPresence::Sealed,
     }
 }
 

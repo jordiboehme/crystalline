@@ -256,6 +256,12 @@ pub const RESERVED_VARS: &[&str] = &[
     // because its length floor is a serve rule, so reserved here.
     "CRYSTALLINE_SETUP_TOKEN",
     "CRYSTALLINE_SETUP_TOKEN_FILE",
+    // The key that seals the secrets kept in Postgres
+    // (`crystalline_remote::sealed::SealKey::from_env`), plain or as a `_FILE`
+    // path for a Docker secret. Read straight from the environment, never
+    // through the settings registry, so reserved here.
+    "CRYSTALLINE_SECRET_KEY",
+    "CRYSTALLINE_SECRET_KEY_FILE",
     // Read straight from the environment when a store opens
     // (`crystalline_index::reader`): `0` turns the read connections off.
     crystalline_index::reader::READ_CONNECTIONS_ENV,
@@ -2353,6 +2359,130 @@ mod tests {
     }
 
     const APP_KEY: &str = include_str!("../../remote/tests/fixtures/app-key-pkcs1.pem");
+
+    fn vault_app(app_id: u64) -> AppCredentials {
+        AppCredentials {
+            app_id,
+            client_id: "Iv23liVAULT".to_string(),
+            client_secret: None,
+            private_key: APP_KEY.to_string(),
+            webhook_secret: None,
+            slug: None,
+            host: "github.com".to_string(),
+        }
+    }
+
+    /// Env > Vault: the environment's App wins while the vault holds a saved
+    /// one, and the vault is not asked; without the environment the vault's
+    /// App is the one. Nothing is read from or written to the state folder,
+    /// even for a home that is file-only.
+    #[test]
+    fn env_app_wins_over_a_vault_row() {
+        use crate::engine::AppHome;
+        use crate::test_vault::{guard, install_memory, key};
+        let _guard = guard();
+        let vault = install_memory(key(7));
+        let dir = tempfile::tempdir().unwrap();
+        crystalline_remote::AppStore::lookup(None, dir.path())
+            .unwrap()
+            .store
+            .save(&vault_app(99))
+            .unwrap();
+        assert!(vault.has("github-app"));
+        let env = overlay_reading(
+            &[
+                ("CRYSTALLINE_GITHUB_APP_ID", "4242"),
+                ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23liSAMPLE"),
+                ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", APP_KEY),
+            ],
+            &[],
+        )
+        .unwrap();
+        for file_only in [true, false] {
+            let home = AppHome::new(None, dir.path().to_path_buf(), file_only);
+            let calls = vault.calls();
+            let app = home.configured(&env).unwrap().expect("the env App");
+            assert_eq!(app.app_id, 4242);
+            assert_eq!(vault.calls(), calls, "the vault is not asked");
+            let saved = home
+                .configured(&EnvOverlay::default())
+                .unwrap()
+                .expect("the vault's App");
+            assert_eq!(saved.app_id, 99);
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// In vault mode the App home never reads or writes the state folder: a
+    /// leftover App file and keychain marker are not read, presence answers
+    /// "may be saved" without asking the vault, the store lock writes no
+    /// file and a remove deletes the vault row and leaves the leftovers
+    /// alone.
+    #[test]
+    fn app_home_in_vault_mode_leaves_the_state_folder_alone() {
+        use crate::engine::AppHome;
+        use crate::test_vault::{guard, install_memory, key};
+        let _guard = guard();
+        let dir = tempfile::tempdir().unwrap();
+        crystalline_remote::AppStore::file_fallback(dir.path())
+            .save_marked(&vault_app(1), dir.path())
+            .unwrap();
+        std::fs::write(dir.path().join("github-app.present"), "github.com").unwrap();
+        let leftovers = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = leftovers(dir.path());
+        let vault = install_memory(key(7));
+        let home = AppHome::new(None, dir.path().to_path_buf(), true);
+        assert!(
+            home.lookup().unwrap().credentials.is_none(),
+            "the leftover file is not read"
+        );
+        drop(crystalline_remote::AppStoreLock::acquire(dir.path()).unwrap());
+        home.lookup().unwrap().store.save(&vault_app(2)).unwrap();
+        assert_eq!(
+            home.remove(&EnvOverlay::default()).unwrap(),
+            Default::default()
+        );
+        assert!(!vault.has("github-app"), "the vault row is deleted");
+        assert_eq!(
+            leftovers(dir.path()),
+            before,
+            "the state folder is untouched"
+        );
+    }
+
+    /// In vault mode `maybe_saved` answers without any I/O: no vault call
+    /// (its callers are on the request path), no state folder read, and
+    /// "may be saved" whether a row exists or not, so a caller fails closed
+    /// until the App load settles.
+    #[test]
+    fn maybe_saved_in_vault_mode_makes_no_vault_call() {
+        use crate::engine::AppHome;
+        use crate::test_vault::{guard, install_memory, key};
+        let _guard = guard();
+        let vault = install_memory(key(7));
+        let dir = tempfile::tempdir().unwrap();
+        let home = AppHome::new(None, dir.path().to_path_buf(), false);
+        assert!(home.maybe_saved());
+        assert_eq!(vault.calls(), 0, "the vault was asked");
+        // `presence` is off the request path and asks the vault: no App is
+        // sealed, so none is configured.
+        assert!(
+            home.presence(&EnvOverlay::default())
+                == crystalline_core::config::GithubAppPresence::None
+        );
+        assert!(vault.calls() > 0, "presence asks the vault");
+        crystalline_remote::vault::clear();
+        crystalline_remote::vault::require();
+        assert!(home.maybe_saved(), "a required vault fails closed too");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn env_app_needs_id_client_id_and_key_together() {

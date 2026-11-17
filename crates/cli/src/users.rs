@@ -16,7 +16,11 @@
 //! command here writes them beside the instance that owns it, as a second
 //! short-lived writer (spec section L rule 4): the instance sees a change on
 //! its next lookup, and accounts tables behind this binary are migrated
-//! only by an owner.
+//! only by an owner. `add`, `disable` and `remove` also delete the person's
+//! GitHub token, which is sealed in the database there (spec section D): a
+//! daemon of this machine deletes it, or the command claims the free
+//! database and deletes it with the key; without either it is refused
+//! before any account is written ([`crystalline_service::route_secret_command`]).
 //!
 //! Except on Windows, where the database engine has no cross-process
 //! coordination on its default IO backend yet, so a running daemon holds the
@@ -31,6 +35,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crystalline_core::config::registration::{
     DOMAIN_NAME_RULE, MAX_DOMAIN_NAME_CHARS, validate_domain_name,
 };
+use crystalline_service::SecretRoute;
 use crystalline_service::rest::{AuthStore, LINKED_BY_CLI, ReflectionLevel, Role, User};
 use crystalline_service::write_list_matches;
 
@@ -44,6 +49,15 @@ use crate::UsersCommand;
 /// confirm in one human line.
 pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
     let loaded = crate::cmd::load(None)?;
+    // `add`, `disable` and `remove` also delete a GitHub token, which on
+    // Postgres is sealed in the database. Where that happens is decided
+    // before any account is written: a refusal leaves nothing half done.
+    let route = match &command {
+        UsersCommand::Add { .. } | UsersCommand::Disable { .. } | UsersCommand::Remove { .. } => {
+            crystalline_service::route_secret_command(&loaded.effective).await?
+        }
+        _ => SecretRoute::Local,
+    };
     let store = crystalline_service::open_accounts_for_cli(&loaded.effective).await?;
 
     match command {
@@ -66,7 +80,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             // Checked before anything is created, so a bad entry leaves no
             // account behind.
             let writes = writes.as_deref().map(parse_write_list).transpose()?;
-            clear_name_for_new_account(&store, &name).await?;
+            clear_name_for_new_account(&store, &name, &route).await?;
             let added = match &mcp_token {
                 // An account for an agent: no password to ask for, and the
                 // token is issued in the same transaction as the account.
@@ -220,8 +234,17 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             println!("'{}' now has Reflection {level}.", stored_name(&name));
         }
         UsersCommand::Disable { name } => {
+            // A sealed token goes first: an account is never disabled while
+            // its token stays, and a failed delete changes nothing. The
+            // disabling is checked before, so a refused one deletes nothing.
+            if sealed(&route) {
+                store.check_change_of(&name, "disable", true).await?;
+                sweep_personal_credential(&name, &route).await?;
+            }
             store.set_disabled(&name, true).await?;
-            sweep_personal_credential(&name).await;
+            if !sealed(&route) {
+                sweep_personal_credential(&name, &route).await?;
+            }
             println!(
                 "Disabled '{}' and revoked its sessions. Enabling it again does not bring them back.",
                 stored_name(&name)
@@ -430,9 +453,17 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             }
         }
         UsersCommand::Remove { name, force } => {
+            // As for `disable`: a sealed token goes before the account,
+            // once the removal is known to pass.
+            if sealed(&route) {
+                store.check_change_of(&name, "remove", !force).await?;
+                sweep_personal_credential(&name, &route).await?;
+            }
             if force {
                 store.remove_user_force(&name).await?;
-                sweep_personal_credential(&name).await;
+                if !sealed(&route) {
+                    sweep_personal_credential(&name, &route).await?;
+                }
                 println!(
                     "Removed '{}' and every session it held (forced). The installation \
                      may now have no admin; add one with `crystalline users add <name> --role admin`.",
@@ -440,7 +471,9 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 );
             } else {
                 store.remove_user(&name).await?;
-                sweep_personal_credential(&name).await;
+                if !sealed(&route) {
+                    sweep_personal_credential(&name, &route).await?;
+                }
                 println!(
                     "Removed '{}' and every session it held.",
                     stored_name(&name)
@@ -480,14 +513,26 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
 /// leaving" case - the daemon's process cache would otherwise go on holding a
 /// token for an account that no longer exists until it restarted. A daemon that
 /// refuses the message is a warning, because it may go on writing on that token.
-async fn sweep_personal_credential(name: &str) {
+///
+/// On Postgres the token is sealed in the database, and the sweep is no longer
+/// best effort: the daemon that owns the database deletes it, or this command
+/// does under its own claim of the database ([`SecretRoute`]). An error then
+/// means the token may still be there, and `Ok` that none is left.
+async fn sweep_personal_credential(name: &str, route: &SecretRoute) -> Result<()> {
     let account = stored_name(name);
     if !crystalline_remote::valid_identity_name(&account) {
         tracing::debug!("'{account}' cannot address a credential; nothing to forget");
-        return;
+        return Ok(());
     }
     let identity = crystalline_remote::TokenIdentity::Personal(account);
     let host = credential_host();
+    match route {
+        SecretRoute::Local => {}
+        SecretRoute::Daemon => return crate::cmd::delete_through_daemon(&identity).await,
+        SecretRoute::Owned(_) | SecretRoute::Beside => {
+            return crate::cmd::delete_sealed_credential(&identity, host.as_deref());
+        }
+    }
     match crystalline_core::config::origins_state_dir() {
         Ok(dir) => crate::cmd::forget_credential(&identity, host.as_deref(), &dir),
         Err(e) => tracing::debug!("could not resolve the state directory to sweep: {e}"),
@@ -499,6 +544,12 @@ async fn sweep_personal_credential(name: &str) {
             stored_name(name)
         );
     }
+    Ok(())
+}
+
+/// Whether `route` keeps the GitHub tokens sealed in the database.
+fn sealed(route: &SecretRoute) -> bool {
+    !matches!(route, SecretRoute::Local)
 }
 
 /// The host a personal credential is filed under, from the same config the
@@ -526,7 +577,11 @@ fn credential_host() -> Option<String> {
 /// running daemon told. Anything that cannot be read or deleted refuses: nothing
 /// may stand on a token the store could not answer about. A name that holds an
 /// account, or that no account can have, is left alone, so the insert answers it.
-async fn clear_name_for_new_account(store: &AuthStore, name: &str) -> Result<()> {
+async fn clear_name_for_new_account(
+    store: &AuthStore,
+    name: &str,
+    route: &SecretRoute,
+) -> Result<()> {
     if crystalline_service::rest::normalize_new_account_name(name).is_err()
         || store.user(name).await?.is_some()
     {
@@ -551,7 +606,13 @@ async fn clear_name_for_new_account(store: &AuthStore, name: &str) -> Result<()>
         );
     }
     store.end_overlay_grants_of_owner(&account).await?;
-    sweep_personal_credential(name).await;
+    // A sealed token: the sweep's `Ok` already says no token is left.
+    if sealed(route) {
+        return sweep_personal_credential(name, route).await.map_err(|e| {
+            anyhow!("a GitHub token saved under '{account}' could not be deleted, so the account was not made: {e:#}")
+        });
+    }
+    sweep_personal_credential(name, route).await?;
     if !crystalline_remote::valid_identity_name(&account) {
         return Ok(());
     }

@@ -92,7 +92,8 @@ pub use owner::{
     Acquired, ConfigDoc, EXIT_MARGIN, FENCE_DETECT_MAX, FenceState, GRACE, LOCK_IDLE_TIMEOUT,
     LOCK_STATEMENT_TIMEOUT, OwnerIdentity, OwnerRow, OwnerTimings, PROBE_PERIOD, PROBE_RETRIES,
     PROBE_TIMEOUT, PgOwner, ProbeAction, ProbeOutcome, ProbeState, SIDE_STATEMENT_TIMEOUT,
-    STANDBY_POLL, SideChannel, StandbyStatus, TERMINATE_WAIT_MS, TIMING_SCALE_ENV, TakeoverReport,
+    STANDBY_POLL, SecretRow, SecretSummary, SecretTable, SideChannel, StandbyStatus,
+    TERMINATE_WAIT_MS, TIMING_SCALE_ENV, TakeoverReport, VAULT_TIMEOUT, count_sealed_secrets,
     probe_owner, read_config_document, read_owner_row, timing_scale,
 };
 pub use session::{

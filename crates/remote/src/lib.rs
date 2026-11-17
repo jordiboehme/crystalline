@@ -26,6 +26,7 @@ pub mod mounts;
 pub mod ops;
 pub mod provider;
 pub mod reflections_backup;
+pub mod sealed;
 pub mod server_client;
 pub mod server_token;
 pub mod sign_in;
@@ -37,6 +38,7 @@ pub mod text;
 pub mod token;
 pub mod tree;
 mod unanswered;
+pub mod vault;
 
 pub use error::RemoteError;
 pub use fanout::{
@@ -99,6 +101,7 @@ pub use text::{ROUTING_BULLET_CHARS, ROUTING_BULLETS_MAX, one_line, routing_bull
 pub use token::{
     MAX_IDENTITY_NAME_BYTES, StoredToken, TokenIdentity, TokenStore, valid_identity_name,
 };
+pub use vault::{SealedRow, SecretVault, VaultSummary};
 
 /// Where a served instance answers the control protocol for a connected
 /// Crystalline: the server mounts its route here and the client posts here.
