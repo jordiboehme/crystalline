@@ -948,8 +948,19 @@ fn render_durable_state(out: &mut String, block: &serde_json::Value) {
         );
     }
     let secrets = &block["secrets"];
+    let key_ids: Vec<&str> = secrets["key_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str())
+        .collect();
+    let keys = match key_ids.as_slice() {
+        [] => String::new(),
+        [one] => format!(" with key {one}"),
+        many => format!(" with keys {}", many.join(", ")),
+    };
     let sealed = match secrets["sealed"].as_u64() {
-        Some(n) => format!("{n} sealed in the database"),
+        Some(n) => format!("{n} sealed in the database{keys}"),
         None => format!(
             "not counted ({})",
             secrets["error"].as_str().unwrap_or("unknown")
@@ -961,6 +972,17 @@ fn render_durable_state(out: &mut String, block: &serde_json::Value) {
         "no key is configured here, so a GitHub token changes only on the active instance"
     };
     let _ = writeln!(out, "  secrets: {sealed}; {key}");
+    let app = match block["github_app"]["source"].as_str() {
+        Some("env") => "from the environment".to_string(),
+        Some("vault") => "sealed in the database".to_string(),
+        Some("none") => "none".to_string(),
+        Some("unread") => format!(
+            "not read ({})",
+            block["github_app"]["error"].as_str().unwrap_or("unknown")
+        ),
+        _ => "sealed in the database (not checked)".to_string(),
+    };
+    let _ = writeln!(out, "  github app: {app}");
     for warning in block["warnings"].as_array().into_iter().flatten() {
         let _ = writeln!(out, "  [warning] {}", text(warning));
     }

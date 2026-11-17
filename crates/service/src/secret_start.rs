@@ -196,8 +196,8 @@ async fn install_checked(
     check_key_ids(&summary, &key_id, database)?;
     vault::install(pg_vault, key);
     tracing::info!(
-        "secrets sealed in postgres with key {key_id} ({} rows)",
-        summary.rows
+        "secrets sealed in postgres with key {key_id} ({})",
+        crate::durable::rows(summary.rows as u64)
     );
     Ok(summary)
 }

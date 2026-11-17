@@ -119,13 +119,17 @@ impl ConfigState {
 }
 
 /// What a report says about the sealed secrets (spec section D): whether
-/// this process has a key and how many rows the database holds. Never a row
-/// name, and a missing key fails nothing.
+/// this process has a key, the ids of the keys and how many rows the
+/// database holds. Never a row name, and a missing key fails nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SecretsState {
     /// Whether `CRYSTALLINE_SECRET_KEY` or `CRYSTALLINE_SECRET_KEY_FILE` is
-    /// set for this process. The key is not read.
+    /// set for this process. A report does not read the key.
     pub key_configured: bool,
+    /// The ids of the keys the secrets are sealed with: the key of the
+    /// instance that installed its vault, or for a report the ids the
+    /// sealed rows record. An id, never the key.
+    pub key_ids: Vec<String>,
     /// How many sealed secrets the database holds, `None` when not counted.
     pub sealed: Option<u64>,
     /// Why they could not be counted.
@@ -133,12 +137,20 @@ pub struct SecretsState {
 }
 
 impl SecretsState {
-    fn line(&self) -> String {
-        let rows = match (&self.sealed, &self.error) {
-            (Some(n), _) => format!("{n} sealed in the database"),
+    fn rows_words(&self) -> String {
+        let keys = match self.key_ids.as_slice() {
+            [] => String::new(),
+            [one] => format!(" with key {one}"),
+            many => format!(" with keys {}", many.join(", ")),
+        };
+        match (&self.sealed, &self.error) {
+            (Some(n), _) => format!("{n} sealed in the database{keys}"),
             (None, Some(e)) => format!("not counted ({e})"),
             (None, None) => "not counted".to_string(),
-        };
+        }
+    }
+
+    fn line(&self) -> String {
         let key = if self.key_configured {
             "a key is configured".to_string()
         } else {
@@ -147,14 +159,94 @@ impl SecretsState {
                 crystalline_remote::sealed::KEY_ENV
             )
         };
-        format!("Secrets: {rows}; {key}")
+        format!("Secrets: {}; {key}", self.rows_words())
+    }
+
+    /// The clause of the start line: the key this instance seals with and
+    /// how many rows the database holds.
+    fn startup_words(&self) -> String {
+        match (self.key_ids.as_slice(), self.sealed) {
+            ([id], Some(n)) => format!("secrets sealed in postgres with key {id} ({})", rows(n)),
+            ([id], None) => format!("secrets sealed in postgres with key {id}"),
+            _ => format!("secrets {}", self.rows_words()),
+        }
     }
 
     fn to_json(&self) -> Value {
         json!({
             "key_configured": self.key_configured,
+            "key_ids": self.key_ids,
             "sealed": self.sealed,
             "error": self.error,
+        })
+    }
+}
+
+/// `n` rows, in words.
+pub(crate) fn rows(n: u64) -> String {
+    match n {
+        1 => "1 row".to_string(),
+        n => format!("{n} rows"),
+    }
+}
+
+/// Where the GitHub App of an instance on Postgres comes from (spec section
+/// F). There is no App file there: a saved App is sealed in the database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AppSource {
+    /// The `CRYSTALLINE_GITHUB_APP_*` variables.
+    Env,
+    /// A row of the sealed vault, read by the instance that has the key.
+    Vault,
+    /// No App is configured.
+    #[default]
+    None,
+    /// A report without the vault: a saved App would be sealed in the
+    /// database, which the report does not read.
+    NotChecked,
+    /// The vault could not be read.
+    Unread(String),
+}
+
+impl AppSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AppSource::Env => "env",
+            AppSource::Vault => "vault",
+            AppSource::None => "none",
+            AppSource::NotChecked => "not_checked",
+            AppSource::Unread(_) => "unread",
+        }
+    }
+
+    fn words(&self) -> String {
+        match self {
+            AppSource::Env => "from the environment".to_string(),
+            AppSource::Vault => "sealed in the database".to_string(),
+            AppSource::None => "none".to_string(),
+            AppSource::NotChecked => "sealed in the database (not checked)".to_string(),
+            AppSource::Unread(e) => format!("not read ({e})"),
+        }
+    }
+
+    /// The clause of the start line.
+    fn startup_words(&self) -> String {
+        match self {
+            AppSource::Env => "GitHub App from env".to_string(),
+            AppSource::Vault => "GitHub App from vault".to_string(),
+            AppSource::None => "GitHub App none".to_string(),
+            AppSource::NotChecked => "GitHub App not checked".to_string(),
+            AppSource::Unread(e) => format!("GitHub App not read ({e})"),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "source": self.as_str(),
+            "error": match self {
+                AppSource::Unread(e) => Some(e.as_str()),
+                _ => None,
+            },
         })
     }
 }
@@ -179,6 +271,8 @@ pub struct DurableStateReport {
     pub config: ConfigState,
     /// The key and the sealed secrets.
     pub secrets: SecretsState,
+    /// Where the GitHub App comes from.
+    pub github_app: AppSource,
     /// One sentence per thing left behind or lost, in the order of the spec.
     pub warnings: Vec<String>,
 }
@@ -200,6 +294,50 @@ pub(crate) fn leftover_accounts_warning(database: &str) -> Option<String> {
     })
 }
 
+/// The sentence for credential files an earlier run on this disk left in
+/// the state directory, `None` when there are none: GitHub token files and
+/// the App file or marker under `origins/`, and the sign-in of each
+/// connected server under `remote/`. Only their names are looked at; their
+/// content is never read. On Postgres every secret is sealed in the
+/// database, so none of these is read.
+pub(crate) fn leftover_credentials_warning(database: &str) -> Option<String> {
+    let state_dir = crystalline_core::config::state_dir().ok()?;
+    leftover_credential_files(&state_dir).map(|files| {
+        format!(
+            "the credential files {} are not read while Postgres is configured: the GitHub tokens, a saved GitHub App and the server sign-ins are sealed in the database {database}. Link GitHub again and sign in to the servers again where needed, then move the files away",
+            files.join(", ")
+        )
+    })
+}
+
+/// The credential files under `state_dir`, sorted, `None` when there are
+/// none. Read from the directory entries alone.
+fn leftover_credential_files(state_dir: &Path) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    let origins = state_dir.join("origins");
+    for entry in std::fs::read_dir(&origins).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let credential = (name.starts_with("github-token") && name.ends_with(".json"))
+            || name == "github-app.json"
+            || name == "github-app.present";
+        if credential && entry.path().is_file() {
+            found.push(entry.path().display().to_string());
+        }
+    }
+    let remote = state_dir.join("remote");
+    for entry in std::fs::read_dir(&remote).into_iter().flatten().flatten() {
+        let file = entry
+            .path()
+            .join(crystalline_remote::server_token::CREDENTIAL_FILE);
+        if file.is_file() {
+            found.push(file.display().to_string());
+        }
+    }
+    found.sort();
+    (!found.is_empty()).then_some(found)
+}
+
 impl DurableStateReport {
     /// The one info line a Postgres start logs.
     pub fn startup_line(&self) -> String {
@@ -212,10 +350,12 @@ impl DurableStateReport {
             None => format!("owner of postgres {}", self.database),
         };
         format!(
-            "durable state: {owner}; accounts in {}; {}; {}",
+            "durable state: {owner}; accounts in {}; {}; {}; {}; {}",
             self.accounts.as_str(),
             self.config.document_words(),
-            self.config.base_words()
+            self.config.base_words(),
+            self.secrets.startup_words(),
+            self.github_app.startup_words()
         )
     }
 
@@ -256,6 +396,7 @@ impl DurableStateReport {
             self.config.base_words()
         ));
         lines.push(self.secrets.line());
+        lines.push(format!("GitHub App: {}", self.github_app.words()));
         lines.extend(
             self.config
                 .base_domains_line()
@@ -303,6 +444,7 @@ impl DurableStateReport {
                 "base_domains": self.config.base_domains,
             },
             "secrets": self.secrets.to_json(),
+            "github_app": self.github_app.to_json(),
             "warnings": self.warnings,
         })
     }
@@ -339,29 +481,36 @@ pub async fn durable_state_for_command(
     let config = config_state_for_command(cfg, config_path).await;
     let mut report = report_of(cfg, role, database, owner_state, owner, config);
     report.secrets = secrets_state_for_command(cfg).await;
+    report.github_app = app_source_for_command(cfg);
     Some(report)
 }
 
-/// The sealed secrets as a command sees them: counted on a lock-free probe
-/// connection, which reads no row and no name, and whether this process has
-/// a key. A count that fails is said in the state and fails nothing.
+/// The sealed secrets as a command sees them: summarized on a lock-free
+/// probe connection, which reads no name and no sealed byte, and whether
+/// this process has a key. A count that fails is said in the state and
+/// fails nothing.
 #[cfg(feature = "postgres")]
 async fn secrets_state_for_command(cfg: &GlobalConfig) -> SecretsState {
     let key_configured = crate::secret_start::key_variable_set();
-    let counted = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
-        Ok(target) => crystalline_index::postgres::count_sealed_secrets(&target)
+    let summary = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
+        Ok(target) => crystalline_index::postgres::summarize_sealed_secrets(&target)
             .await
             .map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
-    let (sealed, error) = match counted {
-        Ok(n) => (Some(n), None),
-        Err(e) => (None, Some(e)),
-    };
-    SecretsState {
-        key_configured,
-        sealed,
-        error,
+    match summary {
+        Ok(summary) => SecretsState {
+            key_configured,
+            key_ids: summary.key_ids,
+            sealed: Some(summary.rows),
+            error: None,
+        },
+        Err(e) => SecretsState {
+            key_configured,
+            key_ids: Vec::new(),
+            sealed: None,
+            error: Some(e),
+        },
     }
 }
 
@@ -369,8 +518,24 @@ async fn secrets_state_for_command(cfg: &GlobalConfig) -> SecretsState {
 async fn secrets_state_for_command(_cfg: &GlobalConfig) -> SecretsState {
     SecretsState {
         key_configured: crate::secret_start::key_variable_set(),
+        key_ids: Vec::new(),
         sealed: None,
         error: Some("this build has no Postgres backend".to_string()),
+    }
+}
+
+/// Where the App comes from, as a command sees it: the environment, or
+/// else not checked. A report has no vault, and the owner decision keeps a
+/// process without the key off the vault, so a saved App is not looked up.
+fn app_source_for_command(cfg: &GlobalConfig) -> AppSource {
+    let api_url = cfg.github.as_ref().and_then(|g| g.api_url.as_deref());
+    let env_app = crate::EnvOverlay::from_process_env()
+        .ok()
+        .and_then(|overlay| overlay.github_app(api_url));
+    if env_app.is_some() {
+        AppSource::Env
+    } else {
+        AppSource::NotChecked
     }
 }
 
@@ -409,14 +574,16 @@ async fn read_document_state(_cfg: &GlobalConfig) -> DocumentState {
 }
 
 /// The report of the instance that owns `database`, for its start: the
-/// owner row it just wrote, read back, and `document`, what the takeover read
-/// of the configuration found (it is not read again). A row that cannot be
-/// read leaves the line without a time.
+/// owner row it just wrote, read back, `document`, what the takeover read
+/// of the configuration found (it is not read again), and `secrets`, what
+/// the vault install found. A row that cannot be read leaves the line
+/// without a time.
 #[cfg(feature = "postgres")]
 pub(crate) async fn durable_state_of_owner(
     loaded: &crate::overlay::LoadedConfig,
     database: &str,
     document: DocumentState,
+    secrets: SecretsState,
 ) -> DurableStateReport {
     let cfg = &loaded.effective;
     let row = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
@@ -432,7 +599,34 @@ pub(crate) async fn durable_state_of_owner(
         OwnerState::Unannounced
     };
     let config = ConfigState::new(document, &loaded.path, loaded.base.as_ref());
-    report_of(cfg, "active", database.to_string(), state, row, config)
+    let mut report = report_of(cfg, "active", database.to_string(), state, row, config);
+    report.secrets = secrets;
+    report.github_app = app_source_of_owner(loaded).await;
+    report
+}
+
+/// Where the App of the instance that installed its vault comes from: the
+/// environment, else the vault, read on a blocking thread of the runtime
+/// (never the owner thread). Only the source is said, never the row.
+#[cfg(feature = "postgres")]
+async fn app_source_of_owner(loaded: &crate::overlay::LoadedConfig) -> AppSource {
+    let api_url = loaded
+        .effective
+        .github
+        .as_ref()
+        .and_then(|g| g.api_url.clone());
+    if loaded.overlay.github_app(api_url.as_deref()).is_some() {
+        return AppSource::Env;
+    }
+    // The folder is not read in vault mode: the lookup goes to the vault.
+    let dir = crystalline_core::config::origins_state_dir().unwrap_or_default();
+    let home = crate::engine::AppHome::new(api_url, dir, false);
+    match tokio::task::spawn_blocking(move || home.lookup()).await {
+        Ok(Ok(lookup)) if lookup.credentials.is_some() => AppSource::Vault,
+        Ok(Ok(_)) => AppSource::None,
+        Ok(Err(e)) => AppSource::Unread(e.to_string()),
+        Err(e) => AppSource::Unread(e.to_string()),
+    }
 }
 
 fn report_of(
@@ -448,6 +642,9 @@ fn report_of(
     if accounts == AccountsLocationKind::Postgres {
         warnings.extend(leftover_accounts_warning(&database));
     }
+    // On Postgres the secrets are sealed in the database whatever holds
+    // the accounts, so a credential file on this disk is never read.
+    warnings.extend(leftover_credentials_warning(&database));
     DurableStateReport {
         role: role.to_string(),
         database,
@@ -456,6 +653,7 @@ fn report_of(
         accounts,
         config,
         secrets: SecretsState::default(),
+        github_app: AppSource::default(),
         warnings,
     }
 }
@@ -488,7 +686,13 @@ mod tests {
                 base_path: Some(PathBuf::from("/etc/crystalline/config.yaml")),
                 base_domains: vec!["team".to_string(), "docs".to_string()],
             },
-            secrets: SecretsState::default(),
+            secrets: SecretsState {
+                key_configured: true,
+                key_ids: vec!["0123456789abcdef".to_string()],
+                sealed: Some(3),
+                error: None,
+            },
+            github_app: AppSource::Vault,
             warnings: vec!["the accounts file /x is not read".to_string()],
         }
     }
@@ -499,8 +703,99 @@ mod tests {
     fn startup_line_names_owner_and_accounts() {
         assert_eq!(
             owned().startup_line(),
-            "durable state: owner of postgres db.internal:5432/c, schema team_a since 2026-11-16T09:30:00Z; accounts in postgres; configuration document (updated 2026-11-17T08:00:00Z); config.yaml /etc/crystalline/config.yaml read as base"
+            "durable state: owner of postgres db.internal:5432/c, schema team_a since 2026-11-16T09:30:00Z; accounts in postgres; configuration document (updated 2026-11-17T08:00:00Z); config.yaml /etc/crystalline/config.yaml read as base; secrets sealed in postgres with key 0123456789abcdef (3 rows); GitHub App from vault"
         );
+    }
+
+    /// The secrets row names the key id and the number of rows, never a row
+    /// name, and the App row names where the App comes from.
+    #[test]
+    fn the_secrets_and_app_rows_name_the_key_and_the_source() {
+        let mut report = owned();
+        let lines = report.block_lines();
+        assert!(
+            lines.iter().any(|l| l
+                == "Secrets: 3 sealed in the database with key 0123456789abcdef; a key is configured"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "GitHub App: sealed in the database"),
+            "{lines:?}"
+        );
+        let json = report.to_json();
+        assert_eq!(json["secrets"]["key_ids"][0], "0123456789abcdef");
+        assert_eq!(json["secrets"]["sealed"], 3);
+        assert_eq!(json["github_app"]["source"], "vault");
+
+        report.github_app = AppSource::Env;
+        assert!(report.startup_line().ends_with("; GitHub App from env"));
+        report.github_app = AppSource::None;
+        assert!(report.startup_line().ends_with("; GitHub App none"));
+        report.github_app = AppSource::NotChecked;
+        assert!(
+            report
+                .block_lines()
+                .iter()
+                .any(|l| l == "GitHub App: sealed in the database (not checked)")
+        );
+        assert_eq!(report.to_json()["github_app"]["source"], "not_checked");
+
+        // A report reads the ids the rows record; with no rows there is none.
+        report.secrets = SecretsState {
+            key_configured: false,
+            key_ids: Vec::new(),
+            sealed: Some(0),
+            error: None,
+        };
+        assert!(report.block_lines().iter().any(|l| {
+            l.starts_with("Secrets: 0 sealed in the database; no key is configured here")
+        }));
+        report.secrets.key_ids = vec!["aaaa".to_string(), "bbbb".to_string()];
+        report.secrets.sealed = Some(2);
+        assert!(
+            report
+                .block_lines()
+                .iter()
+                .any(|l| l.starts_with("Secrets: 2 sealed in the database with keys aaaa, bbbb;"))
+        );
+    }
+
+    /// Credential files an earlier run left are found by their names alone
+    /// (the content is never read), and nothing else in those folders is
+    /// named.
+    #[test]
+    fn leftover_credential_files_are_found_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(leftover_credential_files(dir.path()), None);
+        let origins = dir.path().join("origins");
+        std::fs::create_dir_all(origins.join("team")).unwrap();
+        for name in [
+            "github-token.json",
+            "github-token-personal-ada.json",
+            "github-app.json",
+            "github-app.present",
+            "state.json",
+        ] {
+            std::fs::write(origins.join(name), "not json at all").unwrap();
+        }
+        let host = dir.path().join("remote").join("kb.example");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("credential.json"), "x").unwrap();
+        std::fs::write(dir.path().join("remote").join("sources.json"), "x").unwrap();
+        let found = leftover_credential_files(dir.path()).unwrap();
+        let expected: Vec<String> = [
+            origins.join("github-app.json"),
+            origins.join("github-app.present"),
+            origins.join("github-token-personal-ada.json"),
+            origins.join("github-token.json"),
+            host.join("credential.json"),
+        ]
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+        assert_eq!(found, expected);
     }
 
     /// The line names the document and the base, says when there is no
@@ -525,7 +820,7 @@ mod tests {
         assert!(
             report
                 .startup_line()
-                .ends_with("configuration document (not saved yet); config.yaml none")
+                .contains("; configuration document (not saved yet); config.yaml none; ")
         );
         assert!(report.config.base_domains_line().is_none());
         report.config.document = DocumentState::Unreadable("timed out".to_string());

@@ -637,26 +637,22 @@ pub async fn read_config_document(target: &PgTarget) -> Result<Option<ConfigDoc>
     doc
 }
 
-/// How many sealed secrets `instance_secret` of `target` holds, counted on a
-/// `probe` connection without the lock, for `status` and `doctor`: never a
-/// row name, never a sealed byte. `0` when the table does not exist yet.
-pub async fn count_sealed_secrets(target: &PgTarget) -> Result<u64> {
+/// What `instance_secret` of `target` holds, read on a `probe` connection
+/// without the lock, for `status` and `doctor`: how many rows and the ids of
+/// the keys that sealed them, never a row name, never a sealed byte. Empty
+/// when the table does not exist yet.
+pub async fn summarize_sealed_secrets(target: &PgTarget) -> Result<SecretSummary> {
     let mut conn = connect_one(target, PgRole::Probe, &PgSessionOptions::default()).await?;
     let table = secret_table(target.schema.as_deref());
-    let counted = async {
+    let summary = async {
         if !table_exists(&mut conn, &table).await? {
-            return Ok(0);
+            return Ok(SecretSummary::default());
         }
-        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT count(*)::int8 FROM {table}"
-        )))
-        .fetch_one(&mut conn)
-        .await?;
-        Ok(u64::try_from(rows).unwrap_or(0))
+        summarize_secrets(&mut conn, &table).await
     }
     .await;
     let _ = conn.close().await;
-    counted
+    summary
 }
 
 /// One row of `instance_secret`: a sealed secret and the id of the key that

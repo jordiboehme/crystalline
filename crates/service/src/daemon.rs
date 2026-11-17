@@ -558,7 +558,10 @@ pub async fn run_serve(
     // On a schema the store open just created, the announce after the lock
     // found no owner table; the row is written now.
     // What the takeover read found, for the durable-state line below, so
-    // the report does not read the document a second time.
+    // the report does not read the document a second time; the same for
+    // what the vault install counted.
+    #[cfg(feature = "postgres")]
+    let mut vault_secrets = crate::durable::SecretsState::default();
     #[cfg(feature = "postgres")]
     let takeover_document = match &pg_start {
         Some(pg) => {
@@ -567,7 +570,14 @@ pub async fn run_serve(
             // migrated database holds, and the vault installed, before the
             // engine is built and so before any credential is read.
             if let Some(key) = secret_key {
-                crate::secret_start::open_vault(pg, key).await?;
+                let key_id = key.key_id();
+                let summary = crate::secret_start::open_vault(pg, key).await?;
+                vault_secrets = crate::durable::SecretsState {
+                    key_configured: true,
+                    key_ids: vec![key_id],
+                    sealed: Some(summary.rows as u64),
+                    error: None,
+                };
             }
             // The configuration document, read once now that this instance
             // owns the database and the store open made sure its table exists
@@ -694,8 +704,13 @@ pub async fn run_serve(
                         "the configuration was not read at the takeover".to_string(),
                     )
                 });
-                let report =
-                    crate::durable::durable_state_of_owner(&loaded, pg.database(), document).await;
+                let report = crate::durable::durable_state_of_owner(
+                    &loaded,
+                    pg.database(),
+                    document,
+                    vault_secrets,
+                )
+                .await;
                 tracing::info!("{}", report.startup_line());
                 if let Some(line) = report.config.base_domains_line() {
                     tracing::info!("{line}");

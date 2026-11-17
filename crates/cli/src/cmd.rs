@@ -4168,7 +4168,13 @@ pub async fn connect_github(
         if !instance {
             report["identity"] = serde_json::json!("personal");
             report["account"] = serde_json::json!(identity_label(identity));
-            report["share_identity"] = serde_json::json!(share_identity.mode.as_str());
+            // Unknown while it would depend on an App sealed in the
+            // database that was not read.
+            report["share_identity"] = serde_json::json!(
+                share_identity
+                    .is_checked()
+                    .then(|| share_identity.mode.as_str())
+            );
         }
         println!("{report}");
     } else if instance {
@@ -4185,7 +4191,9 @@ pub async fn connect_github(
             identity_phrase(identity),
             store.kind()
         );
-        if !personal_mode {
+        if !share_identity.is_checked() {
+            println!("Shares run on: {}", share_identity.reason_text());
+        } else if !personal_mode {
             println!(
                 "Run: crystalline config set github.share_identity personal to share with personal identities"
             );
@@ -4462,7 +4470,9 @@ impl PersonalApp<'_> {
             )
         };
         println!("{how} ({} token store).", store.kind());
-        if !personal_mode {
+        if !share_identity.is_checked() {
+            println!("Shares run on: {}", share_identity.reason_text());
+        } else if !personal_mode {
             println!(
                 "Run: crystalline config set github.share_identity personal to share with personal identities"
             );
@@ -6061,14 +6071,33 @@ fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
 }
 
 /// The share identity mode in effect for this process, which has no engine:
-/// the App is asked of what is cheap to read.
+/// the App is asked of what is cheap to read. With the vault installed in
+/// this process (a sealing command on Postgres), `presence` cannot tell a
+/// saved App from "may be saved", so the vault is asked; a vault that does
+/// not answer leaves the mode not checked.
 fn share_identity_here(
     loaded: &crystalline_service::LoadedConfig,
     cfg: &GlobalConfig,
 ) -> crystalline_core::config::EffectiveShareIdentity {
+    use crystalline_core::config::GithubAppPresence;
+    let api_url = loaded
+        .effective
+        .github
+        .as_ref()
+        .and_then(|g| g.api_url.as_deref());
     let app = match app_home(loaded, test_token_store_dir().as_deref()) {
+        Ok(home)
+            if crystalline_remote::vault::installed_key_id().is_some()
+                && loaded.overlay.github_app(api_url).is_none() =>
+        {
+            match home.lookup() {
+                Ok(lookup) if lookup.credentials.is_some() => GithubAppPresence::Configured,
+                Ok(_) => GithubAppPresence::None,
+                Err(_) => GithubAppPresence::Sealed,
+            }
+        }
         Ok(home) => home.presence(&loaded.overlay),
-        Err(_) => crystalline_core::config::GithubAppPresence::None,
+        Err(_) => GithubAppPresence::None,
     };
     crystalline_core::config::EffectiveShareIdentity::resolve(
         cfg.github_share_identity_setting(),

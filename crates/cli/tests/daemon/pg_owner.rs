@@ -21,26 +21,31 @@ const TIMING_SCALE: &str = "10";
 
 /// One `crystalline serve` child with an HTTP endpoint on a free port and its
 /// stderr in a file. Stopped with SIGTERM when dropped.
-struct Serve {
+pub(crate) struct Serve {
     child: Child,
-    addr: String,
+    pub(crate) addr: String,
     log: PathBuf,
 }
 
 impl Serve {
-    fn start(env: &Env, rust_log: Option<&str>) -> Serve {
+    pub(crate) fn start(env: &Env, rust_log: Option<&str>) -> Serve {
         Serve::start_with(env, rust_log, &[])
     }
 
     /// [`Serve::start`] with `extra` variables for this child only.
-    fn start_with(env: &Env, rust_log: Option<&str>, extra: &[(&str, &str)]) -> Serve {
+    pub(crate) fn start_with(env: &Env, rust_log: Option<&str>, extra: &[(&str, &str)]) -> Serve {
         Serve::start_bound(env, "127.0.0.1", rust_log, extra)
     }
 
     /// [`Serve::start_with`] bound on `host`; requests still go to
     /// 127.0.0.1. A bind on `0.0.0.0` is one others can reach, where the
     /// first admin and the setup token are asked of the accounts.
-    fn start_bound(env: &Env, host: &str, rust_log: Option<&str>, extra: &[(&str, &str)]) -> Serve {
+    pub(crate) fn start_bound(
+        env: &Env,
+        host: &str,
+        rust_log: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Serve {
         let port = free_port();
         let bind = format!("{host}:{port}");
         let addr = format!("127.0.0.1:{port}");
@@ -67,11 +72,11 @@ impl Serve {
         Serve { child, addr, log }
     }
 
-    fn pid(&self) -> i32 {
+    pub(crate) fn pid(&self) -> i32 {
         self.child.id() as i32
     }
 
-    fn log(&self) -> String {
+    pub(crate) fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
@@ -84,7 +89,7 @@ impl Serve {
     }
 
     /// Wait until `/health` reports `role`, or panic with the log.
-    fn wait_role(&mut self, role: &str) {
+    pub(crate) fn wait_role(&mut self, role: &str) {
         let start = Instant::now();
         loop {
             if let Some(response) = self.get("/health")
@@ -106,7 +111,7 @@ impl Serve {
     }
 
     /// Wait until `/ready` answers 200, or panic with the log.
-    fn wait_ready(&mut self) {
+    pub(crate) fn wait_ready(&mut self) {
         let start = Instant::now();
         loop {
             if self
@@ -128,7 +133,7 @@ impl Serve {
     }
 
     /// Wait for the process to end and answer its exit code.
-    fn wait_exit(&mut self, within: Duration) -> Option<i32> {
+    pub(crate) fn wait_exit(&mut self, within: Duration) -> Option<i32> {
         let start = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -159,11 +164,11 @@ impl Serve {
         }
     }
 
-    fn alive(&mut self) -> bool {
+    pub(crate) fn alive(&mut self) -> bool {
         self.child.try_wait().unwrap().is_none()
     }
 
-    fn terminate(&mut self) {
+    pub(crate) fn terminate(&mut self) {
         unsafe {
             libc::kill(self.pid(), libc::SIGTERM);
         }
@@ -421,14 +426,14 @@ fn turso_order_unchanged() {
 /// The variables that take the secret key away from a child: a blank value
 /// counts as unset, whatever the shell running the tests has set.
 #[cfg(feature = "postgres")]
-const NO_SECRET_KEY: [(&str, &str); 2] = [
+pub(crate) const NO_SECRET_KEY: [(&str, &str); 2] = [
     ("CRYSTALLINE_SECRET_KEY", ""),
     ("CRYSTALLINE_SECRET_KEY_FILE", ""),
 ];
 
 /// How many rows `pg`'s `instance_secret` holds.
 #[cfg(feature = "postgres")]
-fn secret_rows(pg: &PgScratch) -> String {
+pub(crate) fn secret_rows(pg: &PgScratch) -> String {
     pg.text(&format!(
         "SELECT count(*)::text FROM {}.instance_secret",
         pg.schema
@@ -437,7 +442,7 @@ fn secret_rows(pg: &PgScratch) -> String {
 
 /// A start of `env` that stops by itself: its exit code and its log.
 #[cfg(feature = "postgres")]
-fn failed_start(env: &Env, extra: &[(&str, &str)]) -> (Option<i32>, String) {
+pub(crate) fn failed_start(env: &Env, extra: &[(&str, &str)]) -> (Option<i32>, String) {
     let mut serve = Serve::start_with(env, Some("info"), extra);
     let code = serve.wait_exit(Duration::from_secs(60));
     (code, serve.log())
@@ -764,7 +769,7 @@ fn a_former_standby_serves_what_its_start_parked() {
 }
 
 /// This environment's instance id, as the daemon read or made it.
-fn instance_id(env: &Env) -> String {
+pub(crate) fn instance_id(env: &Env) -> String {
     std::fs::read_to_string(env.state_dir().join("instance-id"))
         .expect("the instance id")
         .trim()
@@ -773,7 +778,7 @@ fn instance_id(env: &Env) -> String {
 
 /// The owner row of `pg`'s schema as `instance_id|released`, where
 /// `released` is `t` or `f`; empty when there is no row.
-fn owner_row(pg: &PgScratch) -> String {
+pub(crate) fn owner_row(pg: &PgScratch) -> String {
     pg.text(&format!(
         "SELECT instance_id || '|' || (released_at IS NOT NULL)::text FROM {}.instance_owner WHERE id = 1",
         pg.schema
@@ -1813,7 +1818,7 @@ fn standalone_paths_unchanged_on_turso() {
 
 /// Run `crystalline <args>` in `env` with `stdin` fed to it: success,
 /// stdout and stderr.
-fn run_with_stdin(env: &Env, args: &[&str], stdin: &str) -> (bool, String, String) {
+pub(crate) fn run_with_stdin(env: &Env, args: &[&str], stdin: &str) -> (bool, String, String) {
     let mut cmd = Command::new(bin());
     env.apply(&mut cmd);
     let mut child = cmd
@@ -1849,7 +1854,7 @@ fn users_add(env: &Env, name: &str, password: &str) {
 }
 
 /// The status a sign-in of `name` with `password` at `serve` gets.
-fn sign_in(serve: &Serve, name: &str, password: &str) -> u16 {
+pub(crate) fn sign_in(serve: &Serve, name: &str, password: &str) -> u16 {
     reqwest::blocking::Client::builder()
         .no_proxy()
         .build()
@@ -2320,7 +2325,7 @@ fn status_on_a_free_database_says_free() {
 
 /// The effective value of setting `key` in `config show --json`, as `env`
 /// sees it, or panics with the output.
-fn shown_setting(env: &Env, key: &str) -> String {
+pub(crate) fn shown_setting(env: &Env, key: &str) -> String {
     let (ok, out, err) = env.run_full(&["--json", "config", "show"]);
     assert!(ok, "{out}{err}");
     let shown: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
@@ -2935,7 +2940,7 @@ fn config_writes_unchanged_on_turso() {
 
 /// Run `crystalline <args>` in `env` with `extra` variables on top of its
 /// own: success, stdout and stderr.
-fn run_vars(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
+pub(crate) fn run_vars(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
     let mut cmd = Command::new(bin());
     env.apply(&mut cmd);
     for (key, value) in extra {
@@ -2983,7 +2988,7 @@ fn seal_token_row(pg: &PgScratch, name: &str, user: &str) {
 
 /// Whether `pg`'s `instance_secret` holds the row `name`.
 #[cfg(feature = "postgres")]
-fn has_secret_row(pg: &PgScratch, name: &str) -> bool {
+pub(crate) fn has_secret_row(pg: &PgScratch, name: &str) -> bool {
     pg.text(&format!(
         "SELECT count(*)::text FROM {}.instance_secret WHERE name = '{name}'",
         pg.schema
@@ -3280,17 +3285,52 @@ fn reports_count_sealed_secrets_and_never_need_the_key() {
     let secrets = &status["durable_state"]["secrets"];
     assert_eq!(secrets["sealed"], 1, "{status}");
     assert_eq!(secrets["key_configured"], false, "{status}");
+    assert_eq!(secrets["key_ids"][0], test_key_id(), "{status}");
+    assert_eq!(
+        status["durable_state"]["github_app"]["source"], "not_checked",
+        "{status}"
+    );
     let (ok, out, err) = env.run_full(&["status"]);
     assert!(ok, "{out}{err}");
     assert!(
-        out.contains("Secrets: 1 sealed in the database; a key is configured"),
+        out.contains(&format!(
+            "Secrets: 1 sealed in the database with key {}; a key is configured",
+            test_key_id()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("GitHub App: sealed in the database (not checked)"),
         "{out}"
     );
     let (_, out, err) = run_vars(&env, &["doctor"], &NO_SECRET_KEY);
     let text = format!("{out}{err}");
     assert!(
-        text.contains("secrets: 1 sealed in the database; no key is configured here"),
+        text.contains(&format!(
+            "secrets: 1 sealed in the database with key {}; no key is configured here",
+            test_key_id()
+        )),
         "{text}"
+    );
+    assert!(
+        text.contains("github app: sealed in the database (not checked)"),
+        "{text}"
+    );
+    // An App from the environment is known without the vault.
+    let app = [
+        ("CRYSTALLINE_GITHUB_APP_ID", "7"),
+        ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.env"),
+        (
+            "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
+            include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem"),
+        ),
+    ];
+    let (ok, out, err) = run_vars(&env, &["status", "--json"], &app);
+    assert!(ok, "{out}{err}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        status["durable_state"]["github_app"]["source"], "env",
+        "{status}"
     );
     for text in [&text, &out] {
         assert!(!text.contains("github-personal"), "a row name: {text}");
@@ -3458,7 +3498,7 @@ fn github_settings(serve: &Serve) -> Value {
 /// Every file under the state folder whose name says it holds a GitHub
 /// token or App.
 #[cfg(all(unix, feature = "postgres"))]
-fn local_github_files(env: &Env) -> Vec<PathBuf> {
+pub(crate) fn local_github_files(env: &Env) -> Vec<PathBuf> {
     fn walk(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -3581,6 +3621,20 @@ fn github_app_set_in_the_pod_seals_beside_the_daemon() {
     assert_eq!(status["data"]["configured"], true, "{status}");
     assert_eq!(local_github_files(&env), Vec::<PathBuf>::new());
 
+    // A start finds the App in the vault and says so on its durable-state
+    // line, without the row's name.
+    serve.terminate();
+    assert_eq!(serve.wait_exit(Duration::from_secs(15)), Some(0));
+    let mut serve = Serve::start_bound(&env, "0.0.0.0", Some("info"), &vars);
+    serve.wait_ready();
+    let log = serve.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("durable state: owner of postgres"))
+        .unwrap_or_else(|| panic!("no durable state line:\n{log}"));
+    assert!(line.ends_with("; GitHub App from vault"), "{line}");
+    assert!(line.contains("(1 row)"), "{line}");
+
     let (ok, out, err) = run_vars(&env, &["github", "app", "remove"], &vars);
     assert!(ok, "{out}{err}");
     assert_eq!(secret_rows(&pg), "0", "the App row is deleted");
@@ -3588,6 +3642,55 @@ fn github_app_set_in_the_pod_seals_beside_the_daemon() {
         owner_command(&pg),
         "|false",
         "the owner row stays the daemon's"
+    );
+    assert!(serve.alive());
+}
+
+/// In the pod, `connect github --personal` reports the share identity from
+/// the vault it sealed in, not from "an App may be saved": with no App
+/// saved, shares run on the instance identity and the hint to turn on
+/// personal sharing is printed.
+#[cfg(all(unix, feature = "postgres"))]
+#[test]
+fn connect_github_personal_in_the_pod_reports_the_checked_share_identity() {
+    let Some(pg) = PgScratch::new("vtpodsi") else {
+        return;
+    };
+    let github = PodGithub::start();
+    let env = Env::new("vtpodsi").on_postgres(&pg);
+    let vars = pod_vars(&github);
+    let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut serve = Serve::start_bound(&env, "0.0.0.0", Some("info"), &vars);
+    serve.wait_ready();
+
+    let (ok, out, err) = run_vars(
+        &env,
+        &[
+            "--json",
+            "connect",
+            "github",
+            "--personal",
+            "--token",
+            "ghp_personal",
+        ],
+        &vars,
+    );
+    assert!(ok, "{out}{err}");
+    let reply: Value = serde_json::from_str(out.trim()).unwrap_or_else(|_| panic!("{out}{err}"));
+    assert_eq!(reply["token_store"], "vault", "{reply}");
+    assert_eq!(
+        reply["share_identity"], "instance",
+        "no App is saved: {reply}"
+    );
+    let (ok, out, err) = run_vars(
+        &env,
+        &["connect", "github", "--personal", "--token", "ghp_personal"],
+        &vars,
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("Run: crystalline config set github.share_identity personal"),
+        "{out}"
     );
     assert!(serve.alive());
 }
@@ -3654,7 +3757,7 @@ fn origin_update_without_key_refused_before_any_write() {
 
 /// The id of the key every Postgres test process runs with.
 #[cfg(feature = "postgres")]
-fn test_key_id() -> String {
+pub(crate) fn test_key_id() -> String {
     use crystalline_remote::sealed::SealKey;
 
     use crate::service::TEST_SECRET_KEY;
@@ -3820,6 +3923,22 @@ fn reports_on_postgres_read_no_local_store() {
     let text = format!("{out}{err}");
     assert!(!text.contains("planted-user"), "{text}");
     assert!(!text.contains(r#""credential_store":"file""#), "{text}");
+    // The planted files are named in one warning, by their names alone.
+    let warnings = doctor["durable_state"]["warnings"].to_string();
+    assert!(
+        warnings.contains("not read while Postgres is configured")
+            && warnings.contains("github-token.json")
+            && warnings.contains("credential.json"),
+        "{doctor}"
+    );
+    let (ok, out, err) = run_vars(&env, &["status"], &github);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("Warning: the credential files ")
+            && out.contains("github-token.json")
+            && !out.contains("planted"),
+        "{out}"
+    );
     // The default share identity depends on an App that would be sealed in
     // the database: not checked, and said so.
     let (ok, out, err) = run_vars(&env, &["--json", "config", "show"], &github);
