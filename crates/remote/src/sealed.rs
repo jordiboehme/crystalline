@@ -34,7 +34,7 @@ pub enum KeyError {
     Unreadable(String),
     /// The key is not 32 bytes in hex or base64.
     #[error(
-        "{var} must hold a 32 byte key as 64 hex characters or as base64 (44 characters). Generate one with: openssl rand -hex 32"
+        "{var} must hold a 32 byte key as 64 hex characters or as base64 (44 characters). Generate one with: openssl rand -base64 32"
     )]
     Malformed {
         /// The variable the key came from.

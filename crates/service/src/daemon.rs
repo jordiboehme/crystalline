@@ -6775,6 +6775,31 @@ mod tests {
         );
     }
 
+    /// Serializes the tests of this binary that install a vault, which is
+    /// process-global, and clears the registry on both ends, so a threaded
+    /// `cargo test` never shows one test's vault to another.
+    #[cfg(feature = "postgres")]
+    struct VaultGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(feature = "postgres")]
+    impl VaultGuard {
+        fn take() -> VaultGuard {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            crystalline_remote::vault::clear();
+            VaultGuard { _serial: serial }
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    impl Drop for VaultGuard {
+        fn drop(&mut self) {
+            crystalline_remote::vault::clear();
+        }
+    }
+
     /// A sign-in a server rotates while the daemon stops lands in the vault
     /// before the database is released: after the stop the row holds the
     /// rotated pair. The side channel answers only while the lock is held,
@@ -6820,7 +6845,7 @@ mod tests {
             owner.try_acquire().await.unwrap(),
             Acquired::Held { .. }
         ));
-        vault::clear();
+        let _guard = VaultGuard::take();
         vault::install(
             Arc::new(crystalline_engine::vault::PgVault::new(
                 owner.side(),
@@ -6943,7 +6968,6 @@ mod tests {
         })
         .await
         .unwrap();
-        vault::clear();
         assert_eq!(saved.0.kind(), "vault");
         let saved = saved.1.expect("the row exists after the stop");
         assert_eq!(saved.refresh_token.as_deref(), Some("cor_1"));

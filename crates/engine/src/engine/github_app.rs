@@ -209,14 +209,13 @@ impl AppHome {
 
     /// Whether an App may be saved here, from the file and the keychain
     /// marker alone (no keychain read). While this process keeps its secrets
-    /// in the vault, the state folder is not looked at: the vault row is
-    /// read instead, and a vault that cannot be read counts as "may be
-    /// saved", so a caller fails closed.
+    /// in the vault, the state folder is not looked at and the vault is not
+    /// asked either (its callers sit on the request path, and a vault call
+    /// is a database round trip): the answer is "may be saved", so a caller
+    /// fails closed until the App load settles the slot.
     pub fn maybe_saved(&self) -> bool {
         if crystalline_remote::vault::engaged() {
-            return self
-                .lookup()
-                .map_or(true, |found| found.credentials.is_some());
+            return true;
         }
         if let AppStore::File { path } = AppStore::file_fallback(&self.dir)
             && path.exists()

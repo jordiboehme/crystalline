@@ -33,23 +33,30 @@ pub(crate) fn turso_ignores_key_sentence() -> String {
 }
 
 /// What the start does with the secret key: on Postgres the key to seal
-/// with, or the error that stops the start; on Turso nothing, with a warning
-/// when a key is set (even one that would not parse, which is not read).
+/// with (read only there, through `read`), or the error that stops the
+/// start; on Turso nothing, with a warning when either variable is set
+/// (`set`): the key, or the file it names, is never read there.
 pub(crate) fn plan(
     backend: DatabaseBackend,
-    read: Result<Option<SealKey>, KeyError>,
+    set: bool,
+    read: impl FnOnce() -> Result<Option<SealKey>, KeyError>,
 ) -> anyhow::Result<(Option<SealKey>, Option<String>)> {
     match backend {
-        DatabaseBackend::Postgres => match read {
+        DatabaseBackend::Postgres => match read() {
             Ok(Some(key)) => Ok((Some(key), None)),
             Ok(None) => Err(anyhow::anyhow!(missing_key_sentence())),
             Err(e) => Err(anyhow::anyhow!("{e}")),
         },
-        DatabaseBackend::Turso => match read {
-            Ok(None) => Ok((None, None)),
-            Ok(Some(_)) | Err(_) => Ok((None, Some(turso_ignores_key_sentence()))),
-        },
+        DatabaseBackend::Turso => Ok((None, set.then(turso_ignores_key_sentence))),
     }
+}
+
+/// Whether either key variable is set to something other than blank, the
+/// way [`SealKey::from_env`] tells set from unset, without reading a file.
+fn key_variable_set() -> bool {
+    [KEY_ENV, KEY_FILE_ENV].iter().any(|var| {
+        std::env::var_os(var).is_some_and(|v| v.to_str().is_none_or(|s| !s.trim().is_empty()))
+    })
 }
 
 /// Read the key for `backend` and act on it: on Postgres this process keeps
@@ -57,7 +64,7 @@ pub(crate) fn plan(
 /// falls back to the keychain or a file before the vault is installed. The
 /// key comes back for [`open_vault`].
 pub(crate) fn read_for_start(backend: DatabaseBackend) -> anyhow::Result<Option<SealKey>> {
-    let (key, warning) = plan(backend, SealKey::from_env())?;
+    let (key, warning) = plan(backend, key_variable_set(), SealKey::from_env)?;
     if let Some(line) = warning {
         tracing::warn!("{line}");
     }
@@ -139,34 +146,33 @@ mod tests {
     /// back to the keychain or a file.
     #[test]
     fn postgres_without_key_fails_start_naming_the_variable() {
-        let err = plan(DatabaseBackend::Postgres, Ok(None)).unwrap_err();
+        let err = plan(DatabaseBackend::Postgres, false, || Ok(None)).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("CRYSTALLINE_SECRET_KEY"), "{text}");
         assert!(text.contains("CRYSTALLINE_SECRET_KEY_FILE"), "{text}");
         assert!(text.contains("openssl rand -base64 32"), "{text}");
         // A key that does not parse stops the start too, naming its variable.
-        let bad = plan(
-            DatabaseBackend::Postgres,
-            Err(KeyError::Malformed { var: KEY_FILE_ENV }),
-        )
+        let bad = plan(DatabaseBackend::Postgres, true, || {
+            Err(KeyError::Malformed { var: KEY_FILE_ENV })
+        })
         .unwrap_err();
         assert!(bad.to_string().contains(KEY_FILE_ENV), "{bad}");
-        let (key, warning) = plan(DatabaseBackend::Postgres, Ok(Some(key()))).unwrap();
+        let (key, warning) = plan(DatabaseBackend::Postgres, true, || Ok(Some(key()))).unwrap();
         assert!(key.is_some() && warning.is_none());
     }
 
-    /// On Turso the key is ignored with one warning, set or not parsable,
-    /// and no key is kept; without one there is no warning.
+    /// On Turso the key is ignored with one warning when a variable is set,
+    /// and it is never read (not even the file); without one there is no
+    /// warning.
     #[test]
     fn turso_warns_and_ignores_secret_key() {
-        for read in [Ok(Some(key())), Err(KeyError::BothSet)] {
-            let (key, warning) = plan(DatabaseBackend::Turso, read).unwrap();
-            assert!(key.is_none(), "the key is not used on Turso");
-            let warning = warning.expect("one warning");
-            assert!(warning.contains("CRYSTALLINE_SECRET_KEY"), "{warning}");
-            assert!(warning.contains("ignored"), "{warning}");
-        }
-        let (key, warning) = plan(DatabaseBackend::Turso, Ok(None)).unwrap();
+        let never = || -> Result<Option<SealKey>, KeyError> { panic!("the key was read on Turso") };
+        let (key, warning) = plan(DatabaseBackend::Turso, true, never).unwrap();
+        assert!(key.is_none(), "the key is not used on Turso");
+        let warning = warning.expect("one warning");
+        assert!(warning.contains("CRYSTALLINE_SECRET_KEY"), "{warning}");
+        assert!(warning.contains("ignored"), "{warning}");
+        let (key, warning) = plan(DatabaseBackend::Turso, false, never).unwrap();
         assert!(key.is_none() && warning.is_none());
     }
 

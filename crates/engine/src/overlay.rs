@@ -2414,9 +2414,10 @@ mod tests {
     }
 
     /// In vault mode the App home never reads or writes the state folder: a
-    /// leftover App file and keychain marker are not read, presence asks the
-    /// vault, the store lock writes no file and a remove deletes the vault
-    /// row and leaves the leftovers alone.
+    /// leftover App file and keychain marker are not read, presence answers
+    /// "may be saved" without asking the vault, the store lock writes no
+    /// file and a remove deletes the vault row and leaves the leftovers
+    /// alone.
     #[test]
     fn app_home_in_vault_mode_leaves_the_state_folder_alone() {
         use crate::engine::AppHome;
@@ -2438,22 +2439,46 @@ mod tests {
         let before = leftovers(dir.path());
         let vault = install_memory(key(7));
         let home = AppHome::new(None, dir.path().to_path_buf(), true);
-        assert!(!home.maybe_saved(), "the leftover file is not read");
-        assert!(home.lookup().unwrap().credentials.is_none());
+        assert!(
+            home.lookup().unwrap().credentials.is_none(),
+            "the leftover file is not read"
+        );
         drop(crystalline_remote::AppStoreLock::acquire(dir.path()).unwrap());
         home.lookup().unwrap().store.save(&vault_app(2)).unwrap();
-        assert!(home.maybe_saved(), "the vault row is found");
         assert_eq!(
             home.remove(&EnvOverlay::default()).unwrap(),
             Default::default()
         );
         assert!(!vault.has("github-app"), "the vault row is deleted");
-        assert!(!home.maybe_saved());
         assert_eq!(
             leftovers(dir.path()),
             before,
             "the state folder is untouched"
         );
+    }
+
+    /// In vault mode `maybe_saved` answers without any I/O: no vault call
+    /// (its callers are on the request path), no state folder read, and
+    /// "may be saved" whether a row exists or not, so a caller fails closed
+    /// until the App load settles.
+    #[test]
+    fn maybe_saved_in_vault_mode_makes_no_vault_call() {
+        use crate::engine::AppHome;
+        use crate::test_vault::{guard, install_memory, key};
+        let _guard = guard();
+        let vault = install_memory(key(7));
+        let dir = tempfile::tempdir().unwrap();
+        let home = AppHome::new(None, dir.path().to_path_buf(), false);
+        assert!(home.maybe_saved());
+        assert!(
+            home.presence(&EnvOverlay::default())
+                == crystalline_core::config::GithubAppPresence::Configured
+        );
+        assert_eq!(vault.calls(), 0, "the vault was asked");
+        crystalline_remote::vault::clear();
+        crystalline_remote::vault::require();
+        assert!(home.maybe_saved(), "a required vault fails closed too");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

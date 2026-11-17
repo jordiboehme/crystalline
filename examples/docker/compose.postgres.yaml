@@ -7,8 +7,10 @@
 # config file needed. The GitHub tokens, a saved GitHub App and server sign-ins
 # are sealed in the database with the key in CRYSTALLINE_SECRET_KEY, which is
 # required on Postgres. Make one and keep it safe, it cannot be recovered:
-#   export CRYSTALLINE_SECRET_KEY="$(openssl rand -base64 32)" Exactly one Crystalline instance is active on a database
-# (or on a schema, see CRYSTALLINE_DATABASE_SCHEMA). A second instance waits as
+#   export CRYSTALLINE_SECRET_KEY="$(openssl rand -base64 32)"
+#
+# Exactly one Crystalline instance is active on a database (or on a schema,
+# see CRYSTALLINE_DATABASE_SCHEMA). A second instance waits as
 # a standby, with no time limit, and takes over when the active one stops. A
 # commented standby is included below. Several active instances on one database
 # are not supported. The accounts start empty: sign in once, with the first
