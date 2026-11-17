@@ -85,6 +85,7 @@ impl Sha256Digest {
 /// `SHA256SUMS` whose signature verified for the wanted tag. Only
 /// [`verify_signature`] makes one, from the very bytes it verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "check the asset's line with `SignedSums::line`"]
 pub struct SignedSums<'a> {
     text: &'a str,
 }

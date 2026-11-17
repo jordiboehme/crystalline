@@ -35,6 +35,11 @@ whoami = { workspace = true }
 # (`desktop_extension::pack`): deflate only, the workspace pin.
 zip = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `O_NONBLOCK` for reading an install marker (`update::install`), so a FIFO
+# in its place cannot block the session hook.
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # The roaming folder from the known-folder API (`config::roaming_root`): the
 # same three features etcetera already enables, so nothing new is built.

@@ -185,9 +185,10 @@ impl Os {
 /// `exe` is canonicalized here (so Homebrew's `bin/crystalline` symlink is
 /// read as its Cellar target) and handed back in the result, so the caller
 /// acts on the very file the markers spoke for; a path that does not
-/// resolve is refused as unknown. `env` looks up an environment variable; `dpkg_list` is the text
-/// of `/var/lib/dpkg/info/crystalline.list`, read by the caller as a file
-/// (never through `dpkg`), or `None` when it is missing.
+/// resolve is refused as unknown. `env` looks up an environment variable;
+/// `dpkg_list` is the text of `/var/lib/dpkg/info/crystalline.list`, read
+/// by the caller as a file (never through `dpkg`), or `None` when it is
+/// missing.
 ///
 /// Markers, relative to the canonical exe's folder:
 /// `../libexec/install-source` (`homebrew`),
@@ -206,11 +207,12 @@ impl Os {
 /// the path contradicts is a `MarkerPathMismatch` naming both: a positive
 /// fallback for another method, a package this system does not have (an
 /// `msi` marker on Unix, a `deb` marker on Windows), or a `deb` marker for
-/// an exe the dpkg list does not hold or with no dpkg list at all. `CRYSTALLINE_CHANNEL=mcpb` (any case)
-/// refuses whatever the markers say, and no other value of it changes
-/// anything. This function produces only the `MarkerPathMismatch`,
-/// `Docker`, `Mcpb` and `Unknown` refusals, each with a method that does
-/// not act; [`Detection::for_build`] adds `NotOfficial` and `AppPackage`.
+/// an exe the dpkg list does not hold or with no dpkg list at all.
+/// `CRYSTALLINE_CHANNEL=mcpb` (any case) refuses whatever the markers say,
+/// and no other value of it changes anything. This function produces only
+/// the `MarkerPathMismatch`, `Docker`, `Mcpb` and `Unknown` refusals, each
+/// with a method that does not act; [`Detection::for_build`] adds
+/// `NotOfficial` and `AppPackage`.
 pub fn detect(
     exe: &Path,
     env: &dyn Fn(&str) -> Option<String>,
@@ -292,11 +294,8 @@ fn marker_method(exe: &Path) -> Result<Option<InstallMethod>, ()> {
     let mut found = None;
     for (path, allowed) in slots {
         let Some(path) = path else { continue };
-        let value = match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => read_marker(&path)?,
-            Ok(_) => return Err(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(()),
+        let Some(value) = read_marker(&path)? else {
+            continue;
         };
         let method = InstallMethod::from_marker(value.trim()).ok_or(())?;
         if !allowed.contains(&method) || found.is_some_and(|f| f != method) {
@@ -310,11 +309,29 @@ fn marker_method(exe: &Path) -> Result<Option<InstallMethod>, ()> {
 /// The longest marker read; every valid one is a word and a line end.
 const MARKER_MAX_BYTES: u64 = 64;
 
-/// A marker's text: at most [`MARKER_MAX_BYTES`] of UTF-8 from a regular
-/// file, so a huge file or a device cannot stall the session hook. A longer
-/// file is refused, not cut.
-fn read_marker(path: &Path) -> Result<String, ()> {
-    let file = std::fs::File::open(path).map_err(|_| ())?;
+/// A marker's text, `Ok(None)` when there is none: at most
+/// [`MARKER_MAX_BYTES`] of UTF-8 from a regular file, so a huge file or a
+/// device cannot stall the session hook. The path is opened once and the
+/// type and size are read from that handle, so nothing can be swapped in
+/// between; on Unix the open does not block, so a FIFO cannot hold it. A
+/// longer file is refused, not cut.
+fn read_marker(path: &Path) -> Result<Option<String>, ()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let meta = file.metadata().map_err(|_| ())?;
+    if !meta.is_file() || meta.len() > MARKER_MAX_BYTES {
+        return Err(());
+    }
     let mut bytes = Vec::new();
     file.take(MARKER_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -322,7 +339,7 @@ fn read_marker(path: &Path) -> Result<String, ()> {
     if bytes.len() as u64 > MARKER_MAX_BYTES {
         return Err(());
     }
-    String::from_utf8(bytes).map_err(|_| ())
+    String::from_utf8(bytes).map(Some).map_err(|_| ())
 }
 
 /// The method the exe's path alone points to, `None` when no heuristic
@@ -1114,5 +1131,20 @@ mod tests {
             detect_on(Os::OtherUnix, &exe, &no_env, None),
             acting(InstallMethod::Homebrew)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_marker_is_refused_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = exe_at(tmp.path(), "fifo/bin");
+        let path = marker_path(&exe, "../libexec");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(detect_on(Os::OtherUnix, &exe, &no_env, None), UNKNOWN);
     }
 }
