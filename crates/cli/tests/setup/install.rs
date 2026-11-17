@@ -601,6 +601,42 @@ fn the_subagent_start_hook_installs_reports_and_uninstalls_beside_a_users_own() 
     );
 }
 
+/// A hand-written `SubagentStart` entry of ours in Codex's hooks file still
+/// comes out on uninstall, and the report names it.
+#[test]
+fn codex_uninstall_removes_and_reports_a_hand_written_subagent_start_hook() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("codex.log");
+    write_shim(&bin_dir, "codex", &log);
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let hooks_path = PathBuf::from(report["hooks"]["path"].as_str().unwrap());
+    let mut hooks = read_json(&hooks_path);
+    hooks["hooks"]["SubagentStart"] = json!([
+        { "hooks": [ { "type": "command", "command": "crystalline hook stop --harness codex" } ] }
+    ]);
+    std::fs::write(&hooks_path, serde_json::to_string_pretty(&hooks).unwrap()).unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["uninstall", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["hooks"]["subagent_start"], "removed", "{report}");
+    if hooks_path.exists() {
+        let after = read_json(&hooks_path);
+        assert!(after["hooks"].get("SubagentStart").is_none(), "{after}");
+    }
+}
+
 /// Codex gets no `SubagentStart` entry, and its report leaves the field out.
 #[test]
 fn codex_install_writes_no_subagent_start_hook() {
@@ -1722,9 +1758,8 @@ fn prompt_system_reconciles_an_install_from_another_version() {
 /// An install written by an older release has no `SubagentStart` group; the
 /// first session start on this binary adds it through the reconcile, without
 /// a manual `crystalline install`, and leaves a person's own hook on the
-/// event alone. The row names 0.32.2 rather than 0.33.0 because this tree's
-/// own version is 0.33.0 until the release bump, and a row at the current
-/// version is never reconciled.
+/// event alone. The row names 0.32.2, an older release than any this tree
+/// can be, since a row at the current version is never reconciled.
 #[test]
 fn an_older_install_gains_the_subagent_start_hook_through_the_reconcile() {
     let work = tempfile::tempdir().unwrap();
