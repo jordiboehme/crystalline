@@ -235,9 +235,12 @@ pub struct StopInput {
     /// The agent type. Alone it does not mean a subagent: a main session
     /// started with `claude --agent <name>` carries it without an id. On a
     /// SubagentStart it picks the block: none for an empty or absent type
-    /// (an internal agent), no store bullet for `Explore` and `Plan`.
+    /// (an internal agent), no store bullet for `Explore` and `Plan`. Read
+    /// as a raw JSON value for the reason the ids are: an unexpected type
+    /// must not fail the parse the Stop path shares. A type that is not a
+    /// string counts as absent.
     #[serde(default)]
-    pub agent_type: Option<String>,
+    pub agent_type: Option<serde_json::Value>,
     /// Set on a payload Cursor sends when it runs a Claude Code hook it
     /// imported. Its presence alone keeps the SubagentStart answer silent.
     /// Read as a raw JSON value for the reason the ids are: an unexpected
@@ -307,7 +310,7 @@ pub(crate) enum SubagentStartDecision {
 /// the store bullet, and a machine with no domain gets nothing.
 ///
 /// Silent for a payload Cursor sends (`cursor_version`), with no domain, and
-/// for an empty or absent `agent_type` (an internal agent). `Explore` and
+/// for an empty, absent or non-string `agent_type` (an internal agent). `Explore` and
 /// `Plan` are lean and read-only by design, so they get no store bullet.
 /// The `agent_id` the payload carries is the child's own and is ignored.
 pub(crate) fn decide_subagent_start(
@@ -318,7 +321,11 @@ pub(crate) fn decide_subagent_start(
     if input.cursor_version.is_some() || !has_domains {
         return SubagentStartDecision::Silent;
     }
-    match input.agent_type.as_deref() {
+    match input
+        .agent_type
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+    {
         None | Some("") => SubagentStartDecision::Silent,
         Some("Explore" | "Plan") => SubagentStartDecision::Block { store: false },
         Some(_) => SubagentStartDecision::Block { store: !read_only },
@@ -1438,6 +1445,10 @@ mod tests {
              - Never ask the user; decide, or name what is open in your report.\n\
              - Skip reflect, evolve_engrams and Crystalline maintenance notices."
         );
+        assert!(
+            include_str!("../../../docs/learning-loop.md").contains(&subagent_block(true)),
+            "docs/learning-loop.md quotes the subagent block as it is"
+        );
     }
 
     /// Every subagent start pays for this block, so its length is pinned.
@@ -1456,7 +1467,7 @@ mod tests {
         let mut i = input();
         i.hook_event_name = Some("SubagentStart".to_string());
         i.agent_id = Some(serde_json::json!("a0000000000000003"));
-        i.agent_type = agent_type.map(str::to_string);
+        i.agent_type = agent_type.map(|t| serde_json::json!(t));
         i
     }
 
@@ -1466,6 +1477,8 @@ mod tests {
         let mut cursor = subagent_start(Some("general-purpose"));
         cursor.cursor_version = Some(serde_json::json!("2.0.0"));
         let mut cursor_number = subagent_start(Some("general-purpose"));
+        let mut numeric_type = subagent_start(None);
+        numeric_type.agent_type = Some(serde_json::json!(7));
         cursor_number.cursor_version = Some(serde_json::json!(2));
         let cases: &[(&str, StopInput, bool, bool, SubagentStartDecision)] = &[
             (
@@ -1518,6 +1531,7 @@ mod tests {
                 Silent,
             ),
             ("no agent_type", subagent_start(None), true, false, Silent),
+            ("a numeric agent_type", numeric_type, true, false, Silent),
             ("cursor_version", cursor, true, false, Silent),
             (
                 "a numeric cursor_version",
@@ -1643,7 +1657,26 @@ mod tests {
         let i: StopInput =
             serde_json::from_str(include_str!("../tests/fixtures/hooks/agent-flag-Stop.json"))
                 .expect("the recorded payload parses");
-        assert_eq!(i.agent_type.as_deref(), Some("spike"));
+        assert_eq!(i.agent_type, Some(serde_json::json!("spike")));
+        let decision = decide(
+            &i,
+            true,
+            false,
+            &SessionState::fresh(),
+            TranscriptStats::Substantial,
+        );
+        assert_eq!(decision, StopDecision::Nudge);
+    }
+
+    /// A Stop whose `agent_type` is not a string still parses and still
+    /// nudges: the field the SubagentStart branch reads must not cost the
+    /// main session its reminder.
+    #[test]
+    fn a_numeric_agent_type_still_nudges() {
+        let i: StopInput = serde_json::from_str(
+            r#"{"session_id":"abc-123","hook_event_name":"Stop","agent_type":7}"#,
+        )
+        .expect("a numeric agent_type parses");
         let decision = decide(
             &i,
             true,
