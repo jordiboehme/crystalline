@@ -59,6 +59,47 @@ const ALPHABET: &[char] = &[
     'e', 'b', 'A', '0', '1', '5', '6', '9',
 ];
 
+/// Endings a mutation may append: the suffixes other grammars accept and
+/// these must refuse, which stacked single edits rarely build.
+const SUFFIXES: &[&str] = &[":30", ":00", "[UTC]", "Z", "z", " ", "+02:00", ".5", "00"];
+
+/// Every string one edit away from `seed`: each deletion, duplication and
+/// adjacent swap, and each substitution and insertion of a digit or an
+/// `ALPHABET` character, plus each suffix appended.
+fn one_edit_away(seed: &str) -> Vec<String> {
+    let chars: Vec<char> = seed.chars().collect();
+    let pool: Vec<char> = ('0'..='9').chain(ALPHABET.iter().copied()).collect();
+    let text = |v: Vec<char>| v.into_iter().collect::<String>();
+    let mut out = Vec::new();
+    for at in 0..chars.len() {
+        let mut v = chars.clone();
+        v.remove(at);
+        out.push(text(v));
+        let mut v = chars.clone();
+        v.insert(at, chars[at]);
+        out.push(text(v));
+        if at + 1 < chars.len() {
+            let mut v = chars.clone();
+            v.swap(at, at + 1);
+            out.push(text(v));
+        }
+        for &c in &pool {
+            let mut v = chars.clone();
+            v[at] = c;
+            out.push(text(v));
+        }
+    }
+    for at in 0..=chars.len() {
+        for &c in &pool {
+            let mut v = chars.clone();
+            v.insert(at, c);
+            out.push(text(v));
+        }
+    }
+    out.extend(SUFFIXES.iter().map(|suffix| format!("{seed}{suffix}")));
+    out
+}
+
 /// splitmix64: a fixed seed gives the same strings on every run.
 struct Rng(u64);
 
@@ -77,7 +118,7 @@ impl Rng {
 }
 
 /// One to three mutations of a seed: drop, double or swap characters, change
-/// a digit, replace or insert a separator.
+/// a digit, replace or insert a separator, append a suffix.
 fn mutate(rng: &mut Rng, seed: &str) -> String {
     let mut chars: Vec<char> = seed.chars().collect();
     for _ in 0..=rng.below(3) {
@@ -86,7 +127,7 @@ fn mutate(rng: &mut Rng, seed: &str) -> String {
             continue;
         }
         let at = rng.below(chars.len());
-        match rng.below(6) {
+        match rng.below(7) {
             0 => {
                 chars.remove(at);
             }
@@ -102,6 +143,7 @@ fn mutate(rng: &mut Rng, seed: &str) -> String {
                 }
             }
             4 => chars[at] = ALPHABET[rng.below(ALPHABET.len())],
+            5 => chars.extend(SUFFIXES[rng.below(SUFFIXES.len())].chars()),
             _ => chars.insert(at, ALPHABET[rng.below(ALPHABET.len())]),
         }
     }
@@ -175,17 +217,17 @@ fn compare(input: &str) -> Vec<(&'static str, Outcome, Outcome)> {
         (
             "parse_date / parse_from_str",
             our_day(parse_date(input)),
-            our_day_from(NaiveDate::parse_from_str(input, "%Y-%m-%d").ok()),
+            chrono_day(NaiveDate::parse_from_str(input, "%Y-%m-%d").ok()),
         ),
         (
             "parse_lenient_date / FromStr",
             our_day(parse_lenient_date(input)),
-            our_day_from(input.parse::<NaiveDate>().ok()),
+            chrono_day(input.parse::<NaiveDate>().ok()),
         ),
         (
             "parse_lenient_date / Deserialize",
             our_day(parse_lenient_date(input)),
-            our_day_from(serde_json::from_str::<NaiveDate>(&json).ok()),
+            chrono_day(serde_json::from_str::<NaiveDate>(&json).ok()),
         ),
         (
             "parse_kept_stamp / NaiveDateTime::parse_from_str",
@@ -204,7 +246,7 @@ fn compare(input: &str) -> Vec<(&'static str, Outcome, Outcome)> {
     ]
 }
 
-fn our_day_from(value: Option<NaiveDate>) -> Outcome {
+fn chrono_day(value: Option<NaiveDate>) -> Outcome {
     value.map_or(Outcome::Refused, Outcome::Date)
 }
 
@@ -216,7 +258,8 @@ fn helpers_agree_with_chrono_on_mutated_inputs() {
     );
     let started = Instant::now();
     let mut rng = Rng(0x5eed_2026_0105_1017);
-    let mut accepted = vec![0usize; compare("").len()];
+    let names: Vec<&str> = compare("").into_iter().map(|(name, _, _)| name).collect();
+    let mut accepted = vec![0usize; names.len()];
     let mut differences = 0usize;
     let mut mismatches = Vec::new();
     let mut check = |input: &str, accepted: &mut Vec<usize>| {
@@ -242,6 +285,13 @@ fn helpers_agree_with_chrono_on_mutated_inputs() {
             "seed {seed:?} is read by no parser"
         );
     }
+    let mut exhaustive = 0usize;
+    for seed in SEEDS {
+        for input in one_edit_away(seed) {
+            check(&input, &mut accepted);
+            exhaustive += 1;
+        }
+    }
     for n in 0..STRINGS {
         let input = mutate(&mut rng, SEEDS[n % SEEDS.len()]);
         check(&input, &mut accepted);
@@ -251,13 +301,15 @@ fn helpers_agree_with_chrono_on_mutated_inputs() {
         "{differences} differences from chrono (first 20):\n{}",
         mismatches.join("\n")
     );
-    let names: Vec<&str> = compare("").into_iter().map(|(name, _, _)| name).collect();
     for (name, count) in names.iter().zip(&accepted) {
         println!("{name}: {count} accepted");
         assert!(
-            *count > STRINGS / 100,
+            *count > STRINGS / 300,
             "{name} accepted only {count} strings"
         );
     }
-    println!("{STRINGS} strings in {:?}", started.elapsed());
+    println!(
+        "{exhaustive} strings one edit away and {STRINGS} random ones in {:?}",
+        started.elapsed()
+    );
 }

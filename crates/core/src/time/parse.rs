@@ -459,3 +459,48 @@ fn comment(s: &str) -> Option<&str> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The grammars' own range checks, seen without the library: chrono
+    /// checks these again behind them, jiff checks fewer (its offsets reach
+    /// 25:59:59), so they must hold at the `Parts` level.
+    #[test]
+    fn grammars_refuse_out_of_range_fields_on_their_own() {
+        let out_of_range = [
+            "2026-01-05T10:17:19+24:00",
+            "2026-01-05T10:17:19-24:00",
+            "2026-01-05T10:17:19+25:59",
+            "2026-01-05T24:00:00Z",
+            "2026-01-05T10:60:00Z",
+            "2026-01-05T10:17:61Z",
+            "2026-02-29T10:17:19Z",
+            "2026-13-05T10:17:19Z",
+            "2026-01-00T10:17:19Z",
+        ];
+        for input in out_of_range {
+            assert_eq!(rfc3339(input), None, "{input:?}");
+            assert_eq!(lenient(input), None, "{input:?}");
+        }
+        for input in [
+            "Mon, 05 Jan 2026 10:17:19 +2400",
+            "Mon, 05 Jan 2026 24:17:19 GMT",
+            "Tue, 05 Jan 2026 10:17:19 GMT",
+        ] {
+            assert_eq!(rfc2822(input), None, "{input:?}");
+        }
+        assert_eq!(kept("20260105T241719Z"), None);
+        assert_eq!(date("2026-02-30"), None);
+        assert_eq!(lenient_date("2026-02-30"), None);
+
+        let edge = rfc3339("2026-12-31T23:59:60.5+23:59").unwrap();
+        assert_eq!(
+            (edge.second, edge.leap, edge.nanos, edge.offset_seconds),
+            (59, true, 500_000_000, 86_340)
+        );
+        let minus = lenient("2026-01-05T10:17:19 -23:59").unwrap();
+        assert_eq!(minus.offset_seconds, -86_340);
+    }
+}
