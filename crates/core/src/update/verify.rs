@@ -20,12 +20,18 @@ pub enum VerifyError {
     /// The asset's line in `SHA256SUMS` names a different sha256.
     #[error("the download does not match its line in SHA256SUMS")]
     SumMismatch,
+    /// `SHA256SUMS` names the asset on more than one line, identical or not.
+    #[error("SHA256SUMS names the downloaded asset on more than one line")]
+    SumDuplicate,
     /// The signature over `SHA256SUMS` is malformed or does not verify.
     #[error("the signature over SHA256SUMS is not valid")]
     BadSignature,
     /// The signature was made by a key this build does not trust.
     #[error("SHA256SUMS is signed by a key this build does not trust")]
     UnknownKey,
+    /// A trusted public key does not parse, or there is none.
+    #[error("no usable public key: a trusted key does not parse or none is set")]
+    NoUsableKey,
     /// The signature is valid but was made for another release.
     #[error("the signature over SHA256SUMS is for {signed:?}, not for tag {wanted}")]
     WrongTag {
@@ -62,10 +68,10 @@ pub fn verify_digest(bytes: &[u8], api_digest: &str) -> Result<(), VerifyError> 
 
 /// Checks `bytes` against the line of `sums` (sha256sum format: 64 hex
 /// digits, a space, then a space or `*`, then the file name) whose file name
-/// equals `asset` exactly. Every line naming `asset` must match.
+/// equals `asset` exactly. A second line naming `asset` is refused, even
+/// with the same digest.
 pub fn verify_sums_line(sums: &str, asset: &str, bytes: &[u8]) -> Result<(), VerifyError> {
-    let actual = sha256_hex(bytes);
-    let mut found = false;
+    let mut listed = None;
     for line in sums.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let Some((hex, name)) = sums_line(line) else {
@@ -74,15 +80,14 @@ pub fn verify_sums_line(sums: &str, asset: &str, bytes: &[u8]) -> Result<(), Ver
         if name != asset {
             continue;
         }
-        if !hex.eq_ignore_ascii_case(&actual) {
-            return Err(VerifyError::SumMismatch);
+        if listed.replace(hex).is_some() {
+            return Err(VerifyError::SumDuplicate);
         }
-        found = true;
     }
-    if found {
-        Ok(())
-    } else {
-        Err(VerifyError::SumMissing)
+    match listed {
+        None => Err(VerifyError::SumMissing),
+        Some(hex) if hex.eq_ignore_ascii_case(&sha256_hex(bytes)) => Ok(()),
+        Some(_) => Err(VerifyError::SumMismatch),
     }
 }
 
@@ -100,23 +105,30 @@ fn sums_line(line: &str) -> Option<(&str, &str)> {
 /// Checks the minisign signature `minisig` over `sums` with any key in
 /// `keys` (each the full text of a `.pub` file), then that its trusted
 /// comment is exactly `tag:<tag>`. Legacy (not pre-hashed) signatures are
-/// refused.
+/// refused, and so is a key list that is empty or holds a key text that does
+/// not parse ([`VerifyError::NoUsableKey`]), so a broken build never reads as
+/// an unknown signer.
 pub fn verify_signature(
     sums: &[u8],
     minisig: &str,
     keys: &[&str],
     tag: &str,
 ) -> Result<(), VerifyError> {
+    let keys = keys
+        .iter()
+        .map(|key| minisign_verify::PublicKey::decode(key))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| VerifyError::NoUsableKey)?;
+    if keys.is_empty() {
+        return Err(VerifyError::NoUsableKey);
+    }
     let signature =
         minisign_verify::Signature::decode(minisig).map_err(|_| VerifyError::BadSignature)?;
     // Every key is tried, so two keys that share an id cannot hide the one
-    // that verifies. A key text that does not parse trusts nothing.
+    // that verifies.
     let mut key_matched = false;
     let mut verified = false;
-    for key in keys {
-        let Ok(key) = minisign_verify::PublicKey::decode(key) else {
-            continue;
-        };
+    for key in &keys {
         match key.verify(sums, &signature, false) {
             Ok(()) => {
                 verified = true;
@@ -309,16 +321,16 @@ mod tests {
     }
 
     #[test]
-    fn a_second_line_for_the_asset_must_match_too() {
-        let sums = format!(
-            "{}  {ASSET}\n{}  {ASSET}\n",
-            sha256_hex(BYTES),
-            sha256_hex(b"something else")
-        );
-        assert_eq!(
-            verify_sums_line(&sums, ASSET, BYTES),
-            Err(VerifyError::SumMismatch)
-        );
+    fn a_second_line_for_the_asset_is_refused() {
+        let good = sha256_hex(BYTES);
+        let other = sha256_hex(b"something else");
+        for (first, second) in [(&good, &other), (&other, &good), (&good, &good)] {
+            let sums = format!("{first}  {ASSET}\n{second} *{ASSET}\n");
+            assert_eq!(
+                verify_sums_line(&sums, ASSET, BYTES),
+                Err(VerifyError::SumDuplicate)
+            );
+        }
     }
 
     #[test]
@@ -355,14 +367,45 @@ mod tests {
             verify_signature(sums.as_bytes(), &sig, &[&other_pub], TAG),
             Err(VerifyError::UnknownKey)
         );
-        assert_eq!(
-            verify_signature(sums.as_bytes(), &sig, &[], TAG),
-            Err(VerifyError::UnknownKey)
+    }
+
+    #[test]
+    fn a_key_that_does_not_parse_is_no_usable_key() {
+        let sums = sums_for(ASSET, BYTES);
+        let sig = sign_with(TEST_KEY, sums.as_bytes(), "tag:v0.34.0");
+        // The bare base64 line is not a `.pub` file text.
+        let bare = TEST_PUB.lines().nth(1).unwrap();
+        for keys in [
+            &[][..],
+            &["not a key"][..],
+            &[bare][..],
+            // A good key beside a broken one still refuses: the build is
+            // broken, which must not read as a good or an unknown signer.
+            &[TEST_PUB, "not a key"][..],
+        ] {
+            assert_eq!(
+                verify_signature(sums.as_bytes(), &sig, keys, TAG),
+                Err(VerifyError::NoUsableKey),
+                "{keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_signature_is_refused() {
+        // Made with `minisign -S -l` and the test key: valid, but not
+        // pre-hashed.
+        let sums = include_str!("../../tests/fixtures/update/legacy-SHA256SUMS");
+        let sig = include_str!("../../tests/fixtures/update/legacy-SHA256SUMS.minisig");
+        let key = minisign_verify::PublicKey::decode(TEST_PUB).unwrap();
+        let decoded = minisign_verify::Signature::decode(sig).unwrap();
+        assert!(
+            key.verify(sums.as_bytes(), &decoded, true).is_ok(),
+            "the fixture is a genuine legacy signature"
         );
-        // A key text that does not parse trusts nothing.
         assert_eq!(
-            verify_signature(sums.as_bytes(), &sig, &["not a key"], TAG),
-            Err(VerifyError::UnknownKey)
+            verify_signature(sums.as_bytes(), sig, &[TEST_PUB], TAG),
+            Err(VerifyError::BadSignature)
         );
     }
 
@@ -388,12 +431,24 @@ mod tests {
             verify_signature(sums.as_bytes(), &sig, &[TEST_PUB], TAG),
             Err(VerifyError::WrongTag { .. })
         ));
-        // A tag that only starts the comment is not the tag.
-        let sig = sign_with(TEST_KEY, sums.as_bytes(), "tag:v0.34.0 extra");
-        assert!(matches!(
-            verify_signature(sums.as_bytes(), &sig, &[TEST_PUB], TAG),
-            Err(VerifyError::WrongTag { .. })
-        ));
+        // Only the exact tag counts, in either direction of a prefix.
+        for (signed, wanted) in [
+            ("tag:v0.34.0 extra", TAG),
+            ("tag:v0.34.0-rc1", TAG),
+            ("tag:v0.34.01", TAG),
+            ("tag:v0.34.0", "v0.34.0-rc1"),
+            ("tag:v0.34.0", "v0.34"),
+        ] {
+            let sig = sign_with(TEST_KEY, sums.as_bytes(), signed);
+            assert_eq!(
+                verify_signature(sums.as_bytes(), &sig, &[TEST_PUB], wanted),
+                Err(VerifyError::WrongTag {
+                    signed: signed.to_string(),
+                    wanted: wanted.to_string(),
+                }),
+                "{signed} for {wanted}"
+            );
+        }
     }
 
     #[test]

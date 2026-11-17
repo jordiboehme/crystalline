@@ -88,24 +88,23 @@ pub enum Gate {
     Open,
     /// Too young; it opens at this instant.
     OpensAt(Stamp),
+    /// Never opens: the minimum age runs past the end of the date range.
+    Never,
 }
 
 /// The release-age gate: open when at least `min_age_hours` have passed
 /// since `published_or_first_seen`. A release dated in the future stays
-/// closed until its age is reached.
+/// closed until its age is reached; an age past the end of the date range
+/// is [`Gate::Never`] instead of a panic or a made-up date.
 pub fn age_gate(published_or_first_seen: Stamp, now: Stamp, min_age_hours: u32) -> Gate {
     let min_age = time::hours(i64::from(min_age_hours));
     if now.since(published_or_first_seen) >= min_age {
         return Gate::Open;
     }
-    // An age that runs past the end of the date range never opens; the gate
-    // names the last second the time module writes instead of panicking.
-    Gate::OpensAt(
-        published_or_first_seen
-            .checked_add(min_age)
-            .or_else(|| Stamp::from_ymd_hms(9999, 12, 31, 23, 59, 59))
-            .unwrap_or(now),
-    )
+    match published_or_first_seen.checked_add(min_age) {
+        Some(at) => Gate::OpensAt(at),
+        None => Gate::Never,
+    }
 }
 
 #[cfg(test)]
@@ -234,10 +233,7 @@ mod tests {
             age_gate(at(18, 9, 0), at(17, 9, 0), 0),
             Gate::OpensAt(at(18, 9, 0))
         );
-        // A gate past the end of the date range stays closed, without a panic.
-        assert!(matches!(
-            age_gate(published, at(17, 9, 0), u32::MAX),
-            Gate::OpensAt(_)
-        ));
+        // An age past the end of the date range never opens, without a panic.
+        assert_eq!(age_gate(published, at(17, 9, 0), u32::MAX), Gate::Never);
     }
 }
