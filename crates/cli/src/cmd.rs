@@ -4155,10 +4155,6 @@ pub async fn connect_github(
         let _ = notify_daemon_forgot(identity).await;
     }
     let share_identity = share_identity_here(&loaded, cfg);
-    let personal_mode = matches!(
-        share_identity.mode,
-        crystalline_core::config::ShareIdentityMode::Personal
-    );
     if json {
         let mut report = serde_json::json!({
             "connected": login,
@@ -4191,12 +4187,8 @@ pub async fn connect_github(
             identity_phrase(identity),
             store.kind()
         );
-        if !share_identity.is_checked() {
-            println!("Shares run on: {}", share_identity.reason_text());
-        } else if !personal_mode {
-            println!(
-                "Run: crystalline config set github.share_identity personal to share with personal identities"
-            );
+        if let Some(note) = share_identity_note(&share_identity) {
+            println!("{note}");
         }
     }
     Ok(())
@@ -4434,10 +4426,6 @@ impl PersonalApp<'_> {
             self.cfg.github_share_identity_setting(),
             crystalline_core::config::GithubAppPresence::Configured,
         );
-        let personal_mode = matches!(
-            share_identity.mode,
-            crystalline_core::config::ShareIdentityMode::Personal
-        );
         if json {
             let mut report = serde_json::json!({
                 "connected": user.login,
@@ -4470,12 +4458,8 @@ impl PersonalApp<'_> {
             )
         };
         println!("{how} ({} token store).", store.kind());
-        if !share_identity.is_checked() {
-            println!("Shares run on: {}", share_identity.reason_text());
-        } else if !personal_mode {
-            println!(
-                "Run: crystalline config set github.share_identity personal to share with personal identities"
-            );
+        if let Some(note) = share_identity_note(&share_identity) {
+            println!("{note}");
         }
         if let DaemonNotice::Refused(e) = &told {
             println!(
@@ -6090,11 +6074,7 @@ fn share_identity_here(
             if crystalline_remote::vault::installed_key_id().is_some()
                 && loaded.overlay.github_app(api_url).is_none() =>
         {
-            match home.lookup() {
-                Ok(lookup) if lookup.credentials.is_some() => GithubAppPresence::Configured,
-                Ok(_) => GithubAppPresence::None,
-                Err(_) => GithubAppPresence::Sealed,
-            }
+            presence_from_lookup(home.lookup())
         }
         Ok(home) => home.presence(&loaded.overlay),
         Err(_) => GithubAppPresence::None,
@@ -6103,6 +6083,40 @@ fn share_identity_here(
         cfg.github_share_identity_setting(),
         app,
     )
+}
+
+/// What a vault lookup of the App says about its presence: saved, not saved,
+/// or not checked when the vault did not answer.
+fn presence_from_lookup(
+    lookup: std::result::Result<crystalline_remote::AppLookup, crystalline_remote::RemoteError>,
+) -> crystalline_core::config::GithubAppPresence {
+    use crystalline_core::config::GithubAppPresence;
+    match lookup {
+        Ok(lookup) if lookup.credentials.is_some() => GithubAppPresence::Configured,
+        Ok(_) => GithubAppPresence::None,
+        Err(_) => GithubAppPresence::Sealed,
+    }
+}
+
+/// The line a personal connect prints after it saved: the mode is not
+/// checked (it would depend on an App sealed in the database that was not
+/// read), or the hint to turn on personal sharing, or nothing.
+fn share_identity_note(
+    share_identity: &crystalline_core::config::EffectiveShareIdentity,
+) -> Option<String> {
+    if !share_identity.is_checked() {
+        Some(format!("Shares run on: {}", share_identity.reason_text()))
+    } else if !matches!(
+        share_identity.mode,
+        crystalline_core::config::ShareIdentityMode::Personal
+    ) {
+        Some(
+            "Run: crystalline config set github.share_identity personal to share with personal identities"
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 /// Where this CLI process finds and keeps the GitHub App: the effective
@@ -6375,5 +6389,54 @@ mod register_request_tests {
         let request = register_request("virtual", Some("notes"), None).unwrap();
         assert!(request["path"].is_null(), "{request}");
         assert_eq!(request["kind"], "virtual");
+    }
+}
+
+#[cfg(test)]
+mod share_identity_tests {
+    use super::*;
+
+    /// A vault lookup that failed leaves the App not checked; one that
+    /// answered says whether an App is saved.
+    #[test]
+    fn a_failed_vault_lookup_leaves_the_app_not_checked() {
+        use crystalline_core::config::GithubAppPresence;
+        use crystalline_remote::{AppLookup, AppStore, RemoteError};
+        let refused = Err(RemoteError::Refused("timed out".to_string()));
+        assert_eq!(presence_from_lookup(refused), GithubAppPresence::Sealed);
+        let empty = Ok(AppLookup {
+            store: AppStore::Vault {
+                name: "github-app".to_string(),
+            },
+            credentials: None,
+            keychain_failed: None,
+            marker: None,
+        });
+        assert_eq!(presence_from_lookup(empty), GithubAppPresence::None);
+    }
+
+    /// A share identity that was not checked is said so after a personal
+    /// connect; a checked one gives the hint only outside personal mode.
+    #[test]
+    fn the_share_identity_note_after_a_personal_connect() {
+        use crystalline_core::config::{
+            EffectiveShareIdentity, GithubAppPresence, ShareIdentityMode,
+        };
+        let sealed = EffectiveShareIdentity::resolve(None, GithubAppPresence::Sealed);
+        assert_eq!(
+            share_identity_note(&sealed).as_deref(),
+            Some("Shares run on: sealed in the database (not checked)")
+        );
+        let no_app = EffectiveShareIdentity::resolve(None, GithubAppPresence::None);
+        assert!(
+            share_identity_note(&no_app)
+                .unwrap()
+                .starts_with("Run: crystalline config set github.share_identity personal")
+        );
+        let personal = EffectiveShareIdentity::resolve(
+            Some(ShareIdentityMode::Personal),
+            GithubAppPresence::None,
+        );
+        assert_eq!(share_identity_note(&personal), None);
     }
 }

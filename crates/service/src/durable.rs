@@ -119,17 +119,17 @@ impl ConfigState {
 }
 
 /// What a report says about the sealed secrets (spec section D): whether
-/// this process has a key, the ids of the keys and how many rows the
-/// database holds. Never a row name, and a missing key fails nothing.
+/// this process has a key and how many rows the database holds. Never a row
+/// name, and a missing key fails nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SecretsState {
     /// Whether `CRYSTALLINE_SECRET_KEY` or `CRYSTALLINE_SECRET_KEY_FILE` is
     /// set for this process. A report does not read the key.
     pub key_configured: bool,
-    /// The ids of the keys the secrets are sealed with: the key of the
-    /// instance that installed its vault, or for a report the ids the
-    /// sealed rows record. An id, never the key.
-    pub key_ids: Vec<String>,
+    /// The id of the key the instance seals with, for its own start line
+    /// only (spec F). `status` and `doctor` never carry one: they report
+    /// whether a key is configured and the number of rows, nothing more.
+    pub key_id: Option<String>,
     /// How many sealed secrets the database holds, `None` when not counted.
     pub sealed: Option<u64>,
     /// Why they could not be counted.
@@ -138,13 +138,8 @@ pub struct SecretsState {
 
 impl SecretsState {
     fn rows_words(&self) -> String {
-        let keys = match self.key_ids.as_slice() {
-            [] => String::new(),
-            [one] => format!(" with key {one}"),
-            many => format!(" with keys {}", many.join(", ")),
-        };
         match (&self.sealed, &self.error) {
-            (Some(n), _) => format!("{n} sealed in the database{keys}"),
+            (Some(n), _) => format!("{n} sealed in the database"),
             (None, Some(e)) => format!("not counted ({e})"),
             (None, None) => "not counted".to_string(),
         }
@@ -165,17 +160,18 @@ impl SecretsState {
     /// The clause of the start line: the key this instance seals with and
     /// how many rows the database holds.
     fn startup_words(&self) -> String {
-        match (self.key_ids.as_slice(), self.sealed) {
-            ([id], Some(n)) => format!("secrets sealed in postgres with key {id} ({})", rows(n)),
-            ([id], None) => format!("secrets sealed in postgres with key {id}"),
-            _ => format!("secrets {}", self.rows_words()),
+        match (&self.key_id, self.sealed) {
+            (Some(id), Some(n)) => {
+                format!("secrets sealed in postgres with key {id} ({})", rows(n))
+            }
+            (Some(id), None) => format!("secrets sealed in postgres with key {id}"),
+            (None, _) => format!("secrets {}", self.rows_words()),
         }
     }
 
     fn to_json(&self) -> Value {
         json!({
             "key_configured": self.key_configured,
-            "key_ids": self.key_ids,
             "sealed": self.sealed,
             "error": self.error,
         })
@@ -192,10 +188,14 @@ pub(crate) fn rows(n: u64) -> String {
 
 /// Where the GitHub App of an instance on Postgres comes from (spec section
 /// F). There is no App file there: a saved App is sealed in the database.
+/// No variant carries a row name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AppSource {
     /// The `CRYSTALLINE_GITHUB_APP_*` variables.
     Env,
+    /// The `CRYSTALLINE_GITHUB_APP_*` variables are set, but they do not
+    /// make an App that can be used; why, in the overlay's words.
+    EnvUnusable(String),
     /// A row of the sealed vault, read by the instance that has the key.
     Vault,
     /// No App is configured.
@@ -205,27 +205,33 @@ pub enum AppSource {
     /// database, which the report does not read.
     NotChecked,
     /// The vault could not be read.
-    Unread(String),
+    Unread,
 }
 
 impl AppSource {
     fn as_str(&self) -> &'static str {
         match self {
             AppSource::Env => "env",
+            AppSource::EnvUnusable(_) => "env_error",
             AppSource::Vault => "vault",
             AppSource::None => "none",
             AppSource::NotChecked => "not_checked",
-            AppSource::Unread(_) => "unread",
+            AppSource::Unread => "unread",
         }
     }
 
     fn words(&self) -> String {
         match self {
             AppSource::Env => "from the environment".to_string(),
+            AppSource::EnvUnusable(e) => {
+                format!("from the environment, but it cannot be used ({e})")
+            }
             AppSource::Vault => "sealed in the database".to_string(),
             AppSource::None => "none".to_string(),
-            AppSource::NotChecked => "sealed in the database (not checked)".to_string(),
-            AppSource::Unread(e) => format!("not read ({e})"),
+            AppSource::NotChecked => {
+                "not checked (a saved App would be sealed in the database)".to_string()
+            }
+            AppSource::Unread => UNREAD_APP.to_string(),
         }
     }
 
@@ -233,10 +239,11 @@ impl AppSource {
     fn startup_words(&self) -> String {
         match self {
             AppSource::Env => "GitHub App from env".to_string(),
+            AppSource::EnvUnusable(_) => "GitHub App from env (unusable)".to_string(),
             AppSource::Vault => "GitHub App from vault".to_string(),
             AppSource::None => "GitHub App none".to_string(),
             AppSource::NotChecked => "GitHub App not checked".to_string(),
-            AppSource::Unread(e) => format!("GitHub App not read ({e})"),
+            AppSource::Unread => "GitHub App not read".to_string(),
         }
     }
 
@@ -244,10 +251,24 @@ impl AppSource {
         json!({
             "source": self.as_str(),
             "error": match self {
-                AppSource::Unread(e) => Some(e.as_str()),
+                AppSource::EnvUnusable(e) => Some(e.clone()),
+                AppSource::Unread => Some(UNREAD_APP.to_string()),
                 _ => None,
             },
         })
+    }
+}
+
+/// Why the App source is unknown when the vault did not answer. A fixed
+/// sentence, so no store error (which may name a row) reaches a report.
+const UNREAD_APP: &str =
+    "the sealed vault could not be read, so whether an App is saved is not known";
+
+/// The App source the environment decides, `None` when it sets no App.
+fn env_app_source(overlay: &crate::EnvOverlay, api_url: Option<&str>) -> Option<AppSource> {
+    match overlay.github_app(api_url)? {
+        Ok(_) => Some(AppSource::Env),
+        Err(e) => Some(AppSource::EnvUnusable(e)),
     }
 }
 
@@ -485,32 +506,28 @@ pub async fn durable_state_for_command(
     Some(report)
 }
 
-/// The sealed secrets as a command sees them: summarized on a lock-free
-/// probe connection, which reads no name and no sealed byte, and whether
-/// this process has a key. A count that fails is said in the state and
-/// fails nothing.
+/// The sealed secrets as a command sees them: counted on a lock-free probe
+/// connection, which reads no name, no key id and no sealed byte, and
+/// whether this process has a key. A count that fails is said in the state
+/// and fails nothing.
 #[cfg(feature = "postgres")]
 async fn secrets_state_for_command(cfg: &GlobalConfig) -> SecretsState {
     let key_configured = crate::secret_start::key_variable_set();
-    let summary = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
-        Ok(target) => crystalline_index::postgres::summarize_sealed_secrets(&target)
+    let counted = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
+        Ok(target) => crystalline_index::postgres::count_sealed_secrets(&target)
             .await
             .map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
-    match summary {
-        Ok(summary) => SecretsState {
-            key_configured,
-            key_ids: summary.key_ids,
-            sealed: Some(summary.rows),
-            error: None,
-        },
-        Err(e) => SecretsState {
-            key_configured,
-            key_ids: Vec::new(),
-            sealed: None,
-            error: Some(e),
-        },
+    let (sealed, error) = match counted {
+        Ok(n) => (Some(n), None),
+        Err(e) => (None, Some(e)),
+    };
+    SecretsState {
+        key_configured,
+        key_id: None,
+        sealed,
+        error,
     }
 }
 
@@ -518,7 +535,7 @@ async fn secrets_state_for_command(cfg: &GlobalConfig) -> SecretsState {
 async fn secrets_state_for_command(_cfg: &GlobalConfig) -> SecretsState {
     SecretsState {
         key_configured: crate::secret_start::key_variable_set(),
-        key_ids: Vec::new(),
+        key_id: None,
         sealed: None,
         error: Some("this build has no Postgres backend".to_string()),
     }
@@ -527,15 +544,12 @@ async fn secrets_state_for_command(_cfg: &GlobalConfig) -> SecretsState {
 /// Where the App comes from, as a command sees it: the environment, or
 /// else not checked. A report has no vault, and the owner decision keeps a
 /// process without the key off the vault, so a saved App is not looked up.
+/// Environment variables that cannot be read are an environment error.
 fn app_source_for_command(cfg: &GlobalConfig) -> AppSource {
     let api_url = cfg.github.as_ref().and_then(|g| g.api_url.as_deref());
-    let env_app = crate::EnvOverlay::from_process_env()
-        .ok()
-        .and_then(|overlay| overlay.github_app(api_url));
-    if env_app.is_some() {
-        AppSource::Env
-    } else {
-        AppSource::NotChecked
+    match crate::EnvOverlay::from_process_env() {
+        Ok(overlay) => env_app_source(&overlay, api_url).unwrap_or(AppSource::NotChecked),
+        Err(e) => AppSource::EnvUnusable(e.to_string()),
     }
 }
 
@@ -615,8 +629,8 @@ async fn app_source_of_owner(loaded: &crate::overlay::LoadedConfig) -> AppSource
         .github
         .as_ref()
         .and_then(|g| g.api_url.clone());
-    if loaded.overlay.github_app(api_url.as_deref()).is_some() {
-        return AppSource::Env;
+    if let Some(source) = env_app_source(&loaded.overlay, api_url.as_deref()) {
+        return source;
     }
     // The folder is not read in vault mode: the lookup goes to the vault.
     let dir = crystalline_core::config::origins_state_dir().unwrap_or_default();
@@ -624,8 +638,8 @@ async fn app_source_of_owner(loaded: &crate::overlay::LoadedConfig) -> AppSource
     match tokio::task::spawn_blocking(move || home.lookup()).await {
         Ok(Ok(lookup)) if lookup.credentials.is_some() => AppSource::Vault,
         Ok(Ok(_)) => AppSource::None,
-        Ok(Err(e)) => AppSource::Unread(e.to_string()),
-        Err(e) => AppSource::Unread(e.to_string()),
+        // The error is not passed on: a store error may name the row.
+        Ok(Err(_)) | Err(_) => AppSource::Unread,
     }
 }
 
@@ -688,7 +702,7 @@ mod tests {
             },
             secrets: SecretsState {
                 key_configured: true,
-                key_ids: vec!["0123456789abcdef".to_string()],
+                key_id: Some("0123456789abcdef".to_string()),
                 sealed: Some(3),
                 error: None,
             },
@@ -707,15 +721,18 @@ mod tests {
         );
     }
 
-    /// The secrets row names the key id and the number of rows, never a row
-    /// name, and the App row names where the App comes from.
+    /// The secrets row of the block says whether a key is configured and
+    /// how many rows there are, never a key id or a row name; only the start
+    /// line names the key id. The App row names where the App comes from,
+    /// and an error never carries a store's words.
     #[test]
-    fn the_secrets_and_app_rows_name_the_key_and_the_source() {
+    fn the_secrets_and_app_rows_name_the_count_and_the_source() {
         let mut report = owned();
         let lines = report.block_lines();
         assert!(
-            lines.iter().any(|l| l
-                == "Secrets: 3 sealed in the database with key 0123456789abcdef; a key is configured"),
+            lines
+                .iter()
+                .any(|l| l == "Secrets: 3 sealed in the database; a key is configured"),
             "{lines:?}"
         );
         assert!(
@@ -724,8 +741,9 @@ mod tests {
                 .any(|l| l == "GitHub App: sealed in the database"),
             "{lines:?}"
         );
+        assert!(!lines.iter().any(|l| l.contains("0123456789abcdef")));
         let json = report.to_json();
-        assert_eq!(json["secrets"]["key_ids"][0], "0123456789abcdef");
+        assert!(!json.to_string().contains("0123456789abcdef"), "{json}");
         assert_eq!(json["secrets"]["sealed"], 3);
         assert_eq!(json["github_app"]["source"], "vault");
 
@@ -738,28 +756,29 @@ mod tests {
             report
                 .block_lines()
                 .iter()
-                .any(|l| l == "GitHub App: sealed in the database (not checked)")
+                .any(|l| l
+                    == "GitHub App: not checked (a saved App would be sealed in the database)")
         );
         assert_eq!(report.to_json()["github_app"]["source"], "not_checked");
+        report.github_app = AppSource::Unread;
+        assert!(report.startup_line().ends_with("; GitHub App not read"));
+        assert_eq!(report.to_json()["github_app"]["error"], UNREAD_APP);
+        report.github_app = AppSource::EnvUnusable("the key is not PEM".to_string());
+        assert!(
+            report.block_lines().iter().any(|l| l
+                == "GitHub App: from the environment, but it cannot be used (the key is not PEM)")
+        );
+        assert_eq!(report.to_json()["github_app"]["source"], "env_error");
 
-        // A report reads the ids the rows record; with no rows there is none.
         report.secrets = SecretsState {
             key_configured: false,
-            key_ids: Vec::new(),
+            key_id: None,
             sealed: Some(0),
             error: None,
         };
         assert!(report.block_lines().iter().any(|l| {
             l.starts_with("Secrets: 0 sealed in the database; no key is configured here")
         }));
-        report.secrets.key_ids = vec!["aaaa".to_string(), "bbbb".to_string()];
-        report.secrets.sealed = Some(2);
-        assert!(
-            report
-                .block_lines()
-                .iter()
-                .any(|l| l.starts_with("Secrets: 2 sealed in the database with keys aaaa, bbbb;"))
-        );
     }
 
     /// Credential files an earlier run left are found by their names alone

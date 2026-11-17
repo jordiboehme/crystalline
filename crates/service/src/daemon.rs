@@ -574,7 +574,7 @@ pub async fn run_serve(
                 let summary = crate::secret_start::open_vault(pg, key).await?;
                 vault_secrets = crate::durable::SecretsState {
                     key_configured: true,
-                    key_ids: vec![key_id],
+                    key_id: Some(key_id),
                     sealed: Some(summary.rows as u64),
                     error: None,
                 };

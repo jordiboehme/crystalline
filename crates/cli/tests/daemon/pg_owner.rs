@@ -3285,7 +3285,10 @@ fn reports_count_sealed_secrets_and_never_need_the_key() {
     let secrets = &status["durable_state"]["secrets"];
     assert_eq!(secrets["sealed"], 1, "{status}");
     assert_eq!(secrets["key_configured"], false, "{status}");
-    assert_eq!(secrets["key_ids"][0], test_key_id(), "{status}");
+    assert!(
+        !status["durable_state"].to_string().contains(&test_key_id()),
+        "a report names no key id: {status}"
+    );
     assert_eq!(
         status["durable_state"]["github_app"]["source"], "not_checked",
         "{status}"
@@ -3293,29 +3296,24 @@ fn reports_count_sealed_secrets_and_never_need_the_key() {
     let (ok, out, err) = env.run_full(&["status"]);
     assert!(ok, "{out}{err}");
     assert!(
-        out.contains(&format!(
-            "Secrets: 1 sealed in the database with key {}; a key is configured",
-            test_key_id()
-        )),
+        out.contains("Secrets: 1 sealed in the database; a key is configured"),
         "{out}"
     );
     assert!(
-        out.contains("GitHub App: sealed in the database (not checked)"),
+        out.contains("GitHub App: not checked (a saved App would be sealed in the database)"),
         "{out}"
     );
     let (_, out, err) = run_vars(&env, &["doctor"], &NO_SECRET_KEY);
     let text = format!("{out}{err}");
     assert!(
-        text.contains(&format!(
-            "secrets: 1 sealed in the database with key {}; no key is configured here",
-            test_key_id()
-        )),
+        text.contains("secrets: 1 sealed in the database; no key is configured here"),
         "{text}"
     );
     assert!(
-        text.contains("github app: sealed in the database (not checked)"),
+        text.contains("github app: not checked (a saved App would be sealed in the database)"),
         "{text}"
     );
+    assert!(!text.contains(&test_key_id()), "a report names no key id");
     // An App from the environment is known without the vault.
     let app = [
         ("CRYSTALLINE_GITHUB_APP_ID", "7"),
@@ -3330,6 +3328,22 @@ fn reports_count_sealed_secrets_and_never_need_the_key() {
     let status: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
         status["durable_state"]["github_app"]["source"], "env",
+        "{status}"
+    );
+    // App variables that do not make an App are an environment error, not
+    // "not checked".
+    let (_, out, err) = run_vars(
+        &env,
+        &["status", "--json"],
+        &[
+            ("CRYSTALLINE_GITHUB_APP_ID", "7"),
+            ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.env"),
+            ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", "not a private key"),
+        ],
+    );
+    let status: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}{err}"));
+    assert_eq!(
+        status["durable_state"]["github_app"]["source"], "env_error",
         "{status}"
     );
     for text in [&text, &out] {
