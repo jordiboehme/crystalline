@@ -171,6 +171,14 @@ pub(crate) fn prompt_hook_output_is_honoured(harness: HarnessKind) -> bool {
     !matches!(harness, HarnessKind::Copilot)
 }
 
+/// Whether a harness gets the managed `SubagentStart` group: Claude Code
+/// only. Codex keeps just the in-subagent silence of its existing hooks,
+/// and Copilot is not covered. Install, the reconcile, uninstall's report
+/// and `crystalline doctor` all ask this one predicate.
+pub(crate) fn subagent_start_hook_applies(harness: HarnessKind) -> bool {
+    matches!(harness, HarnessKind::ClaudeCode)
+}
+
 /// The `SessionStart` matcher: re-route on a fresh start, after `/clear` and
 /// after a compaction. `resume` is deliberately excluded, since a resumed
 /// transcript already carries the earlier routing block.
@@ -279,7 +287,8 @@ pub struct InstallOptions {
     pub project: bool,
     /// Skip the MCP registration.
     pub skip_mcp: bool,
-    /// Skip the `SessionStart`, `Stop` and `UserPromptSubmit` hooks.
+    /// Skip the `SessionStart`, `Stop`, `UserPromptSubmit` and (Claude Code
+    /// only) `SubagentStart` hooks.
     pub skip_hooks: bool,
     /// Skip copying the topical skills.
     pub skip_skills: bool,
@@ -308,6 +317,16 @@ fn stop_group(command: &str) -> Value {
 /// own, narrower timeout. No matcher, like the `Stop` group - neither
 /// harness reads one on this event.
 fn prompt_group(command: &str) -> Value {
+    json!({
+        "hooks": [ { "type": "command", "command": command, "timeout": PROMPT_HOOK_TIMEOUT_SECS } ],
+    })
+}
+
+/// The managed `SubagentStart` group: the `Stop` command, which answers a
+/// `SubagentStart` payload with the subagent block and an older binary
+/// ignores, with the prompt hook's narrow timeout, since it blocks the
+/// spawn. No matcher, so every subagent type runs it.
+fn subagent_start_group(command: &str) -> Value {
     json!({
         "hooks": [ { "type": "command", "command": command, "timeout": PROMPT_HOOK_TIMEOUT_SECS } ],
     })
@@ -531,6 +550,9 @@ pub(crate) fn add_managed_hooks(root: &mut Map<String, Value>, harness: HarnessK
     changed |= ensure_group(root, "Stop", &stop, stop_group);
     if let Some(prompt) = prompt_hook_command(harness) {
         changed |= ensure_group(root, "UserPromptSubmit", &prompt, prompt_group);
+    }
+    if subagent_start_hook_applies(harness) {
+        changed |= ensure_group(root, "SubagentStart", &stop, subagent_start_group);
     }
     changed
 }
@@ -1328,7 +1350,7 @@ fn install_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksRepor
 /// Remove the managed hooks for a harness, dispatching on its storage style.
 fn uninstall_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
     match hooks_style(harness) {
-        HooksStyle::Merged => uninstall_merged_hooks(path),
+        HooksStyle::Merged => uninstall_merged_hooks(harness, path),
         HooksStyle::Owned => uninstall_owned_hooks(path),
         // The hook file comes from the profile row, not from `path`.
         HooksStyle::Profile => install_profile::uninstall_hook_report(harness),
@@ -1345,6 +1367,7 @@ fn install_merged_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hoo
     let had_session_start = hook_present(&root, "SessionStart", SESSION_START_COMMAND);
     let had_stop = hook_present(&root, "Stop", STOP_COMMAND);
     let had_prompt = hook_present(&root, "UserPromptSubmit", PROMPT_COMMAND);
+    let had_subagent_start = hook_present(&root, "SubagentStart", STOP_COMMAND);
     let changed = add_managed_hooks(&mut root, harness);
     if changed {
         write_settings(path, &root)?;
@@ -1364,17 +1387,23 @@ fn install_merged_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hoo
                 "added"
             }
         }),
+        subagent_start: subagent_start_hook_applies(harness).then_some(if had_subagent_start {
+            "already-present"
+        } else {
+            "added"
+        }),
         written: changed,
     })
 }
 
 /// Remove the managed hooks from the shared settings file, writing only on
 /// change.
-fn uninstall_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
+fn uninstall_merged_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
     let mut root = read_settings(path)?;
     let had_session_start = hook_present(&root, "SessionStart", SESSION_START_COMMAND);
     let had_stop = hook_present(&root, "Stop", STOP_COMMAND);
     let had_prompt = hook_present(&root, "UserPromptSubmit", PROMPT_COMMAND);
+    let had_subagent_start = hook_present(&root, "SubagentStart", STOP_COMMAND);
     let changed = remove_managed_hooks(&mut root);
     if changed {
         write_settings(path, &root)?;
@@ -1391,6 +1420,15 @@ fn uninstall_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
         // Code, Codex) supports the prompt hook today, so this is `Some`
         // whenever the merged path runs at all.
         prompt: Some(if had_prompt { "removed" } else { "absent" }),
+        // A hand-written entry under another harness still comes out, so it
+        // is reported wherever one was found.
+        subagent_start: (subagent_start_hook_applies(harness) || had_subagent_start).then_some(
+            if had_subagent_start {
+                "removed"
+            } else {
+                "absent"
+            },
+        ),
         written: changed,
     })
 }
@@ -1424,6 +1462,7 @@ fn install_owned_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hook
                 "added"
             }
         }),
+        subagent_start: None,
         written: changed,
     })
 }
@@ -1471,6 +1510,7 @@ fn uninstall_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
         // The owned style is Copilot's alone, and it supports the prompt
         // hook (written, inert) like the other two, so this is always `Some`.
         prompt: Some(if had_prompt { "removed" } else { "absent" }),
+        subagent_start: None,
         written: changed,
     })
 }
@@ -1906,6 +1946,11 @@ pub(crate) struct HooksReport {
     /// each gets an entry, Copilot's inert) and for the profile harnesses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt: Option<&'static str>,
+    /// What happened to the `SubagentStart` hook, with the same outcome
+    /// words as `prompt`. `None` for every harness but Claude Code (see
+    /// [`subagent_start_hook_applies`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) subagent_start: Option<&'static str>,
     pub(crate) written: bool,
 }
 
@@ -2116,6 +2161,12 @@ fn render_human(header: String, parts: Parts<'_>) -> String {
                 out.push_str(&format!(
                     "  UserPromptSubmit hook: {}\n",
                     hook_label(prompt)
+                ));
+            }
+            if let Some(subagent_start) = h.subagent_start {
+                out.push_str(&format!(
+                    "  SubagentStart hook: {}\n",
+                    hook_label(subagent_start)
                 ));
             }
             out.push_str(&format!("  Settings file: {}\n", h.path));
@@ -3396,6 +3447,103 @@ mod tests {
         assert!(
             !root.contains_key("hooks"),
             "the emptied UserPromptSubmit event is pruned along with the hooks object"
+        );
+    }
+
+    #[test]
+    fn add_managed_hooks_adds_subagent_start_for_claude_code() {
+        let mut root = Map::new();
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+        let groups = root["hooks"]["SubagentStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(
+            groups[0].get("matcher").is_none(),
+            "the SubagentStart group carries no matcher"
+        );
+        assert_eq!(
+            groups[0]["hooks"],
+            json!([ {
+                "type": "command",
+                "command": "crystalline hook stop --harness claude-code",
+                "timeout": 5
+            } ])
+        );
+    }
+
+    #[test]
+    fn add_managed_hooks_is_idempotent_with_subagent_start() {
+        let mut root = Map::new();
+        add_managed_hooks(&mut root, HarnessKind::ClaudeCode);
+        let first = serde_json::to_vec(&root).unwrap();
+        assert!(!add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+        assert_eq!(serde_json::to_vec(&root).unwrap(), first);
+    }
+
+    #[test]
+    fn no_subagent_start_for_other_harnesses() {
+        for harness in [HarnessKind::Codex, HarnessKind::Copilot] {
+            let mut root = Map::new();
+            add_managed_hooks(&mut root, harness);
+            assert!(
+                !root["hooks"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("SubagentStart"),
+                "{harness:?} gets no SubagentStart group"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_group_does_not_count_for_subagent_start() {
+        let mut root = root(json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 10 } ] }
+                ]
+            }
+        }));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+        assert!(hook_present(&root, "SubagentStart", STOP_COMMAND));
+        assert_eq!(root["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_edited_subagent_start_group_is_left_alone() {
+        let edited = json!([
+            {
+                "matcher": "Explore",
+                "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 30 } ]
+            }
+        ]);
+        let mut root = root(json!({ "hooks": { "SubagentStart": edited.clone() } }));
+        add_managed_hooks(&mut root, HarnessKind::ClaudeCode);
+        assert_eq!(root["hooks"]["SubagentStart"], edited);
+    }
+
+    #[test]
+    fn remove_managed_hooks_strips_subagent_start() {
+        let mut root = root(json!({
+            "hooks": {
+                "SubagentStart": [
+                    { "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 5 } ] },
+                    { "hooks": [ { "type": "command", "command": "my-own-subagent-hook" } ] }
+                ]
+            }
+        }));
+        assert!(remove_managed_hooks(&mut root));
+        assert_eq!(
+            root["hooks"]["SubagentStart"],
+            json!([ { "hooks": [ { "type": "command", "command": "my-own-subagent-hook" } ] } ]),
+            "a person's own SubagentStart hook stays"
+        );
+
+        let mut only_ours = Map::new();
+        add_managed_hooks(&mut only_ours, HarnessKind::ClaudeCode);
+        assert!(remove_managed_hooks(&mut only_ours));
+        assert!(
+            !only_ours.contains_key("hooks"),
+            "the emptied SubagentStart event is pruned with the rest"
         );
     }
 

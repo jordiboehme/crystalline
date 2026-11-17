@@ -46,9 +46,23 @@ Experience only compounds when capture actually happens. The loop has three beat
 
 It is a `Stop` hook running `crystalline hook stop`: a once-per-session, late nudge that fires on the first stop after a session gains real substance. It stays silent otherwise: below the substance threshold, once it has already fired, in read-only mode or with no domain registered. When it fires, it asks the agent to review the conversation for durable learnings, propose capturing each one into the fitting domain (the same propose-first, wait-for-a-yes shape the capture skill follows) and raise the salience of any recalled engram that proved key to the task. Where a team domain holds work the team has not seen, one more line counts it and asks the agent to propose sharing it with `share_changes`. It is still a proposal to say yes to, since sharing publishes somebody's work for review.
 
-The reminder costs about 120 tokens, at most once per session. Remove it with `crystalline uninstall <harness>`, or leave it out from the start with `--skip-hooks`.
+The reminder costs about 175 tokens, at most once per session. Remove it with `crystalline uninstall <harness>`, or leave it out from the start with `--skip-hooks`.
 
 There is a third hook: a `UserPromptSubmit` hook running `crystalline hook prompt`, installed for Claude Code, Codex and Copilot alike, so what an earlier session learned meets the agent when it is relevant, without it having to decide to search first. In Claude Code and Codex each prompt arrives with at most three engrams, named by `crystalline://` address, one line each - a head start to read with `read_engram`, not the answer itself. A given engram is named once per session, and again after `/clear` or a compaction. It costs about 200 tokens when it has something to say, and nothing when it does not: it stays silent without a running daemon, before the index has embeddings, or once `recall.enabled` is turned off; `recall.limit` and `recall.min_score` are its cap and its floor (3 and 0.69 by default). Copilot gets the same hook entry but has no channel yet for what it would say, so it stays installed and inert there.
+
+Inside a subagent every one of these hooks stays quiet. A hook call that names a subagent (`agent_id`) gets no routing block, no recall and no capture or maintenance ask, and it leaves the main session's state alone. A session started with `claude --agent <name>` is still a main session and keeps its hooks. Claude Code gives each subagent one short block when it starts instead, through a fourth hook: `SubagentStart`, which runs `crystalline hook stop` so that an older binary ignores it and any uninstall removes it. The block reads:
+
+```text
+Crystalline (you are a subagent):
+- Search Crystalline (search_engrams, read_engram) before you start.
+- Never ask the user; decide, or name what is open in your report.
+- Skip reflect, evolve_engrams and Crystalline maintenance notices.
+- Before you finish, store what saves a later session from reinventing the wheel or stepping into the same trap: facts, decisions with their reason, gotchas. Never what you did, what the files you read already say or what any model knows anyway. Search first; edit the engram that covers it (expected_checksum, re-read and retry on a conflict), else write one with an explicit domain. Domain unclear: name it in your report. Your task's instructions win.
+```
+
+So a subagent searches freely, never asks you anything and leaves reflect and evolve to the main session. It stores what it learned itself, without asking anybody and without handing it back: facts, decisions and gotchas that save a later session from the same work or the same trap, never what the files already say or what any model knows. The store bullet is left out in read-only mode, when no domain is writable, and for the built-in `Explore` and `Plan` agents, which only read. With no domain at all, or for an internal agent without a type, there is no block. A task that says not to write, or gives the writes to someone else (an ingestion split over several subagents, for example), wins over the block. The block reaches foreground and background subagents alike, and a nested subagent gets its own. Inside a Claude Code subagent no `SessionStart`, `UserPromptSubmit` or `Stop` fires anyway, and when a background subagent finishes, its notice reaches the main session as a prompt the recall hook leaves alone. In Codex and Copilot a hook call that carries the subagent's id stays quiet in the same way; neither gets a block yet. Cursor, Kiro, Gemini CLI and Qwen Code have only the session-start hook.
+
+A subagent with the store bullet writes engrams without asking you, and what it stores comes back as recall in later sessions. To give the block only to some agents or to turn it off, edit the `SubagentStart` entry in the settings file instead of deleting it: give it a `matcher` that names the agent types that should get the block, a regular expression such as `^general-purpose$`, or one no agent type has, such as `^none$`, to turn it off. A later install, and the update of the hooks after an upgrade, keep an edited entry as it is; a deleted one comes back.
 
 One session, hook by hook:
 
@@ -59,6 +73,7 @@ sequenceDiagram
     participant D as Daemon
     participant A as Agent
     participant F as Domain files
+    participant S as Subagent
     H->>C: SessionStart
     C->>D: prompt system
     D-->>A: routing block, one line per domain
@@ -69,6 +84,9 @@ sequenceDiagram
     D-->>A: recalled engrams
     A->>D: write_engram
     D->>F: engram written, index updated
+    H->>C: SubagentStart
+    C-->>S: subagent block, once per subagent
+    S->>D: search_engrams, write_engram
     H->>C: Stop
     C-->>A: capture nudge, once per session
     A->>D: write_engram after a yes
