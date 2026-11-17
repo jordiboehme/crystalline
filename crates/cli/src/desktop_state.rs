@@ -476,6 +476,16 @@ pub async fn merge_into(
         GlobalConfig::default()
     };
     let loaded = crate::cmd::load(real_config)?;
+    // Claude Desktop's private state belongs to one machine's config.yaml.
+    // With the configuration kept in a Postgres database, config.yaml is a
+    // read-only base the operator edits, and the registrations live in the
+    // database the active instance owns, so nothing is merged here.
+    if loaded.mode == crystalline_service::overlay::ConfigMode::Document {
+        anyhow::bail!(
+            "this machine keeps its configuration in a Postgres database, so Claude Desktop's state in {} is not merged; register its domains with crystalline domain add",
+            state.folder.display()
+        );
+    }
     let table = crate::cmd::build_name_table(&loaded);
     report.github_enabled = loaded.effective.github_enabled();
     let mut file = loaded.file.clone();

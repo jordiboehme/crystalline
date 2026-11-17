@@ -368,7 +368,11 @@ pub async fn run_serve(
     // config path (flag, then CRYSTALLINE_CONFIG, then the default) and layer
     // the overlay over the file. A bad known variable aborts startup here with
     // a message naming it.
-    let loaded = overlay::load(config_path.as_deref())?;
+    #[cfg_attr(
+        not(feature = "postgres"),
+        allow(unused_mut, reason = "only the postgres backend attaches a document")
+    )]
+    let mut loaded = overlay::load(config_path.as_deref())?;
     // The operator's own setup token, checked before anything binds so a
     // token under the floor stops the start with a sentence naming the
     // variable. Never printed or logged.
@@ -548,7 +552,14 @@ pub async fn run_serve(
     #[cfg(feature = "postgres")]
     if let Some(pg) = &pg_start {
         pg.announce().await?;
+        // The configuration document, read once now that this instance owns
+        // the database and the store open made sure its table exists (spec
+        // section C). A failed read stops the start: an instance that went
+        // on with config.yaml alone would save over the stored settings.
+        read_document_at_takeover(&mut loaded, pg).await?;
     }
+    // The document can set `service.read_only` too.
+    let read_only = read_only || loaded.effective.read_only();
     // The owner of a Postgres database is its only active instance, so the
     // host lock of every domain it serves is its own: claimed with take-over,
     // never waited for until a killed predecessor's heartbeat goes stale.
@@ -578,6 +589,11 @@ pub async fn run_serve(
         .with_instance_id(instance_id)
         .with_env_overlay(loaded.overlay.clone())
         .with_machine_owner_lookup(crate::client::machine_owner_for_engine());
+    // On Postgres the configuration is the document read above, over
+    // config.yaml as a read-only base, and every write goes there.
+    if loaded.document.is_some() {
+        engine = engine.with_persisted(loaded.persisted()?, loaded.base.clone())?;
+    }
     // Told where the state directory is, as the standalone opener is: the
     // same path the engine resolves on its own in a release build, and under
     // the test seam (which refuses to guess one) the isolated directory a
@@ -1204,6 +1220,29 @@ async fn open_store_for_start(
     #[cfg(not(feature = "postgres"))]
     let _ = pg;
     open_store_as_owner(cfg, db).await
+}
+
+/// Read the configuration document of the database `pg` owns and attach it
+/// to `loaded`. Any failure is the start's: on Postgres the configuration
+/// lives in the database, so this instance does not start without it.
+#[cfg(feature = "postgres")]
+async fn read_document_at_takeover(
+    loaded: &mut overlay::LoadedConfig,
+    pg: &crate::standby::PgStart,
+) -> anyhow::Result<()> {
+    let side = pg.side();
+    let fatal = |e: String| {
+        anyhow::anyhow!(
+            "could not read the configuration in the database {} ({e}); on Postgres the configuration lives in the database, so this instance does not start without it",
+            pg.database()
+        )
+    };
+    let body = side.load_config().await.map_err(|e| fatal(e.to_string()))?;
+    loaded
+        .attach_document(Arc::new(side), body.map(|d| d.body))
+        .map_err(|e| fatal(format!("{e:#}")))?;
+    start_step("configuration read");
+    Ok(())
 }
 
 /// Open the accounts store the daemon keeps for domain access and the HTTP

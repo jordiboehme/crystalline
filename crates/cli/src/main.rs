@@ -3060,7 +3060,7 @@ async fn status_dispatch(
     }
     // Nothing answered, so the numbers have to come from the index here, and
     // that needs the config the probe above could do without.
-    let cfg = cmd::load(config.as_deref())?.effective;
+    let mut cfg = cmd::load(config.as_deref())?.effective;
     // On Postgres a report opens no store (only the owner does): without a
     // daemon here it is the owner row and where the accounts live.
     if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none").await {
@@ -3084,7 +3084,7 @@ async fn status_dispatch(
     }
     let route = cmd::reach_index(
         None,
-        &cfg,
+        &mut cfg,
         config.as_deref(),
         db.as_deref(),
         cmd::OpenAs::Read,
@@ -3221,8 +3221,8 @@ async fn sync_dispatch(
     if accept_disk && domain.is_none() {
         anyhow::bail!(crystalline_index::ACCEPT_DISK_NEEDS_DOMAIN);
     }
-    let loaded = cmd::load(config.as_deref())?;
-    let cfg = &loaded.effective;
+    let mut loaded = cmd::load(config.as_deref())?;
+    let mut cfg = loaded.effective.clone();
     let route = cmd::reach_index(
         Some(json!({
             "v": 1,
@@ -3232,7 +3232,7 @@ async fn sync_dispatch(
             "take_over": take_over,
             "accept_disk": accept_disk,
         })),
-        cfg,
+        &mut cfg,
         config.as_deref(),
         db.as_deref(),
         cmd::OpenAs::Write,
@@ -3285,6 +3285,11 @@ async fn sync_dispatch(
         return Ok(());
     }
     let store = cmd::local_store(route, "sync")?;
+    // With the configuration in the database, the names are the document's
+    // too: read under the claim the open just took.
+    if loaded.mode == crystalline_service::overlay::ConfigMode::Document {
+        loaded = crystalline_service::claim::owned_config(config.as_deref()).await?;
+    }
     // Standalone (no daemon, or an explicit `--db`/`--config` override that
     // bypasses one): `cmd::sync`'s own `select_domains` matches `domain`
     // against `cfg.domains`'s local keys directly, with no resolution of its
@@ -3297,7 +3302,7 @@ async fn sync_dispatch(
     let resolved_domain = domain
         .as_deref()
         .map(|d| loaded.name_table().resolve(d).unwrap_or(d).to_string());
-    cmd::sync(store.clone(), cfg, resolved_domain.as_deref(), flags, json).await?;
+    cmd::sync(store.clone(), &cfg, resolved_domain.as_deref(), flags, json).await?;
     // Once the sync has returned cleanly, as the daemon's ctl `sync` does: a
     // synced MANIFEST may declare a new name. A sync that failed says so and
     // adopts nothing. The adoption cannot fail the sync that landed: its own
@@ -3359,7 +3364,7 @@ async fn reindex_dispatch(
 ) -> anyhow::Result<()> {
     use serde_json::json;
     let loaded = cmd::load(config.as_deref())?;
-    let cfg = loaded.effective.clone();
+    let mut cfg = loaded.effective.clone();
 
     // A wipe needs the index to itself, and only the embedded backend can
     // establish that: opening the local database file takes an exclusive lock,
@@ -3451,7 +3456,7 @@ async fn reindex_dispatch(
         (!wipe).then(|| json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }));
     let route = cmd::reach_index(
         request,
-        &cfg,
+        &mut cfg,
         config.as_deref(),
         db.as_deref(),
         if wipe {
@@ -3494,7 +3499,9 @@ async fn reindex_dispatch(
 
 /// `config show|set|unset`: route over the daemon's ctl `configure` command
 /// when one is running, else act on the config file directly. Neither path
-/// opens the index; settings live in `config.yaml`, not the database.
+/// opens the index. With Postgres configured the settings live in the
+/// database's configuration document instead (see
+/// [`crystalline_service::configure`]).
 async fn config_dispatch(command: ConfigCommand, json: bool) -> anyhow::Result<()> {
     match command {
         ConfigCommand::Show { config } => {
@@ -5425,6 +5432,16 @@ async fn domain_add_dispatch(
         {
             let done = cmd::register_through_daemon("virtual", Some(&name), None).await?;
             (done.manifest.unwrap_or_default(), done.adopted)
+        } else if let Some(done) = cmd::register_in_document(
+            "virtual",
+            Some(&name),
+            None,
+            db.as_deref(),
+            config.as_deref(),
+        )
+        .await?
+        {
+            (done.manifest.unwrap_or_default(), done.adopted)
         } else {
             cmd::domain_add_register_virtual(&name, config.as_deref())?
         };
@@ -5456,6 +5473,19 @@ async fn domain_add_dispatch(
                 cmd::register_through_daemon("file", name.as_deref(), path.as_deref()).await?;
             let root = done.root.ok_or_else(|| {
                 anyhow::anyhow!("the daemon registered '{}' with no folder", done.name)
+            })?;
+            (done.name, root, done.adopted, done.shadowed)
+        } else if let Some(done) = cmd::register_in_document(
+            "file",
+            name.as_deref(),
+            path.as_deref(),
+            db.as_deref(),
+            config.as_deref(),
+        )
+        .await?
+        {
+            let root = done.root.ok_or_else(|| {
+                anyhow::anyhow!("the registration of '{}' named no folder", done.name)
             })?;
             (done.name, root, done.adopted, done.shadowed)
         } else {
