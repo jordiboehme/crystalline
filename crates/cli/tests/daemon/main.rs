@@ -25,6 +25,11 @@ mod mcp_stub;
 // `Env` and `PgScratch` helpers of `service`.
 #[cfg(unix)]
 mod pg_owner;
+// A redeploy on Postgres keeps every account, setting, domain and sealed
+// secret; on Turso the state folder is the instance. Reaches the `Serve`
+// helpers of `pg_owner`.
+#[cfg(unix)]
+mod pg_redeploy;
 // The same two seams as bridge above.
 #[cfg(debug_assertions)]
 mod packaged;
