@@ -74,7 +74,11 @@ async fn embed_pass(store: &dyn Store, cfg: &GlobalConfig) -> Result<()> {
 /// `domain remove`) mutate `loaded.file` and save it back to `loaded.path`, so
 /// no environment value ever bakes into `config.yaml`.
 pub(crate) fn load(config_override: Option<&Path>) -> Result<crystalline_service::LoadedConfig> {
-    crystalline_service::overlay::load(config_override)
+    let loaded = crystalline_service::overlay::load(config_override)?;
+    // On Postgres no CLI path reads the keychain or the state folder for a
+    // secret (spec section D).
+    crystalline_service::keep_secrets_off_local_stores(&loaded.effective);
+    Ok(loaded)
 }
 
 /// Resolve the index database path from an optional override.
@@ -4051,6 +4055,7 @@ pub async fn connect_github(
                 state_dir: &state_dir,
                 token_store_dir,
                 cfg,
+                beside_daemon,
             };
             if disconnect {
                 return person.disconnect(json).await;
@@ -4120,6 +4125,11 @@ pub async fn connect_github(
         refresh_expires_at: None,
     };
     account_then.refuse_if_changed().await?;
+    // Beside the daemon its cache is dropped before the write as well (see
+    // the notice after it).
+    if beside_daemon {
+        let _ = notify_daemon_forgot(identity).await;
+    }
     let store = save_credential(
         identity,
         token_host.as_deref(),
@@ -4294,6 +4304,9 @@ struct PersonalApp<'a> {
     state_dir: &'a Path,
     token_store_dir: Option<&'a Path>,
     cfg: &'a crystalline_core::config::GlobalConfig,
+    /// The token is sealed beside a daemon of this machine that owns the
+    /// Postgres database ([`crystalline_service::SecretRoute::Beside`]).
+    beside_daemon: bool,
 }
 
 impl PersonalApp<'_> {
@@ -4375,6 +4388,12 @@ impl PersonalApp<'_> {
             expires_at: grant.expires_at,
             refresh_expires_at: grant.refresh_expires_at,
         };
+        // Beside the daemon the cache is dropped before the write as well,
+        // so a read of the daemon racing the write never keeps the old
+        // token past the notice after it.
+        if self.beside_daemon {
+            let _ = notify_daemon_forgot(self.identity).await;
+        }
         let saved = save_credential(
             self.identity,
             self.token_host,

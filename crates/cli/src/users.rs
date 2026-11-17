@@ -235,8 +235,10 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
         }
         UsersCommand::Disable { name } => {
             // A sealed token goes first: an account is never disabled while
-            // its token stays, and a failed delete changes nothing.
+            // its token stays, and a failed delete changes nothing. The
+            // disabling is checked before, so a refused one deletes nothing.
             if sealed(&route) {
+                store.check_change_of(&name, "disable", true).await?;
                 sweep_personal_credential(&name, &route).await?;
             }
             store.set_disabled(&name, true).await?;
@@ -451,8 +453,10 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             }
         }
         UsersCommand::Remove { name, force } => {
-            // As for `disable`: a sealed token goes before the account.
+            // As for `disable`: a sealed token goes before the account,
+            // once the removal is known to pass.
             if sealed(&route) {
+                store.check_change_of(&name, "remove", !force).await?;
                 sweep_personal_credential(&name, &route).await?;
             }
             if force {

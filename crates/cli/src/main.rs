@@ -2300,6 +2300,10 @@ fn run() -> anyhow::Result<()> {
         words.clone(),
         is_report(cli.command.as_ref()),
     );
+    // On Postgres the secrets live in the sealed vault: from here on no
+    // credential call of this process reads or writes the keychain or the
+    // state folder (a `--config` read later says the same for its file).
+    crystalline_service::keep_secrets_off_local_stores_for(None);
     // Inside Claude Desktop's app package every new file under AppData lands
     // in the package's private copy, so from here on a write there that was
     // not sent to the daemon fails loudly instead of splitting the state.

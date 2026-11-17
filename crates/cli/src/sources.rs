@@ -718,6 +718,18 @@ async fn ask_one(record: SourceRecord, dir: std::path::PathBuf) -> SourceRow {
         row.fetched_at = Some(cached.fetched_at.to_rfc3339());
         row.failure = cached.last_failure;
     }
+    // On Postgres the sign-in is sealed in the database, which a report
+    // never opens: the source is not asked, and no local store is read.
+    if !record.from_env
+        && crystalline_remote::vault::engaged()
+        && crystalline_remote::vault::installed_key_id().is_none()
+    {
+        row.credential_store = Some("vault".to_string());
+        row.error = Some(
+            "its sign-in is sealed in the database, so only the active instance asks it; run crystalline status there".to_string(),
+        );
+        return row;
+    }
     let timed_out = RemoteFailure::TimedOut {
         source: record.name.clone(),
         url: record.url.clone(),
