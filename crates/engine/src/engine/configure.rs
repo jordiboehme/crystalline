@@ -189,8 +189,8 @@ impl Engine {
     /// pair rule of [`settings::apply_checked`]. In document mode a
     /// `database.*` key is refused (where the configuration lives is decided
     /// by that block, so it stays in config.yaml and the environment), so are
-    /// `service.http` and a `service.public_url` with a path (read before the
-    /// document is read), and the
+    /// `service.http` and a `service.public_url` that moves the base path
+    /// (both read before the document is read), and the
     /// pair rule is checked over the document merged with its base, the way
     /// the running server reads it.
     fn apply_setting(&self, file: &mut GlobalConfig, key: &str, value: Option<&str>) -> Result<()> {
@@ -202,7 +202,17 @@ impl Engine {
             return Ok(());
         }
         settings::refuse_database_key_in_document(key)
-            .and_then(|()| settings::refuse_bind_key_in_document(key, value))
+            .and_then(|()| settings::refuse_bind_key_in_document(key))
+            .and_then(|()| {
+                settings::refuse_public_url_in_document(
+                    self.config_base
+                        .as_ref()
+                        .unwrap_or(&GlobalConfig::default()),
+                    &self.overlay,
+                    key,
+                    value,
+                )
+            })
             .map_err(|e| EngineError::Refused(e.to_string()))?;
         let mut next = file.clone();
         match value {

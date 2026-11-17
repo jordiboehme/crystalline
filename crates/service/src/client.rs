@@ -2719,7 +2719,15 @@ async fn configure_document(
 ) -> anyhow::Result<Value> {
     use crate::engine::ConfigureAction;
     if let Some(key) = key.filter(|_| action != "show") {
-        crate::settings::refuse_bind_key_in_document(key, value.filter(|_| action == "set"))
+        crate::settings::refuse_bind_key_in_document(key)
+            .and_then(|()| {
+                crate::settings::refuse_public_url_in_document(
+                    loaded.base.as_ref().unwrap_or(&loaded.file),
+                    &loaded.overlay,
+                    key,
+                    value.filter(|_| action == "set"),
+                )
+            })
             .map_err(anyhow::Error::msg)?;
     }
     let action = match action {
