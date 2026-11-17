@@ -7098,8 +7098,6 @@ fn a_daemonless_command_leaves_no_host_lock_behind_on_postgres() {
 /// through `database.schema` (`CRYSTALLINE_DATABASE_SCHEMA`, [`PgScratch::env`]).
 #[test]
 fn no_test_selects_a_schema_through_url_options() {
-    // Built in two parts so this file does not match its own scan.
-    let needle = format!("{}{}", "options=", "-c");
     let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates");
     let mut stack: Vec<PathBuf> = std::fs::read_dir(&tests)
         .unwrap()
@@ -7113,13 +7111,80 @@ fn no_test_selects_a_schema_through_url_options() {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "rs")
-                && std::fs::read_to_string(&p).is_ok_and(|c| c.contains(&needle))
+                && std::fs::read_to_string(&p).is_ok_and(|c| sets_session_options(&c))
             {
                 hits.push(p);
             }
         }
     }
     assert!(hits.is_empty(), "URL options select a schema in {hits:?}");
+}
+
+/// Whether `text` holds a URL `options` value that sets a session setting
+/// (`-c name=value`, or `--name=value`), in any percent-encoding of it.
+fn sets_session_options(text: &str) -> bool {
+    // Built in two parts so this file does not match its own scan.
+    let key = ["opt", "ions="].concat();
+    text.match_indices(&key).any(|(at, _)| {
+        let value: String = text[at + key.len()..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '&' | '"' | '\'' | ')'))
+            .collect();
+        let decoded = percent_decoded(&value);
+        decoded.starts_with("-c") || decoded.starts_with("--")
+    })
+}
+
+/// `text` with every `%XX` escape and every `+` decoded.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let escaped = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+                match escaped {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                        continue;
+                    }
+                    None => out.push(b'%'),
+                }
+            }
+            b'+' => out.push(b' '),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The scan sees the literal form and every encoded one, and leaves other
+/// URL parameters alone.
+#[test]
+fn the_options_scan_decodes_before_it_matches() {
+    let key = ["opt", "ions="].concat();
+    for value in [
+        "-c%20search_path%3Dteam",
+        "-c search_path=team",
+        "%2Dc%20search_path%3Dteam",
+        "%2dc+search_path%3Dteam",
+        "--search_path%3Dteam",
+        "%2D%2Dsearch_path=team",
+    ] {
+        let url = format!("postgres://u@h/db?sslmode=disable&{key}{value}");
+        assert!(sets_session_options(&url), "{url}");
+    }
+    for url in [
+        "postgres://u@h/db?sslmode=disable",
+        "postgres://u@h/db?application_name=x",
+    ] {
+        assert!(!sets_session_options(url), "{url}");
+    }
 }
 
 /// The secret key every Postgres process test runs with: fixed, so a test
