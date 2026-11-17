@@ -2987,7 +2987,7 @@ async fn status_dispatch(
                 // A standby was answered above; the daemon's own role,
                 // active when its reply carries none.
                 let role = data["role"].as_str().unwrap_or("active");
-                cmd::durable_state_block(&loaded.effective, role).await
+                cmd::durable_state_block(&loaded.effective, role, config.as_deref()).await
             }
             Err(_) => None,
         };
@@ -3067,7 +3067,7 @@ async fn status_dispatch(
         .effective;
     // On Postgres a report opens no store (only the owner does): without a
     // daemon here it is the owner row and where the accounts live.
-    if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none").await {
+    if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none", config.as_deref()).await {
         if json {
             let registered: Vec<&String> = cfg.domains.keys().collect();
             println!(

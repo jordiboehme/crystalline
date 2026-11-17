@@ -6,6 +6,8 @@
 //!
 //! It exists on Postgres only. On Turso there is no block.
 
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use crystalline_core::config::{AccountsLocation, GlobalConfig};
 use crystalline_index::postgres::OwnerRow;
@@ -42,6 +44,80 @@ pub enum OwnerState {
     Unknown(String),
 }
 
+/// What a look at the configuration document found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentState {
+    /// The document was saved, last at this time.
+    Saved(DateTime<Utc>),
+    /// No document is stored yet: the database runs on config.yaml and the
+    /// defaults.
+    NotSaved,
+    /// The document could not be read.
+    Unreadable(String),
+}
+
+/// Where the settings and the domain registry come from (spec section F).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigState {
+    /// The document in the database.
+    pub document: DocumentState,
+    /// The config.yaml read as the read-only base, `None` when there is no
+    /// such file.
+    pub base_path: Option<PathBuf>,
+    /// The domains config.yaml registers. They cannot be removed, purged or
+    /// renamed while the configuration lives in the database.
+    pub base_domains: Vec<String>,
+}
+
+impl ConfigState {
+    /// The state for a base `config` read from `path`, with what the look
+    /// at the document found. A path that is no file is no base.
+    pub fn new(document: DocumentState, path: &Path, config: Option<&GlobalConfig>) -> Self {
+        let base_path = path.is_file().then(|| path.to_path_buf());
+        let base_domains = match (&base_path, config) {
+            (Some(_), Some(config)) => config.domains.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        ConfigState {
+            document,
+            base_path,
+            base_domains,
+        }
+    }
+
+    fn document_words(&self) -> String {
+        match &self.document {
+            DocumentState::Saved(at) => format!("configuration document (updated {})", stamp(*at)),
+            DocumentState::NotSaved => "configuration document (not saved yet)".to_string(),
+            DocumentState::Unreadable(e) => format!("configuration document (not read: {e})"),
+        }
+    }
+
+    fn base_words(&self) -> String {
+        match &self.base_path {
+            Some(path) => format!("config.yaml {} read as base", path.display()),
+            None => "config.yaml none".to_string(),
+        }
+    }
+
+    /// The info line about base domains, `None` when config.yaml registers
+    /// none.
+    pub fn base_domains_line(&self) -> Option<String> {
+        let path = self.base_path.as_ref()?;
+        (!self.base_domains.is_empty()).then(|| {
+            format!(
+                "config.yaml {} registers {} ({}): they cannot be removed, purged or renamed while the configuration lives in the database, so edit that file",
+                path.display(),
+                match self.base_domains.len() {
+                    1 => "1 domain".to_string(),
+                    n => format!("{n} domains"),
+                },
+                self.base_domains.join(", ")
+            )
+        })
+    }
+}
+
 /// The ownership and durable state of one Postgres database.
 #[derive(Debug, Clone)]
 pub struct DurableStateReport {
@@ -58,6 +134,8 @@ pub struct DurableStateReport {
     pub owner: Option<OwnerRow>,
     /// Where the accounts live.
     pub accounts: AccountsLocationKind,
+    /// Where the settings and the domain registry come from.
+    pub config: ConfigState,
     /// One sentence per thing left behind or lost, in the order of the spec.
     pub warnings: Vec<String>,
 }
@@ -91,8 +169,10 @@ impl DurableStateReport {
             None => format!("owner of postgres {}", self.database),
         };
         format!(
-            "durable state: {owner}; accounts in {}",
-            self.accounts.as_str()
+            "durable state: {owner}; accounts in {}; {}; {}",
+            self.accounts.as_str(),
+            self.config.document_words(),
+            self.config.base_words()
         )
     }
 
@@ -127,6 +207,16 @@ impl DurableStateReport {
             ),
         });
         lines.push(format!("Accounts: in {}", self.accounts.as_str()));
+        lines.push(format!(
+            "Configuration: {}; {}",
+            self.config.document_words(),
+            self.config.base_words()
+        ));
+        lines.extend(
+            self.config
+                .base_domains_line()
+                .map(|l| format!("Note: {l}")),
+        );
         lines.extend(self.warnings.iter().map(|w| format!("Warning: {w}")));
         lines
     }
@@ -149,6 +239,11 @@ impl DurableStateReport {
             OwnerState::Free => ("free", None),
             OwnerState::Unknown(e) => ("unknown", Some(e.as_str())),
         };
+        let (document, updated, document_error) = match &self.config.document {
+            DocumentState::Saved(at) => ("saved", Some(stamp(*at)), None),
+            DocumentState::NotSaved => ("none", None, None),
+            DocumentState::Unreadable(e) => ("unreadable", None, Some(e.as_str())),
+        };
         json!({
             "role": self.role,
             "database": self.database,
@@ -156,6 +251,13 @@ impl DurableStateReport {
             "owner_error": error,
             "owner": owner,
             "accounts": self.accounts.as_str(),
+            "config": {
+                "document": document,
+                "document_updated": updated,
+                "document_error": document_error,
+                "base_path": self.config.base_path.as_ref().map(|p| p.display().to_string()),
+                "base_domains": self.config.base_domains,
+            },
             "warnings": self.warnings,
         })
     }
@@ -175,6 +277,7 @@ fn accounts_kind(cfg: &GlobalConfig) -> AccountsLocationKind {
 pub async fn durable_state_for_command(
     cfg: &GlobalConfig,
     role: &str,
+    config_path: Option<&Path>,
 ) -> Option<DurableStateReport> {
     use crate::claim::Holder;
     let (database, owner_state, owner) = match crate::claim::holder(cfg).await {
@@ -188,7 +291,42 @@ pub async fn durable_state_for_command(
         }
         Holder::Unknown { database, error } => (database, OwnerState::Unknown(error), None),
     };
-    Some(report_of(cfg, role, database, owner_state, owner))
+    let config = config_state_for_command(cfg, config_path).await;
+    Some(report_of(cfg, role, database, owner_state, owner, config))
+}
+
+/// The configuration state a command sees: the document read on a
+/// lock-free probe connection, config.yaml as the base. A document that
+/// cannot be read is said in the state and fails nothing.
+async fn config_state_for_command(cfg: &GlobalConfig, config_path: Option<&Path>) -> ConfigState {
+    let document = read_document_state(cfg).await;
+    match crate::overlay::load(config_path) {
+        Ok(loaded) => ConfigState::new(document, &loaded.path, Some(&loaded.file)),
+        Err(_) => ConfigState {
+            document,
+            base_path: None,
+            base_domains: Vec::new(),
+        },
+    }
+}
+
+/// What the document of `cfg`'s database holds, read without the lock.
+#[cfg(feature = "postgres")]
+async fn read_document_state(cfg: &GlobalConfig) -> DocumentState {
+    let target = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
+        Ok(target) => target,
+        Err(e) => return DocumentState::Unreadable(e.to_string()),
+    };
+    match crystalline_index::postgres::read_config_document(&target).await {
+        Ok(Some(doc)) => DocumentState::Saved(doc.updated_at),
+        Ok(None) => DocumentState::NotSaved,
+        Err(e) => DocumentState::Unreadable(e.to_string()),
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn read_document_state(_cfg: &GlobalConfig) -> DocumentState {
+    DocumentState::Unreadable("this build has no Postgres backend".to_string())
 }
 
 /// The report of the instance that owns `database`, for its start: the
@@ -196,9 +334,10 @@ pub async fn durable_state_for_command(
 /// line without a time.
 #[cfg(feature = "postgres")]
 pub(crate) async fn durable_state_of_owner(
-    cfg: &GlobalConfig,
+    loaded: &crate::overlay::LoadedConfig,
     database: &str,
 ) -> DurableStateReport {
+    let cfg = &loaded.effective;
     let row = match crystalline_index::postgres::PgTarget::from_config(&cfg.database()) {
         Ok(target) => crystalline_index::postgres::read_owner_row(&target)
             .await
@@ -211,7 +350,12 @@ pub(crate) async fn durable_state_of_owner(
     } else {
         OwnerState::Unannounced
     };
-    report_of(cfg, "active", database.to_string(), state, row)
+    let config = ConfigState::new(
+        read_document_state(cfg).await,
+        &loaded.path,
+        loaded.base.as_ref(),
+    );
+    report_of(cfg, "active", database.to_string(), state, row, config)
 }
 
 fn report_of(
@@ -220,6 +364,7 @@ fn report_of(
     database: String,
     owner_state: OwnerState,
     owner: Option<OwnerRow>,
+    config: ConfigState,
 ) -> DurableStateReport {
     let accounts = accounts_kind(cfg);
     let mut warnings = Vec::new();
@@ -232,6 +377,7 @@ fn report_of(
         owner_state,
         owner,
         accounts,
+        config,
         warnings,
     }
 }
@@ -257,6 +403,13 @@ mod tests {
                 released_at: None,
             }),
             accounts: AccountsLocationKind::Postgres,
+            config: ConfigState {
+                document: DocumentState::Saved(
+                    Utc.with_ymd_and_hms(2026, 11, 17, 8, 0, 0).unwrap(),
+                ),
+                base_path: Some(PathBuf::from("/etc/crystalline/config.yaml")),
+                base_domains: vec!["team".to_string(), "docs".to_string()],
+            },
             warnings: vec!["the accounts file /x is not read".to_string()],
         }
     }
@@ -267,7 +420,55 @@ mod tests {
     fn startup_line_names_owner_and_accounts() {
         assert_eq!(
             owned().startup_line(),
-            "durable state: owner of postgres db.internal:5432/c, schema team_a since 2026-11-16T09:30:00Z; accounts in postgres"
+            "durable state: owner of postgres db.internal:5432/c, schema team_a since 2026-11-16T09:30:00Z; accounts in postgres; configuration document (updated 2026-11-17T08:00:00Z); config.yaml /etc/crystalline/config.yaml read as base"
+        );
+    }
+
+    /// The line names the document and the base, says when there is no
+    /// document or no base, and the base domains get their own sentence.
+    #[test]
+    fn startup_line_names_document_and_base() {
+        let mut report = owned();
+        assert!(report.startup_line().contains(
+            "configuration document (updated 2026-11-17T08:00:00Z); config.yaml /etc/crystalline/config.yaml read as base"
+        ));
+        let note = report.config.base_domains_line().unwrap();
+        assert!(note.contains("registers 2 domains (team, docs)"), "{note}");
+        assert!(
+            note.contains("cannot be removed, purged or renamed"),
+            "{note}"
+        );
+        report.config = ConfigState {
+            document: DocumentState::NotSaved,
+            base_path: None,
+            base_domains: Vec::new(),
+        };
+        assert!(
+            report
+                .startup_line()
+                .ends_with("configuration document (not saved yet); config.yaml none")
+        );
+        assert!(report.config.base_domains_line().is_none());
+        report.config.document = DocumentState::Unreadable("timed out".to_string());
+        assert!(
+            report
+                .startup_line()
+                .contains("configuration document (not read: timed out)")
+        );
+        let json = report.to_json();
+        assert_eq!(json["config"]["document"], "unreadable");
+        assert_eq!(json["config"]["document_error"], "timed out");
+        assert_eq!(owned().to_json()["config"]["base_domains"][1], "docs");
+        let lines = owned().block_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Configuration: configuration document (updated"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Note: config.yaml /etc"))
         );
     }
 

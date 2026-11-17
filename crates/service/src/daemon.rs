@@ -670,9 +670,11 @@ pub async fn run_serve(
             // its own warning.
             #[cfg(feature = "postgres")]
             {
-                let report =
-                    crate::durable::durable_state_of_owner(&loaded.effective, pg.database()).await;
+                let report = crate::durable::durable_state_of_owner(&loaded, pg.database()).await;
                 tracing::info!("{}", report.startup_line());
+                if let Some(line) = report.config.base_domains_line() {
+                    tracing::info!("{line}");
+                }
                 for warning in &report.warnings {
                     tracing::warn!("{warning}");
                 }

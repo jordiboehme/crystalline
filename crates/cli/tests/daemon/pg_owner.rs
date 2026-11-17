@@ -1950,6 +1950,10 @@ fn startup_line_names_owner_and_accounts() {
         "{line}"
     );
     assert!(line.contains(" since "), "{line}");
+    assert!(
+        line.contains("configuration document (") && line.contains("config.yaml "),
+        "{line}"
+    );
     let credentials = pg
         .url
         .split('@')
@@ -2232,8 +2236,22 @@ struct CountingListener {
 
 impl CountingListener {
     fn start() -> CountingListener {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        // Never the port of the local test Postgres: a listener there would
+        // sit in front of the real database and break every other test.
+        let test_port = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL")
+            .ok()
+            .and_then(|url| {
+                let rest = url.split_once("://")?.1;
+                let host = rest.split(['/', '?']).next()?.rsplit('@').next()?;
+                host.rsplit_once(':')?.1.parse::<u16>().ok()
+            });
+        let (listener, port) = loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if Some(port) != test_port {
+                break (listener, port);
+            }
+        };
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = accepted.clone();
         std::thread::spawn(move || {
@@ -2348,6 +2366,42 @@ fn mcp_bridge_reaching_daemon_never_fetches_document() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    assert!(watch.accepted() > 0, "the listener saw no connect at all");
+}
+
+/// A report never fails on the configuration document: when it cannot be
+/// read, `status` and `domain list` warn on stderr that the registrations
+/// shown are config.yaml's alone, and still answer.
+#[test]
+fn a_report_warns_and_answers_when_the_document_cannot_be_read() {
+    let Some(pg) = PgScratch::new("cdwarn") else {
+        return;
+    };
+    let env = Env::new("cdwarn").on_postgres(&pg);
+    let watch = CountingListener::start();
+    for args in [&["status", "--json"][..], &["domain", "list", "--json"][..]] {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        let out = cmd
+            .env("CRYSTALLINE_DATABASE_URL", &watch.url)
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            stderr.contains("the registrations shown are config.yaml's alone"),
+            "{args:?}: no warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("could not read the configuration in the database"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            serde_json::from_slice::<Value>(&out.stdout).is_ok(),
+            "{args:?} did not answer: {} {stderr}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
     assert!(watch.accepted() > 0, "the listener saw no connect at all");
 }
 

@@ -211,15 +211,17 @@ pub(crate) async fn reach_index(
 pub(crate) async fn durable_state_block(
     cfg: &GlobalConfig,
     role: &str,
+    config_path: Option<&Path>,
 ) -> Option<(Vec<String>, serde_json::Value)> {
     #[cfg(feature = "postgres")]
     {
-        let report = crystalline_service::durable::durable_state_for_command(cfg, role).await?;
+        let report =
+            crystalline_service::durable::durable_state_for_command(cfg, role, config_path).await?;
         Some((report.block_lines(), report.to_json()))
     }
     #[cfg(not(feature = "postgres"))]
     {
-        let _ = (cfg, role);
+        let _ = (cfg, role, config_path);
         None
     }
 }

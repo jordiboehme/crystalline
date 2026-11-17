@@ -920,6 +920,33 @@ fn render_durable_state(out: &mut String, block: &serde_json::Value) {
     };
     let _ = writeln!(out, "  owner: {line}");
     let _ = writeln!(out, "  accounts: in {}", text(&block["accounts"]));
+    let config = &block["config"];
+    let document = match config["document"].as_str() {
+        Some("saved") => format!("saved, updated {}", text(&config["document_updated"])),
+        Some("none") => "not saved yet".to_string(),
+        _ => format!(
+            "not read ({})",
+            config["document_error"].as_str().unwrap_or("unknown")
+        ),
+    };
+    let base = match config["base_path"].as_str() {
+        Some(path) => format!("config.yaml {path} read as base"),
+        None => "no config.yaml".to_string(),
+    };
+    let _ = writeln!(out, "  configuration: document {document}; {base}");
+    let base_domains: Vec<&str> = config["base_domains"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.as_str())
+        .collect();
+    if !base_domains.is_empty() {
+        let _ = writeln!(
+            out,
+            "  config.yaml registers {}: they cannot be removed, purged or renamed while the configuration lives in the database",
+            base_domains.join(", ")
+        );
+    }
     for warning in block["warnings"].as_array().into_iter().flatten() {
         let _ = writeln!(out, "  [warning] {}", text(warning));
     }
@@ -2476,7 +2503,9 @@ pub async fn run(
     } else {
         "none"
     };
-    let durable_state = cmd::durable_state_block(cfg, role).await.map(|(_, v)| v);
+    let durable_state = cmd::durable_state_block(cfg, role, config_override)
+        .await
+        .map(|(_, v)| v);
 
     Ok(DoctorReport {
         durable_state,

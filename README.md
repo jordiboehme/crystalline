@@ -148,7 +148,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only domains](docs/deployment.md#published-read-only-domains) | Knowledge curated in a git repository, served read-only to agents |
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network (with `evolve.contradictions` off, or its checkpoint pre-fetched too) |
-| [Run on PostgreSQL](docs/deployment.md#run-on-postgresql) | One active instance owns a PostgreSQL database with its accounts and index, a standby takes over; a redeploy keeps everyone signed in |
+| [Run on PostgreSQL](docs/deployment.md#run-on-postgresql) | One active instance owns a PostgreSQL database with its accounts, settings, domain registry and index, a standby takes over; a redeploy keeps everyone signed in |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
 | [Team server with a GitHub App](docs/deployment.md#team-server-with-a-github-app) | An App of your own reads, pulls and shares; access to each domain follows the repository on GitHub |
 | [Reflection on a team server](docs/deployment.md#reflection-on-a-team-server) | People and agents work on a domain's Reflection on one home instance, backed up to its own branch |
