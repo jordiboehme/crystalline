@@ -90,8 +90,10 @@ impl Precedence {
     }
 
     /// `major.minor.patch`, plus `-pre` when there are pre-release
-    /// identifiers, built from the parsed parts only. Build metadata and
-    /// any text that did not parse are never echoed.
+    /// identifiers, built from the parsed parts only. Build metadata is
+    /// dropped, but an alphanumeric pre-release identifier is kept as
+    /// written, so a caller must gate on [`Precedence::is_stable`] before it
+    /// shows a rendered version: a stable one is digits and dots only.
     pub fn render(&self) -> String {
         let (major, minor, patch) = self.triple;
         let mut out = format!("{major}.{minor}.{patch}");
@@ -147,18 +149,23 @@ mod tests {
     }
 
     #[test]
-    fn render_never_echoes_extra_text() {
-        // Alphanumeric identifiers are kept as written, so the text is only
-        // ever what the parse accepted; callers that put it in front of a
-        // person check the shape themselves (S30).
-        for input in ["1.2.3-<script>", "1.2.3-rc.1 extra", "1.2.3.4", "1.2.3+<b>"] {
-            if let Some(p) = Precedence::parse(input) {
-                let r = p.render();
-                assert!(!r.contains('+'), "{input} -> {r}");
-                assert!(r.len() <= input.len(), "{input} -> {r}");
-            }
-        }
-        assert_eq!(Precedence::parse("1.2.3+<b>").unwrap().render(), "1.2.3");
-        assert_eq!(Precedence::parse("1.2.3.4").unwrap().render(), "1.2.3");
+    fn render_drops_build_metadata_and_extra_parts_but_keeps_pre_release_text() {
+        let r = |v: &str| Precedence::parse(v).unwrap().render();
+        assert_eq!(r("1.2.3+<b>"), "1.2.3");
+        assert_eq!(r("1.2.3.4"), "1.2.3");
+        assert_eq!(r("1.2.3-<script>"), "1.2.3-<script>");
+        assert!(!Precedence::parse("1.2.3-<script>").unwrap().is_stable());
+        assert!(Precedence::parse("1.2.3-rc.1 extra").is_some());
+        assert_eq!(r("1.2.3-rc.1 extra"), "1.2.3-rc.1 extra");
+    }
+
+    #[test]
+    fn is_stable_and_numeric_identifiers_normalise() {
+        let p = |v: &str| Precedence::parse(v).unwrap();
+        assert!(!p("1.2.3-alpha").is_stable());
+        assert!(!p("1.2.3-7").is_stable());
+        assert!(p("1.2.3").is_stable());
+        assert_eq!(p("1.2.3-01").render(), "1.2.3-1");
+        assert_eq!(p("1.2.3-rc.01").render(), "1.2.3-rc.1");
     }
 }

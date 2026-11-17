@@ -1074,6 +1074,7 @@ pub fn strictly_newer(candidate: &str, baseline: &str) -> bool {
         _ => false,
     }
 }
+
 /// How long each stage of a displacement waits for the old daemon to leave.
 struct DisplaceWaits {
     /// After the graceful `ctl shutdown` ask.
