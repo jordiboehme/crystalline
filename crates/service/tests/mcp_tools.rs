@@ -8412,7 +8412,7 @@ async fn configure_lists_no_operator_setting() {
         .iter()
         .map(|s| s["key"].as_str().unwrap())
         .collect();
-    assert_eq!(keys.len(), 18, "{keys:?}");
+    assert_eq!(keys.len(), 20, "{keys:?}");
     assert!(keys.contains(&"github.enabled") && keys.contains(&"search.salience_weight"));
     assert!(
         keys.contains(&"service.response_format"),
