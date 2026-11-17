@@ -103,11 +103,20 @@ fn the_test_key_seam_is_debug_only() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let name = "\"CRYSTALLINE_TEST_UPDATE_KEY\"";
     let mut reads = 0;
-    for entry in std::fs::read_dir(&src).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
+    // Every .rs file under src, subfolders included.
+    let mut files = Vec::new();
+    let mut dirs = vec![src];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
         }
+    }
+    for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         for (at, line) in lines.iter().enumerate() {

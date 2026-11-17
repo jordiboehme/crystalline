@@ -200,3 +200,30 @@ fn official_flag_only_for_tagged_builds() {
         );
     }
 }
+
+/// release.yml makes `SHA256SUMS` twice, in the `checksums` job for the
+/// signature and in `publish` from the files it ships, and publish compares
+/// the two byte for byte. The two collect steps must stay the same text, or
+/// every release fails at that compare.
+#[test]
+fn the_two_checksum_steps_are_the_same() {
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&repo_file(".github/workflows/release.yml"))
+            .expect("release.yml parses");
+    let collect = |job: &str| -> String {
+        workflow["jobs"][job]["steps"]
+            .as_sequence()
+            .unwrap_or_else(|| panic!("the {job} job has steps"))
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Collect archives and generate checksums"))
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_else(|| panic!("the {job} job collects the archives"))
+            .to_string()
+    };
+    let checksums = collect("checksums");
+    assert!(
+        checksums.contains("LC_ALL=C sha256sum"),
+        "the glob order is fixed"
+    );
+    assert_eq!(checksums, collect("publish"));
+}

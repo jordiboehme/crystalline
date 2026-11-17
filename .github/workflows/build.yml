@@ -466,6 +466,21 @@ jobs:
             --no-build \
             --deb-version "$deb_version" \
             --output "dist/crystalline_${deb_version}_${LEG_DEB_ARCH}.deb"
+          # The install marker must land where the updater looks for it, or
+          # every .deb install would read as a plain tarball.
+          # Read into variables first: a grep -q that stops reading early
+          # could fail the writer on a closed pipe under pipefail.
+          deb="dist/crystalline_${deb_version}_${LEG_DEB_ARCH}.deb"
+          listing="$(dpkg-deb -c "$deb")"
+          if ! grep -q ' \./usr/lib/crystalline/install-source$' <<<"$listing"; then
+            echo "::error::the .deb has no usr/lib/crystalline/install-source"
+            exit 1
+          fi
+          said="$(dpkg-deb --fsys-tarfile "$deb" | tar -xO ./usr/lib/crystalline/install-source)"
+          if [ "$said" != deb ]; then
+            echo "::error::the .deb install marker says '$said', not deb"
+            exit 1
+          fi
 
       - name: Upload .deb artifact
         if: matrix.musl
@@ -558,6 +573,10 @@ jobs:
           $exe = 'C:\Program Files\Crystalline\bin\crystalline.exe'
           if (-not (Test-Path $exe)) { throw 'crystalline.exe missing after install' }
           & $exe --version
+          # The install marker beside the exe, or every MSI install would
+          # read as a plain zip to the updater.
+          $m = 'C:\Program Files\Crystalline\bin\install-source'
+          if (-not (Test-Path $m) -or (Get-Content $m -Raw).Trim() -ne 'msi') { throw 'the MSI installed no msi marker beside the exe' }
           # The order in the MSI itself: EndDaemonTasks after
           # RemoveExistingProducts (a deferred action cannot sit before it,
           # error 2613) and ahead of RemoveFiles, so it runs in a removal.

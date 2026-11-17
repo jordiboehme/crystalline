@@ -74,7 +74,6 @@ jobs:
   # - build: false only when a call finds its tag already at another commit,
   #   which means another release of this version won the race; then the run
   #   skips everything after this job and stays green.
-  # - called: true for a call from CI, which has to create the tag.
   # - sign: true when the run signs SHA256SUMS: every call that builds, and a
   #   dry run on main, which proves the secret key and the compiled-in public
   #   keys together before a release depends on them. A dry run from any
@@ -93,7 +92,6 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       publish: ${{ steps.resolve.outputs.publish }}
       build: ${{ steps.resolve.outputs.build }}
-      called: ${{ steps.resolve.outputs.called }}
       sign: ${{ steps.resolve.outputs.sign }}
       sign_tag: ${{ steps.resolve.outputs.sign_tag }}
     steps:
@@ -134,9 +132,9 @@ jobs:
               build=false
             fi
             # publish follows build: a run that lost the race publishes nothing.
-            { echo "tag=$tag"; echo "publish=$build"; echo "build=$build"; echo "called=true"; echo "sign=$build"; echo "sign_tag=$tag"; } >> "$GITHUB_OUTPUT"
+            { echo "tag=$tag"; echo "publish=$build"; echo "build=$build"; echo "sign=$build"; echo "sign_tag=$tag"; } >> "$GITHUB_OUTPUT"
           else
-            { echo "tag="; echo "publish=false"; echo "build=true"; echo "called=false"; } >> "$GITHUB_OUTPUT"
+            { echo "tag="; echo "publish=false"; echo "build=true"; } >> "$GITHUB_OUTPUT"
             if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
               version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
               { echo "sign=true"; echo "sign_tag=v${version}-dry-run"; } >> "$GITHUB_OUTPUT"
@@ -594,7 +592,9 @@ jobs:
           # SHA256SUMS like everything else.
           find downloads -type f \( -path 'downloads/crystalline-*/*' -o -path 'downloads/mcpb-bundles/*' -o -path 'downloads/skill-zips/*' -o -path 'downloads/sboms/*' \) \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' -o -name '*.cdx.json' \) -exec cp {} release/ \;
           cd release
-          sha256sum -- * > SHA256SUMS
+          # The C locale fixes the glob's order, so this job and the other
+          # copy of this step make the same bytes.
+          LC_ALL=C sha256sum -- * > SHA256SUMS
           ls -la
 
       - name: Upload the checksums
@@ -603,6 +603,9 @@ jobs:
           name: release-sums
           path: release/SHA256SUMS
           if-no-files-found: error
+          # Only this run needs it; a signed file for a release that may
+          # never ship should not linger.
+          retention-days: 1
 
   # Signs SHA256SUMS with the online minisign key, the only job that sees
   # MINISIGN_SECRET_KEY. It stays small on purpose: no checkout, so no build
@@ -672,6 +675,7 @@ jobs:
           name: release-signature
           path: signing/SHA256SUMS.minisig
           if-no-files-found: error
+          retention-days: 1
 
   # Proves the key pair before anything is published: the release's own
   # Linux binary checks the signature with the public keys compiled into it
@@ -717,6 +721,14 @@ jobs:
           bin=$(find "$dir" -type f -name crystalline | head -n1)
           [ -n "$bin" ] || { echo "::error::no crystalline binary in the linux-amd64 archive"; exit 1; }
           chmod +x "$bin"
+          # The test seams exist only in debug builds; the shipped binary
+          # must not even carry their names. A new seam adds its name here.
+          for seam in CRYSTALLINE_TEST_UPDATE_KEY; do
+            if grep -a -q "$seam" "$bin"; then
+              echo "::error::the release binary carries the test seam $seam"
+              exit 1
+            fi
+          done
           "$bin" update verify-sums --tag "$TAG" signed/SHA256SUMS signed/SHA256SUMS.minisig
 
   publish:
@@ -785,7 +797,9 @@ jobs:
           # SHA256SUMS like everything else.
           find downloads -type f \( -path 'downloads/crystalline-*/*' -o -path 'downloads/mcpb-bundles/*' -o -path 'downloads/skill-zips/*' -o -path 'downloads/sboms/*' \) \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' -o -name '*.cdx.json' \) -exec cp {} release/ \;
           cd release
-          sha256sum -- * > SHA256SUMS
+          # The C locale fixes the glob's order, so this job and the other
+          # copy of this step make the same bytes.
+          LC_ALL=C sha256sum -- * > SHA256SUMS
           ls -la
 
       # The sums the sign job signed, and check-signature checked, must be
@@ -813,6 +827,20 @@ jobs:
             exit 1
           fi
           cp signed/SHA256SUMS.minisig release/SHA256SUMS.minisig
+
+      # check-signature proved the key pair on its own download; this checks
+      # the very files that ship, before the tag and the release exist.
+      - name: Check the release signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/verify"
+          mkdir -p "$dir"
+          tar xzf "release/crystalline-${TAG}-linux-amd64.tar.gz" -C "$dir"
+          bin=$(find "$dir" -type f -name crystalline | head -n1)
+          [ -n "$bin" ] || { echo "::error::no crystalline binary in crystalline-${TAG}-linux-amd64.tar.gz"; exit 1; }
+          chmod +x "$bin"
+          "$bin" update verify-sums --tag "$TAG" release/SHA256SUMS release/SHA256SUMS.minisig
 
       # actions/attest fails only when a whole subject list matches nothing,
       # so a single renamed asset would drop out of its attestation without a
@@ -926,13 +954,13 @@ jobs:
             release/crystalline_*.deb
             release/crystalline-claude-desktop-only-${{ needs.notes.outputs.tag }}-macos.mcpb
 
-      # Only for a call from CI, which is every release now. An annotated
-      # tag, made through the API because the checkout keeps no credentials. Its tagger is the workflow's token. A
-      # tag made with that token starts no other workflow, so this run is the
-      # only release of it. The tag already at this commit is a re-run of a
-      # failed publish; at another commit it is an error, never moved.
+      # Every release is a call from CI, which has to create its tag. An
+      # annotated tag, made through the API because the checkout keeps no
+      # credentials. Its tagger is the workflow's token. A tag made with that
+      # token starts no other workflow, so this run is the only release of
+      # it. The tag already at this commit is a re-run of a failed publish;
+      # at another commit it is an error, never moved.
       - name: Create the tag at the tested commit
-        if: needs.notes.outputs.called == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

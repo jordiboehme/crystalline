@@ -141,7 +141,7 @@ Apart from these sealed secrets, nothing is encrypted at rest. Use disk encrypti
 
 ## Verify a release
 
-Every release has a `SHA256SUMS` file that lists every other asset.
+Every release has a `SHA256SUMS` file that lists every other asset except its own signature, `SHA256SUMS.minisig`.
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing

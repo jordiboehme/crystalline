@@ -17,7 +17,10 @@
 # - the tag exists but has no GitHub release: exit 1, naming the stray tag
 #   and how to remove it. A tag pushed by hand, or a release run that stopped
 #   after it made the tag, would otherwise read as released, and that
-#   version would never ship.
+#   version would never ship. A release that is publishing right now has its
+#   tag before its release (a draft reads as no release until its assets are
+#   up), so a missing release is looked up again a few times before this
+#   fails.
 # - the tag is new and release-notes/v<version>.md is there, not empty and
 #   opens with an H1: release=true, exit 0.
 # - the tag is new and the notes file is missing or has no H1: exit 1. The
@@ -27,7 +30,9 @@
 #
 # A tag lookup that fails (network, a remote that does not answer) also exits
 # 1. It never reads as "no tag", which would start a release. A release
-# lookup that fails exits 1 as well, and never reads as "no release".
+# lookup that fails is tried again too, then exits 1, and never reads as
+# "no release". $RELEASE_CHECK_TRIES (default 6) and $RELEASE_CHECK_WAIT
+# (seconds between tries, default 30) set how long it waits.
 #
 # The release lookup goes through `gh api`, so it needs gh and a token
 # (GH_TOKEN on GitHub Actions, `gh auth login` locally). The repository is
@@ -90,19 +95,32 @@ repo_slug() {
   fi
 }
 
-# Whether the GitHub release for a tag exists: prints yes or no. Returns 1
-# on a lookup error, which never reads as "no release".
+# Whether the GitHub release for a tag exists: prints yes or no. A missing
+# release or a failed lookup is tried again, up to $RELEASE_CHECK_TRIES
+# times, so a release that is publishing and a passing API error both pass.
+# Returns 1 when the last lookup failed, which never reads as "no release".
 release_exists() {
-  local tag="$1" repo err rc=0
+  local tag="$1" repo err rc try
+  local tries="${RELEASE_CHECK_TRIES:-6}" wait="${RELEASE_CHECK_WAIT:-30}"
   repo="$(repo_slug)" || return 1
   if ! command -v gh >/dev/null 2>&1; then
     echo "::error::gh is not installed, so the release for $tag cannot be looked up" >&2
     return 1
   fi
-  err="$(gh api --silent "repos/$repo/releases/tags/$tag" 2>&1 >/dev/null)" || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    echo yes
-  elif grep -q 'HTTP 404' <<<"$err"; then
+  for ((try = 1; ; try++)); do
+    rc=0
+    err="$(gh api --silent "repos/$repo/releases/tags/$tag" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo yes
+      return 0
+    fi
+    if [ "$try" -ge "$tries" ]; then
+      break
+    fi
+    echo "release: found no release $tag in $repo (try $try of $tries), looking again in ${wait}s" >&2
+    sleep "$wait"
+  done
+  if grep -q 'HTTP 404' <<<"$err"; then
     echo no
   else
     echo "::error::could not look up the release $tag in $repo (gh api exit $rc: $err)" >&2
@@ -114,7 +132,7 @@ release_exists() {
 # what happened and how to remove it.
 stray_tag() {
   local tag="$1"
-  echo "::error::the tag $tag exists but there is no GitHub release for it. It was pushed by hand, or a release run stopped after it made the tag. While the tag is there no merge releases $version. If a release run failed, re-run its failed jobs; otherwise delete the tag with 'git push origin :refs/tags/$tag' (and 'git tag -d $tag' locally) and push to main again." >&2
+  echo "::error::the tag $tag exists but there is no GitHub release for it. It was pushed by hand, or a release run stopped after it made the tag, or a release run is still publishing (wait for it and re-run this job). While the tag is there no merge releases $version. If a release run failed, re-run its failed jobs; otherwise an admin deletes the tag with 'git push origin :refs/tags/$tag' (and 'git tag -d $tag' locally), then push to main again." >&2
   exit 1
 }
 
