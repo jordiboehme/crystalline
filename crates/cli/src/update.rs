@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use crystalline_core::time::{self, Stamp};
 use crystalline_core::update::{
-    CheckOutcome, CheckState, Checks, Detection, FAILED_REASON, Gate, InstallMethod, LatestRelease,
-    Lookup, OffReason, Refusal, UPDATE_CACHE_FILE, UpdateCache, UpdateFacts, age_gate,
-    archive_member, asset_name, display_path,
+    CheckOutcome, CheckState, Checks, DetectedInstall, Detection, FAILED_REASON, Gate,
+    InstallMethod, LatestRelease, Lookup, OffReason, Refusal, UPDATE_CACHE_FILE, UpdateCache,
+    UpdateFacts, age_gate, archive_member, asset_name, display_path,
 };
 use crystalline_core::version::{Precedence, release_tag, release_version};
 use crystalline_service::update::swap::finish_after_swap;
@@ -1841,7 +1841,7 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
         source,
         now,
     )?;
-    let detection = block_detection();
+    let DetectedInstall { exe, detection } = block_detection();
     let env = |name: &str| std::env::var(name).ok();
     let suppressed = OffReason::suppressing(&env, &detection).is_some();
     if suppressed || !detection.acts() {
@@ -1852,13 +1852,12 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
         at: now,
         held,
     };
+    // An exe that cannot be named is one `update now` refuses
+    // (`tarball_refusal(None)`), so the block sends nobody there.
     let tarball = if detection.method == InstallMethod::Tarball {
-        crystalline_service::update::detect_here()
-            .exe
-            .as_deref()
-            .map_or(TarballFolder::Writable, |exe| {
-                TarballFolder::of(exe, effective_uid())
-            })
+        exe.as_deref().map_or(TarballFolder::ByHand, |exe| {
+            TarballFolder::of(exe, effective_uid())
+        })
     } else {
         TarballFolder::Writable
     };
@@ -1891,13 +1890,13 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
     }
 }
 
-/// The detection the session block offers for: [`detect_here`]'s, the
-/// build refusals applied.
+/// The install the session block offers for: [`detect_here`]'s, the
+/// build refusals applied, with the exe it found.
 ///
 /// [`detect_here`]: crystalline_service::update::detect_here
 #[cfg(not(debug_assertions))]
-fn block_detection() -> Detection {
-    crystalline_service::update::detect_here().detection
+fn block_detection() -> DetectedInstall {
+    crystalline_service::update::detect_here()
 }
 
 /// The detection the session block offers for. A debug build reads
@@ -1905,15 +1904,20 @@ fn block_detection() -> Detection {
 /// `tarball`) as an acting install of that method, so a process test can
 /// show the block from a test binary, which is never an official build.
 #[cfg(debug_assertions)]
-fn block_detection() -> Detection {
-    std::env::var("CRYSTALLINE_TEST_UPDATE_METHOD")
+fn block_detection() -> DetectedInstall {
+    let here = crystalline_service::update::detect_here();
+    let detection = std::env::var("CRYSTALLINE_TEST_UPDATE_METHOD")
         .ok()
         .and_then(|key| serde_json::from_value(serde_json::Value::String(key)).ok())
         .map(|method| Detection {
             method,
             refusal: None,
         })
-        .unwrap_or_else(|| crystalline_service::update::detect_here().detection)
+        .unwrap_or(here.detection);
+    DetectedInstall {
+        exe: here.exe,
+        detection,
+    }
 }
 
 #[cfg(test)]
