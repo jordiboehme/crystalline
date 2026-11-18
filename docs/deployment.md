@@ -56,11 +56,11 @@ Downloads go to `~/.cache/crystalline/updates/<tag>/` on macOS and Linux (`XDG_C
 
 ### .deb
 
-`crystalline update now` downloads and verifies the package and prints how to install it:
+`crystalline update now` downloads and verifies the package and prints how to install it, with the full path of the download folder, for example:
 
 ```
 Install it with:
-  cd ~/.cache/crystalline/updates/v0.34.0
+  cd /home/ada/.cache/crystalline/updates/v0.34.0
   sudo apt install ./crystalline_0.34.0_amd64.deb
 ```
 
@@ -68,7 +68,7 @@ It never runs apt. As root the line has no `sudo`. Run as `sudo crystalline upda
 
 ### tar.gz on macOS and Linux
 
-`crystalline update now` downloads and verifies the archive, takes only the `crystalline` binary out of it, checks it (the code signature on macOS, then its version) and puts it in place of the binary you ran. Then the new binary runs `crystalline update finish`. That hands the running daemon over to the new version with the same start options (database, config, read-only mode, HTTP address, allowed hosts), and refreshes the installed hooks and skills for user scope and for the project of the current folder. Other projects refresh when a session starts in them. When the daemon read a `CRYSTALLINE_*` variable that this shell does not have, it is left running on the old version and the output says why; run `crystalline status` from a shell that has the variable.
+`crystalline update now` downloads and verifies the archive, takes only the `crystalline` binary out of it, checks it (the code signature on macOS, then its version) and puts it in place of the binary you ran. Then the new binary hands the running daemon over to the new version with the same start options (database, config, read-only mode, HTTP address, allowed hosts), and refreshes the installed hooks and skills for user scope and for the project of the current folder. Other projects refresh when a session starts in them. When the daemon read a `CRYSTALLINE_*` variable that this shell does not have, it is left running on the old version and the output says why; run `crystalline status` from a shell that has the variable.
 
 When you cannot write to the binary's folder, `update now` refuses before it downloads anything and names the folder. For a folder of root's (such as `/usr/local/bin` on Linux) it suggests `sudo crystalline update now`. Under `sudo` it downloads into a new folder of root's and replaces only the binary. The daemon is not touched, and the output says to run `crystalline status` as yourself, which hands the daemon over. By hand: take `crystalline` from the newest release's tar.gz and move it over the old binary.
 
@@ -116,7 +116,7 @@ Check once a day for a newer Crystalline? Nothing is installed without you. [y/N
 
 Yes turns the check on. No, Enter or Ctrl-C leave it off and print "Daily update check: off (`crystalline update auto on` turns it on).". It never asks when `update.check` or `CRYSTALLINE_UPDATE_CHECK` is set already, with `--json`, on a build `update now` does not act on, when the check is kept off (see below) or when a session start refreshes an install. An install without a terminal prints only that second line, once per machine.
 
-With the check on, the daemon asks GitHub at most once a day (after a failed check, again after four hours), and it never makes the daemon's start or its requests wait. It sends one anonymous request to `https://api.github.com/repos/jordiboehme/crystalline/releases/latest` with the User-Agent `crystalline/<version>`, and no token. With the check on, GitHub sees your address and the version once a day, nothing else. The exact list is in [Outbound connections](security.md#outbound-connections). The check only looks: it installs nothing. With the check off the daemon makes no request; `update check` and `update now` still ask when you run them.
+Once a day (after a failed check, after four hours) Crystalline asks GitHub for the newest release, with no token and the User-Agent `crystalline/<version>`. GitHub sees your address and the version, nothing else; the details are in [Outbound connections](security.md#outbound-connections). The check never makes the daemon's start or its requests wait. The check only looks: it installs nothing. With the check off the daemon makes no request; `update check` and `update now` still ask when you run them.
 
 The check stays off, whatever `update.check` says, when `NO_UPDATE_NOTIFIER` or `CI` is set to a value in the daemon's environment, in a Docker install and in the Claude Desktop-only bundle. A systemd service reads its settings from `/etc/default/crystalline`: add `CRYSTALLINE_UPDATE_CHECK=true` there and restart the service. `crystalline update auto on` says so on a machine with the .deb and its unit.
 
