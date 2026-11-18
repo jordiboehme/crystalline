@@ -20,14 +20,17 @@ import { BUTTON } from "./primitives";
 
 export function LazyBoundary({
   fallback,
+  failed,
   children,
 }: {
   fallback: ReactNode;
+  /** What stands in when the chunk never arrives; the reload prompt by default. */
+  failed?: ReactNode;
   children: ReactNode;
 }) {
   const { pathname } = useLocation();
   return (
-    <ChunkErrorBoundary resetKey={pathname}>
+    <ChunkErrorBoundary resetKey={pathname} failed={failed}>
       <Suspense fallback={fallback}>{children}</Suspense>
     </ChunkErrorBoundary>
   );
@@ -50,7 +53,7 @@ export function LazyBoundary({
  * of catching only chunk failures.
  */
 class ChunkErrorBoundary extends Component<
-  { resetKey: string; children: ReactNode },
+  { resetKey: string; failed?: ReactNode; children: ReactNode },
   { error: unknown; resetKey: string }
 > {
   state: { error: unknown; resetKey: string } = {
@@ -82,7 +85,7 @@ class ChunkErrorBoundary extends Component<
       // on exactly as it arrived.
       throw error as Error;
     }
-    return <ChunkFailed />;
+    return this.props.failed ?? <ChunkFailed />;
   }
 }
 

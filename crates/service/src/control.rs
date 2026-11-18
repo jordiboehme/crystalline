@@ -164,9 +164,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // memory: `status` asks this and reads the cache file only when the
         // daemon cannot answer.
         "update_facts" => {
-            let facts = shared
-                .update
-                .facts(shared.engine.config().update_check_enabled());
+            let facts = shared.update.facts(shared.engine.update_settings().0);
             match serde_json::to_value(facts) {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),

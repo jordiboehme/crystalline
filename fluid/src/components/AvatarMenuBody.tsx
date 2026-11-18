@@ -4,6 +4,10 @@
  * Handbook and Log out. The anonymous viewer gets the same menu without the
  * account rows and with Log in in their place.
  *
+ * An admin whose server found a newer release also gets a quiet chip under
+ * the name, which opens the update note (`UpdateNote.tsx`, held by the
+ * trigger in `AvatarMenu.tsx`).
+ *
  * Lazy: only the trigger is in the entry (`AvatarMenu.tsx`).
  *
  * The three Display choices are segmented radio groups inside one row each.
@@ -13,6 +17,7 @@
  */
 
 import {
+  ArrowUpCircle,
   BookOpen,
   Check,
   ExternalLink,
@@ -49,6 +54,7 @@ import { useTheme } from "../theme/context";
 import { useWide } from "../useWide";
 import type { ThemePreference } from "../theme/context";
 import { ITEM_CLASSES, MENU_SEPARATOR } from "./menu";
+import { Chip } from "./primitives";
 
 const ICON = "shrink-0 text-muted";
 const SEGMENT =
@@ -160,8 +166,11 @@ function Who(): ReactElement {
 
 export default function AvatarMenuBody({
   onShortcuts,
+  onUpdateNote,
 }: {
   onShortcuts: () => void;
+  /** Open the update note; the menu closes first. */
+  onUpdateNote: () => void;
 }): ReactElement {
   const { user, capabilities, logout } = useAuth();
   const { preference, resolved, choose } = useTheme();
@@ -176,6 +185,24 @@ export default function AvatarMenuBody({
     <>
       <div aria-hidden="true" className="avatar-grab" />
       <Who />
+      {user && capabilities.canAdminister && capabilities.updateAvailable && (
+        <DropdownMenu.Item
+          className={ITEM_CLASSES}
+          aria-label={`Crystalline ${capabilities.updateAvailable} available`}
+          textValue={`${capabilities.updateAvailable} available`}
+          onSelect={onUpdateNote}
+        >
+          <Chip variant="accent">
+            <ArrowUpCircle
+              aria-hidden="true"
+              size={12}
+              strokeWidth={1.75}
+              className="mr-1"
+            />
+            {capabilities.updateAvailable} available
+          </Chip>
+        </DropdownMenu.Item>
+      )}
       {user && (
         <>
           {/*

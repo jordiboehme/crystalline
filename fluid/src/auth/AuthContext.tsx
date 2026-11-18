@@ -61,6 +61,12 @@ export interface Capabilities {
   oauth: boolean;
   /** The version of the server that answered the probe. */
   serverVersion: string;
+  /**
+   * A newer stable release the server's own update check found, as a plain
+   * `x.y.z`, or null. The server names it to an admin only (spec S28); a
+   * missing field (an older server) and any other shape read as null (S30).
+   */
+  updateAvailable: string | null;
 }
 
 /** The auth surface every screen sees. */

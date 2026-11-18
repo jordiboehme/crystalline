@@ -66,6 +66,9 @@ const COSTS: Readonly<Record<string, Cost>> = {
   "smoke.spec.ts": { root: 66, path: 70 },
   "sso-login.spec.ts": { root: 1, path: 1 },
   "table-grid.spec.ts": { root: 75, path: 75 },
+  // Measured locally on 2026-11-18 (chromium only, 2.1 s and 1.8 s),
+  // rounded up; replace with a CI number.
+  "update-note.spec.ts": { root: 3, path: 2 },
 };
 
 /** The cost of a spec file the table does not name yet. */

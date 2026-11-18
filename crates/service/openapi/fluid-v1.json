@@ -293,7 +293,7 @@
           "auth"
         ],
         "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, whether it has any accounts at all, whether this session may\ndrive the share surfaces, and which server version it is talking to, so a\nmismatched UI can say so instead of failing later.",
-        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`, the default with a GitHub App), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and an identity a proxy asserts (`auth.trusted_header` or `auth.proxy_headers`) is minted a session on the first call, which is the only way those modes obtain a token.",
+        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`, the default with a GitHub App), and which server version it is talking to, and, for an admin only, a newer release the server's update check found (`update_available`). Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and an identity a proxy asserts (`auth.trusted_header` or `auth.proxy_headers`) is minted a session on the first call, which is the only way those modes obtain a token.",
         "operationId": "get_me",
         "responses": {
           "200": {
@@ -15120,6 +15120,14 @@
           "read_only": {
             "type": "boolean",
             "description": "Whether this instance refuses content mutations."
+          },
+          "update_available": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A newer stable release this server's daily update check found, as\n`major.minor.patch`, or null.\n\nOnly an admin is told, by the same check the admin routes use; every\nother caller gets null. Null as well when the check is off, its last\nrun failed or is more than 48 hours old, the release is younger than\n`update.min_age_hours`, the version is not newer or not a stable\nrelease, the build is not an official one, or `crystalline update now`\nwould not act for how this server was installed. Read-only: nothing\non this surface updates the server.",
+            "example": "0.35.0"
           },
           "user": {
             "oneOf": [

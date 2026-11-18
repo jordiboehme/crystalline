@@ -202,14 +202,16 @@ pub const RESERVED_VARS: &[&str] = &[
     // record or refuse the open instead of opening Claude Desktop. Read straight from the
     // environment, so reserved for the same reason.
     "CRYSTALLINE_TEST_DESKTOP_OPEN",
-    // The updater's debug-build seams (`crystalline_service::update::client`
-    // and `crystalline_core::update::trusted_keys`): the release API root,
-    // the download root and an extra trusted key. Read straight from the
+    // The updater's debug-build seams (`crystalline_service::update::client`,
+    // `crystalline_core::update::trusted_keys` and the CLI's session-start
+    // block): the release API root, the download root, an extra trusted key
+    // and the install method a test binary acts as. Read straight from the
     // environment, and only by a debug build, so reserved here or every test
     // run that sets them logs a warning.
     "CRYSTALLINE_TEST_UPDATE_API",
     "CRYSTALLINE_TEST_UPDATE_DOWNLOAD",
     "CRYSTALLINE_TEST_UPDATE_KEY",
+    "CRYSTALLINE_TEST_UPDATE_METHOD",
     // `crystalline_remote::token`'s boolean kill switch
     // (`refuse_real_keychain`): set, it refuses the real OS keychain
     // backend everywhere in that module and falls back to the file store at
@@ -1646,6 +1648,7 @@ mod tests {
             "CRYSTALLINE_TEST_UPDATE_API",
             "CRYSTALLINE_TEST_UPDATE_DOWNLOAD",
             "CRYSTALLINE_TEST_UPDATE_KEY",
+            "CRYSTALLINE_TEST_UPDATE_METHOD",
         ] {
             assert!(is_reserved(name), "{name}");
         }
