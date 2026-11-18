@@ -132,6 +132,11 @@ pub struct GlobalConfig {
     /// config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation: Option<AutomationConfig>,
+    /// The opt-in update check. Absent means the check is off and a release
+    /// waits the default age, so every existing config keeps working
+    /// untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateConfig>,
 }
 
 impl GlobalConfig {
@@ -473,6 +478,24 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|a| a.evolve_threshold)
             .unwrap_or(DEFAULT_EVOLVE_THRESHOLD)
+    }
+
+    /// `update.check`: whether the daemon looks for a new release once a day.
+    /// Absent means off.
+    pub fn update_check_enabled(&self) -> bool {
+        self.update.as_ref().and_then(|u| u.check).unwrap_or(false)
+    }
+
+    /// `update.min_age_hours`: how old a release must be before the check
+    /// offers it. Absent means [`DEFAULT_UPDATE_MIN_AGE_HOURS`]; a value a
+    /// hand-edited file sets above [`MAX_UPDATE_MIN_AGE_HOURS`] reads as
+    /// that bound, as the setter would have refused it.
+    pub fn update_min_age_hours(&self) -> u32 {
+        self.update
+            .as_ref()
+            .and_then(|u| u.min_age_hours)
+            .unwrap_or(DEFAULT_UPDATE_MIN_AGE_HOURS)
+            .min(MAX_UPDATE_MIN_AGE_HOURS)
     }
 
     /// `auth.login.max_delay`. Absent config or an absent key means the
@@ -1321,6 +1344,26 @@ impl std::fmt::Debug for OidcConfig {
             .field("redirect_uri", &self.redirect_uri)
             .finish()
     }
+}
+
+/// `update.min_age_hours`'s default: a release is offered one day after it
+/// is published.
+pub const DEFAULT_UPDATE_MIN_AGE_HOURS: u32 = 24;
+
+/// The largest `update.min_age_hours` a setter accepts: thirty days. A larger
+/// value would keep the age gate shut for practical purposes.
+pub const MAX_UPDATE_MIN_AGE_HOURS: u32 = 720;
+
+/// The `update` block: the opt-in daily check for a new release.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// Whether the daemon checks once a day. Absent means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<bool>,
+    /// How many hours a release must be old before it is offered, 0 to 720.
+    /// Absent means 24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_age_hours: Option<u32>,
 }
 
 /// `automation.evolve_threshold`'s default: the number of open maintenance

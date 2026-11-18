@@ -97,46 +97,54 @@ fn a_release_build_ignores_the_test_key() {
 }
 
 /// S11: the key seam is read in exactly one place, an item compiled only
-/// into debug builds.
+/// into debug builds. It lives in core (`update::trusted_keys`), which both
+/// this CLI and the service's update client use, so no crate reads it twice.
 #[test]
 fn the_test_key_seam_is_debug_only() {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let name = "\"CRYSTALLINE_TEST_UPDATE_KEY\"";
-    let mut reads = 0;
-    // Every .rs file under src, subfolders included.
-    let mut files = Vec::new();
-    let mut dirs = vec![src];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                files.push(path);
+    let mut reads = Vec::new();
+    for krate in ["cli", "core", "service"] {
+        // Every .rs file under src, subfolders included.
+        let mut files = Vec::new();
+        let mut dirs = vec![crates.join(krate).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (at, line) in lines.iter().enumerate() {
+                if !line.contains(name) {
+                    continue;
+                }
+                reads.push(format!("{krate}: {}", path.display()));
+                // The read sits in a function whose attribute is the cfg.
+                let item = lines[..at]
+                    .iter()
+                    .rposition(|l| l.starts_with("fn ") || l.starts_with("pub"))
+                    .expect("the read sits in an item");
+                assert_eq!(
+                    lines[item - 1].trim(),
+                    "#[cfg(debug_assertions)]",
+                    "{}:{}: the read of {name} is not debug-only",
+                    path.display(),
+                    at + 1
+                );
             }
         }
     }
-    for path in files {
-        let text = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        for (at, line) in lines.iter().enumerate() {
-            if !line.contains(name) {
-                continue;
-            }
-            reads += 1;
-            // The read sits in a function whose attribute is the cfg.
-            let item = lines[..at]
-                .iter()
-                .rposition(|l| l.starts_with("fn ") || l.starts_with("pub"))
-                .expect("the read sits in an item");
-            assert_eq!(
-                lines[item - 1].trim(),
-                "#[cfg(debug_assertions)]",
-                "{}:{}: the read of {name} is not debug-only",
-                path.display(),
-                at + 1
-            );
-        }
-    }
-    assert_eq!(reads, 1, "the seam is read in exactly one place");
+    assert_eq!(
+        reads.len(),
+        1,
+        "the seam is read in exactly one place: {reads:?}"
+    );
+    assert!(reads[0].starts_with("core: "), "{reads:?}");
 }

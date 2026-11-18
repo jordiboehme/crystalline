@@ -13,9 +13,9 @@ use crystalline_core::base::{BasePath, PathProblem, PublicBase};
 use crystalline_core::config::{
     AuthConfig, AutomationConfig, CaptureConfig, DatabaseBackend, DatabaseConfig,
     EffectiveShareIdentity, EvolveConfig, GitHubConfig, GithubAppPresence, GlobalConfig,
-    HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig, RecallConfig, RemoteConfig,
-    ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
-    WebhookConfig,
+    HttpSetting, IdentityConfig, IndexConfig, LoginConfig, MAX_UPDATE_MIN_AGE_HOURS, OidcConfig,
+    RecallConfig, RemoteConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode,
+    SkillsConfig, SkillsServe, UpdateConfig, WebhookConfig,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -681,6 +681,28 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_evolve_threshold,
             clear: clear_evolve_threshold,
             effective: evolve_threshold_effective,
+        },
+        SettingSpec {
+            key: "update.check",
+            doc: "Whether the daemon checks once a day for a newer release and says so at session start (default false); the check reads the public release feed, sends no token and never installs anything",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            secret: false,
+            operator_only: true,
+            apply: set_update_check,
+            clear: clear_update_check,
+            effective: update_check_effective,
+        },
+        SettingSpec {
+            key: "update.min_age_hours",
+            doc: "How many hours a release must be old before the update check offers it, 0 to 720 (default 24); a young release is skipped in case it gets pulled",
+            kind: SettingKind::U64,
+            startup_effective: false,
+            secret: false,
+            operator_only: true,
+            apply: set_update_min_age_hours,
+            clear: clear_update_min_age_hours,
+            effective: update_min_age_hours_effective,
         },
     ]
 }
@@ -1848,6 +1870,75 @@ fn evolve_contradictions_effective(config: &GlobalConfig) -> (String, bool) {
     (config.evolve_contradictions().to_string(), is_default)
 }
 
+// --- update.check -----------------------------------------------------------
+
+/// Drop the `update` block once every field in it has been cleared.
+fn drop_update_if_empty(config: &mut GlobalConfig) {
+    if config.update.as_ref() == Some(&UpdateConfig::default()) {
+        config.update = None;
+    }
+}
+
+fn set_update_check(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .trim()
+        .parse()
+        .map_err(|_| SettingsError(format!("update.check must be true or false, got '{value}'")))?;
+    config.update.get_or_insert_with(Default::default).check = Some(parsed);
+    Ok(())
+}
+
+fn clear_update_check(config: &mut GlobalConfig) {
+    if let Some(u) = config.update.as_mut() {
+        u.check = None;
+    }
+    drop_update_if_empty(config);
+}
+
+fn update_check_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.update.as_ref().and_then(|u| u.check).is_none();
+    (config.update_check_enabled().to_string(), is_default)
+}
+
+// --- update.min_age_hours ---------------------------------------------------
+
+fn set_update_min_age_hours(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let refuse = || {
+        SettingsError(format!(
+            "update.min_age_hours must be a whole number of hours between 0 and {MAX_UPDATE_MIN_AGE_HOURS}, got '{value}'"
+        ))
+    };
+    let trimmed = value.trim();
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse());
+    }
+    let parsed: u32 = trimmed.parse().map_err(|_| refuse())?;
+    if parsed > MAX_UPDATE_MIN_AGE_HOURS {
+        return Err(refuse());
+    }
+    config
+        .update
+        .get_or_insert_with(Default::default)
+        .min_age_hours = Some(parsed);
+    Ok(())
+}
+
+fn clear_update_min_age_hours(config: &mut GlobalConfig) {
+    if let Some(u) = config.update.as_mut() {
+        u.min_age_hours = None;
+    }
+    drop_update_if_empty(config);
+}
+
+fn update_min_age_hours_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .update
+        .as_ref()
+        .and_then(|u| u.min_age_hours)
+        .is_none();
+    (config.update_min_age_hours().to_string(), is_default)
+}
+
 // --- recall.enabled ----------------------------------------------------------
 
 fn set_recall_enabled(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -2958,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_forty_six_keys_in_order() {
+    fn registry_lists_exactly_the_forty_nine_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -3009,6 +3100,8 @@ mod tests {
                 "automation.webhook.url",
                 "automation.webhook.secret",
                 "automation.evolve_threshold",
+                "update.check",
+                "update.min_age_hours",
             ]
         );
     }
@@ -3056,6 +3149,8 @@ mod tests {
                 "automation.webhook.url",
                 "automation.webhook.secret",
                 "automation.evolve_threshold",
+                "update.check",
+                "update.min_age_hours",
             ]
         );
         // The rule, not only the list: a key added under one of the three
@@ -3066,7 +3161,8 @@ mod tests {
                 || (spec.key.starts_with("service.") && spec.key != "service.response_format")
                 || spec.key == "github.api_url"
                 || spec.key == "github.oauth_client_id"
-                || spec.key.starts_with("automation.");
+                || spec.key.starts_with("automation.")
+                || spec.key.starts_with("update.");
             assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
             assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
             assert!(is_known_key(spec.key), "{}", spec.key);
@@ -3230,6 +3326,11 @@ mod tests {
                 (
                     "automation.evolve_threshold",
                     "CRYSTALLINE_AUTOMATION_EVOLVE_THRESHOLD".to_string()
+                ),
+                ("update.check", "CRYSTALLINE_UPDATE_CHECK".to_string()),
+                (
+                    "update.min_age_hours",
+                    "CRYSTALLINE_UPDATE_MIN_AGE_HOURS".to_string()
                 ),
             ]
         );
@@ -3731,7 +3832,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 47);
+        assert_eq!(views.len(), 49);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -3782,6 +3883,8 @@ mod tests {
                 "automation.webhook.url",
                 "automation.webhook.secret",
                 "automation.evolve_threshold",
+                "update.check",
+                "update.min_age_hours",
             ]
         );
 
@@ -4398,6 +4501,55 @@ mod tests {
         );
         let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
         assert!(!yaml.contains("evolve"), "{yaml}");
+    }
+
+    // --- update.* ----------------------------------------------------------
+
+    #[test]
+    fn update_check_defaults_off() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(update_check_effective(&cfg), ("false".to_string(), true));
+        apply(&mut cfg, "update.check", " true ").unwrap();
+        assert_eq!(update_check_effective(&cfg), ("true".to_string(), false));
+        assert!(apply(&mut cfg, "update.check", "maybe").is_err());
+        unset(&mut cfg, "update.check").unwrap();
+        assert_eq!(cfg.update, None);
+        assert!(!cfg.update_check_enabled());
+    }
+
+    #[test]
+    fn min_age_hours_defaults_to_24() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(
+            update_min_age_hours_effective(&cfg),
+            ("24".to_string(), true)
+        );
+        apply(&mut cfg, "update.min_age_hours", "0").unwrap();
+        assert_eq!(cfg.update_min_age_hours(), 0);
+        apply(&mut cfg, "update.min_age_hours", "720").unwrap();
+        assert_eq!(cfg.update_min_age_hours(), 720);
+        unset(&mut cfg, "update.min_age_hours").unwrap();
+        assert_eq!(cfg.update, None);
+        assert_eq!(cfg.update_min_age_hours(), 24);
+        // A hand-edited file past the bound reads as the bound.
+        cfg.update = Some(crystalline_core::config::UpdateConfig {
+            check: None,
+            min_age_hours: Some(100_000),
+        });
+        assert_eq!(cfg.update_min_age_hours(), 720);
+    }
+
+    #[test]
+    fn min_age_hours_refuses_a_negative_or_text_value() {
+        let mut cfg = GlobalConfig::default();
+        for bad in ["-1", "+5", "soon", "1.5", "", "721", "99999999999"] {
+            let err = apply(&mut cfg, "update.min_age_hours", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("between 0 and 720"),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(cfg.update, None);
     }
 
     // --- recall.* ----------------------------------------------------------

@@ -251,6 +251,10 @@ mod pg {
     /// after the lock was taken.
     pub(crate) const START_FAILED: &str = "this instance could not start; see its log";
 
+    /// The answer to `update_facts` before the daemon serves: the words an
+    /// unknown ctl command starts with.
+    pub(crate) const UPDATE_FACTS_UNKNOWN: &str = "unknown ctl command 'update_facts'";
+
     /// The test-only variable that holds a Postgres start for this many
     /// milliseconds right after the lock is taken, so a test can reach the
     /// window between the lock and the handover. Read by a debug build only.
@@ -606,6 +610,17 @@ mod pg {
                     None => Stop::Standby,
                 };
                 (envelope_ok(json!({ "stopping": true })), stop)
+            }
+            // Never parked either: until the daemon serves, the update facts
+            // are answered as an unknown command, as a daemon from before
+            // 0.34.0 answers them, so `status` falls back to the cache file
+            // at once instead of waiting out a standby or a slow start.
+            "update_facts" => {
+                let serving = handover.borrow().clone();
+                match serving {
+                    Some(shared) => (crate::control::handle(req, &shared).await.0, Stop::No),
+                    None => (envelope_err(UPDATE_FACTS_UNKNOWN), Stop::No),
+                }
             }
             _ => match wait_for_daemon(handover).await {
                 Waited::Daemon(shared) => {
@@ -1060,6 +1075,31 @@ mod pg {
                 released_at: released
                     .then(|| Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap()),
             }
+        }
+
+        /// Before the daemon serves, `update_facts` is answered at once as
+        /// an unknown command, so `status` falls back to the cache file
+        /// instead of waiting out a standby or a slow start.
+        #[tokio::test]
+        async fn update_facts_is_answered_at_once_before_the_daemon_serves() {
+            let (_status, status) = watch::channel(StandbyStatus::new());
+            let view = StandbyView {
+                status,
+                database: "db:5432/c".to_string(),
+                started: Instant::now(),
+            };
+            let (_handover, mut handover) = watch::channel(None);
+            let request = json!({"v": 1, "cmd": "update_facts"});
+            let (answer, stop) = tokio::time::timeout(
+                Duration::from_secs(5),
+                answer_early(&request, &view, &mut handover),
+            )
+            .await
+            .expect("never parked");
+            assert!(matches!(stop, Stop::No));
+            assert_eq!(answer["ok"], false, "{answer}");
+            assert_eq!(answer["error"], UPDATE_FACTS_UNKNOWN, "{answer}");
+            assert!(UPDATE_FACTS_UNKNOWN.starts_with("unknown ctl command 'update_facts'"));
         }
 
         /// The sentences name the active instance when it announced itself,
