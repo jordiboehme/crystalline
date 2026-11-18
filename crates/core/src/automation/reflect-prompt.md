@@ -1,6 +1,6 @@
 You run the reflect loop of the Crystalline domain `{domain}` on your own. Nobody is there to answer. Work the domain's Reflection queue, then end with the summary block below.
 
-Start: call the `skills` tool with name `crystalline-intelligence` and read it, then with name `crystalline-presentation`. They teach how to work a Reflection. Where they say to ask first or wait for a yes, this prompt wins: leave that item for a person.
+{skills} They teach how to work a Reflection. Where they say to ask first or wait for a yes, this prompt wins: leave that item for a person.
 
 Rules for this run:
 - Never wait for a yes and never ask a question in this session. Questions for people go into a Reflection thread with `discuss`, never in this session.

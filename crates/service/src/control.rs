@@ -1342,7 +1342,7 @@ fn folds_on_the_way_in(req: &Value) -> bool {
 /// domain collide with the one an alias already points at. Nor is
 /// `forget_domain`: it names a domain that was just removed, and mapping that
 /// name could only land on a different, live domain.
-const DOMAIN_REFERENCE_COMMANDS: [&str; 22] = [
+const DOMAIN_REFERENCE_COMMANDS: [&str; 23] = [
     "sync",
     "file_stamps",
     "scaffold_manifest",
@@ -1359,6 +1359,7 @@ const DOMAIN_REFERENCE_COMMANDS: [&str; 22] = [
     "origin_discard",
     "origin_resolve",
     "provision",
+    "automation_prompt",
     "automation_lease_take",
     "automation_lease_renew",
     "automation_lease_release",

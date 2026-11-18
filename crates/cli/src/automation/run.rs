@@ -131,7 +131,6 @@ pub(super) async fn run_one(
     stop: &watch::Receiver<bool>,
 ) -> anyhow::Result<Ran> {
     let args = &opts.args;
-    let prompt = headless_prompt(lp, domain, args.max_items);
     if opts.dry_run {
         let shown = ClaudeRun {
             program: claude.to_path_buf(),
@@ -152,6 +151,7 @@ pub(super) async fn run_one(
         println!("  {}", words.join(" "));
         return Ok(Ran::Exited(0));
     }
+    let prompt = run_prompt(lp, client, domain, args.max_items).await?;
     let take = client.verb(
         "automation_lease_take",
         lp,
@@ -377,6 +377,38 @@ fn share_failure(domain: &str, error: &str, remote: bool) -> String {
 
 /// A take refusal that means "not now": a run is going, or the loop runs on
 /// another instance.
+/// The prompt a run on `domain` starts its agent with, as the server it
+/// talks to builds it (`automation_prompt`): the server knows whether its MCP
+/// surface serves the `skills` tool the prompt starts with. A server older
+/// than the verb refuses it, and the run then starts with this binary's
+/// shipped prompt, which calls the `skills` tool. Asked before the lease is
+/// taken, so a failure here leaves no lease behind.
+pub(super) async fn run_prompt(
+    lp: Loop,
+    client: &AutomationClient,
+    domain: &str,
+    max_items: u32,
+) -> anyhow::Result<String> {
+    let answer = client
+        .verb(
+            "automation_prompt",
+            lp,
+            json!({ "domain": domain, "max_items": max_items }),
+        )
+        .await;
+    match answer {
+        Ok(setup) => setup["prompt"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("the prompt answer carried no prompt")),
+        Err(e) if is_refusal(&e) => {
+            eprintln!("{domain}: the server sent no prompt ({e}); this run uses the shipped one.");
+            Ok(headless_prompt(lp, domain, max_items, false))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub(super) fn is_busy(e: &anyhow::Error) -> bool {
     let text = e.to_string();
     text == "already running" || text.starts_with("runs on ")

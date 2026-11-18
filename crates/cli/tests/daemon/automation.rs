@@ -32,6 +32,11 @@ fn engram(title: &str, permalink: &str, body: &str) -> String {
 
 /// A daemon serving `busy` (one mechanical finding) and `quiet` (none).
 fn env_with_domains(tag: &str) -> DaemonEnv {
+    env_with_domains_and(tag, "")
+}
+
+/// [`env_with_domains`] with `extra` appended to the daemon's config.
+fn env_with_domains_and(tag: &str, extra: &str) -> DaemonEnv {
     let mut env = DaemonEnv::new(tag);
     let busy = env.dir.join("kb-busy");
     let quiet = env.dir.join("kb-quiet");
@@ -62,7 +67,7 @@ fn env_with_domains(tag: &str) -> DaemonEnv {
     std::fs::write(
         &config,
         format!(
-            "service:\n  response_format: json\ndomains:\n  busy:\n    path: {}\n  quiet:\n    path: {}\n",
+            "service:\n  response_format: json\ndomains:\n  busy:\n    path: {}\n  quiet:\n    path: {}\n{extra}",
             busy.display(),
             quiet.display()
         ),
@@ -238,6 +243,11 @@ fn run_records_the_run_and_releases_the_lease() {
     assert!(calls.contains("arg=--strict-mcp-config"), "{calls}");
     assert!(
         calls.contains("arg=You run the evolve loop of the Crystalline domain `busy`"),
+        "{calls}"
+    );
+    // The daemon serves the skills tool, so the prompt starts with it.
+    assert!(
+        calls.contains("Start: call the `skills` tool with name `crystalline-intelligence`"),
         "{calls}"
     );
     let cfg = calls
@@ -531,9 +541,65 @@ fn prompt_prints_the_shipped_prompt() {
         assert_eq!(code(&out), Some(0), "{}", explain(&out));
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            crystalline_core::automation::headless_prompt(lp, "work", 7)
+            crystalline_core::automation::headless_prompt(lp, "work", 7, false)
         );
     }
+}
+
+/// `prompt --json` answers what the `automation_prompt` verb answers for
+/// the same request: the prompt, the forbidden tools, the version and the
+/// checksum. `--skills-loaded` puts the line that says the skills are
+/// loaded in place of the call to the `skills` tool.
+#[test]
+fn prompt_json_prints_the_runner_setup() {
+    use crystalline_core::automation::{Loop, runner_setup};
+    let env = DaemonEnv::new("pj");
+    for (lp, word) in [(Loop::Reflect, "reflect"), (Loop::Evolve, "evolve")] {
+        for loaded in [false, true] {
+            let mut args = vec![
+                word,
+                "prompt",
+                "--json",
+                "--domain",
+                "work",
+                "--max-items",
+                "7",
+            ];
+            if loaded {
+                args.push("--skills-loaded");
+            }
+            let out = env.output(&args);
+            assert_eq!(code(&out), Some(0), "{}", explain(&out));
+            let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                printed,
+                serde_json::to_value(runner_setup(lp, "work", 7, loaded)).unwrap(),
+                "{word} loaded {loaded}"
+            );
+        }
+    }
+    let out = env.output(&["reflect", "prompt", "--domain", "work", "--skills-loaded"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        crystalline_core::automation::headless_prompt(Loop::Reflect, "work", 20, true)
+    );
+}
+
+/// A run takes its prompt from the daemon, which knows whether it serves
+/// the `skills` tool: with `skills.serve: false` the agent is told its
+/// skills are already loaded instead of calling a tool it cannot list.
+#[test]
+fn a_run_on_a_daemon_that_hides_the_skills_tool_says_they_are_loaded() {
+    let env = env_with_domains_and("sk", "skills:\n  serve: false\n");
+    env.fake_claude("", SUMMARY, 0);
+    let out = env.output(&["evolve", "run", "--domain", "busy"]);
+    assert_eq!(code(&out), Some(0), "{}", explain(&out));
+    let calls = env.calls();
+    assert!(
+        calls.contains("Your skills are already loaded: `crystalline-intelligence`."),
+        "{calls}"
+    );
+    assert!(!calls.contains("call the `skills` tool"), "{calls}");
 }
 
 /// The daemon's own process id, from the record it published.
