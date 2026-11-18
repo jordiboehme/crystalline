@@ -1021,6 +1021,33 @@ fn a_daemon_exits_cleanly_on_sigterm_and_sigint() {
     }
 }
 
+/// Delete `dir` while a daemon still runs in it and watches a domain in it.
+///
+/// The daemon is meant to react to the delete: about 300 ms after the domain
+/// files go, its watcher syncs, and the sync writes the domain's `index.md`
+/// again and opens a database temp folder under `state/crystalline/tmp`
+/// (measured 2026-11-18: `kb-eng/index.md` back after 318 ms,
+/// `tmp/.tmp*/tursodb_temp_file` made and removed at 310 ms). When the walk
+/// of `remove_dir_all` is slow, under the load of a full suite, such an entry
+/// lands in a folder the walk has already emptied, and the final `rmdir`
+/// fails with `DirectoryNotEmpty`. That is the daemon working, not the fault
+/// under test, so the delete starts over on that error and only on that one;
+/// the daemon makes nothing once a folder is gone, so a few passes leave no
+/// folder.
+fn remove_under_a_live_daemon(dir: &Path) {
+    for _ in 0..20 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => panic!("could not delete {}: {e}", dir.display()),
+        }
+    }
+    panic!(
+        "{} still had new entries after 20 deletes: the daemon keeps writing into a deleted folder",
+        dir.display()
+    );
+}
+
 /// The same for the daemon a client autostarts, the kind the 2026-11-04
 /// leftovers were (`serve --daemon --autostarted`, in a session of its own,
 /// working in its state directory): once its bridge is gone it is nobody's
@@ -1044,7 +1071,7 @@ fn an_autostarted_daemon_exits_on_sigterm() {
         // The bridge goes first, or it would reconnect and start a successor.
         drop(client);
         if deleted {
-            std::fs::remove_dir_all(&env.dir).unwrap();
+            remove_under_a_live_daemon(&env.dir);
         }
 
         let pid = libc::pid_t::try_from(pid).unwrap();
