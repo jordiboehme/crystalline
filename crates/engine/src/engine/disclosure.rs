@@ -675,7 +675,7 @@ impl Engine {
         if let (Some(by), false) = (by, confirmed.is_empty()) {
             let readers = self.page_readers_now(domain).await?;
             let repo = self.page_repo(domain);
-            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let at = time::now().rfc3339_secs_z();
             for source in confirmed {
                 list.retain(|d| !(d.source == *source && d.by == by));
                 list.push(Disclosure {

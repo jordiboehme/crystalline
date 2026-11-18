@@ -44,7 +44,10 @@ fn agent() -> ReflectionCaller {
 /// reflected and its baseline is set), and the clock at [`START`].
 async fn reflecting() -> Fx {
     let fx = fixture(&[("MANIFEST.md", &manifest("reflection: on\n"))]).await;
-    fx.engine.set_automation_now(Some(start()));
+    fx.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start(),
+        )));
     fx.engine
         .write_reflection(
             &WriteReflectionParams {
@@ -173,7 +176,10 @@ const STUB: &str = "A title and almost nothing else.\n\n- [context] meant to be 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mechanical_finding_makes_evolve_due_and_judgment_does_not() {
     let fx = fixture(&[("stub-note.md", &engram("Stub note", "stub-note", STUB))]).await;
-    fx.engine.set_automation_now(Some(start()));
+    fx.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start(),
+        )));
     let s = status(&fx.engine, Loop::Evolve).await;
     assert!(s["counts"]["judgment"].as_u64().unwrap() > 0, "{s}");
     assert_eq!(s["counts"]["mechanical"], 0, "{s}");
@@ -241,7 +247,9 @@ async fn a_crashed_runner_expires_after_five_minutes() {
     open_thread(&fx, "aaaa1111", "Still true?").await;
     let token = take(&fx.engine, Loop::Reflect, "eng", "k8s").await;
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(120)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() + Duration::seconds(120),
+        )));
     fx.engine
         .automation_lease_renew(Loop::Reflect, "eng", &token, &Scope::Unrestricted)
         .await
@@ -249,13 +257,17 @@ async fn a_crashed_runner_expires_after_five_minutes() {
 
     // Then the runner dies. Five minutes after the last renewal it still runs.
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(120 + 299)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() + Duration::seconds(120 + 299),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["running"]["runner"], "k8s", "{s}");
     assert_eq!(s["due"], false, "{s}");
 
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(120 + 301)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() + Duration::seconds(120 + 301),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["running"], Value::Null, "{s}");
     assert_eq!(s["due"], true, "{s}");
@@ -353,7 +365,9 @@ async fn a_failed_run_parks_nothing() {
     // The loop backs off for 5 minutes after the failure; then the item
     // that run did not settle is due again.
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(301)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() + Duration::seconds(301),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
     assert_eq!(s["left_for_person"], 0, "{s}");
@@ -367,7 +381,8 @@ async fn a_failed_run_parks_nothing() {
 
 /// Record one run of `outcome` on `eng` at `now`.
 async fn run_at(fx: &Fx, now: DateTime<FixedOffset>, outcome: RunOutcome) {
-    fx.engine.set_automation_now(Some(now));
+    fx.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(now)));
     let token = take(&fx.engine, Loop::Reflect, "eng", "cli").await;
     record(
         &fx.engine,
@@ -414,12 +429,16 @@ async fn failed_runs_back_off_until_a_run_does_not_fail() {
     let second = start() + Duration::seconds(360);
     run_at(&fx, second, RunOutcome::Failed).await;
     fx.engine
-        .set_automation_now(Some(second + Duration::seconds(599)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            second + Duration::seconds(599),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], "backing off after 2 failed runs", "{s}");
     assert_eq!(s["due"], false, "{s}");
     fx.engine
-        .set_automation_now(Some(second + Duration::seconds(601)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            second + Duration::seconds(601),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
     assert_eq!(s["reason"], Value::Null, "{s}");
@@ -432,7 +451,9 @@ async fn failed_runs_back_off_until_a_run_does_not_fail() {
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], "backing off after 1 failed run", "{s}");
     fx.engine
-        .set_automation_now(Some(capped + Duration::seconds(311)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            capped + Duration::seconds(311),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
 }
@@ -445,7 +466,9 @@ async fn a_failure_from_the_future_backs_nothing_off() {
     open_thread(&fx, "aaaa1111", "Still true?").await;
     run_at(&fx, start(), RunOutcome::Failed).await;
     fx.engine
-        .set_automation_now(Some(start() - Duration::hours(2)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() - Duration::hours(2),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], Value::Null, "{s}");
     assert_eq!(s["due"], true, "{s}");
@@ -463,11 +486,15 @@ async fn the_backoff_stops_at_six_hours() {
     }
     let last = now - Duration::seconds(1);
     fx.engine
-        .set_automation_now(Some(last + Duration::seconds(6 * 3600 - 1)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            last + Duration::seconds(6 * 3600 - 1),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], "backing off after 12 failed runs", "{s}");
     fx.engine
-        .set_automation_now(Some(last + Duration::seconds(6 * 3600 + 1)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            last + Duration::seconds(6 * 3600 + 1),
+        )));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
 }
@@ -482,7 +509,9 @@ async fn a_read_only_instance_runs_no_loop() {
     let cfg = fx.engine.config();
     let store = fx.engine.store();
     let read_only = Engine::new(store, cfg, None, None).with_read_only(true);
-    read_only.set_automation_now(Some(start()));
+    read_only.set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+        start(),
+    )));
     for lp in [Loop::Evolve, Loop::Reflect] {
         let answer = read_only
             .automation_status(lp, &["eng".to_string()], &Scope::Unrestricted)
@@ -585,7 +614,9 @@ async fn an_unchanged_item_keeps_its_version_a_day_later() {
 
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     fx.engine
-        .set_automation_now(Some(start() + Duration::days(1)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() + Duration::days(1),
+        )));
     let after = source_change_age(&fx).await;
     assert!(after > before, "the age moved: {before} then {after}");
     let s = status(&fx.engine, Loop::Reflect).await;
@@ -715,7 +746,9 @@ async fn direct_team_with(
     )
     .await
     .unwrap();
-    eng.set_automation_now(Some(start()));
+    eng.set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+        start(),
+    )));
     std::fs::create_dir_all(root.join("notes")).unwrap();
     (eng, root)
 }
@@ -1079,7 +1112,9 @@ async fn a_record_after_a_takeover_is_refused() {
     open_thread(&fx, "aaaa1111", "Still true?").await;
     let old = take(&fx.engine, Loop::Reflect, "eng", "k8s").await;
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(301)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() + Duration::seconds(301),
+        )));
     take(&fx.engine, Loop::Reflect, "eng", "cli").await;
     let err = fx
         .engine
@@ -1190,8 +1225,14 @@ async fn on_postgres_evolve_runs_on_the_host_and_a_stale_lease_expires_once() {
     };
     let a = instance_on(open().await, "alpha", &[]).await;
     let b = instance_on(open().await, "beta", &[]).await;
-    a.engine.set_automation_now(Some(start()));
-    b.engine.set_automation_now(Some(start()));
+    a.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start(),
+        )));
+    b.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start(),
+        )));
 
     let s = status(&b.engine, Loop::Evolve).await;
     assert_eq!(s["runs_on"], "alpha", "{s}");
@@ -1204,7 +1245,9 @@ async fn on_postgres_evolve_runs_on_the_host_and_a_stale_lease_expires_once() {
 
     let old = take(&a.engine, Loop::Evolve, "eng", "k8s").await;
     a.engine
-        .set_automation_now(Some(start() + Duration::seconds(301)));
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start() + Duration::seconds(301),
+        )));
     take(&a.engine, Loop::Evolve, "eng", "cli").await;
     let err = a
         .engine
@@ -1239,7 +1282,9 @@ async fn a_write_while_the_lease_lapsed_is_still_shared() {
         .await
         .unwrap();
     let token = taken["token"].as_str().unwrap().to_string();
-    eng.set_automation_now(Some(start() + Duration::seconds(400)));
+    eng.set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+        start() + Duration::seconds(400),
+    )));
     write_note(&root, "notes/late.md", "written while the lease lapsed");
     eng.note_written("brand", "runner", &["notes/late.md".to_string()])
         .await

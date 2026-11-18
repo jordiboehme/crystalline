@@ -830,7 +830,7 @@ impl Engine {
             .valid_to
             .as_deref()
             .map(|raw| {
-                NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
+                time::parse_date(raw).ok_or_else(|| {
                     EngineError::Invalid(format!(
                         "valid_to must be a plain ISO date (YYYY-MM-DD), got '{raw}'"
                     ))
@@ -985,15 +985,14 @@ impl Engine {
     fn build_retirement_edit(
         current: &str,
         status: &str,
-        valid_to: Option<NaiveDate>,
+        valid_to: Option<Day>,
         successor_permalink: Option<&str>,
         successor_title: Option<&str>,
         actor: &str,
     ) -> String {
         let mut edited = set_frontmatter_field(current, "status", status);
         if let Some(date) = valid_to {
-            edited =
-                set_frontmatter_field(&edited, "valid_to", &date.format("%Y-%m-%d").to_string());
+            edited = set_frontmatter_field(&edited, "valid_to", &date.ymd());
         }
         if let Some(permalink) = successor_permalink {
             let line = format!("- superseded_by [[{permalink}]]");

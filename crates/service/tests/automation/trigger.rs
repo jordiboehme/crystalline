@@ -147,9 +147,10 @@ async fn reflecting(extra: &str, url: Option<&str>) -> Fx {
         |cfg, _| webhook(cfg, url, None),
     )
     .await;
-    fx.engine.set_automation_now(Some(
-        chrono::DateTime::parse_from_rfc3339("2026-10-21T10:00:00+00:00").unwrap(),
-    ));
+    fx.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            chrono::DateTime::parse_from_rfc3339("2026-10-21T10:00:00+00:00").unwrap(),
+        )));
     fx.engine
         .write_reflection(
             &WriteReflectionParams {
@@ -896,9 +897,10 @@ async fn a_failed_run_waits_out_its_backoff_then_sends() {
         "nothing while the loop backs off"
     );
     // The five minutes after the failure are over.
-    fx.engine.set_automation_now(Some(
-        chrono::DateTime::parse_from_rfc3339("2026-10-21T10:06:00+00:00").unwrap(),
-    ));
+    fx.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            chrono::DateTime::parse_from_rfc3339("2026-10-21T10:06:00+00:00").unwrap(),
+        )));
     let hit = hook
         .next(minutes(6))
         .await

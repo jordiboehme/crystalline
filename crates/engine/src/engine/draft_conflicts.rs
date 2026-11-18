@@ -1542,7 +1542,7 @@ mod tests {
             start: Some("start\n".to_string()),
             start_sha256: None,
             shared: None,
-            merged_at: merged.then(chrono::Utc::now),
+            merged_at: merged.then(crystalline_core::time::now),
             merging: None,
             settling: None,
         }

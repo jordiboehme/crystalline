@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use crystalline_remote::state::RepositoryIds;
 use crystalline_remote::{
     Collaborator, GithubApp, RemoteError, RepoRole, RepoVisibility, RepositoryFacts,
@@ -383,7 +383,7 @@ struct Generation {
 #[derive(Clone, Copy)]
 struct Failing {
     /// The first failure since the last good lookup, as wall time.
-    since: DateTime<Utc>,
+    since: Stamp,
     /// When the last failed lookup failed, for [`RETRY_AFTER_FAILURE`];
     /// `None` once an invalidation asks for a new lookup at once.
     last: Option<Instant>,
@@ -528,7 +528,7 @@ impl GithubGovernor {
     /// Since when lookups have been failing, or `None` while every
     /// repository's last lookup worked. Only repositories still connected to
     /// a domain count.
-    pub fn degraded_since(&self) -> Option<DateTime<Utc>> {
+    pub fn degraded_since(&self) -> Option<Stamp> {
         self.connected_failures()
             .into_iter()
             .map(|(_, failing)| failing.since)
@@ -538,7 +538,7 @@ impl GithubGovernor {
     /// Since when a repository's lookups have been failing while its last
     /// answer may still serve (GitHub down, a rate limit and the like), or
     /// `None`.
-    pub fn stale_since(&self) -> Option<DateTime<Utc>> {
+    pub fn stale_since(&self) -> Option<Stamp> {
         self.connected_failures()
             .into_iter()
             .filter(|(_, failing)| !failing.gone)
@@ -1222,7 +1222,7 @@ impl GithubGovernor {
     /// failures to learn: only a good lookup opens it.
     fn mark_failing(state: &mut State, key: &str, now: Instant, gone: bool) {
         let earlier = state.failing.get(key).copied();
-        let since = earlier.map_or_else(Utc::now, |failing| failing.since);
+        let since = earlier.map_or_else(time::now, |failing| failing.since);
         let gone = gone || earlier.is_some_and(|failing| failing.gone);
         state.failing.insert(
             key.to_string(),
@@ -1740,7 +1740,7 @@ impl super::Engine {
     /// Since when GitHub has not answered who may use a connected domain
     /// (see [`GithubGovernor::degraded_since`]), `None` while it answers or
     /// before anything was asked.
-    pub fn github_access_degraded(&self) -> Option<DateTime<Utc>> {
+    pub fn github_access_degraded(&self) -> Option<Stamp> {
         self.github_governor.get()?.degraded_since()
     }
 
@@ -1846,7 +1846,7 @@ impl super::Engine {
 
     /// Since when a connected repository's lookups have been failing while
     /// its last answer may still serve (see [`GithubGovernor::stale_since`]).
-    pub fn github_access_stale_since(&self) -> Option<DateTime<Utc>> {
+    pub fn github_access_stale_since(&self) -> Option<Stamp> {
         self.github_governor.get()?.stale_since()
     }
 
@@ -3357,10 +3357,10 @@ mod tests {
         rig.github
             .with(REPO, |r| r.down = Some(|| RemoteError::Offline));
         tokio::time::advance(6 * MIN).await;
-        let before = Utc::now();
+        let before = time::now();
         rig.knowledge("alice").await;
         let since = rig.governor.degraded_since().expect("degraded");
-        assert!(since >= before - chrono::Duration::seconds(5));
+        assert!(since >= before - time::seconds(5));
         // A second failure keeps the first one's time.
         tokio::time::advance(MIN).await;
         rig.knowledge("alice").await;

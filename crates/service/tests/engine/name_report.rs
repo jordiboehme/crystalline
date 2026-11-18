@@ -405,7 +405,12 @@ async fn the_timed_collection_keeps_an_empty_row() {
         vec![("eng", explicit(bare_folder(tmp.path(), "eng")))],
     );
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
     let row = report["considered"]

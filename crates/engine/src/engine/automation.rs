@@ -492,7 +492,7 @@ impl Engine {
         scope: &Scope,
     ) -> Result<Value> {
         let started_at = report.started_at.trim();
-        if !started_at.is_empty() && DateTime::parse_from_rfc3339(started_at).is_err() {
+        if !started_at.is_empty() && time::parse_rfc3339(started_at).is_none() {
             return Err(EngineError::Invalid(format!(
                 "started_at '{started_at}' is not an RFC 3339 time"
             )));
@@ -648,7 +648,7 @@ impl Engine {
         let title = format!(
             "{} run on {domain}, {}",
             lp.title_word(),
-            self.automation_clock().format("%Y-%m-%d")
+            self.automation_clock().day().ymd()
         );
         let mut description = cap_summary(summary, SUMMARY_MAX_BYTES).to_string();
         if !held_back.is_empty() {
@@ -753,12 +753,12 @@ impl Engine {
     /// Read `at` as now in the automation verbs, or the real clock again
     /// with `None`.
     #[cfg(any(test, feature = "testing"))]
-    pub fn set_automation_now(&self, at: Option<DateTime<FixedOffset>>) {
+    pub fn set_automation_now(&self, at: Option<OffsetStamp>) {
         *self.automation_now.lock().unwrap() = at;
     }
 
     /// Now, for the automation verbs: the test clock when one is set.
-    fn automation_clock(&self) -> DateTime<FixedOffset> {
+    fn automation_clock(&self) -> OffsetStamp {
         #[cfg(any(test, feature = "testing"))]
         if let Some(at) = *self.automation_now.lock().unwrap() {
             return at;
@@ -770,8 +770,8 @@ impl Engine {
     /// is written in, so the store compares them as strings.
     fn automation_window(&self) -> (String, String) {
         let now = self.automation_clock();
-        let stale_before = now - Duration::seconds(LEASE_STALE_SECS);
-        (now.to_rfc3339(), stale_before.to_rfc3339())
+        let stale_before = now - time::seconds(LEASE_STALE_SECS);
+        (now.rfc3339(), stale_before.rfc3339())
     }
 
     /// Refuse a caller who may not run `lp` on `domain`: reflect needs the
@@ -1199,7 +1199,7 @@ impl Engine {
                 })
             }
             Loop::Evolve => {
-                let today = self.automation_clock().date_naive().to_string();
+                let today = self.automation_clock().day().ymd();
                 let swept = self
                     .evolve_findings(
                         &EvolveParams {
@@ -1309,10 +1309,9 @@ impl Engine {
                 let now = self.automation_clock();
                 // A failure "later" than now (the clock went back) starts no
                 // wait, so a wait never outlasts its own length.
-                DateTime::parse_from_rfc3339(ended)
-                    .ok()
+                time::parse_rfc3339(ended)
                     .filter(|ended| *ended <= now)
-                    .filter(|ended| now < *ended + Duration::seconds(backoff_secs(failed)))
+                    .filter(|ended| now < *ended + time::seconds(backoff_secs(failed)))
                     .map(|_| failed)
             }
             _ => None,

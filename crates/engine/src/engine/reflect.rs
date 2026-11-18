@@ -78,16 +78,12 @@ impl Item {
 }
 
 fn secs_since_rfc3339(at: Option<&str>) -> Option<i64> {
-    let at = chrono::DateTime::parse_from_rfc3339(at?).ok()?;
-    Some(
-        (chrono::Utc::now() - at.with_timezone(&chrono::Utc))
-            .num_seconds()
-            .max(0),
-    )
+    let at = time::parse_rfc3339(at?)?;
+    Some((time::now() - at.stamp()).num_seconds().max(0))
 }
 
 fn secs_since_epoch(mtime: i64) -> i64 {
-    (chrono::Utc::now().timestamp() - mtime).max(0)
+    (time::now().unix_seconds() - mtime).max(0)
 }
 
 /// An item's version: a sha256 over `parts`, each closed by a NUL so two

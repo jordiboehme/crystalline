@@ -69,7 +69,7 @@ fn view(c: crate::engine::GithubIdentity) -> GithubIdentityResponse {
         account: c.account,
         connected: c.connected,
         login: c.login,
-        connected_at: c.connected_at.map(|at| at.to_rfc3339()),
+        connected_at: c.connected_at.map(|at| at.rfc3339()),
         token_store: c.token_store,
         pending: c.pending.map(|p| GithubPendingView {
             user_code: p.user_code,

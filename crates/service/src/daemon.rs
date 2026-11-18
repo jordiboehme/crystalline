@@ -3726,7 +3726,7 @@ async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bo
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
-                engine.origin_poll_tick(Instant::now(), chrono::Utc::now()).await;
+                engine.origin_poll_tick(Instant::now(), crystalline_core::time::now()).await;
             }
         }
     }
@@ -3931,7 +3931,7 @@ pub async fn run_orphan_sweep(
             _ = ticker.tick() => {
                 match engine
                     .collect_orphaned_domains(
-                        Some(chrono::Duration::days(ORPHAN_GRACE_DAYS)),
+                        Some(crystalline_core::time::days(ORPHAN_GRACE_DAYS)),
                         false,
                     )
                     .await

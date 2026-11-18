@@ -1477,7 +1477,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
- "chrono",
  "crystalline-core",
  "crystalline-identity",
  "crystalline-index",

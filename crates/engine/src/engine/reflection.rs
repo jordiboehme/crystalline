@@ -726,7 +726,7 @@ impl Engine {
                 || self.held_elsewhere(
                     Some(&host.instance_id),
                     Some(&host.heartbeat_at),
-                    chrono::Utc::now(),
+                    time::now(),
                 ))
         {
             return Ok(Some(Some(host.label.clone())));
@@ -741,7 +741,7 @@ impl Engine {
         // them holds it does not matter and the row cannot tell. Otherwise
         // nobody here serves it, and the gate says to start the daemon.
         if self.is_one_shot() {
-            let stale_before = (now_offset() - Duration::seconds(self.stale_secs)).to_rfc3339();
+            let stale_before = (time::now() - time::seconds(self.stale_secs)).rfc3339();
             let daemon_holds = host.is_some_and(|host| {
                 host.instance_id == self.instance_id && host.heartbeat_at >= stale_before
             });
@@ -796,9 +796,9 @@ impl Engine {
         let id = store.domain_id(domain).await.ok().flatten()?;
         let host = store.domain_host(id).await.ok().flatten()?;
         drop(store);
-        let beat = DateTime::parse_from_rfc3339(&host.heartbeat_at).ok()?;
-        let since = chrono::Utc::now().signed_duration_since(beat.with_timezone(&chrono::Utc));
-        (since > Duration::seconds(self.stale_secs)).then(|| since.num_minutes().max(1))
+        let beat = time::parse_rfc3339(&host.heartbeat_at)?;
+        let since = time::now().since(beat.stamp());
+        (since > time::seconds(self.stale_secs)).then(|| since.num_minutes().max(1))
     }
 
     /// Whether `host` records another instance than this one as the holder.
@@ -1135,7 +1135,7 @@ pub(super) fn reflection_dir(root: &Path) -> PathBuf {
 }
 
 fn now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    time::now().rfc3339_secs_z()
 }
 
 /// A page without its `reflection:` frontmatter block, which names the
@@ -2811,11 +2811,9 @@ impl Engine {
 /// opened on a heading that had no id yet.
 pub(crate) fn thread_view(inner: &str, t: &crystalline_core::threads::Thread, text: &str) -> Value {
     use crystalline_core::threads as th;
-    let last = chrono::DateTime::parse_from_rfc3339(t.last_at())
-        .map(|d| d.with_timezone(&chrono::Utc))
-        .ok();
+    let last = time::parse_rfc3339(t.last_at()).map(|d| d.stamp());
     let age = last
-        .map(|d| (chrono::Utc::now() - d).num_seconds().max(0))
+        .map(|d| (time::now() - d).num_seconds().max(0))
         .unwrap_or(0);
     json!({
         "id": t.id,

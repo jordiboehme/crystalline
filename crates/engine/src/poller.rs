@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::Stamp;
 
 /// The background poll interval when neither a domain nor the global
 /// `github.poll_secs` setting configures one.
@@ -110,7 +110,7 @@ struct DomainPollState {
     /// `next_due`'s wall-clock mirror, for `status_report`'s offline
     /// `origins` block (an `Instant` carries no epoch, so it cannot be
     /// serialized on its own).
-    next_due_at: Option<DateTime<Utc>>,
+    next_due_at: Option<Stamp>,
     /// The most recently completed poll's outcome, `None` before the first
     /// completed poll.
     last_result: Option<DomainPollOutcome>,
@@ -124,7 +124,7 @@ struct DomainPollState {
 #[derive(Default)]
 pub(crate) struct OriginPollerState {
     domains: Mutex<HashMap<String, DomainPollState>>,
-    rate_limited_until: Mutex<Option<DateTime<Utc>>>,
+    rate_limited_until: Mutex<Option<Stamp>>,
     tick_counter: AtomicU64,
     no_token_log_at: Mutex<Option<Instant>>,
 }
@@ -150,7 +150,7 @@ impl OriginPollerState {
 
     /// Records `domain`'s next-due instant, in both clocks together so they
     /// never drift apart.
-    pub(crate) fn schedule(&self, domain: &str, next_due: Instant, next_due_at: DateTime<Utc>) {
+    pub(crate) fn schedule(&self, domain: &str, next_due: Instant, next_due_at: Stamp) {
         let mut domains = self.domains.lock().unwrap();
         let entry = domains.entry(domain.to_string()).or_default();
         entry.next_due = Some(next_due);
@@ -164,7 +164,7 @@ impl OriginPollerState {
     }
 
     /// `domain`'s next-due wall-clock instant, for the offline status block.
-    pub(crate) fn next_due_at(&self, domain: &str) -> Option<DateTime<Utc>> {
+    pub(crate) fn next_due_at(&self, domain: &str) -> Option<Stamp> {
         self.domains
             .lock()
             .unwrap()
@@ -194,13 +194,13 @@ impl OriginPollerState {
     /// Pauses every domain's polling until `until`: GitHub rate limits are
     /// per-token, so one domain hitting the limit means every domain is
     /// paused, not just the one that tripped it. `None` clears the pause.
-    pub(crate) fn set_rate_limited_until(&self, until: Option<DateTime<Utc>>) {
+    pub(crate) fn set_rate_limited_until(&self, until: Option<Stamp>) {
         *self.rate_limited_until.lock().unwrap() = until;
     }
 
     /// The shared rate-limit pause deadline, if the poller is currently
     /// waiting one out.
-    pub(crate) fn rate_limited_until(&self) -> Option<DateTime<Utc>> {
+    pub(crate) fn rate_limited_until(&self) -> Option<Stamp> {
         *self.rate_limited_until.lock().unwrap()
     }
 
@@ -224,6 +224,7 @@ impl OriginPollerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crystalline_core::time;
 
     // --- effective_interval_secs -------------------------------------------
 
@@ -324,18 +325,15 @@ mod tests {
     fn state_schedule_round_trips_next_due_at_and_gates_is_due() {
         let state = OriginPollerState::default();
         let now = Instant::now();
-        let wall = Utc::now();
+        let wall = time::now();
         state.schedule(
             "brand",
             now + Duration::from_secs(60),
-            wall + chrono::Duration::seconds(60),
+            wall + time::seconds(60),
         );
         assert!(!state.is_due("brand", now));
         assert!(state.is_due("brand", now + Duration::from_secs(61)));
-        assert_eq!(
-            state.next_due_at("brand"),
-            Some(wall + chrono::Duration::seconds(60))
-        );
+        assert_eq!(state.next_due_at("brand"), Some(wall + time::seconds(60)));
     }
 
     #[test]
@@ -353,7 +351,7 @@ mod tests {
     fn state_rate_limit_pause_round_trips_and_clears() {
         let state = OriginPollerState::default();
         assert_eq!(state.rate_limited_until(), None);
-        let until = Utc::now() + chrono::Duration::minutes(5);
+        let until = time::now() + time::minutes(5);
         state.set_rate_limited_until(Some(until));
         assert_eq!(state.rate_limited_until(), Some(until));
         state.set_rate_limited_until(None);

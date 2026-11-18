@@ -762,7 +762,7 @@ impl Engine {
                 .as_ref()
                 .and_then(|t| t.user_display())
                 .map(str::to_string),
-            connected_at: token.as_ref().map(|t| t.created_at.into_chrono()),
+            connected_at: token.as_ref().map(|t| t.created_at),
             token_store: token.is_some().then(|| store.kind().to_string()),
             pending,
             error,
@@ -1232,7 +1232,7 @@ impl Engine {
             login: link.as_ref().map(|l| l.login.clone()),
             github_id: link.as_ref().map(|l| l.github_id),
             host: link.as_ref().map(|l| l.host.clone()),
-            linked_at: link.as_ref().map(|l| l.linked_at.into_chrono()),
+            linked_at: link.as_ref().map(|l| l.linked_at),
             token_live: link.as_ref().is_some_and(|l| l.token_live),
             pending,
             error,

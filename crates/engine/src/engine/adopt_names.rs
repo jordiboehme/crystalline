@@ -151,7 +151,7 @@ impl Engine {
             entry.rename_question = Some(RenameQuestion {
                 from,
                 to: to.to_string(),
-                seen_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                seen_at: time::now().rfc3339_secs_z(),
                 answered: Some(RenameAnswer::Keep),
             });
             self.commit_config(&mut file_guard, file)?;
@@ -611,7 +611,7 @@ impl Engine {
 /// before an answer asks about the whole change once. Anything else starts
 /// a new question.
 fn ask_rename(entry: &mut DomainEntry, previous: String, canonical: &str) {
-    let seen_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let seen_at = time::now().rfc3339_secs_z();
     match &mut entry.rename_question {
         Some(question) if question.to == canonical && question.answered.is_some() => {}
         Some(question) if question.answered.is_none() => {

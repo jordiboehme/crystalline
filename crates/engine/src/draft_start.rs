@@ -47,7 +47,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::sha256_hex;
@@ -91,7 +91,8 @@ pub struct DraftStart {
     /// What the open proposal holds.
     pub shared: Option<SharedText>,
     /// Set when a merge changed the row. Drives the notice.
-    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub merged_at: Option<Stamp>,
     /// Stands while a merge is being written: set before the row is written
     /// and cleared when the start moves after it. A crash between the two
     /// leaves the merged row over the old start, and this says so, so the next
@@ -528,7 +529,7 @@ mod tests {
                 proposal: 42,
                 text: Some("what the proposal holds\n".to_string()),
             }),
-            merged_at: Some("2026-11-06T10:00:00Z".parse().unwrap()),
+            merged_at: time::parse_lenient_stamp("2026-11-06T10:00:00Z"),
             merging: None,
             settling: None,
         };

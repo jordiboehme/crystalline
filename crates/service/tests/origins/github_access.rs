@@ -294,11 +294,11 @@ async fn the_daemon_status_says_since_when_github_has_not_answered() {
     let answer = status().await;
     assert_eq!(
         answer["data"]["github_access_degraded_since"],
-        json!(since.to_rfc3339())
+        json!(since.rfc3339())
     );
     assert_eq!(
         answer["data"]["github_access_stale_since"],
-        json!(since.to_rfc3339())
+        json!(since.rfc3339())
     );
 }
 

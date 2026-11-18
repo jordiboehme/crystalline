@@ -140,6 +140,12 @@ impl Delta {
         self.0.to_std().ok()
     }
 
+    /// A `std::time::Duration` as a span, nanoseconds kept, or `None` when
+    /// it is out of range, as chrono's `TimeDelta::from_std` refuses it.
+    pub fn from_std(value: Duration) -> Option<Delta> {
+        TimeDelta::from_std(value).ok().map(Delta)
+    }
+
     /// Wraps a chrono span. Removed in stage 3.
     #[doc(hidden)]
     pub fn from_chrono(value: TimeDelta) -> Self {
@@ -485,6 +491,34 @@ impl Sub<Delta> for Day {
 
     fn sub(self, rhs: Delta) -> Day {
         Day(self.0 - rhs.0)
+    }
+}
+
+/// Moves the instant and keeps the written offset. Panics when out of
+/// range, as chrono's `DateTime<FixedOffset> + TimeDelta` does.
+impl Add<Delta> for OffsetStamp {
+    type Output = OffsetStamp;
+
+    fn add(self, rhs: Delta) -> OffsetStamp {
+        OffsetStamp(
+            self.0
+                .checked_add_signed(rhs.0)
+                .expect("`OffsetStamp + Delta` overflowed"),
+        )
+    }
+}
+
+/// Moves the instant back and keeps the written offset. Panics when out of
+/// range, as chrono's `DateTime<FixedOffset> - TimeDelta` does.
+impl Sub<Delta> for OffsetStamp {
+    type Output = OffsetStamp;
+
+    fn sub(self, rhs: Delta) -> OffsetStamp {
+        OffsetStamp(
+            self.0
+                .checked_sub_signed(rhs.0)
+                .expect("`OffsetStamp - Delta` overflowed"),
+        )
     }
 }
 
@@ -1345,6 +1379,19 @@ mod tests {
     }
 
     #[test]
+    fn from_std_keeps_nanoseconds_and_refuses_what_chrono_refuses() {
+        let value = Duration::new(301, 123_456_789);
+        assert_eq!(
+            Delta::from_std(value).map(Delta::into_chrono),
+            TimeDelta::from_std(value).ok()
+        );
+        assert_eq!(Delta::from_std(value).and_then(|d| d.to_std()), Some(value));
+        assert_eq!(Delta::from_std(Duration::ZERO), Some(Delta::ZERO));
+        assert_eq!(Delta::from_std(Duration::MAX), None);
+        assert!(TimeDelta::from_std(Duration::MAX).is_err());
+    }
+
+    #[test]
     fn operators_match_chrono() {
         let base = Stamp::from_unix(BASE_SECS, 120_000_000).unwrap();
         let reference = chrono_utc(BASE_SECS, 120_000_000);
@@ -1367,6 +1414,24 @@ mod tests {
             (day - hours(47)).into_chrono(),
             day.into_chrono() - TimeDelta::hours(47)
         );
+    }
+
+    #[test]
+    fn offset_stamp_moves_and_keeps_its_offset_as_chrono_does() {
+        let written = parse_rfc3339("2026-01-05T23:30:00.120-05:00").unwrap();
+        let reference = DateTime::parse_from_rfc3339("2026-01-05T23:30:00.120-05:00").unwrap();
+        let span = hours(1) + millis(5);
+        assert_eq!(
+            (written + span).into_chrono(),
+            reference + span.into_chrono()
+        );
+        assert_eq!(
+            (written - span).into_chrono(),
+            reference - span.into_chrono()
+        );
+        assert_eq!((written + span).rfc3339(), "2026-01-06T00:30:00.125-05:00");
+        assert_eq!((written - span).rfc3339(), "2026-01-05T22:30:00.115-05:00");
+        assert_eq!((written + span).day().ymd(), "2026-01-06");
     }
 
     #[test]

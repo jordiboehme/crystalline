@@ -515,7 +515,7 @@ async fn viewing_the_queue_never_counts_as_a_run() {
     // appearing.
     crystalline_service::maintenance::save(&crystalline_service::maintenance::MaintenanceState {
         pending_domains: vec!["eng".to_string()],
-        pending_since: Some("2026-08-01T10:00:00Z".parse().unwrap()),
+        pending_since: crystalline_core::time::parse_lenient_stamp("2026-08-01T10:00:00Z"),
         ..Default::default()
     })
     .unwrap();

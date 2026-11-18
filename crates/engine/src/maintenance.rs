@@ -58,8 +58,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeDelta, Utc};
 use crystalline_core::config::{self, ConfigError};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 
 /// The file name under the state directory's `hooks` folder.
@@ -133,12 +133,10 @@ pub fn mcp_nudge_due(
     state: &MaintenanceState,
     kind: NudgeKind,
     identity: &str,
-    now: DateTime<Utc>,
+    now: Stamp,
 ) -> bool {
     match state.mcp_nudges.get(&nudge_key(kind, identity)) {
-        Some(last) => {
-            now.signed_duration_since(*last) >= TimeDelta::hours(MCP_NUDGE_COOLDOWN_HOURS)
-        }
+        Some(last) => now.since(*last) >= time::hours(MCP_NUDGE_COOLDOWN_HOURS),
         None => true,
     }
 }
@@ -160,21 +158,21 @@ pub struct MaintenanceState {
     /// When the current backlog started: the moment the first domain of this
     /// round went pending, not the most recent one. It is what a "the backlog
     /// is getting old" nudge measures against.
-    #[serde(default)]
-    pub pending_since: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub pending_since: Option<Stamp>,
     /// When a consolidation sweep last ran on this machine.
-    #[serde(default)]
-    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub last_run_at: Option<Stamp>,
     /// When the human was last nudged about the backlog. Written by the Stop
     /// hook through [`record_nudge`], which is the only thing that nudges.
-    #[serde(default)]
-    pub last_nudge_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub last_nudge_at: Option<Stamp>,
     /// When this file was first written on this machine. Written by the Stop
     /// hook through [`record_first_seen`], which owns it: the other recorders
     /// round-trip it untouched, so a human write is never the thing that starts
     /// the clock.
-    #[serde(default)]
-    pub first_seen: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub first_seen: Option<Stamp>,
     /// When each MCP nudge was last carried on a write receipt, keyed
     /// `<kind>:<identity>` (see `nudge_key`). Written by
     /// [`record_mcp_nudge`], read by [`mcp_nudge_due`], and untouched by every
@@ -184,8 +182,8 @@ pub struct MaintenanceState {
     /// agents writing through one daemon each meet the ask once, and neither
     /// spends the other's quiet hours. Ordered, so the file's bytes do not
     /// depend on hashing.
-    #[serde(default)]
-    pub mcp_nudges: BTreeMap<String, DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_map")]
+    pub mcp_nudges: BTreeMap<String, Stamp>,
     /// Open reflect items per domain whose Reflection is on here, as the
     /// daemon last counted them for the machine owner
     /// (`Engine::record_reflect_counts`, every `REFLECT_COUNT_HEARTBEAT`). Zero
@@ -196,8 +194,8 @@ pub struct MaintenanceState {
     /// When the Stop hook last asked for the Reflection queue. Written by
     /// [`record_reflect_nudge`], read by the hook's own cooldown. Always this
     /// machine's, for its own and its mounted domains, like `last_nudge_at`.
-    #[serde(default)]
-    pub last_reflect_nudge_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub last_reflect_nudge_at: Option<Stamp>,
 }
 
 /// What a connected Crystalline's Stop hook asks this server for
@@ -234,12 +232,12 @@ pub struct EvolveStatus {
     /// is empty: the record keeps one time for the whole backlog, so a time
     /// beside an empty list would tell a caller that somebody wrote to a
     /// domain it cannot see.
-    #[serde(default)]
-    pub pending_since: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub pending_since: Option<Stamp>,
     /// When a sweep last ran on the server. A global sweep time, not narrowed
     /// to the caller's domains: it says nothing about any one domain.
-    #[serde(default)]
-    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub last_run_at: Option<Stamp>,
 }
 
 /// The server half of the reflect nudge: open reflect items per domain whose
@@ -397,7 +395,7 @@ pub fn record_run_unscoped() {
 /// field under the lock cannot. `now` is the caller's instant, the same one the
 /// decision was made against, rather than a fresh clock read. Failures are
 /// logged at debug and swallowed, like every writer here.
-pub fn record_nudge(now: DateTime<Utc>) {
+pub fn record_nudge(now: Stamp) {
     if let Err(e) = path().and_then(|p| record_nudge_at(&p, now)) {
         tracing::debug!("maintenance state not stamped with the nudge: {e}");
     }
@@ -411,7 +409,7 @@ pub fn record_nudge(now: DateTime<Utc>) {
 /// for exactly the reason [`record_nudge`] does, and a no-op once the stamp
 /// exists, so a later call never restarts the quiet week. Failures are logged
 /// at debug and swallowed.
-pub fn record_first_seen(now: DateTime<Utc>) {
+pub fn record_first_seen(now: Stamp) {
     if let Err(e) = path().and_then(|p| record_first_seen_at(&p, now)) {
         tracing::debug!("maintenance state clock not started: {e}");
     }
@@ -434,7 +432,7 @@ pub fn record_first_seen(now: DateTime<Utc>) {
 /// machine, the way the Stop hook reaches [`record_nudge`] - and a reader
 /// looking for what writes this field should read `record_mcp_nudge_at`.
 pub fn record_mcp_nudge(kind: NudgeKind, identity: &str) {
-    if let Err(e) = path().and_then(|p| record_mcp_nudge_at(&p, kind, identity, Utc::now())) {
+    if let Err(e) = path().and_then(|p| record_mcp_nudge_at(&p, kind, identity, time::now())) {
         tracing::debug!("maintenance state not stamped with the mcp nudge: {e}");
     }
 }
@@ -442,7 +440,7 @@ pub fn record_mcp_nudge(kind: NudgeKind, identity: &str) {
 /// Stamp the Stop hook's reflect ask at `now`. A recorder rather than a save
 /// for the reason [`record_nudge`] is one; failures are logged at debug and
 /// swallowed.
-pub fn record_reflect_nudge(now: DateTime<Utc>) {
+pub fn record_reflect_nudge(now: Stamp) {
     if let Err(e) = path().and_then(|p| record_reflect_nudge_at(&p, now)) {
         tracing::debug!("maintenance state not stamped with the reflect nudge: {e}");
     }
@@ -531,7 +529,7 @@ fn record_pending_at(path: &Path, domain: &str) -> Result<(), ConfigError> {
         state.pending_domains.push(domain.to_string());
     }
     if state.pending_since.is_none() {
-        state.pending_since = Some(Utc::now());
+        state.pending_since = Some(time::now());
     }
     write_locked(path, &state)
 }
@@ -541,7 +539,7 @@ fn record_pending_at(path: &Path, domain: &str) -> Result<(), ConfigError> {
 fn record_run_at(path: &Path, swept_domains: &[String]) -> Result<(), ConfigError> {
     let _write = write_lock();
     let mut state = load_from(path);
-    state.last_run_at = Some(Utc::now());
+    state.last_run_at = Some(time::now());
     state
         .pending_domains
         .retain(|d| !swept_domains.iter().any(|swept| swept == d));
@@ -554,7 +552,7 @@ fn record_run_at(path: &Path, swept_domains: &[String]) -> Result<(), ConfigErro
 /// [`record_nudge`] against an explicit file, one critical section like the
 /// recorders above. `now` comes from the caller rather than the clock because
 /// the hook decided at a particular instant and stamps that same one.
-fn record_nudge_at(path: &Path, now: DateTime<Utc>) -> Result<(), ConfigError> {
+fn record_nudge_at(path: &Path, now: Stamp) -> Result<(), ConfigError> {
     let _write = write_lock();
     let mut state = load_from(path);
     state.last_nudge_at = Some(now);
@@ -563,7 +561,7 @@ fn record_nudge_at(path: &Path, now: DateTime<Utc>) -> Result<(), ConfigError> {
 
 /// [`record_reflect_nudge`] against an explicit file, one critical section like
 /// [`record_nudge_at`].
-fn record_reflect_nudge_at(path: &Path, now: DateTime<Utc>) -> Result<(), ConfigError> {
+fn record_reflect_nudge_at(path: &Path, now: Stamp) -> Result<(), ConfigError> {
     let _write = write_lock();
     let mut state = load_from(path);
     state.last_reflect_nudge_at = Some(now);
@@ -586,7 +584,7 @@ fn record_reflect_open_at(path: &Path, counts: &BTreeMap<String, u64>) -> Result
 /// [`record_first_seen`] against an explicit file, one critical section like
 /// the recorders above. The check is inside it too: the first writer to reach
 /// this wins, and a later one leaves the stamp it finds alone.
-fn record_first_seen_at(path: &Path, now: DateTime<Utc>) -> Result<(), ConfigError> {
+fn record_first_seen_at(path: &Path, now: Stamp) -> Result<(), ConfigError> {
     let _write = write_lock();
     let mut state = load_from(path);
     if state.first_seen.is_some() {
@@ -616,7 +614,7 @@ pub(crate) fn record_mcp_nudge_at(
     path: &Path,
     kind: NudgeKind,
     identity: &str,
-    now: DateTime<Utc>,
+    now: Stamp,
 ) -> Result<(), ConfigError> {
     let _write = write_lock();
     let mut state = load_from(path);
@@ -629,7 +627,7 @@ pub(crate) fn record_mcp_nudge_at(
 fn record_run_unscoped_at(path: &Path) -> Result<(), ConfigError> {
     let _write = write_lock();
     let mut state = load_from(path);
-    state.last_run_at = Some(Utc::now());
+    state.last_run_at = Some(time::now());
     state.pending_domains.clear();
     state.pending_since = None;
     write_locked(path, &state)
@@ -643,10 +641,10 @@ mod tests {
     fn hook_status_names_only_what_the_caller_may_see() {
         let state = MaintenanceState {
             pending_domains: vec!["open".to_string(), "lab".to_string()],
-            pending_since: DateTime::from_timestamp(1_800_000_000, 0),
-            last_run_at: DateTime::from_timestamp(1_799_000_000, 0),
-            last_nudge_at: DateTime::from_timestamp(1_800_100_000, 0),
-            first_seen: DateTime::from_timestamp(1_790_000_000, 0),
+            pending_since: Stamp::from_unix(1_800_000_000, 0),
+            last_run_at: Stamp::from_unix(1_799_000_000, 0),
+            last_nudge_at: Stamp::from_unix(1_800_100_000, 0),
+            first_seen: Stamp::from_unix(1_790_000_000, 0),
             ..MaintenanceState::default()
         };
         let visible: std::collections::HashSet<String> = ["open".to_string()].into();
@@ -667,9 +665,9 @@ mod tests {
     fn the_remote_backlog_is_appended_and_the_clocks_stay_local() {
         let local = MaintenanceState {
             pending_domains: vec!["notes".to_string(), "jordi-acme".to_string()],
-            last_run_at: DateTime::from_timestamp(1, 0),
-            last_nudge_at: DateTime::from_timestamp(1_800_100_000, 0),
-            first_seen: DateTime::from_timestamp(1_790_000_000, 0),
+            last_run_at: Stamp::from_unix(1, 0),
+            last_nudge_at: Stamp::from_unix(1_800_100_000, 0),
+            first_seen: Stamp::from_unix(1_790_000_000, 0),
             ..MaintenanceState::default()
         };
         let merged = local.with_remote_pending(&["jordi-acme".to_string(), "runbooks".to_string()]);
@@ -696,7 +694,7 @@ mod tests {
         let after = HookStatus::from_state(
             &MaintenanceState {
                 pending_domains: vec!["lab".to_string()],
-                pending_since: DateTime::from_timestamp(1_800_000_000, 0),
+                pending_since: Stamp::from_unix(1_800_000_000, 0),
                 ..MaintenanceState::default()
             },
             &visible,
@@ -860,7 +858,7 @@ mod tests {
         // A human writes through the daemon while the hook is still deciding.
         record_pending_at(&path, "landed-late").unwrap();
 
-        let stamped: DateTime<Utc> = "2026-08-20T10:00:00Z".parse().unwrap();
+        let stamped = time::parse_lenient_stamp("2026-08-20T10:00:00Z").unwrap();
         record_nudge_at(&path, stamped).unwrap();
 
         let after = load_from(&path);
@@ -882,8 +880,8 @@ mod tests {
     #[test]
     fn record_first_seen_starts_the_clock_once_and_keeps_the_backlog() {
         let (_dir, path) = scratch();
-        let first: DateTime<Utc> = "2026-08-01T09:00:00Z".parse().unwrap();
-        let later: DateTime<Utc> = "2026-08-20T09:00:00Z".parse().unwrap();
+        let first = time::parse_lenient_stamp("2026-08-01T09:00:00Z").unwrap();
+        let later = time::parse_lenient_stamp("2026-08-20T09:00:00Z").unwrap();
 
         record_first_seen_at(&path, first).unwrap();
         assert_eq!(load_from(&path).first_seen, Some(first));
@@ -934,7 +932,7 @@ mod tests {
     #[test]
     fn a_nudge_is_due_once_per_cooldown_per_identity() {
         let (_dir, path) = scratch();
-        let now: DateTime<Utc> = "2026-09-16T09:00:00Z".parse().unwrap();
+        let now = time::parse_lenient_stamp("2026-09-16T09:00:00Z").unwrap();
 
         let fresh = load_from(&path);
         assert!(mcp_nudge_due(&fresh, NudgeKind::Share, "ada", now));
@@ -955,9 +953,9 @@ mod tests {
             "another person keeps their own cadence"
         );
 
-        let inside = now + TimeDelta::hours(MCP_NUDGE_COOLDOWN_HOURS) - TimeDelta::minutes(1);
+        let inside = now + time::hours(MCP_NUDGE_COOLDOWN_HOURS) - time::minutes(1);
         assert!(!mcp_nudge_due(&after, NudgeKind::Share, "ada", inside));
-        let past = now + TimeDelta::hours(MCP_NUDGE_COOLDOWN_HOURS);
+        let past = now + time::hours(MCP_NUDGE_COOLDOWN_HOURS);
         assert!(
             mcp_nudge_due(&after, NudgeKind::Share, "ada", past),
             "once the cooldown has passed the ask is due again"
@@ -973,16 +971,16 @@ mod tests {
             // round-trip.
             v: 99,
             pending_domains: vec!["eng".to_string(), "ops".to_string()],
-            pending_since: Some("2026-08-01T10:00:00Z".parse().unwrap()),
-            last_run_at: Some("2026-08-02T11:30:00Z".parse().unwrap()),
-            last_nudge_at: Some("2026-08-03T12:45:00Z".parse().unwrap()),
-            first_seen: Some("2026-07-01T09:15:00Z".parse().unwrap()),
+            pending_since: Some(time::parse_lenient_stamp("2026-08-01T10:00:00Z").unwrap()),
+            last_run_at: Some(time::parse_lenient_stamp("2026-08-02T11:30:00Z").unwrap()),
+            last_nudge_at: Some(time::parse_lenient_stamp("2026-08-03T12:45:00Z").unwrap()),
+            first_seen: Some(time::parse_lenient_stamp("2026-07-01T09:15:00Z").unwrap()),
             mcp_nudges: BTreeMap::from([(
                 "share:ada".to_string(),
-                "2026-08-03T13:00:00Z".parse().unwrap(),
+                time::parse_lenient_stamp("2026-08-03T13:00:00Z").unwrap(),
             )]),
             reflect_open: BTreeMap::from([("eng".to_string(), 2)]),
-            last_reflect_nudge_at: Some("2026-08-04T08:00:00Z".parse().unwrap()),
+            last_reflect_nudge_at: Some(time::parse_lenient_stamp("2026-08-04T08:00:00Z").unwrap()),
         };
 
         save_to(&path, &state).unwrap();
@@ -1003,7 +1001,7 @@ mod tests {
     fn the_reflect_status_names_only_the_reflections_the_caller_curates() {
         let state = MaintenanceState {
             reflect_open: BTreeMap::from([("eng".to_string(), 3), ("ops".to_string(), 1)]),
-            last_reflect_nudge_at: DateTime::from_timestamp(1_800_000_000, 0),
+            last_reflect_nudge_at: Stamp::from_unix(1_800_000_000, 0),
             ..MaintenanceState::default()
         };
         let curated: BTreeSet<String> = ["eng".to_string()].into();

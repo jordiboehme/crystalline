@@ -939,7 +939,12 @@ async fn a_domain_unregistered_past_the_grace_period_is_collected() {
     assert!(before >= 2, "the orphan starts with its rows: {before}");
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 
@@ -979,7 +984,12 @@ async fn a_domain_unregistered_for_an_hour_is_not_collected() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 
@@ -1006,7 +1016,12 @@ async fn a_registered_domain_is_never_collected_whatever_its_stamp() {
     let before = engrams_of(&store, "keep").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 
@@ -1044,7 +1059,12 @@ async fn a_never_stamped_domain_is_stamped_now_and_not_collected() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 
@@ -1072,7 +1092,12 @@ async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let dry = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), true)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(dry["dry_run"], true, "the report says which it was: {dry}");
@@ -1097,7 +1122,12 @@ async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
     );
 
     let wet = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1129,7 +1159,12 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 
@@ -1176,7 +1211,12 @@ async fn a_read_only_preview_says_nothing_was_changed() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), true)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            true,
+        )
         .await
         .unwrap();
 
@@ -1232,7 +1272,12 @@ async fn an_unreadable_configuration_collects_nothing() {
         }
 
         let report = engine
-            .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+            .collect_orphaned_domains(
+                Some(crystalline_core::time::Delta::from_chrono(
+                    chrono::Duration::days(7),
+                )),
+                false,
+            )
             .await
             .unwrap();
 
@@ -1296,7 +1341,12 @@ async fn a_virtual_domains_rows_are_never_collected() {
     assert!(before >= 2, "it has rows to lose: {before}");
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 
@@ -1366,7 +1416,12 @@ async fn a_virtual_orphan_is_virtual_even_on_a_read_only_instance() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 
@@ -1408,7 +1463,12 @@ async fn a_person_asking_collects_a_never_stamped_orphan_and_a_sweep_does_not() 
     // The sweep first, with no grace period at all: an unstamped domain is not
     // old, it is unmeasured, so even a zero grace keeps it.
     let swept = engine
-        .collect_orphaned_domains(Some(chrono::Duration::zero()), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::zero(),
+            )),
+            false,
+        )
         .await
         .unwrap();
     assert!(
@@ -1573,7 +1633,10 @@ async fn a_domain_registered_only_in_the_config_file_is_stamped_and_never_collec
         ("the sweep", Some(chrono::Duration::days(7))),
         ("the person", None),
     ] {
-        let report = engine.collect_orphaned_domains(grace, false).await.unwrap();
+        let report = engine
+            .collect_orphaned_domains(grace.map(crystalline_core::time::Delta::from_chrono), false)
+            .await
+            .unwrap();
         assert!(
             !collected(&report).contains(&"later".to_string()),
             "{label}: a domain the file registers is not collected: {report}"
@@ -1617,7 +1680,10 @@ async fn a_domain_a_live_peer_hosts_is_kept_on_both_paths() {
         ("the sweep", Some(chrono::Duration::days(7))),
         ("the person", None),
     ] {
-        let report = engine.collect_orphaned_domains(grace, false).await.unwrap();
+        let report = engine
+            .collect_orphaned_domains(grace.map(crystalline_core::time::Delta::from_chrono), false)
+            .await
+            .unwrap();
         assert!(
             collected(&report).is_empty(),
             "{label}: a live peer's domain is not this instance's to collect: {report}"
@@ -1653,7 +1719,12 @@ async fn a_domain_whose_host_lock_went_stale_is_collected() {
     assert!(engrams_of(&store, "gone").await.unwrap() >= 2);
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(
+            Some(crystalline_core::time::Delta::from_chrono(
+                chrono::Duration::days(7),
+            )),
+            false,
+        )
         .await
         .unwrap();
 

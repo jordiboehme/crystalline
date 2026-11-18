@@ -207,7 +207,7 @@ impl Engine {
             Ok(Some(host)) => !self.held_elsewhere(
                 Some(&host.instance_id),
                 Some(&host.heartbeat_at),
-                Utc::now(),
+                time::now(),
             ),
             Ok(None) => true,
             // Unknown is not left behind: nothing here could drop it.

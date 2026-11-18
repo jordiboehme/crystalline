@@ -1919,7 +1919,7 @@ impl Engine {
     /// is shared, so a rename on this machine alone would rename the domain
     /// under that instance too.
     async fn refuse_shared_index(&self, old: &str) -> Result<()> {
-        let now = Utc::now();
+        let now = time::now();
         let stats = {
             let store = self.store.lock().await;
             store.domain_stats().await?

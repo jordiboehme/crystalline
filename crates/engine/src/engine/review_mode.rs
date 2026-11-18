@@ -1648,7 +1648,7 @@ impl Engine {
         // `crystalline doctor --fix` drops.
         let elsewhere = match store.domain_host(domain_id).await {
             Ok(host) => host.as_ref().is_some_and(|h| {
-                self.held_elsewhere(Some(&h.instance_id), Some(&h.heartbeat_at), Utc::now())
+                self.held_elsewhere(Some(&h.instance_id), Some(&h.heartbeat_at), time::now())
             }),
             Err(e) => {
                 tracing::warn!(
@@ -1799,10 +1799,10 @@ impl Engine {
     /// when the whole sweep declined to collect.
     pub async fn collect_orphaned_domains(
         &self,
-        grace: Option<Duration>,
+        grace: Option<time::Delta>,
         dry_run: bool,
     ) -> Result<Value> {
-        let now = Utc::now();
+        let now = time::now();
         // A dry run writes nothing at all: not a removal, and not a stamp
         // either, so a preview cannot move a clock the caller is only asking
         // about. A read-only instance is the other way round: it stamps and it
@@ -1842,7 +1842,7 @@ impl Engine {
         let stamped = if stamps {
             let names: Vec<&str> = registered.iter().map(String::as_str).collect();
             let store = self.store.lock().await;
-            store.stamp_registered(&names, &now.to_rfc3339()).await?;
+            store.stamp_registered(&names, &now.rfc3339()).await?;
             names.len()
         } else {
             0
@@ -1887,8 +1887,8 @@ impl Engine {
             let age = row
                 .last_registered
                 .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|seen| now.signed_duration_since(seen.with_timezone(&Utc)));
+                .and_then(time::parse_rfc3339)
+                .map(|seen| now.since(seen.stamp()));
 
             // Why this domain was kept, as a word a caller can branch on and a
             // sentence one can print. `None` is the only outcome that deletes.
@@ -2061,7 +2061,7 @@ impl Engine {
         if stamps && !start_clock.is_empty() {
             let names: Vec<&str> = start_clock.iter().map(String::as_str).collect();
             let store = self.store.lock().await;
-            store.stamp_registered(&names, &now.to_rfc3339()).await?;
+            store.stamp_registered(&names, &now.rfc3339()).await?;
         }
 
         let mut report = json!({

@@ -3484,7 +3484,7 @@ async fn sweep_on(engine: &Engine, today: &str) -> serde_json::Value {
 async fn an_engram_past_its_valid_to_is_never_paired_and_one_ending_today_is() {
     let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
     let (_tmp, engine) = engine_with(loader(s, loads)).await;
-    engine.set_contradiction_today(day("2026-10-01"));
+    engine.set_contradiction_today(crystalline_core::time::Day::from_chrono(day("2026-10-01")));
     set(&engine, "evolve.contradictions", "full").await;
     for (title, content) in [
         ("Eighteen", NODE_18),
@@ -3517,7 +3517,7 @@ async fn an_engram_past_its_valid_to_is_never_paired_and_one_ending_today_is() {
 async fn an_engram_that_expires_between_walks_leaves_the_queue_without_an_edit() {
     let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
     let (_tmp, engine) = engine_with(loader(s, loads)).await;
-    engine.set_contradiction_today(day("2026-10-01"));
+    engine.set_contradiction_today(crystalline_core::time::Day::from_chrono(day("2026-10-01")));
     set(&engine, "evolve.contradictions", "full").await;
     three(&engine).await;
     valid_to(&engine, "eighteen", "2026-10-01").await;
@@ -3531,7 +3531,7 @@ async fn an_engram_that_expires_between_walks_leaves_the_queue_without_an_edit()
     assert!(!engine.contradictions_wanted(), "drained for the day");
 
     // A day on: Eighteen's window closed yesterday.
-    engine.set_contradiction_today(day("2026-10-02"));
+    engine.set_contradiction_today(crystalline_core::time::Day::from_chrono(day("2026-10-02")));
     assert!(
         engine.contradictions_wanted(),
         "a new day asks for a walk, with no write"
@@ -3967,7 +3967,9 @@ async fn a_prose_edit_reads_one_engram_and_midnight_reads_none() {
     assert_eq!(engine.contradiction_fact_loads(), loads + 1);
     assert_eq!(s.forwards(), forwards, "nothing is scored again");
 
-    engine.set_contradiction_today(chrono::Utc::now().date_naive() + chrono::Days::new(1));
+    engine.set_contradiction_today(crystalline_core::time::Day::from_chrono(
+        chrono::Utc::now().date_naive() + chrono::Days::new(1),
+    ));
     let (walks, loads) = (
         engine.contradiction_fact_walks(),
         engine.contradiction_fact_loads(),
@@ -4074,12 +4076,12 @@ async fn a_file_read_before_its_stamp_caught_up_is_read_again() {
     let path = dir.join("twenty.md");
     let stamped = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, stamped.replace("Node 20", "Node 22")).unwrap();
-    engine.set_contradiction_today(day("2030-01-01"));
+    engine.set_contradiction_today(crystalline_core::time::Day::from_chrono(day("2030-01-01")));
     engine.score_contradictions().await.unwrap();
 
     std::fs::write(&path, &stamped).unwrap();
     engine.sync(None).await.unwrap();
-    engine.set_contradiction_today(day("2030-01-02"));
+    engine.set_contradiction_today(crystalline_core::time::Day::from_chrono(day("2030-01-02")));
     let loads = engine.contradiction_fact_loads();
     engine.score_contradictions().await.unwrap();
     assert_eq!(

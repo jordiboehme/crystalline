@@ -157,7 +157,7 @@ impl Engine {
         let manifest_created = if manifest.exists() {
             false
         } else {
-            let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+            let today = time::today_utc().ymd();
             std::fs::write(
                 &manifest,
                 crystalline_core::manifest_template(&domain_name, &today),
@@ -320,7 +320,7 @@ impl Engine {
             self.sync_sources_local();
         }
 
-        let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+        let today = time::today_utc().ymd();
         let scaffold = self
             .scaffold_virtual_manifest(name, &crystalline_core::manifest_template(name, &today))
             .await?;

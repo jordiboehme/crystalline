@@ -92,7 +92,9 @@ async fn clone_at(
     )
     .await
     .unwrap();
-    eng.set_automation_now(Some(start()));
+    eng.set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+        start(),
+    )));
     std::fs::create_dir_all(root.join("notes")).unwrap();
     (eng, root)
 }
@@ -557,8 +559,14 @@ async fn on_postgres_the_home_comes_first_and_the_host_lock_decides_among_the_ho
     let files = [("MANIFEST.md", marked.as_str())];
     let a = instance_at(open().await, "alpha", "https://a.example", &files).await;
     let b = instance_at(open().await, "beta", "https://b.example", &files).await;
-    a.engine.set_automation_now(Some(start()));
-    b.engine.set_automation_now(Some(start()));
+    a.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start(),
+        )));
+    b.engine
+        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
+            start(),
+        )));
 
     let s = status_of(&b.engine, "eng").await;
     assert_eq!(s["runs_on"], "https://a.example", "{s}");

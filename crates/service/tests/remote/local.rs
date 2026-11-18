@@ -927,7 +927,7 @@ async fn a_hidden_team_copy_is_neither_polled_nor_shared() {
     mock.set_branch("main", &second);
     machine
         .engine
-        .origin_poll_tick(std::time::Instant::now(), chrono::Utc::now())
+        .origin_poll_tick(std::time::Instant::now(), crystalline_core::time::now())
         .await;
     assert!(
         !root.join("fresh.md").exists(),
@@ -969,7 +969,7 @@ async fn a_hidden_team_copy_is_neither_polled_nor_shared() {
     assert!(!machine.engine.shadowed_domains().contains(d));
     machine
         .engine
-        .origin_poll_tick(std::time::Instant::now(), chrono::Utc::now())
+        .origin_poll_tick(std::time::Instant::now(), crystalline_core::time::now())
         .await;
     assert!(
         root.join("fresh.md").exists(),

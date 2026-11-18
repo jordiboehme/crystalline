@@ -81,7 +81,6 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 use crystalline_core::{HarnessKind, config};
@@ -501,21 +500,19 @@ pub fn decide(
 /// function stays a plain comparison, and a throttle record that reads as
 /// nonsense costs delayed asks rather than a decision made on a stamp nobody
 /// wrote.
-pub fn evolve_ask(m: &MaintenanceState, now: DateTime<Utc>) -> Option<Vec<String>> {
+pub fn evolve_ask(m: &MaintenanceState, now: crystalline_core::time::Stamp) -> Option<Vec<String>> {
     if let Some(nudged) = m.last_nudge_at
-        && now.signed_duration_since(nudged) < TimeDelta::hours(EVOLVE_NUDGE_COOLDOWN_HOURS)
+        && now.since(nudged) < crystalline_core::time::hours(EVOLVE_NUDGE_COOLDOWN_HOURS)
     {
         return None;
     }
-    let interval = TimeDelta::days(EVOLVE_RUN_INTERVAL_DAYS);
+    let interval = crystalline_core::time::days(EVOLVE_RUN_INTERVAL_DAYS);
     let weekly_due = match m.last_run_at {
-        Some(ran) => now.signed_duration_since(ran) >= interval,
+        Some(ran) => now.since(ran) >= interval,
         // No sweep ever recorded: the clock runs from the first time this
         // hook saw the machine. Absent (the very first call, which seeds it)
         // nothing is due yet.
-        None => m
-            .first_seen
-            .is_some_and(|seen| now.signed_duration_since(seen) >= interval),
+        None => m.first_seen.is_some_and(|seen| now.since(seen) >= interval),
     };
     if weekly_due || !m.pending_domains.is_empty() {
         Some(m.pending_domains.clone())
@@ -658,9 +655,9 @@ fn remote_backlogs(set: &crystalline_remote::SourceSet) -> RemoteBacklogs {
 
 /// Whether the reflect ask's cooldown is clear: never asked, or asked at
 /// least [`REFLECT_NUDGE_COOLDOWN_HOURS`] ago.
-pub fn reflect_ask(m: &MaintenanceState, now: DateTime<Utc>) -> bool {
+pub fn reflect_ask(m: &MaintenanceState, now: crystalline_core::time::Stamp) -> bool {
     m.last_reflect_nudge_at.is_none_or(|at| {
-        now.signed_duration_since(at) >= TimeDelta::hours(REFLECT_NUDGE_COOLDOWN_HOURS)
+        now.since(at) >= crystalline_core::time::hours(REFLECT_NUDGE_COOLDOWN_HOURS)
     })
 }
 
@@ -899,7 +896,7 @@ pub fn run_stop(harness: Option<&str>) {
     // `record_pending` from the daemon landing inside that gap has to survive.
     // Nothing else here writes the file, so the whole-file save is gone and
     // with it the window it opened.
-    let now = chrono::Utc::now();
+    let now = crystalline_core::time::now();
     let mut maintenance_state = maintenance::load();
     if maintenance_state.first_seen.is_none() {
         stamp_maintenance(Stamp::FirstSeen, now);
@@ -1135,7 +1132,7 @@ enum Stamp {
 /// goes to a daemon that already runs (a passive attach, the hook's budget
 /// allows no start) and is dropped when none answers. Best effort either
 /// way, like every recorder.
-fn stamp_maintenance(stamp: Stamp, now: chrono::DateTime<chrono::Utc>) {
+fn stamp_maintenance(stamp: Stamp, now: crystalline_core::time::Stamp) {
     if crystalline_service::runs_in::PackageContext::here().is_packaged() {
         let name = match stamp {
             Stamp::FirstSeen => "first_seen",
@@ -1146,7 +1143,7 @@ fn stamp_maintenance(stamp: Stamp, now: chrono::DateTime<chrono::Utc>) {
             "v": 1,
             "cmd": "maintenance_stamp",
             "stamp": name,
-            "at": now.to_rfc3339(),
+            "at": now.rfc3339(),
         });
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1950,16 +1947,16 @@ mod tests {
 
     /// The fixed instant every throttle case below measures against, so no
     /// test depends on the wall clock.
-    fn now() -> chrono::DateTime<chrono::Utc> {
-        "2026-08-17T12:00:00Z".parse().unwrap()
+    fn now() -> crystalline_core::time::Stamp {
+        crystalline_core::time::parse_lenient_stamp("2026-08-17T12:00:00Z").unwrap()
     }
 
-    fn days_ago(days: i64) -> chrono::DateTime<chrono::Utc> {
-        now() - chrono::TimeDelta::days(days)
+    fn days_ago(days: i64) -> crystalline_core::time::Stamp {
+        now() - crystalline_core::time::days(days)
     }
 
-    fn hours_ago(hours: i64) -> chrono::DateTime<chrono::Utc> {
-        now() - chrono::TimeDelta::hours(hours)
+    fn hours_ago(hours: i64) -> crystalline_core::time::Stamp {
+        now() - crystalline_core::time::hours(hours)
     }
 
     #[test]
@@ -2065,7 +2062,9 @@ mod tests {
         let short = MaintenanceState {
             // One minute later than the sweep above, so one minute short of the
             // interval.
-            last_run_at: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + TimeDelta::minutes(1)),
+            last_run_at: Some(
+                days_ago(EVOLVE_RUN_INTERVAL_DAYS) + crystalline_core::time::minutes(1),
+            ),
             ..due.clone()
         };
         assert_eq!(
@@ -2090,7 +2089,9 @@ mod tests {
         );
 
         let short = MaintenanceState {
-            first_seen: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + TimeDelta::minutes(1)),
+            first_seen: Some(
+                days_ago(EVOLVE_RUN_INTERVAL_DAYS) + crystalline_core::time::minutes(1),
+            ),
             ..MaintenanceState::default()
         };
         assert_eq!(
@@ -2107,7 +2108,9 @@ mod tests {
         let state = MaintenanceState {
             pending_domains: vec!["a".to_string()],
             pending_since: Some(days_ago(2)),
-            last_nudge_at: Some(hours_ago(EVOLVE_NUDGE_COOLDOWN_HOURS) + TimeDelta::minutes(1)),
+            last_nudge_at: Some(
+                hours_ago(EVOLVE_NUDGE_COOLDOWN_HOURS) + crystalline_core::time::minutes(1),
+            ),
             first_seen: Some(days_ago(30)),
             ..MaintenanceState::default()
         };
