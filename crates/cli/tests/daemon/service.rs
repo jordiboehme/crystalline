@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crystalline_core::config::{self, GlobalConfig, ResponseFormat, ServiceConfig};
 use serde_json::{Value, json};
@@ -64,12 +64,9 @@ impl Env {
     }
 
     fn with(tag: &str, hub: &'static str, workers: Option<&'static str>) -> Env {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::common::unique_suffix();
         // A short base keeps the macOS unix-socket path within 104 bytes.
-        let dir = PathBuf::from("/tmp").join(format!("cq-{tag}-{nanos}"));
+        let dir = PathBuf::from("/tmp").join(format!("cq-{tag}-{unique}"));
         std::fs::create_dir_all(dir.join("config")).unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();
         std::fs::create_dir_all(dir.join("cache")).unwrap();
@@ -7340,13 +7337,10 @@ impl PgScratch {
             eprintln!("note: skipping the postgres leg (CRYSTALLINE_TEST_POSTGRES_URL is unset)");
             return None;
         };
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::common::unique_suffix();
         let pg = PgScratch {
             url,
-            schema: format!("{prefix}_{nanos}"),
+            schema: format!("{prefix}_{unique}"),
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

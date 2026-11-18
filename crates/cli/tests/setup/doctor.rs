@@ -1254,11 +1254,8 @@ fn domain_filter_restricts_checks_to_one_domain() {
 #[test]
 #[cfg(unix)]
 fn detects_and_fixes_a_stale_lock_and_orphaned_socket() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{nanos}"));
+    let unique = crate::common::unique_suffix();
+    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{unique}"));
     std::fs::create_dir_all(home.join("config")).unwrap();
     std::fs::create_dir_all(home.join("state")).unwrap();
     std::fs::create_dir_all(home.join("cache")).unwrap();
@@ -1457,11 +1454,8 @@ fn a_free_lock_with_no_record_is_reported_by_name_and_fixed() {
 /// every test that calls it: the isolation runs through `/tmp` and `HOME`.
 #[cfg(unix)]
 fn isolated_home(tag: &str) -> (PathBuf, PathBuf) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{tag}-{nanos}"));
+    let unique = crate::common::unique_suffix();
+    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{tag}-{unique}"));
     std::fs::create_dir_all(home.join("config")).unwrap();
     std::fs::create_dir_all(home.join("state")).unwrap();
     std::fs::create_dir_all(home.join("cache")).unwrap();
