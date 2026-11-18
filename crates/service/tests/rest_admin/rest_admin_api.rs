@@ -5893,7 +5893,7 @@ async fn me_update_available_is_admin_only() {
     }
 
     // An agent's MCP token opens no identity on this surface, even the
-    // admin's own: the probe answers it as anyone without a session.
+    // admin's own.
     let issued: serde_json::Value = as_session(
         fx.addr,
         reqwest::Method::POST,
@@ -5908,20 +5908,21 @@ async fn me_update_available_is_admin_only() {
     .await
     .unwrap();
     let token = issued["token"].as_str().expect("a token is issued");
+    // `resolve` reads only the trusted header, the forwarded headers and the
+    // session cookie, never `Authorization`, and `/auth/me` is a public path,
+    // so the token is ignored: with `auth.anonymous` on this fixture answers
+    // 200 as the anonymous viewer.
     let resp = client()
         .get(format!("http://{}/api/v1/auth/me", fx.addr))
         .bearer_auth(token)
         .send()
         .await
         .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(!text.contains("0.35.0"), "{status}: {text}");
-    if status == 200 {
-        let me: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(me["user"], serde_json::Value::Null, "{me}");
-        assert_eq!(me["update_available"], serde_json::Value::Null, "{me}");
-    }
+    assert_eq!(resp.status(), 200);
+    let me: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(me["user"], serde_json::Value::Null, "{me}");
+    assert_eq!(me["anonymous"], true, "{me}");
+    assert_eq!(me["update_available"], serde_json::Value::Null, "{me}");
 }
 
 /// A router with no daemon behind it names no update, and a daemon's facts
