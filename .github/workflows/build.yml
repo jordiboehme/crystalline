@@ -1,8 +1,8 @@
 name: Build
 
 # The build, sign, notarize and package half of a release. release.yml calls
-# this for every release (a call from CI on main or a `v*` tag push) and for
-# its manual dry run. All six platform legs
+# this for every release (a call from CI on main) and for its manual dry
+# run. All six platform legs
 # build, the musl legs also make .deb packages and the Windows legs .msi
 # packages.
 #
@@ -107,17 +107,16 @@ jobs:
     needs: fluid-dist
     runs-on: ${{ matrix.os }}
     # The macOS legs sign and notarize, so they run in the protected
-    # `release` environment, which only `v*` tags and main may enter and
-    # which holds the Apple secrets. The other legs need no secret and stay
-    # outside it. So does a manual dry run from any other branch: the
+    # `release` environment, which only main may enter and which holds the
+    # Apple secrets. The other legs need no secret and stay outside it. So
+    # does a manual dry run from any other branch or from a tag: the
     # environment would refuse it, and once the Apple secrets live only in
     # the environment they are empty outside it, so such a dry run builds an
     # unsigned binary as designed (see "Decide whether to sign and
-    # notarize"). deployment: false uses the
-    # environment for its secrets and branch rule without recording a
-    # deployment for every build.
+    # notarize"). deployment: false uses the environment for its secrets and
+    # branch rule without recording a deployment for every build.
     environment:
-      name: ${{ matrix.codesign && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') && 'release' || '' }}
+      name: ${{ matrix.codesign && github.ref == 'refs/heads/main' && 'release' || '' }}
       deployment: false
     strategy:
       fail-fast: false
@@ -152,6 +151,12 @@ jobs:
       LEG_TARGET: ${{ matrix.target }}
       LEG_PLATFORM: ${{ matrix.platform }}
       LEG_DEB_ARCH: ${{ matrix.deb_arch }}
+      # The official-build flag the binary reads at compile time
+      # (crystalline_core::update::official_build): 1 only for a release,
+      # which passes its tag. A dry run passes no tag and gets an empty
+      # value, so its binary refuses `crystalline update now`, like every
+      # build made outside this workflow.
+      CRYSTALLINE_OFFICIAL_BUILD: ${{ inputs.tag != '' && '1' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -461,6 +466,21 @@ jobs:
             --no-build \
             --deb-version "$deb_version" \
             --output "dist/crystalline_${deb_version}_${LEG_DEB_ARCH}.deb"
+          # The install marker must land where the updater looks for it, or
+          # every .deb install would read as a plain tarball.
+          # Read into variables first: a grep -q that stops reading early
+          # could fail the writer on a closed pipe under pipefail.
+          deb="dist/crystalline_${deb_version}_${LEG_DEB_ARCH}.deb"
+          listing="$(dpkg-deb -c "$deb")"
+          if ! grep -q ' \./usr/lib/crystalline/install-source$' <<<"$listing"; then
+            echo "::error::the .deb has no usr/lib/crystalline/install-source"
+            exit 1
+          fi
+          said="$(dpkg-deb --fsys-tarfile "$deb" | tar -xO ./usr/lib/crystalline/install-source)"
+          if [ "$said" != deb ]; then
+            echo "::error::the .deb install marker says '$said', not deb"
+            exit 1
+          fi
 
       - name: Upload .deb artifact
         if: matrix.musl
@@ -553,6 +573,10 @@ jobs:
           $exe = 'C:\Program Files\Crystalline\bin\crystalline.exe'
           if (-not (Test-Path $exe)) { throw 'crystalline.exe missing after install' }
           & $exe --version
+          # The install marker beside the exe, or every MSI install would
+          # read as a plain zip to the updater.
+          $m = 'C:\Program Files\Crystalline\bin\install-source'
+          if (-not (Test-Path $m) -or (Get-Content $m -Raw).Trim() -ne 'msi') { throw 'the MSI installed no msi marker beside the exe' }
           # The order in the MSI itself: EndDaemonTasks after
           # RemoveExistingProducts (a deferred action cannot sit before it,
           # error 2613) and ahead of RemoveFiles, so it runs in a removal.

@@ -34,6 +34,10 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
 
 COPY --from=crystalline /usr/local/bin/crystalline /usr/local/bin/crystalline
+# The install marker the published image ships beside the binary, so
+# `crystalline update` refuses here too and points at a new image. It comes
+# from this folder, not the image, so a pinned tag older than 0.34.0 builds.
+COPY --chmod=0444 install-source /usr/local/lib/crystalline/install-source
 COPY --chmod=755 crystalline-loop.sh /usr/local/bin/crystalline-loop
 
 # The same user and paths as the published image. A run writes its log and

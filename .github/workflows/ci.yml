@@ -1386,7 +1386,10 @@ jobs:
       # change so the script is exercised before a release depends on it. On
       # a pull request that bumps the version it reports the release the
       # merge would start; otherwise it says there is nothing to release.
+      # GH_TOKEN: a tag that exists is looked up as a GitHub release too.
       - name: The release check reads the version and its tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/release-check.sh
 
   # Static checks of the workflows and the bundled action. actionlint catches
@@ -1647,7 +1650,8 @@ jobs:
   # Release on merge. The last pull request of a version bumps it and adds
   # release-notes/v<version>.md; once that merge passes `ci-passed` on main,
   # this releases it. scripts/release-check.sh decides: a version that is
-  # already tagged is a no-op with one line, a new version without its notes
+  # already tagged and released is a no-op with one line, a tag with no
+  # GitHub release (a stray tag) fails here, a new version without its notes
   # fails here, and a new version with its notes releases.
   #
   # Only the `release` job holds a concurrency group, never cancelled in
@@ -1678,8 +1682,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # GH_TOKEN: a tag that exists is looked up as a GitHub release too, so
+      # a stray tag fails here instead of reading as released.
       - name: Is this version new
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/release-check.sh
 
   # The release itself, release.yml called with the tag. A called workflow

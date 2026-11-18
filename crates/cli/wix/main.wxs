@@ -69,6 +69,16 @@
                   Source='$(var.CargoTargetBinDir)\crystalline.exe'
                   KeyPath='yes'/>
             </Component>
+            <!-- The install marker `crystalline update` reads beside the
+                 canonical exe: it says msi, so the binary knows this MSI
+                 installed it, in the default folder or a custom one. -->
+            <Component Id='InstallSource' Guid='*'>
+              <File Id='InstallSourceFile'
+                  Name='install-source'
+                  DiskId='1'
+                  Source='$(var.CargoTargetDir)\..\crates\cli\wix\install-source'
+                  KeyPath='yes'/>
+            </Component>
           </Directory>
         </Directory>
       </Directory>
@@ -84,6 +94,7 @@
         Absent='disallow'>
       <ComponentRef Id='License'/>
       <ComponentRef Id='CrystallineBinary'/>
+      <ComponentRef Id='InstallSource'/>
       <Feature Id='Environment'
           Title='PATH Environment Variable'
           Description='Adds the install location to the system PATH so crystalline is available from any terminal.'
