@@ -552,6 +552,10 @@ async fn a_journal_for_another_index_is_left_alone_body(store: Arc<Mutex<dyn Sto
     );
     let mut foreign = own.clone();
     foreign["owner"]["index"] = serde_json::json!("/elsewhere/other-index.db");
+    // On Postgres the key, not the shown name, says which index it is.
+    if foreign["owner"].get("index_key").is_some() {
+        foreign["owner"]["index_key"] = serde_json::json!("postgres:another-database");
+    }
     std::fs::write(m.journal(), serde_json::to_vec(&foreign).unwrap()).unwrap();
 
     let other = m.engine(false).await;

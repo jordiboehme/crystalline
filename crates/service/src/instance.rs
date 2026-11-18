@@ -2953,9 +2953,9 @@ pub enum IndexLocation {
     /// The local Turso file at this path.
     File(String),
     /// A Postgres database, described without credentials
-    /// (`host:port/db, schema s`), or `None` when the configuration does not
-    /// name one this binary can describe, or its URL is not clean enough to
-    /// show any part of it.
+    /// (`host:port/db, schema s`, or `(address not shown), schema s` when the
+    /// URL is not clean enough to show any part of it), or `None` when the
+    /// configuration does not name one this binary can describe.
     Database(Option<String>),
 }
 
@@ -2968,9 +2968,7 @@ impl IndexLocation {
             return IndexLocation::File(db.display().to_string());
         }
         #[cfg(feature = "postgres")]
-        if let Ok(target) = crystalline_index::postgres::PgTarget::from_config(&database)
-            && target.address().is_some()
-        {
+        if let Ok(target) = crystalline_index::postgres::PgTarget::from_config(&database) {
             return IndexLocation::Database(Some(target.describe()));
         }
         IndexLocation::Database(None)

@@ -231,9 +231,12 @@ pub struct PostgresStore {
     // `commit()`/`rollback()`. Every statement routes to it while it is present;
     // the engine mutex serializes access so there is never contention.
     tx: TokioMutex<Option<PoolConnection<Postgres>>>,
-    // A sanitized `host:port/dbname`, never the credentials. `None` only if the
-    // url could not be parsed for display.
+    // A sanitized `host:port/dbname`, never the credentials. `None` when the
+    // url is not clean enough to show any part of it.
     db_path: Option<String>,
+    // What tells this store apart from another, never shown
+    // ([`database_key`]).
+    db_key: Option<String>,
     schema_version: i64,
     // The schema this store operates in, when scoped (test isolation). `None`
     // uses the connection's default search_path.
@@ -455,6 +458,7 @@ impl PostgresStore {
         opts: &PgSessionOptions,
     ) -> Result<PostgresStore> {
         let db_path = sanitize_url(url);
+        let db_key = database_key(url, schema.as_deref());
         let target = PgTarget {
             url: url.to_string(),
             schema: schema.clone(),
@@ -484,6 +488,7 @@ impl PostgresStore {
             pool,
             tx: TokioMutex::new(None),
             db_path,
+            db_key,
             schema_version,
             schema,
             tag_cache: Mutex::new(HashMap::new()),
@@ -524,6 +529,7 @@ impl PostgresStore {
                 pool: pool.clone(),
                 tx: TokioMutex::new(None),
                 db_path: self.db_path.clone(),
+                db_key: self.db_key.clone(),
                 schema_version: self.schema_version,
                 schema: self.schema.clone(),
                 tag_cache: Mutex::new(HashMap::new()),
@@ -1522,6 +1528,34 @@ pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
         return None;
     }
     Some(shown)
+}
+
+/// What tells one Postgres store apart from another, for a comparison and
+/// never for display: the host, port and database the connection options
+/// parse to (as a connect reads the URL, credentials and the rest of the
+/// query left out) and the schema, hashed. `None` when the URL does not
+/// parse as connection options, which no connect gets past either.
+///
+/// Separate from [`sanitize_url`] on purpose: that one gives up on any URL
+/// it cannot show safely, and two such URLs naming different databases must
+/// still not compare equal.
+pub(crate) fn database_key(url: &str, schema: Option<&str>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::str::FromStr as _;
+    let opts = sqlx::postgres::PgConnectOptions::from_str(url).ok()?;
+    let mut hash = Sha256::new();
+    for part in [
+        opts.get_host(),
+        &opts.get_port().to_string(),
+        opts.get_database().unwrap_or_default(),
+        schema.unwrap_or_default(),
+    ] {
+        hash.update(part.as_bytes());
+        hash.update([0]);
+    }
+    let digest = hash.finalize();
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!("postgres:{hex}"))
 }
 
 /// The child rows recreated on every upsert, deleted in one statement and so
@@ -3329,6 +3363,7 @@ impl ReadStore for PostgresStore {
             fts_mode: FtsMode::CandidateScan,
             schema_version: self.schema_version,
             db_path: self.db_path.clone(),
+            db_key: self.db_key.clone(),
             db_size: None,
         })
     }

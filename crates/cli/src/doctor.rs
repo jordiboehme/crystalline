@@ -2681,7 +2681,7 @@ fn rename_doctor(
                         None => restorable = false,
                     }
                 }
-                if owner.index != here.index {
+                if !owner.same_index(here) {
                     match owner.index.as_deref() {
                         // A Postgres index is named by its host and database,
                         // which the configuration's url chooses.
@@ -6860,6 +6860,7 @@ mod tests {
     fn owner(index: &str, config: &str, state_dir: &str) -> crystalline_service::RenameOwner {
         crystalline_service::RenameOwner {
             index: Some(index.to_string()),
+            index_key: None,
             config: Some(config.to_string()),
             state_dir: state_dir.to_string(),
         }

@@ -31,7 +31,7 @@ local-embeddings = [
 # Runtime is selected from config, so a release binary must carry this to honor
 # `backend: postgres` at all; `--no-default-features` produces a Turso-only
 # build that drops sqlx.
-postgres = ["dep:sqlx", "dep:pgvector"]
+postgres = ["dep:sqlx", "dep:pgvector", "dep:url"]
 
 [dependencies]
 crystalline-core = { workspace = true }
@@ -49,8 +49,9 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 # Parses a database URL strictly before any part of it is shown
-# (`postgres::sanitize_url`); already in the tree through crystalline-core.
-url = { workspace = true }
+# (`postgres::sanitize_url`), gated by `postgres`; already in the tree through
+# crystalline-core.
+url = { workspace = true, optional = true }
 
 # Local embedding stack, gated by `local-embeddings`. CPU everywhere except on
 # Apple Silicon Macs, where the target table below adds candle's `metal`

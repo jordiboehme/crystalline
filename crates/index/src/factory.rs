@@ -198,6 +198,28 @@ pub fn store_location(cfg: &DatabaseConfig, db_override: Option<&Path>) -> Optio
     }
 }
 
+/// The [`StoreInfo::db_key`](crate::StoreInfo::db_key) the store
+/// `open_store(cfg, ..)` opens would answer, without opening anything: a
+/// hash of the Postgres host, port, database and schema, never shown, and
+/// `None` on Turso, where the path is the identity.
+pub fn store_key(cfg: &DatabaseConfig) -> Option<String> {
+    match cfg.backend {
+        DatabaseBackend::Turso => None,
+        DatabaseBackend::Postgres => postgres_key(cfg),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_key(cfg: &DatabaseConfig) -> Option<String> {
+    let url = cfg.url.as_deref()?;
+    crate::postgres::database_key(url, cfg.schema.as_deref())
+}
+
+#[cfg(not(feature = "postgres"))]
+fn postgres_key(_cfg: &DatabaseConfig) -> Option<String> {
+    None
+}
+
 #[cfg(feature = "postgres")]
 fn postgres_location(cfg: &DatabaseConfig) -> Option<String> {
     cfg.url.as_deref().and_then(crate::postgres::sanitize_url)

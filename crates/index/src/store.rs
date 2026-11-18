@@ -2187,8 +2187,15 @@ pub struct StoreInfo {
     pub fts_mode: FtsMode,
     /// The applied schema version.
     pub schema_version: i64,
-    /// The database file path, or `None` for an in-memory store.
+    /// The database file path, or `None` for an in-memory store. On
+    /// Postgres the `host:port/db` for display, `None` when the URL is not
+    /// clean enough to show any part of it.
     pub db_path: Option<String>,
+    /// What tells this store apart from another when `db_path` cannot: on
+    /// Postgres a hash of the host, port, database and schema, never shown;
+    /// `None` on Turso, where the path is the identity.
+    #[serde(skip)]
+    pub db_key: Option<String>,
     /// The database file size in bytes, when known.
     pub db_size: Option<u64>,
 }
