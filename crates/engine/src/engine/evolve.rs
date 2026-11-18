@@ -1435,11 +1435,11 @@ impl Engine {
                 engram_type: fm.engram_type.trim().to_ascii_lowercase(),
                 tags: fm.tags.clone(),
                 salience: yaml_number(fm.extra.get("salience")),
-                recorded_at: fm.recorded_at.map(chrono_day),
-                valid_from: fm.valid_from.map(chrono_day),
-                valid_to: fm.valid_to.map(chrono_day),
-                stale_on: fm.stale_on().map(chrono_day),
-                verified_on: fm.latest_verified().map(|v| chrono_day(v.at.day())),
+                recorded_at: fm.recorded_at,
+                valid_from: fm.valid_from,
+                valid_to: fm.valid_to,
+                stale_on: fm.stale_on(),
+                verified_on: fm.latest_verified().map(|v| v.at.day()),
                 tokens,
                 token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
                 inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
@@ -1492,7 +1492,7 @@ impl Engine {
 
         let input = SweepInput {
             domain: name.to_string(),
-            today,
+            today: time_day(today),
             engrams: facts,
             graph,
             unresolved,
@@ -1559,7 +1559,7 @@ impl Engine {
         let work = origin::unshared_work(&root, &state_dir)?;
         Some(ShareFacts {
             unshared: work.count(),
-            oldest_change: work.oldest_change_date(),
+            oldest_change: work.oldest_change_date().map(time_day),
         })
     }
 

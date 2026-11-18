@@ -12641,6 +12641,13 @@ fn chrono_day(day: crystalline_core::time::Day) -> NaiveDate {
     day.into_chrono()
 }
 
+/// A chrono date the engine still holds as the time module's date the index
+/// takes. A stage 2 bridge: it goes when the engine moves onto
+/// `crystalline_core::time`.
+fn time_day(day: NaiveDate) -> crystalline_core::time::Day {
+    crystalline_core::time::Day::from_chrono(day)
+}
+
 /// The ISO date `spec` before today, for `timeframe` windows like `7d`, `24h`,
 /// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure.
 fn timeframe_cutoff(spec: &str) -> Option<String> {

@@ -1353,7 +1353,7 @@ async fn read_document_at_takeover(
     };
     let doc = side.load_config().await.map_err(|e| fatal(e.to_string()))?;
     let state = match &doc {
-        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at),
+        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at.into_chrono()),
         None => crate::durable::DocumentState::NotSaved,
     };
     loaded

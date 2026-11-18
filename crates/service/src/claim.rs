@@ -1161,6 +1161,7 @@ pub(crate) mod pg {
     fn since(owner: &OwnerRow) -> String {
         owner
             .since
+            .into_chrono()
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
@@ -1311,9 +1312,14 @@ pub(crate) mod pg {
                 pid: 42,
                 backend_pid: 4242,
                 version: "0.33.0".to_string(),
-                since: Utc.with_ymd_and_hms(2026, 11, 16, 9, 30, 0).unwrap(),
-                released_at: released
-                    .then(|| Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap()),
+                since: crystalline_core::time::Stamp::from_chrono(
+                    Utc.with_ymd_and_hms(2026, 11, 16, 9, 30, 0).unwrap(),
+                ),
+                released_at: released.then(|| {
+                    crystalline_core::time::Stamp::from_chrono(
+                        Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap(),
+                    )
+                }),
             }
         }
 

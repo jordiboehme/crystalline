@@ -92,6 +92,7 @@ use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
 use crystalline_core::reflection::ReflectionFile;
+use crystalline_core::time::{self, Delta, Stamp};
 use crystalline_core::{
     DomainLayout, MAX_ATTACHMENT_BYTES, PARSE_GENERATION, PathClass, ReflectionMode,
     attachment_mime, parse_engram, slash_rel, validate_asset_path,
@@ -1954,10 +1955,10 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         || report.reflections_changed > 0
         || report.relations_resolved + report.links_resolved > 0
         || ends_rebuild;
-    let now = chrono::Utc::now();
-    let refresh_before = (now - SYNC_STAMP_REFRESH).to_rfc3339();
+    let now = time::now();
+    let refresh_before = (now - SYNC_STAMP_REFRESH).rfc3339();
     if let Err(e) = store
-        .record_sync(domain, &now.to_rfc3339(), wrote, &refresh_before)
+        .record_sync(domain, &now.rfc3339(), wrote, &refresh_before)
         .await
     {
         let _ = store.rollback().await;
@@ -1974,7 +1975,7 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
 /// so this bounds an idle domain to one small write per hour, and keeps the
 /// stamp a reader without the engine's memory sees (a daemonless `status`, a
 /// domain another instance hosts) at most this stale after a sync.
-pub const SYNC_STAMP_REFRESH: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+pub const SYNC_STAMP_REFRESH: Delta = time::hours(1);
 
 /// A hold inside the apply, after the walker check and the read of the host
 /// move and before any row is written, for the tests that land a claim or a
@@ -2124,7 +2125,7 @@ pub async fn reindex_domains(
                     .map_err(|e| in_domain("reindex", name, e))?;
                 let stamped = match rebuild {
                     Some(kind) => {
-                        let now = chrono::Utc::now().to_rfc3339();
+                        let now = time::now().rfc3339();
                         store
                             .begin_rebuild(domain, &now, kind)
                             .await
@@ -2884,9 +2885,9 @@ fn file_mtime(meta: &std::fs::Metadata) -> i64 {
 /// records. A timestamp outside the representable range falls back to the epoch,
 /// which keeps the prefilter comparing like with like rather than erroring.
 fn rfc3339_from_mtime(mtime: i64) -> String {
-    chrono::DateTime::from_timestamp(mtime, 0)
-        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
-        .to_rfc3339()
+    Stamp::from_unix(mtime, 0)
+        .unwrap_or(Stamp::UNIX_EPOCH)
+        .rfc3339()
 }
 
 /// Classify one path under the reserved `assets/` prefix. `None` means the file

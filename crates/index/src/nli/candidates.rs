@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
-use chrono::NaiveDate;
+use crystalline_core::time::Day;
 use sha2::{Digest, Sha256};
 
 use super::OrderAggregation;
@@ -25,9 +25,9 @@ pub struct CandidateFacts<'a> {
     /// The effective frontmatter status, lowercased.
     pub status: &'a str,
     /// Start of the validity window; absent is unbounded.
-    pub valid_from: Option<NaiveDate>,
+    pub valid_from: Option<Day>,
     /// End of the validity window; absent is unbounded.
-    pub valid_to: Option<NaiveDate>,
+    pub valid_to: Option<Day>,
     /// What the model reads of the engram, [`observations_digest`]: a pair
     /// stays scored while both digests match, whatever else in the files
     /// changed.
@@ -70,7 +70,7 @@ pub struct Candidates {
 /// strictly before `today`; a window that ends today still counts, and an
 /// absent `valid_to` never expires. The one rule the candidates, the lines
 /// the walk embeds and the sweep's read all apply.
-pub fn eligible(status: &str, valid_to: Option<NaiveDate>, today: NaiveDate) -> bool {
+pub fn eligible(status: &str, valid_to: Option<Day>, today: Day) -> bool {
     is_current_status(status)
         && !SPECULATIVE_STATUSES.contains(&status)
         && !expired(valid_to, today)
@@ -79,19 +79,19 @@ pub fn eligible(status: &str, valid_to: Option<NaiveDate>, today: NaiveDate) -> 
 /// Whether a validity window closed before `today`: strictly before, so a
 /// window that ends today is still open, and an absent `valid_to` never
 /// closes.
-pub fn expired(valid_to: Option<NaiveDate>, today: NaiveDate) -> bool {
+pub fn expired(valid_to: Option<Day>, today: Day) -> bool {
     valid_to.is_some_and(|to| to < today)
 }
 
 /// Whether `[from_a, to_a]` and `[from_b, to_b]` overlap; an absent bound is
 /// unbounded.
 pub fn windows_overlap(
-    from_a: Option<NaiveDate>,
-    to_a: Option<NaiveDate>,
-    from_b: Option<NaiveDate>,
-    to_b: Option<NaiveDate>,
+    from_a: Option<Day>,
+    to_a: Option<Day>,
+    from_b: Option<Day>,
+    to_b: Option<Day>,
 ) -> bool {
-    let starts_by = |from: Option<NaiveDate>, to: Option<NaiveDate>| match (from, to) {
+    let starts_by = |from: Option<Day>, to: Option<Day>| match (from, to) {
         (Some(f), Some(t)) => f <= t,
         _ => true,
     };
@@ -134,7 +134,7 @@ pub fn contradiction_candidates(
     facts: &[CandidateFacts<'_>],
     related_threshold: f64,
     max_pairs: usize,
-    today: NaiveDate,
+    today: Day,
 ) -> Candidates {
     let vectors: Vec<Option<&[f32]>> = facts
         .iter()
@@ -303,7 +303,7 @@ pub fn scoring_checksum(observations: &[FactObservation], rules: &LineRules<'_>)
 /// speculative, not past their `valid_to`, with observations (the candidate
 /// rule's eligibility, without the lead vector). These are the lines the walk
 /// keeps a vector for.
-pub fn eligible_lines(facts: &[CandidateFacts<'_>], today: NaiveDate) -> BTreeMap<String, String> {
+pub fn eligible_lines(facts: &[CandidateFacts<'_>], today: Day) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for f in facts
         .iter()
@@ -570,8 +570,8 @@ mod tests {
     use super::*;
     use crate::sweep::MAX_LINE_PAIRS_PER_ENGRAM_PAIR;
 
-    fn day(s: &str) -> NaiveDate {
-        s.parse().unwrap()
+    fn day(s: &str) -> Day {
+        crystalline_core::time::parse_date(s).unwrap()
     }
 
     fn obs(line: usize, text: &str) -> FactObservation {
@@ -619,8 +619,8 @@ mod tests {
     struct Owned {
         id: i64,
         status: String,
-        from: Option<NaiveDate>,
-        to: Option<NaiveDate>,
+        from: Option<Day>,
+        to: Option<Day>,
         checksum: String,
         vector: Option<Vec<f32>>,
         obs: Vec<FactObservation>,
@@ -658,7 +658,7 @@ mod tests {
 
     /// A date before every window in these tests, so only the status and
     /// window rules decide.
-    fn long_ago() -> NaiveDate {
+    fn long_ago() -> Day {
         day("2000-01-01")
     }
 

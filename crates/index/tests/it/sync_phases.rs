@@ -501,7 +501,7 @@ async fn assets_are_indexed_refreshed_and_removed(store: &dyn Store) {
     assert_eq!(shot.size, PNG.len() as u64);
     assert_eq!(shot.sha256, sha_hex(PNG));
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&shot.modified).is_ok(),
+        crystalline_core::time::parse_rfc3339(&shot.modified).is_some(),
         "modified is RFC 3339: {}",
         shot.modified
     );

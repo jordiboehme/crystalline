@@ -54,8 +54,8 @@ pub mod twins;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use chrono::NaiveDate;
 use crystalline_core::similarity::{dice_coefficient, normalize};
+use crystalline_core::time::{self, Day};
 use serde::Serialize;
 
 use crate::nli::OrderAggregation;
@@ -761,19 +761,19 @@ pub struct EngramFacts {
     pub salience: Option<f64>,
     /// `recorded_at`, the date every age comparison uses. An engram without one
     /// has no knowable age and is never flagged for being old.
-    pub recorded_at: Option<NaiveDate>,
+    pub recorded_at: Option<Day>,
     /// Start of the validity window. Absent means always valid, and absence is
     /// never itself a finding.
-    pub valid_from: Option<NaiveDate>,
+    pub valid_from: Option<Day>,
     /// End of the validity window. Absent means valid forever, and absence is
     /// never itself a finding.
-    pub valid_to: Option<NaiveDate>,
+    pub valid_to: Option<Day>,
     /// The effective staleness date: `stale_after`, falling back to the legacy
     /// `review_after`.
-    pub stale_on: Option<NaiveDate>,
+    pub stale_on: Option<Day>,
     /// The date of the newest verification, from the `verified` trail or the
     /// legacy `last_verified` date.
-    pub verified_on: Option<NaiveDate>,
+    pub verified_on: Option<Day>,
     /// The body text, frontmatter excluded.
     pub body: String,
     /// The engram's top-level observation bullets, in file order. `V010`
@@ -895,9 +895,8 @@ impl EngramFacts {
 
     /// Days between `recorded_at` and `today`, or `None` when the engram
     /// records no date to measure from.
-    pub fn age_days(&self, today: NaiveDate) -> Option<i64> {
-        self.recorded_at
-            .map(|d| today.signed_duration_since(d).num_days())
+    pub fn age_days(&self, today: Day) -> Option<i64> {
+        self.recorded_at.map(|d| d.days_until(today))
     }
 
     /// The `domain/permalink` address, the form findings cite.
@@ -1091,7 +1090,7 @@ pub struct ShareFacts {
     /// own mtime. `None` when no changed file has one to read - a delta made
     /// only of deletions, or a tree this process could not stat - and the rule
     /// then stays quiet rather than guessing an age.
-    pub oldest_change: Option<NaiveDate>,
+    pub oldest_change: Option<Day>,
 }
 
 /// One domain's assembled sweep input.
@@ -1106,7 +1105,7 @@ pub struct SweepInput {
     pub domain: String,
     /// The date every temporal rule compares against. Passed in rather than
     /// read from the clock so a run is reproducible and testable.
-    pub today: NaiveDate,
+    pub today: Day,
     /// The engrams in scope. Findings only ever attach to one of these.
     pub engrams: Vec<EngramFacts>,
     /// The resolved graph around them. Nodes may include targets in other
@@ -1217,7 +1216,7 @@ pub struct SweepInput {
 impl SweepInput {
     /// An empty input for `domain` evaluated as of `today`, with default
     /// options.
-    pub fn new(domain: impl Into<String>, today: NaiveDate) -> SweepInput {
+    pub fn new(domain: impl Into<String>, today: Day) -> SweepInput {
         SweepInput {
             domain: domain.into(),
             today,
@@ -1964,6 +1963,7 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             && fact.is_current()
             && graph.inbound_rel_sources(fact.id, "supersedes").is_empty()
         {
+            let (valid_to, today) = (valid_to.ymd(), today.ymd());
             report.findings.push(Finding::about("V001", fact).with(
                 Class::Judgment,
                 format!(
@@ -1988,9 +1988,10 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             && fact.verified_on.is_none_or(|v| v < stale_on)
         {
             let seen = match fact.verified_on {
-                Some(v) => format!("last verified {v}"),
+                Some(v) => format!("last verified {}", v.ymd()),
                 None => "never verified".to_string(),
             };
+            let (stale_on, today) = (stale_on.ymd(), today.ymd());
             report.findings.push(Finding::about("V002", fact).with(
                 Class::Judgment,
                 format!("stale since {stale_on} with no verification recorded since"),
@@ -2012,7 +2013,7 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             let evidence = format!(
                 "generated.by {}; recorded {}; no verified entry",
                 fact.generated_by.as_deref().unwrap_or(""),
-                fact.recorded_at.map(|d| d.to_string()).unwrap_or_default(),
+                fact.recorded_at.map(|d| d.ymd()).unwrap_or_default(),
             );
             report.findings.push(
                 Finding::about("V006", fact).with(
@@ -2207,7 +2208,7 @@ fn detect_unshared(input: &SweepInput, report: &mut SweepReport) {
     let Some(oldest) = share.oldest_change else {
         return;
     };
-    let age = (input.today - oldest).num_days();
+    let age = oldest.days_until(input.today);
     if age < input.options.share_stale_days {
         return;
     }
@@ -2221,13 +2222,14 @@ fn detect_unshared(input: &SweepInput, report: &mut SweepReport) {
                 crystalline_core::text::plural(changes, "change has been", "changes have been")
             ),
             format!(
-                "{}; oldest change {oldest}; today={}; threshold {} days",
+                "{}; oldest change {}; today={}; threshold {} days",
                 crystalline_core::text::plural(
                     changes,
                     "substantive local change",
                     "substantive local changes"
                 ),
-                input.today,
+                oldest.ymd(),
+                input.today.ymd(),
                 input.options.share_stale_days
             ),
             format!("share_changes domain={}", input.domain),
@@ -2267,7 +2269,7 @@ fn detect_aging(input: &SweepInput, report: &mut SweepReport) {
     for (age, fact) in candidates.into_iter().take(cap) {
         let recorded = fact
             .recorded_at
-            .map(|d| d.to_string())
+            .map(|d| d.ymd())
             .unwrap_or_else(|| "unknown".to_string());
         report.findings.push(Finding::about("V003", fact).with(
             Class::Judgment,
@@ -2434,7 +2436,7 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
         {
             let recorded = fact
                 .recorded_at
-                .map(|d| d.to_string())
+                .map(|d| d.ymd())
                 .unwrap_or_else(|| "unknown".to_string());
             let tags = if fact.tags.is_empty() {
                 "no tags".to_string()
@@ -3656,8 +3658,10 @@ fn detect_attachments(input: &SweepInput, report: &mut SweepReport) {
             continue;
         }
         let described = format!(
-            "{path}; {}, {} bytes; modified {modified}",
-            row.mime, row.size
+            "{path}; {}, {} bytes; modified {}",
+            row.mime,
+            row.size,
+            modified.ymd()
         );
 
         // V108: nothing in the domain says this file is part of its teaching.
@@ -3701,10 +3705,8 @@ fn detect_attachments(input: &SweepInput, report: &mut SweepReport) {
 /// The date an attachment's RFC 3339 `modified` stamp falls on, or `None` when
 /// the stamp does not parse. Absence fails quiet: a row nobody can date is
 /// never called orphaned or unanalyzed.
-fn attachment_date(modified: &str) -> Option<NaiveDate> {
-    chrono::DateTime::parse_from_rfc3339(modified.trim())
-        .ok()
-        .map(|dt| dt.date_naive())
+fn attachment_date(modified: &str) -> Option<Day> {
+    time::parse_rfc3339(modified.trim()).map(|dt| dt.day())
 }
 
 /// The first eight characters of a hash, which is as much as evidence needs to

@@ -1539,7 +1539,6 @@ dependencies = [
  "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",
- "chrono",
  "crystalline-core",
  "hf-hub",
  "hf-xet",

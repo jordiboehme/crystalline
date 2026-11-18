@@ -77,7 +77,7 @@ async fn timed_pass(
             .unwrap();
         if let Some(kind) = rebuild {
             locked
-                .begin_rebuild(domain, &chrono::Utc::now().to_rfc3339(), kind)
+                .begin_rebuild(domain, &crystalline_core::time::now().rfc3339(), kind)
                 .await
                 .unwrap();
         }
