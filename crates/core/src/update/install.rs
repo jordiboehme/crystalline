@@ -84,7 +84,7 @@ pub enum Refusal {
     },
     /// A container: pull the new image.
     Docker,
-    /// The Claude Desktop extension: Claude Desktop updates it.
+    /// The Claude Desktop-only bundle: the newer .mcpb is opened by hand.
     Mcpb,
     /// No method could be told.
     Unknown,

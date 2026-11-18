@@ -19,7 +19,7 @@ pub enum OffReason {
     Ci,
     /// A Docker install: pull the new image.
     Docker,
-    /// The Claude Desktop extension: Claude Desktop updates it.
+    /// The Claude Desktop-only bundle: the newer .mcpb is opened by hand.
     DesktopExtension,
     /// There is no state folder to cache a check in, so none could run.
     NoStateFolder,

@@ -33,6 +33,118 @@ Unregistering a domain stops it being served the moment it happens, whatever bec
 
 Each package writes a one-line `install-source` file that tells `crystalline update` how this binary was installed. The marker is read relative to the binary's real path, so a copy of the binary somewhere else does not inherit it. The .deb ships `/usr/lib/crystalline/install-source` with `deb`. The Homebrew formula writes `install-source` with `homebrew` into the formula's `libexec` folder. The MSI installs `install-source` with `msi` beside `crystalline.exe` in `bin\`, in the default folder or a custom one. The container image ships `/usr/local/lib/crystalline/install-source` with `docker`, owned by root and read-only. The tar.gz and zip archives carry no marker, and the Claude Desktop only bundle is known by `CRYSTALLINE_CHANNEL=mcpb`. Only a binary the release workflow built for a tagged release is an official build. Any other build (a `cargo build`, a dry run of the workflow, a distribution package) never replaces itself with `crystalline update now`.
 
+## Updating
+
+Two commands update Crystalline, and they work the same in every shape:
+
+- `crystalline update check` asks GitHub now for the newest stable release. It prints both versions, when the release was published, how this binary was installed, what `update now` would do and the link to the release notes. It asks whether or not the daily check is on. Exit code 0 means up to date, or the newer release is still younger than the release-age gate (the output says when it is offered). 10 means an update is available. 1 means the check failed. `--json` prints the same plan as JSON.
+- `crystalline update now` prints the same plan and then does what the install method allows. Exit code 0 means done, or nothing to do. 10 means an update is available but nothing was done. 1 means refused (the reason is printed) or failed.
+
+Only a stable release newer than the running binary is offered: never a pre-release, never a downgrade. A release is offered once it is 24 hours old (`update.min_age_hours`, 0 to 720, or `CRYSTALLINE_UPDATE_MIN_AGE_HOURS`), so a release that is pulled again soon after it came out reaches nobody. `--ignore-age` on either command skips the wait. When GitHub's API does not answer (its rate limit), the age counts from the first time this machine saw the release.
+
+`update now` reads the [install marker](#install-markers) of the binary you run and refuses before it downloads anything when it should not act: on a build that is not official ("not an official release build"), inside an app package such as Claude Desktop's ("run it in a normal terminal"), when the marker and the binary's path disagree (both are named), in a Docker install, in the Claude Desktop-only bundle and when the method cannot be told.
+
+Homebrew and tar.gz installs change installed files, so `update now` asks first (`Update to <version> now? [y/N]`), and `--yes` skips the question. Without `--yes` and without a terminal, as in an agent's shell, it prints the plan, ends with "Nothing was changed. Run crystalline update now --yes to update." and exits with 10. The .deb, MSI and zip are only downloaded and verified, which changes nothing installed, so `update now` does that without a question and then prints the command or the steps that install it. You run those yourself.
+
+Every download is verified before it is used, and a failed check stops the update: the sha256 digest GitHub lists for the file (when the API answered), the file's line in `SHA256SUMS`, and the minisign signature over `SHA256SUMS`, whose signed comment must name the release being installed. On macOS the new binary must also carry Crystalline's code signature, and on a tar.gz install it must print the release's version before it is put in place. A line such as "Verified: the sha256 digest GitHub lists, the minisign signature over SHA256SUMS for v0.34.0, the line in SHA256SUMS." says which checks ran. `update now` refuses a release without a valid signature, so it cannot install anything older than 0.34.0, the first signed release. How to check a download by hand: [Verify a release](security.md#verify-a-release).
+
+Downloads go to `~/.cache/crystalline/updates/<tag>/` on macOS and Linux (`XDG_CACHE_HOME` moves it) and to `%LOCALAPPDATA%\crystalline\updates\<tag>\` on Windows. The folder of the release you install stays until a newer one was downloaded and verified. A lock file in `updates/` keeps two runs apart.
+
+### Homebrew
+
+`crystalline update now` runs `brew upgrade jordiboehme/tap/crystalline` after you said yes, then reads the version Homebrew installed. It says "upgraded to <version>", or fails with "brew did not upgrade (tap not refreshed?)" when `brew upgrade` ended without a new version: run `brew update` and try again. By hand, run the same `brew upgrade` command. The next `crystalline` command or agent session hands the daemon over to the new version ([Daemon lifecycle](#daemon-lifecycle)).
+
+### .deb
+
+`crystalline update now` downloads and verifies the package and prints how to install it, with the full path of the download folder, for example:
+
+```
+Install it with:
+  cd /home/ada/.cache/crystalline/updates/v0.34.0
+  sudo apt install ./crystalline_0.34.0_amd64.deb
+```
+
+It never runs apt. As root the line has no `sudo`. Run as `sudo crystalline update now`, it downloads into a new folder of root's and prints `sudo apt install` with the full path of the package. Upgrading the package restarts the systemd service only if it is running. The service reads its settings from `/etc/default/crystalline`, so its daily check is turned on there, not with `update auto on` ([Linux server with systemd](#linux-server-with-systemd)).
+
+### tar.gz on macOS and Linux
+
+`crystalline update now` downloads and verifies the archive, takes only the `crystalline` binary out of it, checks it (the code signature on macOS, then its version) and puts it in place of the binary you ran. Then the new binary hands the running daemon over to the new version with the same start options (database, config, read-only mode, HTTP address, allowed hosts), and refreshes the installed hooks and skills for user scope and for the project of the current folder. Other projects refresh when a session starts in them. When the daemon read a `CRYSTALLINE_*` variable that this shell does not have, it is left running on the old version and the output says why; run `crystalline status` from a shell that has the variable.
+
+When you cannot write to the binary's folder, `update now` refuses before it downloads anything and names the folder. For a folder of root's (such as `/usr/local/bin` on Linux) it suggests `sudo crystalline update now`. Under `sudo` it downloads into a new folder of root's and replaces only the binary. The daemon is not touched, and the output says to run `crystalline status` as yourself, which hands the daemon over. By hand: take `crystalline` from the newest release's tar.gz and move it over the old binary.
+
+### Windows MSI and zip
+
+On Windows `crystalline update now` runs nothing. It downloads and verifies the .msi or the zip into the download folder (for the zip it also takes `crystalline.exe` out of it), prints the steps with exact paths for Windows PowerShell 5.1 and PowerShell 7, and saves them as `steps.txt` in the same folder, whose path it prints. Every agent session that uses Crystalline holds `crystalline.exe` open, so the steps start with closing them. An agent can run `update now` and show you the steps, and you run them when your sessions are closed.
+
+For the MSI the steps are:
+
+1. Close every agent session that uses Crystalline. When a daemon runs, stop it with `crystalline ctl shutdown`, or the installer may ask for a reboot.
+2. Run the installer and wait for it, with the folder of your current install as `APPLICATIONFOLDER`, so a custom folder is kept. `update now` prints the full line, for example `$p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', '"<download folder>\crystalline-v0.34.0-windows-amd64.msi"', '/passive', '/norestart', 'APPLICATIONFOLDER="C:\Program Files\Crystalline"'; $p.ExitCode`. In the default folder a double click on the .msi works too. Windows asks for administrator rights. The MSI has no Authenticode signature yet, so the prompt names an unknown publisher. The signed `SHA256SUMS` that `update now` checked is what tells you the file is the release.
+3. Read the exit code: 0 means installed, 3010 means installed and active after a reboot (reboot first), 1602 means cancelled (for example a no at the administrator prompt; nothing changed), 1618 means another installation is running (wait and run step 2 again). Any other number means it did not install.
+4. Start the daemon again as it was started, then run `crystalline status`. The steps say how: the task `\Crystalline\Daemon` (`schtasks.exe /Run /TN '\Crystalline\Daemon'`), the same `crystalline serve` command with the variables it had then, or nothing, because the next agent session starts it.
+
+For the zip the steps do not stop the daemon:
+
+1. Close every agent session that uses Crystalline.
+2. Copy the new `crystalline.exe` from the download folder beside the old one, as `crystalline.new.exe`.
+3. Rename the old `crystalline.exe` to `crystalline.old.exe` (Windows allows that for an exe in use).
+4. Rename `crystalline.new.exe` to `crystalline.exe`. If this fails, the steps say how to put the old one back.
+5. Run `crystalline --version`. It must print the new version.
+6. Run `crystalline status`. It hands the daemon over to the new version with its start options.
+
+Run the steps one at a time and stop at the first error. The copy comes first, so a step that fails never leaves the folder without its exe. The next `update now` and `crystalline doctor` remove a `crystalline.old.exe` that is no longer in use.
+
+### Docker
+
+The image has its update check off, and `update now` refuses ("a Docker install; pull the new image"). Pull the new image and recreate the container, for example `docker compose pull && docker compose up -d`. See [Run in a container](#run-in-a-container).
+
+### Claude Desktop extension
+
+The standard extension starts the `crystalline` you installed, so update that one with the method above. Claude Desktop then offers the new extension in an update dialog ([Claude Desktop setup](setup/claude-desktop.md#updating)). The Claude Desktop-only bundle carries its own Crystalline: its update check is off and `update now` refuses. Download the newer `crystalline-claude-desktop-only-v<version>-macos.mcpb` from the releases page and open it, so it installs over the old one.
+
+### A binary you built yourself
+
+A binary from `cargo build`, `cargo install` or a distribution package is not an official build, so `update now` refuses and never replaces it. Build the new version the same way. `update check` still tells you whether a newer release exists.
+
+### The daily update check
+
+The daily check is off by default. Turn it on with `crystalline update auto on` (it prints "Update check on. Turn it off with: crystalline update auto off") and off with `crystalline update auto off`. Both set `update.check`, the same as `crystalline config set update.check true`; the variable is `CRYSTALLINE_UPDATE_CHECK`. The key is an operator setting, so an agent cannot switch it with the `configure` tool. `crystalline install` in a terminal asks once per machine:
+
+```
+Check once a day for a newer Crystalline? Nothing is installed without you. [y/N]
+```
+
+Yes turns the check on. No, Enter or Ctrl-C leave it off and print "Daily update check: off (`crystalline update auto on` turns it on).". It never asks when `update.check` or `CRYSTALLINE_UPDATE_CHECK` is set already, with `--json`, on a build `update now` does not act on, when the check is kept off (see below) or when a session start refreshes an install. An install without a terminal prints only that second line, once per machine.
+
+Once a day (after a failed check, after four hours) Crystalline asks GitHub for the newest release, with no token and the User-Agent `crystalline/<version>`. GitHub sees your address and the version, nothing else; the details are in [Outbound connections](security.md#outbound-connections). The check never makes the daemon's start or its requests wait. The check only looks: it installs nothing. With the check off the daemon makes no request; `update check` and `update now` still ask when you run them.
+
+The check stays off, whatever `update.check` says, when `NO_UPDATE_NOTIFIER` or `CI` is set to a value in the daemon's environment, in a Docker install and in the Claude Desktop-only bundle. A systemd service reads its settings from `/etc/default/crystalline`: add `CRYSTALLINE_UPDATE_CHECK=true` there and restart the service. `crystalline update auto on` says so on a machine with the .deb and its unit.
+
+When a check finds a newer release that passed the age gate, it shows in these places:
+
+- `crystalline status` and `crystalline doctor` show how this binary was installed, whether it is an official build and what the last check found, for example "update check on; Crystalline 0.35.0 is available (this is 0.34.0); run: crystalline update now". With the check off they say "update check off" and why.
+- After most commands at a terminal, one line on stderr, at most once a day per version: "Crystalline 0.35.0 is available (this is 0.34.0). Update with: crystalline update now". It never shows with `--json`, when stderr is not a terminal, or after `status`, `doctor`, `update`, `install` and the commands that programs and hooks run.
+- At the start of an agent session, the routing block that the session-start hook from `crystalline install` delivers carries one short block, at most once a day per version. Never in a subagent, never on a resumed, cleared or compacted session, and only for an install `update now` acts on:
+
+  ```
+  Crystalline 0.35.0 is available (this is 0.34.0, homebrew). Notes: https://github.com/jordiboehme/crystalline/releases/tag/v0.35.0
+  Tell the user once. If they want it: run crystalline update now --yes. No user here: do nothing.
+  ```
+
+  The last line names what to run for the install method: `update now --yes` for Homebrew and tar.gz, `update now` and the apt command it prints for the .deb, `update now` and the steps it prints for the MSI and the zip. The block reads only the cached result: no network, no daemon call, no wait.
+- In Fluid, an admin sees a small note in the avatar menu ([Web UI from the daemon](#web-ui-from-the-daemon)). Nobody else sees it.
+
+```mermaid
+flowchart LR
+    D[Daemon, check on] -->|once a day, no token| G[GitHub releases API]
+    D --> C[update-check.json]
+    C --> S[status and doctor]
+    C --> H[stderr hint]
+    C --> B[Session-start block]
+    D -->|admins only| F[Fluid note]
+    P[Person or agent] -->|crystalline update now| V[Download, verify, act per method]
+```
+
 ## Claude Desktop extension
 
 The standard extension (macOS and Windows) carries no Crystalline. `crystalline install claude-desktop` builds it on your machine, saves it as `crystalline.mcpb` in Crystalline's state folder and opens it in Claude Desktop. The release does not carry it. The command pins the path of the first crystalline on `PATH` (or its own, when `PATH` has none) in `CRYSTALLINE_BINARY`. The extension is a small Node launcher that Claude Desktop runs with its own Node. It tries the pinned binary first and falls back to a search (Homebrew's two folders, then `PATH` on macOS; `Program Files`, then `PATH` on Windows). It checks that it is 0.24.0 or newer and relays stdio to `crystalline mcp`, which lands on the same daemon as the personal workstation shape. So a Desktop user keeps one Crystalline up to date, the same one Claude Code and the CLI use. After an upgrade, the first `crystalline mcp` the older extension starts builds the extension again at its own version and opens it, so Claude Desktop shows an update dialog. It does this once per version and only when `crystalline install claude-desktop` ran once (its record in the state folder), with a lock so that only one offer runs at a time. On Windows the bridge inside Claude Desktop's package writes nothing: it sends `desktop_offer` to the daemon outside the package, which offers it when it runs the same version, and the bridge does not wait for the answer. Declined, or no dialog: run `crystalline install claude-desktop`. Without a usable binary the launcher answers by itself: one `status` tool, and instructions that tell the model (and through it the user) what to install. Someone who uses only Claude Desktop on a Mac, and neither Claude Code nor the `crystalline` command, can take `crystalline-claude-desktop-only-v<version>-macos.mcpb` instead. It carries a universal binary and keeps the 0.18.2 behaviour: its daemon stays attached to Desktop and exits five seconds after Desktop quits. Both bundles take no configuration and start with no domains. The daemon opens the web UI at `http://localhost:7411` by default, so the extension is also how a Desktop user gets the browser half (`service.http: false`, or `CRYSTALLINE_SERVICE_HTTP=false`, turns it off). The agent creates a domain whenever it needs somewhere to capture knowledge, with the `add_domain` tool - a folder of markdown files under `Documents/Crystalline` (the default domains root, overridable with `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), a database-backed virtual domain or a GitHub team domain. Onboarding is automatic, and the same command saves the `crystalline-intelligence` skill as a zip in Downloads, which adds capture and collaboration best practices as an uploadable skill (see [Skills](learning-loop.md#skills)).
