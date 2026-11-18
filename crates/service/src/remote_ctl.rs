@@ -55,6 +55,7 @@ pub const REMOTE_COMMANDS: &[&str] = &[
     "origin_changes",
     crystalline_remote::FILE_COMMAND,
     "automation_status",
+    "automation_prompt",
     "automation_lease_take",
     "automation_lease_renew",
     "automation_lease_release",

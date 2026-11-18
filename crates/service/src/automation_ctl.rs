@@ -1,5 +1,5 @@
-//! The seven automation verbs a headless runner sends: `automation_status`,
-//! `automation_lease_take`, `automation_lease_renew`,
+//! The eight automation verbs a headless runner sends: `automation_status`,
+//! `automation_prompt`, `automation_lease_take`, `automation_lease_renew`,
 //! `automation_lease_release`, `automation_run_record`, `automation_share`
 //! and `automation_runs`.
 //!
@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crystalline_core::automation::{Loop, RunReport};
+use crystalline_core::automation::{DEFAULT_MAX_ITEMS, Loop, RunReport};
 use serde_json::Value;
 
 use crate::control::{envelope_err, envelope_err_kind, envelope_ok};
@@ -18,8 +18,9 @@ use crate::engine::{Engine, EngineError};
 use crate::scope::Scope;
 
 /// The verbs of this module, in the order a run uses them.
-pub const AUTOMATION_COMMANDS: [&str; 7] = [
+pub const AUTOMATION_COMMANDS: [&str; 8] = [
     "automation_status",
+    "automation_prompt",
     "automation_lease_take",
     "automation_lease_renew",
     "automation_lease_release",
@@ -163,6 +164,28 @@ async fn run(
             };
             engine
                 .automation_share(lp, domain, token, summary, scope)
+                .await?
+        }
+        "automation_prompt" => {
+            let max_items = match request.get("max_items") {
+                None | Some(Value::Null) => DEFAULT_MAX_ITEMS,
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        Failure::invalid(format!(
+                            "max_items must be a whole number from 0 to {}",
+                            u32::MAX
+                        ))
+                    })?,
+            };
+            let skills_loaded = match request.get("skills_loaded") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(loaded)) => Some(*loaded),
+                Some(_) => return Err(Failure::invalid("skills_loaded must be true or false")),
+            };
+            engine
+                .automation_prompt(lp, domain, max_items, skills_loaded, scope)
                 .await?
         }
         "automation_runs" => {

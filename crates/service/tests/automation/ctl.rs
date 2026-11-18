@@ -189,3 +189,157 @@ async fn an_unknown_maintenance_stamp_is_refused() {
     let answer = ask(&fx, "maintenance_stamp", json!({ "stamp": "bogus" })).await;
     assert_eq!(answer["ok"], false, "{answer}");
 }
+
+/// `automation_prompt` answers what a runner starts its own agent with, the
+/// same for both loops: the filled-in prompt, the forbidden tools in order,
+/// this version and the checksum of the prompt and the tools.
+#[tokio::test]
+async fn automation_prompt_answers_the_prompt_the_tools_and_a_checksum() {
+    use crystalline_core::automation::{HEADLESS_DISALLOWED_TOOLS, Loop, runner_setup};
+    let fx = fixture(&[("MANIFEST.md", &manifest("reflection: on\n"))]).await;
+    for lp in [Loop::Reflect, Loop::Evolve] {
+        let answer = ask(
+            &fx,
+            "automation_prompt",
+            json!({ "loop": lp, "domain": "eng", "max_items": 7 }),
+        )
+        .await;
+        assert_eq!(answer["ok"], true, "{answer}");
+        let data = &answer["data"];
+        assert_eq!(
+            data,
+            &serde_json::to_value(runner_setup(lp, "eng", 7, false)).unwrap(),
+            "{lp}"
+        );
+        assert!(
+            data["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Stop after 7 items")
+        );
+        assert_eq!(data["disallowed_tools"], json!(HEADLESS_DISALLOWED_TOOLS));
+        assert_eq!(data["version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            data["checksum"].as_str().unwrap().starts_with("sha256:"),
+            "{data}"
+        );
+        // The same request answers the same sum.
+        let again = ask(
+            &fx,
+            "automation_prompt",
+            json!({ "loop": lp, "domain": "eng", "max_items": 7 }),
+        )
+        .await;
+        assert_eq!(again["data"]["checksum"], data["checksum"], "{lp}");
+    }
+    // Without a cap the default of a run applies.
+    let plain = ask(
+        &fx,
+        "automation_prompt",
+        json!({ "loop": "evolve", "domain": "eng" }),
+    )
+    .await;
+    assert!(
+        plain["data"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Stop after 20 items"),
+        "{plain}"
+    );
+}
+
+/// A cap that is no whole number in range, a `skills_loaded` that is no
+/// boolean, a missing domain and an unknown one are refused.
+#[tokio::test]
+async fn automation_prompt_refuses_a_bad_cap_and_an_unknown_domain() {
+    let fx = fixture(&[("MANIFEST.md", &manifest(""))]).await;
+    for cap in [json!(-1), json!(1.5), json!("7"), json!(4_294_967_296u64)] {
+        let answer = ask(
+            &fx,
+            "automation_prompt",
+            json!({ "loop": "evolve", "domain": "eng", "max_items": cap }),
+        )
+        .await;
+        assert_eq!(answer["kind"], "invalid", "{cap}: {answer}");
+        assert_eq!(
+            answer["error"], "max_items must be a whole number from 0 to 4294967295",
+            "{answer}"
+        );
+    }
+    let top = ask(
+        &fx,
+        "automation_prompt",
+        json!({ "loop": "evolve", "domain": "eng", "max_items": 4_294_967_295u64 }),
+    )
+    .await;
+    assert_eq!(top["ok"], true, "{top}");
+    let loaded = ask(
+        &fx,
+        "automation_prompt",
+        json!({ "loop": "evolve", "domain": "eng", "skills_loaded": "yes" }),
+    )
+    .await;
+    assert_eq!(loaded["kind"], "invalid", "{loaded}");
+    assert_eq!(loaded["error"], "skills_loaded must be true or false");
+    let missing = ask(&fx, "automation_prompt", json!({ "loop": "evolve" })).await;
+    assert_eq!(missing["error"], "domain is required", "{missing}");
+    let unknown = ask(
+        &fx,
+        "automation_prompt",
+        json!({ "loop": "evolve", "domain": "nosuch" }),
+    )
+    .await;
+    let take = ask(
+        &fx,
+        "automation_lease_take",
+        json!({ "loop": "evolve", "domain": "nosuch", "runner": "cron" }),
+    )
+    .await;
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    assert_eq!(unknown["error"], take["error"], "{unknown} {take}");
+    let wrong_loop = ask(
+        &fx,
+        "automation_prompt",
+        json!({ "loop": "sweep", "domain": "eng" }),
+    )
+    .await;
+    assert_eq!(wrong_loop["kind"], "invalid", "{wrong_loop}");
+}
+
+/// The prompt's start follows this instance's `skills.serve`: it calls the
+/// `skills` tool where the tool is served, says the skills are loaded where
+/// `false` hides it, and `skills_loaded` overrides the setting both ways.
+#[tokio::test]
+async fn automation_prompt_picks_the_skills_line_from_the_setting_and_the_request() {
+    use crystalline_core::automation::{Loop, headless_prompt};
+    use crystalline_core::config::{SkillsConfig, SkillsServe};
+    for (serve, served) in [
+        (None, true),
+        (Some(SkillsServe::Auto), true),
+        (Some(SkillsServe::Always), true),
+        (Some(SkillsServe::Never), false),
+    ] {
+        let fx = fixture_with(&[("MANIFEST.md", &manifest(""))], |cfg, _| {
+            cfg.skills = serve.map(|serve| SkillsConfig { serve: Some(serve) });
+        })
+        .await;
+        for (requested, loaded) in [
+            (Value::Null, !served),
+            (json!(true), true),
+            (json!(false), false),
+        ] {
+            let answer = ask(
+                &fx,
+                "automation_prompt",
+                json!({ "loop": "evolve", "domain": "eng", "max_items": 7,
+                        "skills_loaded": requested }),
+            )
+            .await;
+            assert_eq!(
+                answer["data"]["prompt"],
+                headless_prompt(Loop::Evolve, "eng", 7, loaded),
+                "serve {serve:?}, skills_loaded {requested}"
+            );
+        }
+    }
+}

@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use crystalline_core::automation::{
-    HEADLESS_DISALLOWED_TOOLS, LEASE_RENEW_SECS, Loop, RunOutcome, RunSummary, headless_prompt,
-    parse_run_summary,
+    DEFAULT_MAX_ITEMS, HEADLESS_DISALLOWED_TOOLS, LEASE_RENEW_SECS, Loop, RunOutcome, RunSummary,
+    headless_prompt, parse_run_summary, runner_setup,
 };
 use crystalline_remote::{Connection, RemoteFailure};
 use serde_json::{Value, json};
@@ -71,7 +71,7 @@ const EXIT_NOTHING: u8 = 1;
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
     /// The most items the agent works in one run.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = DEFAULT_MAX_ITEMS)]
     pub max_items: u32,
     /// The most agent turns in one run.
     #[arg(long, default_value_t = 60)]
@@ -106,10 +106,10 @@ pub enum LoopCommand {
         domain: Vec<String>,
     },
     /// Work what is due with a headless Claude Code agent: take the lease,
-    /// run the agent with the shipped prompt, share its changes as a pull
-    /// request, record the run and release the lease. Exit 0 when the run is
-    /// done or stopped at its item cap, 1 when nothing is due or a run is
-    /// already going, 2 when the run failed or on an error.
+    /// run the agent with the prompt the server answers, share its changes
+    /// as a pull request, record the run and release the lease. Exit 0 when
+    /// the run is done or stopped at its item cap, 1 when nothing is due or a
+    /// run is already going, 2 when the run failed or on an error.
     Run {
         /// The domain to work. Omit to work every due domain in turn.
         #[arg(long)]
@@ -139,21 +139,40 @@ pub enum LoopCommand {
         args: RunArgs,
     },
     /// Print the shipped prompt a headless run starts its agent with, for a
-    /// runner outside the CLI.
+    /// runner outside the CLI. With --json: the prompt, the tools the agent
+    /// may not call, this version and their checksum, the answer the
+    /// automation_prompt ctl verb gives.
     Prompt {
         /// The domain the prompt names.
         #[arg(long)]
         domain: String,
         /// The item cap the prompt names.
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = DEFAULT_MAX_ITEMS)]
         max_items: u32,
+        /// Say the agent's skills are already loaded instead of calling the
+        /// skills tool, for a runner that hands them to its agent itself.
+        #[arg(long)]
+        skills_loaded: bool,
     },
 }
 
 /// Run `command` for loop `lp`.
 pub async fn run(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<()> {
-    if let LoopCommand::Prompt { domain, max_items } = &command {
-        print!("{}", headless_prompt(lp, domain, *max_items));
+    if let LoopCommand::Prompt {
+        domain,
+        max_items,
+        skills_loaded,
+    } = &command
+    {
+        if json {
+            let setup = runner_setup(lp, domain, *max_items, *skills_loaded);
+            println!("{}", serde_json::to_string(&setup)?);
+        } else {
+            print!(
+                "{}",
+                headless_prompt(lp, domain, *max_items, *skills_loaded)
+            );
+        }
         return Ok(());
     }
     let code = match dispatch(lp, command, json).await {

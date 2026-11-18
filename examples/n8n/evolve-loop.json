@@ -3,7 +3,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Crystalline evolve loop\n\nRuns the evolve loop of one domain when something is due. See docs/automation.md in the Crystalline repository.\n\n1. Create a Bearer Auth credential **Crystalline runner token** with the `cmt_` token of an agent account that may write the domain. Use another account than the reflect workflow. Pick it on every HTTP Request node and on **Crystalline MCP**.\n2. Create an Anthropic credential and pick a model on **Claude**.\n3. Edit **Settings**: the server address, the domain and the item cap.\n4. Run `crystalline evolve prompt --domain <domain> --max-items <cap>` and paste what it prints into the prompt of **Fix the findings**. Paste it again after a Crystalline upgrade.\n5. Optional: turn on `evolve_trigger: webhook` in the domain's MANIFEST, set the instance's `automation.webhook.url` to this workflow's production webhook URL and `automation.webhook.secret` to a long random value, and give n8n the same value as `CRYSTALLINE_WEBHOOK_SECRET`. An instance has one webhook URL for both loops and every domain, so only one of the two loop workflows takes the webhook; the other runs on its schedule. **Check the signature** drops an event for the other loop. A webhook for another domain only starts a status check of the domain in **Settings**.\n\n6. Import `renew-lease.json` too, pick the credential on its HTTP Request node, and pick that workflow on **Keep the lease fresh**. It renews the lease every 60 seconds while the agent works, without holding up this workflow, and stops when the run is recorded.\n\nIf a renew fails three times, the renewing stops and the lease is stale 5 minutes after the last renew. Another run may then take it over: this run's share and record are refused, and the writes it made are not in a pull request. For long runs use `crystalline evolve run`.",
+        "content": "## Crystalline evolve loop\n\nRuns the evolve loop of one domain when something is due. See docs/automation.md in the Crystalline repository.\n\n1. Create a Bearer Auth credential **Crystalline runner token** with the `cmt_` token of an agent account that may write the domain. Use another account than the reflect workflow. Pick it on every HTTP Request node and on **Crystalline MCP**.\n2. Create an Anthropic credential and pick a model on **Claude**.\n3. Edit **Settings**: the server address, the domain and the item cap.\n4. Nothing to paste: **Fetch the prompt** asks the server for the shipped prompt (`automation_prompt`) at the start of every run, so the agent always gets the prompt of the version the server runs. When the server refuses it (a token that may not run the loop, an unknown domain, a server older than 0.34.0), **Prompt refused** stops the workflow with the server's error, and no lease is taken.\n5. Optional: turn on `evolve_trigger: webhook` in the domain's MANIFEST, set the instance's `automation.webhook.url` to this workflow's production webhook URL and `automation.webhook.secret` to a long random value, and give n8n the same value as `CRYSTALLINE_WEBHOOK_SECRET`. An instance has one webhook URL for both loops and every domain, so only one of the two loop workflows takes the webhook; the other runs on its schedule. **Check the signature** drops an event for the other loop. A webhook for another domain only starts a status check of the domain in **Settings**.\n\n6. Import `renew-lease.json` too, pick the credential on its HTTP Request node, and pick that workflow on **Keep the lease fresh**. It renews the lease every 60 seconds while the agent works, without holding up this workflow, and stops when the run is recorded.\n\nIf a renew fails three times, the renewing stops and the lease is stale 5 minutes after the last renew. Another run may then take it over: this run's share and record are refused, and the writes it made are not in a pull request. For long runs use `crystalline evolve run`.",
         "height": 520,
         "width": 620
       },
@@ -80,7 +80,7 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Edit these values. The token is not here: it is the credential\n// \"Crystalline runner token\" (Bearer Auth) on the HTTP Request nodes and on\n// the MCP Client Tool.\nreturn [{\n  json: {\n    // The server's address as n8n reaches it, without a trailing slash. A\n    // host name the server does not know must be in its\n    // CRYSTALLINE_SERVICE_ALLOWED_HOSTS.\n    url: 'https://crystalline.example.com',\n    // The domain this workflow works.\n    domain: 'eng',\n    // The item cap. Use the same number as in the prompt you pasted.\n    maxItems: 10,\n    // The runner label the run record shows.\n    runner: 'n8n',\n    startedAt: new Date().toISOString(),\n  },\n}];\n"
+        "jsCode": "// Edit these values. The token is not here: it is the credential\n// \"Crystalline runner token\" (Bearer Auth) on the HTTP Request nodes and on\n// the MCP Client Tool.\nreturn [{\n  json: {\n    // The server's address as n8n reaches it, without a trailing slash. A\n    // host name the server does not know must be in its\n    // CRYSTALLINE_SERVICE_ALLOWED_HOSTS.\n    url: 'https://crystalline.example.com',\n    // The domain this workflow works.\n    domain: 'eng',\n    // The item cap. The prompt is fetched for it at the start of every run.\n    maxItems: 10,\n    // The runner label the run record shows.\n    runner: 'n8n',\n    startedAt: new Date().toISOString(),\n  },\n}];\n"
       },
       "id": "7309f59f-ce1f-5284-8d1b-e0c468ab42c8",
       "name": "Settings",
@@ -89,6 +89,80 @@
       "position": [
         440,
         300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Settings').first().json.url }}/api/v1/ctl",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ v: 1, cmd: 'automation_prompt', loop: 'evolve', domain: $('Settings').first().json.domain, max_items: $('Settings').first().json.maxItems }) }}",
+        "options": {}
+      },
+      "id": "67bb5a92-b24f-5265-ac73-ca2b618cab78",
+      "name": "Fetch the prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        660,
+        120
+      ],
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Crystalline runner token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "781c9611-b6dc-540b-8bb9-261064483a55",
+              "leftValue": "={{ $json.ok === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      },
+      "id": "f3dfca81-c6e6-5232-be4d-0a9ed59b837b",
+      "name": "Prompt fetched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ 'The server refused the prompt: ' + $json.error }}"
+      },
+      "id": "abde2dc8-3d8d-5f53-981c-5ccb635836fd",
+      "name": "Prompt refused",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        140
       ]
     },
     {
@@ -253,7 +327,7 @@
     {
       "parameters": {
         "promptType": "define",
-        "text": "Paste here what this prints: crystalline evolve prompt --domain eng --max-items 10",
+        "text": "={{ $('Fetch the prompt').first().json.data.prompt }}",
         "options": {
           "maxIterations": 40
         }
@@ -304,7 +378,6 @@
         "excludeTools": [
           "delete_engram",
           "move_engram",
-          "split_engram",
           "remove_domain",
           "add_domain",
           "configure",
@@ -474,7 +547,36 @@
       "main": [
         [
           {
+            "node": "Fetch the prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch the prompt": {
+      "main": [
+        [
+          {
+            "node": "Prompt fetched?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt fetched?": {
+      "main": [
+        [
+          {
             "node": "Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prompt refused",
             "type": "main",
             "index": 0
           }

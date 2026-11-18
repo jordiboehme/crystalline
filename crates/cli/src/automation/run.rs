@@ -131,12 +131,19 @@ pub(super) async fn run_one(
     stop: &watch::Receiver<bool>,
 ) -> anyhow::Result<Ran> {
     let args = &opts.args;
-    let prompt = headless_prompt(lp, domain, args.max_items);
+    // A stop never waits on the server: no lease is taken yet. A dry run
+    // asks too, so it shows the tools the server forbids.
+    let Some(setup) = unless_stopped(run_prompt(lp, client, domain, args.max_items), stop).await
+    else {
+        return Ok(Ran::Busy);
+    };
+    let setup = setup?;
     if opts.dry_run {
         let shown = ClaudeRun {
             program: claude.to_path_buf(),
             mcp_config: PathBuf::from("<mcp config>"),
             prompt: "<prompt>".to_string(),
+            disallowed_tools: setup.disallowed_tools,
             max_turns: args.max_turns,
             model: args.model.clone(),
         };
@@ -157,10 +164,8 @@ pub(super) async fn run_one(
         lp,
         json!({ "domain": domain, "runner": args.runner }),
     );
-    let mut stopping = stop.clone();
-    let take = tokio::select! {
-        take = take => take,
-        _ = stopping.wait_for(|stopped| *stopped) => return Ok(Ran::Busy),
+    let Some(take) = unless_stopped(take, stop).await else {
+        return Ok(Ran::Busy);
     };
     let take = match take {
         Ok(take) => take,
@@ -220,7 +225,8 @@ pub(super) async fn run_one(
     let run = ClaudeRun {
         program: claude.to_path_buf(),
         mcp_config: config.path.clone(),
-        prompt,
+        prompt: setup.prompt,
+        disallowed_tools: setup.disallowed_tools,
         max_turns: args.max_turns,
         model: args.model.clone(),
     };
@@ -373,6 +379,120 @@ fn share_failure(domain: &str, error: &str, remote: bool) -> String {
         " Once that is fixed, share them with: crystalline origin share {domain}"
     ));
     text
+}
+
+/// What a run starts its agent with: the prompt and the tools it may never
+/// call.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct RunPrompt {
+    pub(super) prompt: String,
+    /// Bare MCP tool names.
+    pub(super) disallowed_tools: Vec<String>,
+}
+
+impl RunPrompt {
+    /// This binary's shipped prompt and its own list of forbidden tools.
+    fn shipped(lp: Loop, domain: &str, max_items: u32) -> RunPrompt {
+        RunPrompt {
+            prompt: headless_prompt(lp, domain, max_items, false),
+            disallowed_tools: HEADLESS_DISALLOWED_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+        }
+    }
+
+    /// The prompt and the tools of an `automation_prompt` answer.
+    pub(super) fn of_answer(answer: &Value) -> anyhow::Result<RunPrompt> {
+        let prompt = answer["prompt"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("the prompt answer carried no prompt"))?
+            .to_string();
+        let disallowed_tools = answer["disallowed_tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .map(|t| t.as_str().map(str::to_string))
+                    .collect::<Option<Vec<String>>>()
+            })
+            .ok_or_else(|| anyhow::anyhow!("the prompt answer carried no list of tools"))?;
+        Ok(RunPrompt {
+            prompt,
+            disallowed_tools,
+        })
+    }
+}
+
+/// `fut`'s output, or `None` when a stop comes first.
+pub(super) async fn unless_stopped<F: std::future::Future>(
+    fut: F,
+    stop: &watch::Receiver<bool>,
+) -> Option<F::Output> {
+    let mut stopping = stop.clone();
+    tokio::select! {
+        out = fut => Some(out),
+        _ = stopping.wait_for(|stopped| *stopped) => None,
+    }
+}
+
+/// The prompt a run on `domain` starts its agent with and the tools it may
+/// never call, as the server it talks to answers them (`automation_prompt`):
+/// the server knows whether its MCP surface serves the `skills` tool the
+/// prompt starts with, and which tools it forbids, also when it is newer
+/// than this binary. Asked before the lease is taken, so a failure here
+/// leaves no lease behind. See [`prompt_of`] for the answer.
+pub(super) async fn run_prompt(
+    lp: Loop,
+    client: &AutomationClient,
+    domain: &str,
+    max_items: u32,
+) -> anyhow::Result<RunPrompt> {
+    let answer = client
+        .verb(
+            "automation_prompt",
+            lp,
+            json!({ "domain": domain, "max_items": max_items }),
+        )
+        .await;
+    prompt_of(answer, lp, domain, max_items)
+}
+
+/// What a run starts with after `answer` to its `automation_prompt`: the
+/// server's prompt and tools; this binary's shipped prompt and its own list
+/// when the server does not know the verb (a server older than it, see
+/// [`verb_unknown`]); and every other failure (a refusal of the caller's
+/// rights, an unknown domain, a server or network error) as it is, so the
+/// run ends before it takes a lease.
+pub(super) fn prompt_of(
+    answer: anyhow::Result<Value>,
+    lp: Loop,
+    domain: &str,
+    max_items: u32,
+) -> anyhow::Result<RunPrompt> {
+    match answer {
+        Ok(setup) => RunPrompt::of_answer(&setup),
+        Err(e) if verb_unknown(&e) => {
+            eprintln!(
+                "{domain}: the server does not know automation_prompt yet ({e}); this run uses the shipped prompt."
+            );
+            Ok(RunPrompt::shipped(lp, domain, max_items))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `e` is a server's answer that it does not know
+/// `automation_prompt`: an older local daemon's "unknown ctl command" or an
+/// older remote server's refusal of a command it does not serve.
+pub(super) fn verb_unknown(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    text.starts_with("unknown ctl command 'automation_prompt'")
+        || text
+            == format!(
+                "'automation_prompt' {}",
+                crystalline_service::remote_ctl::NOT_REMOTE
+            )
 }
 
 /// A take refusal that means "not now": a run is going, or the loop runs on
@@ -871,6 +991,108 @@ pub(super) fn stop_signal() -> watch::Receiver<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool the server forbids and this binary does not know yet still
+    /// reaches the agent's `--disallowedTools`.
+    #[test]
+    fn the_servers_forbidden_tools_reach_the_argv() {
+        let mut tools: Vec<String> = HEADLESS_DISALLOWED_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        tools.push("newly_forbidden".to_string());
+        let answer = json!({
+            "prompt": "the server's prompt",
+            "disallowed_tools": tools,
+            "version": "9.9.9",
+            "checksum": "sha256:00",
+        });
+        let setup = RunPrompt::of_answer(&answer).unwrap();
+        assert_eq!(setup.disallowed_tools, tools);
+        let run = ClaudeRun {
+            program: PathBuf::from("claude"),
+            mcp_config: PathBuf::from("mcp.json"),
+            prompt: setup.prompt,
+            disallowed_tools: setup.disallowed_tools,
+            max_turns: 60,
+            model: None,
+        };
+        let args = claude_args(&run);
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert!(
+            args[at + 1].ends_with(",mcp__crystalline__newly_forbidden"),
+            "{args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "the server's prompt");
+    }
+
+    #[test]
+    fn a_prompt_answer_without_its_parts_is_an_error() {
+        for answer in [
+            json!({ "disallowed_tools": [] }),
+            json!({ "prompt": "p" }),
+            json!({ "prompt": "p", "disallowed_tools": [1] }),
+        ] {
+            assert!(RunPrompt::of_answer(&answer).is_err(), "{answer}");
+        }
+    }
+
+    /// An older server that does not know the verb, locally or remotely:
+    /// the run falls back to this binary's shipped prompt and its own list.
+    #[test]
+    fn an_unknown_verb_falls_back_to_the_shipped_prompt_and_this_binarys_tools() {
+        for refusal in [
+            anyhow::Error::msg(
+                "unknown ctl command 'automation_prompt'; expected status, sessions, holder",
+            ),
+            anyhow::Error::new(RemoteFailure::Refused(
+                "'automation_prompt' is not available over a remote connection".to_string(),
+            )),
+        ] {
+            let text = refusal.to_string();
+            let shipped = prompt_of(Err(refusal), Loop::Evolve, "kb", 7).unwrap();
+            assert_eq!(
+                shipped.prompt,
+                headless_prompt(Loop::Evolve, "kb", 7, false),
+                "{text}"
+            );
+            assert_eq!(
+                shipped.disallowed_tools, HEADLESS_DISALLOWED_TOOLS,
+                "{text}"
+            );
+        }
+    }
+
+    /// Every other failure ends the run with its own error, before a take.
+    #[test]
+    fn a_refused_prompt_is_an_error_and_no_fallback() {
+        for refusal in [
+            anyhow::Error::new(RemoteFailure::Refused(
+                "you may not write to 'kb', so you may not run its evolve loop".to_string(),
+            )),
+            anyhow::Error::new(RemoteFailure::Invalid(
+                "max_items must be a whole number from 0 to 4294967295".to_string(),
+            )),
+            anyhow::Error::msg("unknown domain 'kb'"),
+            anyhow::Error::msg("unknown ctl command 'automation_status'; expected status"),
+            anyhow::Error::new(std::io::Error::other("connection reset")),
+        ] {
+            let text = refusal.to_string();
+            let err = prompt_of(Err(refusal), Loop::Evolve, "kb", 7).unwrap_err();
+            assert_eq!(err.to_string(), text);
+        }
+    }
+
+    /// A stop that comes first ends the wait for the server; without one
+    /// the answer comes through.
+    #[tokio::test]
+    async fn a_stop_ends_the_wait_for_the_server() {
+        let (tx, rx) = watch::channel(false);
+        assert_eq!(unless_stopped(async { 1 }, &rx).await, Some(1));
+        tx.send(true).unwrap();
+        let never = std::future::pending::<u8>();
+        assert_eq!(unless_stopped(never, &rx).await, None);
+    }
 
     #[test]
     fn a_refused_share_names_why_and_the_way_out() {

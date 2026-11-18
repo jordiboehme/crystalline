@@ -177,7 +177,13 @@ mod tests {
             let request = json!({ "v": 1, "cmd": cmd, "loop": "reflect", "domain": "ops" });
             assert_eq!(unanswered_check(&request).as_deref(), Some(said), "{cmd}");
         }
-        for read in ["automation_status", "automation_runs", "status", "file"] {
+        for read in [
+            "automation_status",
+            "automation_prompt",
+            "automation_runs",
+            "status",
+            "file",
+        ] {
             let request = json!({ "v": 1, "cmd": read, "loop": "reflect" });
             assert_eq!(unanswered_check(&request), None, "{read}");
         }

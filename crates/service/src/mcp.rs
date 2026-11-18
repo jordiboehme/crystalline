@@ -7318,6 +7318,27 @@ mod tests {
 
     use super::*;
 
+    /// A headless run may split, so both files of a split are noted for the
+    /// run's pull request: the source it edited and the engram it created.
+    #[test]
+    fn a_split_receipt_notes_the_source_and_the_new_engram() {
+        let receipt = json!({
+            "domain": "eng",
+            "source": { "permalink": "big", "path": "notes/big.md", "title": "Big" },
+            "new": { "permalink": "part", "path": "notes/part.md", "title": "Part" },
+            "moved_observations": [3],
+            "moved_sections": [],
+        });
+        let noted = written_paths(&receipt);
+        assert_eq!(
+            noted,
+            std::collections::BTreeMap::from([(
+                "eng".to_string(),
+                vec!["notes/big.md".to_string(), "notes/part.md".to_string()]
+            )])
+        );
+    }
+
     /// The configure tool description is what a client searches to find the
     /// domain policy keys, so every `policy_registry` key must appear in it.
     #[test]

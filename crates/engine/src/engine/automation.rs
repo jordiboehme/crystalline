@@ -206,6 +206,32 @@ impl Engine {
         Ok(json!({ "loop": lp, "domains": out }))
     }
 
+    /// What a runner that starts its own agent sets up a run of `lp` on
+    /// `domain` with: the filled-in prompt for at most `max_items` items, the
+    /// tools the agent may not call, this version and the checksum of the
+    /// two ([`crystalline_core::automation::RunnerSetup`]). The rights are
+    /// those of [`Engine::automation_status`] for a named domain: the caller
+    /// may run `lp` there, and a domain it may not see is unknown.
+    ///
+    /// The prompt's start calls the `skills` tool unless `skills_loaded`
+    /// says the skills are loaded already, or, when it says nothing, this
+    /// instance hides the `skills` tool (`skills.serve: false`, read from
+    /// the setting frozen at start like the MCP surface it describes).
+    pub async fn automation_prompt(
+        &self,
+        lp: Loop,
+        domain: &str,
+        max_items: u32,
+        skills_loaded: Option<bool>,
+        scope: &Scope,
+    ) -> Result<Value> {
+        self.require_loop_right(lp, domain, scope).await?;
+        let loaded =
+            crystalline_core::automation::skills_loaded(self.skills_serve(), skills_loaded);
+        let setup = crystalline_core::automation::runner_setup(lp, domain, max_items, loaded);
+        Ok(serde_json::to_value(setup).expect("a runner setup is plain JSON"))
+    }
+
     /// What a person may see of the loops on `domain`: `{reflect?, evolve?}`
     /// (just `only` when it names one), each the entry
     /// [`Engine::automation_status`] gives, cut to the caller's share. The
