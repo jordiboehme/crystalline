@@ -66,9 +66,11 @@ pub struct WriteParams {
     pub title: String,
     /// The markdown body. Observations `- [category] text` and relations
     /// `- rel_type [[Target]]` in the body are parsed and indexed. Required
-    /// for an engram. With `path`: the file's text, for a text file (svg,
-    /// txt, csv, json, yaml, toml, xml); send any other file as `base64`
-    /// instead.
+    /// for an engram. A frontmatter block at its top is merged into the
+    /// engram's frontmatter: parameters win, and engine-owned keys are
+    /// ignored and named in the receipt. With `path`: the file's text, for a
+    /// text file (svg, txt, csv, json, yaml, toml, xml); send any other file
+    /// as `base64` instead.
     #[serde(default)]
     pub content: Option<String>,
     /// Upload a file instead of writing an engram: its path under `assets/`,
