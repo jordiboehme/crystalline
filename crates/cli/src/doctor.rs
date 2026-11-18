@@ -2989,7 +2989,7 @@ fn index_unavailable_reason(
     service: &ServiceDoctor,
     bypassed: bool,
 ) -> String {
-    let db = location.place();
+    let at = location.at();
     let pid = service
         .lock_pid
         .map(|p| p.to_string())
@@ -2997,31 +2997,32 @@ fn index_unavailable_reason(
     let skipped = "so the orphan, unindexed, embedding and tag checks did not run";
     // Not a holder problem: see `instance::words_for_holder`.
     if crystalline_index::is_schema_too_new_text(error) {
-        return format!("the index at {db} cannot be used by this binary, {skipped}. {error}");
+        return format!("the index {at} cannot be used by this binary, {skipped}. {error}");
     }
     // The wedge first: it is the one holder `--fix` can do something about.
     if service.daemon_unresponsive && !service.daemon_dislodged {
         return format!(
-            "an unresponsive daemon (pid {pid}) holds the index at {db} and answers nothing on its socket, {skipped}. Rerun `crystalline doctor --fix` to replace it. The index reported: {error}"
+            "an unresponsive daemon (pid {pid}) holds the index {at} and answers nothing on its socket, {skipped}. Rerun `crystalline doctor --fix` to replace it. The index reported: {error}"
         );
     }
     let live_daemon = instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
     if live_daemon && bypassed {
         return format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {db}, and --db or --config told doctor to read that file directly instead of asking the daemon, {skipped}. Run `crystalline doctor` without --db and --config to have the daemon answer them, or stop it first with `crystalline ctl shutdown`. The index reported: {error}"
+            "the running Crystalline daemon (pid {pid}) owns the index {at}, and --db or --config told doctor to read {} directly instead of asking the daemon, {skipped}. Run `crystalline doctor` without --db and --config to have the daemon answer them, or stop it first with `crystalline ctl shutdown`. The index reported: {error}",
+            location.direct_target()
         );
     }
     if live_daemon {
         return format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {db} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
+            "the running Crystalline daemon (pid {pid}) owns the index {at} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
         );
     }
     match location {
         crystalline_service::instance::IndexLocation::File(_) => format!(
-            "the index at {db} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+            "the index {at} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
         ),
         crystalline_service::instance::IndexLocation::Database(_) => format!(
-            "the index in {db} could not be opened, {skipped}. {} The database reported: {error}",
+            "the index {at} could not be opened, {skipped}. {} The database reported: {error}",
             crystalline_service::instance::database_open_advice()
         ),
     }

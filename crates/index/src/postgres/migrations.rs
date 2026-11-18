@@ -3254,7 +3254,7 @@ mod tests {
         let behind = apply_locked_set(&mut conn, Some(&schema), &INDEX_SET);
         tokio::pin!(behind);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(500), &mut behind)
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut behind)
                 .await
                 .is_err(),
             "a schema behind waits for the migration lock"

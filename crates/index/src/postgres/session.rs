@@ -337,6 +337,32 @@ mod tests {
         assert_eq!(t.describe(), "db.internal:5432/crystalline, schema team_a");
         let t = PgTarget { schema: None, ..t };
         assert_eq!(t.describe(), "db.internal:5432/crystalline, default schema");
+        // Credentials in the query string, an `@` in the query with and
+        // without userinfo before the host, and a raw `/` or `@` in a
+        // password: none of it is ever shown.
+        for url in [
+            "postgres://db.internal:5432/crystalline?password=secret",
+            "postgres://db.internal:5432/crystalline?sslpassword=secret&sslmode=require",
+            "postgres://db.internal:5432/crystalline?user=ada@corp&password=secret",
+            "postgres://ada:secret@db.internal:5432/crystalline?user=ada@corp&password=secret",
+            "postgres://ada:secret@db.internal:5432/crystalline#password=secret",
+            "postgres://ada:se/cret@db.internal:5432/crystalline",
+            "postgres://ada:se@cret@db.internal:5432/crystalline",
+        ] {
+            let t = PgTarget {
+                url: url.to_string(),
+                schema: None,
+            };
+            let shown = t.describe();
+            assert_eq!(
+                shown, "db.internal:5432/crystalline, default schema",
+                "{url}"
+            );
+            assert!(
+                !shown.contains("secret") && !shown.contains("cret"),
+                "{url}"
+            );
+        }
     }
 
     /// The longest schema and a full UUID tag still fit in the 63 bytes

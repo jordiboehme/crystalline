@@ -2953,8 +2953,9 @@ pub enum IndexLocation {
     /// The local Turso file at this path.
     File(String),
     /// A Postgres database, described without credentials
-    /// (`host:port/db, schema s`).
-    Database(String),
+    /// (`host:port/db, schema s`), or `None` when the configuration does not
+    /// name one this binary can describe.
+    Database(Option<String>),
 }
 
 impl IndexLocation {
@@ -2967,22 +2968,25 @@ impl IndexLocation {
         }
         #[cfg(feature = "postgres")]
         if let Ok(target) = crystalline_index::postgres::PgTarget::from_config(&database) {
-            return IndexLocation::Database(target.describe());
+            return IndexLocation::Database(Some(target.describe()));
         }
-        IndexLocation::Database("(the configured database)".to_string())
+        IndexLocation::Database(None)
     }
 
-    /// The location in a sentence: the path, or `the database <place>`.
-    pub fn place(&self) -> String {
+    /// Where the index is, as it follows "the index" in a sentence:
+    /// `at <path>`, `in the database <place>` or `in the configured
+    /// database`.
+    pub fn at(&self) -> String {
         match self {
-            IndexLocation::File(path) => path.clone(),
-            IndexLocation::Database(place) => format!("the database {place}"),
+            IndexLocation::File(path) => format!("at {path}"),
+            IndexLocation::Database(Some(place)) => format!("in the database {place}"),
+            IndexLocation::Database(None) => "in the configured database".to_string(),
         }
     }
 
     /// What `--db` or `--config` reached past the daemon to: the file, or
     /// the database.
-    fn direct_target(&self) -> &'static str {
+    pub fn direct_target(&self) -> &'static str {
         match self {
             IndexLocation::File(_) => "that file",
             IndexLocation::Database(_) => "that database",
@@ -3009,9 +3013,9 @@ pub fn index_unreachable_words(location: &IndexLocation, error: &str, bypassed: 
         && !crystalline_index::is_schema_too_new_text(error)
     {
         return format!(
-            "the standalone command `{command}` (pid {}) holds the index at {} right now; run this again once it has finished. The index reported: {error}",
+            "the standalone command `{command}` (pid {}) holds the index {} right now; run this again once it has finished. The index reported: {error}",
             info.pid,
-            location.place()
+            location.at()
         );
     }
     words_for_holder(info.map(|info| info.pid), location, error, bypassed)
@@ -3029,27 +3033,27 @@ pub fn words_for_holder(
     error: &str,
     bypassed: bool,
 ) -> String {
-    let place = location.place();
+    let at = location.at();
     // An index newer than this binary is not a holder problem, and the lock
     // advice below would send a person looking for a process that is not
     // there. Its own message names the remedy, so it stands alone.
     if crystalline_index::is_schema_too_new_text(error) {
-        return format!("the index at {place} cannot be used by this binary: {error}");
+        return format!("the index {at} cannot be used by this binary: {error}");
     }
     match (holder, bypassed) {
         (Some(pid), true) => format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {place}, and --db or --config told this command to read {} directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}",
+            "the running Crystalline daemon (pid {pid}) owns the index {at}, and --db or --config told this command to read {} directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}",
             location.direct_target()
         ),
         (Some(pid), false) => format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {place} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}"
+            "the running Crystalline daemon (pid {pid}) owns the index {at} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}"
         ),
         (None, _) => match location {
             IndexLocation::File(_) => format!(
-                "the index at {place} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+                "the index {at} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
             ),
             IndexLocation::Database(_) => format!(
-                "the index in {place} could not be opened, and no Crystalline daemon is running to ask instead. {} The database reported: {error}",
+                "the index {at} could not be opened, and no Crystalline daemon is running to ask instead. {} The database reported: {error}",
                 database_open_advice()
             ),
         },
@@ -3872,8 +3876,9 @@ mod tests {
     #[test]
     fn a_database_that_did_not_open_gets_database_advice() {
         let raw = "error returned from database: sorry, too many clients already";
-        let place =
-            IndexLocation::Database("db.internal:5432/crystalline, schema team_a".to_string());
+        let place = IndexLocation::Database(Some(
+            "db.internal:5432/crystalline, schema team_a".to_string(),
+        ));
         let words = words_for_holder(None, &place, raw, false);
         assert!(
             words.contains("the database db.internal:5432/crystalline, schema team_a"),
@@ -3889,6 +3894,25 @@ mod tests {
         assert!(
             bypassed.contains("read that database directly"),
             "{bypassed}"
+        );
+        assert!(
+            bypassed.contains("owns the index in the database db.internal"),
+            "{bypassed}"
+        );
+        let newer = words_for_holder(
+            None,
+            &place,
+            "this index was upgraded by a newer Crystalline (schema v99)",
+            false,
+        );
+        assert!(
+            newer.starts_with("the index in the database db.internal"),
+            "{newer}"
+        );
+        let unnamed = words_for_holder(None, &IndexLocation::Database(None), raw, false);
+        assert!(
+            unnamed.starts_with("the index in the configured database could not be opened"),
+            "{unnamed}"
         );
     }
 
