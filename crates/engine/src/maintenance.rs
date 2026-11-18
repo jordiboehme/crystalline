@@ -637,6 +637,50 @@ fn record_run_unscoped_at(path: &Path) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
 
+    /// `maintenance.json` files written by 0.33.0, frozen:
+    /// every stamp, the nudge map and the counts load, and writing them back
+    /// gives the same bytes. A file that stopped loading would reset to
+    /// nothing without a word and lose the nudge cooldowns.
+    #[test]
+    fn a_state_file_from_0_33_0_round_trips_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MAINTENANCE_FILE);
+        for written in [
+            r#"{"v":1,"pending_domains":["eng","ops"],"pending_since":"2027-01-15T08:00:00Z","last_run_at":"2027-01-03T18:13:20.120Z","last_nudge_at":"2027-01-16T11:46:40.123456789Z","first_seen":"2026-09-21T14:13:20.123456Z","mcp_nudges":{"capture:human:ada":"2027-01-17T15:33:20Z","evolve:agent:bot":"2027-01-17T15:33:21.500Z"},"reflect_open":{"eng":3},"last_reflect_nudge_at":"2027-01-18T19:20:00Z"}"#,
+            r#"{"v":1,"pending_domains":[],"pending_since":null,"last_run_at":null,"last_nudge_at":null,"first_seen":null,"mcp_nudges":{},"last_reflect_nudge_at":null}"#,
+        ] {
+            std::fs::write(&path, written).unwrap();
+            let state = load_from(&path);
+            assert_eq!(state.v, 1, "{written}");
+            save_to(&path, &state).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        }
+        let state = load_from(&path);
+        assert_eq!(
+            state,
+            MaintenanceState {
+                v: 1,
+                ..MaintenanceState::default()
+            }
+        );
+        std::fs::write(
+            &path,
+            r#"{"v":1,"pending_domains":["eng"],"pending_since":"2027-01-15T08:00:00Z","last_run_at":null,"last_nudge_at":"2027-01-16T11:46:40.123456789Z","first_seen":null,"mcp_nudges":{"capture:human:ada":"2027-01-17T15:33:20Z"},"last_reflect_nudge_at":null}"#,
+        )
+        .unwrap();
+        let state = load_from(&path);
+        assert_eq!(state.pending_domains, ["eng"]);
+        assert_eq!(state.pending_since, Stamp::from_unix(1_800_000_000, 0));
+        assert_eq!(
+            state.last_nudge_at,
+            Stamp::from_unix(1_800_100_000, 123_456_789)
+        );
+        assert_eq!(
+            state.mcp_nudges.get("capture:human:ada"),
+            Stamp::from_unix(1_800_200_000, 0).as_ref()
+        );
+    }
+
     #[test]
     fn hook_status_names_only_what_the_caller_may_see() {
         let state = MaintenanceState {

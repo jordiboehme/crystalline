@@ -222,3 +222,33 @@ pub fn stale_line(source: &str, url: &str, fetched_at: Stamp, failure: Option<&s
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cached answers written by 0.33.0, frozen: each loads
+    /// for its account, and writing it again gives the same bytes.
+    #[test]
+    fn a_cached_answer_from_0_33_0_round_trips_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        for written in [
+            r#"{"account":"ada","etag":"\"e1\"","fetched_at":"2027-01-15T08:00:00.120Z","data":{"domains":[{"name":"eng"}]},"last_failure":"timed out"}"#,
+            r#"{"account":"ada","etag":"","fetched_at":"2027-01-15T08:00:00Z","data":null,"last_failure":null}"#,
+        ] {
+            std::fs::write(dir.path().join("domains.json"), written).unwrap();
+            let cached = read_cached(dir.path(), "domains.json", "ada").expect("loads");
+            assert!(read_cached(dir.path(), "domains.json", "bob").is_none());
+            write_cached(dir.path(), "domains.json", &cached).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("domains.json")).unwrap(),
+                written
+            );
+        }
+        let cached = read_cached(dir.path(), "domains.json", "ada").unwrap();
+        assert_eq!(
+            cached.fetched_at,
+            crystalline_core::time::Stamp::from_unix(1_800_000_000, 0).unwrap()
+        );
+    }
+}
