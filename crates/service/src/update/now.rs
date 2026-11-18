@@ -45,17 +45,18 @@ pub struct UpdateLock {
 /// left behind to time out.
 pub fn take_lock(cache_dir: &Path) -> Result<UpdateLock, UpdateError> {
     let dir = cache_dir.join(UPDATES_DIR);
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&dir).map_err(UpdateError::Lock)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dir.join(LOCK_FILE))?;
+        .open(dir.join(LOCK_FILE))
+        .map_err(UpdateError::Lock)?;
     match FileExt::try_lock(&file) {
         Ok(()) => Ok(UpdateLock { _file: file }),
         Err(fs4::TryLockError::WouldBlock) => Err(UpdateError::Locked),
-        Err(fs4::TryLockError::Error(err)) => Err(err.into()),
+        Err(fs4::TryLockError::Error(err)) => Err(UpdateError::Lock(err)),
     }
 }
 
@@ -86,31 +87,85 @@ pub fn remove_older_tags(cache_dir: &Path, keep: &str) {
     }
 }
 
+/// The suffix of a file downloaded but not yet verified. Such a file is
+/// hidden (it starts with a dot) and never has a name a printed command
+/// points at.
+const UNVERIFIED: &str = ".unverified";
+
+/// The staging name of `name` in `dir`: `.<name>.unverified`.
+fn staged(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(".{name}{UNVERIFIED}"))
+}
+
 /// Download `asset` of `release` with `SHA256SUMS` and its signature into
-/// `dir`, and verify it, fail closed, in the spec's order: the digest
-/// GitHub's API lists for the asset (only when the API answered; an API
-/// answer without a digest for it is refused), then the minisign signature
+/// `dir`, and verify it, fail closed: the digest GitHub's API lists for the
+/// asset (only when the API answered; an API answer without a digest for it
+/// is refused before anything is downloaded), then the minisign signature
 /// over `SHA256SUMS` with the trusted keys and the release's tag, then the
 /// asset's line in those very signed bytes. One tag value, `release.tag`,
 /// names every download and the signature, and every check runs on the
 /// bytes that were written, never on a second read.
 ///
-/// On success the asset's path and the checks that ran; on any failure the
-/// three files are removed, so nothing unverified is left in `dir`.
+/// The three files are downloaded under staging names
+/// (`.<name>.unverified`) and take their final names only once every check
+/// passed, the asset last. So a run that is interrupted, killed or refused
+/// never leaves unverified bytes under the name a printed command points
+/// at, and never replaces a copy an earlier run verified. Staging files an
+/// earlier run left are removed first; call it under the update lock.
+///
+/// On success the asset's path and the checks that ran.
 pub async fn fetch_verified(
     release: &LatestRelease,
     asset: &str,
     dir: &Path,
 ) -> Result<(PathBuf, Checks), UpdateError> {
+    if release.from_api && !release.digests.contains_key(asset) {
+        return Err(UpdateError::NoDigest);
+    }
     std::fs::create_dir_all(dir)?;
-    let paths = [dir.join(asset), dir.join(SUMS), dir.join(SUMS_SIG)];
-    let verified = fetch_and_verify(release, asset, &paths).await;
-    if verified.is_err() {
-        for path in &paths {
-            let _ = std::fs::remove_file(path);
+    remove_staging_leftovers(dir);
+    let names = [asset, SUMS, SUMS_SIG];
+    let staging = names.map(|name| staged(dir, name));
+    let verified = fetch_and_verify(release, asset, &staging).await;
+    let checks = match verified {
+        Ok(checks) => checks,
+        Err(err) => {
+            remove_all(&staging);
+            return Err(err);
+        }
+    };
+    // The signature files first, the asset last: its final name appears
+    // only once everything beside it is in place.
+    for (from, name) in staging.iter().zip(names).rev() {
+        if let Err(err) = std::fs::rename(from, dir.join(name)) {
+            remove_all(&staging);
+            return Err(err.into());
         }
     }
-    verified.map(|checks| (paths[0].clone(), checks))
+    Ok((dir.join(asset), checks))
+}
+
+fn remove_all(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove the staging and partial files a run that was interrupted left in
+/// `dir`: hidden files ending in `.unverified` or holding `.part-`.
+fn remove_staging_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') && (name.ends_with(UNVERIFIED) || name.contains(".part-")) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 async fn fetch_and_verify(
@@ -157,6 +212,44 @@ mod tests {
         assert!(
             cache.path().join("updates/.lock").is_file(),
             "the lock file stays"
+        );
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_made_says_so() {
+        let cache = tempfile::tempdir().unwrap();
+        let file = cache.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let err = take_lock(&file).expect_err("no folder under a file");
+        assert!(matches!(err, UpdateError::Lock(_)), "{err:?}");
+        assert!(
+            err.to_string().starts_with("cannot take the update lock: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_staging_leftovers_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            ".crystalline_0.34.0_amd64.deb.unverified",
+            ".SHA256SUMS.unverified",
+            ".crystalline_0.34.0_amd64.deb.part-123",
+            "crystalline_0.34.0_amd64.deb",
+            "SHA256SUMS",
+            "unverified",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        remove_staging_leftovers(dir.path());
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["SHA256SUMS", "crystalline_0.34.0_amd64.deb", "unverified"]
         );
     }
 

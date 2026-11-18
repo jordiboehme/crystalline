@@ -82,6 +82,8 @@ pub enum UpdateError {
     Redirect,
     /// Another `crystalline update now` holds the update lock.
     Locked,
+    /// The update lock could not be made or taken.
+    Lock(std::io::Error),
     /// The release has no asset for this install method on this system.
     NoAsset,
     /// GitHub's API answered but lists no digest for the asset, so the
@@ -108,6 +110,7 @@ impl std::fmt::Display for UpdateError {
                 f.write_str("the download was redirected away from GitHub or too often")
             }
             UpdateError::Locked => f.write_str("another update is running"),
+            UpdateError::Lock(err) => write!(f, "cannot take the update lock: {err}"),
             UpdateError::NoAsset => {
                 f.write_str("the release has no download for this install on this system")
             }
@@ -121,7 +124,7 @@ impl std::error::Error for UpdateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             UpdateError::Http(err) => Some(err),
-            UpdateError::Io(err) => Some(err),
+            UpdateError::Io(err) | UpdateError::Lock(err) => Some(err),
             UpdateError::Verify(err) => Some(err),
             _ => None,
         }

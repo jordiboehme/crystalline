@@ -392,6 +392,17 @@ fn refused_line(refusal: &Refusal) -> String {
 /// The line `update now` prints when it stops before acting.
 const NOTHING_CHANGED: &str = "Nothing was changed.";
 
+/// The line a gated `update now` adds when the release has no publish time
+/// and the check never saw it.
+pub(crate) const AGE_FROM_NOW: &str = "GitHub's API did not answer, so the release age counts from now. crystalline update check starts the count; --ignore-age skips the wait.";
+
+/// The note under a gated plan: [`AGE_FROM_NOW`] when the gate was counted
+/// from now. `update now` keeps no first sighting of its own, so without
+/// one the wait would restart at every run.
+pub(crate) fn gate_note(since: Option<Stamp>, gate: Gate) -> Option<&'static str> {
+    (since.is_none() && matches!(gate, Gate::OpensAt(_))).then_some(AGE_FROM_NOW)
+}
+
 /// The line a plan-only `update now` ends with (U10).
 const RUN_WITH_YES: &str = "Nothing was changed. Run crystalline update now --yes to update.";
 
@@ -416,6 +427,8 @@ pub(crate) struct NowContext<'a> {
     pub(crate) min_age_hours: u32,
     /// Runs `brew` and the installed binary.
     pub(crate) spawner: &'a dyn Spawner,
+    /// The `brew` to run ([`brew_program`]).
+    pub(crate) brew: String,
     /// Whether a person at a terminal can be asked.
     pub(crate) terminal: bool,
     /// Asks the question and says whether the answer was yes.
@@ -435,7 +448,8 @@ pub(crate) struct NowContext<'a> {
 pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
     let current = Precedence::parse(crystalline_core::VERSION)
         .context("this binary's version could not be read")?;
-    let detection = crystalline_service::update::detect_here().detection;
+    let detected = crystalline_service::update::detect_here();
+    let detection = detected.detection;
     // Every refusal comes before any request or file (S6).
     if let Some(refusal) = refusal_of(&detection) {
         anyhow::bail!(refused_line(&refusal));
@@ -457,6 +471,7 @@ pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
         check_cache,
         min_age_hours,
         spawner: &SystemSpawner,
+        brew: brew_program(detected.exe.as_deref()),
         terminal,
         ask: &ask_at_terminal,
         euid: effective_uid(),
@@ -498,19 +513,23 @@ pub(crate) async fn act(
     yes: bool,
     ignore_age: bool,
 ) -> anyhow::Result<u8> {
+    // Counted from the publish time, else from when this machine first saw
+    // this very release (the check's cache), else from now.
+    let first_seen = context
+        .check_cache
+        .as_ref()
+        .and_then(UpdateCache::known_release)
+        .filter(|known| known.version == release.tag)
+        .map(|known| known.published_at.unwrap_or(known.first_seen));
+    let since = release.published_at.or(first_seen);
     let gate = if ignore_age {
         Gate::Open
     } else {
-        // Counted from the publish time, else from when this machine first
-        // saw this very release, else from now.
-        let first_seen = context
-            .check_cache
-            .as_ref()
-            .and_then(UpdateCache::known_release)
-            .filter(|known| known.version == release.tag)
-            .map(|known| known.published_at.unwrap_or(known.first_seen));
-        let since = release.published_at.or(first_seen).unwrap_or(context.now);
-        age_gate(since, context.now, context.min_age_hours)
+        age_gate(
+            since.unwrap_or(context.now),
+            context.now,
+            context.min_age_hours,
+        )
     };
     let plan = plan(
         context.current.clone(),
@@ -522,6 +541,9 @@ pub(crate) async fn act(
     );
     print!("{}", render_plan(&plan));
     if !plan.update_available() {
+        if let Some(note) = gate_note(since, gate) {
+            println!("{note}");
+        }
         return Ok(0);
     }
     let method = context.detection.method;
@@ -541,7 +563,10 @@ pub(crate) async fn act(
     }
     match method {
         InstallMethod::Homebrew => {
-            println!("{}", brew_upgrade(context.spawner, &context.current)?);
+            println!(
+                "{}",
+                brew_upgrade(context.spawner, &context.brew, &context.current)?
+            );
             Ok(0)
         }
         InstallMethod::Deb | InstallMethod::Msi | InstallMethod::Zip => {
@@ -567,17 +592,27 @@ pub(crate) async fn act(
 /// it moved past `current`. A version that did not move is an error, since
 /// `brew upgrade` can exit 0 without upgrading when the tap is stale. Only
 /// the parsed version is shown, never what the binary printed (S23).
-pub(crate) fn brew_upgrade(spawner: &dyn Spawner, current: &Precedence) -> anyhow::Result<String> {
+///
+/// `brew` is the program [`brew_program`] found for this install.
+pub(crate) fn brew_upgrade(
+    spawner: &dyn Spawner,
+    brew: &str,
+    current: &Precedence,
+) -> anyhow::Result<String> {
     println!("Running: {BREW_UPGRADE}");
-    let args: Vec<&str> = BREW_UPGRADE.split(' ').collect();
-    let code = spawner
-        .run(args[0], &args[1..])
-        .context("brew could not be started")?;
+    let args: Vec<&str> = BREW_UPGRADE.split(' ').skip(1).collect();
+    let code = spawner.run(brew, &args).with_context(|| {
+        if brew == "brew" {
+            "brew could not be started (is it on PATH?)".to_string()
+        } else {
+            format!("{brew} could not be started")
+        }
+    })?;
     if code != 0 {
         anyhow::bail!("brew upgrade failed (exit code {code})");
     }
     let unreadable = "brew upgrade ran, but the installed version could not be read";
-    let prefix = spawner.output("brew", &["--prefix"]).context(unreadable)?;
+    let prefix = spawner.output(brew, &["--prefix"]).context(unreadable)?;
     let binary = Path::new(prefix.trim()).join("bin").join("crystalline");
     let printed = spawner
         .output(&binary.to_string_lossy(), &["--version"])
@@ -594,6 +629,23 @@ pub(crate) fn brew_upgrade(spawner: &dyn Spawner, current: &Precedence) -> anyho
     } else {
         anyhow::bail!(BREW_DID_NOT_UPGRADE)
     }
+}
+
+/// The `brew` of the Homebrew this binary was installed by: `<prefix>/bin/brew`
+/// when the canonical exe lies under `<prefix>/Cellar/` and that file is
+/// there, so an agent's shell or a service without Homebrew on its `PATH`
+/// still finds it; else plain `brew` from `PATH`.
+pub(crate) fn brew_program(exe: Option<&Path>) -> String {
+    exe.into_iter()
+        .flat_map(Path::ancestors)
+        .find(|dir| dir.file_name().is_some_and(|name| name == "Cellar"))
+        .and_then(Path::parent)
+        .map(|prefix| prefix.join("bin").join("brew"))
+        .filter(|brew| brew.is_file())
+        .map_or_else(
+            || "brew".to_string(),
+            |brew| brew.to_string_lossy().into_owned(),
+        )
 }
 
 /// The checks a download passed, in the order they ran, as one line (spec
@@ -1024,6 +1076,7 @@ mod tests {
             check_cache: None,
             min_age_hours: 24,
             spawner,
+            brew: "brew".to_string(),
             terminal,
             ask,
             euid: Some(1000),
@@ -1183,30 +1236,83 @@ mod tests {
     #[test]
     fn brew_branch_records_the_command_and_reports_no_move() {
         let spawner = Recording::new(0, brew_outputs("0.33.0"));
-        let err = brew_upgrade(&spawner, &v("0.33.0")).unwrap_err();
+        let err = brew_upgrade(&spawner, "brew", &v("0.33.0")).unwrap_err();
         assert_eq!(err.to_string(), BREW_DID_NOT_UPGRADE);
         assert_eq!(err.to_string(), "brew did not upgrade (tap not refreshed?)");
         assert_eq!(spawner.calls(), BREW_CALLS);
 
         let spawner = Recording::new(0, brew_outputs("0.34.0"));
         assert_eq!(
-            brew_upgrade(&spawner, &v("0.33.0")).unwrap(),
+            brew_upgrade(&spawner, "brew", &v("0.33.0")).unwrap(),
             "upgraded to 0.34.0"
         );
 
         // A failed brew stops there.
         let spawner = Recording::new(1, brew_outputs("0.34.0"));
-        let err = brew_upgrade(&spawner, &v("0.33.0")).unwrap_err();
+        let err = brew_upgrade(&spawner, "brew", &v("0.33.0")).unwrap_err();
         assert_eq!(err.to_string(), "brew upgrade failed (exit code 1)");
         assert_eq!(spawner.calls(), BREW_CALLS[..1]);
 
-        // What the binary prints is never shown as it came.
-        let spawner = Recording::new(0, brew_outputs("0.34.0-rc.1 <b>"));
-        let err = brew_upgrade(&spawner, &v("0.33.0")).unwrap_err();
+        // A pre-release is no upgrade, even when it reads as newer.
+        let spawner = Recording::new(0, brew_outputs("0.35.0-rc.1"));
+        let err = brew_upgrade(&spawner, "brew", &v("0.33.0")).unwrap_err();
         assert_eq!(
             err.to_string(),
             "brew upgrade ran, but the installed version could not be read"
         );
+
+        // The brew found for the install is the one run.
+        let spawner = Recording::new(0, Vec::new());
+        let err = brew_upgrade(&spawner, "/opt/homebrew/bin/brew", &v("0.33.0")).unwrap_err();
+        assert_eq!(
+            spawner.calls()[..2],
+            [
+                "/opt/homebrew/bin/brew upgrade jordiboehme/tap/crystalline",
+                "/opt/homebrew/bin/brew --prefix"
+            ]
+        );
+        assert!(err.to_string().contains("could not be read"), "{err}");
+
+        // What the binary prints is never shown as it came.
+        let spawner = Recording::new(0, brew_outputs("0.34.0-rc.1 <b>"));
+        let err = brew_upgrade(&spawner, "brew", &v("0.33.0")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "brew upgrade ran, but the installed version could not be read"
+        );
+    }
+
+    #[test]
+    fn brew_is_found_beside_the_cellar_or_on_path() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("homebrew");
+        let exe = prefix.join("Cellar/crystalline/0.33.0/bin/crystalline");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        assert_eq!(brew_program(Some(&exe)), "brew", "no brew in the prefix");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::write(prefix.join("bin/brew"), b"").unwrap();
+        assert_eq!(
+            brew_program(Some(&exe)),
+            prefix.join("bin/brew").to_string_lossy()
+        );
+        assert_eq!(
+            brew_program(Some(Path::new("/usr/local/bin/crystalline"))),
+            "brew"
+        );
+        assert_eq!(brew_program(None), "brew");
+    }
+
+    #[test]
+    fn a_gate_counted_from_now_says_how_to_start_the_count() {
+        let closed = Gate::OpensAt(at(18));
+        assert_eq!(gate_note(None, closed), Some(AGE_FROM_NOW));
+        assert_eq!(
+            AGE_FROM_NOW,
+            "GitHub's API did not answer, so the release age counts from now. crystalline update check starts the count; --ignore-age skips the wait."
+        );
+        assert_eq!(gate_note(Some(at(17)), closed), None, "a known start");
+        assert_eq!(gate_note(None, Gate::Open), None);
+        assert_eq!(gate_note(None, Gate::Never), None);
     }
 
     #[test]

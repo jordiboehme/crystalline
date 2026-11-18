@@ -102,8 +102,12 @@ fn good_digest() -> Option<String> {
     Some(format!("sha256:{}", sha256_hex(BYTES.as_bytes())))
 }
 
-/// Trust the test key through the debug-only seam, or stop trusting it.
-fn trust_test_key(on: bool) {
+/// The test key trusted through the debug-only seam while this lives
+/// (with `on`), and never after: dropped also when a test panics, so no
+/// later test in the same process trusts it by accident.
+struct TestKey;
+
+fn trust_test_key(on: bool) -> TestKey {
     // SAFETY: every test that touches the environment holds `ENV`.
     unsafe {
         if on {
@@ -111,6 +115,14 @@ fn trust_test_key(on: bool) {
         } else {
             std::env::remove_var("CRYSTALLINE_TEST_UPDATE_KEY");
         }
+    }
+    TestKey
+}
+
+impl Drop for TestKey {
+    fn drop(&mut self) {
+        // SAFETY: as above; the guard is dropped while `ENV` is still held.
+        unsafe { std::env::remove_var("CRYSTALLINE_TEST_UPDATE_KEY") };
     }
 }
 
@@ -131,14 +143,13 @@ fn files_in(dir: &Path) -> Vec<String> {
 async fn a_signed_release_verifies_with_every_check() {
     let _env = ENV.lock().await;
     let fake = serve(Served::good()).await;
-    trust_test_key(true);
+    let _key = trust_test_key(true);
     let cache = tempfile::tempdir().unwrap();
     let dir = cache.path().join("updates").join(TAG);
 
     let (path, checks) = fetch_verified(&release(good_digest(), true), ASSET, &dir)
         .await
         .expect("verified");
-    trust_test_key(false);
 
     assert_eq!(path, dir.join(ASSET));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), BYTES);
@@ -171,12 +182,11 @@ async fn a_signed_release_verifies_with_every_check() {
 async fn the_fallback_has_no_digest_to_check() {
     let _env = ENV.lock().await;
     let _fake = serve(Served::good()).await;
-    trust_test_key(true);
+    let _key = trust_test_key(true);
     let dir = tempfile::tempdir().unwrap();
     let (_, checks) = fetch_verified(&release(None, false), ASSET, dir.path())
         .await
         .expect("verified without a digest");
-    trust_test_key(false);
     assert!(!checks.digest, "only the API carries a digest");
     assert!(checks.sums && checks.signature);
 }
@@ -212,13 +222,6 @@ async fn a_download_that_fails_a_check_is_removed() {
             "verification failed: the download does not match the sha256 digest GitHub lists for the asset",
         ),
         (
-            "no digest from the API",
-            good.clone(),
-            release(None, true),
-            true,
-            "GitHub lists no sha256 digest for the download",
-        ),
-        (
             "a changed asset",
             tampered,
             release(None, false),
@@ -249,12 +252,12 @@ async fn a_download_that_fails_a_check_is_removed() {
     ];
     for (name, served, release, trusted, message) in cases {
         let _fake = serve(served).await;
-        trust_test_key(trusted);
+        let key = trust_test_key(trusted);
         let dir = tempfile::tempdir().unwrap();
         let err = fetch_verified(&release, ASSET, dir.path())
             .await
             .expect_err(name);
-        trust_test_key(false);
+        drop(key);
         assert_eq!(err.to_string(), message, "{name}");
         assert!(
             files_in(dir.path()).is_empty(),
@@ -286,4 +289,119 @@ async fn a_missing_signature_is_an_error_and_leaves_nothing() {
         .expect_err("no signature");
     assert!(matches!(err, UpdateError::Status(404)), "{err:?}");
     assert!(files_in(dir.path()).is_empty());
+}
+
+/// An API answer without a digest for the asset is refused before any
+/// download.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn no_digest_from_the_api_downloads_nothing() {
+    let _env = ENV.lock().await;
+    let fake = serve(Served::good()).await;
+    let _key = trust_test_key(true);
+    let dir = tempfile::tempdir().unwrap();
+    let err = fetch_verified(&release(None, true), ASSET, dir.path())
+        .await
+        .expect_err("no digest");
+    assert_eq!(
+        err.to_string(),
+        "GitHub lists no sha256 digest for the download"
+    );
+    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+    assert!(files_in(dir.path()).is_empty());
+}
+
+/// A refused download never replaces a copy an earlier run verified.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn a_refused_run_keeps_an_earlier_verified_copy() {
+    let _env = ENV.lock().await;
+    let good = Served::good();
+    let _fake = serve(Served {
+        asset: "a changed package".to_string(),
+        ..good.clone()
+    })
+    .await;
+    let _key = trust_test_key(true);
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in [
+        (ASSET, BYTES),
+        ("SHA256SUMS", good.sums.as_str()),
+        ("SHA256SUMS.minisig", good.sig.as_str()),
+    ] {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    fetch_verified(&release(None, false), ASSET, dir.path())
+        .await
+        .expect_err("a changed asset");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(ASSET)).unwrap(),
+        BYTES
+    );
+    assert_eq!(
+        files_in(dir.path()),
+        ["SHA256SUMS", "SHA256SUMS.minisig", ASSET]
+    );
+}
+
+/// A run interrupted between the download and the verification (here: the
+/// signature never arrives and the run is dropped) leaves the downloaded
+/// bytes only under a staging name; an earlier verified copy keeps its
+/// name and bytes, and the next run clears the leftovers.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn an_interrupted_run_leaves_nothing_under_the_final_name() {
+    use axum::body::Body;
+    use axum::http::Response;
+
+    let _env = ENV.lock().await;
+    let good = Served::good();
+    let sums = good.sums.clone();
+    let fake = Fake::start(move |_, path, _| {
+        if path.ends_with("/SHA256SUMS.minisig") {
+            // Headers, then a body that never ends.
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(futures::stream::pending::<
+                    Result<String, std::io::Error>,
+                >()))
+                .unwrap()
+        } else if path.ends_with("/SHA256SUMS") {
+            respond(StatusCode::OK, &[], &sums)
+        } else {
+            respond(StatusCode::OK, &[], "unverified bytes")
+        }
+    })
+    .await;
+    use_fake(&fake);
+    let _key = trust_test_key(true);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(ASSET), BYTES).unwrap();
+
+    let fallback = release(None, false);
+    let run = fetch_verified(&fallback, ASSET, dir.path());
+    let interrupted = tokio::time::timeout(std::time::Duration::from_secs(1), run).await;
+    assert!(interrupted.is_err(), "the run was still waiting");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(ASSET)).unwrap(),
+        BYTES,
+        "the earlier verified copy is untouched"
+    );
+    let staged = format!(".{ASSET}.unverified");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(&staged)).unwrap(),
+        "unverified bytes",
+        "the download sits under its staging name only"
+    );
+    assert!(!files_in(dir.path()).contains(&"SHA256SUMS".to_string()));
+
+    // The next run removes the leftovers and puts the verified files in place.
+    let _fake = serve(good).await;
+    fetch_verified(&release(None, false), ASSET, dir.path())
+        .await
+        .expect("verified");
+    assert_eq!(
+        files_in(dir.path()),
+        ["SHA256SUMS", "SHA256SUMS.minisig", ASSET]
+    );
 }
