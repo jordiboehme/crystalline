@@ -2105,6 +2105,152 @@ pub fn in_desktop_extension_folder(exe: &Path) -> bool {
     })
 }
 
+// --- the handover marker ---------------------------------------------------
+
+/// The handover marker's file name in the state folder.
+///
+/// `update finish` writes it right before it asks the older daemon to stop
+/// and removes it once that call is over, whatever its outcome. A client
+/// that would start a daemon of its own while the marker holds waits for
+/// the successor instead ([`wait_out_handover`]): a bridge reconnects the
+/// moment its socket closes, and a daemon it started would win the state
+/// folder with the bridge's own flags, without the displaced daemon's HTTP
+/// address and allowed hosts.
+///
+/// Its name and shape are a contract between releases: the readers are the
+/// bridges of the version that runs, the writer is the next version's
+/// `update finish`. A reader ignores fields it does not know, and a file it
+/// cannot read is no marker.
+pub(crate) const HANDOVER_FILE: &str = "handover.json";
+
+/// What the handover marker holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandoverMarker {
+    /// The process that hands the daemon over. A marker whose process is
+    /// gone holds no more.
+    pub pid: u32,
+    /// The instant after which the marker holds no more, RFC 3339.
+    pub until: String,
+}
+
+/// How long a marker says it holds: the displacement's whole escalation
+/// (the ask, then the two signals) and the successor's readiness budget,
+/// with a margin.
+const HANDOVER_WINDOW: Duration = Duration::from_secs(
+    DISPLACE_WAITS.ask.as_secs()
+        + DISLODGE_TERM_WAIT.as_secs()
+        + DISLODGE_KILL_WAIT.as_secs()
+        + READINESS_BUDGET.as_secs()
+        + 5,
+);
+
+/// The longest a client waits because of a marker, whatever the marker
+/// says: a deadline far ahead (a clock that jumped, a writer's mistake)
+/// never blocks a spawn for longer.
+const HANDOVER_MAX_WAIT: Duration = Duration::from_secs(45);
+
+/// Whether the marker `text` holds at `now` for the process `me`: it
+/// parses, names another process that `alive` still finds, and its
+/// deadline lies ahead. Answers how long it still holds, at most
+/// [`HANDOVER_MAX_WAIT`]. Pure.
+pub(crate) fn handover_holds(
+    text: Option<&str>,
+    now: crystalline_core::time::Stamp,
+    me: u32,
+    alive: impl Fn(u32) -> bool,
+) -> Option<Duration> {
+    let marker: HandoverMarker = serde_json::from_str(text?).ok()?;
+    if marker.pid == me || !alive(marker.pid) {
+        return None;
+    }
+    let until = crystalline_core::time::parse_rfc3339(&marker.until)?.stamp();
+    let left = until.since(now).to_std().filter(|left| !left.is_zero())?;
+    Some(left.min(HANDOVER_MAX_WAIT))
+}
+
+/// The handover marker's path, `<state_dir>/handover.json`.
+fn handover_path() -> Option<PathBuf> {
+    config::state_dir().ok().map(|dir| dir.join(HANDOVER_FILE))
+}
+
+/// The marker [`mark_handover`] wrote; dropping it removes the file.
+#[derive(Debug)]
+pub(crate) struct HandoverGuard {
+    path: PathBuf,
+}
+
+impl Drop for HandoverGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Mark the handover ([`mark_handover`]), then [`displace`] the daemon
+/// `pid` behind `sock`: the marker exists before the daemon is asked to
+/// stop, so no bridge it drops can miss it. Answers whether the daemon is
+/// gone, and the marker, which holds until the caller drops it.
+pub(crate) async fn displace_for_handover(sock: &Path, pid: u32) -> (bool, Option<HandoverGuard>) {
+    let marker = mark_handover();
+    (displace(sock, pid).await, marker)
+}
+
+/// Write the handover marker for this process, holding for
+/// [`HANDOVER_WINDOW`]. Best effort: without it a connected bridge may
+/// start the successor itself, as before the marker existed, so a failure
+/// is logged and the handover goes on.
+pub(crate) fn mark_handover() -> Option<HandoverGuard> {
+    let path = handover_path()?;
+    let until = crystalline_core::time::now()
+        .checked_add(crystalline_core::time::Delta::from_std(HANDOVER_WINDOW)?)?;
+    let marker = HandoverMarker {
+        pid: std::process::id(),
+        until: until.rfc3339(),
+    };
+    let text = serde_json::to_string(&marker).ok()?;
+    // Written beside and renamed, so a reader never sees half a file.
+    let staging = path.with_file_name(format!(".{HANDOVER_FILE}.{}", std::process::id()));
+    let written = std::fs::write(&staging, text).and_then(|()| std::fs::rename(&staging, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&staging);
+        tracing::warn!(
+            "could not mark the daemon handover in {} ({e}); a connected session may start the new daemon itself",
+            path.display()
+        );
+        return None;
+    }
+    Some(HandoverGuard { path })
+}
+
+/// While another process hands the daemon over (a fresh handover marker),
+/// wait for the successor it starts instead of starting one: attach to it
+/// once it answers. `None` at once when no marker holds, and once the
+/// marker is gone, its process is gone or its time is up; the caller then
+/// starts a daemon as it would have. Bounded by [`HANDOVER_MAX_WAIT`]
+/// whatever the marker says.
+pub(crate) async fn wait_out_handover() -> Option<Connection> {
+    let path = handover_path()?;
+    let me = std::process::id();
+    let started = Instant::now();
+    let mut said = false;
+    loop {
+        let text = std::fs::read_to_string(&path).ok();
+        handover_holds(text.as_deref(), crystalline_core::time::now(), me, |pid| {
+            !process_gone(pid)
+        })?;
+        if !said {
+            said = true;
+            tracing::info!("a daemon handover is under way; waiting for the new daemon");
+        }
+        if let Some(conn) = try_attach().await {
+            return Some(conn);
+        }
+        if started.elapsed() >= HANDOVER_MAX_WAIT {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Poll for a daemon another client starts, for up to `budget`, without
 /// spawning one.
 async fn wait_for_successor(budget: Duration) -> Option<Connection> {
@@ -2190,6 +2336,11 @@ pub(crate) async fn ensure_daemon_in(
 ) -> anyhow::Result<Connection> {
     use crate::daemon_task::BridgeFailure;
     if !here.is_packaged() {
+        // A handover under way starts the successor with the displaced
+        // daemon's options; a spawn here would race it with this client's.
+        if let Some(conn) = wait_out_handover().await {
+            return Ok(conn);
+        }
         return ensure_daemon_with(true, options).await;
     }
     if let (Some(conn), _) = try_attach_displacing_in(here).await {
@@ -4564,6 +4715,10 @@ mod tests {
             let request: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
             let cmd = request["cmd"].as_str().unwrap_or("").to_string();
             log.lock().unwrap().push(cmd.clone());
+            // Whether a handover marker existed when the stop was asked.
+            if cmd == "shutdown" && handover_path().is_some_and(|path| path.exists()) {
+                log.lock().unwrap().push("handover-marked".to_string());
+            }
             let reply = match (cmd.as_str(), &holder) {
                 ("holder", Some(facts)) => {
                     serde_json::json!({ "v": 1, "ok": true, "data": facts })
@@ -4582,6 +4737,267 @@ mod tests {
             }
             let _ = write.flush().await;
         }
+    }
+
+    /// I3: when a handover marker holds, by a table of the cases.
+    #[test]
+    fn a_handover_marker_holds_only_while_fresh_and_its_writer_lives() {
+        let now = crystalline_core::time::parse_rfc3339("2026-11-18T10:00:00Z")
+            .unwrap()
+            .stamp();
+        let me = 100;
+        let alive = |pid: u32| pid != 666;
+        let marker = |pid: u32, until: &str| format!(r#"{{"pid":{pid},"until":"{until}"}}"#);
+        let fresh = marker(4242, "2026-11-18T10:00:10Z");
+        let extra = r#"{"pid":4242,"until":"2026-11-18T10:00:10+00:00","by":"0.35.0"}"#;
+        let cases: Vec<(&str, Option<String>, Option<Duration>)> = vec![
+            ("absent", None, None),
+            ("not JSON", Some("{".to_string()), None),
+            ("not a marker", Some(r#"{"pid":"x"}"#.to_string()), None),
+            ("fresh", Some(fresh.clone()), Some(Duration::from_secs(10))),
+            (
+                "unknown fields are read past",
+                Some(extra.to_string()),
+                Some(Duration::from_secs(10)),
+            ),
+            (
+                "past its deadline",
+                Some(marker(4242, "2026-11-18T09:59:59Z")),
+                None,
+            ),
+            (
+                "at its deadline",
+                Some(marker(4242, "2026-11-18T10:00:00Z")),
+                None,
+            ),
+            (
+                "writer gone",
+                Some(marker(666, "2026-11-18T10:00:10Z")),
+                None,
+            ),
+            (
+                "written by this process",
+                Some(marker(me, "2026-11-18T10:00:10Z")),
+                None,
+            ),
+            (
+                "a deadline that is no instant",
+                Some(marker(4242, "soon")),
+                None,
+            ),
+            (
+                "a far deadline is capped",
+                Some(marker(4242, "2026-11-19T10:00:00Z")),
+                Some(HANDOVER_MAX_WAIT),
+            ),
+        ];
+        for (label, text, want) in cases {
+            assert_eq!(
+                handover_holds(text.as_deref(), now, me, alive),
+                want,
+                "{label}"
+            );
+        }
+    }
+
+    /// I3: the marker's file name and shape are read by the bridges of an
+    /// older release, so they stay as they are.
+    #[test]
+    fn the_handover_marker_format_is_frozen() {
+        assert_eq!(HANDOVER_FILE, "handover.json");
+        let marker = HandoverMarker {
+            pid: 4242,
+            until: "2026-11-18T10:00:40+00:00".to_string(),
+        };
+        let literal = r#"{"pid":4242,"until":"2026-11-18T10:00:40+00:00"}"#;
+        assert_eq!(serde_json::to_string(&marker).unwrap(), literal);
+        assert_eq!(
+            serde_json::from_str::<HandoverMarker>(literal).unwrap(),
+            marker
+        );
+        assert!(HANDOVER_WINDOW < HANDOVER_MAX_WAIT, "{HANDOVER_WINDOW:?}");
+    }
+
+    /// I3: a marker this process writes names it, holds for the window and
+    /// goes with its guard.
+    #[test]
+    fn mark_handover_writes_a_marker_its_guard_removes() {
+        let _home = ScratchHome::new("handover-mark");
+        let path = handover_path().unwrap();
+        let guard = mark_handover().expect("marked");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let marker: HandoverMarker = serde_json::from_str(&text).unwrap();
+        assert_eq!(marker.pid, std::process::id());
+        let other = std::process::id() + 1;
+        let left = handover_holds(Some(&text), crystalline_core::time::now(), other, |_| true)
+            .expect("fresh for another process");
+        assert!(left <= HANDOVER_WINDOW && left > HANDOVER_WINDOW - Duration::from_secs(5));
+        assert_eq!(
+            handover_holds(
+                Some(&text),
+                crystalline_core::time::now(),
+                std::process::id(),
+                |_| true
+            ),
+            None,
+            "the writer itself never waits on its own marker"
+        );
+        drop(guard);
+        assert!(!path.exists(), "dropping the guard removes the marker");
+    }
+
+    /// Write a marker for `pid` that holds for a minute.
+    #[cfg(unix)]
+    fn write_marker_for(pid: u32) -> PathBuf {
+        let until = crystalline_core::time::now()
+            .checked_add(crystalline_core::time::seconds(60))
+            .unwrap();
+        let path = handover_path().unwrap();
+        let marker = HandoverMarker {
+            pid,
+            until: until.rfc3339(),
+        };
+        std::fs::write(&path, serde_json::to_string(&marker).unwrap()).unwrap();
+        path
+    }
+
+    /// A process that stands in for the `update finish` that writes a
+    /// marker: alive until killed.
+    #[cfg(unix)]
+    fn marker_writer() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// I3, the race itself: the old daemon is gone and the handover marker
+    /// holds. A reconnecting client starts nothing and waits; once the
+    /// successor answers on the pipe it attaches to that one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnecting_client_waits_for_the_successor_while_a_handover_runs() {
+        let _home = ScratchHome::new("handover-wait");
+        let mut writer = marker_writer();
+        write_marker_for(writer.id());
+
+        let mut waiting = tokio::spawn(wait_out_handover());
+        // No daemon answers yet, so the wait must still be going: a spawn
+        // here is the race the marker removes.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "the client gave up waiting while the handover holds"
+        );
+
+        // The successor comes up.
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let facts = serde_json::json!({
+            "pid": std::process::id(), "version": crystalline_core::VERSION,
+            "mcp_line_options": true
+        });
+        let (server, _seen) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+        let conn = tokio::time::timeout(Duration::from_secs(20), waiting)
+            .await
+            .expect("the wait ends once the successor answers")
+            .unwrap();
+        assert!(conn.is_some(), "attached to the successor");
+        server.abort();
+        let _ = writer.kill();
+        let _ = writer.wait();
+    }
+
+    /// I3: the wait ends, with nothing attached, once the marker is removed
+    /// or its writer is gone, so the client then starts a daemon as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_handover_wait_ends_when_the_marker_or_its_writer_goes() {
+        let _home = ScratchHome::new("handover-ends");
+        // Removed while waiting.
+        let mut writer = marker_writer();
+        let path = write_marker_for(writer.id());
+        let mut waiting = tokio::spawn(wait_out_handover());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(&path).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(20), waiting)
+            .await
+            .expect("the wait ends with the marker")
+            .unwrap();
+        assert!(ended.is_none());
+
+        // The writer dies while waiting.
+        write_marker_for(writer.id());
+        let mut waiting = tokio::spawn(wait_out_handover());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err()
+        );
+        writer.kill().unwrap();
+        writer.wait().unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(20), waiting)
+            .await
+            .expect("the wait ends with its writer")
+            .unwrap();
+        assert!(ended.is_none());
+
+        // No marker: no wait at all.
+        let _ = std::fs::remove_file(&path);
+        assert!(wait_out_handover().await.is_none());
+    }
+
+    /// I3: the marker is written before the old daemon is asked to stop,
+    /// and holds until the caller drops it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_handover_marks_before_it_asks_the_daemon_to_stop() {
+        let _home = ScratchHome::new("handover-order");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let mut old = marker_writer();
+        let pid = old.id();
+        let facts = serde_json::json!({ "pid": pid, "version": "0.0.1" });
+        let (server, seen) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+        // The old daemon leaves once it was asked to.
+        let asked = seen.clone();
+        let leaver = tokio::spawn(async move {
+            while !asked.lock().unwrap().iter().any(|cmd| cmd == "shutdown") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let _ = old.kill();
+            let _ = old.wait();
+        });
+
+        let (gone, marker) = displace_for_handover(&sock, pid).await;
+        assert!(gone, "the old daemon left");
+        let marker = marker.expect("marked");
+        let log = seen.lock().unwrap().clone();
+        let at = log.iter().position(|cmd| cmd == "shutdown").expect("asked");
+        assert_eq!(
+            log.get(at + 1).map(String::as_str),
+            Some("handover-marked"),
+            "the marker existed when the stop was asked: {log:?}"
+        );
+        let path = handover_path().unwrap();
+        assert!(path.exists(), "it holds while the successor starts");
+        drop(marker);
+        assert!(!path.exists());
+        leaver.await.unwrap();
+        server.abort();
     }
 
     /// A pid that is certainly dead: a child that already exited and was
