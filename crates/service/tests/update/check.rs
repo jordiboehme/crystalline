@@ -148,16 +148,67 @@ async fn a_failed_check_is_cached() {
     );
     assert_eq!(failed.etag, None);
     assert_eq!(read_cache(&path), Some(failed.clone()));
-    assert_eq!(run_check(&path, later(12)).await, failed);
+    assert_eq!(run_check(&path, later(3)).await, failed);
     assert_eq!(
         api_count(&fake),
         1,
-        "a failure holds the next check off too"
+        "a failure holds the next check off too, for four hours"
     );
 
-    run_check(&path, later(24)).await;
+    run_check(&path, later(4)).await;
     assert_eq!(api_count(&fake), 2);
     assert_eq!(sent_etag(&fake, 1), None, "no ETag after a failure");
+}
+
+#[tokio::test]
+async fn a_failed_check_is_retried_after_four_hours_and_a_good_one_stands_a_day() {
+    let _env = ENV.lock().await;
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answering = down.clone();
+    let fake = Fake::start(move |_, path, _| {
+        if answering.load(Ordering::SeqCst) {
+            respond(StatusCode::BAD_GATEWAY, &[], "down")
+        } else if path == API_PATH {
+            respond(StatusCode::OK, &[], &api_release("v99.0.0"))
+        } else {
+            respond(StatusCode::NOT_FOUND, &[], "")
+        }
+    })
+    .await;
+    use_fake(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+
+    // A good check stands a day: nothing at +4 h or +23 h.
+    run_check(&path, t0()).await;
+    run_check(&path, later(4)).await;
+    run_check(&path, later(23)).await;
+    assert_eq!(api_count(&fake), 1);
+
+    // A day later GitHub is down: the failure stands four hours, not a day.
+    down.store(true, Ordering::SeqCst);
+    let failed = run_check(&path, later(24)).await;
+    assert!(matches!(failed.outcome, CheckOutcome::Failed { .. }));
+    assert_eq!(api_count(&fake), 2);
+    run_check(&path, later(27)).await;
+    assert_eq!(api_count(&fake), 2, "held off within four hours");
+
+    // Four hours on it asks again and, answered, stands a day from then.
+    down.store(false, Ordering::SeqCst);
+    let found = run_check(&path, later(28)).await;
+    assert_eq!(release_outcome(&found).2, t0(), "the known release kept");
+    assert_eq!(api_count(&fake), 3);
+
+    // The bound lives in the file: a new daemon's first look obeys it too.
+    let exe = dir.path().join("crystalline");
+    std::fs::write(&exe, "binary").unwrap();
+    let none = |_: &str| None;
+    let state = UpdateState::detect(&exe, &none, Some(path.clone()));
+    assert!(state.subscribe().borrow().is_some(), "loaded at start");
+    run_check(&path, later(28 + 23)).await;
+    assert_eq!(api_count(&fake), 3, "a good check stands a day again");
+    run_check(&path, later(28 + 24)).await;
+    assert_eq!(api_count(&fake), 4);
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@
 //! the daemon's start or its requests: it runs in its own task, after a
 //! random wait so many daemons started together do not ask GitHub at the
 //! same second. Failures are cached as well, so a broken network costs one
-//! request a day.
+//! request every four hours.
 //!
 //! Nothing from the network reaches an agent as it came (S23): the cache
 //! keeps the tag only as the release client built it, a failure keeps a
@@ -26,10 +26,28 @@ use tokio::sync::watch;
 
 use super::client::{UpdateError, latest_release};
 
-/// How long a check's result stands before the next one: one day, failed
-/// checks included.
+/// How long a successful check's result stands before the next one: one
+/// day.
 pub fn check_interval() -> Delta {
     time::hours(24)
+}
+
+/// How long a failed check holds off the next one: four hours, so a laptop
+/// that started offline or a passing GitHub error does not hide a release
+/// for a day.
+pub fn retry_interval() -> Delta {
+    time::hours(4)
+}
+
+/// Whether `cache` still stands at `now`: a release for
+/// [`check_interval`], a failure for [`retry_interval`]. A `checked_at` in
+/// the future never stands.
+pub fn still_fresh(cache: &UpdateCache, now: Stamp) -> bool {
+    let within = match cache.outcome {
+        CheckOutcome::Release { .. } => check_interval(),
+        CheckOutcome::Failed { .. } => retry_interval(),
+    };
+    cache.fresh(now, within)
 }
 
 /// How often the check task wakes to see whether a check is due. A
@@ -49,8 +67,8 @@ const LOCK_POLL: Duration = Duration::from_millis(250);
 
 /// The longest random wait before a daemon's first look: short, so a
 /// daemon that exits when idle still gets to check. Short-lived daemons
-/// still ask at most once a day, since every look starts from the cache
-/// file the last attempt wrote.
+/// still ask no more often than one daemon would, since every look starts
+/// from the cache file the last attempt wrote.
 pub const MAX_START_JITTER: Duration = Duration::from_secs(60);
 
 /// The file the .deb's package list is read from, as a file and never
@@ -76,9 +94,9 @@ pub fn read_cache(path: &Path) -> Option<UpdateCache> {
     UpdateCache::parse(&text)
 }
 
-/// One check against the cache at `cache_path`: when the cached check is
-/// younger than a day (a failed one too) it is returned as it is and
-/// nothing is asked. Otherwise the newest release is looked up, the result
+/// One check against the cache at `cache_path`: while the cached check
+/// still stands ([`still_fresh`]: a release for a day, a failure for four
+/// hours) it is returned as it is and nothing is asked. Otherwise the newest release is looked up, the result
 /// written through a temporary file and a rename, and returned. A write
 /// that fails is logged; the result is still returned.
 ///
@@ -94,7 +112,7 @@ pub fn read_cache(path: &Path) -> Option<UpdateCache> {
 /// answered. The first time a version newer than this binary is seen, one
 /// log line `newer release <version> seen` goes to the journal.
 pub async fn run_check(cache_path: &Path, now: Stamp) -> UpdateCache {
-    let fresh = || read_cache(cache_path).filter(|c| c.fresh(now, check_interval()));
+    let fresh = || read_cache(cache_path).filter(|c| still_fresh(c, now));
     if let Some(cache) = fresh() {
         return cache;
     }
@@ -114,7 +132,7 @@ pub async fn run_check(cache_path: &Path, now: Stamp) -> UpdateCache {
     };
     // Read again under the lock: the holder before may have just written.
     let previous = read_cache(cache_path);
-    if let Some(cache) = previous.as_ref().filter(|c| c.fresh(now, check_interval())) {
+    if let Some(cache) = previous.as_ref().filter(|c| still_fresh(c, now)) {
         return cache.clone();
     }
     remove_left_temp_files(cache_path);
@@ -467,8 +485,8 @@ pub fn start_jitter() -> Duration {
 
 /// The daemon's check task: waits `first_wait`, then every `wake` runs a
 /// check when one may run (`setting_on` is read each time, so a change of
-/// `update.check` needs no restart) and the last one is a day old. "A day
-/// old" is decided by [`run_check`] from the cache file, so a new daemon
+/// `update.check` needs no restart) and the last one no longer stands
+/// ([`still_fresh`]). That is decided from the cache file, so a new daemon
 /// never asks sooner than the last attempt of an earlier one allows. Ends
 /// on the shutdown signal, also in the middle of a lookup.
 pub async fn run_update_checks(
@@ -495,7 +513,7 @@ pub async fn run_update_checks(
         // A fresh file wins over memory: a check another process wrote (a
         // `crystalline update check`, another daemon) reaches the answer
         // within one wake.
-        if let Some(file) = read_cache(&path).filter(|c| c.fresh(now, check_interval())) {
+        if let Some(file) = read_cache(&path).filter(|c| still_fresh(c, now)) {
             let file = file.answered();
             state.cache.send_if_modified(|held| {
                 let changed = *held != file;
@@ -504,14 +522,14 @@ pub async fn run_update_checks(
             });
             continue;
         }
-        // Memory still holds a day's check when the file could not be
-        // written: no second request that day. A state folder that stays
+        // Memory still holds a standing check when the file could not be
+        // written: no second request before it lapses. A state folder that stays
         // unwritable still costs one request per daemon start.
         if state
             .cache
             .borrow()
             .as_ref()
-            .is_some_and(|cache| cache.fresh(now, check_interval()))
+            .is_some_and(|cache| still_fresh(cache, now))
         {
             continue;
         }
