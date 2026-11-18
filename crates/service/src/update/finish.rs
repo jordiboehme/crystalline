@@ -7,7 +7,7 @@
 //! mode, HTTP address, allowed hosts, environment names). The old binary
 //! never stops the daemon itself: a stopped daemon loses how it was
 //! started. A handover marker in the state folder
-//! ([`crate::instance::HANDOVER_FILE`]) holds while it runs, so a connected
+//! (`handover.json`, see `instance::HANDOVER_FILE`) holds while it runs, so a connected
 //! bridge waits for this successor instead of starting its own (S24: the
 //! session survives the handover).
 
