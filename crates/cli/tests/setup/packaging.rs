@@ -228,6 +228,39 @@ fn the_two_checksum_steps_are_the_same() {
     assert_eq!(checksums, collect("publish"));
 }
 
+/// CI calls release.yml as a reusable workflow. A secret release.yml declares
+/// but the call does not name resolves to an empty string there, even in a
+/// job with the `release` environment that holds it, so the call must name
+/// every declared secret. The 0.34.0 release first failed at signing that
+/// way: `MINISIGN_SECRET_KEY` was declared and not named.
+#[test]
+fn ci_names_every_secret_the_release_declares() {
+    let release: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&repo_file(".github/workflows/release.yml"))
+            .expect("release.yml parses");
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&repo_file(".github/workflows/ci.yml")).expect("ci.yml parses");
+    let declared: Vec<String> = release["on"]["workflow_call"]["secrets"]
+        .as_mapping()
+        .expect("release.yml declares its secrets")
+        .keys()
+        .filter_map(|key| key.as_str().map(str::to_string))
+        .collect();
+    assert!(declared.iter().any(|name| name == "MINISIGN_SECRET_KEY"));
+    let passed = ci["jobs"]["release"]["secrets"]
+        .as_mapping()
+        .expect("ci.yml's release job names its secrets");
+    for name in &declared {
+        assert_eq!(
+            passed
+                .get(serde_yaml_ng::Value::String(name.clone()))
+                .and_then(|value| value.as_str()),
+            Some(format!("${{{{ secrets.{name} }}}}").as_str()),
+            "ci.yml's release call must name {name}"
+        );
+    }
+}
+
 /// Every `CRYSTALLINE_TEST_UPDATE_*` name any crate under crates/ holds is
 /// in the seam loop of release.yml's `check-signature` job, which fails a release
 /// whose binary carries one. A seam added to the code and not to the loop
