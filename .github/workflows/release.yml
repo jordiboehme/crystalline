@@ -43,9 +43,12 @@ on:
         required: false
       TAP_GITHUB_TOKEN:
         required: false
-      # Declared only so the sign job may name it: no caller passes it. It
-      # lives in the `release` environment, whose copy is what the sign job
-      # reads, and nothing outside that environment ever sees it.
+      # It lives only in the `release` environment. CI passes the name, with
+      # an empty value since its calling job has no environment, and the sign
+      # job's environment copy takes its place. A secret the caller does not
+      # name resolves to an empty string in a called workflow, even inside a
+      # job with an environment, so every secret declared here must be named
+      # by the call in ci.yml (a packaging test checks it).
       MINISIGN_SECRET_KEY:
         required: false
 
