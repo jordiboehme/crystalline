@@ -53,19 +53,19 @@ impl Spawner for SystemSpawner {
 
 /// A spawner for the tests: every call is recorded as one line (`program
 /// args...`), `run` answers 0 and `output` what `answer` says.
-#[cfg(any(test, feature = "testing"))]
-pub struct Scripted<F> {
+#[cfg(test)]
+pub(crate) struct Scripted<F> {
     answer: F,
     calls: std::sync::Mutex<Vec<String>>,
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl<F> Scripted<F>
 where
     F: Fn(&str, &[&str]) -> std::io::Result<String> + Send + Sync,
 {
     /// A spawner whose `output` is `answer(program, args)`.
-    pub fn new(answer: F) -> Self {
+    pub(crate) fn new(answer: F) -> Self {
         Scripted {
             answer,
             calls: std::sync::Mutex::default(),
@@ -73,7 +73,7 @@ where
     }
 
     /// Every call so far, in order.
-    pub fn calls(&self) -> Vec<String> {
+    pub(crate) fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -87,7 +87,7 @@ where
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl<F> Spawner for Scripted<F>
 where
     F: Fn(&str, &[&str]) -> std::io::Result<String> + Send + Sync,

@@ -691,3 +691,21 @@ fn the_gate_follows_the_postgres_settings_document() {
         text(&out.stderr)
     );
 }
+
+/// The tar.gz update runs the new binary as `.crystalline-new-<pid>` and
+/// requires its first `--version` line to be exactly `crystalline
+/// <version>`. That holds for the real binary under that name too: clap
+/// prints the command name, not the file name, and nothing comes first.
+#[test]
+fn the_real_binary_passes_the_version_check_under_its_staging_name() {
+    let folder = tempfile::tempdir().unwrap();
+    let staged = folder.path().join(".crystalline-new-1");
+    std::fs::copy(env!("CARGO_BIN_EXE_crystalline"), &staged).unwrap();
+    let want = crystalline_core::version::Precedence::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    crystalline_service::update::version_matches(
+        &crystalline_service::update::SystemSpawner,
+        &staged,
+        &want,
+    )
+    .expect("the real binary names its own version");
+}
