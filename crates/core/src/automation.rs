@@ -195,7 +195,6 @@ const EVOLVE_PROMPT: &str = include_str!("automation/evolve-prompt.md");
 pub const HEADLESS_DISALLOWED_TOOLS: &[&str] = &[
     "delete_engram",
     "move_engram",
-    "split_engram",
     "remove_domain",
     "add_domain",
     "configure",

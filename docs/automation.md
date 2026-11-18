@@ -87,7 +87,7 @@ The shipped prompts (`crystalline <loop> prompt` prints them) tell the agent tha
 - Reflect works the queue. Evolve asks `evolve_engrams` for `mechanical` findings only and never touches a `judgment` finding.
 - A tool answer that says the domain was renamed in its MANIFEST is left for a person and named in the summary.
 
-The agent may not call these tools, and `run` passes the same list to `--disallowedTools`: `delete_engram`, `move_engram`, `split_engram`, `remove_domain`, `add_domain`, `configure`, `provision`, `share_changes`, `update_domain`, `resolve_conflict`, `withdraw_proposal` and `discard_changes`. Two more rules are parameters, not tools, so they are rules of the prompt only: no `write_reflection` action `delete_asset` and no `write_engram` with `overwrite: true`.
+The agent may not call these tools, and `run` passes the same list to `--disallowedTools`: `delete_engram`, `move_engram`, `remove_domain`, `add_domain`, `configure`, `provision`, `share_changes`, `update_domain`, `resolve_conflict`, `withdraw_proposal` and `discard_changes`. Two more rules are parameters, not tools, so they are rules of the prompt only: no `write_reflection` action `delete_asset` and no `write_engram` with `overwrite: true`.
 
 ### The prompt for your own agent
 
@@ -194,7 +194,7 @@ Each workflow has a note with its setup steps. In short:
 4. There is nothing to paste: the node Fetch the prompt asks the server for the prompt with `automation_prompt` at the start of every run, so after an upgrade the agent gets the new prompt at once. A run whose fetch fails takes no lease.
 5. Import `renew-lease.json`, pick the credential on its HTTP Request node and pick that workflow on the node Keep the lease fresh.
 
-The MCP Client Tool leaves out the twelve tools a headless run may not call. That list is fixed in the workflow, so compare it with the `disallowed_tools` that Fetch the prompt answers after an upgrade. The HTTP Request nodes send the ctl verbs the CLI sends: `automation_prompt`, `automation_status`, `automation_lease_take`, `automation_lease_renew`, `automation_share` and `automation_run_record`, each a `POST /api/v1/ctl` with a body such as `{"v": 1, "cmd": "automation_status", "loop": "reflect", "domains": ["eng"]}`. The answer is `{"v": 1, "ok": true, "data": ...}`, or `ok: false` with an `error` such as `already running`.
+The MCP Client Tool leaves out the eleven tools a headless run may not call. That list is fixed in the workflow, so compare it with the `disallowed_tools` that Fetch the prompt answers after an upgrade. The HTTP Request nodes send the ctl verbs the CLI sends: `automation_prompt`, `automation_status`, `automation_lease_take`, `automation_lease_renew`, `automation_share` and `automation_run_record`, each a `POST /api/v1/ctl` with a body such as `{"v": 1, "cmd": "automation_status", "loop": "reflect", "domains": ["eng"]}`. The answer is `{"v": 1, "ok": true, "data": ...}`, or `ok: false` with an `error` such as `already running`.
 
 An instance has one webhook URL (`automation.webhook.url`) for both loops and every domain whose trigger is on. So only one of the two loop workflows takes the webhook, and the other runs on its schedule. Its signature check drops an event for the other loop, and a webhook for another domain only starts a status check of the domain in Settings.
 

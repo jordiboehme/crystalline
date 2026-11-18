@@ -327,7 +327,6 @@
         "excludeTools": [
           "delete_engram",
           "move_engram",
-          "split_engram",
           "remove_domain",
           "add_domain",
           "configure",

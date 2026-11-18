@@ -175,11 +175,11 @@ mod tests {
                 "mcp__crystalline",
                 "--disallowedTools",
                 "mcp__crystalline__delete_engram,mcp__crystalline__move_engram,\
-                 mcp__crystalline__split_engram,mcp__crystalline__remove_domain,\
-                 mcp__crystalline__add_domain,mcp__crystalline__configure,\
-                 mcp__crystalline__provision,mcp__crystalline__share_changes,\
-                 mcp__crystalline__update_domain,mcp__crystalline__resolve_conflict,\
-                 mcp__crystalline__withdraw_proposal,mcp__crystalline__discard_changes",
+                 mcp__crystalline__remove_domain,mcp__crystalline__add_domain,\
+                 mcp__crystalline__configure,mcp__crystalline__provision,\
+                 mcp__crystalline__share_changes,mcp__crystalline__update_domain,\
+                 mcp__crystalline__resolve_conflict,mcp__crystalline__withdraw_proposal,\
+                 mcp__crystalline__discard_changes",
                 "--output-format",
                 "stream-json",
                 "--verbose",
