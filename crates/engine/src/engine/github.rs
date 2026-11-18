@@ -1232,7 +1232,7 @@ impl Engine {
             login: link.as_ref().map(|l| l.login.clone()),
             github_id: link.as_ref().map(|l| l.github_id),
             host: link.as_ref().map(|l| l.host.clone()),
-            linked_at: link.as_ref().map(|l| l.linked_at),
+            linked_at: link.as_ref().map(|l| l.linked_at.into_chrono()),
             token_live: link.as_ref().is_some_and(|l| l.token_live),
             pending,
             error,

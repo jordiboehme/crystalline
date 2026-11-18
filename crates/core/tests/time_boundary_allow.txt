@@ -37,10 +37,6 @@ crates/engine/src/nudge.rs
 crates/engine/src/origin.rs
 crates/engine/src/poller.rs
 crates/engine/src/registration.rs
-crates/identity/Cargo.toml
-crates/identity/src/auth_store.rs
-crates/identity/src/auth_store/tests.rs
-crates/identity/src/join.rs
 crates/rest/Cargo.toml
 crates/rest/src/domains.rs
 crates/rest/src/github_settings.rs

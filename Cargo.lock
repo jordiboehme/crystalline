@@ -1512,7 +1512,6 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
- "chrono",
  "crystalline-core",
  "crystalline-identity",
  "crystalline-index",

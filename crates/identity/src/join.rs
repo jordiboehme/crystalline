@@ -72,6 +72,7 @@
 //! holder there is - so a table of joins would only ever be a table of joins
 //! that are already over.
 
+use crystalline_core::time;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -221,10 +222,10 @@ pub struct Join {
 pub fn grant_deadline(expires_at: Option<&str>) -> Option<Instant> {
     let at = expires_at?;
     let now = Instant::now();
-    let Ok(at) = chrono::DateTime::parse_from_rfc3339(at) else {
+    let Some(at) = time::parse_rfc3339(at) else {
         return Some(now);
     };
-    let left = at.signed_duration_since(chrono::Utc::now());
+    let left = at.stamp().since(time::now());
     Some(now + left.to_std().unwrap_or(Duration::ZERO))
 }
 

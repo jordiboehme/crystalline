@@ -39,7 +39,7 @@ async fn a_delivery_is_remembered_once() {
 #[tokio::test]
 async fn a_delivery_older_than_a_day_is_forgotten() {
     let (store, _guard) = test_store().await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     assert!(
         store
             .remember_delivery_at("old", now - 86_401)
@@ -4202,7 +4202,7 @@ async fn a_refresh_rotates_both_tokens_and_the_predecessor_stops_working() {
             "UPDATE oauth_grants SET refresh_expires_at = ?2 WHERE id = ?1",
             vec![
                 Value::Integer(first.id),
-                Value::Integer(chrono::Utc::now().timestamp() + 60),
+                Value::Integer(time::now().unix_seconds() + 60),
             ],
         )
         .await
@@ -4239,7 +4239,7 @@ async fn a_refresh_rotates_both_tokens_and_the_predecessor_stops_working() {
     );
     assert!(
         grant_int(&store, first.id, "refresh_expires_at").await
-            > chrono::Utc::now().timestamp() + OAUTH_REFRESH_TTL_SECS - 60,
+            > time::now().unix_seconds() + OAUTH_REFRESH_TTL_SECS - 60,
         "the new refresh token's thirty days start at the rotation"
     );
     assert!(
@@ -4334,7 +4334,7 @@ async fn a_replayed_refresh_token_revokes_the_whole_grant() {
 async fn a_token_two_rotations_back_is_a_replay() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let first = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -4495,7 +4495,7 @@ async fn revoking_a_grant_stops_both_tokens_and_removing_the_account_sweeps_them
     );
     assert!(listed[0].last_used.is_none());
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&listed[0].refresh_expires_at).is_ok(),
+        time::parse_rfc3339(&listed[0].refresh_expires_at).is_some(),
         "the expiry a person reads is RFC 3339: {}",
         listed[0].refresh_expires_at
     );
@@ -4777,7 +4777,7 @@ async fn only_an_allowed_authorization_stamps_a_registration_as_used() {
 
     // Two hours later that row is still on the short clock, because
     // nothing it has been through counts as an authorization.
-    let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    let two_hours_ago = (time::now() - time::hours(2)).rfc3339();
     store
         .db
         .execute(
@@ -4865,8 +4865,8 @@ async fn a_registration_that_never_authorized_expires_within_the_hour() {
     // Two hours ago for all three of the old ones, and the one that
     // authorized did so half an hour ago: well past the hour, nowhere near
     // the thirty days.
-    let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-    let half_hour_ago = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+    let two_hours_ago = (time::now() - time::hours(2)).rfc3339();
+    let half_hour_ago = (time::now() - time::minutes(30)).rfc3339();
     for id in [
         &never.client_id,
         &authorized.client_id,
@@ -5104,7 +5104,7 @@ async fn close_refresh_window(store: &AuthStore, id: i64) {
 async fn two_parallel_refreshes_inside_the_window_both_succeed() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5181,7 +5181,7 @@ async fn two_parallel_refreshes_inside_the_window_both_succeed() {
 async fn the_same_token_after_the_window_revokes_the_grant() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5267,7 +5267,7 @@ async fn the_grace_window_keeps_the_client_and_account_checks() {
         )
         .await
         .unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5341,7 +5341,7 @@ async fn token_row_exists(store: &AuthStore, refresh_token: &str) -> bool {
 async fn a_flood_of_copies_inside_the_window_revokes_and_evicts_nobody() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5407,7 +5407,7 @@ async fn a_flood_of_copies_inside_the_window_revokes_and_evicts_nobody() {
 async fn a_reissue_into_a_full_live_set_is_a_replay() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5453,7 +5453,7 @@ async fn a_reissue_into_a_full_live_set_is_a_replay() {
 async fn a_token_many_rotations_back_still_replays() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5487,7 +5487,7 @@ async fn a_token_many_rotations_back_still_replays() {
 async fn a_rotated_token_is_forgotten_after_thirty_days() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5537,7 +5537,7 @@ async fn a_rotated_token_is_forgotten_after_thirty_days() {
 async fn a_siblings_rotation_closes_the_window_for_its_parent() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5575,7 +5575,7 @@ async fn a_siblings_rotation_closes_the_window_for_its_parent() {
 async fn a_rotation_time_in_the_future_is_no_reissue() {
     let (store, _guard) = test_store().await;
     let client = oauth_cast(&store).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     let issued = store
         .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
         .await
@@ -5672,7 +5672,7 @@ async fn an_explicit_revoke_is_recorded_and_listed_for_a_while() {
     assert!(json.contains("\"reason\":\"revoked\""), "{json}");
     assert!(!json.contains(OAUTH_ACCESS_PREFIX) && !json.contains(OAUTH_REFRESH_PREFIX));
 
-    let later = chrono::Utc::now().timestamp() + OAUTH_ENDED_KEPT_SECS + 1;
+    let later = time::now().unix_seconds() + OAUTH_ENDED_KEPT_SECS + 1;
     assert!(
         store
             .list_ended_oauth_grants_at("ada", later)
@@ -5705,7 +5705,7 @@ async fn a_migrated_predecessor_inside_the_window_is_reissued() {
     let (id, client_id) = {
         let store = AuthStore::open(&path).await.unwrap();
         let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let id = store
             .returned_id(
                 "INSERT INTO oauth_grants
@@ -5720,7 +5720,7 @@ async fn a_migrated_predecessor_inside_the_window_is_reissued() {
                     Value::Text(token_hash("cor_current")),
                     Value::Text(token_hash(&previous)),
                     Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(time::now().rfc3339()),
                 ],
             )
             .await
@@ -5729,7 +5729,7 @@ async fn a_migrated_predecessor_inside_the_window_is_reissued() {
     };
     let store = AuthStore::open(&path).await.unwrap();
     let rotated_at = token_int(&store, &previous, "rotated_at").await.unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = time::now().unix_seconds();
     assert!(
         (now - 12..=now - 8).contains(&rotated_at),
         "the rotation time is the current access token's issue: {rotated_at} vs {now}"
@@ -5760,7 +5760,7 @@ async fn an_old_store_with_a_previous_refresh_hash_keeps_working() {
     let id = {
         let store = AuthStore::open(&path).await.unwrap();
         let client = oauth_cast(&store).await;
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         // What the 0.32.0 issue and rotation wrote, column by column.
         store
             .returned_id(
@@ -5776,7 +5776,7 @@ async fn an_old_store_with_a_previous_refresh_hash_keeps_working() {
                     Value::Text(token_hash(&refresh)),
                     Value::Text(token_hash(&previous)),
                     Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(time::now().rfc3339()),
                 ],
             )
             .await
@@ -6845,7 +6845,7 @@ mod postgres {
                 .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
                 .await
                 .unwrap();
-            let now = chrono::Utc::now().timestamp();
+            let now = time::now().unix_seconds();
             let (one, two) = tokio::join!(
                 a.refresh_oauth_grant_at(&grant.refresh_token, &client.client_id, None, now),
                 b.refresh_oauth_grant_at(&grant.refresh_token, &client.client_id, None, now),
@@ -6880,7 +6880,7 @@ mod postgres {
         store.session_user(&session.token).await.unwrap().unwrap();
         store.mark_seen("ada").await.unwrap();
         assert_eq!(store.user("ada").await.unwrap().unwrap().last_seen, first);
-        let old = (chrono::Utc::now() - chrono::Duration::seconds(61)).to_rfc3339();
+        let old = (time::now() - time::seconds(61)).rfc3339();
         store
             .db
             .execute(
