@@ -19,6 +19,10 @@ use crystalline_service::instance::{LockInfo, StartMode};
 /// `update now` and `doctor` remove.
 pub(crate) const OLD_EXE: &str = "crystalline.old.exe";
 
+/// The name the zip steps copy the new exe to beside the running one,
+/// before any rename; a leftover goes with [`OLD_EXE`]'s.
+pub(crate) const NEW_EXE: &str = "crystalline.new.exe";
+
 /// The file the steps are saved to in the download folder.
 pub(crate) const STEPS_FILE: &str = "steps.txt";
 
@@ -210,29 +214,44 @@ fn start_again(daemon: Option<&DaemonStart>, exe: &str) -> String {
     text
 }
 
-/// The zip steps (S22): close the sessions, rename the running exe to
-/// [`OLD_EXE`], copy the new one in, check its version, and run `status`,
-/// which hands the daemon over to the new version with its start options.
+/// The zip steps (S22): close the sessions, copy the new exe in beside the
+/// running one as [`NEW_EXE`], rename the running exe to [`OLD_EXE`] and
+/// the new one to its name, check its version, and run `status`, which
+/// hands the daemon over to the new version with its start options. The
+/// copy comes first: a download folder that is gone, or a folder that
+/// needs administrator rights, stops the steps before anything in use
+/// changed, so following saved steps never leaves the install without its
+/// exe.
 pub(crate) fn zip_steps(download: &Path, canonical_exe: &Path, new_version: &Precedence) -> String {
-    let exe = ps_quoted(&display_path(canonical_exe));
+    let exe_text = display_path(canonical_exe);
+    let (folder, name) = exe_text
+        .rsplit_once('\\')
+        .unwrap_or(("", exe_text.as_str()));
+    let exe = ps_quoted(&exe_text);
+    let staged = ps_quoted(&format!(r"{folder}\{NEW_EXE}"));
+    let old = ps_quoted(&format!(r"{folder}\{OLD_EXE}"));
     let new = ps_quoted(&format!(r"{}\crystalline.exe", folder_text(download)));
+    let name = ps_quoted(name);
     let mut out = String::from(
-        "Replace crystalline.exe with these steps in Windows PowerShell or PowerShell 7:\n",
+        "Replace crystalline.exe with these steps in Windows PowerShell or PowerShell 7. Run them one at a time and stop at the first error:\n",
     );
     out.push_str(&format!("1. {CLOSE_SESSIONS}\n"));
     out.push_str(&format!(
-        "2. Rename-Item -LiteralPath {exe} -NewName {}\n",
+        "2. Copy-Item -LiteralPath {new} -Destination {staged}\n"
+    ));
+    out.push_str(&format!(
+        "3. Rename-Item -LiteralPath {exe} -NewName {}\n",
         ps_quoted(OLD_EXE)
     ));
     out.push_str(&format!(
-        "3. Copy-Item -LiteralPath {new} -Destination {exe}\n"
+        "4. Rename-Item -LiteralPath {staged} -NewName {name}\n   If this fails, put the old one back: Rename-Item -LiteralPath {old} -NewName {name}\n"
     ));
     out.push_str(&format!(
-        "4. & {exe} --version\n   It must print crystalline {}.\n",
+        "5. & {exe} --version\n   It must print crystalline {}.\n",
         new_version.render()
     ));
     out.push_str(&format!(
-        "5. & {exe} status\n   It hands the daemon over to the new version, started as before.\n"
+        "6. & {exe} status\n   It hands the daemon over to the new version, started as before.\n"
     ));
     out
 }
@@ -256,19 +275,23 @@ pub(crate) fn steps_file_bytes(steps: &str) -> Vec<u8> {
     bytes
 }
 
-/// Remove a [`OLD_EXE`] an earlier update left beside `canonical_exe`: only
-/// a plain file of that exact name. Best effort: an exe still running or a
-/// folder this user may not write keeps it. Hands back the path when one
-/// is still there.
+/// Remove the [`OLD_EXE`] and [`NEW_EXE`] an earlier update left beside
+/// `canonical_exe`: only plain files of those exact names. Best effort: an
+/// exe still running or a folder this user may not write keeps it. Hands
+/// back the path of an [`OLD_EXE`] that is still there.
 pub(crate) fn remove_old_exe(canonical_exe: &Path) -> Option<std::path::PathBuf> {
-    let old = canonical_exe.parent()?.join(OLD_EXE);
-    let meta = std::fs::symlink_metadata(&old).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    match std::fs::remove_file(&old) {
-        Ok(()) => None,
-        Err(_) => Some(old),
+    let dir = canonical_exe.parent()?;
+    let _ = remove_plain_file(&dir.join(NEW_EXE));
+    let old = dir.join(OLD_EXE);
+    (!remove_plain_file(&old)).then_some(old)
+}
+
+/// Remove `path` when it is a plain file; `false` only when one is there
+/// and could not be removed.
+fn remove_plain_file(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => std::fs::remove_file(path).is_ok(),
+        _ => true,
     }
 }
 
@@ -483,15 +506,37 @@ mod tests {
         );
         assert_eq!(
             text,
-            r"Replace crystalline.exe with these steps in Windows PowerShell or PowerShell 7:
+            r"Replace crystalline.exe with these steps in Windows PowerShell or PowerShell 7. Run them one at a time and stop at the first error:
 1. Close every agent session that uses Crystalline (Claude Code, Claude Desktop, Codex, Cursor and others): each one holds crystalline.exe open.
-2. Rename-Item -LiteralPath 'C:\Users\a\tools\crystalline\crystalline.exe' -NewName 'crystalline.old.exe'
-3. Copy-Item -LiteralPath 'C:\Users\a\AppData\Local\crystalline\cache\updates\v0.34.0\crystalline.exe' -Destination 'C:\Users\a\tools\crystalline\crystalline.exe'
-4. & 'C:\Users\a\tools\crystalline\crystalline.exe' --version
+2. Copy-Item -LiteralPath 'C:\Users\a\AppData\Local\crystalline\cache\updates\v0.34.0\crystalline.exe' -Destination 'C:\Users\a\tools\crystalline\crystalline.new.exe'
+3. Rename-Item -LiteralPath 'C:\Users\a\tools\crystalline\crystalline.exe' -NewName 'crystalline.old.exe'
+4. Rename-Item -LiteralPath 'C:\Users\a\tools\crystalline\crystalline.new.exe' -NewName 'crystalline.exe'
+   If this fails, put the old one back: Rename-Item -LiteralPath 'C:\Users\a\tools\crystalline\crystalline.old.exe' -NewName 'crystalline.exe'
+5. & 'C:\Users\a\tools\crystalline\crystalline.exe' --version
    It must print crystalline 0.34.0.
-5. & 'C:\Users\a\tools\crystalline\crystalline.exe' status
+6. & 'C:\Users\a\tools\crystalline\crystalline.exe' status
    It hands the daemon over to the new version, started as before.
 "
+        );
+    }
+
+    /// The copy from the download folder comes before any rename of the
+    /// running exe: a missing source stops the steps with the install
+    /// intact.
+    #[test]
+    fn zip_steps_copy_before_anything_is_renamed() {
+        let text = zip_steps(
+            Path::new(DOWNLOAD),
+            Path::new(r"C:\t\crystalline.exe"),
+            &Precedence::parse("0.34.0").unwrap(),
+        );
+        let copy = text.find("Copy-Item").unwrap();
+        let first_rename = text.find("Rename-Item").unwrap();
+        assert!(copy < first_rename, "{text}");
+        assert_eq!(text.matches("Copy-Item").count(), 1, "{text}");
+        assert!(
+            !text[..first_rename].contains(r"-Destination 'C:\t\crystalline.exe'"),
+            "the copy never targets the running exe: {text}"
         );
     }
 
@@ -604,6 +649,12 @@ mod tests {
         assert!(!dir.path().join(OLD_EXE).exists());
         assert!(dir.path().join("crystalline.old.exe.bak").exists());
         assert_eq!(std::fs::read(&exe).unwrap(), b"current");
+        std::fs::write(dir.path().join(NEW_EXE), b"half copied").unwrap();
+        assert_eq!(remove_old_exe(&exe), None);
+        assert!(
+            !dir.path().join(NEW_EXE).exists(),
+            "a leftover new exe goes too"
+        );
         std::fs::create_dir(dir.path().join(OLD_EXE)).unwrap();
         assert_eq!(remove_old_exe(&exe), None, "a folder is left alone");
         assert!(dir.path().join(OLD_EXE).is_dir());

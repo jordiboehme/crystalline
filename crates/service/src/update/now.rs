@@ -16,7 +16,7 @@ use crystalline_core::update::{
 use crystalline_core::version::release_version;
 use fs4::FileExt;
 
-use super::client::{UpdateError, download};
+use super::client::{UpdateError, download_base, download_from};
 
 /// The folder under the cache folder that holds the lock and the downloads.
 const UPDATES_DIR: &str = "updates";
@@ -119,6 +119,61 @@ pub async fn fetch_verified(
     asset: &str,
     dir: &Path,
 ) -> Result<(PathBuf, Checks), UpdateError> {
+    fetch_verified_from(&ReleaseSource::here(), release, asset, dir).await
+}
+
+/// Where [`fetch_verified_from`] downloads from and which keys it trusts.
+/// A release build has only [`ReleaseSource::here`]: GitHub and the
+/// compiled-in keys. A debug build's test can name a local server and an
+/// extra key without touching the process environment (S11).
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseSource {
+    #[cfg(debug_assertions)]
+    test: Option<(String, String)>,
+}
+
+impl ReleaseSource {
+    /// GitHub and the trusted keys (in a debug build also the
+    /// environment seams).
+    pub fn here() -> ReleaseSource {
+        ReleaseSource::default()
+    }
+
+    /// A debug build's test source: the web root `base` and the extra
+    /// trusted public key `key` (the text of a `.pub` file).
+    #[cfg(debug_assertions)]
+    pub fn for_test(base: &str, key: &str) -> ReleaseSource {
+        ReleaseSource {
+            test: Some((base.trim_end_matches('/').to_string(), key.to_string())),
+        }
+    }
+
+    fn base(&self) -> String {
+        #[cfg(debug_assertions)]
+        if let Some((base, _)) = &self.test {
+            return base.clone();
+        }
+        download_base()
+    }
+
+    fn keys(&self) -> std::io::Result<Vec<String>> {
+        #[allow(unused_mut)]
+        let mut keys = crystalline_core::update::trusted_keys()?;
+        #[cfg(debug_assertions)]
+        if let Some((_, key)) = &self.test {
+            keys.push(key.clone());
+        }
+        Ok(keys)
+    }
+}
+
+/// [`fetch_verified`] from `source`.
+pub async fn fetch_verified_from(
+    source: &ReleaseSource,
+    release: &LatestRelease,
+    asset: &str,
+    dir: &Path,
+) -> Result<(PathBuf, Checks), UpdateError> {
     if release.from_api && !release.digests.contains_key(asset) {
         return Err(UpdateError::NoDigest);
     }
@@ -126,7 +181,7 @@ pub async fn fetch_verified(
     remove_staging_leftovers(dir);
     let names = [asset, SUMS, SUMS_SIG];
     let staging = names.map(|name| staged(dir, name));
-    let verified = fetch_and_verify(release, asset, &staging).await;
+    let verified = fetch_and_verify(source, release, asset, &staging).await;
     let checks = match verified {
         Ok(checks) => checks,
         Err(err) => {
@@ -245,14 +300,16 @@ fn remove_staging_leftovers(dir: &Path) {
 }
 
 async fn fetch_and_verify(
+    source: &ReleaseSource,
     release: &LatestRelease,
     asset: &str,
     [asset_path, sums_path, sig_path]: &[PathBuf; 3],
 ) -> Result<Checks, UpdateError> {
     let tag = release.tag.as_str();
-    let bytes = download(tag, asset, asset_path).await?;
-    let sums = download(tag, SUMS, sums_path).await?;
-    let sig = download(tag, SUMS_SIG, sig_path).await?;
+    let base = source.base();
+    let bytes = download_from(&base, tag, asset, asset_path).await?;
+    let sums = download_from(&base, tag, SUMS, sums_path).await?;
+    let sig = download_from(&base, tag, SUMS_SIG, sig_path).await?;
     let digest = Sha256Digest::of(&bytes);
     let mut checks = Checks::default();
     if release.from_api {
@@ -262,7 +319,7 @@ async fn fetch_and_verify(
     }
     let sig = std::str::from_utf8(&sig)
         .map_err(|_| UpdateError::Verify(crystalline_core::update::VerifyError::BadSignature))?;
-    let keys = crystalline_core::update::trusted_keys()?;
+    let keys = source.keys()?;
     let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
     let signed = verify_signature(&sums, sig, &keys, tag).map_err(UpdateError::Verify)?;
     checks.signature = true;

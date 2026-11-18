@@ -161,6 +161,19 @@ fn set_mode(file: &File, mode: u32) -> std::io::Result<()> {
     }
 }
 
+/// Open the extracted `new` without following a link (`O_NOFOLLOW`), so
+/// its mode and owner are set on the file the extract wrote, never on what
+/// a link put in its place points at.
+#[cfg(unix)]
+fn open_new(new: &Path) -> Result<File, UpdateError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(new)
+        .map_err(UpdateError::Swap)
+}
+
 /// Give `new` the permission bits of `canonical_exe` (masked to `0o777`),
 /// set on its open handle, so neither the umask nor the extract decides who
 /// may run the installed binary. An old exe that cannot be read leaves
@@ -172,7 +185,7 @@ fn keep_mode(new: &Path, canonical_exe: &Path) -> Result<(), UpdateError> {
         let mode = std::fs::metadata(canonical_exe)
             .map(|old| old.permissions().mode() & 0o777)
             .unwrap_or(0o755);
-        let file = File::open(new).map_err(UpdateError::Swap)?;
+        let file = open_new(new)?;
         set_mode(&file, mode).map_err(UpdateError::Swap)?;
     }
     #[cfg(not(unix))]
@@ -256,7 +269,7 @@ fn version_matches_within(
     let program = bin.to_str().ok_or(UpdateError::VersionMismatch)?;
     let printed = spawner
         .output_within(program, &["--version"], limit)
-        .map_err(|_| UpdateError::VersionMismatch)?;
+        .map_err(|_| UpdateError::DidNotRun)?;
     let expected = format!("crystalline {}", want.render());
     if printed.lines().next().map(str::trim_end) == Some(expected.as_str()) {
         Ok(())
@@ -285,7 +298,9 @@ fn match_owner(new: &Path, canonical_exe: &Path) -> Result<(), UpdateError> {
         // memory.
         if unsafe { libc::geteuid() } == 0 {
             let old = std::fs::metadata(canonical_exe).map_err(UpdateError::Swap)?;
-            std::os::unix::fs::chown(new, Some(old.uid()), Some(old.gid()))
+            // On the handle (`fchown`), never by path through a link.
+            let file = open_new(new)?;
+            std::os::unix::fs::fchown(&file, Some(old.uid()), Some(old.gid()))
                 .map_err(UpdateError::Swap)?;
         }
     }
@@ -511,6 +526,28 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), b"the new binary", "swapped");
         let mode = std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "{mode:o}");
+    }
+
+    /// The mode is set through a handle opened without following a link:
+    /// a link put where the extracted file was is refused, and its target
+    /// keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_place_of_the_new_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let old = dir.path().join("crystalline");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let new = dir.path().join(format!("{NEW_PREFIX}1"));
+        std::os::unix::fs::symlink(&target, &new).unwrap();
+        let err = keep_mode(&new, &old).unwrap_err();
+        assert!(matches!(err, UpdateError::Swap(_)), "{err}");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// Any old mode is kept, group and other bits included.
@@ -745,7 +782,8 @@ mod tests {
             Duration::from_millis(300),
         )
         .unwrap_err();
-        assert!(matches!(err, UpdateError::VersionMismatch), "{err}");
+        assert!(matches!(err, UpdateError::DidNotRun), "{err}");
+        assert_eq!(err.to_string(), "the new binary did not run");
         assert!(
             began.elapsed() < Duration::from_secs(10),
             "{:?}",

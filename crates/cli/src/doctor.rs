@@ -7499,7 +7499,7 @@ mod tests {
         };
         let current = crystalline_core::version::Precedence::parse("0.34.0").unwrap();
         let lines =
-            crate::update::report_lines(&facts, &current, crystalline_core::time::now(), 24);
+            crate::update::report_lines(&facts, &current, crystalline_core::time::now(), 24, None);
         let report = DoctorReport {
             update: Some(UpdateDoctor { facts, lines }),
             ..DoctorReport::default()
@@ -7507,7 +7507,7 @@ mod tests {
         let out = render_human(&report);
         assert!(
             out.contains(
-                "update:\n  install: homebrew, official build\n  update check off (not turned on); turn it on with: crystalline update auto on\n"
+                "update:\n  install: homebrew, official build\n  update check off (not turned on)\n"
             ),
             "{out}"
         );

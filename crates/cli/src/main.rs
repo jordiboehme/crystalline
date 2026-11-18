@@ -2569,6 +2569,11 @@ fn run() -> anyhow::Result<()> {
             cmd: UpdateCommand::Check { ignore_age },
         }) => on_runtime(move || update::check(ignore_age, cli.json)),
         Some(Command::Update {
+            cmd: UpdateCommand::Now { .. },
+        }) if cli.json => Err(anyhow::anyhow!(
+            "update now prints text only: run it without --json (update check --json gives the plan as JSON)"
+        )),
+        Some(Command::Update {
             cmd: UpdateCommand::Now { yes, ignore_age },
         }) => on_runtime(move || update::now(yes, ignore_age)),
         Some(Command::Update {

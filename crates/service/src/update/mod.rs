@@ -18,7 +18,8 @@ pub use client::{UpdateError, download, latest_release};
 pub use codesign::codesign_ok;
 pub use finish::{Handover, hand_over};
 pub use now::{
-    UpdateLock, download_dir, extract_zip_member, fetch_verified, remove_older_tags, take_lock,
+    ReleaseSource, UpdateLock, download_dir, extract_zip_member, fetch_verified,
+    fetch_verified_from, remove_older_tags, take_lock,
 };
 pub use spawn::{Spawner, SystemSpawner};
 pub use swap::{

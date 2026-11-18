@@ -100,6 +100,9 @@ pub enum UpdateError {
     Codesign,
     /// The new binary does not print the release's version.
     VersionMismatch,
+    /// The new binary did not run, or did not end within its time limit
+    /// (a C library that is too old, a `noexec` mount).
+    DidNotRun,
     /// The new binary could not be put over the old one.
     Swap(std::io::Error),
 }
@@ -137,6 +140,7 @@ impl std::fmt::Display for UpdateError {
             UpdateError::VersionMismatch => {
                 f.write_str("the new binary does not print the release's version")
             }
+            UpdateError::DidNotRun => f.write_str("the new binary did not run"),
             UpdateError::Swap(err) => write!(f, "cannot replace the binary: {err}"),
         }
     }
@@ -228,6 +232,17 @@ pub async fn latest_release(etag: Option<&str>) -> Result<Lookup, UpdateError> {
 /// written beside `dest` and renamed into place, so `dest` is never left
 /// half written; it is still unverified until the caller's checks pass.
 pub async fn download(tag: &str, asset: &str, dest: &Path) -> Result<Vec<u8>, UpdateError> {
+    download_from(&download_base(), tag, asset, dest).await
+}
+
+/// [`download`] from the web root `base`: [`download_base`] unless a debug
+/// build's test named another ([`super::now::ReleaseSource`]).
+pub(crate) async fn download_from(
+    base: &str,
+    tag: &str,
+    asset: &str,
+    dest: &Path,
+) -> Result<Vec<u8>, UpdateError> {
     if release_version(tag).is_none() {
         return Err(UpdateError::NotARelease);
     }
@@ -247,10 +262,7 @@ pub async fn download(tag: &str, asset: &str, dest: &Path) -> Result<Vec<u8>, Up
         .redirect(download_redirects())
         .build()?;
     let response = client
-        .get(format!(
-            "{}/{REPO}/releases/download/{tag}/{asset}",
-            download_base()
-        ))
+        .get(format!("{base}/{REPO}/releases/download/{tag}/{asset}"))
         .send()
         .await?;
     let status = response.status();
@@ -402,7 +414,7 @@ fn api_base() -> String {
 /// The web root of the redirect and the downloads; a debug build takes
 /// `CRYSTALLINE_TEST_UPDATE_DOWNLOAD` instead when it is set (S11).
 #[cfg(debug_assertions)]
-fn download_base() -> String {
+pub(crate) fn download_base() -> String {
     std::env::var("CRYSTALLINE_TEST_UPDATE_DOWNLOAD")
         .map(|base| base.trim_end_matches('/').to_string())
         .unwrap_or_else(|_| WEB_BASE.to_string())
@@ -411,7 +423,7 @@ fn download_base() -> String {
 /// The web root of the redirect and the downloads. A release build has no
 /// seam.
 #[cfg(not(debug_assertions))]
-fn download_base() -> String {
+pub(crate) fn download_base() -> String {
     WEB_BASE.to_string()
 }
 

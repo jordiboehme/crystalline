@@ -591,6 +591,20 @@ fn an_unofficial_build_refuses_before_any_download() {
     }
 }
 
+/// `update now` has no JSON output, so `--json` is refused before
+/// anything else, not ignored.
+#[test]
+fn now_refuses_json() {
+    let home = tempfile::tempdir().unwrap();
+    let out = isolated(home.path(), &["--json", "update", "now"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("update now prints text only: run it without --json"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
 #[test]
 fn now_documents_its_exit_codes_and_flags() {
     let out = crate::common::crystalline()
@@ -808,9 +822,7 @@ fn status_with_the_check_off_ignores_the_cache() {
     let stdout = text(&out.stdout);
     assert!(out.status.success(), "{stdout}{}", text(&out.stderr));
     assert!(
-        stdout.contains(
-            "\nUpdates: update check off (not turned on); turn it on with: crystalline update auto on\n"
-        ),
+        stdout.contains("\nUpdates: update check off (not turned on)\n"),
         "{stdout}"
     );
     assert!(!stdout.contains("99.0.0"), "{stdout}");

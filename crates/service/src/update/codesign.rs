@@ -39,14 +39,18 @@ pub fn codesign_args(bin: &str) -> Vec<String> {
     ]
 }
 
+/// How long `codesign` may take before it is killed and the check fails.
+pub const CODESIGN_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Check the code signature of `bin` against [`codesign_requirement`]. Any
-/// failure, `codesign` itself missing included, is [`UpdateError::Codesign`].
+/// failure, `codesign` itself missing or past [`CODESIGN_TIME_LIMIT`]
+/// included, is [`UpdateError::Codesign`].
 pub fn codesign_ok(spawner: &dyn Spawner, bin: &std::path::Path) -> Result<(), UpdateError> {
     let bin = bin.to_str().ok_or(UpdateError::Codesign)?;
     let args = codesign_args(bin);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     spawner
-        .output(CODESIGN, &args)
+        .output_within(CODESIGN, &args, CODESIGN_TIME_LIMIT)
         .map(|_| ())
         .map_err(|_| UpdateError::Codesign)
 }

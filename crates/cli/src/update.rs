@@ -20,9 +20,9 @@ use crystalline_core::update::{
 use crystalline_core::version::{Precedence, release_tag, release_version};
 use crystalline_service::update::swap::finish_after_swap;
 use crystalline_service::update::{
-    Handover, Spawner, SystemSpawner, UpdateError, UpdateLock, download_dir, extract_zip_member,
-    fetch_verified, hand_over, install_tarball, latest_release, remove_older_tags,
-    root_owned_install_dir, take_lock, under_sudo, writable_install_dir,
+    Handover, ReleaseSource, Spawner, SystemSpawner, UpdateError, UpdateLock, download_dir,
+    extract_zip_member, fetch_verified_from, hand_over, install_tarball, latest_release,
+    remove_older_tags, root_owned_install_dir, take_lock, under_sudo, writable_install_dir,
 };
 use serde::{Serialize, Serializer};
 
@@ -283,6 +283,17 @@ pub(crate) async fn check(ignore_age: bool, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
         print!("{}", render_plan(&plan));
+        // A tar.gz folder this process cannot write: say now what `update
+        // now` would say, with the sudo hint for a folder of root's.
+        if plan.update_available()
+            && detection.method == InstallMethod::Tarball
+            && let Some(refusal) = tarball_refusal(
+                crystalline_service::update::detect_here().exe.as_deref(),
+                effective_uid(),
+            )
+        {
+            println!("{refusal}");
+        }
     }
     match plan.exit_code() {
         0 => Ok(()),
@@ -410,6 +421,10 @@ pub(crate) fn gate_note(since: Option<Stamp>, gate: Gate) -> Option<&'static str
 /// The line a plan-only `update now` ends with (U10).
 const RUN_WITH_YES: &str = "Nothing was changed. Run crystalline update now --yes to update.";
 
+/// [`RUN_WITH_YES`] for a run under `sudo`, which needs `sudo` again.
+const RUN_WITH_SUDO_YES: &str =
+    "Nothing was changed. Run sudo crystalline update now --yes to update.";
+
 /// What `brew upgrade` is said with when it left the version where it was
 /// (S13).
 pub(crate) const BREW_DID_NOT_UPGRADE: &str = "brew did not upgrade (tap not refreshed?)";
@@ -450,6 +465,9 @@ pub(crate) struct NowContext<'a> {
     pub(crate) daemon: Option<DaemonStart>,
     /// `%ProgramFiles%`, which names the MSI's default folder.
     pub(crate) program_files: Option<String>,
+    /// Where the .deb, MSI and zip are downloaded from and which keys
+    /// verify them.
+    pub(crate) source: ReleaseSource,
     /// When the run started.
     pub(crate) now: Stamp,
 }
@@ -505,6 +523,7 @@ pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
         exe: detected.exe,
         daemon: running_daemon(),
         program_files: std::env::var("ProgramFiles").ok(),
+        source: ReleaseSource::here(),
         now: time::now(),
     };
     let result = run_now(&context, yes, ignore_age).await;
@@ -565,6 +584,26 @@ pub(crate) fn tarball_refusal(exe: Option<&Path>, euid: Option<u32>) -> Option<S
     ))
 }
 
+/// What a report says to do about an available update of the tar.gz
+/// install at `exe` when this process cannot write its folder: `sudo` for
+/// a folder of root's (when not root already), else that `update now`
+/// does nothing here. `None` when the folder is writable, so `crystalline
+/// update now` is the action.
+pub(crate) fn tarball_action(exe: Option<&Path>, euid: Option<u32>) -> Option<String> {
+    let exe = exe?;
+    if writable_install_dir(exe) {
+        return None;
+    }
+    if root_owned_install_dir(exe) && euid != Some(0) {
+        return Some("run: sudo crystalline update now".to_string());
+    }
+    let dir = exe.parent().unwrap_or(exe);
+    Some(format!(
+        "update now does nothing here (you cannot write to {})",
+        display_path(dir)
+    ))
+}
+
 /// [`now`] once its parts are known: the lock, the lookup and the action.
 /// Hands back the exit code.
 pub(crate) async fn run_now(
@@ -590,7 +629,6 @@ pub(crate) async fn run_now(
         Lookup::Fresh(release, _) => release,
         Lookup::NotModified => anyhow::bail!("GitHub's answer could not be read"),
     };
-    remove_older_tags(&context.cache_dir, &release.tag);
     act(context, &release, yes, ignore_age, &mut lock).await
 }
 
@@ -649,7 +687,14 @@ pub(crate) async fn act(
             }
         }
         Consent::PlanOnly => {
-            println!("{RUN_WITH_YES}");
+            println!(
+                "{}",
+                if context.sudo {
+                    RUN_WITH_SUDO_YES
+                } else {
+                    RUN_WITH_YES
+                }
+            );
             return Ok(EXIT_UPDATE_AVAILABLE);
         }
     }
@@ -664,7 +709,10 @@ pub(crate) async fn act(
         InstallMethod::Deb => {
             let asset = asset_name(method, &release.version).ok_or(UpdateError::NoAsset)?;
             let dir = download_dir(&context.cache_dir, &release.tag);
-            let (path, checks) = fetch_verified(release, &asset, &dir).await?;
+            println!("Downloading {asset}");
+            let (path, checks) =
+                fetch_verified_from(&context.source, release, &asset, &dir).await?;
+            remove_older_tags(&context.cache_dir, &release.tag);
             println!("{}", checks_line(&checks, &release.tag));
             println!("Downloaded: {}", display_path(&path));
             print!("{}", apt_steps(&dir, &asset, context.euid, context.sudo));
@@ -685,6 +733,7 @@ pub(crate) async fn act(
             let asset = asset_name(method, &release.version).ok_or(UpdateError::NoAsset)?;
             let member = archive_member(&release.version).ok_or(UpdateError::NoAsset)?;
             let dir = download_dir(&context.cache_dir, &release.tag);
+            println!("Downloading {asset}");
             let checks = install_tarball(
                 context.spawner,
                 release,
@@ -695,6 +744,7 @@ pub(crate) async fn act(
                 cfg!(target_os = "macos"),
             )
             .await?;
+            remove_older_tags(&context.cache_dir, &release.tag);
             println!("{}", checks_line(&checks, &release.tag));
             println!(
                 "Replaced {} with {}.",
@@ -728,7 +778,12 @@ pub(crate) async fn windows_steps(
         .with_context(|| refused_line(&Refusal::Unknown))?;
     let leftover = update_windows::remove_old_exe(exe);
     let dir = download_dir(&context.cache_dir, &release.tag);
-    let (path, checks) = fetch_verified(release, asset, &dir).await?;
+    println!("Downloading {asset}");
+    let (path, checks) = fetch_verified_from(&context.source, release, asset, &dir).await?;
+    // Only now, with this release verified, do older download folders go
+    // (a gated, declined or failed run removes nothing), and never this
+    // one, which the saved steps point into.
+    remove_older_tags(&context.cache_dir, &release.tag);
     println!("{}", checks_line(&checks, &release.tag));
     println!("Downloaded: {}", display_path(&path));
     let steps = if context.detection.method == InstallMethod::Zip {
@@ -736,7 +791,7 @@ pub(crate) async fn windows_steps(
         let mut steps = String::new();
         if let Some(old) = &leftover {
             steps.push_str(&format!(
-                "{} is still there and in use; delete it once nothing runs it, before step 2.\n",
+                "{} is still there and in use; delete it once nothing runs it, before step 3.\n",
                 display_path(old)
             ));
         }
@@ -800,10 +855,16 @@ pub(crate) fn brew_upgrade(
         anyhow::bail!("brew upgrade failed (exit code {code})");
     }
     let unreadable = "brew upgrade ran, but the installed version could not be read";
-    let prefix = spawner.output(brew, &["--prefix"]).context(unreadable)?;
+    let prefix = spawner
+        .output_within(brew, &["--prefix"], BREW_PREFIX_TIME_LIMIT)
+        .context(unreadable)?;
     let binary = Path::new(prefix.trim()).join("bin").join("crystalline");
     let printed = spawner
-        .output(&binary.to_string_lossy(), &["--version"])
+        .output_within(
+            &binary.to_string_lossy(),
+            &["--version"],
+            crystalline_service::update::swap::VERSION_TIME_LIMIT,
+        )
         .context(unreadable)?;
     let installed = printed
         .lines()
@@ -818,6 +879,9 @@ pub(crate) fn brew_upgrade(
         anyhow::bail!(BREW_DID_NOT_UPGRADE)
     }
 }
+
+/// How long `brew --prefix` may take after the upgrade.
+const BREW_PREFIX_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What a tar.gz update says under `sudo` instead of running `update
 /// finish` (S5).
@@ -846,8 +910,16 @@ pub(crate) fn after_swap(spawner: &dyn Spawner, exe: &Path, sudo: bool) -> anyho
         return Ok(0);
     }
     println!("Running: {} update finish", display_path(exe));
-    let code = finish_after_swap(spawner, exe)
-        .context("the binary is updated, but update finish could not be started")?;
+    let code = finish_after_swap(spawner, exe).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::TimedOut {
+            anyhow::anyhow!(
+                "the binary is updated, but update finish did not finish in time: run crystalline status to hand the daemon over"
+            )
+        } else {
+            anyhow::Error::new(err)
+                .context("the binary is updated, but update finish could not be started")
+        }
+    })?;
     if code != 0 {
         anyhow::bail!(
             "the binary is updated, but update finish failed (exit code {code}): run crystalline status to hand the daemon over"
@@ -1147,11 +1219,15 @@ pub(crate) fn auto_lines(
 /// whether the check is on and what its last check found. With the check
 /// off nothing from the cache is said, since `update check` writes it
 /// whatever the setting is. Pure.
+///
+/// `tarball` is [`tarball_action`] for a tar.gz install whose folder this
+/// process cannot write: what to do instead of `crystalline update now`.
 pub(crate) fn report_lines(
     facts: &UpdateFacts,
     current: &Precedence,
     now: Stamp,
     min_age_hours: u32,
+    tarball: Option<&str>,
 ) -> [String; 2] {
     let build = if facts.official {
         "official build"
@@ -1160,14 +1236,10 @@ pub(crate) fn report_lines(
     };
     let install = format!("{}, {build}", facts.method.label());
     let check = match facts.check {
-        CheckState::Off(OffReason::NotTurnedOn) => format!(
-            "update check off ({}); turn it on with: crystalline update auto on",
-            OffReason::NotTurnedOn.text()
-        ),
         CheckState::Off(reason) => format!("update check off ({})", reason.text()),
         CheckState::On => format!(
             "update check on; {}",
-            last_check_text(facts, current, now, min_age_hours)
+            last_check_text(facts, current, now, min_age_hours, tarball)
         ),
     };
     [install, check]
@@ -1181,6 +1253,7 @@ fn last_check_text(
     current: &Precedence,
     now: Stamp,
     min_age_hours: u32,
+    tarball: Option<&str>,
 ) -> String {
     let Some(cache) = &facts.cache else {
         return "no check yet".to_string();
@@ -1211,7 +1284,10 @@ fn last_check_text(
                 refusal_text(&Refusal::Unknown)
             ),
             None => format!(
-                "Crystalline {newer} is available (this is {current}); run: crystalline update now"
+                "Crystalline {newer} is available (this is {current}); {}",
+                tarball
+                    .filter(|_| facts.method == InstallMethod::Tarball)
+                    .unwrap_or("run: crystalline update now")
             ),
         },
     }
@@ -1240,6 +1316,9 @@ pub(crate) async fn report_facts(ask_daemon: bool, setting_on: bool) -> UpdateFa
     };
     let mut facts = asked
         .unwrap_or_else(|| crystalline_service::update::UpdateState::at_start().facts(setting_on));
+    // Applied here too, whatever the daemon did, so a cached failure
+    // reason or an unanswered cache never reaches a report (S23).
+    facts.cache = facts.cache.and_then(UpdateCache::answered);
     if facts.check != CheckState::On {
         facts.cache = None;
     }
@@ -1269,11 +1348,20 @@ pub(crate) async fn report_for(
     ask_daemon: bool,
 ) -> (UpdateFacts, [String; 2]) {
     let facts = report_facts(ask_daemon, cfg.update_check_enabled()).await;
+    let tarball = if facts.method == InstallMethod::Tarball {
+        tarball_action(
+            crystalline_service::update::detect_here().exe.as_deref(),
+            effective_uid(),
+        )
+    } else {
+        None
+    };
     let lines = report_lines(
         &facts,
         &this_version(),
         time::now(),
         cfg.update_min_age_hours(),
+        tarball.as_deref(),
     );
     (facts, lines)
 }
@@ -1317,102 +1405,179 @@ pub(crate) fn may_offer(env: &dyn Fn(&str) -> Option<String>, detection: &Detect
     OffReason::suppressing(env, detection).is_none() && detection.acts()
 }
 
-/// After a command: print [`stderr_hint`] on stderr when [`hint_may_show`]
-/// holds, the effective `update.check` is on (`update check` writes the
-/// cache whatever it says) and the release's age gate is open. Reads only
-/// the cache file and the settings, and only the settings once the cache
-/// names a newer release. Silent on every failure.
+/// After a command: print [`stderr_hint`] on stderr when [`decide_hint`]
+/// says so. The stamp and the cache file decide "nothing to show" first; the
+/// detection and the settings (a Postgres document only when config.yaml
+/// and the environment do not decide) are read only when a hint is due,
+/// and a decision not to show is remembered for [`HINT_HOLD_HOURS`], so no
+/// command after it reads them again. Silent on every failure.
 pub(crate) fn print_hint() {
     let tty = std::io::stderr().is_terminal();
     if !tty {
         return;
     }
-    let env = |name: &str| std::env::var(name).ok();
-    let Some(cache) = crystalline_core::config::state_dir()
-        .ok()
-        .and_then(|dir| crystalline_service::update::read_cache(&dir.join(UPDATE_CACHE_FILE)))
+    let Ok(state) = crystalline_core::config::state_dir() else {
+        return;
+    };
+    let Some(cache) = crystalline_service::update::read_cache(&state.join(UPDATE_CACHE_FILE))
         .and_then(UpdateCache::answered)
     else {
-        return;
-    };
-    let current = this_version();
-    let Some(line) = stderr_hint(&cache, &current) else {
-        return;
-    };
-    // Once per 24 h per version, decided before anything costs more than a
-    // file read (the detection, the settings, a Postgres connection).
-    let Some(newer) = cache.newer_release(&current) else {
-        return;
-    };
-    let Ok(state) = crystalline_core::config::state_dir() else {
         return;
     };
     let stamp_path = state.join(HINT_STAMP_FILE);
     let stamp = std::fs::read_to_string(&stamp_path)
         .ok()
         .and_then(|text| serde_json::from_str::<HintStamp>(&text).ok());
-    let now = time::now();
-    if !hint_due(stamp.as_ref(), &newer, now) {
-        return;
-    }
-    let detection = crystalline_service::update::detect_here().detection;
-    if !hint_may_show(tty, &env, &detection) {
-        return;
-    }
-    let Some(cfg) = settings_for_hint() else {
-        return;
-    };
-    if cfg.update_check_enabled() && cache.gate(now, cfg.update_min_age_hours()) == Some(Gate::Open)
-    {
-        eprintln!("{line}");
-        // Best effort: a stamp that cannot be written means the hint
-        // shows again after the next command.
-        let stamp = HintStamp {
-            version: newer.render(),
-            at: now,
-        };
-        if let Ok(text) = serde_json::to_string(&stamp) {
-            let _ = std::fs::write(&stamp_path, text);
+    let env = |name: &str| std::env::var(name).ok();
+    let outcome = decide_hint(
+        &cache,
+        stamp.as_ref(),
+        &this_version(),
+        time::now(),
+        || {
+            hint_may_show(
+                tty,
+                &env,
+                &crystalline_service::update::detect_here().detection,
+            )
+        },
+        settings_for_hint,
+    );
+    let stamp = match outcome {
+        HintOutcome::Nothing => return,
+        HintOutcome::Hold(stamp) => stamp,
+        HintOutcome::Show(line, stamp) => {
+            eprintln!("{line}");
+            stamp
         }
+    };
+    // Best effort: a stamp that cannot be written means the decision is
+    // made again after the next command.
+    if let Ok(text) = serde_json::to_string(&stamp) {
+        let _ = write_replacing(&stamp_path, text.as_bytes());
     }
+}
+
+/// What [`decide_hint`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum HintOutcome {
+    /// Nothing is due, or the hint may not show here: no stamp is written.
+    Nothing,
+    /// Due but not shown (the check is off, the gate closed, the settings
+    /// unreadable): the stamp that holds the next decision back.
+    Hold(HintStamp),
+    /// The line to print and the stamp that records it.
+    Show(String, HintStamp),
+}
+
+/// The stderr hint's decision. Reads nothing itself: the cache and the
+/// stamp come in, and the two costlier reads are closures called only when
+/// the cheap ones leave a hint due. `may_show` is [`hint_may_show`] (the
+/// detection); `settings` gives the effective `update.check` and
+/// `update.min_age_hours`, `None` when they cannot be read.
+pub(crate) fn decide_hint(
+    cache: &UpdateCache,
+    stamp: Option<&HintStamp>,
+    current: &Precedence,
+    now: Stamp,
+    may_show: impl FnOnce() -> bool,
+    settings: impl FnOnce() -> Option<(bool, u32)>,
+) -> HintOutcome {
+    let Some(line) = stderr_hint(cache, current) else {
+        return HintOutcome::Nothing;
+    };
+    let Some(newer) = cache.newer_release(current) else {
+        return HintOutcome::Nothing;
+    };
+    if !hint_due(stamp, &newer, now) || !may_show() {
+        return HintOutcome::Nothing;
+    }
+    let stamp = |held: bool| HintStamp {
+        version: newer.render(),
+        at: now,
+        held,
+    };
+    match settings() {
+        Some((true, min_age_hours)) if cache.gate(now, min_age_hours) == Some(Gate::Open) => {
+            HintOutcome::Show(line, stamp(false))
+        }
+        _ => HintOutcome::Hold(stamp(true)),
+    }
+}
+
+/// Write `bytes` to a temp file beside `path` and rename it over `path`,
+/// so a file another account left there (a first run under `sudo`) is
+/// replaced rather than written into, and a reader never sees half a file.
+fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(bytes)?;
+    file.persist(path).map_err(|err| err.error)?;
+    Ok(())
 }
 
 /// The stderr hint's stamp in the state folder, beside the cache.
 const HINT_STAMP_FILE: &str = "update-hint.json";
 
-/// When the stderr hint last showed, and for which version.
+/// How long a decision not to show the hint holds before the settings are
+/// read again.
+const HINT_HOLD_HOURS: i64 = 1;
+
+/// When the stderr hint last showed, or was last held back, and for which
+/// version.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub(crate) struct HintStamp {
     /// The version the hint named, rendered.
     pub(crate) version: String,
-    /// When it showed.
+    /// When it showed or was held back.
     #[serde(with = "time::serde::stamp")]
     pub(crate) at: Stamp,
+    /// Held back rather than shown: the decision is made again after
+    /// [`HINT_HOLD_HOURS`] instead of 24 h.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) held: bool,
 }
 
 /// Whether the hint for `newer` is due: no stamp, a stamp for another
-/// version, or one at least 24 h old. A stamp later than `now` (a clock
-/// that was wrong) does not hold the hint back. Pure.
+/// version, a shown stamp at least 24 h old or a held one at least
+/// [`HINT_HOLD_HOURS`] old. A stamp later than `now` (a clock that was
+/// wrong) does not hold the hint back. Pure.
 pub(crate) fn hint_due(stamp: Option<&HintStamp>, newer: &Precedence, now: Stamp) -> bool {
     match stamp {
         Some(stamp) if stamp.version == newer.render() => {
             let age = now.since(stamp.at);
-            age < time::Delta::ZERO || age >= time::hours(24)
+            let hold = if stamp.held {
+                time::hours(HINT_HOLD_HOURS)
+            } else {
+                time::hours(24)
+            };
+            age < time::Delta::ZERO || age >= hold
         }
         _ => true,
     }
 }
 
-/// The effective settings for the hint, a Postgres configuration document
-/// included, read on the command runtime's deep-stack thread; `None` when
-/// they do not load. The default config, also after a command run with
-/// `--config`: the hint is advisory, and each command names its config in
-/// its own field.
-fn settings_for_hint() -> Option<crystalline_core::config::GlobalConfig> {
-    crate::on_runtime_value_current_thread(|| crystalline_service::config_for_report(None))
-        .ok()?
+/// The effective `update.check` and `update.min_age_hours` for the hint,
+/// read on the command runtime's deep-stack thread; `None` when they do not
+/// load. config.yaml and the environment first: the Postgres configuration
+/// document is read only in document mode and only when the environment
+/// does not already turn the check off. The default config, also after a
+/// command run with `--config`: the hint is advisory.
+fn settings_for_hint() -> Option<(bool, u32)> {
+    let env_off = std::env::var("CRYSTALLINE_UPDATE_CHECK")
         .ok()
-        .map(|loaded| loaded.effective)
+        .is_some_and(|value| !value.is_empty());
+    let loaded = crate::on_runtime_value_current_thread(move || {
+        crystalline_service::config_for_hint(move |loaded| {
+            loaded.mode == crystalline_service::overlay::ConfigMode::Document
+                && !(env_off && !loaded.effective.update_check_enabled())
+        })
+    })
+    .ok()??;
+    Some((
+        loaded.effective.update_check_enabled(),
+        loaded.effective.update_min_age_hours(),
+    ))
 }
 
 #[cfg(test)]
@@ -1745,6 +1910,7 @@ mod tests {
             exe: None,
             daemon: None,
             program_files: None,
+            source: ReleaseSource::here(),
             now: now(),
         }
     }
@@ -1822,10 +1988,6 @@ mod tests {
         files
     }
 
-    /// The download seam and the test key, set for one test at a time.
-    #[cfg(debug_assertions)]
-    static WINDOWS_SEAMS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// `update now`'s MSI or zip branch, [`windows_steps`], against a fake
     /// release of `asset` (signed with the test key) for an install of
     /// `method` at `<tmp>/Program Files/Crystalline/bin/crystalline.exe`.
@@ -1899,23 +2061,13 @@ mod tests {
             from_api: false,
             ..newer_release()
         };
-        let printed = {
-            let _seams = WINDOWS_SEAMS.lock().await;
-            // SAFETY: the seams are read only by the download and the key
-            // lookup, which no other test of this binary runs, and the lock
-            // keeps the tests that set them apart.
-            unsafe {
-                std::env::set_var("CRYSTALLINE_TEST_UPDATE_DOWNLOAD", &base);
-                std::env::set_var("CRYSTALLINE_TEST_UPDATE_KEY", fixtures.join("test.pub"));
-            }
-            let printed = windows_steps(&context, &release, asset, "crystalline.exe").await;
-            // SAFETY: as above.
-            unsafe {
-                std::env::remove_var("CRYSTALLINE_TEST_UPDATE_DOWNLOAD");
-                std::env::remove_var("CRYSTALLINE_TEST_UPDATE_KEY");
-            }
-            printed.unwrap()
-        };
+        context.source = ReleaseSource::for_test(
+            &base,
+            &std::fs::read_to_string(fixtures.join("test.pub")).unwrap(),
+        );
+        let printed = windows_steps(&context, &release, asset, "crystalline.exe")
+            .await
+            .unwrap();
         assert_eq!(spawner.calls(), Vec::<String>::new(), "nothing is run");
         let after = snapshot(&root);
         let dir = download_dir(&context.cache_dir, tag);
@@ -2662,6 +2814,7 @@ mod tests {
                 &v("0.34.0"),
                 now(),
                 24,
+                None,
             );
             assert!(
                 lines[1].starts_with(&format!("update check off ({})", reason.text())),
@@ -2681,11 +2834,9 @@ mod tests {
             &v("0.34.0"),
             now(),
             24,
+            None,
         );
-        assert_eq!(
-            lines[1],
-            "update check off (not turned on); turn it on with: crystalline update auto on"
-        );
+        assert_eq!(lines[1], "update check off (not turned on)");
         assert_eq!(lines[0], "tar.gz, official build");
     }
 
@@ -2704,6 +2855,7 @@ mod tests {
             &v("0.34.0"),
             now(),
             24,
+            None,
         );
         assert_eq!(lines[0], "homebrew, official build");
         assert_eq!(
@@ -2723,6 +2875,7 @@ mod tests {
             &v("0.34.0"),
             now(),
             24,
+            None,
         );
         assert_eq!(lines[0], "tar.gz, not an official release build");
         assert_eq!(
@@ -2741,6 +2894,7 @@ mod tests {
                 &v("0.34.0"),
                 now(),
                 24,
+                None,
             )[1]
             .clone()
         };
@@ -2856,6 +3010,97 @@ mod tests {
         assert_eq!(stderr_hint(&odd, &v("0.34.0")), None);
     }
 
+    /// S2 (PR D review): a due hint with the check off reads the settings
+    /// once and holds the decision; the next commands decide from the
+    /// stamp alone and never read the settings (no document, no
+    /// connection).
+    #[test]
+    fn a_held_hint_reads_no_settings_until_the_hold_ends() {
+        let cache = release_cache("v0.35.0", Some(at(1)), at(16));
+        let current = v("0.34.0");
+        let reads = std::cell::Cell::new(0);
+        let check_off = || {
+            reads.set(reads.get() + 1);
+            Some((false, 24))
+        };
+        let HintOutcome::Hold(held) =
+            decide_hint(&cache, None, &current, now(), || true, check_off)
+        else {
+            panic!("a due hint with the check off is held");
+        };
+        assert!(held.held);
+        assert_eq!(reads.get(), 1);
+        // Ten minutes later: nothing, and neither the detection nor the
+        // settings are asked.
+        let later = Stamp::from_ymd_hms(2026, 11, 17, 13, 10, 0).unwrap();
+        let outcome = decide_hint(
+            &cache,
+            Some(&held),
+            &current,
+            later,
+            || panic!("no detection while held"),
+            || panic!("no settings read while held"),
+        );
+        assert_eq!(outcome, HintOutcome::Nothing);
+        // Past the hold, the check now on: shown, with a 24 h stamp.
+        let after = Stamp::from_ymd_hms(2026, 11, 17, 14, 5, 0).unwrap();
+        let HintOutcome::Show(line, shown) = decide_hint(
+            &cache,
+            Some(&held),
+            &current,
+            after,
+            || true,
+            || Some((true, 24)),
+        ) else {
+            panic!("shown once the check is on");
+        };
+        assert!(line.contains("0.35.0"), "{line}");
+        assert!(!shown.held);
+        // Settings that cannot be read hold too; a hint that may not show
+        // here writes nothing and reads no settings.
+        assert!(matches!(
+            decide_hint(&cache, None, &current, now(), || true, || None),
+            HintOutcome::Hold(_)
+        ));
+        assert_eq!(
+            decide_hint(
+                &cache,
+                None,
+                &current,
+                now(),
+                || false,
+                || panic!("no settings")
+            ),
+            HintOutcome::Nothing
+        );
+        // A gate still closed holds.
+        let fresh = release_cache("v0.35.0", Some(at(17)), at(17));
+        assert!(matches!(
+            decide_hint(&fresh, None, &current, now(), || true, || Some((true, 24))),
+            HintOutcome::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn the_hint_stamp_is_replaced_not_written_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(HINT_STAMP_FILE);
+        std::fs::write(&path, b"old").unwrap();
+        write_replacing(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(names.len(), 1, "no temp file stays");
+        #[cfg(unix)]
+        {
+            // A read-only file in a writable folder is still replaced, as a
+            // root-owned one would be.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            write_replacing(&path, b"newer").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"newer");
+        }
+    }
+
     /// The hint shows at most once per 24 h per version.
     #[test]
     fn the_hint_is_due_once_a_day_per_version() {
@@ -2863,6 +3108,7 @@ mod tests {
         let stamp = |version: &str, at: Stamp| HintStamp {
             version: version.to_string(),
             at,
+            held: false,
         };
         assert!(hint_due(None, &newer, now()));
         // Shown three hours ago for this version: not again.
@@ -2874,6 +3120,14 @@ mod tests {
         assert!(hint_due(Some(&stamp("0.34.1", at(17))), &newer, now()));
         // A stamp from the future does not hold it back.
         assert!(hint_due(Some(&stamp("0.35.0", at(18))), &newer, now()));
+        // A held stamp holds for one hour only.
+        let held = |at: Stamp| HintStamp {
+            held: true,
+            ..stamp("0.35.0", at)
+        };
+        let half_hour = Stamp::from_ymd_hms(2026, 11, 17, 12, 30, 0).unwrap();
+        assert!(!hint_due(Some(&held(half_hour)), &newer, now()));
+        assert!(hint_due(Some(&held(at(17))), &newer, now()));
         let back: HintStamp =
             serde_json::from_str(&serde_json::to_string(&stamp("0.35.0", at(17))).unwrap())
                 .unwrap();
