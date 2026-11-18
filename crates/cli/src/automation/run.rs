@@ -136,6 +136,10 @@ pub(super) async fn run_one(
             program: claude.to_path_buf(),
             mcp_config: PathBuf::from("<mcp config>"),
             prompt: "<prompt>".to_string(),
+            disallowed_tools: HEADLESS_DISALLOWED_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
             max_turns: args.max_turns,
             model: args.model.clone(),
         };
@@ -153,8 +157,8 @@ pub(super) async fn run_one(
     }
     // A stop never waits on the server: no lease is taken yet.
     let mut stopping = stop.clone();
-    let prompt = tokio::select! {
-        prompt = run_prompt(lp, client, domain, args.max_items) => prompt?,
+    let setup = tokio::select! {
+        setup = run_prompt(lp, client, domain, args.max_items) => setup?,
         _ = stopping.wait_for(|stopped| *stopped) => return Ok(Ran::Busy),
     };
     let take = client.verb(
@@ -224,7 +228,8 @@ pub(super) async fn run_one(
     let run = ClaudeRun {
         program: claude.to_path_buf(),
         mcp_config: config.path.clone(),
-        prompt,
+        prompt: setup.prompt,
+        disallowed_tools: setup.disallowed_tools,
         max_turns: args.max_turns,
         model: args.model.clone(),
     };
@@ -381,18 +386,62 @@ fn share_failure(domain: &str, error: &str, remote: bool) -> String {
 
 /// A take refusal that means "not now": a run is going, or the loop runs on
 /// another instance.
-/// The prompt a run on `domain` starts its agent with, as the server it
-/// talks to builds it (`automation_prompt`): the server knows whether its MCP
-/// surface serves the `skills` tool the prompt starts with. A server older
-/// than the verb refuses it, and the run then starts with this binary's
-/// shipped prompt, which calls the `skills` tool. Asked before the lease is
-/// taken, so a failure here leaves no lease behind.
+/// What a run starts its agent with: the prompt and the tools it may never
+/// call.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct RunPrompt {
+    pub(super) prompt: String,
+    /// Bare MCP tool names.
+    pub(super) disallowed_tools: Vec<String>,
+}
+
+impl RunPrompt {
+    /// This binary's shipped prompt and its own list of forbidden tools.
+    fn shipped(lp: Loop, domain: &str, max_items: u32) -> RunPrompt {
+        RunPrompt {
+            prompt: headless_prompt(lp, domain, max_items, false),
+            disallowed_tools: HEADLESS_DISALLOWED_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+        }
+    }
+
+    /// The prompt and the tools of an `automation_prompt` answer.
+    pub(super) fn of_answer(answer: &Value) -> anyhow::Result<RunPrompt> {
+        let prompt = answer["prompt"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("the prompt answer carried no prompt"))?
+            .to_string();
+        let disallowed_tools = answer["disallowed_tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .map(|t| t.as_str().map(str::to_string))
+                    .collect::<Option<Vec<String>>>()
+            })
+            .ok_or_else(|| anyhow::anyhow!("the prompt answer carried no list of tools"))?;
+        Ok(RunPrompt {
+            prompt,
+            disallowed_tools,
+        })
+    }
+}
+
+/// The prompt a run on `domain` starts its agent with and the tools it may
+/// never call, as the server it talks to answers them (`automation_prompt`):
+/// the server knows whether its MCP surface serves the `skills` tool the
+/// prompt starts with, and which tools it forbids, also when it is newer
+/// than this binary. A server older than the verb refuses it, and the run
+/// then starts with this binary's shipped prompt and its own list. Asked
+/// before the lease is taken, so a failure here leaves no lease behind.
 pub(super) async fn run_prompt(
     lp: Loop,
     client: &AutomationClient,
     domain: &str,
     max_items: u32,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RunPrompt> {
     let answer = client
         .verb(
             "automation_prompt",
@@ -401,13 +450,10 @@ pub(super) async fn run_prompt(
         )
         .await;
     match answer {
-        Ok(setup) => setup["prompt"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("the prompt answer carried no prompt")),
+        Ok(setup) => RunPrompt::of_answer(&setup),
         Err(e) if is_refusal(&e) => {
             eprintln!("{domain}: the server sent no prompt ({e}); this run uses the shipped one.");
-            Ok(headless_prompt(lp, domain, max_items, false))
+            Ok(RunPrompt::shipped(lp, domain, max_items))
         }
         Err(e) => Err(e),
     }
@@ -907,6 +953,61 @@ pub(super) fn stop_signal() -> watch::Receiver<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool the server forbids and this binary does not know yet still
+    /// reaches the agent's `--disallowedTools`.
+    #[test]
+    fn the_servers_forbidden_tools_reach_the_argv() {
+        let mut tools: Vec<String> = HEADLESS_DISALLOWED_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        tools.push("newly_forbidden".to_string());
+        let answer = json!({
+            "prompt": "the server's prompt",
+            "disallowed_tools": tools,
+            "version": "9.9.9",
+            "checksum": "sha256:00",
+        });
+        let setup = RunPrompt::of_answer(&answer).unwrap();
+        assert_eq!(setup.disallowed_tools, tools);
+        let run = ClaudeRun {
+            program: PathBuf::from("claude"),
+            mcp_config: PathBuf::from("mcp.json"),
+            prompt: setup.prompt,
+            disallowed_tools: setup.disallowed_tools,
+            max_turns: 60,
+            model: None,
+        };
+        let args = claude_args(&run);
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert!(
+            args[at + 1].ends_with(",mcp__crystalline__newly_forbidden"),
+            "{args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "the server's prompt");
+    }
+
+    #[test]
+    fn a_prompt_answer_without_its_parts_is_an_error() {
+        for answer in [
+            json!({ "disallowed_tools": [] }),
+            json!({ "prompt": "p" }),
+            json!({ "prompt": "p", "disallowed_tools": [1] }),
+        ] {
+            assert!(RunPrompt::of_answer(&answer).is_err(), "{answer}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_is_the_shipped_prompt_with_this_binarys_tools() {
+        let shipped = RunPrompt::shipped(Loop::Evolve, "kb", 7);
+        assert_eq!(
+            shipped.prompt,
+            headless_prompt(Loop::Evolve, "kb", 7, false)
+        );
+        assert_eq!(shipped.disallowed_tools, HEADLESS_DISALLOWED_TOOLS);
+    }
 
     #[test]
     fn a_refused_share_names_why_and_the_way_out() {

@@ -45,17 +45,20 @@ pub struct ClaudeRun {
     pub mcp_config: PathBuf,
     /// The filled-in shipped prompt.
     pub prompt: String,
+    /// The bare MCP tool names the agent may never call, as the server
+    /// answered them (`automation_prompt`).
+    pub disallowed_tools: Vec<String>,
     /// `--max-turns`.
     pub max_turns: u32,
     /// `--model`, when one is named.
     pub model: Option<String>,
 }
 
-/// The tools a headless agent may never call, in Claude Code's names.
-pub(super) fn disallowed_tools() -> String {
-    HEADLESS_DISALLOWED_TOOLS
+/// The tools `names` in Claude Code's names, joined for `--disallowedTools`.
+pub(super) fn disallowed_tools<S: AsRef<str>>(names: &[S]) -> String {
+    names
         .iter()
-        .map(|name| format!("{MCP_TOOL_PREFIX}__{name}"))
+        .map(|name| format!("{MCP_TOOL_PREFIX}__{}", name.as_ref()))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -75,7 +78,7 @@ pub(super) fn claude_args(cfg: &ClaudeRun) -> Vec<String> {
         "--allowedTools".into(),
         MCP_TOOL_PREFIX.into(),
         "--disallowedTools".into(),
-        disallowed_tools(),
+        disallowed_tools(&cfg.disallowed_tools),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
@@ -148,6 +151,10 @@ mod tests {
             program: PathBuf::from("/usr/local/bin/claude"),
             mcp_config: PathBuf::from("/tmp/run/mcp.json"),
             prompt: "the prompt".to_string(),
+            disallowed_tools: HEADLESS_DISALLOWED_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
             max_turns: 60,
             model: model.map(str::to_string),
         }
@@ -201,7 +208,7 @@ mod tests {
 
     #[test]
     fn the_disallowed_tools_are_every_headless_tool_by_its_mcp_name() {
-        let list = disallowed_tools();
+        let list = disallowed_tools(HEADLESS_DISALLOWED_TOOLS);
         let names: Vec<&str> = list.split(',').collect();
         assert_eq!(names.len(), HEADLESS_DISALLOWED_TOOLS.len());
         for (full, bare) in names.iter().zip(HEADLESS_DISALLOWED_TOOLS) {
