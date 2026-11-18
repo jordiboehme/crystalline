@@ -94,7 +94,7 @@ chrono = "0.4.45"
 # The date library behind crystalline_core::time from 0.34.0 on: no serde
 # (every date goes through a named adapter), no system time zone and no tz
 # database. No crate uses it yet.
-jiff = { version = "1.0.0", default-features = false, features = ["std"] }
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # The span-preserving JSONC editor install uses on harness files it shares
