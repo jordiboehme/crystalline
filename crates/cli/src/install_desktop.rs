@@ -100,8 +100,9 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
     }
 
     // The offer lock first, so an update offer cannot put its old bundle
-    // back over this build or write the record beside it. Held to the end.
-    let Some(_lock) = crystalline_service::desktop_offer::take_lock()? else {
+    // back over this build or write the record beside it. Held until the
+    // report is printed.
+    let Some(lock) = crystalline_service::desktop_offer::take_lock()? else {
         anyhow::bail!(crystalline_service::desktop_offer::BUSY_REFUSAL);
     };
 
@@ -170,6 +171,9 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
             report_text(extension.as_ref(), skill.as_ref(), &notices)
         );
     }
+    // Not held while the person reads the question.
+    drop(lock);
+    crate::install::ask_update_check(json);
     Ok(())
 }
 

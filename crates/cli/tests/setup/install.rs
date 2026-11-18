@@ -2400,3 +2400,91 @@ fn uninstalling_codex_keeps_a_folder_cursor_still_writes() {
         "Cursor still writes ~/.agents/skills"
     );
 }
+
+/// The install-time update question's text, as stderr would carry it.
+const UPDATE_QUESTION: &str = "Check once a day for a newer Crystalline?";
+
+#[test]
+fn an_unofficial_build_never_asks_and_records_nothing() {
+    // A test binary is never an official build, so the install-time update
+    // question is suppressed: no question, no hint, no stamp (S26). The
+    // asking itself is covered by the unit tests in install.rs.
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    for args in [
+        &["install", "claude-code"][..],
+        &["--json", "install", "claude-code"][..],
+    ] {
+        let out = install_cmd(&home, &bin_dir)
+            .args(args)
+            .env_remove("CI")
+            .env_remove("NO_UPDATE_NOTIFIER")
+            .env_remove("CRYSTALLINE_UPDATE_CHECK")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            !stderr.contains(UPDATE_QUESTION) && !stderr.contains("update auto on"),
+            "{stderr}"
+        );
+        let receipt = read_json(&receipt_file(&home));
+        assert_eq!(receipt["format"], 1);
+        assert!(receipt.get("update_check_asked").is_none(), "{receipt}");
+    }
+}
+
+#[test]
+fn auto_reconcile_never_asks() {
+    // The session-start reconcile replays an install from another version
+    // without asking, and keeps a stamp an earlier install wrote, as does a
+    // second install.
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    let stamp = "2026-11-18T09:00:00Z";
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+        receipt["update_check_asked"] = json!(stamp);
+    });
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("Refreshed the claude-code install"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(UPDATE_QUESTION) && !stderr.contains("update auto on"),
+        "{stderr}"
+    );
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(receipt["installs"][0]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(receipt["update_check_asked"], stamp, "the stamp is kept");
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code", "--project"])
+        .current_dir(work.path())
+        .assert()
+        .success();
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(receipt["format"], 1);
+    assert_eq!(
+        receipt["update_check_asked"], stamp,
+        "a second install keeps it"
+    );
+}

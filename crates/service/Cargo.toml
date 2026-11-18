@@ -83,6 +83,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+# The tar.gz update unpacks the one member that holds the binary.
+tar = { workspace = true }
+flate2 = { workspace = true }
+# The zip update on Windows unpacks crystalline.exe into the download folder.
+zip = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -141,7 +146,6 @@ walkdir = { workspace = true }
 reqwest = { workspace = true }
 openidconnect = { workspace = true }
 yrs = { workspace = true }
-zip = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,
 # and `tracing-subscriber` the capture layer one test asserts the sign-in's
 # log lines through; both are test-only additions to crates this package
@@ -149,8 +153,6 @@ zip = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 serde_yaml_ng = { workspace = true }
-flate2 = { workspace = true }
-tar = { workspace = true }
 # The fake GitHub in tests/origins/github_app.rs answers and reads blobs in
 # base64, as the real API does.
 base64 = { workspace = true }
@@ -158,6 +160,9 @@ base64 = { workspace = true }
 # its own rather than with the server's helper.
 hmac = { workspace = true }
 tiktoken-rs = { workspace = true }
+# tests/update/now.rs signs a fake release's SHA256SUMS with the test key, as
+# the release job signs the real one.
+minisign = { workspace = true }
 tokio-tungstenite = { workspace = true }
 # The fake identity provider in tests/auth/oidc.rs: `jsonwebtoken` signs its ID
 # tokens (RS256, from the committed PEM fixtures) and `rsa` reads the same PEM

@@ -80,6 +80,31 @@ pub enum UpdateError {
     /// A download was redirected to a place that is not GitHub, or over
     /// plain http, or more than three times.
     Redirect,
+    /// Another `crystalline update now` holds the update lock.
+    Locked,
+    /// The update lock could not be made or taken.
+    Lock(std::io::Error),
+    /// The release has no asset for this install method on this system.
+    NoAsset,
+    /// GitHub's API answered but lists no digest for the asset, so the
+    /// download cannot be checked against it (fail closed).
+    NoDigest,
+    /// A download failed its verification.
+    Verify(crystalline_core::update::VerifyError),
+    /// The binary could not be unpacked from the archive.
+    Extract(std::io::Error),
+    /// The archive does not hold the binary exactly once as a plain file.
+    NoMember,
+    /// The new binary's macOS code signature does not meet the release
+    /// requirement.
+    Codesign,
+    /// The new binary does not print the release's version.
+    VersionMismatch,
+    /// The new binary did not run, or did not end within its time limit
+    /// (a C library that is too old, a `noexec` mount).
+    DidNotRun,
+    /// The new binary could not be put over the old one.
+    Swap(std::io::Error),
 }
 
 impl std::fmt::Display for UpdateError {
@@ -98,6 +123,25 @@ impl std::fmt::Display for UpdateError {
             UpdateError::Redirect => {
                 f.write_str("the download was redirected away from GitHub or too often")
             }
+            UpdateError::Locked => f.write_str("another update is running"),
+            UpdateError::Lock(err) => write!(f, "cannot take the update lock: {err}"),
+            UpdateError::NoAsset => {
+                f.write_str("the release has no download for this install on this system")
+            }
+            UpdateError::NoDigest => f.write_str("GitHub lists no sha256 digest for the download"),
+            UpdateError::Verify(err) => write!(f, "verification failed: {err}"),
+            UpdateError::Extract(err) => write!(f, "cannot unpack the binary: {err}"),
+            UpdateError::NoMember => {
+                f.write_str("the archive does not hold the binary once as a plain file")
+            }
+            UpdateError::Codesign => f.write_str(
+                "the new binary's macOS code signature does not meet the release requirement",
+            ),
+            UpdateError::VersionMismatch => {
+                f.write_str("the new binary does not print the release's version")
+            }
+            UpdateError::DidNotRun => f.write_str("the new binary did not run"),
+            UpdateError::Swap(err) => write!(f, "cannot replace the binary: {err}"),
         }
     }
 }
@@ -106,7 +150,11 @@ impl std::error::Error for UpdateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             UpdateError::Http(err) => Some(err),
-            UpdateError::Io(err) => Some(err),
+            UpdateError::Io(err)
+            | UpdateError::Lock(err)
+            | UpdateError::Extract(err)
+            | UpdateError::Swap(err) => Some(err),
+            UpdateError::Verify(err) => Some(err),
             _ => None,
         }
     }
@@ -184,6 +232,17 @@ pub async fn latest_release(etag: Option<&str>) -> Result<Lookup, UpdateError> {
 /// written beside `dest` and renamed into place, so `dest` is never left
 /// half written; it is still unverified until the caller's checks pass.
 pub async fn download(tag: &str, asset: &str, dest: &Path) -> Result<Vec<u8>, UpdateError> {
+    download_from(&download_base(), tag, asset, dest).await
+}
+
+/// [`download`] from the web root `base`: [`download_base`] unless a debug
+/// build's test named another ([`super::now::ReleaseSource`]).
+pub(crate) async fn download_from(
+    base: &str,
+    tag: &str,
+    asset: &str,
+    dest: &Path,
+) -> Result<Vec<u8>, UpdateError> {
     if release_version(tag).is_none() {
         return Err(UpdateError::NotARelease);
     }
@@ -203,10 +262,7 @@ pub async fn download(tag: &str, asset: &str, dest: &Path) -> Result<Vec<u8>, Up
         .redirect(download_redirects())
         .build()?;
     let response = client
-        .get(format!(
-            "{}/{REPO}/releases/download/{tag}/{asset}",
-            download_base()
-        ))
+        .get(format!("{base}/{REPO}/releases/download/{tag}/{asset}"))
         .send()
         .await?;
     let status = response.status();
@@ -358,7 +414,7 @@ fn api_base() -> String {
 /// The web root of the redirect and the downloads; a debug build takes
 /// `CRYSTALLINE_TEST_UPDATE_DOWNLOAD` instead when it is set (S11).
 #[cfg(debug_assertions)]
-fn download_base() -> String {
+pub(crate) fn download_base() -> String {
     std::env::var("CRYSTALLINE_TEST_UPDATE_DOWNLOAD")
         .map(|base| base.trim_end_matches('/').to_string())
         .unwrap_or_else(|_| WEB_BASE.to_string())
@@ -367,7 +423,7 @@ fn download_base() -> String {
 /// The web root of the redirect and the downloads. A release build has no
 /// seam.
 #[cfg(not(debug_assertions))]
-fn download_base() -> String {
+pub(crate) fn download_base() -> String {
     WEB_BASE.to_string()
 }
 

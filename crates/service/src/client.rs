@@ -2860,6 +2860,23 @@ pub async fn config_for_report(
     Ok(loaded)
 }
 
+/// The configuration an advisory line after a command reads (the CLI's
+/// update hint): [`overlay::load`] (config.yaml and the environment, no
+/// connection) and, in document mode, the configuration document read
+/// lock-free, but only when `needs_document` says the file and the
+/// environment do not decide. Quiet: `None` when anything cannot be read,
+/// and no warning, since the command it follows is about something else.
+pub async fn config_for_hint(
+    needs_document: impl FnOnce(&overlay::LoadedConfig) -> bool,
+) -> Option<overlay::LoadedConfig> {
+    let mut loaded = overlay::load(None).ok()?;
+    crate::claim::keep_secrets_off_local_stores(&loaded.effective);
+    if needs_document(&loaded) {
+        attach_viewed_document(&mut loaded).await.ok()?;
+    }
+    Some(loaded)
+}
+
 /// [`configure`] against config.yaml itself: the whole configuration in file
 /// mode, a `database.*` key in document mode.
 fn configure_file(
