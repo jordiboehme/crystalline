@@ -16,6 +16,7 @@ use crystalline_core::config::{
 };
 use crystalline_core::names::NameTable;
 use crystalline_core::text::plural;
+use crystalline_core::time;
 use crystalline_index::{
     ChunkParams, DomainKind, HostClaim, RebuildKind, Store, apply_scan, configured_model_id,
     download_local_model, provider_from_config, reindex_domains, resolve_forward_refs,
@@ -335,10 +336,10 @@ fn humanize_duration(secs: u64) -> String {
 /// without an `Option` dance. `--json` output always keeps the raw ISO
 /// string; this is for human rendering only.
 pub(crate) fn relative_time(value: &str) -> String {
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) else {
+    let Some(parsed) = time::parse_rfc3339(value) else {
         return value.to_string();
     };
-    let secs = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+    let secs = time::now().since(parsed.stamp()).num_seconds();
     if secs < 0 {
         return value.to_string();
     }
@@ -364,10 +365,7 @@ pub fn domain_init(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
     let created = if manifest.exists() {
         false
     } else {
-        let today = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
+        let today = time::today_utc().ymd();
         std::fs::write(
             &manifest,
             crystalline_core::manifest_template(&domain_name, &today),
@@ -3720,9 +3718,9 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     {
         let next = d["next_due"]
             .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .and_then(time::parse_rfc3339)
             .map(|t| {
-                let secs = (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+                let secs = t.stamp().since(time::now()).num_seconds();
                 if secs > 0 {
                     format!("in {secs}s")
                 } else {
@@ -4122,7 +4120,7 @@ pub async fn connect_github(
             .clone()
             .unwrap_or_else(|| "github.com".to_string()),
         user: login.clone(),
-        created_at: crystalline_core::time::now(),
+        created_at: time::now(),
         refresh_token: None,
         expires_at: None,
         refresh_expires_at: None,
@@ -4386,7 +4384,7 @@ impl PersonalApp<'_> {
                 .map(str::to_string)
                 .unwrap_or_else(|| "github.com".to_string()),
             user: user.login.clone(),
-            created_at: crystalline_core::time::now(),
+            created_at: time::now(),
             refresh_token: grant.refresh_token,
             expires_at: grant.expires_at,
             refresh_expires_at: grant.refresh_expires_at,
@@ -5740,7 +5738,7 @@ mod device_flow_error_tests {
 
 #[cfg(test)]
 mod relative_time_tests {
-    use super::{humanize_duration, relative_time};
+    use super::{humanize_duration, relative_time, time};
 
     #[test]
     fn humanize_duration_buckets_at_each_unit_boundary() {
@@ -5756,10 +5754,10 @@ mod relative_time_tests {
 
     #[test]
     fn relative_time_renders_past_instants_as_a_duration_ago() {
-        let five_minutes_ago = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let five_minutes_ago = (time::now() - time::minutes(5)).rfc3339();
         assert_eq!(relative_time(&five_minutes_ago), "5m ago");
 
-        let three_days_ago = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        let three_days_ago = (time::now() - time::days(3)).rfc3339();
         assert_eq!(relative_time(&three_days_ago), "3d ago");
     }
 
@@ -5770,8 +5768,7 @@ mod relative_time_tests {
 
         // A future instant (clock skew, a deliberately future value) must
         // never be rendered as "ago" - that would actively mislead.
-        let five_minutes_from_now =
-            (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        let five_minutes_from_now = (time::now() + time::minutes(5)).rfc3339();
         assert_eq!(relative_time(&five_minutes_from_now), five_minutes_from_now);
     }
 }

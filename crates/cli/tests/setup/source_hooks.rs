@@ -587,7 +587,7 @@ fn the_stop_hook_combines_the_local_and_the_remote_evolve_status() {
     );
     // `beta` is also a local domain here, hidden while acme lends its own.
     let config = local_config(home.path(), &["zeta", "beta"], "");
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crystalline_core::time::now().rfc3339();
     let hooks = isolated_state_dir(home.path()).join("hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     std::fs::write(
@@ -1069,7 +1069,7 @@ fn the_stop_hook_names_a_mounted_reflection_with_open_items() {
         json!({
             "account": "keeper",
             "etag": "cached",
-            "fetched_at": chrono::Utc::now().to_rfc3339(),
+            "fetched_at": crystalline_core::time::now().rfc3339(),
             "data": { "evolve": {}, "reflect": { "domains": { "open": 2, "unmounted": 5 } } },
         })
         .to_string(),

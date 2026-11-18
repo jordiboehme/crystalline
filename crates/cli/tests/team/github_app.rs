@@ -69,8 +69,9 @@ impl FakeGithub {
                 } else {
                     "404 Not Found"
                 };
-                let date = (chrono::Utc::now() + chrono::Duration::seconds(skew_secs))
-                    .format("%a, %d %b %Y %H:%M:%S GMT");
+                let date = (crystalline_core::time::now()
+                    + crystalline_core::time::seconds(skew_secs))
+                .http_date();
                 let response = format!(
                     "HTTP/1.1 {status}\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()

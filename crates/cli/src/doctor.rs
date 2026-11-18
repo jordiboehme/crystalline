@@ -69,6 +69,7 @@ use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DatabaseBackend, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::text::plural;
+use crystalline_core::time;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{DomainLayout, HarnessKind, PathClass, harness_paths, slash_rel};
 use crystalline_index::{
@@ -1978,14 +1979,13 @@ pub struct KeptDoctor {
 fn check_kept(
     found: Vec<crystalline_core::kept::KeptText>,
     domain_filter: Option<&str>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: time::Stamp,
 ) -> Vec<KeptDoctor> {
     found
         .into_iter()
         .filter(|k| domain_filter.is_none_or(|d| k.domain == d))
         .map(|k| {
-            let stale =
-                now - k.kept_at.into_chrono() > chrono::Duration::days(crate::kept::STALE_DAYS);
+            let stale = now.since(k.kept_at) > time::days(crate::kept::STALE_DAYS);
             KeptDoctor {
                 line: format!(
                     "{} {}, kept {}, {}",
@@ -2001,10 +2001,7 @@ fn check_kept(
                 unfinished: k.unfinished,
                 kind: k.kind,
                 path: k.path.clone(),
-                kept_at: k
-                    .kept_at
-                    .into_chrono()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                kept_at: k.kept_at.rfc3339_secs_z(),
                 bytes: k.bytes,
                 file: k.file.display().to_string(),
                 stale,
@@ -2318,7 +2315,7 @@ pub async fn run(
     let mut merge = None;
     let mut merge_error = None;
     if merge_desktop_state {
-        let today = chrono::Local::now().date_naive();
+        let today = time::today_utc();
         let mut merged = crate::desktop_state::MergeReport::default();
         for state in &desktop_states {
             if let Err(e) =
@@ -2551,7 +2548,7 @@ pub async fn run(
 
     let daemon_task = check_task(fix);
 
-    let kept = check_kept(crate::kept::scan_here(), domain_filter, chrono::Utc::now());
+    let kept = check_kept(crate::kept::scan_here(), domain_filter, time::now());
     let case_twins = check_case_twins(cfg);
 
     // Only an active daemon answers the file-stamp request (a standby
@@ -3602,19 +3599,19 @@ fn same_apart_from_generated(a: &str, b: &str) -> bool {
 
 /// When a file was written: its `generated.at`, else its `recorded_at`, else
 /// the file's modification time.
-fn written_at(file: &StrayFile) -> Option<chrono::DateTime<chrono::Utc>> {
+fn written_at(file: &StrayFile) -> Option<time::Stamp> {
     let engram = crystalline_core::parse_engram(&file.source).ok();
     let frontmatter = engram.as_ref().map(|e| &e.frontmatter);
     if let Some(at) = frontmatter
         .and_then(|f| f.generated.as_ref())
         .and_then(|g| g.at)
     {
-        return Some(at.into_chrono().with_timezone(&chrono::Utc));
+        return Some(at.stamp());
     }
     if let Some(day) = frontmatter.and_then(|f| f.recorded_at) {
-        return day.into_chrono().and_hms_opt(0, 0, 0).map(|t| t.and_utc());
+        return day.start_utc();
     }
-    file.modified.map(chrono::DateTime::<chrono::Utc>::from)
+    file.modified.and_then(time::Stamp::from_system_time)
 }
 
 /// What doctor reports about one stray pair, and what `--fix` did about it,
@@ -7280,14 +7277,14 @@ mod tests {
     fn kept_texts_follow_the_domain_filter_and_old_ones_warn() {
         use crystalline_core::kept::{self, KeptKind};
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = time::now();
         kept::write(
             dir.path(),
             "eng",
             None,
             KeptKind::Reflection,
             "a.md",
-            crystalline_core::time::Stamp::from_chrono(now),
+            now,
             "x",
         )
         .unwrap();
@@ -7297,7 +7294,7 @@ mod tests {
             None,
             KeptKind::Engram,
             "b.md",
-            crystalline_core::time::Stamp::from_chrono(now - chrono::Duration::days(31)),
+            now - time::days(31),
             "y",
         )
         .unwrap();

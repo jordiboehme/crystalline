@@ -1407,7 +1407,6 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "axum",
- "chrono",
  "clap",
  "crystalline-core",
  "crystalline-index",

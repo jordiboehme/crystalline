@@ -2,20 +2,3 @@
 # chrono bridge (from_chrono, into_chrono). Each crate's move onto
 # crystalline_core::time removes its lines; the list goes away with chrono
 # itself. Read by crates/core/tests/it/time_boundary.rs.
-crates/cli/Cargo.toml
-crates/cli/src/automation/run.rs
-crates/cli/src/cmd.rs
-crates/cli/src/desktop_state.rs
-crates/cli/src/doctor.rs
-crates/cli/src/harness_files.rs
-crates/cli/src/hook.rs
-crates/cli/src/install_desktop.rs
-crates/cli/src/kept.rs
-crates/cli/src/recall.rs
-crates/cli/tests/daemon/pg_owner.rs
-crates/cli/tests/daemon/pg_redeploy.rs
-crates/cli/tests/setup/hook.rs
-crates/cli/tests/setup/install_desktop.rs
-crates/cli/tests/setup/kept.rs
-crates/cli/tests/setup/source_hooks.rs
-crates/cli/tests/team/github_app.rs

@@ -6,6 +6,7 @@
 //! the record answers.
 
 use super::*;
+use crystalline_core::time;
 
 /// How long one renew may take. Well under the five minutes after which a
 /// lease is stale; a renew that takes longer is retried on the next tick.
@@ -187,7 +188,7 @@ pub(super) async fn run_one(
         .ok_or_else(|| anyhow::anyhow!("the lease answer carried no token"))?
         .to_string();
     let period = Duration::from_secs(renew_secs(take["renew_secs"].as_u64()));
-    let started = chrono::Utc::now();
+    let started = time::now();
     let lease = Lease {
         client,
         lp,
@@ -259,7 +260,7 @@ pub(super) async fn run_one(
             None => text.clone(),
         };
         let report = json!({
-            "started_at": started.to_rfc3339(),
+            "started_at": started.rfc3339(),
             "outcome": outcome,
             "done": done,
             "summary": recorded_summary,
@@ -660,12 +661,12 @@ impl Lease<'_> {
     /// Record a failed run (which releases the lease), then return `e`.
     async fn fail_and_err<T>(
         &self,
-        started: &chrono::DateTime<chrono::Utc>,
+        started: &time::Stamp,
         e: anyhow::Error,
         stop: watch::Receiver<bool>,
     ) -> anyhow::Result<T> {
         let report = json!({
-            "started_at": started.to_rfc3339(),
+            "started_at": started.rfc3339(),
             "outcome": RunOutcome::Failed,
             "done": 0,
             "summary": format!("The run could not start: {e:#}"),
@@ -715,7 +716,7 @@ pub(super) fn open_log(
     log_dir: Option<&Path>,
     lp: Loop,
     domain: &str,
-    started: &chrono::DateTime<chrono::Utc>,
+    started: &time::Stamp,
 ) -> anyhow::Result<(PathBuf, std::fs::File)> {
     let dir = match log_dir {
         Some(dir) => dir.to_path_buf(),
@@ -726,10 +727,7 @@ pub(super) fn open_log(
     crystalline_core::config::check_write(&dir)?;
     std::fs::create_dir_all(&dir)?;
     let prefix = format!("{lp}-{}-", file_safe(domain));
-    let path = dir.join(format!(
-        "{prefix}{}.jsonl",
-        started.format("%Y%m%dT%H%M%S%.3fZ")
-    ));
+    let path = dir.join(format!("{prefix}{}.jsonl", started.compact_millis_z()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

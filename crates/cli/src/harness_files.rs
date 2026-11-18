@@ -46,7 +46,7 @@ pub(crate) fn backup_once(
     if has_backup(&dir, &name)? {
         return Ok(None);
     }
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let stamp = crystalline_core::time::now().compact_z();
     let backup = dir.join(format!("{name}.{stamp}"));
     write_private(&backup, bytes)?;
     Ok(Some(backup))
