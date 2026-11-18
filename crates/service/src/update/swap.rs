@@ -8,6 +8,14 @@
 //!
 //! Under `sudo` (S5) only the download, the checks and the swap run; the
 //! caller skips `update finish`, so root never touches the person's daemon.
+//!
+//! Known limits: a sudo run holds its own lock in its own temp folder, so a
+//! sudo run and a normal run at the same moment can remove each other's
+//! `.crystalline-new-*` file; the worse case is a failed run with the old
+//! exe intact. The new binary's `--version` and `update finish` run without
+//! a time limit while the lock is held; the binary is verified first (and
+//! codesigned on macOS), so a hang is not expected, and the lock goes with
+//! the process when it is killed.
 
 use std::fs::File;
 use std::io::Read;
@@ -91,14 +99,22 @@ pub fn root_owned_install_dir(canonical_exe: &Path) -> bool {
 /// one opened) and removed again on any failure.
 pub fn extract_member(archive: &Path, member: &str, into: &Path) -> Result<PathBuf, UpdateError> {
     let target = into.join(format!("{NEW_PREFIX}{}", std::process::id()));
-    let result = extract_into(archive, member, &target);
-    if result.is_err() {
+    let mut created = false;
+    let result = extract_into(archive, member, &target, &mut created);
+    // Only a file this run created is removed: a name that was taken
+    // already is someone else's.
+    if result.is_err() && created {
         let _ = std::fs::remove_file(&target);
     }
     result.map(|()| target)
 }
 
-fn extract_into(archive: &Path, member: &str, target: &Path) -> Result<(), UpdateError> {
+fn extract_into(
+    archive: &Path,
+    member: &str,
+    target: &Path,
+    created: &mut bool,
+) -> Result<(), UpdateError> {
     let file = File::open(archive).map_err(UpdateError::Extract)?;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
     let mut found = false;
@@ -112,10 +128,14 @@ fn extract_into(archive: &Path, member: &str, target: &Path) -> Result<(), Updat
         }
         found = true;
         let mut out = create_new_executable(target).map_err(UpdateError::Extract)?;
+        *created = true;
+        set_mode(&out, 0o755).map_err(UpdateError::Extract)?;
         let copied = std::io::copy(&mut entry.take(MAX_BINARY_BYTES + 1), &mut out)
             .map_err(UpdateError::Extract)?;
         if copied > MAX_BINARY_BYTES {
-            return Err(UpdateError::TooLarge);
+            return Err(UpdateError::Extract(std::io::Error::other(
+                "the binary is larger than 1 GiB",
+            )));
         }
         out.sync_all().map_err(UpdateError::Extract)?;
     }
@@ -126,7 +146,43 @@ fn extract_into(archive: &Path, member: &str, target: &Path) -> Result<(), Updat
     }
 }
 
-/// A new file at `path`, mode 0755 on Unix; an existing file is an error.
+/// Set the mode of the open `file` (`fchmod`), which no umask reduces.
+fn set_mode(file: &File, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, mode);
+        Ok(())
+    }
+}
+
+/// Give `new` the permission bits of `canonical_exe` (masked to `0o777`),
+/// set on its open handle, so neither the umask nor the extract decides who
+/// may run the installed binary. An old exe that cannot be read leaves
+/// `new` at 0755.
+fn keep_mode(new: &Path, canonical_exe: &Path) -> Result<(), UpdateError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(canonical_exe)
+            .map(|old| old.permissions().mode() & 0o777)
+            .unwrap_or(0o755);
+        let file = File::open(new).map_err(UpdateError::Swap)?;
+        set_mode(&file, mode).map_err(UpdateError::Swap)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (new, canonical_exe);
+    }
+    Ok(())
+}
+
+/// A new file at `path`, created with mode 0755 on Unix (the umask may
+/// reduce it; [`set_mode`] sets it after); an existing file is an error.
 fn create_new_executable(path: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -241,6 +297,7 @@ pub async fn install_tarball(
     let (archive, mut checks) = fetch_verified(release, asset, download_dir).await?;
     let new = extract_member(&archive, member, exe_dir)?;
     let mut check_and_swap = || -> Result<(), UpdateError> {
+        keep_mode(&new, canonical_exe)?;
         if check_codesign {
             codesign_ok(spawner, &new)?;
             checks.codesign = true;
@@ -344,10 +401,97 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&new).unwrap().permissions().mode() & 0o777;
-            // The umask can only take bits away.
-            assert_eq!(mode & !0o755, 0, "{mode:o}");
-            assert_eq!(mode & 0o700, 0o700, "{mode:o}");
+            assert_eq!(
+                mode, 0o755,
+                "set on the handle, whatever the umask: {mode:o}"
+            );
         }
+    }
+
+    /// The environment variable that makes [`umask_stand_in`] run, naming
+    /// its work folder.
+    #[cfg(unix)]
+    const UMASK_STAND_IN: &str = "CRYSTALLINE_TEST_UMASK_STAND_IN";
+
+    /// Not a test: the child [`a_strict_umask_keeps_the_old_mode`] starts,
+    /// so the umask of 077 is set in a process of its own and never in the
+    /// test process, whose other threads create files too. It extracts the
+    /// member next to `<work>/bin/crystalline`, keeps the old mode and swaps.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a stand-in process for a test, started by that test"]
+    fn umask_stand_in() {
+        let Some(work) = std::env::var_os(UMASK_STAND_IN) else {
+            return;
+        };
+        let work = PathBuf::from(work);
+        // SAFETY: umask takes a mode and cannot fail.
+        unsafe { libc::umask(0o077) };
+        let archive = archive(
+            &work,
+            &[(MEMBER, b"the new binary", tar::EntryType::Regular)],
+        );
+        let bin = work.join("bin");
+        let exe = bin.join("crystalline");
+        let new = extract_member(&archive, MEMBER, &bin).unwrap();
+        keep_mode(&new, &exe).unwrap();
+        swap(&new, &exe).unwrap();
+    }
+
+    /// Under a umask of 077 an old exe at 0755 ends at 0755: the mode is
+    /// set on the open handle, so a strict umask (sudo uses the person's)
+    /// never leaves an install nobody else can run.
+    #[cfg(unix)]
+    #[test]
+    fn a_strict_umask_keeps_the_old_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("crystalline");
+        std::fs::write(&exe, b"the old binary").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "update::swap::tests::umask_stand_in",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(UMASK_STAND_IN, work.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&exe).unwrap(), b"the new binary", "swapped");
+        let mode = std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "{mode:o}");
+    }
+
+    /// Any old mode is kept, group and other bits included.
+    #[cfg(unix)]
+    #[test]
+    fn the_old_mode_is_copied() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        let exe = work.path().join("crystalline");
+        std::fs::write(&exe, b"old").unwrap();
+        let new = work.path().join(format!("{NEW_PREFIX}1"));
+        std::fs::write(&new, b"new").unwrap();
+        for old in [0o750, 0o711, 0o775] {
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(old)).unwrap();
+            keep_mode(&new, &exe).unwrap();
+            let mode = std::fs::metadata(&new).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, old, "{mode:o}");
+        }
+        // An old exe that cannot be read leaves 0755.
+        keep_mode(&new, &work.path().join("gone")).unwrap();
+        let mode = std::fs::metadata(&new).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "{mode:o}");
     }
 
     #[test]
@@ -387,6 +531,11 @@ mod tests {
         let planted = into.join(format!("{NEW_PREFIX}{}", std::process::id()));
         std::fs::write(&planted, b"planted").unwrap();
         assert!(extract_member(&archive, MEMBER, &into).is_err());
+        assert_eq!(
+            std::fs::read(&planted).unwrap(),
+            b"planted",
+            "a file this run did not create is kept"
+        );
         remove_new_leftovers(&into);
         assert!(files_in(&into).is_empty());
         extract_member(&archive, MEMBER, &into).unwrap();

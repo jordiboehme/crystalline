@@ -499,9 +499,9 @@ pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
         now: time::now(),
     };
     let result = run_now(&context, yes, ignore_age).await;
-    // The folder of a sudo run goes, but for a .deb: the printed apt
-    // command points into it.
-    if sudo && detection.method != InstallMethod::Deb {
+    // The folder of a sudo run goes, but for a .deb whose apt command was
+    // printed: that command points into it.
+    if sudo && !keeps_sudo_folder(detection.method, &result, &context.cache_dir) {
         let _ = std::fs::remove_dir_all(&context.cache_dir);
     }
     match result? {
@@ -510,12 +510,33 @@ pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
     }
 }
 
+/// Whether the temp folder of a sudo run stays: only for a .deb that was
+/// downloaded (the run ended with 0 and a release folder is there), whose
+/// printed apt command points into it. A refused, failed or up-to-date run
+/// leaves nothing behind.
+pub(crate) fn keeps_sudo_folder(
+    method: InstallMethod,
+    result: &anyhow::Result<u8>,
+    folder: &Path,
+) -> bool {
+    method == InstallMethod::Deb
+        && matches!(result, Ok(0))
+        && std::fs::read_dir(folder.join("updates")).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        })
+}
+
 /// Why a tar.gz install cannot be updated in place, before anything is
 /// downloaded: its folder is not writable for this process. The text names
 /// the folder and the manual steps, and, for a folder of root's, `sudo
 /// crystalline update now`. `None` when the swap can go ahead.
 pub(crate) fn tarball_refusal(exe: Option<&Path>, euid: Option<u32>) -> Option<String> {
-    let exe = exe?;
+    // No canonical exe: nothing the swap could act on.
+    let Some(exe) = exe else {
+        return Some(refused_line(&Refusal::Unknown));
+    };
     if writable_install_dir(exe) {
         return None;
     }
@@ -1700,7 +1721,10 @@ mod tests {
             ),
             "{refusal}"
         );
-        assert_eq!(tarball_refusal(None, Some(1000)), None);
+        assert_eq!(
+            tarball_refusal(None, Some(1000)),
+            Some(refused_line(&Refusal::Unknown))
+        );
     }
 
     #[cfg(unix)]
@@ -1761,5 +1785,47 @@ mod tests {
             )
             .contains("did not start")
         );
+    }
+
+    #[test]
+    fn a_sudo_folder_stays_only_for_a_downloaded_deb() {
+        let folder = tempfile::tempdir().unwrap();
+        let ok: anyhow::Result<u8> = Ok(0);
+        // Nothing downloaded yet (up to date, gated): it goes.
+        std::fs::create_dir_all(folder.path().join("updates")).unwrap();
+        assert!(!keeps_sudo_folder(InstallMethod::Deb, &ok, folder.path()));
+        std::fs::create_dir_all(folder.path().join("updates").join("v0.34.0")).unwrap();
+        assert!(keeps_sudo_folder(InstallMethod::Deb, &ok, folder.path()));
+        assert!(!keeps_sudo_folder(
+            InstallMethod::Tarball,
+            &ok,
+            folder.path()
+        ));
+        let failed: anyhow::Result<u8> = Err(anyhow::anyhow!("refused"));
+        assert!(!keeps_sudo_folder(
+            InstallMethod::Deb,
+            &failed,
+            folder.path()
+        ));
+        let plan_only: anyhow::Result<u8> = Ok(EXIT_UPDATE_AVAILABLE);
+        assert!(!keeps_sudo_folder(
+            InstallMethod::Deb,
+            &plan_only,
+            folder.path()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_tarball_without_its_exe_is_refused_before_the_lock() {
+        let cache = tempfile::tempdir().unwrap();
+        let spawner = Recording::new(0, Vec::new());
+        let context = NowContext {
+            cache_dir: cache.path().to_path_buf(),
+            exe: None,
+            ..ctx(InstallMethod::Tarball, &spawner, false, &never_asked)
+        };
+        let err = run_now(&context, true, true).await.unwrap_err();
+        assert_eq!(err.to_string(), refused_line(&Refusal::Unknown));
+        assert!(!cache.path().join("updates").exists(), "no lock, no folder");
     }
 }

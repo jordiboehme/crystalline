@@ -6,6 +6,7 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 
 use axum::body::Body;
 use axum::http::{Response, StatusCode};
@@ -131,6 +132,7 @@ fn install_folder() -> (tempfile::TempDir, std::path::PathBuf) {
     let install = tempfile::tempdir().unwrap();
     let exe = install.path().join("crystalline");
     std::fs::write(&exe, b"the old binary").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     (install, exe)
 }
 
@@ -179,6 +181,11 @@ async fn update_now_tarball_end_to_end() {
         }
     );
     assert_eq!(std::fs::read_to_string(&exe).unwrap(), script);
+    assert_eq!(
+        std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "the old exe's mode"
+    );
     assert_eq!(files_in(install.path()), ["crystalline"], "nothing else");
     let new = format!(
         "{}/{NEW_PREFIX}{}",
