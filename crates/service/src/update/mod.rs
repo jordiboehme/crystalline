@@ -18,11 +18,11 @@ pub use client::{UpdateError, download, latest_release};
 pub use codesign::codesign_ok;
 pub use finish::{Handover, hand_over};
 pub use now::{
-    ReleaseSource, UpdateLock, download_dir, extract_zip_member, fetch_verified,
+    ReleaseSource, UpdateLock, Verified, download_dir, extract_zip_member, fetch_verified,
     fetch_verified_from, remove_older_tags, take_lock,
 };
 pub use spawn::{Spawner, SystemSpawner};
 pub use swap::{
-    extract_member, install_tarball, root_owned_install_dir, swap, under_sudo, version_matches,
-    writable_install_dir,
+    extract_member, install_tarball, install_verified, root_owned_install_dir, swap, under_sudo,
+    version_matches, writable_install_dir,
 };

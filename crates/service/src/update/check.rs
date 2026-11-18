@@ -3,7 +3,7 @@
 //! state folder, and the facts `status` asks for over the control socket.
 //!
 //! The check is off by default, and never runs under `NO_UPDATE_NOTIFIER`,
-//! `CI`, in a container or in the Claude Desktop extension. It never blocks
+//! `CI`, in a container or in the Claude Desktop-only bundle. It never blocks
 //! the daemon's start or its requests: it runs in its own task, after a
 //! random wait so many daemons started together do not ask GitHub at the
 //! same second. Failures are cached as well, so a broken network costs one

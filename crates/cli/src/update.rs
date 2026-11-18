@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use crystalline_core::time::{self, Stamp};
 use crystalline_core::update::{
-    CheckOutcome, CheckState, Checks, Detection, FAILED_REASON, Gate, InstallMethod, LatestRelease,
-    Lookup, OffReason, Refusal, UPDATE_CACHE_FILE, UpdateCache, UpdateFacts, age_gate,
-    archive_member, asset_name, display_path,
+    CheckOutcome, CheckState, Checks, DetectedInstall, Detection, FAILED_REASON, Gate,
+    InstallMethod, LatestRelease, Lookup, OffReason, Refusal, UPDATE_CACHE_FILE, UpdateCache,
+    UpdateFacts, age_gate, archive_member, asset_name, display_path,
 };
 use crystalline_core::version::{Precedence, release_tag, release_version};
 use crystalline_service::update::swap::finish_after_swap;
@@ -568,6 +568,33 @@ pub(crate) fn keeps_sudo_folder(
         })
 }
 
+/// Whether this process can update the tar.gz install at a binary's path
+/// in place. The one check behind [`tarball_refusal`], [`tarball_action`]
+/// and the session block's action, so the three cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TarballFolder {
+    /// The folder is writable: `update now` swaps the binary.
+    Writable,
+    /// The folder is root's and this process is not root: `sudo
+    /// crystalline update now`, which the person runs.
+    Sudo,
+    /// The folder is not writable otherwise: only by hand.
+    ByHand,
+}
+
+impl TarballFolder {
+    /// The folder of `exe` for a process running as `euid`.
+    pub(crate) fn of(exe: &Path, euid: Option<u32>) -> TarballFolder {
+        if writable_install_dir(exe) {
+            TarballFolder::Writable
+        } else if root_owned_install_dir(exe) && euid != Some(0) {
+            TarballFolder::Sudo
+        } else {
+            TarballFolder::ByHand
+        }
+    }
+}
+
 /// Why a tar.gz install cannot be updated in place, before anything is
 /// downloaded: its folder is not writable for this process. The text names
 /// the folder and the manual steps, and, for a folder of root's, `sudo
@@ -577,7 +604,8 @@ pub(crate) fn tarball_refusal(exe: Option<&Path>, euid: Option<u32>) -> Option<S
     let Some(exe) = exe else {
         return Some(refused_line(&Refusal::Unknown));
     };
-    if writable_install_dir(exe) {
+    let folder = TarballFolder::of(exe, euid);
+    if folder == TarballFolder::Writable {
         return None;
     }
     let dir = exe.parent().unwrap_or(exe);
@@ -585,7 +613,7 @@ pub(crate) fn tarball_refusal(exe: Option<&Path>, euid: Option<u32>) -> Option<S
         "take crystalline from the tar.gz of the newest release ({RELEASES_URL}/latest) and move it over {}.",
         display_path(exe)
     );
-    let next = if root_owned_install_dir(exe) && euid != Some(0) {
+    let next = if folder == TarballFolder::Sudo {
         format!("Run sudo crystalline update now, or update by hand: {by_hand}")
     } else {
         format!("Update by hand: {by_hand}")
@@ -603,17 +631,14 @@ pub(crate) fn tarball_refusal(exe: Option<&Path>, euid: Option<u32>) -> Option<S
 /// update now` is the action.
 pub(crate) fn tarball_action(exe: Option<&Path>, euid: Option<u32>) -> Option<String> {
     let exe = exe?;
-    if writable_install_dir(exe) {
-        return None;
+    match TarballFolder::of(exe, euid) {
+        TarballFolder::Writable => None,
+        TarballFolder::Sudo => Some("run: sudo crystalline update now".to_string()),
+        TarballFolder::ByHand => Some(format!(
+            "update now does nothing here (you cannot write to {})",
+            display_path(exe.parent().unwrap_or(exe))
+        )),
     }
-    if root_owned_install_dir(exe) && euid != Some(0) {
-        return Some("run: sudo crystalline update now".to_string());
-    }
-    let dir = exe.parent().unwrap_or(exe);
-    Some(format!(
-        "update now does nothing here (you cannot write to {})",
-        display_path(dir)
-    ))
 }
 
 /// [`now`] once its parts are known: the lock, the lookup and the action.
@@ -715,11 +740,10 @@ pub(crate) async fn act(
             let asset = asset_name(method, &release.version).ok_or(UpdateError::NoAsset)?;
             let dir = download_dir(&context.cache_dir, &release.tag);
             println!("Downloading {asset}");
-            let (path, checks) =
-                fetch_verified_from(&context.source, release, &asset, &dir).await?;
+            let verified = fetch_verified_from(&context.source, release, &asset, &dir).await?;
             remove_older_tags(&context.cache_dir, &release.tag);
-            println!("{}", checks_line(&checks, &release.tag));
-            println!("Downloaded: {}", display_path(&path));
+            println!("{}", checks_line(&verified.checks, &release.tag));
+            println!("Downloaded: {}", display_path(&verified.path));
             print!("{}", apt_steps(&dir, &asset, context.euid, context.sudo));
             Ok(0)
         }
@@ -784,15 +808,15 @@ pub(crate) async fn windows_steps(
     let leftover = update_windows::remove_old_exe(exe);
     let dir = download_dir(&context.cache_dir, &release.tag);
     println!("Downloading {asset}");
-    let (path, checks) = fetch_verified_from(&context.source, release, asset, &dir).await?;
+    let verified = fetch_verified_from(&context.source, release, asset, &dir).await?;
     // Only now, with this release verified, do older download folders go
     // (a gated, declined or failed run removes nothing), and never this
     // one, which the saved steps point into.
     remove_older_tags(&context.cache_dir, &release.tag);
-    println!("{}", checks_line(&checks, &release.tag));
-    println!("Downloaded: {}", display_path(&path));
+    println!("{}", checks_line(&verified.checks, &release.tag));
+    println!("Downloaded: {}", display_path(&verified.path));
     let steps = if context.detection.method == InstallMethod::Zip {
-        extract_zip_member(&path, member, &dir)?;
+        extract_zip_member(&verified.bytes, member, &dir)?;
         let mut steps = String::new();
         if let Some(old) = &leftover {
             steps.push_str(&format!(
@@ -1400,7 +1424,7 @@ pub(crate) fn stderr_hint(cache: &UpdateCache, current: &Precedence) -> Option<S
 
 /// Whether the stderr hint may show at all: stderr is a terminal, nothing
 /// in `env` suppresses the check (`NO_UPDATE_NOTIFIER`, `CI`, Docker, the
-/// Claude Desktop extension) and `update now` would act for this binary.
+/// Claude Desktop-only bundle) and `update now` would act for this binary.
 pub(crate) fn hint_may_show(
     stderr_tty: bool,
     env: &dyn Fn(&str) -> Option<String>,
@@ -1411,7 +1435,7 @@ pub(crate) fn hint_may_show(
 
 /// Whether an update may be offered for this binary at all: nothing in
 /// `env` suppresses the check (`NO_UPDATE_NOTIFIER`, `CI`, Docker, the
-/// Claude Desktop extension) and `update now` would act for it, which rules
+/// Claude Desktop-only bundle) and `update now` would act for it, which rules
 /// out an unofficial build, an app package and an unknown method too. The
 /// stderr hint and the install-time question share it. Pure.
 pub(crate) fn may_offer(env: &dyn Fn(&str) -> Option<String>, detection: &Detection) -> bool {
@@ -1641,13 +1665,17 @@ pub(crate) struct BlockInputs<'a> {
     pub(crate) now: Stamp,
     /// The effective `update.min_age_hours`.
     pub(crate) min_age_hours: u32,
+    /// For a tar.gz install, whether this process can write its folder
+    /// ([`TarballFolder::Writable`] for any other method).
+    pub(crate) tarball: TarballFolder,
 }
 
 /// The cheap half of [`session_block`]'s decision: a fresh start outside a
-/// subagent (`source` `startup` or absent), a cache that parses and names an
-/// exact release tag newer than `current`, and no stamp holding that
-/// version back. Answers the cache and the newer version. The session hook
-/// asks it before it detects the install or reads a setting. Pure.
+/// subagent (`source` `startup`, Copilot's `new` or absent), a cache that
+/// parses and names an exact release tag newer than `current`, and no stamp
+/// holding that version back. Answers the cache and the newer version. The
+/// session hook asks it before it detects the install or reads a setting.
+/// Pure.
 pub(crate) fn block_due(
     cache: Option<&str>,
     stamp: Option<&str>,
@@ -1656,7 +1684,7 @@ pub(crate) fn block_due(
     source: Option<&str>,
     now: Stamp,
 ) -> Option<(UpdateCache, Precedence)> {
-    if in_subagent || !matches!(source, None | Some("startup")) {
+    if in_subagent || !matches!(source, None | Some("startup" | "new")) {
         return None;
     }
     let cache = UpdateCache::parse(cache?)?;
@@ -1666,9 +1694,19 @@ pub(crate) fn block_due(
 }
 
 /// What the agent is told to do for `method`, `None` for one `update now`
-/// does not act on.
-fn block_action(method: InstallMethod) -> Option<&'static str> {
+/// does not act on. A tar.gz install whose folder this process cannot
+/// write is never sent to `update now`, which would only be refused: the
+/// person runs `sudo` in their own terminal, or updates by hand.
+fn block_action(method: InstallMethod, tarball: TarballFolder) -> Option<&'static str> {
     match method {
+        InstallMethod::Tarball if tarball == TarballFolder::Sudo => Some(
+            "show them the command sudo crystalline update now, which they run in their own \
+             terminal (it asks for their password); do not run it yourself.",
+        ),
+        InstallMethod::Tarball if tarball == TarballFolder::ByHand => Some(
+            "tell them update now cannot write to this install's folder, so they replace the \
+             binary by hand with the one from the release's tar.gz.",
+        ),
         InstallMethod::Tarball | InstallMethod::Homebrew => {
             Some("run crystalline update now --yes.")
         }
@@ -1703,7 +1741,7 @@ pub(crate) fn session_block(inputs: &BlockInputs) -> Option<String> {
     if cache.gate(inputs.now, inputs.min_age_hours) != Some(Gate::Open) {
         return None;
     }
-    let action = block_action(inputs.detection.method)?;
+    let action = block_action(inputs.detection.method, inputs.tarball)?;
     let tag = release_tag(&newer)?;
     Some(format!(
         "Crystalline {} is available (this is {}, {}). Notes: {RELEASES_URL}/tag/{tag}\n\
@@ -1803,7 +1841,7 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
         source,
         now,
     )?;
-    let detection = block_detection();
+    let DetectedInstall { exe, detection } = block_detection();
     let env = |name: &str| std::env::var(name).ok();
     let suppressed = OffReason::suppressing(&env, &detection).is_some();
     if suppressed || !detection.acts() {
@@ -1813,6 +1851,15 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
         version: newer.render(),
         at: now,
         held,
+    };
+    // An exe that cannot be named is one `update now` refuses
+    // (`tarball_refusal(None)`), so the block sends nobody there.
+    let tarball = if detection.method == InstallMethod::Tarball {
+        exe.as_deref().map_or(TarballFolder::ByHand, |exe| {
+            TarballFolder::of(exe, effective_uid())
+        })
+    } else {
+        TarballFolder::Writable
     };
     let shown =
         within(BLOCK_SETTINGS_WAIT, settings_for_hint).and_then(|(check_on, min_age_hours)| {
@@ -1827,6 +1874,7 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
                 source,
                 now,
                 min_age_hours,
+                tarball,
             })
         });
     match shown {
@@ -1842,13 +1890,13 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
     }
 }
 
-/// The detection the session block offers for: [`detect_here`]'s, the
-/// build refusals applied.
+/// The install the session block offers for: [`detect_here`]'s, the
+/// build refusals applied, with the exe it found.
 ///
 /// [`detect_here`]: crystalline_service::update::detect_here
 #[cfg(not(debug_assertions))]
-fn block_detection() -> Detection {
-    crystalline_service::update::detect_here().detection
+fn block_detection() -> DetectedInstall {
+    crystalline_service::update::detect_here()
 }
 
 /// The detection the session block offers for. A debug build reads
@@ -1856,15 +1904,20 @@ fn block_detection() -> Detection {
 /// `tarball`) as an acting install of that method, so a process test can
 /// show the block from a test binary, which is never an official build.
 #[cfg(debug_assertions)]
-fn block_detection() -> Detection {
-    std::env::var("CRYSTALLINE_TEST_UPDATE_METHOD")
+fn block_detection() -> DetectedInstall {
+    let here = crystalline_service::update::detect_here();
+    let detection = std::env::var("CRYSTALLINE_TEST_UPDATE_METHOD")
         .ok()
         .and_then(|key| serde_json::from_value(serde_json::Value::String(key)).ok())
         .map(|method| Detection {
             method,
             refusal: None,
         })
-        .unwrap_or_else(|| crystalline_service::update::detect_here().detection)
+        .unwrap_or(here.detection);
+    DetectedInstall {
+        exe: here.exe,
+        detection,
+    }
 }
 
 #[cfg(test)]
@@ -3820,6 +3873,7 @@ mod tests {
             source: Some("startup"),
             now: now(),
             min_age_hours: 24,
+            tarball: TarballFolder::Writable,
         }
     }
 
@@ -3889,8 +3943,9 @@ mod tests {
     }
 
     /// Jordi's word budget (2026-11-17): the block stays under 60 words for
-    /// every method, with the longest realistic versions and the sentence
-    /// S24 may add to the tarball line.
+    /// every method, with the longest realistic versions. S24 is ruled: an
+    /// MCP session survives the tar.gz handover (its bridge waits for the
+    /// successor and reconnects), so the tarball line adds no restart.
     #[test]
     fn every_block_stays_under_60_words() {
         let cache = cache_text("v10.20.30");
@@ -3903,14 +3958,64 @@ mod tests {
             InstallMethod::Zip,
         ] {
             let detection = acting(method);
-            let mut block =
-                session_block(&block_inputs(Some(&cache), &current, &detection)).expect("a block");
-            if method == InstallMethod::Tarball {
-                block.push_str(" Restart the session afterwards.");
+            for tarball in [
+                TarballFolder::Writable,
+                TarballFolder::Sudo,
+                TarballFolder::ByHand,
+            ] {
+                let block = session_block(&BlockInputs {
+                    tarball,
+                    ..block_inputs(Some(&cache), &current, &detection)
+                })
+                .expect("a block");
+                let words = block.split_whitespace().count();
+                assert!(words < 60, "{method:?} {tarball:?}: {words} words: {block}");
             }
-            let words = block.split_whitespace().count();
-            assert!(words < 60, "{method:?}: {words} words: {block}");
         }
+    }
+
+    /// M13: a tar.gz install whose folder is root's sends the agent to the
+    /// person, who runs `sudo` in their own terminal; one this process
+    /// cannot write otherwise says it is done by hand. Neither tells the
+    /// agent to run `update now` itself, which would only be refused.
+    #[test]
+    fn a_tarball_folder_this_process_cannot_write_changes_the_block() {
+        let cache = cache_text("v0.35.0");
+        let current = v("0.34.0");
+        let tarball = acting(InstallMethod::Tarball);
+        let block = |folder| {
+            session_block(&BlockInputs {
+                tarball: folder,
+                ..block_inputs(Some(&cache), &current, &tarball)
+            })
+            .expect("a block")
+        };
+        assert_eq!(
+            block(TarballFolder::Sudo),
+            format!(
+                "Crystalline 0.35.0 is available (this is 0.34.0, tar.gz). Notes: {NOTES}\n\
+                 Tell the user once. If they want it: show them the command sudo crystalline update now, \
+                 which they run in their own terminal (it asks for their password); do not run it yourself. \
+                 No user here: do nothing."
+            )
+        );
+        assert_eq!(
+            block(TarballFolder::ByHand),
+            format!(
+                "Crystalline 0.35.0 is available (this is 0.34.0, tar.gz). Notes: {NOTES}\n\
+                 Tell the user once. If they want it: tell them update now cannot write to this install's folder, \
+                 so they replace the binary by hand with the one from the release's tar.gz. \
+                 No user here: do nothing."
+            )
+        );
+        // The folder decides nothing for another method.
+        let homebrew = acting(InstallMethod::Homebrew);
+        let brew = session_block(&BlockInputs {
+            tarball: TarballFolder::Sudo,
+            ..block_inputs(Some(&cache), &current, &homebrew)
+        })
+        .expect("a block");
+        assert!(brew.contains("run crystalline update now --yes."), "{brew}");
     }
 
     /// S23: the version is rendered from the parsed tag, and the notes URL
@@ -3970,6 +4075,16 @@ mod tests {
                 ..base()
             })
             .is_some()
+        );
+        // So is Copilot's `new` (its hooks reference lists `startup`,
+        // `resume` and `new` for sessionStart).
+        assert!(
+            session_block(&BlockInputs {
+                source: Some("new"),
+                ..base()
+            })
+            .is_some(),
+            "a new Copilot session is a fresh start"
         );
         let cases: Vec<(&str, BlockInputs)> = vec![
             (

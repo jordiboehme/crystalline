@@ -227,3 +227,123 @@ fn the_two_checksum_steps_are_the_same() {
     );
     assert_eq!(checksums, collect("publish"));
 }
+
+/// Every `CRYSTALLINE_TEST_UPDATE_*` name any crate under crates/ holds is
+/// in the seam loop of release.yml's `check-signature` job, which fails a release
+/// whose binary carries one. A seam added to the code and not to the loop
+/// would ship unseen.
+#[test]
+fn the_release_checks_every_updater_seam() {
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&repo_file(".github/workflows/release.yml"))
+            .expect("release.yml parses");
+    let check = workflow["jobs"]["check-signature"]["steps"]
+        .as_sequence()
+        .expect("the check-signature job has steps")
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .find(|run| run.contains("for seam in "))
+        .expect("a step loops over the seams");
+    let looped: Vec<&str> = check
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("for seam in "))
+        .and_then(|rest| rest.strip_suffix("; do"))
+        .expect("the loop line")
+        .split_whitespace()
+        .collect();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found = std::collections::BTreeSet::new();
+    // Every crate under crates/, its sources, tests and build scripts alike.
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .expect("the crates folder")
+        .map(|entry| entry.expect("a crate").path())
+        .filter(|path| path.is_dir())
+        .collect();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a source folder") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a source file");
+            for (at, _) in text.match_indices("CRYSTALLINE_TEST_UPDATE_") {
+                let name: String = text[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                    .collect();
+                if name != "CRYSTALLINE_TEST_UPDATE_" {
+                    found.insert(name);
+                }
+            }
+            // A name built another way (`concat!`, `format!` or a prefix
+            // constant) would never show whole: every `TEST_UPDATE_` in the
+            // shipped sources must be part of a whole name the loop above
+            // saw. Tests (this one among them) may name the prefix alone.
+            let shipped = path.components().any(|part| part.as_os_str() == "src");
+            for (at, _) in text.match_indices("TEST_UPDATE_").filter(|_| shipped) {
+                let whole = text[..at].ends_with("CRYSTALLINE_")
+                    && text[at + "TEST_UPDATE_".len()..]
+                        .starts_with(|c: char| c.is_ascii_uppercase());
+                assert!(
+                    whole,
+                    "{}: a seam name built in pieces near byte {at}; spell it whole so the release check sees it",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(found.len() >= 4, "the four updater seams: {found:?}");
+    for name in &found {
+        assert!(
+            looped.contains(&name.as_str()),
+            "release.yml's seam loop misses {name}"
+        );
+    }
+}
+
+/// The macOS signing step in build.yml reads the Team ID from the
+/// `APPLE_TEAM_ID` line of `crates/core/src/update/mod.rs` with `sed`.
+/// A reformatted constant would make that read come out empty and fail
+/// the release at its first signing leg, so the line keeps the shape the
+/// `sed` matches and holds the constant's value.
+#[test]
+fn build_yml_reads_the_compiled_in_team_id() {
+    let build = repo_file(".github/workflows/build.yml");
+    assert!(
+        build.contains(
+            r#"sed -n 's/^pub const APPLE_TEAM_ID: &str = "\([A-Z0-9]*\)";$/\1/p' "$GITHUB_WORKSPACE/crates/core/src/update/mod.rs""#
+        ),
+        "build.yml reads the Team ID from the source"
+    );
+    assert!(
+        !build.contains("TeamIdentifier=${APPLE_TEAM_ID}"),
+        "the Team ID is not taken from the secret"
+    );
+    let source = repo_file("crates/core/src/update/mod.rs");
+    // The lines the `sed` prints a value for: the whole line in this shape.
+    let matched: Vec<&str> = source
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("pub const APPLE_TEAM_ID: &str = \"")?
+                .strip_suffix("\";")
+                .filter(|id| {
+                    id.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                })
+        })
+        .collect();
+    assert_eq!(
+        matched,
+        [crystalline_core::update::APPLE_TEAM_ID],
+        "exactly one line the sed reads, holding the constant's value"
+    );
+    assert!(
+        crystalline_core::update::APPLE_TEAM_ID
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    );
+}
