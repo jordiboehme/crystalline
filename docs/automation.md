@@ -2,7 +2,7 @@
 
 Two loops keep a domain in shape. The reflect loop works a domain's [Reflection](reflection.md): feedback people left on a page, threads waiting for an answer and pages whose engrams changed. The evolve loop works the maintenance findings of [`crystalline evolve`](evolve.md). Both can run without a person starting an agent.
 
-Crystalline never starts a program. A runner outside it does the work: `crystalline reflect run` started by you or by a scheduler, a container job or an n8n workflow. Crystalline answers four questions for that runner: is something due, may I run now (the lease), what did the run change (the share) and how did it end (the run record). It can also send a signed webhook when work becomes due, so a runner starts without polling.
+Crystalline never starts a program. A runner outside it does the work: `crystalline reflect run` started by you or by a scheduler, a container job or an n8n workflow. Crystalline answers five questions for that runner: is something due, which prompt does the agent start with (the prompt), may I run now (the lease), what did the run change (the share) and how did it end (the run record). It can also send a signed webhook when work becomes due, so a runner starts without polling.
 
 Every runner asks first. When nothing is due, it ends at once and starts no agent.
 

@@ -151,13 +151,17 @@ pub(super) async fn run_one(
         println!("  {}", words.join(" "));
         return Ok(Ran::Exited(0));
     }
-    let prompt = run_prompt(lp, client, domain, args.max_items).await?;
+    // A stop never waits on the server: no lease is taken yet.
+    let mut stopping = stop.clone();
+    let prompt = tokio::select! {
+        prompt = run_prompt(lp, client, domain, args.max_items) => prompt?,
+        _ = stopping.wait_for(|stopped| *stopped) => return Ok(Ran::Busy),
+    };
     let take = client.verb(
         "automation_lease_take",
         lp,
         json!({ "domain": domain, "runner": args.runner }),
     );
-    let mut stopping = stop.clone();
     let take = tokio::select! {
         take = take => take,
         _ = stopping.wait_for(|stopped| *stopped) => return Ok(Ran::Busy),
