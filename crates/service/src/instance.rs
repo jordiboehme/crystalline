@@ -683,17 +683,32 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
     (conn, displaced.is_some())
 }
 
+/// What a displacement hands its caller: how the displaced daemon was
+/// started, and the handover marker written before it was asked to stop.
+/// The marker holds while this value lives, so the caller keeps it until
+/// its successor answers (or it gave up): meanwhile a connected bridge,
+/// which reconnects the moment its socket closes, waits for that successor
+/// instead of starting one with its own flags.
+#[derive(Debug)]
+pub struct Displaced {
+    /// What the displaced daemon's record said about how it was started;
+    /// `None` for a daemon older than 0.22.1.
+    pub start: Option<StartOptions>,
+    /// The marker, removed when this value is dropped.
+    pub(crate) marker: Option<HandoverGuard>,
+}
+
 /// As [`try_attach_reporting`], but a displacement hands back what the
-/// displaced daemon said about how it was started (the outer `Some`; the
-/// inner value is `None` for a daemon older than 0.22.1). The daemon is gone
-/// once it has left, so this first ask is the only chance to hear it.
+/// displaced daemon said about how it was started and the handover marker
+/// ([`Displaced`]). The daemon is gone once it has left, so this first ask
+/// is the only chance to hear it.
 ///
 /// The pipe is asked first and the record is not read here: a stale record
 /// (its daemon was killed before it removed it) or a private one (written
 /// inside an app package, which only that package sees) never decides
 /// anything, and a one-shot command, which serves no pipe, is no daemon to
 /// attach to.
-pub async fn try_attach_displacing() -> (Option<Connection>, Option<Option<StartOptions>>) {
+pub async fn try_attach_displacing() -> (Option<Connection>, Option<Displaced>) {
     try_attach_displacing_in(crate::runs_in::PackageContext::here()).await
 }
 
@@ -712,7 +727,7 @@ pub async fn try_attach_displacing() -> (Option<Connection>, Option<Option<Start
 /// so the session hangs instead of getting the stub.
 pub(crate) async fn try_attach_displacing_in(
     here: &crate::runs_in::PackageContext,
-) -> (Option<Connection>, Option<Option<StartOptions>>) {
+) -> (Option<Connection>, Option<Displaced>) {
     let Ok(sock) = config::service_sock_path() else {
         return (None, None);
     };
@@ -729,9 +744,17 @@ pub(crate) async fn try_attach_displacing_in(
             facts.pid,
             crystalline_core::VERSION
         );
-        if displace(&sock, facts.pid).await {
-            return (None, Some(facts.start));
+        let (gone, marker) = displace_for_handover(&sock, facts.pid).await;
+        if gone {
+            return (
+                None,
+                Some(Displaced {
+                    start: facts.start,
+                    marker,
+                }),
+            );
         }
+        drop(marker);
         // The old daemon is still running: `displace` either could not verify
         // it as a Crystalline process and so never signalled it, or not even
         // the hard signal ended it. Another client may also have finished the
@@ -2117,10 +2140,22 @@ pub fn in_desktop_extension_folder(exe: &Path) -> bool {
 /// folder with the bridge's own flags, without the displaced daemon's HTTP
 /// address and allowed hosts.
 ///
+/// Every displacement writes it, `update finish`'s and that of any newer
+/// client that finds an older daemon ([`try_attach_displacing`]), and holds
+/// it until its successor answers or it gave up.
+///
 /// Its name and shape are a contract between releases: the readers are the
 /// bridges of the version that runs, the writer is the next version's
 /// `update finish`. A reader ignores fields it does not know, and a file it
 /// cannot read is no marker.
+///
+/// Bounds: the writer's pid is asked with signal 0, and a pid the system
+/// gave to another user's process answers EPERM, which counts as alive. So a
+/// reused pid keeps a marker holding until its deadline, never longer, and
+/// a reader waits [`HANDOVER_MAX_WAIT`] at most whatever the file says. A
+/// marker whose writer was killed before its guard ran stays on disk until
+/// a reader finds it stale (writer gone or deadline passed) and removes it,
+/// or the next handover replaces it.
 pub(crate) const HANDOVER_FILE: &str = "handover.json";
 
 /// What the handover marker holds.
@@ -2166,6 +2201,42 @@ pub(crate) fn handover_holds(
     let until = crystalline_core::time::parse_rfc3339(&marker.until)?.stamp();
     let left = until.since(now).to_std().filter(|left| !left.is_zero())?;
     Some(left.min(HANDOVER_MAX_WAIT))
+}
+
+/// Whether the marker `text` is a stale one a reader may remove: it parses
+/// and names another process, and that process is gone or its deadline has
+/// passed. A file that does not parse is left alone (it may be a later
+/// release's). Pure.
+pub(crate) fn handover_stale(
+    text: &str,
+    now: crystalline_core::time::Stamp,
+    me: u32,
+    alive: impl Fn(u32) -> bool,
+) -> bool {
+    let Ok(marker) = serde_json::from_str::<HandoverMarker>(text) else {
+        return false;
+    };
+    if marker.pid == me {
+        return false;
+    }
+    let past = crystalline_core::time::parse_rfc3339(&marker.until).is_some_and(|until| {
+        until
+            .stamp()
+            .since(now)
+            .to_std()
+            .is_none_or(|left| left.is_zero())
+    });
+    !alive(marker.pid) || past
+}
+
+/// Remove the stale marker at `path` that read as `text`, only while the
+/// file still holds exactly that text: a fresh marker another handover
+/// wrote in the meantime stays. The state folder is this user's own, so
+/// only a marker of this user's processes is ever removed.
+fn remove_stale_handover(path: &Path, text: &str) {
+    if std::fs::read_to_string(path).is_ok_and(|now| now == text) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// The handover marker's path, `<state_dir>/handover.json`.
@@ -2234,9 +2305,16 @@ pub(crate) async fn wait_out_handover() -> Option<Connection> {
     let mut said = false;
     loop {
         let text = std::fs::read_to_string(&path).ok();
-        handover_holds(text.as_deref(), crystalline_core::time::now(), me, |pid| {
-            !process_gone(pid)
-        })?;
+        let now = crystalline_core::time::now();
+        let alive = |pid| !process_gone(pid);
+        if handover_holds(text.as_deref(), now, me, alive).is_none() {
+            if let Some(text) = &text
+                && handover_stale(text, now, me, alive)
+            {
+                remove_stale_handover(&path, text);
+            }
+            return None;
+        }
         if !said {
             said = true;
             tracing::info!("a daemon handover is under way; waiting for the new daemon");
@@ -2383,7 +2461,10 @@ pub(crate) async fn ensure_daemon_with(
     spawn: bool,
     options: &SpawnOptions,
 ) -> anyhow::Result<Connection> {
-    if let Some(conn) = try_attach().await {
+    // A displacement on the way hands back the handover marker, held until
+    // this call returns, so other clients wait for the daemon it starts.
+    let (conn, mut _handover) = try_attach_displacing().await;
+    if let Some(conn) = conn {
         return Ok(conn);
     }
     if !spawn {
@@ -2412,8 +2493,12 @@ pub(crate) async fn ensure_daemon_with(
     match diagnose_holder().await {
         // A daemon just won the race and answers: attach, never dislodge.
         HolderState::Responsive => {
-            if let Some(conn) = try_attach().await {
+            let (conn, displaced) = try_attach_displacing().await;
+            if let Some(conn) = conn {
                 return Ok(conn);
+            }
+            if displaced.is_some() {
+                _handover = displaced;
             }
         }
         HolderState::Unresponsive { .. } => match dislodge_unresponsive().await {
@@ -2469,13 +2554,16 @@ pub(crate) async fn ensure_daemon_with(
     let deadline = Instant::now() + READINESS_BUDGET;
     let mut next_look = Instant::now() + DATABASE_LOOK_EVERY;
     while Instant::now() < deadline {
-        let (conn, displaced) = try_attach_reporting().await;
+        let (conn, displaced) = try_attach_displacing().await;
         if let Some(conn) = conn {
             return Ok(conn);
         }
-        if displaced && respawns < 3 {
-            respawns += 1;
-            spawn_daemon(options)?;
+        if let Some(displaced) = displaced {
+            _handover = Some(displaced);
+            if respawns < 3 {
+                respawns += 1;
+                spawn_daemon(options)?;
+            }
         }
         // The race: another machine took the database between the look
         // above and the spawn, and the daemon left with the lock-held code
@@ -4800,6 +4888,88 @@ mod tests {
         }
     }
 
+    /// A reader removes only a marker that parses, names another process
+    /// and is over: its writer gone or its deadline passed.
+    #[test]
+    fn only_a_stale_handover_marker_is_removed() {
+        let now = crystalline_core::time::parse_rfc3339("2026-11-18T10:00:00Z")
+            .unwrap()
+            .stamp();
+        let alive = |pid: u32| pid != 666;
+        let marker = |pid: u32, until: &str| format!(r#"{{"pid":{pid},"until":"{until}"}}"#);
+        let cases = [
+            ("fresh", marker(4242, "2026-11-18T10:00:10Z"), false),
+            ("writer gone", marker(666, "2026-11-18T10:00:10Z"), true),
+            (
+                "past its deadline",
+                marker(4242, "2026-11-18T09:59:00Z"),
+                true,
+            ),
+            (
+                "at its deadline",
+                marker(4242, "2026-11-18T10:00:00Z"),
+                true,
+            ),
+            (
+                "this process's own",
+                marker(100, "2026-11-18T09:59:00Z"),
+                false,
+            ),
+            ("not a marker", "{\"version\":2}".to_string(), false),
+            ("not JSON", "{".to_string(), false),
+        ];
+        for (label, text, want) in cases {
+            assert_eq!(handover_stale(&text, now, 100, alive), want, "{label}");
+        }
+    }
+
+    /// I3: any displacement, not only `update finish`'s, marks the handover
+    /// before it asks the older daemon to stop, and the marker holds while
+    /// the caller keeps what the displacement handed back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_displacement_marks_the_handover_before_the_stop() {
+        let _home = ScratchHome::new("handover-displace");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let mut old = marker_writer();
+        let pid = old.id();
+        let facts = serde_json::json!({ "pid": pid, "version": "0.0.1" });
+        let (server, seen) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+        let asked = seen.clone();
+        let leaver = tokio::spawn(async move {
+            while !asked.lock().unwrap().iter().any(|cmd| cmd == "shutdown") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let _ = old.kill();
+            let _ = old.wait();
+        });
+
+        let (conn, displaced) = try_attach_displacing().await;
+        assert!(conn.is_none());
+        let displaced = displaced.expect("the older daemon was displaced");
+        let log = seen.lock().unwrap().clone();
+        let at = log.iter().position(|cmd| cmd == "shutdown").expect("asked");
+        assert_eq!(
+            log.get(at + 1).map(String::as_str),
+            Some("handover-marked"),
+            "the marker existed when the stop was asked: {log:?}"
+        );
+        let path = handover_path().unwrap();
+        assert!(displaced.marker.is_some());
+        assert!(
+            path.exists(),
+            "it holds while the caller starts the successor"
+        );
+        drop(displaced);
+        assert!(!path.exists());
+        leaver.await.unwrap();
+        server.abort();
+    }
+
     /// I3: the marker's file name and shape are read by the bridges of an
     /// older release, so they stay as they are.
     #[test]
@@ -4951,6 +5121,24 @@ mod tests {
             .expect("the wait ends with its writer")
             .unwrap();
         assert!(ended.is_none());
+        assert!(!path.exists(), "the reader removed the stale marker");
+
+        // A marker past its deadline is removed by the reader too, even
+        // when its writer still runs.
+        let live = marker_writer();
+        let past = HandoverMarker {
+            pid: live.id(),
+            until: crystalline_core::time::now()
+                .checked_sub(crystalline_core::time::seconds(1))
+                .unwrap()
+                .rfc3339(),
+        };
+        std::fs::write(&path, serde_json::to_string(&past).unwrap()).unwrap();
+        assert!(wait_out_handover().await.is_none());
+        assert!(!path.exists(), "a marker past its deadline is removed");
+        let mut live = live;
+        let _ = live.kill();
+        let _ = live.wait();
 
         // No marker: no wait at all.
         let _ = std::fs::remove_file(&path);

@@ -3378,10 +3378,17 @@ fn decode<T: DeserializeOwned>(args: Value) -> anyhow::Result<T> {
 pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
     let conn = match crate::instance::try_attach_displacing().await {
         (Some(conn), _) => conn,
-        (None, Some(start)) => match crate::instance::attach_after_displacement(start).await {
-            Some(conn) => conn,
-            None => return Ok(None),
-        },
+        // The handover marker in `displaced` holds until the successor
+        // answers, so a connected bridge waits for it.
+        (None, Some(displaced)) => {
+            let crate::instance::Displaced { start, marker } = displaced;
+            let conn = crate::instance::attach_after_displacement(start).await;
+            drop(marker);
+            match conn {
+                Some(conn) => conn,
+                None => return Ok(None),
+            }
+        }
         (None, None) => return Ok(None),
     };
     Ok(Some(ctl_exchange(conn, cmd).await?))
