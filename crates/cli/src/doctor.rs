@@ -3328,7 +3328,7 @@ async fn check_domain_checks(
         let Some(block) = crystalline_core::frontmatter::second_block(&source) else {
             continue;
         };
-        let mut plan = match crystalline_core::frontmatter::merge_second_block(&source) {
+        let mut plan = match crystalline_core::frontmatter::merge_second_blocks(&source) {
             Some(crystalline_core::frontmatter::BlockMerge::Merged(text)) => Ok(text),
             Some(crystalline_core::frontmatter::BlockMerge::NotRepairable(why)) => Err(format!(
                 "--fix leaves it: {why}. Rewrite the engram with write_engram and overwrite: true"
@@ -5610,7 +5610,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             let _ = if f.fixed {
                 writeln!(
                     out,
-                    "  fixed {}: merged the second frontmatter block ({keys}) into the engram's own",
+                    "  fixed {}: merged the second frontmatter block ({keys}) into the engram's own, written anew as an overwrite writes it (YAML comments and the key order are not kept)",
                     f.path
                 )
             } else if let Some(note) = &f.not_fixed {
@@ -5622,7 +5622,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             } else {
                 writeln!(
                     out,
-                    "  [problem] {} opens its body with a second frontmatter block on line {} ({keys}), which readers take for text (verify rule E012), rerun with --fix to merge it into the engram's own",
+                    "  [problem] {} opens its body with a second frontmatter block on line {} ({keys}), which readers take for text (verify rule E012), rerun with --fix to merge it into the engram's own (the frontmatter is written anew, without YAML comments or the key order)",
                     f.path, f.line
                 )
             };

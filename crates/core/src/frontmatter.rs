@@ -869,6 +869,7 @@ pub fn frontmatter_block(yaml: &str) -> Option<serde_yaml_ng::Mapping> {
 /// Whether `text` opens, after blank lines, with a block that looks like
 /// engram frontmatter ([`frontmatter_block`]).
 pub fn opens_with_frontmatter(text: &str) -> bool {
+    let text = to_lf(text);
     split_frontmatter(text.trim_start_matches('\n'))
         .is_some_and(|parts| frontmatter_block(parts.yaml).is_some())
 }
@@ -878,7 +879,8 @@ pub fn opens_with_frontmatter(text: &str) -> bool {
 /// whose content opened with a block stored before 0.34.0. Every reader takes
 /// the first block only, so the keys of the second are lost to them.
 pub fn body_opens_with_frontmatter(source: &str) -> bool {
-    split_frontmatter(source).is_some_and(|parts| opens_with_frontmatter(parts.body))
+    let source = to_lf(source);
+    split_frontmatter(&source).is_some_and(|parts| opens_with_frontmatter(parts.body))
 }
 
 /// A second frontmatter block at the top of an engram's body.
@@ -893,6 +895,9 @@ pub struct SecondBlock {
 /// The second block the body of `source` opens with, or `None` when it opens
 /// with none ([`body_opens_with_frontmatter`]).
 pub fn second_block(source: &str) -> Option<SecondBlock> {
+    // CRLF reads as LF, which keeps the line numbers.
+    let source = to_lf(source);
+    let source = source.as_ref();
     let parts = split_frontmatter(source)?;
     let lead = parts.body.len() - parts.body.trim_start_matches('\n').len();
     let inner = split_frontmatter(&parts.body[lead..])?;
@@ -925,8 +930,14 @@ pub enum BlockMerge {
 /// parameter is left out, so the block's value takes their place. The body
 /// is the text under the block, as a write stores its content.
 ///
-/// `None` when the body opens with no such block.
+/// `None` when the body opens with no such block. A CRLF source is read as
+/// LF, and the merge is LF, as every stored engram is. The frontmatter is
+/// written anew, as an overwrite writes it: YAML comments and the key order
+/// of the engram's own block are not kept. Only the first stacked block is
+/// merged; [`merge_second_blocks`] merges them all.
 pub fn merge_second_block(source: &str) -> Option<BlockMerge> {
+    let source = to_lf(source);
+    let source = source.as_ref();
     let parts = split_frontmatter(source)?;
     let inner = split_frontmatter(parts.body.trim_start_matches('\n'))?;
     let block = frontmatter_block(inner.yaml)?;
@@ -994,6 +1005,26 @@ pub fn merge_second_block(source: &str) -> Option<BlockMerge> {
         ));
     }
     Some(BlockMerge::Merged(merged))
+}
+
+/// [`merge_second_block`] until the body opens with no block, for an engram
+/// that holds several stacked ones. At most 64 rounds, then the text as far
+/// as it got is not repairable. `None` when there is no block to merge.
+pub fn merge_second_blocks(source: &str) -> Option<BlockMerge> {
+    let mut text = match merge_second_block(source)? {
+        BlockMerge::Merged(text) => text,
+        refused => return Some(refused),
+    };
+    for _ in 0..64 {
+        match merge_second_block(&text) {
+            None => return Some(BlockMerge::Merged(text)),
+            Some(BlockMerge::Merged(next)) => text = next,
+            Some(refused) => return Some(refused),
+        }
+    }
+    Some(BlockMerge::NotRepairable(
+        "the body opens with more stacked blocks than one repair merges".to_string(),
+    ))
 }
 
 fn not_plain_text(key: &str) -> BlockMerge {
@@ -1088,6 +1119,51 @@ mod tests {
         );
         // A merge of a merged engram has nothing left to do.
         assert_eq!(merge_second_block(&text), None);
+    }
+
+    #[test]
+    fn a_crlf_engram_s_second_block_is_found_and_merged() {
+        let crlf = DOUBLED.replace('\n', "\r\n");
+        assert!(body_opens_with_frontmatter(&crlf));
+        assert!(opens_with_frontmatter(
+            "\r\n---\r\nstatus: draft\r\n---\r\nIntro"
+        ));
+        assert_eq!(second_block(&crlf), second_block(DOUBLED));
+        assert_eq!(merge_second_block(&crlf), merge_second_block(DOUBLED));
+    }
+
+    #[test]
+    fn stacked_blocks_are_merged_until_none_is_left() {
+        let stacked = DOUBLED.replacen(
+            "---\n\n# Cache Policy",
+            "---\n---\nresource: https://example.com/a\n---\n---\nreview_after: 2027-01-01\n---\n\n# Cache Policy",
+            1,
+        );
+        let Some(BlockMerge::Merged(one)) = merge_second_block(&stacked) else {
+            panic!("not merged");
+        };
+        assert!(
+            second_block(&one).is_some(),
+            "one round leaves the next block"
+        );
+        let Some(BlockMerge::Merged(all)) = merge_second_blocks(&stacked) else {
+            panic!("not merged");
+        };
+        assert_eq!(second_block(&all), None);
+        let engram = parse_engram(&all).unwrap();
+        assert_eq!(engram.frontmatter.engram_type, "decision");
+        assert_eq!(
+            engram.frontmatter.resource.as_deref(),
+            Some("https://example.com/a")
+        );
+        assert!(
+            engram.frontmatter.stale_after.is_some() || engram.frontmatter.review_after.is_some()
+        );
+        assert_eq!(
+            engram.body,
+            "\n# Cache Policy\n\nWe cache for five minutes.\n"
+        );
+        assert_eq!(merge_second_blocks(&all), None);
     }
 
     #[test]

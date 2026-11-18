@@ -199,7 +199,7 @@
     },
     {
       "parameters": {
-        "errorMessage": "={{ 'The server forbids other tools than Crystalline MCP excludes. Set its excluded tools to exactly: ' + ($json.data.disallowed_tools || []).join(', ') }}"
+        "errorMessage": "={{ 'The server forbids other tools than this workflow excludes. Update both lists to exactly these tools: the excluded tools of Crystalline MCP and the list in Same forbidden tools?. The tools: ' + ($json.data.disallowed_tools || []).join(', ') }}"
       },
       "id": "8bdceea6-f151-52aa-b49a-46db10a5e6de",
       "name": "Forbidden tools changed",

@@ -86,7 +86,10 @@ impl Engine {
     /// One function because two verbs create engrams - [`Engine::write_engram`]
     /// and [`Engine::split_engram`] - and a second copy of these screens is a
     /// second chance to leave one of them out.
-    fn engram_destination(folder: Option<&str>, title: &str) -> Result<(String, String)> {
+    pub(super) fn engram_destination(
+        folder: Option<&str>,
+        title: &str,
+    ) -> Result<(String, String)> {
         let folder = folder.map(str::to_string).unwrap_or_default();
         let title_slug = slugify(title);
         if title_slug.is_empty() {

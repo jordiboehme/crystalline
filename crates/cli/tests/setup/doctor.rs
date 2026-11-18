@@ -723,7 +723,7 @@ fn reports_and_merges_a_second_frontmatter_block() {
     )
     .unwrap();
     assert!(
-        stdout.contains("[problem] cache-policy.md opens its body with a second frontmatter block on line 10 (type, status, tags, owner), which readers take for text (verify rule E012), rerun with --fix to merge it into the engram's own"),
+        stdout.contains("[problem] cache-policy.md opens its body with a second frontmatter block on line 10 (type, status, tags, owner), which readers take for text (verify rule E012), rerun with --fix to merge it into the engram's own (the frontmatter is written anew, without YAML comments or the key order)"),
         "{stdout}"
     );
 
@@ -742,7 +742,7 @@ fn reports_and_merges_a_second_frontmatter_block() {
     .unwrap();
     assert!(
         fixed_out.contains(
-            "fixed cache-policy.md: merged the second frontmatter block (type, status, tags, owner) into the engram's own"
+            "fixed cache-policy.md: merged the second frontmatter block (type, status, tags, owner) into the engram's own, written anew as an overwrite writes it (YAML comments and the key order are not kept)"
         ),
         "{fixed_out}"
     );
@@ -770,6 +770,61 @@ fn reports_and_merges_a_second_frontmatter_block() {
     assert!(!crystalline_core::frontmatter::body_opens_with_frontmatter(
         &healed
     ));
+}
+
+/// Three stacked blocks in a CRLF file are found, and one `--fix` merges
+/// them all.
+#[test]
+fn merges_every_stacked_block_of_a_crlf_engram_in_one_run() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    let stacked = SECOND_BLOCK
+        .replacen(
+            "owner: platform\n---\n",
+            "owner: platform\n---\n---\nresource: https://example.com/a\n---\n---\nsource_date: 2026-05-01\n---\n",
+            1,
+        )
+        .replace('\n', "\r\n");
+    write(&domain_dir, "cache-policy.md", &stacked);
+
+    let mut fix = bin();
+    let _home = shield_ambient_home(&mut fix);
+    let fixed_out = String::from_utf8(
+        fix.args(["doctor", "--fix", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        fixed_out.contains("fixed cache-policy.md: merged"),
+        "{fixed_out}"
+    );
+    let healed = std::fs::read_to_string(domain_dir.join("cache-policy.md")).unwrap();
+    assert!(!healed.contains('\r'), "{healed:?}");
+    assert!(!crystalline_core::frontmatter::body_opens_with_frontmatter(
+        &healed
+    ));
+    let engram = crystalline_core::parse_engram(&healed).unwrap();
+    assert_eq!(engram.frontmatter.engram_type, "decision");
+    assert_eq!(
+        engram.frontmatter.resource.as_deref(),
+        Some("https://example.com/a")
+    );
+    assert_eq!(
+        engram.frontmatter.source_date.map(|d| d.ymd()).as_deref(),
+        Some("2026-05-01")
+    );
+    assert_eq!(
+        engram.body,
+        "\n# Cache Policy\n\nWe cache for five minutes.\n"
+    );
 }
 
 /// Copies with different values are a person's call: reported, never written.

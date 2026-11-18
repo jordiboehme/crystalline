@@ -307,6 +307,23 @@ async fn no_edit_puts_a_second_block_under_the_engram_s_own() {
         assert!(err.to_string().contains("set_frontmatter"), "{err}");
         assert_eq!(stored(&engine, "eng", permalink).await, before);
     }
+    // A CRLF block is the same block: it is stored as LF, so it is refused
+    // just the same.
+    for (permalink, params) in [
+        (
+            "headed",
+            edit("headed", "prepend", "\r\n---\r\nstatus: draft\r\n---\r\n"),
+        ),
+        (
+            "blank",
+            edit("blank", "append", "---\r\nstatus: draft\r\n---\r\nBefore"),
+        ),
+    ] {
+        let before = stored(&engine, "eng", permalink).await;
+        let err = engine.edit_engram(&params).await.unwrap_err();
+        assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+        assert_eq!(stored(&engine, "eng", permalink).await, before);
+    }
     // A rule further down is markdown, and an append lands.
     engine
         .edit_engram(&edit("headed", "append", "---\nstatus: draft\n---\nAfter"))
@@ -326,7 +343,35 @@ const DOUBLED: &str = "---\ntype: engram\ntitle: Cache Policy\npermalink: cache-
 async fn a_0_33_0_second_block_is_found_and_merges_as_a_rewrite_would() {
     let (tmp, engine) = fixture().await;
     std::fs::write(tmp.path().join("eng/cache-policy.md"), DOUBLED).unwrap();
+    // The same engram saved with CRLF line endings is found too.
+    std::fs::write(
+        tmp.path().join("eng/cache-policy-crlf.md"),
+        DOUBLED
+            .replace("permalink: cache-policy", "permalink: cache-policy-crlf")
+            .replace('\n', "\r\n"),
+    )
+    .unwrap();
     engine.sync(None).await.unwrap();
+    let crlf = engine
+        .validate_engrams(
+            &crystalline_service::params::ValidateParams {
+                domain: "eng".to_string(),
+                identifier: Some("cache-policy-crlf".to_string()),
+                engram_type: None,
+                drift: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        crlf["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["kind"] == "E012"),
+        "{crlf}"
+    );
 
     let report = engine
         .validate_engrams(

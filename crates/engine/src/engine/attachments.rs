@@ -1193,6 +1193,19 @@ impl Engine {
             "# {title}\n\n{}\n\n- derived_from [[{}]]",
             plan.moved, desc.permalink
         );
+        // The capture puts its file back when it fails after writing it, but
+        // a put-back that fails leaves the file. Where it would land, and
+        // whether something was there before, so a failed capture that left
+        // a new file behind still reports it.
+        let capture_file = match &source {
+            ContentSource::File { root } => Self::engram_destination(p.folder.as_deref(), &title)
+                .ok()
+                .map(|(rel, _)| {
+                    let existed = root.join(&rel).exists();
+                    (root.join(&rel), rel, existed)
+                }),
+            ContentSource::Virtual => None,
+        };
         let created = self
             .write_engram_as(
                 &WriteParams {
@@ -1219,7 +1232,18 @@ impl Engine {
                 // whoever asked for the split, wherever their writes land.
                 scope,
             )
-            .await?;
+            .await;
+        let created = match created {
+            Ok(created) => created,
+            Err(e) => {
+                if let Some((abs, rel, false)) = &capture_file
+                    && abs.exists()
+                {
+                    left.push((desc.domain.clone(), rel.clone()));
+                }
+                return Err(e);
+            }
+        };
         // Where the capture path put it, which is also what the rollback below
         // has to address. Absent means the receipt shape changed under this
         // code: the rollback is skipped and said out loud rather than run

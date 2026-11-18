@@ -18,8 +18,9 @@
 //! `E011` warns about a key or value too large for the metadata index.
 //! `E012` warns about a body that opens with a second frontmatter block,
 //! which 0.33.0 stored when a capture's content opened with one;
-//! `crystalline doctor --fix` merges it by the rules a write lifts such a
-//! block by.
+//! `crystalline doctor --fix` merges it (and any blocks stacked under it) by
+//! the rules a write lifts such a block by, writing the frontmatter anew as
+//! an overwrite does, so YAML comments and the key order are not kept.
 //!
 //! `E009` is the odd one out twice over: it is about paths rather than
 //! frontmatter, and it is domain-scoped rather than per-file, so it runs from
@@ -312,7 +313,8 @@ pub(crate) fn emit_second_block(
         ),
         Some(
             "merge it into the engram's own frontmatter with `crystalline doctor --fix` (a file \
-             domain), or rewrite the engram with write_engram, overwrite: true and its whole text \
+             domain; the frontmatter is written anew, without YAML comments or the key order), \
+             or rewrite the engram with write_engram, overwrite: true and its whole text \
              as content, which merges the block"
                 .into(),
         ),
