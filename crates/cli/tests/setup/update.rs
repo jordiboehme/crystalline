@@ -814,6 +814,11 @@ fn status_with_the_check_off_ignores_the_cache() {
         "{stdout}"
     );
     assert!(!stdout.contains("99.0.0"), "{stdout}");
+    // Nor in --json: the last check is withheld while the check is off.
+    let json: serde_json::Value =
+        serde_json::from_slice(&isolated(home.path(), &["--json", "status"]).stdout).unwrap();
+    assert_eq!(json["update"]["check"], "off: not turned on");
+    assert!(json["update"]["cache"].is_null(), "{json}");
 }
 
 /// Without a daemon, `status` reads the cache file: the method line says

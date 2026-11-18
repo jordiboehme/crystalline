@@ -19,7 +19,3 @@
 
 # Point at a pre-fetched embedding model directory (air-gapped hosts).
 #CRYSTALLINE_MODELS_DIR=/opt/crystalline/models
-
-# Check once a day for a newer stable release (off by default). The check
-# sends no token and installs nothing.
-#CRYSTALLINE_UPDATE_CHECK=true

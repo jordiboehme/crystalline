@@ -1073,16 +1073,31 @@ pub(crate) async fn set_update_check(on: bool) -> anyhow::Result<serde_json::Val
 /// reads its settings from `/etc/default/crystalline`, never from the
 /// config this command wrote (S10, S27): `Some` only for a .deb install
 /// with a unit under `root` (`/` outside tests).
+///
+/// For `off` the line is said only when that file turns the check on (an
+/// uncommented `CRYSTALLINE_UPDATE_CHECK=` that is not `false`): the
+/// service's check is off by default, so otherwise there is nothing to
+/// change.
 pub(crate) fn deb_service_line(detection: &Detection, root: &Path, on: bool) -> Option<String> {
     if detection.method != InstallMethod::Deb
         || !SYSTEMD_UNITS.iter().any(|unit| root.join(unit).is_file())
     {
         return None;
     }
-    let value = if on { "true" } else { "false" };
-    Some(format!(
-        "The crystalline service reads its settings from /etc/default/crystalline, not from this config: set CRYSTALLINE_UPDATE_CHECK={value} there, then run: sudo systemctl restart crystalline"
-    ))
+    if on {
+        return Some(
+            "The crystalline service reads its settings from /etc/default/crystalline, not from this config: set CRYSTALLINE_UPDATE_CHECK=true there, then run: sudo systemctl restart crystalline".to_string(),
+        );
+    }
+    let defaults = std::fs::read_to_string(root.join("etc/default/crystalline")).ok()?;
+    let sets_it = defaults.lines().any(|line| {
+        line.trim()
+            .strip_prefix("CRYSTALLINE_UPDATE_CHECK=")
+            .is_some_and(|value| value.trim().trim_matches('"') != "false")
+    });
+    sets_it.then(|| {
+        "The crystalline service reads its settings from /etc/default/crystalline, which turns its check on: remove CRYSTALLINE_UPDATE_CHECK there, then run: sudo systemctl restart crystalline".to_string()
+    })
 }
 
 /// `crystalline update auto on|off`: set `update.check` and say what it is
@@ -1193,17 +1208,28 @@ fn last_check_text(
 /// facts made here from this binary and the cache file (no daemon, a
 /// standby, or a daemon from before 0.34.0), with `setting_on` the
 /// effective `update.check`.
+///
+/// While the check is off the last check is withheld (`cache` is `None`):
+/// `update check` writes the cache whatever the setting says, and a report
+/// must not offer what the setting keeps quiet about.
 pub(crate) async fn report_facts(ask_daemon: bool, setting_on: bool) -> UpdateFacts {
-    if ask_daemon
-        && let Ok(Some(data)) = crystalline_service::ctl_if_running_passive(
+    let asked = if ask_daemon {
+        crystalline_service::ctl_if_running_passive(
             serde_json::json!({ "v": 1, "cmd": "update_facts" }),
         )
         .await
-        && let Ok(facts) = serde_json::from_value::<UpdateFacts>(data)
-    {
-        return facts;
+        .ok()
+        .flatten()
+        .and_then(|data| serde_json::from_value::<UpdateFacts>(data).ok())
+    } else {
+        None
+    };
+    let mut facts = asked
+        .unwrap_or_else(|| crystalline_service::update::UpdateState::at_start().facts(setting_on));
+    if facts.check != CheckState::On {
+        facts.cache = None;
     }
-    crystalline_service::update::UpdateState::at_start().facts(setting_on)
+    facts
 }
 
 /// [`report_facts`] and its [`report_lines`] for `status`, with the
@@ -1221,7 +1247,9 @@ pub(crate) async fn report_here(
 }
 
 /// [`report_facts`] and its [`report_lines`] under the effective settings
-/// `cfg`.
+/// `cfg`. The age gate and the version compared are this client's
+/// (`update.min_age_hours` here, this binary's version), also when the
+/// facts are the daemon's: after the version handover the two agree.
 pub(crate) async fn report_for(
     cfg: &crystalline_core::config::GlobalConfig,
     ask_daemon: bool,
@@ -1288,6 +1316,22 @@ pub(crate) fn print_hint() {
     let Some(line) = stderr_hint(&cache, &current) else {
         return;
     };
+    // Once per 24 h per version, decided before anything costs more than a
+    // file read (the detection, the settings, a Postgres connection).
+    let Some(newer) = cache.newer_release(&current) else {
+        return;
+    };
+    let Ok(state) = crystalline_core::config::state_dir() else {
+        return;
+    };
+    let stamp_path = state.join(HINT_STAMP_FILE);
+    let stamp = std::fs::read_to_string(&stamp_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<HintStamp>(&text).ok());
+    let now = time::now();
+    if !hint_due(stamp.as_ref(), &newer, now) {
+        return;
+    }
     let detection = crystalline_service::update::detect_here().detection;
     if !hint_may_show(tty, &env, &detection) {
         return;
@@ -1295,16 +1339,52 @@ pub(crate) fn print_hint() {
     let Some(cfg) = settings_for_hint() else {
         return;
     };
-    if cfg.update_check_enabled()
-        && cache.gate(time::now(), cfg.update_min_age_hours()) == Some(Gate::Open)
+    if cfg.update_check_enabled() && cache.gate(now, cfg.update_min_age_hours()) == Some(Gate::Open)
     {
         eprintln!("{line}");
+        // Best effort: a stamp that cannot be written means the hint
+        // shows again after the next command.
+        let stamp = HintStamp {
+            version: newer.render(),
+            at: now,
+        };
+        if let Ok(text) = serde_json::to_string(&stamp) {
+            let _ = std::fs::write(&stamp_path, text);
+        }
+    }
+}
+
+/// The stderr hint's stamp in the state folder, beside the cache.
+const HINT_STAMP_FILE: &str = "update-hint.json";
+
+/// When the stderr hint last showed, and for which version.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub(crate) struct HintStamp {
+    /// The version the hint named, rendered.
+    pub(crate) version: String,
+    /// When it showed.
+    #[serde(with = "time::serde::stamp")]
+    pub(crate) at: Stamp,
+}
+
+/// Whether the hint for `newer` is due: no stamp, a stamp for another
+/// version, or one at least 24 h old. A stamp later than `now` (a clock
+/// that was wrong) does not hold the hint back. Pure.
+pub(crate) fn hint_due(stamp: Option<&HintStamp>, newer: &Precedence, now: Stamp) -> bool {
+    match stamp {
+        Some(stamp) if stamp.version == newer.render() => {
+            let age = now.since(stamp.at);
+            age < time::Delta::ZERO || age >= time::hours(24)
+        }
+        _ => true,
     }
 }
 
 /// The effective settings for the hint, a Postgres configuration document
 /// included, read on the command runtime's deep-stack thread; `None` when
-/// they do not load.
+/// they do not load. The default config, also after a command run with
+/// `--config`: the hint is advisory, and each command names its config in
+/// its own field.
 fn settings_for_hint() -> Option<crystalline_core::config::GlobalConfig> {
     crate::on_runtime_value_current_thread(|| crystalline_service::config_for_report(None))
         .ok()?
@@ -2684,8 +2764,26 @@ mod tests {
                 && line.contains("/etc/default/crystalline"),
             "{line}"
         );
+        // Off: only when /etc/default/crystalline turns the check on.
+        assert_eq!(deb_service_line(&deb, root.path(), false), None);
+        let defaults = root.path().join("etc/default");
+        std::fs::create_dir_all(&defaults).unwrap();
+        std::fs::write(
+            defaults.join("crystalline"),
+            "#CRYSTALLINE_UPDATE_CHECK=true\nCRYSTALLINE_UPDATE_CHECK=false\n",
+        )
+        .unwrap();
+        assert_eq!(deb_service_line(&deb, root.path(), false), None);
+        std::fs::write(
+            defaults.join("crystalline"),
+            "CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411\nCRYSTALLINE_UPDATE_CHECK=true\n",
+        )
+        .unwrap();
         let off = deb_service_line(&deb, root.path(), false).expect("the service line");
-        assert!(off.contains("CRYSTALLINE_UPDATE_CHECK=false"), "{off}");
+        assert!(
+            off.contains("remove CRYSTALLINE_UPDATE_CHECK") && off.contains("systemctl restart"),
+            "{off}"
+        );
         assert_eq!(
             deb_service_line(&acting(InstallMethod::Tarball), root.path(), true),
             None
@@ -2733,5 +2831,29 @@ mod tests {
         assert_eq!(stderr_hint(&cache, &v("0.35.0")), None);
         let odd = release_cache("v0.35.0<b>", Some(at(1)), at(17));
         assert_eq!(stderr_hint(&odd, &v("0.34.0")), None);
+    }
+
+    /// The hint shows at most once per 24 h per version.
+    #[test]
+    fn the_hint_is_due_once_a_day_per_version() {
+        let newer = v("0.35.0");
+        let stamp = |version: &str, at: Stamp| HintStamp {
+            version: version.to_string(),
+            at,
+        };
+        assert!(hint_due(None, &newer, now()));
+        // Shown three hours ago for this version: not again.
+        assert!(!hint_due(Some(&stamp("0.35.0", at(17))), &newer, now()));
+        // 25 hours ago: due again.
+        let day_before = Stamp::from_ymd_hms(2026, 11, 16, 12, 0, 0).unwrap();
+        assert!(hint_due(Some(&stamp("0.35.0", day_before)), &newer, now()));
+        // Another version, however fresh: due.
+        assert!(hint_due(Some(&stamp("0.34.1", at(17))), &newer, now()));
+        // A stamp from the future does not hold it back.
+        assert!(hint_due(Some(&stamp("0.35.0", at(18))), &newer, now()));
+        let back: HintStamp =
+            serde_json::from_str(&serde_json::to_string(&stamp("0.35.0", at(17))).unwrap())
+                .unwrap();
+        assert_eq!(back, stamp("0.35.0", at(17)));
     }
 }
