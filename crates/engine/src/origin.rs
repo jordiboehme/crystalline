@@ -251,7 +251,7 @@ pub(crate) fn status_report_json(
         "declined_proposals": report.declined_proposals,
         "merged_unconsumed": report.merged_unconsumed,
         "conflicts": report.conflicts,
-        "last_checked": report.last_checked,
+        "last_checked": report.last_checked.map(crystalline_core::time::serde::stamp_json),
         "probe_error": probe_error,
         "stack_number": report.stack_number,
         "stack_wedged": report.stack_wedged,
@@ -262,13 +262,13 @@ pub(crate) fn status_report_json(
             "sha": share.sha,
             "url": share.url,
             "title": share.title,
-            "shared_at": share.shared_at,
+            "shared_at": crystalline_core::time::serde::stamp_json(share.shared_at),
             "author_login": share.author_login,
         })).collect::<Vec<Value>>(),
         "direct_refused": refusal.map(|refusal| json!({
             "branch": refusal.branch,
             "message": refusal.message,
-            "refused_at": refusal.refused_at,
+            "refused_at": crystalline_core::time::serde::stamp_json(refusal.refused_at),
             "line": crystalline_remote::error::direct_refused_line(&refusal.branch),
         })),
     });
@@ -503,7 +503,7 @@ pub(crate) fn origin_poll_status_json(
         "domain": domain,
         "repo": report.repo,
         "branch": report.branch,
-        "last_checked": report.last_checked,
+        "last_checked": report.last_checked.map(crystalline_core::time::serde::stamp_json),
         "last_result": last_result.map(poll_outcome_json),
         "next_due": next_due,
         "open_proposals": report.open_proposals.len(),
@@ -1434,7 +1434,7 @@ mod tests {
             url: "https://example.invalid/7".to_string(),
             branch: "share-7".to_string(),
             title: "Share 1 new engram".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: crystalline_core::time::now(),
             status: crystalline_remote::state::ProposalStatus::Open,
             files: vec![crystalline_remote::state::ProposedFile {
                 path: "proposed.md".to_string(),
@@ -1742,7 +1742,7 @@ mod tests {
             url: url.to_string(),
             branch: format!("share/{number}"),
             title: title.to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: crystalline_core::time::now(),
             status: ProposalStatus::Open,
             files: vec![],
             head_commit: None,
@@ -1842,7 +1842,7 @@ mod tests {
                 sha: "c0ffee".to_string(),
                 url: Some("https://forge.test/acme/brand-knowledge/commit/c0ffee".to_string()),
                 title: "Refine the brand voice".to_string(),
-                shared_at: chrono::Utc::now(),
+                shared_at: crystalline_core::time::now(),
                 author_login: Some("instance-gh".to_string()),
                 files: vec![crystalline_remote::state::ProposedFile {
                     path: "notes/new.md".to_string(),
@@ -1911,7 +1911,7 @@ mod tests {
             login: login.map(str::to_string),
             branch: "main".to_string(),
             message: "Changes must be made through a pull request.".to_string(),
-            refused_at: chrono::Utc::now(),
+            refused_at: crystalline_core::time::now(),
         }
     }
 

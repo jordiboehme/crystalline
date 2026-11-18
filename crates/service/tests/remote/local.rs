@@ -121,7 +121,7 @@ impl LocalMachine {
                 access_token: "test-token".to_string(),
                 host: "github.com".to_string(),
                 user: "mock-user".to_string(),
-                created_at: chrono::Utc::now(),
+                created_at: crystalline_core::time::now(),
                 refresh_token: None,
                 expires_at: None,
                 refresh_expires_at: None,
@@ -1088,9 +1088,9 @@ fn seed_offer(
         kind: crystalline_remote::CredentialKind::Token,
         token_endpoint: None,
         revocation_endpoint: None,
-        connected_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        connected_at: crystalline_core::time::parse_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
-            .into(),
+            .stamp(),
         mounts: domains
             .iter()
             .map(|(d, _)| MountRecord {
@@ -1118,9 +1118,9 @@ fn seed_offer(
         &crystalline_remote::Cached {
             account: "keeper".into(),
             etag: "seeded".into(),
-            fetched_at: chrono::DateTime::parse_from_rfc3339(fetched_at)
+            fetched_at: crystalline_core::time::parse_rfc3339(fetched_at)
                 .unwrap()
-                .into(),
+                .stamp(),
             data: json!({ "domains": rows }),
             last_failure: failure.map(str::to_string),
         },

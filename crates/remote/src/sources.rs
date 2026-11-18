@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RemoteError;
@@ -102,7 +102,8 @@ pub struct SourceRecord {
     #[serde(default)]
     pub revocation_endpoint: Option<String>,
     /// When the sign-in happened.
-    pub connected_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub connected_at: Stamp,
     /// Every name this source handed out, in the order it handed them out.
     #[serde(default)]
     pub mounts: Vec<MountRecord>,
@@ -476,7 +477,7 @@ pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Opt
         kind: CredentialKind::Token,
         token_endpoint: None,
         revocation_endpoint: None,
-        connected_at: Utc::now(),
+        connected_at: time::now(),
         mounts: Vec::new(),
         domains,
         from_env: true,
@@ -494,7 +495,7 @@ mod tests {
             kind: CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            connected_at: Stamp::from_unix(1_800_000_000, 0).unwrap(),
             mounts: Vec::new(),
             domains: None,
             from_env: false,

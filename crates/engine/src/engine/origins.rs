@@ -1229,7 +1229,7 @@ impl Engine {
                             "Showing the review feedback stored at the last check of the team's \
                              repository, at {}. Nothing was pulled: only an instance admin can \
                              start a new pull. The server also pulls on its own schedule.",
-                            at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                            at.rfc3339_secs_z()
                         ),
                         None => "The team's repository has not been checked yet, so there is no \
                                  stored review feedback. Nothing was pulled: only an instance \
@@ -1239,7 +1239,7 @@ impl Engine {
                     domains.push(json!({
                         "domain": name,
                         "pulled": false,
-                        "last_checked": checked,
+                        "last_checked": checked.map(crystalline_core::time::serde::stamp_json),
                         "open_proposals": open_proposals,
                         "note": note,
                     }));
@@ -2167,7 +2167,9 @@ impl Engine {
                     self.origin_poller.record_result(&name, outcome);
                 }
                 Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
-                    let until = reset.unwrap_or_else(|| wall_now + Duration::hours(1));
+                    let until = reset
+                        .map(crystalline_core::time::Stamp::into_chrono)
+                        .unwrap_or_else(|| wall_now + Duration::hours(1));
                     tracing::warn!(
                         "origin poll: GitHub is rate limiting this machine; pausing every domain until {until}"
                     );
@@ -4432,7 +4434,7 @@ impl Engine {
             "id": conflict.id,
             "path": conflict.path,
             "kind": conflict.kind,
-            "detected_at": conflict.detected_at,
+            "detected_at": crystalline_core::time::serde::stamp_json(conflict.detected_at),
             "base": base_v,
             "local": local_v,
             "upstream": upstream_v,

@@ -48,8 +48,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use chrono::Utc;
 use crystalline_core::base::{BasePath, PublicBase};
+use crystalline_core::time;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -920,7 +920,7 @@ where
                 other => other,
             })?;
         let routing = routing_model(&http, &origin, &token.access_token, &after).await;
-        let now = Utc::now();
+        let now = time::now();
         let credential = ServerCredential::oauth(
             token.access_token,
             token.refresh_token,
@@ -1118,7 +1118,7 @@ async fn with_token(
     let token = shaped(token)?;
     let account = whoami(http, &origin, token, budget).await?;
     let routing = routing_model(http, &origin, token, budget).await;
-    let now = Utc::now();
+    let now = time::now();
     let credential =
         ServerCredential::token(token.to_string(), origin.clone(), account.clone(), now);
     let record = SourceRecord {
@@ -1446,7 +1446,7 @@ fn save(
             &Cached {
                 account: source.account.clone(),
                 etag: String::new(),
-                fetched_at: Utc::now(),
+                fetched_at: time::now(),
                 data: routing.clone(),
                 last_failure: None,
             },

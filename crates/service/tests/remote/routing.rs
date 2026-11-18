@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use crystalline_remote::{
     Cached, CredentialKind, DomainChoice, ForwardedAgent, MountRecord, ROUTING_FILE,
     ServerCredential, SourceSet, update_sources, write_cached,
@@ -82,7 +81,7 @@ async fn connect_fake(
             format!("cmt_{name}"),
             url.clone(),
             "keeper".into(),
-            Utc::now(),
+            crystalline_core::time::now(),
         ),
     );
     write_cached(
@@ -91,7 +90,7 @@ async fn connect_fake(
         &Cached {
             account: "keeper".into(),
             etag: "e".into(),
-            fetched_at: Utc::now(),
+            fetched_at: crystalline_core::time::now(),
             data: json!({ "read_only": false, "domains": [{ "name": domain, "bullets": [], "origin": null }] }),
             last_failure: None,
         },

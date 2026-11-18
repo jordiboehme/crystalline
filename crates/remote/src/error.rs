@@ -65,7 +65,7 @@ pub enum RemoteError {
     #[error("GitHub is rate limiting this machine; trying again later. Nothing is lost.")]
     RateLimited {
         /// When the rate limit window resets, if GitHub reported one.
-        reset: Option<chrono::DateTime<chrono::Utc>>,
+        reset: Option<crystalline_core::time::Stamp>,
     },
 
     /// A repository-role lookup through the GitHub App found no such login:
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn rate_limited_carries_an_optional_reset_time() {
-        let reset = chrono::Utc::now();
+        let reset = crystalline_core::time::now();
         let err = RemoteError::RateLimited { reset: Some(reset) };
         match err {
             RemoteError::RateLimited { reset: got } => assert_eq!(got, Some(reset)),

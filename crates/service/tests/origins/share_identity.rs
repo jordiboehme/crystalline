@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use chrono::Utc;
 use crystalline_core::config::save_yaml;
 use crystalline_core::config::{AuthConfig, GitHubConfig, GlobalConfig, ServiceConfig};
 use crystalline_index::TursoStore;
@@ -427,7 +426,7 @@ fn grant(access: &str) -> UserTokenGrant {
     UserTokenGrant {
         access_token: access.to_string(),
         refresh_token: None,
-        expires_at: Some(Utc::now() + chrono::Duration::hours(8)),
+        expires_at: Some(crystalline_core::time::now() + crystalline_core::time::hours(8)),
         refresh_expires_at: None,
     }
 }
@@ -596,7 +595,7 @@ fn stored(token: &str) -> crystalline_remote::StoredToken {
         access_token: token.to_string(),
         host: "github.com".to_string(),
         user: format!("{token}-gh"),
-        created_at: Utc::now(),
+        created_at: crystalline_core::time::now(),
         refresh_token: None,
         expires_at: None,
         refresh_expires_at: None,
@@ -1544,7 +1543,7 @@ async fn a_renewal_in_flight_saves_nothing_for_a_new_account() {
     );
     let mut expiring = grant("ghu_old");
     expiring.refresh_token = Some("ghr_old".to_string());
-    expiring.expires_at = Some(Utc::now() + chrono::Duration::minutes(1));
+    expiring.expires_at = Some(crystalline_core::time::now() + crystalline_core::time::minutes(1));
     fx.eng.link_github("ada", expiring).await.unwrap();
 
     let eng = fx.eng.clone();

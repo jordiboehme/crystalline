@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use chrono::Utc;
+use crystalline_core::time::{self, Stamp};
 use serde_json::Value;
 
 use crate::mounts::{
@@ -250,7 +250,7 @@ pub struct SourceSet {
 #[derive(Clone)]
 pub struct BackgroundRefresh {
     /// When the refresh began.
-    pub started: chrono::DateTime<Utc>,
+    pub started: Stamp,
     /// `None` while it runs; then the sources it did not get to ask because
     /// this process was still setting up its network connection.
     pub outcome: tokio::sync::watch::Receiver<Option<BTreeSet<String>>>,
@@ -843,7 +843,7 @@ impl SourceSet {
         }
         let (tx, rx) = tokio::sync::watch::channel(None);
         let started = BackgroundRefresh {
-            started: Utc::now(),
+            started: time::now(),
             outcome: rx,
         };
         *slot = Some(started.clone());
@@ -989,10 +989,10 @@ impl SourceSet {
             ) {
                 Some(cached) => {
                     listed.insert(record.name.clone());
-                    let old = Utc::now()
-                        .signed_duration_since(cached.fetched_at)
+                    let old = time::now()
+                        .since(cached.fetched_at)
                         .to_std()
-                        .is_ok_and(|age| age > STALE_AFTER);
+                        .is_some_and(|age| age > STALE_AFTER);
                     if cached.last_failure.is_some() || old {
                         stale.push(stale_line(
                             &record.name,
@@ -1040,7 +1040,7 @@ mod tests {
             kind: CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            connected_at: Stamp::from_unix(1_800_000_000, 0).unwrap(),
             mounts: Vec::new(),
             domains: list.map(|l| l.iter().map(|d| d.to_string()).collect()),
             from_env: false,
@@ -1165,7 +1165,7 @@ mod tests {
             kind: crate::CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: Utc::now(),
+            connected_at: time::now(),
             mounts: Vec::new(),
             domains: None,
             from_env: false,
@@ -1182,7 +1182,7 @@ mod tests {
             &crate::Cached {
                 account: "ada".into(),
                 etag: "e".into(),
-                fetched_at: Utc::now(),
+                fetched_at: time::now(),
                 data: serde_json::json!({ "domains": [{ "name": "jordi", "bullets": ["b"] }] }),
                 last_failure: None,
             },
@@ -1313,7 +1313,7 @@ mod tests {
                 &crate::Cached {
                     account: record.account.clone(),
                     etag: "e".into(),
-                    fetched_at: Utc::now(),
+                    fetched_at: time::now(),
                     data: serde_json::json!({ "domains": [domain] }),
                     last_failure: None,
                 },

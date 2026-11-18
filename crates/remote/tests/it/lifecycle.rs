@@ -215,7 +215,7 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
         url: format!("https://example.test/pull/{number}"),
         branch: format!("crystalline/share-{number}"),
         title: format!("Share proposal {number}"),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         status: ProposalStatus::Open,
         files: vec![ProposedFile {
             path: path.to_string(),
@@ -632,9 +632,9 @@ async fn scenario_02b_an_unchanged_pull_still_moves_last_checked() {
 
     // `subscribe` already stamped `last_checked` once; back it off by a
     // day so a later "did it move forward" comparison cannot pass merely
-    // because two `Utc::now()` calls landed in the same instant.
+    // because two `time::now()` calls landed in the same instant.
     let mut state = load_state(&sub.state_dir);
-    let backdated = chrono::Utc::now() - chrono::Duration::hours(17);
+    let backdated = crystalline_core::time::now() - crystalline_core::time::hours(17);
     state.last_checked = Some(backdated);
     state.save(&sub.state_dir).unwrap();
 
@@ -3728,7 +3728,7 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
         url: "https://github.test/pulls/9".to_string(),
         branch: "crystalline/share-brand-000101000000".to_string(),
         title: "Share updates from brand".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         status: ProposalStatus::Declined,
         files: vec![
             ProposedFile {

@@ -118,7 +118,7 @@ fn write_fake_token(dir: &Path) {
             access_token: "test-token".to_string(),
             host: "github.com".to_string(),
             user: "mock-user".to_string(),
-            created_at: Utc::now(),
+            created_at: crystalline_core::time::now(),
             refresh_token: None,
             expires_at: None,
             refresh_expires_at: None,

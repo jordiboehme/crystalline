@@ -2437,7 +2437,7 @@ mod tests {
             kind: crystalline_remote::CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: chrono::Utc::now(),
+            connected_at: crystalline_core::time::now(),
             mounts: vec![crystalline_remote::MountRecord {
                 remote: "jordi".into(),
                 local: "jordi-acme".into(),
@@ -2470,7 +2470,7 @@ mod tests {
                 &crystalline_remote::Cached {
                     account: "ada".into(),
                     etag: "e".into(),
-                    fetched_at: chrono::Utc::now(),
+                    fetched_at: crystalline_core::time::now(),
                     data,
                     last_failure: None,
                 },

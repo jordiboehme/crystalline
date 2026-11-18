@@ -2419,7 +2419,7 @@ async fn a_blocked_direct_share_answers_round_one_without_a_question() {
         url: "https://github.test/pull/5".to_string(),
         branch: "crystalline/share-kb-x".to_string(),
         title: "Older".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         status: crystalline_remote::state::ProposalStatus::Open,
         files: vec![],
         head_commit: None,

@@ -90,7 +90,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::Utc;
+use crystalline_core::time;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -965,7 +965,7 @@ impl Connection {
 
     async fn bearer_by(&self, deadline: Instant, limit: Duration) -> Result<String, RemoteFailure> {
         match self.held() {
-            Some(credential) if !credential.needs_refresh(Utc::now()) => {
+            Some(credential) if !credential.needs_refresh(time::now()) => {
                 Ok(credential.access_token)
             }
             Some(credential) => {
@@ -981,7 +981,7 @@ impl Connection {
     /// token another process may be about to spend.
     pub async fn bearer_without_refresh(&self) -> Result<String, RemoteFailure> {
         match self.held() {
-            Some(credential) if !credential.needs_refresh(Utc::now()) => {
+            Some(credential) if !credential.needs_refresh(time::now()) => {
                 Ok(credential.access_token)
             }
             Some(_) => Err(RemoteFailure::Expired {
@@ -1381,7 +1381,7 @@ async fn read_capped(
 /// Whether `credential` is somebody else's finished refresh: no longer the
 /// token the caller saw rejected, and not due for a refresh itself.
 fn settled(credential: &ServerCredential, rejected: Option<&str>) -> bool {
-    Some(credential.access_token.as_str()) != rejected && !credential.needs_refresh(Utc::now())
+    Some(credential.access_token.as_str()) != rejected && !credential.needs_refresh(time::now())
 }
 
 /// How many refresh jobs of this process are still running.
@@ -1537,7 +1537,7 @@ impl RefreshJob {
             client_id,
             stored.resource.clone(),
             stored.account.clone(),
-            Utc::now(),
+            time::now(),
         );
         // The server has spent the old refresh token. A failed save must not
         // lose the new pair as well: this process keeps using it, and the
@@ -1634,7 +1634,7 @@ mod tests {
             kind: CredentialKind::Oauth,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: Utc::now(),
+            connected_at: time::now(),
             mounts: Vec::new(),
             domains: None,
             from_env: false,
@@ -1755,7 +1755,7 @@ mod tests {
             "cmt_live".to_string(),
             url,
             "keeper".to_string(),
-            Utc::now(),
+            time::now(),
         ))));
         let failed = connection
             .file_within("open", "assets/shot.png", Duration::from_millis(200))
@@ -1832,7 +1832,7 @@ mod tests {
             "cmt_live".to_string(),
             url.to_string(),
             "keeper".to_string(),
-            Utc::now(),
+            time::now(),
         ))));
         connection
     }

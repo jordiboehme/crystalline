@@ -497,7 +497,7 @@ async fn an_unavailable_source_is_named_in_the_queue_as_on_the_page() {
             kind: crystalline_remote::CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: chrono::Utc::now(),
+            connected_at: crystalline_core::time::now(),
             mounts: vec![crystalline_remote::MountRecord {
                 remote: "harbor".to_string(),
                 local: "harbor".to_string(),

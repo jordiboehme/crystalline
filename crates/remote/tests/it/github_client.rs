@@ -616,7 +616,10 @@ async fn rate_limit_headers_map_to_rate_limited_with_a_parsed_reset() {
     let err = provider.branch_head(&origin(), None).await.unwrap_err();
     match err {
         RemoteError::RateLimited { reset } => {
-            assert_eq!(reset, chrono::DateTime::from_timestamp(1_700_000_000, 0));
+            assert_eq!(
+                reset,
+                crystalline_core::time::Stamp::from_unix(1_700_000_000, 0)
+            );
         }
         other => panic!("expected RateLimited, got {other:?}"),
     }
@@ -639,7 +642,7 @@ async fn retry_after_alone_still_maps_to_rate_limited() {
     let base = spawn(app).await;
     let provider = GitHubProvider::new(Some(base), None);
 
-    let before = chrono::Utc::now();
+    let before = crystalline_core::time::now();
     let err = provider.branch_head(&origin(), None).await.unwrap_err();
     match err {
         RemoteError::RateLimited { reset: Some(reset) } => {
@@ -877,7 +880,10 @@ async fn a_rate_limited_403_stays_rate_limited_whatever_the_body_says() {
     let err = provider.branch_head(&origin(), None).await.unwrap_err();
     match err {
         RemoteError::RateLimited { reset } => {
-            assert_eq!(reset, chrono::DateTime::from_timestamp(1_700_000_000, 0));
+            assert_eq!(
+                reset,
+                crystalline_core::time::Stamp::from_unix(1_700_000_000, 0)
+            );
         }
         other => panic!("expected RateLimited, got {other:?}"),
     }

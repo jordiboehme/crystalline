@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use chrono::{TimeDelta, Utc};
+use crystalline_core::time::{self, Delta};
 use crystalline_remote::{
     Connection, CredentialKind, Fetched, ForwardedAgent, Health, ONE_DOMAIN_LIMIT, ROUTING_FILE,
     RemoteFailure, ServerCredential, ServerCredentialStore, SourceRecord, fetch_cached,
@@ -41,7 +41,7 @@ pub fn source(
         kind,
         token_endpoint,
         revocation_endpoint: None,
-        connected_at: Utc::now(),
+        connected_at: time::now(),
         mounts: Vec::new(),
         domains: None,
         from_env: false,
@@ -77,7 +77,7 @@ pub async fn token_source(
     save_credential(
         remote_dir,
         &record,
-        &ServerCredential::token(token, server.origin(), account.into(), Utc::now()),
+        &ServerCredential::token(token, server.origin(), account.into(), time::now()),
     );
     record
 }
@@ -140,7 +140,7 @@ async fn a_revoked_pasted_token_says_sign_in_again() {
     save_credential(
         dir.path(),
         &record,
-        &ServerCredential::token(issued.token, server.origin(), "keeper".into(), Utc::now()),
+        &ServerCredential::token(issued.token, server.origin(), "keeper".into(), time::now()),
     );
     let connection = Connection::open(record, dir.path()).unwrap();
     let failure = connection
@@ -298,7 +298,7 @@ async fn fake_ctl(State(fake): State<Fake>, headers: HeaderMap) -> (StatusCode, 
     )
 }
 
-fn oauth(access: &str, refresh: &str, issued_ago: TimeDelta, resource: &str) -> ServerCredential {
+fn oauth(access: &str, refresh: &str, issued_ago: Delta, resource: &str) -> ServerCredential {
     ServerCredential::oauth(
         access.to_string(),
         refresh.to_string(),
@@ -306,7 +306,7 @@ fn oauth(access: &str, refresh: &str, issued_ago: TimeDelta, resource: &str) -> 
         "coc_test".to_string(),
         resource.to_string(),
         "keeper".to_string(),
-        Utc::now() - issued_ago,
+        time::now() - issued_ago,
     )
 }
 
@@ -326,7 +326,7 @@ async fn two_connections_refreshing_at_once_spend_the_refresh_token_once() {
     save_credential(
         dir.path(),
         &record,
-        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &fake.url),
+        &oauth("coa_0", "cor_0", time::hours(2), &fake.url),
     );
     let a = Connection::open(record.clone(), dir.path()).unwrap();
     let b = Connection::open(record, dir.path()).unwrap();
@@ -366,12 +366,12 @@ async fn a_failed_refresh_marks_only_that_source() {
     save_credential(
         dir.path(),
         &a,
-        &oauth("coa_0", "cor_stale", TimeDelta::hours(2), &broken.url),
+        &oauth("coa_0", "cor_stale", time::hours(2), &broken.url),
     );
     save_credential(
         dir.path(),
         &b,
-        &oauth("coa_fine", "cor_fine", TimeDelta::zero(), &fine.url),
+        &oauth("coa_fine", "cor_fine", Delta::ZERO, &fine.url),
     );
     let a = Connection::open(a, dir.path()).unwrap();
     let b = Connection::open(b, dir.path()).unwrap();
@@ -411,7 +411,7 @@ async fn a_401_on_a_token_the_clock_thinks_is_fresh_refreshes_once() {
     save_credential(
         dir.path(),
         &record,
-        &oauth("coa_thinks_fresh", "cor_0", TimeDelta::zero(), &fake.url),
+        &oauth("coa_thinks_fresh", "cor_0", Delta::ZERO, &fake.url),
     );
     let connection = Connection::open(record.clone(), dir.path()).unwrap();
     let data = connection
@@ -444,7 +444,7 @@ async fn the_no_refresh_path_never_spends_the_refresh_token() {
     save_credential(
         dir.path(),
         &record,
-        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &fake.url),
+        &oauth("coa_0", "cor_0", time::hours(2), &fake.url),
     );
     let connection = Connection::open(record, dir.path()).unwrap();
     let failure = connection
@@ -533,7 +533,7 @@ fn a_cache_written_for_another_account_is_not_read() {
     let cached = crystalline_remote::Cached {
         account: "someone".to_string(),
         etag: "e".to_string(),
-        fetched_at: Utc::now(),
+        fetched_at: time::now(),
         data: json!({ "domains": [] }),
         last_failure: None,
     };
@@ -547,9 +547,7 @@ fn a_cache_written_for_another_account_is_not_read() {
 
 #[test]
 fn the_staleness_line_names_the_source_the_time_and_the_remedy() {
-    let at = chrono::DateTime::parse_from_rfc3339("2026-09-30T08:15:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let at = time::parse_rfc3339("2026-09-30T08:15:00Z").unwrap().stamp();
     assert_eq!(
         stale_line(
             "acme",
@@ -729,7 +727,7 @@ fn pasted(url: &str, remote_dir: &Path) -> SourceRecord {
             "cmt_live".into(),
             url.to_string(),
             "keeper".into(),
-            Utc::now(),
+            time::now(),
         ),
     );
     record
@@ -799,7 +797,7 @@ async fn a_refresh_that_fails_on_the_network_keeps_the_refresh_token_and_tries_a
     save_credential(
         dir.path(),
         &record,
-        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &url),
+        &oauth("coa_0", "cor_0", time::hours(2), &url),
     );
     let window = Duration::from_millis(300);
     let connection = Connection::open(record.clone(), dir.path())
@@ -952,7 +950,7 @@ async fn a_refresh_that_hangs_does_not_hold_up_another_caller_on_the_same_connec
     save_credential(
         dir.path(),
         &record,
-        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &url),
+        &oauth("coa_0", "cor_0", time::hours(2), &url),
     );
     let connection = Connection::open(record, dir.path())
         .unwrap()
@@ -1108,7 +1106,7 @@ async fn a_rotation_whose_save_fails_is_kept_and_used() {
     save_credential(
         dir.path(),
         &record,
-        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &fake.url),
+        &oauth("coa_0", "cor_0", time::hours(2), &fake.url),
     );
     let host = record.host_dir(dir.path());
     std::fs::write(host.join("refresh.lock"), b"").unwrap();
@@ -1152,7 +1150,7 @@ fn unsavable(fake: &FakeServer, dir: &Path, health: Health) -> (Connection, std:
     save_credential(
         dir,
         &record,
-        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &fake.url),
+        &oauth("coa_0", "cor_0", time::hours(2), &fake.url),
     );
     let host = record.host_dir(dir);
     std::fs::write(host.join("refresh.lock"), b"").unwrap();
@@ -1282,7 +1280,7 @@ async fn a_refresh_answered_with_a_redirect_never_sends_the_refresh_token_on() {
     save_credential(
         dir.path(),
         &record,
-        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &url),
+        &oauth("coa_0", "cor_0", time::hours(2), &url),
     );
     let connection = Connection::open(record.clone(), dir.path()).unwrap();
     let failure = connection.ctl(status()).await.unwrap_err();

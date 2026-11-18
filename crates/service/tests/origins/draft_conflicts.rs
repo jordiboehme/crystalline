@@ -4944,7 +4944,7 @@ async fn a_folder_conflict_in_a_reviewing_domain_still_needs_github() {
             kind: crystalline_remote::merge::ConflictKind::EditEdit,
             base_commit: "base".to_string(),
             upstream_commit: "upstream".to_string(),
-            detected_at: chrono::Utc::now(),
+            detected_at: crystalline_core::time::now(),
         });
     });
     let off = t.engine_over(t.eng.store(), |config| {
@@ -5801,7 +5801,7 @@ async fn status_names_a_merge_a_poller_did() {
         access_token: "test-token".to_string(),
         host: "github.com".to_string(),
         user: "mock-user".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         refresh_token: None,
         expires_at: None,
         refresh_expires_at: None,

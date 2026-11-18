@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RemoteError;
@@ -119,18 +120,27 @@ pub struct StoredToken {
     /// The login of the user this token authenticates as.
     pub user: String,
     /// When this token was saved.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub created_at: Stamp,
     /// The refresh token of an expiring GitHub App user token; `None` for an
     /// OAuth App token or a personal access token, which do not expire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     /// When `access_token` stops working; `None` when it never does.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::stamp_option"
+    )]
+    pub expires_at: Option<Stamp>,
     /// When `refresh_token` stops working. `None` means there is no refresh
     /// token or its expiry is unknown, not only that it never expires.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::stamp_option"
+    )]
+    pub refresh_expires_at: Option<Stamp>,
 }
 
 impl StoredToken {
@@ -492,7 +502,7 @@ impl TokenStore {
                 access_token: token.clone(),
                 host: host.clone(),
                 user: String::new(),
-                created_at: chrono::Utc::now(),
+                created_at: time::now(),
                 refresh_token: None,
                 expires_at: None,
                 refresh_expires_at: None,
@@ -975,7 +985,7 @@ mod tests {
             access_token: "gho_examplesecret".to_string(),
             host: "github.com".to_string(),
             user: "octocat".to_string(),
-            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            created_at: Stamp::from_unix(1_700_000_000, 0).unwrap(),
             refresh_token: None,
             expires_at: None,
             refresh_expires_at: None,
@@ -998,8 +1008,8 @@ mod tests {
     fn stored_token_round_trips_the_refresh_fields() {
         let mut token = sample_token();
         token.refresh_token = Some("ghr_secretrefresh".to_string());
-        token.expires_at = chrono::DateTime::from_timestamp(1_700_028_800, 0);
-        token.refresh_expires_at = chrono::DateTime::from_timestamp(1_715_897_600, 0);
+        token.expires_at = Stamp::from_unix(1_700_028_800, 0);
+        token.refresh_expires_at = Stamp::from_unix(1_715_897_600, 0);
         let back: StoredToken =
             serde_json::from_str(&serde_json::to_string(&token).unwrap()).unwrap();
         assert_eq!(back, token);

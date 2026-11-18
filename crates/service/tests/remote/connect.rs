@@ -1350,7 +1350,7 @@ async fn a_source_saved_by_0_23_0_still_opens_after_the_upgrade() {
             token,
             server.origin(),
             "keeper".into(),
-            chrono::Utc::now(),
+            crystalline_core::time::now(),
         ))
         .unwrap();
     std::fs::write(

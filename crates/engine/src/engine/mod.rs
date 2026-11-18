@@ -4913,7 +4913,9 @@ impl Engine {
                 Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
                     // GitHub limits the token, not the repository: every
                     // domain waits, the origin poller's pulls included.
-                    let until = reset.unwrap_or_else(|| wall_now + chrono::Duration::hours(1));
+                    let until = reset
+                        .map(crystalline_core::time::Stamp::into_chrono)
+                        .unwrap_or_else(|| wall_now + chrono::Duration::hours(1));
                     tracing::warn!(
                         "reflection backup: GitHub is rate limiting this machine; pausing until {until}"
                     );
@@ -14096,7 +14098,7 @@ mod share_actor_tests {
                 access_token: format!("{user}-secret"),
                 host: "github.com".to_string(),
                 user: user.to_string(),
-                created_at: Utc::now(),
+                created_at: crystalline_core::time::now(),
                 refresh_token: None,
                 expires_at: None,
                 refresh_expires_at: None,
@@ -14123,7 +14125,7 @@ mod share_actor_tests {
             access_token: format!("{user}-secret"),
             host: "github.com".to_string(),
             user: user.to_string(),
-            created_at: Utc::now(),
+            created_at: crystalline_core::time::now(),
             refresh_token: None,
             expires_at: None,
             refresh_expires_at: None,
@@ -15293,7 +15295,7 @@ mod hidden_copy_tests {
                 kind: CredentialKind::Token,
                 token_endpoint: None,
                 revocation_endpoint: None,
-                connected_at: Utc::now(),
+                connected_at: crystalline_core::time::now(),
                 mounts: vec![MountRecord {
                     remote: "notes".to_string(),
                     local: "notes".to_string(),

@@ -1569,7 +1569,6 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chacha20poly1305",
- "chrono",
  "crystalline-core",
  "diffy",
  "flate2",

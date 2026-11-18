@@ -683,8 +683,10 @@ async fn github_app_authorization_drops_the_token_and_keeps_the_link() {
             UserTokenGrant {
                 access_token: "ghu_ada".to_string(),
                 refresh_token: Some("ghr_ada".to_string()),
-                expires_at: Some(Utc::now() + chrono::Duration::hours(8)),
-                refresh_expires_at: Some(Utc::now() + chrono::Duration::days(180)),
+                expires_at: Some(crystalline_core::time::now() + crystalline_core::time::hours(8)),
+                refresh_expires_at: Some(
+                    crystalline_core::time::now() + crystalline_core::time::days(180),
+                ),
             },
         )
         .await

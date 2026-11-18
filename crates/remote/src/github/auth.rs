@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 
 use super::GitHubProvider;
@@ -213,10 +213,8 @@ impl AccessTokenResponse {
     /// than panicking on a malformed response.
     fn into_grant(self) -> Option<UserTokenGrant> {
         let access_token = self.access_token?;
-        let now = Utc::now();
-        let at = |secs: i64| {
-            chrono::TimeDelta::try_seconds(secs).and_then(|d| now.checked_add_signed(d))
-        };
+        let now = time::now();
+        let at = |secs: i64| time::try_seconds(secs).and_then(|d| now.checked_add(d));
         Some(UserTokenGrant {
             access_token,
             refresh_token: self.refresh_token,
@@ -237,12 +235,12 @@ pub struct UserTokenGrant {
     /// The refresh token, when the token expires.
     pub refresh_token: Option<String>,
     /// When `access_token` stops working (`expires_in` from the response).
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Stamp>,
     /// When `refresh_token` stops working (`refresh_token_expires_in`).
     /// `None` means there is no refresh token or its expiry is unknown (the
     /// response did not say, or the value was out of range), not only that it
     /// never expires.
-    pub refresh_expires_at: Option<DateTime<Utc>>,
+    pub refresh_expires_at: Option<Stamp>,
 }
 
 /// Redacts both tokens, for the same reason as `StoredToken`'s `Debug`.

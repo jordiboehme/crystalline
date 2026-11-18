@@ -4766,7 +4766,7 @@ async fn check_github_app(
             let probe = app.probe().await;
             doctor.clock_skew_secs = probe
                 .server_date
-                .map(|date| (date - chrono::Utc::now()).num_seconds());
+                .map(|date| date.since(crystalline_core::time::now()).num_seconds());
             match &probe.info {
                 Ok(info) => {
                     doctor.jwt_accepted = Some(true);
