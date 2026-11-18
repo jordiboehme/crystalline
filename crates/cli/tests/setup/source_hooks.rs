@@ -122,7 +122,7 @@ fn seed_source_as(
         kind: crystalline_remote::CredentialKind::Token,
         token_endpoint: None,
         revocation_endpoint: None,
-        connected_at: chrono::Utc::now(),
+        connected_at: crystalline_core::time::now(),
         mounts: mounts
             .iter()
             .map(|(remote, local)| crystalline_remote::MountRecord {
@@ -144,7 +144,7 @@ fn seed_source_as(
         token.into(),
         url.to_string(),
         account.into(),
-        chrono::Utc::now(),
+        crystalline_core::time::now(),
     );
     crystalline_remote::ServerCredentialStore::file(&host)
         .save(&credential)
@@ -173,7 +173,7 @@ fn write_cache_as(host: &Path, account: &str, file: &str, data: Value) {
         &crystalline_remote::Cached {
             account: account.into(),
             etag: "seeded".into(),
-            fetched_at: chrono::Utc::now(),
+            fetched_at: crystalline_core::time::now(),
             data,
             last_failure: None,
         },
@@ -874,7 +874,7 @@ fn seed_named(
     failure: Option<&str>,
     fetched_at: &str,
 ) {
-    let fixed: chrono::DateTime<chrono::Utc> = fetched_at.parse().unwrap();
+    let fixed = crystalline_core::time::parse_lenient_stamp(fetched_at).unwrap();
     let record = crystalline_remote::SourceRecord {
         url: url.to_string(),
         name: name.to_string(),

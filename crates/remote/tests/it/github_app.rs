@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use crystalline_core::time::{self, Delta, Stamp};
 use crystalline_remote::github::app::{
     AppInfo, Collaborator, GithubApp, ManifestParams, RepoRole, RepoVisibility, app_manifest,
     convert_manifest, manifest_post_url,
@@ -43,8 +43,8 @@ async fn spawn(router: Router) -> String {
 }
 
 /// The instant every test's clock starts at.
-fn t0() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap()
+fn t0() -> Stamp {
+    Stamp::from_ymd_hms(2026, 10, 28, 12, 0, 0).unwrap()
 }
 
 /// The host a loopback base url stands for, as `AppCredentials.host` holds
@@ -67,14 +67,14 @@ fn creds(host: &str, slug: Option<&str>) -> AppCredentials {
 
 /// A settable clock shared between a test and its App.
 #[derive(Clone)]
-struct TestClock(Arc<Mutex<DateTime<Utc>>>);
+struct TestClock(Arc<Mutex<Stamp>>);
 
 impl TestClock {
     fn new() -> TestClock {
         TestClock(Arc::new(Mutex::new(t0())))
     }
 
-    fn set(&self, at: DateTime<Utc>) {
+    fn set(&self, at: Stamp) {
         *self.0.lock().unwrap() = at;
     }
 
@@ -90,7 +90,7 @@ struct Mock {
     /// `owner/name` -> installation id; a repository missing here answers 404.
     installations: HashMap<String, u64>,
     /// How long after `t0` a minted token expires.
-    lifetime: Option<Duration>,
+    lifetime: Option<Delta>,
     /// Sent as `X-GitHub-Enterprise-Version` on every answer when set.
     ghes_version: Option<&'static str>,
     /// Every request, as `(METHOD raw-path, headers)`.
@@ -186,12 +186,12 @@ async fn token_handler(
         *n += 1;
         *n
     };
-    let expires_at = t0() + mock.lifetime.unwrap_or(Duration::hours(1));
+    let expires_at = t0() + mock.lifetime.unwrap_or(time::hours(1));
     mock.answer(
         StatusCode::CREATED,
         serde_json::json!({
             "token": format!("ghs_{id}_{n}"),
-            "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "expires_at": expires_at.rfc3339_secs_z(),
         }),
     )
 }
@@ -328,17 +328,17 @@ async fn a_token_is_reused_until_five_minutes_before_expiry() {
     assert_eq!(mock.minted(11), 1);
 
     // Still reused a second before the five-minute margin...
-    clock.set(t0() + Duration::minutes(55) - Duration::seconds(1));
+    clock.set(t0() + time::minutes(55) - time::seconds(1));
     assert_eq!(app.installation_token(11).await.unwrap(), "ghs_11_1");
     assert_eq!(mock.minted(11), 1);
     // ...and renewed once the margin is reached.
-    clock.set(t0() + Duration::minutes(55));
+    clock.set(t0() + time::minutes(55));
     assert_eq!(app.installation_token(11).await.unwrap(), "ghs_11_2");
     assert_eq!(mock.minted(11), 2);
 
     // Expires four minutes out: inside the margin, so every call mints.
     let (mock, _base, app, _clock) = serve(Mock {
-        lifetime: Some(Duration::minutes(4)),
+        lifetime: Some(time::minutes(4)),
         ..Mock::default()
     })
     .await;
@@ -640,7 +640,7 @@ async fn the_probe_reads_githubs_clock_even_when_the_jwt_is_refused() {
         "{:?}",
         probe.info
     );
-    assert_eq!(probe.server_date, Some(t0() + Duration::seconds(120)));
+    assert_eq!(probe.server_date, Some(t0() + time::seconds(120)));
 }
 
 #[tokio::test]
@@ -897,7 +897,7 @@ async fn rate_limit_on_the_permission_lookup_is_rate_limited() {
     let err = app.repo_role("acme/kb", "limited").await.unwrap_err();
     match err {
         RemoteError::RateLimited { reset } => {
-            assert_eq!(reset, Some(Utc.timestamp_opt(1793188800, 0).unwrap()));
+            assert_eq!(reset, Some(Stamp::from_unix(1793188800, 0).unwrap()));
         }
         other => panic!("expected RateLimited, got {other:?}"),
     }

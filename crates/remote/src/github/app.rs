@@ -20,7 +20,7 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Duration, Utc};
+use crystalline_core::time::{self, Delta, Stamp};
 use percent_encoding::utf8_percent_encode;
 use reqwest::{Method, Response, StatusCode};
 use rustls_pki_types::pem::PemObject;
@@ -41,11 +41,11 @@ const HEADER: &str = r#"{"alg":"RS256","typ":"JWT"}"#;
 /// How far before `now` the token claims to be issued. GitHub rejects a token
 /// issued in its future, and a local clock a little ahead of GitHub's is the
 /// common failure.
-const BACKDATE: Duration = Duration::seconds(60);
+const BACKDATE: Delta = time::seconds(60);
 
 /// How long after `now` the token expires. GitHub allows at most ten minutes
 /// from the issue time; with the backdate this stays a minute inside it.
-const LIFETIME: Duration = Duration::seconds(540);
+const LIFETIME: Delta = time::seconds(540);
 
 /// A GitHub App's RSA private key, parsed and ready to sign.
 ///
@@ -93,10 +93,10 @@ struct Claims<'a> {
 ///
 /// `now` is a parameter so a test can pin the whole token: PKCS#1 v1.5
 /// signing is deterministic.
-pub fn app_jwt(key: &AppKey, client_id: &str, now: DateTime<Utc>) -> Result<String, RemoteError> {
+pub fn app_jwt(key: &AppKey, client_id: &str, now: Stamp) -> Result<String, RemoteError> {
     let claims = Claims {
-        iat: (now - BACKDATE).timestamp(),
-        exp: (now + LIFETIME).timestamp(),
+        iat: (now - BACKDATE).unix_seconds(),
+        exp: (now + LIFETIME).unix_seconds(),
         iss: client_id,
     };
     let claims = serde_json::to_vec(&claims)
@@ -124,7 +124,7 @@ pub fn app_jwt(key: &AppKey, client_id: &str, now: DateTime<Utc>) -> Result<Stri
 /// How long before its `expires_at` an installation token is renewed. GitHub
 /// issues them for an hour; a token this close to the end could expire in the
 /// middle of a share.
-const RENEW_BEFORE: Duration = Duration::minutes(5);
+const RENEW_BEFORE: Delta = time::minutes(5);
 
 /// The domain of a GitHub account's `noreply` commit address,
 /// `<id>+<login>@<domain>`, for the host an API url stands for (`None` is
@@ -157,7 +157,7 @@ fn noreply_domain(host: Option<&str>) -> String {
 /// The clock a [`GithubApp`] reads: the issue time of its JWTs and the
 /// moment a cached token is measured against. [`GithubApp::new`] uses the
 /// system clock; [`GithubApp::with_clock`] swaps it.
-pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+pub type Clock = Arc<dyn Fn() -> Stamp + Send + Sync>;
 
 /// The name and email a commit records for its author or committer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,7 +234,7 @@ pub struct AppProbe {
     pub info: Result<AppInfo, RemoteError>,
     /// GitHub's time when it answered, `None` when there was no answer or
     /// it carried no readable `Date`.
-    pub server_date: Option<DateTime<Utc>>,
+    pub server_date: Option<Stamp>,
 }
 
 /// `GET /app/installations` entry.
@@ -276,7 +276,8 @@ struct InstallationResponse {
 #[derive(Deserialize)]
 struct AccessTokenResponse {
     token: String,
-    expires_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    expires_at: Stamp,
 }
 
 /// `GET /users/{login}` response.
@@ -549,7 +550,7 @@ const PAGE_SIZE: usize = 100;
 /// An installation token and when GitHub said it ends.
 struct CachedToken {
     token: String,
-    expires_at: DateTime<Utc>,
+    expires_at: Stamp,
 }
 
 /// One installation's token, behind the lock that keeps its renewal single:
@@ -662,7 +663,7 @@ impl GithubApp {
             api_url,
             creds,
             key,
-            clock: Arc::new(Utc::now),
+            clock: Arc::new(time::now),
             slug: Mutex::new(slug),
             bot: Mutex::new(None),
             installations: Mutex::new(HashMap::new()),
@@ -706,8 +707,8 @@ impl GithubApp {
             }
         };
         let server_date = header(&response, "date")
-            .and_then(|date| DateTime::parse_from_rfc2822(&date).ok())
-            .map(|date| date.with_timezone(&Utc));
+            .and_then(|date| time::parse_rfc2822(&date))
+            .map(|date| date.stamp());
         let info = if response.status() == StatusCode::UNAUTHORIZED {
             Err(jwt_refused())
         } else {
@@ -1522,7 +1523,6 @@ async fn send(builder: reqwest::RequestBuilder) -> Result<Response, RemoteError>
 mod tests {
     use super::*;
     use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
-    use chrono::TimeZone;
 
     /// A throwaway 2048-bit key generated for these tests only. It protects
     /// nothing and belongs to no App.
@@ -1530,8 +1530,8 @@ mod tests {
     /// The same test key as PKCS#8.
     const PKCS8: &str = include_str!("../../tests/fixtures/app-key-pkcs8.pem");
 
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap()
+    fn now() -> Stamp {
+        Stamp::from_ymd_hms(2026, 10, 28, 12, 0, 0).unwrap()
     }
 
     fn parts(token: &str) -> Vec<String> {
@@ -1549,7 +1549,7 @@ mod tests {
         let p = parts(&token);
         assert_eq!(p.len(), 3);
         assert_eq!(decode(&p[0]), br#"{"alg":"RS256","typ":"JWT"}"#);
-        let t = now().timestamp();
+        let t = now().unix_seconds();
         let expected = format!(r#"{{"iat":{},"exp":{},"iss":"Iv1.test"}}"#, t - 60, t + 540);
         assert_eq!(String::from_utf8(decode(&p[1])).unwrap(), expected);
     }

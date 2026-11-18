@@ -872,7 +872,9 @@ impl Provider for MockProvider {
             return Err(RemoteError::AuthExpired);
         }
         if let Some(reset) = inner.rate_limited_branches.get(&origin.branch) {
-            return Err(RemoteError::RateLimited { reset: *reset });
+            return Err(RemoteError::RateLimited {
+                reset: reset.map(crystalline_core::time::Stamp::from_chrono),
+            });
         }
         let commit = inner.branches.get(&origin.branch).cloned().ok_or_else(|| {
             RemoteError::RepoNotFound {
@@ -1193,7 +1195,9 @@ impl Provider for MockProvider {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(format!("branch_ref:{name}"));
         if let Some(reset) = inner.branch_ref_rate_limited {
-            return Err(RemoteError::RateLimited { reset: Some(reset) });
+            return Err(RemoteError::RateLimited {
+                reset: Some(crystalline_core::time::Stamp::from_chrono(reset)),
+            });
         }
         Ok(inner.branches.get(name).cloned())
     }

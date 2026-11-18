@@ -436,7 +436,7 @@ mod tests {
             "cmt_x".to_string(),
             "https://kb.example".to_string(),
             "alice".to_string(),
-            chrono::Utc::now(),
+            crystalline_core::time::now(),
         );
         let unavailable = |r: Result<(), RemoteError>, what: &str| {
             assert!(

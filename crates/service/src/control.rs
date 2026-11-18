@@ -2067,7 +2067,7 @@ mod tests {
             kind: CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: chrono::Utc::now(),
+            connected_at: crystalline_core::time::now(),
             mounts: Vec::new(),
             domains: None,
             from_env: false,
@@ -2084,7 +2084,7 @@ mod tests {
             &Cached {
                 account: "keeper".to_string(),
                 etag: "e".to_string(),
-                fetched_at: chrono::Utc::now(),
+                fetched_at: crystalline_core::time::now(),
                 data: json!({ "domains": [
                     { "name": "locked", "bullets": ["Route here"], "domain_read_only": true },
                     { "name": "open", "bullets": ["Route there"] },

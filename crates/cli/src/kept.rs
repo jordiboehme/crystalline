@@ -46,7 +46,10 @@ pub fn to_json(k: &KeptText) -> Value {
         "unfinished": k.unfinished,
         "kind": k.kind,
         "path": k.path,
-        "kept_at": k.kept_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "kept_at": k
+            .kept_at
+            .into_chrono()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "bytes": k.bytes,
         "sender": k.sender,
         "file": k.file.display().to_string(),
@@ -75,7 +78,10 @@ pub fn what(k: &KeptText) -> String {
 
 /// "2026-10-15 08:00 UTC".
 pub fn when(k: &KeptText) -> String {
-    k.kept_at.format("%Y-%m-%d %H:%M UTC").to_string()
+    k.kept_at
+        .into_chrono()
+        .format("%Y-%m-%d %H:%M UTC")
+        .to_string()
 }
 
 /// Run one `kept` subcommand.
@@ -196,7 +202,7 @@ mod tests {
             None,
             kept::KeptKind::Engram,
             "a.md",
-            at,
+            crystalline_core::time::Stamp::from_chrono(at),
             "x",
         )
         .unwrap();

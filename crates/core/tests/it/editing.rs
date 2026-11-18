@@ -2,13 +2,13 @@
 //! regression), frontmatter field edits and the `generated` provenance touch.
 
 use crate::common::{fixtures_dir, read};
-use chrono::{DateTime, FixedOffset};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_after_section_reporting, insert_before_section,
     prepend_body, remove_frontmatter_field, replace_section, replace_section_reporting,
     set_evolve_ack, set_frontmatter_field, set_frontmatter_number, set_stale_after, set_verified,
     touch_generated,
 };
+use crystalline_core::time::{self, Day, OffsetStamp};
 use crystalline_core::{EvolveAck, Verified, parse_engram};
 
 fn nested_headings() -> String {
@@ -269,8 +269,7 @@ fn set_frontmatter_field_inserts_when_absent() {
 #[test]
 fn touch_generated_records_the_actor_and_an_rfc3339_instant() {
     let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
-    let now: DateTime<FixedOffset> =
-        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let now: OffsetStamp = time::parse_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
     let out = touch_generated(&source, "claude-code/1.0.5", None, now);
     assert!(
         out.contains("generated: { by: claude-code/1.0.5, at: 2026-07-02T10:00:00+00:00 }"),
@@ -279,7 +278,7 @@ fn touch_generated_records_the_actor_and_an_rfc3339_instant() {
     let e = parse_engram(&out).unwrap();
     let g = e.frontmatter.generated.unwrap();
     assert_eq!(g.by, "claude-code/1.0.5");
-    assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-02T10:00:00+00:00");
+    assert_eq!(g.at.unwrap().rfc3339(), "2026-07-02T10:00:00+00:00");
 }
 
 /// A write that reports no model emits exactly the two-key form it always
@@ -288,8 +287,7 @@ fn touch_generated_records_the_actor_and_an_rfc3339_instant() {
 #[test]
 fn a_generated_block_without_a_model_emits_the_two_key_form_unchanged() {
     let source = read(&fixtures_dir().join("canonical/generated-provenance.md"));
-    let now: DateTime<FixedOffset> =
-        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let now: OffsetStamp = time::parse_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
     let out = touch_generated(&source, "claude-code/1.0.5", None, now);
     let expected = source.replace(
         "generated: { by: claude-code/1.0.5, at: 2026-07-27T09:15:00+00:00 }",
@@ -304,8 +302,7 @@ fn a_generated_block_without_a_model_emits_the_two_key_form_unchanged() {
 #[test]
 fn touch_generated_keeps_a_reported_model() {
     let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
-    let now: DateTime<FixedOffset> =
-        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let now: OffsetStamp = time::parse_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
     let out = touch_generated(&source, "claude-code/2.1.271", Some("claude-opus-5"), now);
     assert!(
         out.contains(
@@ -323,8 +320,7 @@ fn touch_generated_migrates_a_legacy_timestamp_line_in_place() {
     // Editing it swaps that one line for the provenance block and leaves every
     // other byte, including the frontmatter order, exactly where it was.
     let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
-    let now: DateTime<FixedOffset> =
-        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let now: OffsetStamp = time::parse_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
     let out = touch_generated(&source, "human:jordi", None, now);
     let expected = source.replace(
         "timestamp: 2026-05-01T09:15:00+00:00",
@@ -348,8 +344,7 @@ generated: { by: old/1, at: 2021-01-01T00:00:00+00:00 }
 
 body
 ";
-    let now: DateTime<FixedOffset> =
-        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let now: OffsetStamp = time::parse_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
     let out = touch_generated(source, "new/2", None, now);
     assert!(
         out.contains("timestamp: 2020-01-01T00:00:00+00:00"),
@@ -361,7 +356,7 @@ body
     assert_eq!(fm.generated.as_ref().unwrap().by, "new/2");
     // Recency reads the provenance block, not the stale legacy key.
     assert_eq!(
-        fm.written_at().unwrap().to_rfc3339(),
+        fm.written_at().unwrap().rfc3339(),
         "2026-07-02T10:00:00+00:00"
     );
 }
@@ -385,13 +380,12 @@ status: stable
 
 Body.
 ";
-    let now: DateTime<FixedOffset> =
-        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let now: OffsetStamp = time::parse_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
     let out = touch_generated(source, "claude-code/1.0.5", None, now);
     let e = parse_engram(&out).expect("the refreshed engram still parses");
     let g = e.frontmatter.generated.unwrap();
     assert_eq!(g.by, "claude-code/1.0.5");
-    assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-02T10:00:00+00:00");
+    assert_eq!(g.at.unwrap().rfc3339(), "2026-07-02T10:00:00+00:00");
     // The old block is gone rather than orphaned, and its neighbours stayed put.
     assert!(!out.contains("human:jordi"), "{out}");
     assert!(!out.contains("2026-01-01T00:00:00+00:00"), "{out}");
@@ -414,8 +408,7 @@ generated:
 
 Body.
 ";
-    let now: DateTime<FixedOffset> =
-        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let now: OffsetStamp = time::parse_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
     let out = touch_generated(source, "new/2", None, now);
     let e = parse_engram(&out).expect("the refreshed engram still parses");
     assert_eq!(e.frontmatter.generated.unwrap().by, "new/2");
@@ -437,10 +430,10 @@ status: stable
 
 Body.
 ";
-    let date = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let date = Day::from_ymd(2026, 12, 1).unwrap();
     let out = set_stale_after(source, date);
     let e = parse_engram(&out).expect("the edited engram still parses");
-    assert_eq!(e.frontmatter.stale_on().unwrap().to_string(), "2026-12-01");
+    assert_eq!(e.frontmatter.stale_on().unwrap().ymd(), "2026-12-01");
     assert!(!out.contains("2026-08-01"), "{out}");
     assert!(out.contains("status: stable"), "{out}");
 }
@@ -451,23 +444,23 @@ fn set_stale_after_migrates_a_legacy_review_after_line_in_place() {
     // Setting the bound swaps that one line and leaves every other byte,
     // including the frontmatter order, exactly where it was.
     let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
-    let date = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let date = Day::from_ymd(2026, 12, 1).unwrap();
     let out = set_stale_after(&source, date);
     let expected = source.replace("review_after: 2026-08-01", "stale_after: 2026-12-01");
     assert_eq!(out, expected);
     let e = parse_engram(&out).unwrap();
     assert!(e.frontmatter.review_after.is_none());
-    assert_eq!(e.frontmatter.stale_on().unwrap().to_string(), "2026-12-01");
+    assert_eq!(e.frontmatter.stale_on().unwrap().ymd(), "2026-12-01");
 }
 
 #[test]
 fn set_stale_after_appends_when_neither_spelling_is_present() {
     let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
-    let date = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let date = Day::from_ymd(2026, 12, 1).unwrap();
     let out = set_stale_after(&source, date);
     assert!(out.contains("stale_after: 2026-12-01"), "{out}");
     let e = parse_engram(&out).unwrap();
-    assert_eq!(e.frontmatter.stale_after.unwrap().to_string(), "2026-12-01");
+    assert_eq!(e.frontmatter.stale_after.unwrap().ymd(), "2026-12-01");
 }
 
 #[test]
@@ -480,10 +473,7 @@ fn remove_frontmatter_field_removes_exactly_one_line() {
     // The neighboring fields whose names share the `valid_` prefix survive.
     let e = parse_engram(&out).unwrap();
     assert_eq!(e.frontmatter.valid_to, None);
-    assert_eq!(
-        e.frontmatter.valid_from,
-        chrono::NaiveDate::from_ymd_opt(2026, 5, 1)
-    );
+    assert_eq!(e.frontmatter.valid_from, Day::from_ymd(2026, 5, 1));
 }
 
 #[test]
@@ -527,7 +517,7 @@ fn verification(by: &str, at: &str) -> Verified {
     Verified {
         by: by.to_string(),
         model: None,
-        at: DateTime::parse_from_rfc3339(at).ok(),
+        at: time::parse_rfc3339(at),
     }
 }
 
@@ -564,7 +554,7 @@ fn set_verified_replaces_a_block_sequence_without_orphaning_items() {
     assert_eq!(e.frontmatter.verified.len(), 2);
     assert_eq!(e.frontmatter.verified[1].by, "c/3");
     assert_eq!(
-        e.frontmatter.latest_verified().unwrap().at.to_rfc3339(),
+        e.frontmatter.latest_verified().unwrap().at.rfc3339(),
         "2026-02-01T00:00:00+00:00"
     );
 }
@@ -584,7 +574,7 @@ fn set_verified_appends_and_leaves_a_legacy_last_verified_alone() {
     // The newer typed entry is what recency reads.
     let latest = e.frontmatter.latest_verified().unwrap();
     assert_eq!(latest.by, Some("human:jordi"));
-    assert_eq!(latest.at.to_rfc3339(), "2026-08-02T09:00:00+00:00");
+    assert_eq!(latest.at.rfc3339(), "2026-08-02T09:00:00+00:00");
 }
 
 #[test]
@@ -610,7 +600,7 @@ fn ack(rule: &str, scope: Option<&str>, note: Option<&str>) -> EvolveAck {
         scope: scope.map(str::to_string),
         note: note.map(str::to_string),
         by: "human:jordi".to_string(),
-        at: DateTime::parse_from_rfc3339("2026-08-20T09:00:00+00:00").ok(),
+        at: time::parse_rfc3339("2026-08-20T09:00:00+00:00"),
     }
 }
 

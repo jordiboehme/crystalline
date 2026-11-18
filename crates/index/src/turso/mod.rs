@@ -70,6 +70,7 @@ use crate::store::{
 };
 use crate::store::{AutomationLease, AutomationRun, LeaseClaim, LeaseHolder};
 use crate::sweep::{SpelledRef, UnresolvedRef};
+use crystalline_core::time;
 
 /// `?from` through `?(from + count - 1)`, comma separated: an `IN` list's
 /// placeholders.
@@ -289,7 +290,7 @@ impl TursoStore {
         // Subsecond precision, so a second attempt inside the same second
         // cannot land on a name that is already taken - and if one somehow
         // does, the open fails rather than renaming over the earlier copy.
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+        let stamp = time::now().compact_millis_z();
         let mut aside_base = path.as_os_str().to_os_string();
         aside_base.push(format!(".unreadable-{stamp}"));
         let aside_base = PathBuf::from(aside_base);
@@ -6064,7 +6065,7 @@ mod tests {
                     "INSERT INTO schema_migration (version, applied_at) VALUES (?1, ?2)",
                     vec![
                         Value::Integer(store.schema_version + 1),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                        Value::Text(time::now().rfc3339()),
                     ],
                 )
                 .await

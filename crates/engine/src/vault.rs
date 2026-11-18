@@ -178,7 +178,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use chrono::Utc;
     use crystalline_index::postgres::{
         Acquired, OwnerIdentity, PgOwner, PgTarget, PostgresStore, ScratchSchema,
     };
@@ -263,7 +262,7 @@ mod tests {
                 access_token: "ghp_sealed_secret".to_string(),
                 host: "github.com".to_string(),
                 user: "keeper".to_string(),
-                created_at: Utc::now(),
+                created_at: crystalline_core::time::now(),
                 refresh_token: None,
                 expires_at: None,
                 refresh_expires_at: None,

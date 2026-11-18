@@ -31,7 +31,7 @@ fn plant(home: &Path) -> (PathBuf, PathBuf) {
         None,
         KeptKind::Reflection,
         "guides/a.md",
-        Utc::now() - Duration::hours(1),
+        crystalline_core::time::Stamp::from_chrono(Utc::now() - Duration::hours(1)),
         "Typed on the page.\n",
     )
     .unwrap();
@@ -41,7 +41,7 @@ fn plant(home: &Path) -> (PathBuf, PathBuf) {
         None,
         KeptKind::Engram,
         "runbooks/deploy.md",
-        Utc::now() - Duration::days(45),
+        crystalline_core::time::Stamp::from_chrono(Utc::now() - Duration::days(45)),
         "Typed on the engram.\n",
     )
     .unwrap();
@@ -229,7 +229,7 @@ fn status_through_the_daemon_counts_the_kept_texts() {
         None,
         KeptKind::Reflection,
         "a.md",
-        Utc::now(),
+        crystalline_core::time::Stamp::from_chrono(Utc::now()),
         "x",
     )
     .unwrap();
@@ -302,7 +302,7 @@ fn a_new_domain_never_reaches_texts_left_under_its_name() {
         None,
         KeptKind::Engram,
         "old.md",
-        Utc::now(),
+        crystalline_core::time::Stamp::from_chrono(Utc::now()),
         "left over",
     )
     .unwrap();
@@ -326,7 +326,7 @@ fn a_kept_file_is_shown_as_a_file_and_not_as_text() {
         Some("alice"),
         KeptKind::Engram,
         "assets/deck.png",
-        Utc::now(),
+        crystalline_core::time::Stamp::from_chrono(Utc::now()),
         b"\x89PNG\r\n\x1a\n\x00\xff her deck",
     )
     .unwrap();

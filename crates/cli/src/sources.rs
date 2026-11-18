@@ -718,7 +718,7 @@ async fn ask_one(record: SourceRecord, dir: std::path::PathBuf) -> SourceRow {
         ..SourceRow::default()
     };
     if let Some(cached) = read_cached(&record.host_dir(&dir), ROUTING_FILE, &record.account) {
-        row.fetched_at = Some(cached.fetched_at.to_rfc3339());
+        row.fetched_at = Some(cached.fetched_at.rfc3339());
         row.failure = cached.last_failure;
     }
     // On Postgres the sign-in is sealed in the database, which a report
@@ -752,7 +752,7 @@ async fn ask_one(record: SourceRecord, dir: std::path::PathBuf) -> SourceRow {
             .credential()
             .await
             .and_then(|c| c.expires_at)
-            .map(|at| at.to_rfc3339());
+            .map(|at| at.rfc3339());
         let answer = connection
             .ctl_data(json!({ "v": 1, "cmd": "status" }))
             .await

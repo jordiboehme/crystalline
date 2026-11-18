@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -285,10 +285,10 @@ pub struct OwnerRow {
     /// The holder's Crystalline version.
     pub version: String,
     /// When the holder took the lock.
-    pub since: DateTime<Utc>,
+    pub since: Stamp,
     /// When the holder released the lock cleanly; `None` while it holds it
     /// or when it stopped without releasing.
-    pub released_at: Option<DateTime<Utc>>,
+    pub released_at: Option<Stamp>,
 }
 
 /// The answer to a lock attempt.
@@ -319,7 +319,7 @@ pub enum FenceState {
 #[derive(Clone, Debug, Default)]
 pub struct StandbyStatus {
     /// When the wait started.
-    pub waiting_since: DateTime<Utc>,
+    pub waiting_since: Stamp,
     /// The owner row the last poll read; `None` when the holder has not
     /// announced itself or the table does not exist.
     pub owner: Option<OwnerRow>,
@@ -334,7 +334,7 @@ impl StandbyStatus {
     /// A status whose wait starts now.
     pub fn new() -> StandbyStatus {
         StandbyStatus {
-            waiting_since: Utc::now(),
+            waiting_since: time::now(),
             ..StandbyStatus::default()
         }
     }
@@ -426,8 +426,8 @@ async fn table_exists(conn: &mut PgConnection, table: &str) -> Result<bool> {
 }
 
 /// The microseconds since the epoch as a time.
-fn from_micros(us: i64) -> Result<DateTime<Utc>> {
-    DateTime::from_timestamp_micros(us)
+fn from_micros(us: i64) -> Result<Stamp> {
+    Stamp::from_unix_micros(us)
         .ok_or_else(|| IndexError::Db(format!("a stored time is out of range: {us}")))
 }
 
@@ -546,7 +546,7 @@ pub struct ConfigDoc {
     /// The document itself.
     pub body: serde_json::Value,
     /// When it was last saved.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Stamp,
     /// Who saved it last.
     pub updated_by: String,
 }
@@ -1466,7 +1466,7 @@ impl PgOwner {
     /// lock, it was fenced, or its thread is gone.
     pub async fn wait_acquire(&self, status: watch::Sender<StandbyStatus>) -> Result<Acquired> {
         status.send_modify(|s| {
-            s.waiting_since = Utc::now();
+            s.waiting_since = time::now();
             s.polls = 0;
             s.last_error = None;
         });
@@ -1598,7 +1598,7 @@ fn standby_delay(poll: Duration, failures: u32) -> Duration {
 #[derive(Clone, Copy)]
 struct Held {
     lock_pid: i32,
-    since: DateTime<Utc>,
+    since: Stamp,
 }
 
 /// The owner thread's state.
@@ -1753,7 +1753,7 @@ impl Worker {
         let previous = read_row(conn, &self.table).await?;
         self.held = Some(Held {
             lock_pid: pid,
-            since: Utc::now(),
+            since: time::now(),
         });
         self.lock_pid.store(pid, Ordering::Release);
         self.probe = ProbeState::new();
@@ -1821,7 +1821,7 @@ impl Worker {
             .bind(i64::from(std::process::id()))
             .bind(i64::from(held.lock_pid))
             .bind(&me.version)
-            .bind(held.since.timestamp_micros())
+            .bind(held.since.unix_micros())
             .execute(&mut *conn)
             .await?;
         Ok(())
@@ -2745,7 +2745,7 @@ mod tests {
         let doc = side.load_config().await.unwrap().expect("the document");
         assert_eq!(doc.body, first);
         assert_eq!(doc.updated_by, "test-a");
-        assert!((Utc::now() - doc.updated_at).num_seconds().abs() < 60);
+        assert!((time::now() - doc.updated_at).num_seconds().abs() < 60);
         assert_eq!(read_config_document(&t).await.unwrap(), Some(doc.clone()));
         let blocking = side.clone();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -3056,7 +3056,7 @@ mod tests {
         assert_eq!(row.backend_pid, i64::from(lock_pid));
         assert_eq!(row.version, "0.33.0-test");
         assert!(row.released_at.is_none());
-        assert!((Utc::now() - row.since).num_seconds().abs() < 60);
+        assert!((time::now() - row.since).num_seconds().abs() < 60);
         // A second announce keeps the time the lock was taken.
         tokio::time::sleep(Duration::from_millis(20)).await;
         a.announce().await.unwrap();

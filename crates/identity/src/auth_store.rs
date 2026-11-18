@@ -67,6 +67,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use crystalline_core::time::{self, Stamp};
 use sha2::{Digest, Sha256};
 use turso::{Builder, Connection, Database, Value};
 
@@ -375,7 +376,8 @@ pub struct GithubLink {
     /// The login last seen for the id, a cache.
     pub login: String,
     /// When the link was made.
-    pub linked_at: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub linked_at: Stamp,
     /// False once the stored user token is known to be gone (revoked or
     /// expired); the link itself stays.
     pub token_live: bool,
@@ -402,8 +404,8 @@ fn github_link_from_row(row: &AuthRow) -> GithubLink {
         },
         login: cell_text(row, 3).unwrap_or_default(),
         linked_at: cell_text(row, 4)
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
-            .map(|at| at.with_timezone(&chrono::Utc))
+            .and_then(|at| time::parse_rfc3339(&at))
+            .map(|at| at.stamp())
             .unwrap_or_default(),
         token_live: matches!(row.get_value(5), Ok(Value::Integer(live)) if live != 0),
     }
@@ -570,9 +572,9 @@ impl OverlayGrant {
         }
         match &self.expires_at {
             None => true,
-            Some(at) => match chrono::DateTime::parse_from_rfc3339(at) {
-                Ok(at) => at > chrono::Utc::now(),
-                Err(_) => false,
+            Some(at) => match time::parse_rfc3339(at) {
+                Some(at) => at.stamp() > time::now(),
+                None => false,
             },
         }
     }
@@ -2012,7 +2014,7 @@ impl AuthStore {
                         Value::Text(role.as_str().to_string()),
                         reflection.to_db(),
                         Value::Text(hash),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                        Value::Text(time::now().rfc3339()),
                     ],
                 )
                 .await
@@ -2081,7 +2083,7 @@ impl AuthStore {
                         Value::Text(name.clone()),
                         Value::Text(display.to_string()),
                         Value::Text(hash),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                        Value::Text(time::now().rfc3339()),
                     ],
                 )
                 .await
@@ -2640,7 +2642,7 @@ impl AuthStore {
                         Value::Text(name.clone()),
                         Value::Text(display),
                         Value::Text(role.as_str().to_string()),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                        Value::Text(time::now().rfc3339()),
                     ],
                 )
                 .await
@@ -2923,7 +2925,7 @@ impl AuthStore {
                     GITHUB_ID_TAKEN.to_string(),
                 ));
             }
-            let now = chrono::Utc::now();
+            let now = time::now();
             self.db
                 .execute(
                     "DELETE FROM github_link WHERE account = ?1",
@@ -2940,7 +2942,7 @@ impl AuthStore {
                         Value::Text(host.clone()),
                         Value::Integer(id),
                         Value::Text(login.to_string()),
-                        Value::Text(now.to_rfc3339()),
+                        Value::Text(now.rfc3339()),
                     ],
                 )
                 .await
@@ -3059,7 +3061,7 @@ impl AuthStore {
     /// day (a replay, which does no work). See
     /// [`AuthStore::remember_delivery_at`].
     pub async fn remember_delivery(&self, id: &str) -> Result<bool> {
-        self.remember_delivery_at(id, chrono::Utc::now().timestamp())
+        self.remember_delivery_at(id, time::now().unix_seconds())
             .await
     }
 
@@ -3187,7 +3189,7 @@ impl AuthStore {
                             None => Value::Null,
                         },
                         Value::Text(role.as_str().to_string()),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                        Value::Text(time::now().rfc3339()),
                     ],
                 )
                 .await
@@ -3264,7 +3266,7 @@ impl AuthStore {
         let name = normalize_account_name(name)?;
         let token = random_hex();
         let csrf = random_hex();
-        let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl_secs);
+        let expires_at = time::now().unix_seconds().saturating_add(ttl_secs);
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -3324,7 +3326,7 @@ impl AuthStore {
     /// trusted-header path resolves the token by identity, not by cookie.
     pub async fn ensure_session(&self, name: &str, ttl_secs: i64) -> Result<SessionMint> {
         let name = normalize_account_name(name)?;
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = now.saturating_add(ttl_secs);
@@ -3400,7 +3402,7 @@ impl AuthStore {
     /// that must match.
     pub async fn newest_session_csrf(&self, name: &str) -> Result<Option<String>> {
         let name = normalize_account_name(name)?;
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         self.live_csrf(&name, now).await
     }
@@ -3414,7 +3416,7 @@ impl AuthStore {
     /// the cookie's owner as having just been seen: they are not the one making
     /// the request.
     pub async fn session_owner(&self, token: &str) -> Result<Option<String>> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         Ok(self
             .db
@@ -3438,7 +3440,7 @@ impl AuthStore {
     /// read as a fresh sighting and queue every stream's check behind the
     /// store's writes.
     pub async fn session_user_quiet(&self, token: &str) -> Result<Option<User>> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         Ok(self
             .db
@@ -3509,7 +3511,7 @@ impl AuthStore {
     /// name. Clearing them on sight makes that unrecoverable rather than
     /// dormant.
     pub async fn session_user(&self, token: &str) -> Result<Option<(User, String)>> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         if self.db.is_postgres() {
             self.prune_orphans_if_due().await?;
@@ -3561,7 +3563,7 @@ impl AuthStore {
     /// Stamp `last_seen_at` of `name` with now. On Postgres only when the
     /// stamp is missing or older than [`STAMP_THRESHOLD_SECS`].
     async fn stamp_seen(&self, name: &str) -> Result<()> {
-        let now = chrono::Utc::now();
+        let now = time::now();
         if self.db.is_postgres() {
             self.db
                 .execute(
@@ -3569,7 +3571,7 @@ impl AuthStore {
                      WHERE name = ?1 AND (last_seen_at IS NULL OR last_seen_at < ?3)",
                     vec![
                         Value::Text(name.to_string()),
-                        Value::Text(now.to_rfc3339()),
+                        Value::Text(now.rfc3339()),
                         Value::Text(stamp_cutoff(now)),
                     ],
                 )
@@ -3578,7 +3580,7 @@ impl AuthStore {
             self.db
                 .execute(
                     "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
-                    vec![Value::Text(name.to_string()), Value::Text(now.to_rfc3339())],
+                    vec![Value::Text(name.to_string()), Value::Text(now.rfc3339())],
                 )
                 .await
         }
@@ -3590,22 +3592,22 @@ impl AuthStore {
     /// `oauth_grants`) with now. On Postgres only when the stamp is missing
     /// or older than [`STAMP_THRESHOLD_SECS`].
     async fn stamp_used(&self, table: &'static str, id: i64) -> Result<()> {
-        let now = chrono::Utc::now();
+        let now = time::now();
         let (sql, params) = match (table, self.db.is_postgres()) {
             ("mcp_tokens", false) => (
                 "UPDATE mcp_tokens SET last_used = ?2 WHERE id = ?1",
-                vec![Value::Integer(id), Value::Text(now.to_rfc3339())],
+                vec![Value::Integer(id), Value::Text(now.rfc3339())],
             ),
             ("oauth_grants", false) => (
                 "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
-                vec![Value::Integer(id), Value::Text(now.to_rfc3339())],
+                vec![Value::Integer(id), Value::Text(now.rfc3339())],
             ),
             ("mcp_tokens", true) => (
                 "UPDATE mcp_tokens SET last_used = ?2
                  WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
                 vec![
                     Value::Integer(id),
-                    Value::Text(now.to_rfc3339()),
+                    Value::Text(now.rfc3339()),
                     Value::Text(stamp_cutoff(now)),
                 ],
             ),
@@ -3614,7 +3616,7 @@ impl AuthStore {
                  WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
                 vec![
                     Value::Integer(id),
-                    Value::Text(now.to_rfc3339()),
+                    Value::Text(now.rfc3339()),
                     Value::Text(stamp_cutoff(now)),
                 ],
             ),
@@ -3630,7 +3632,7 @@ impl AuthStore {
         if !self.db.prune_due() {
             return Ok(());
         }
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         self.db
             .execute(PRUNE_SESSIONS, vec![Value::Integer(now)])
             .await
@@ -3753,7 +3755,7 @@ impl AuthStore {
         let user = normalize_account_name(user)?;
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
-        let created_at = chrono::Utc::now().to_rfc3339();
+        let created_at = time::now().rfc3339();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -3871,7 +3873,7 @@ impl AuthStore {
     ) -> Result<IssuedMcpToken> {
         let name = normalize_new_account_name(name)?;
         let hash = token_hash(&token);
-        let created_at = chrono::Utc::now().to_rfc3339();
+        let created_at = time::now().rfc3339();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -4016,7 +4018,7 @@ impl AuthStore {
         let user = normalize_account_name(user)?;
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
-        let created_at = chrono::Utc::now().to_rfc3339();
+        let created_at = time::now().rfc3339();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -4082,7 +4084,7 @@ impl AuthStore {
         let owner = normalize_account_name(owner)?;
         let token = format!("{DRAFT_LINK_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
-        let created_at = chrono::Utc::now().to_rfc3339();
+        let created_at = time::now().rfc3339();
         let _guard = self.lock().await;
         let id = self
             .returned_id(
@@ -4248,7 +4250,7 @@ impl AuthStore {
         as_admin: bool,
     ) -> Result<Option<OverlayGrant>> {
         let owner = normalize_account_name(owner)?;
-        let revoked_at = chrono::Utc::now().to_rfc3339();
+        let revoked_at = time::now().rfc3339();
         let _guard = self.lock().await;
         // One predicate and one parameter list, built once and used by both
         // statements: an admin ends any link on the instance, everybody else
@@ -4421,7 +4423,7 @@ impl AuthStore {
                 "UPDATE overlay_grant SET revoked_at = ?1
                  WHERE domain = ?2 AND owner = ?3 AND path = ?4 AND revoked_at IS NULL",
                 vec![
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(time::now().rfc3339()),
                     Value::Text(domain.to_string()),
                     Value::Text(owner.clone()),
                     Value::Text(path.to_string()),
@@ -4444,7 +4446,7 @@ impl AuthStore {
                 "UPDATE overlay_grant SET revoked_at = ?1
                  WHERE owner = ?2 AND revoked_at IS NULL",
                 vec![
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(time::now().rfc3339()),
                     Value::Text(owner.clone()),
                 ],
             )
@@ -4468,7 +4470,7 @@ impl AuthStore {
                 "UPDATE overlay_grant SET revoked_at = ?1
                  WHERE domain = ?2 AND revoked_at IS NULL",
                 vec![
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(time::now().rfc3339()),
                     Value::Text(domain.to_string()),
                 ],
             )
@@ -4523,7 +4525,7 @@ impl AuthStore {
             client_name: name.to_string(),
             client_uri: client_uri.map(str::to_string),
             redirect_uris: redirect_uris.to_vec(),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: time::now().rfc3339(),
             last_used: None,
         };
         let encoded = serde_json::to_string(&client.redirect_uris)
@@ -4632,7 +4634,7 @@ impl AuthStore {
                 "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
                 vec![
                     Value::Text(client_id.to_string()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(time::now().rfc3339()),
                 ],
             )
             .await
@@ -4656,7 +4658,7 @@ impl AuthStore {
     ///
     /// Expiry is the statement's comparison, like every other one here.
     pub async fn prune_oauth_grants(&self) -> Result<usize> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         self.db
             .execute(
@@ -4736,10 +4738,9 @@ impl AuthStore {
     /// order is time order - the same property
     /// [`AuthStore::list_mcp_tokens`] already orders on.
     pub async fn prune_oauth_clients(&self) -> Result<usize> {
-        let now = chrono::Utc::now();
-        let idle_cutoff = (now - chrono::Duration::seconds(OAUTH_CLIENT_UNUSED_SECS)).to_rfc3339();
-        let unauthorized_cutoff =
-            (now - chrono::Duration::seconds(OAUTH_CLIENT_UNAUTHORIZED_SECS)).to_rfc3339();
+        let now = time::now();
+        let idle_cutoff = (now - time::seconds(OAUTH_CLIENT_UNUSED_SECS)).rfc3339();
+        let unauthorized_cutoff = (now - time::seconds(OAUTH_CLIENT_UNAUTHORIZED_SECS)).rfc3339();
         let _guard = self.lock().await;
         let removed = self
             .db
@@ -4809,9 +4810,9 @@ impl AuthStore {
             bail!("an oauth grant needs a resource to be issued for");
         }
         let pair = TokenPair::new();
-        let now = chrono::Utc::now();
-        let issued_at = now.timestamp();
-        let created_at = now.to_rfc3339();
+        let now = time::now();
+        let issued_at = now.unix_seconds();
+        let created_at = now.rfc3339();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -4960,7 +4961,7 @@ impl AuthStore {
             refresh_token,
             client_id,
             resource,
-            chrono::Utc::now().timestamp(),
+            time::now().unix_seconds(),
         )
         .await
     }
@@ -5373,7 +5374,7 @@ impl AuthStore {
         if resource.is_empty() {
             return Ok(None);
         }
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         if self.db.is_postgres() {
             self.prune_orphans_if_due().await?;
@@ -5442,7 +5443,7 @@ impl AuthStore {
                  ORDER BY g.created_at DESC, g.id DESC",
                 vec![
                     Value::Text(user.clone()),
-                    Value::Integer(chrono::Utc::now().timestamp()),
+                    Value::Integer(time::now().unix_seconds()),
                 ],
             )
             .await
@@ -5482,7 +5483,7 @@ impl AuthStore {
     /// the grant had when it ended; `refresh_expires_at` holds the moment it
     /// ended, since nothing refreshes it any more.
     pub async fn list_ended_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
-        self.list_ended_oauth_grants_at(user, chrono::Utc::now().timestamp())
+        self.list_ended_oauth_grants_at(user, time::now().unix_seconds())
             .await
     }
 
@@ -5549,7 +5550,7 @@ impl AuthStore {
     /// clients card lists for a while.
     pub async fn revoke_oauth_grant(&self, user: &str, id: i64) -> Result<bool> {
         let user = normalize_account_name(user)?;
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -5593,7 +5594,7 @@ impl AuthStore {
     /// record of why is [`OauthGrantEndReason::ClientRevoked`].
     pub async fn revoke_oauth_grant_by_token(&self, token: &str, client_id: &str) -> Result<bool> {
         let hash = token_hash(token);
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -5642,7 +5643,7 @@ impl AuthStore {
     /// should be told about on that card, unlike a removed account, which has
     /// nobody left to tell and goes through `delete_oauth_grants_of`.
     async fn end_oauth_grants_of(&self, name: &str, reason: OauthGrantEndReason) -> Result<()> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::now().unix_seconds();
         let rows = self
             .db
             .query(
@@ -5854,7 +5855,7 @@ impl AuthStore {
     ) -> Result<VisibilityWrite> {
         let domain = normalize_domain(domain)?;
         let owner = normalize_account_name(owner)?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = time::now().rfc3339();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -6111,7 +6112,7 @@ impl AuthStore {
     pub async fn transfer_domain(&self, domain: &str, new_owner: &str) -> Result<()> {
         let domain = normalize_domain(domain)?;
         let new_owner = normalize_account_name(new_owner)?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = time::now().rfc3339();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -6223,7 +6224,7 @@ impl AuthStore {
         if added_by.is_empty() {
             bail!("recording a membership needs an actor to record it as");
         }
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = time::now().rfc3339();
         let _guard = self.lock().await;
         self.db
             .begin_immediate()
@@ -6420,7 +6421,7 @@ impl AuthStore {
                 format!("'{account}' is the reserved name of the machine owner, not an account"),
             ));
         }
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = time::now().rfc3339();
         let context = || format!("giving '{account}' the Reflection of domain '{domain}'");
         let _guard = self.lock().await;
         self.db.begin_immediate().await.with_context(context)?;
@@ -6926,7 +6927,7 @@ impl AuthStore {
                     Value::Text(issuer.to_string()),
                     Value::Text(subject.to_string()),
                     Value::Text(user.to_string()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(time::now().rfc3339()),
                     Value::Text(linked_by.to_string()),
                 ],
             )
@@ -7247,16 +7248,16 @@ fn decode_redirect_uris(encoded: Option<&str>) -> Vec<String> {
 /// `last_used` again: [`STAMP_THRESHOLD_SECS`] before `now`, in the same
 /// RFC 3339 UTC form the stamps are written in, so the text comparison is a
 /// time comparison.
-fn stamp_cutoff(now: chrono::DateTime<chrono::Utc>) -> String {
-    (now - chrono::Duration::seconds(STAMP_THRESHOLD_SECS)).to_rfc3339()
+fn stamp_cutoff(now: Stamp) -> String {
+    (now - time::seconds(STAMP_THRESHOLD_SECS)).rfc3339()
 }
 
 /// A unix timestamp column as the RFC 3339 string a person reads. The expiry
 /// columns are integers so every comparison happens in SQL; this is the one
 /// place that turns one back into text, on the way out to a management screen.
 fn rfc3339_from_unix(secs: i64) -> String {
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|when| when.to_rfc3339())
+    Stamp::from_unix(secs, 0)
+        .map(|when| when.rfc3339())
         .unwrap_or_default()
 }
 

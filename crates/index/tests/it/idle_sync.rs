@@ -27,6 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crystalline_core::time;
 use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, SYNC_STAMP_REFRESH, Store, TursoStore, apply_scan, scan_paths,
@@ -202,8 +203,7 @@ async fn an_unchanged_sync_refreshes_a_stamp_older_than_the_interval() {
     };
 
     // A stamp just inside the interval stays, and nothing is written.
-    let inside =
-        (chrono::Utc::now() - SYNC_STAMP_REFRESH + chrono::TimeDelta::minutes(5)).to_rfc3339();
+    let inside = (time::now() - SYNC_STAMP_REFRESH + time::minutes(5)).rfc3339();
     store.record_sync(domain, &inside, true, "").await.unwrap();
     store.checkpoint_wal().await.unwrap();
     sync_domain_with(&store, "d", root.path(), &params())
@@ -213,8 +213,7 @@ async fn an_unchanged_sync_refreshes_a_stamp_older_than_the_interval() {
     assert_eq!(wal_frames(&db), 0, "a stamp inside the interval stays");
 
     // One just past it is refreshed by the next unchanged sync.
-    let past =
-        (chrono::Utc::now() - SYNC_STAMP_REFRESH - chrono::TimeDelta::minutes(5)).to_rfc3339();
+    let past = (time::now() - SYNC_STAMP_REFRESH - time::minutes(5)).rfc3339();
     store.record_sync(domain, &past, true, "").await.unwrap();
     store.checkpoint_wal().await.unwrap();
     sync_domain_with(&store, "d", root.path(), &params())

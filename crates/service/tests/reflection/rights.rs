@@ -408,7 +408,7 @@ fn mount_harbor(fx: &crate::fixture::Fx) {
             kind: crystalline_remote::CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: chrono::Utc::now(),
+            connected_at: crystalline_core::time::now(),
             mounts: vec![crystalline_remote::MountRecord {
                 remote: "harbor".to_string(),
                 local: "harbor".to_string(),
@@ -685,7 +685,7 @@ async fn over_mcp_the_open_tier_is_refused_alike_and_sees_only_a_count() {
             kind: crystalline_remote::CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: chrono::Utc::now(),
+            connected_at: crystalline_core::time::now(),
             mounts: vec![crystalline_remote::MountRecord {
                 remote: "harbor".to_string(),
                 local: "harbor".to_string(),

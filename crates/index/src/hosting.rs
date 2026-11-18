@@ -9,6 +9,7 @@
 
 use crate::error::Result;
 use crate::store::{DomainHost, DomainId, HostClaim, HostMove, OnlyElsewhere, Store};
+use crystalline_core::time;
 
 /// A claim of [`claim_host_marking_moves`]: the claim itself, and when it
 /// replaced a live claim of this same instance id (this machine's daemon,
@@ -143,9 +144,9 @@ pub fn stale_secs() -> i64 {
 /// RFC 3339 in the one spelling every heartbeat is written in, so the
 /// comparison stays a lexical one.
 pub fn claim_window(stale_secs: i64) -> (String, String) {
-    let now = chrono::Utc::now().fixed_offset();
-    let stale_before = now - chrono::Duration::seconds(stale_secs);
-    (now.to_rfc3339(), stale_before.to_rfc3339())
+    let now = time::now();
+    let stale_before = now - time::seconds(stale_secs);
+    (now.rfc3339(), stale_before.rfc3339())
 }
 
 /// The refusal of `--accept-disk` without a named domain: it drops rows, so

@@ -64,8 +64,8 @@ impl ContradictionFact {
         CandidateFacts {
             id: self.id,
             status: &self.status,
-            valid_from: self.valid_from,
-            valid_to: self.valid_to,
+            valid_from: self.valid_from.map(time_day),
+            valid_to: self.valid_to.map(time_day),
             checksum: &self.checksum,
             lead_vector: self.lead_vector.as_deref(),
             observations: &self.observations,
@@ -104,8 +104,8 @@ impl ParsedFact {
         let fm = &engram.frontmatter;
         ParsedFact {
             status: fm.status.clone(),
-            valid_from: fm.valid_from,
-            valid_to: fm.valid_to,
+            valid_from: fm.valid_from.map(chrono_day),
+            valid_to: fm.valid_to.map(chrono_day),
             observations: engram
                 .observations
                 .iter()
@@ -807,7 +807,7 @@ impl Engine {
         let lines = {
             let views: Vec<CandidateFacts<'_>> =
                 facts.iter().map(ContradictionFact::view).collect();
-            eligible_lines(&views, today)
+            eligible_lines(&views, time_day(today))
         };
         let hashes: Vec<String> = lines.keys().cloned().collect();
         let present = if hashes.is_empty() {
@@ -1678,7 +1678,7 @@ impl Engine {
                 .iter()
                 .filter(|f| {
                     f.lead_vector.is_none()
-                        && eligible(&f.status, f.valid_to, today)
+                        && eligible(&f.status, f.valid_to.map(time_day), time_day(today))
                         && !f.observations.is_empty()
                 })
                 .count();
@@ -1714,7 +1714,8 @@ impl Engine {
                 let (full, vectors_capped, all) = {
                     let views: Vec<CandidateFacts<'_>> =
                         facts.iter().map(ContradictionFact::view).collect();
-                    let found = contradiction_candidates(&views, threshold, max_pairs, today);
+                    let found =
+                        contradiction_candidates(&views, threshold, max_pairs, time_day(today));
                     let all = pending_pairs(&views, &found.pairs, &scored);
                     (found.full, found.capped.then_some(found.compared), all)
                 };
@@ -1781,7 +1782,7 @@ impl Engine {
     ) {
         let expired: HashSet<i64> = facts
             .iter()
-            .filter(|f| expired(f.valid_to, today))
+            .filter(|f| expired(f.valid_to.map(time_day), time_day(today)))
             .map(|f| f.id.0)
             .collect();
         if expired.is_empty() {

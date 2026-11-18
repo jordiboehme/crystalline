@@ -441,7 +441,7 @@ async fn exchange_code_parses_expiring_tokens() {
     );
     let base = spawn(app).await;
 
-    let before = chrono::Utc::now();
+    let before = crystalline_core::time::now();
     let grant = exchange_code(
         &base,
         "Iv1.app",
@@ -451,15 +451,15 @@ async fn exchange_code_parses_expiring_tokens() {
     )
     .await
     .unwrap();
-    let after = chrono::Utc::now();
+    let after = crystalline_core::time::now();
 
     assert_eq!(grant.access_token, "ghu_access");
     assert_eq!(grant.refresh_token.as_deref(), Some("ghr_refresh"));
-    let eight_hours = chrono::Duration::seconds(28800);
+    let eight_hours = crystalline_core::time::seconds(28800);
     let expires = grant.expires_at.expect("an expiry");
     assert!(expires >= before + eight_hours && expires <= after + eight_hours);
     let refresh_expires = grant.refresh_expires_at.expect("a refresh expiry");
-    let six_months = chrono::Duration::seconds(15897600);
+    let six_months = crystalline_core::time::seconds(15897600);
     assert!(refresh_expires >= before + six_months && refresh_expires <= after + six_months);
     let bodies = recorded.lock().unwrap();
     assert_eq!(bodies[0]["client_id"], "Iv1.app");

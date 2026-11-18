@@ -26,7 +26,7 @@ fn keep(s: &Served) -> (String, String) {
         None,
         KeptKind::Reflection,
         PAGE,
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         "Typed on the page.\n",
     )
     .unwrap();
@@ -37,7 +37,7 @@ fn keep(s: &Served) -> (String, String) {
         None,
         KeptKind::Engram,
         ENGRAM,
-        later,
+        crystalline_core::time::Stamp::from_chrono(later),
         "Typed on the engram.\n",
     )
     .unwrap();
@@ -47,7 +47,7 @@ fn keep(s: &Served) -> (String, String) {
         None,
         KeptKind::Reflection,
         PAGE,
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         "Another domain.\n",
     )
     .unwrap();
@@ -252,7 +252,7 @@ async fn a_contributor_gets_a_pages_text_and_not_the_pacts() {
         None,
         KeptKind::Reflection,
         "PACT.md",
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         "Typed on the pact.\n",
     )
     .unwrap();
@@ -373,7 +373,7 @@ async fn a_drafts_kept_text_goes_to_its_owner_only() {
         Some("ed"),
         KeptKind::Engram,
         ENGRAM,
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         "Typed in ed's draft.\n",
     )
     .unwrap();
@@ -427,7 +427,7 @@ async fn a_kept_file_is_listed_as_a_file_and_downloads_as_its_bytes() {
         Some("ed"),
         KeptKind::Engram,
         "assets/deck.pdf",
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         &bytes,
     )
     .unwrap();
@@ -533,7 +533,7 @@ async fn a_kept_copy_that_cannot_be_read_names_no_server_path() {
         Some("ed"),
         KeptKind::Engram,
         "assets/deck.pdf",
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         b"her deck",
     )
     .unwrap();
@@ -660,7 +660,7 @@ async fn a_name_taken_later_never_reaches_texts_left_under_it() {
             None,
             KeptKind::Engram,
             "old.md",
-            at,
+            crystalline_core::time::Stamp::from_chrono(at),
             "left over\n",
         )
         .unwrap();
@@ -714,7 +714,16 @@ async fn start_and_a_hand_added_domain_set_left_over_texts_aside() {
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
     let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap();
     for name in ["gone", "eng"] {
-        kept::write(&root, name, None, KeptKind::Engram, "a.md", at, "text\\n").unwrap();
+        kept::write(
+            &root,
+            name,
+            None,
+            KeptKind::Engram,
+            "a.md",
+            crystalline_core::time::Stamp::from_chrono(at),
+            "text\\n",
+        )
+        .unwrap();
     }
     s.fx.engine.finish_leftover_rename().await;
     let state: Vec<(String, bool)> = kept::scan(&root)
@@ -726,7 +735,16 @@ async fn start_and_a_hand_added_domain_set_left_over_texts_aside() {
         vec![("eng".to_string(), false), ("gone".to_string(), true)]
     );
 
-    kept::write(&root, "fresh", None, KeptKind::Engram, "a.md", at, "old\\n").unwrap();
+    kept::write(
+        &root,
+        "fresh",
+        None,
+        KeptKind::Engram,
+        "a.md",
+        crystalline_core::time::Stamp::from_chrono(at),
+        "old\\n",
+    )
+    .unwrap();
     let config = s.fx.tmp.path().join("config.yaml");
     let mut cfg: crystalline_core::config::GlobalConfig =
         crystalline_core::config::load_yaml(&config).unwrap();
@@ -761,7 +779,16 @@ async fn a_hand_added_case_twin_leaves_the_registered_domains_texts() {
     .await;
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
     let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap();
-    kept::write(&root, "eng", None, KeptKind::Engram, "a.md", at, "eng's\\n").unwrap();
+    kept::write(
+        &root,
+        "eng",
+        None,
+        KeptKind::Engram,
+        "a.md",
+        crystalline_core::time::Stamp::from_chrono(at),
+        "eng's\\n",
+    )
+    .unwrap();
     // The twin's own folder name, so the check runs on a disk that tells
     // case apart too.
     kept::write(
@@ -770,7 +797,7 @@ async fn a_hand_added_case_twin_leaves_the_registered_domains_texts() {
         None,
         KeptKind::Engram,
         "b.md",
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         "eng's too\\n",
     )
     .unwrap();
@@ -815,7 +842,7 @@ async fn a_kept_comment_goes_to_its_sender_and_to_editors() {
         None,
         KeptKind::Comment,
         PAGE,
-        at,
+        crystalline_core::time::Stamp::from_chrono(at),
         "Vera asks.\n",
     )
     .unwrap();
@@ -835,7 +862,7 @@ async fn a_kept_comment_goes_to_its_sender_and_to_editors() {
         None,
         KeptKind::Comment,
         PAGE,
-        later,
+        crystalline_core::time::Stamp::from_chrono(later),
         "Nobody's.\n",
     )
     .unwrap();

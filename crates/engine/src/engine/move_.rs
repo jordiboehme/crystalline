@@ -1338,7 +1338,14 @@ impl Engine {
                 .0;
             notes = cross_link_reason(&cross.stranded, &whole.unwritable, &whole.dropped);
         }
-        let text = (text != original).then(|| touch_generated(&text, mover, None, now_offset()));
+        let text = (text != original).then(|| {
+            touch_generated(
+                &text,
+                mover,
+                None,
+                crystalline_core::time::now().to_offset_utc(),
+            )
+        });
         Ok((text, notes))
     }
 
@@ -2125,7 +2132,12 @@ impl Engine {
         if count == 0 {
             return None;
         }
-        let replaced = touch_generated(&relinked, actor, None, now_offset());
+        let replaced = touch_generated(
+            &relinked,
+            actor,
+            None,
+            crystalline_core::time::now().to_offset_utc(),
+        );
         // The rewritten reference passes through the same funnel every other
         // write's final text does: `spec.to_domain` is the destination's
         // local name (moves are localized before they reach here), so

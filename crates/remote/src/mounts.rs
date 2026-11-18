@@ -1034,7 +1034,7 @@ mod tests {
             kind: CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            connected_at: crystalline_core::time::Stamp::from_unix(1_800_000_000, 0).unwrap(),
             mounts: Vec::new(),
             domains: None,
             from_env: false,

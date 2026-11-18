@@ -1364,7 +1364,7 @@ async fn read_document_at_takeover(
     };
     let doc = side.load_config().await.map_err(|e| fatal(e.to_string()))?;
     let state = match &doc {
-        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at),
+        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at.into_chrono()),
         None => crate::durable::DocumentState::NotSaved,
     };
     loaded
@@ -7071,7 +7071,7 @@ mod tests {
             kind: CredentialKind::Oauth,
             token_endpoint: Some(format!("{server}/api/v1/oauth/token")),
             revocation_endpoint: None,
-            connected_at: chrono::Utc::now(),
+            connected_at: crystalline_core::time::now(),
             mounts: Vec::new(),
             domains: None,
             from_env: false,
@@ -7085,7 +7085,7 @@ mod tests {
             "coc_test".to_string(),
             server.clone(),
             "keeper".to_string(),
-            chrono::Utc::now() - chrono::TimeDelta::hours(2),
+            crystalline_core::time::now() - crystalline_core::time::hours(2),
         );
         let (opened, dir) = (record.clone(), remote_dir.clone());
         let connection = tokio::task::spawn_blocking(move || {

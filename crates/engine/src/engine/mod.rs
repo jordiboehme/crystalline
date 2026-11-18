@@ -4913,7 +4913,9 @@ impl Engine {
                 Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
                     // GitHub limits the token, not the repository: every
                     // domain waits, the origin poller's pulls included.
-                    let until = reset.unwrap_or_else(|| wall_now + chrono::Duration::hours(1));
+                    let until = reset
+                        .map(crystalline_core::time::Stamp::into_chrono)
+                        .unwrap_or_else(|| wall_now + chrono::Duration::hours(1));
                     tracing::warn!(
                         "reflection backup: GitHub is rate limiting this machine; pausing until {until}"
                     );
@@ -11799,7 +11801,7 @@ fn ack_json(entry: &EvolveAck) -> Value {
         "scope": entry.scope,
         "note": entry.note,
         "by": entry.by,
-        "at": entry.at.map(|at| at.to_rfc3339()),
+        "at": entry.at.map(|at| at.rfc3339()),
     })
 }
 
@@ -12642,6 +12644,20 @@ fn now_offset() -> DateTime<FixedOffset> {
     chrono::Utc::now().fixed_offset()
 }
 
+/// A frontmatter date as the chrono date the engine's own types still hold.
+/// A stage 2 bridge: it goes when the engine moves onto
+/// `crystalline_core::time`.
+fn chrono_day(day: crystalline_core::time::Day) -> NaiveDate {
+    day.into_chrono()
+}
+
+/// A chrono date the engine still holds as the time module's date the index
+/// takes. A stage 2 bridge: it goes when the engine moves onto
+/// `crystalline_core::time`.
+fn time_day(day: NaiveDate) -> crystalline_core::time::Day {
+    crystalline_core::time::Day::from_chrono(day)
+}
+
 /// The ISO date `spec` before today, for `timeframe` windows like `7d`, `24h`,
 /// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure.
 fn timeframe_cutoff(spec: &str) -> Option<String> {
@@ -12688,11 +12704,11 @@ fn build_markdown(
         status: Some(status.to_string()),
         ..Frontmatter::default()
     };
-    fm.recorded_at = chrono::NaiveDate::parse_from_str(recorded_at, "%Y-%m-%d").ok();
+    fm.recorded_at = crystalline_core::time::parse_date(recorded_at);
     fm.generated = Some(crystalline_core::Generated {
         by: actor.to_string(),
         model: model.map(str::to_string),
-        at: Some(now),
+        at: Some(crystalline_core::time::OffsetStamp::from_chrono(now)),
     });
     // Models routinely double-encode nested tool arguments, so an object
     // arriving as a JSON string is accepted by parsing it first.
@@ -14090,7 +14106,7 @@ mod share_actor_tests {
                 access_token: format!("{user}-secret"),
                 host: "github.com".to_string(),
                 user: user.to_string(),
-                created_at: Utc::now(),
+                created_at: crystalline_core::time::now(),
                 refresh_token: None,
                 expires_at: None,
                 refresh_expires_at: None,
@@ -14117,7 +14133,7 @@ mod share_actor_tests {
             access_token: format!("{user}-secret"),
             host: "github.com".to_string(),
             user: user.to_string(),
-            created_at: Utc::now(),
+            created_at: crystalline_core::time::now(),
             refresh_token: None,
             expires_at: None,
             refresh_expires_at: None,
@@ -15287,7 +15303,7 @@ mod hidden_copy_tests {
                 kind: CredentialKind::Token,
                 token_endpoint: None,
                 revocation_endpoint: None,
-                connected_at: Utc::now(),
+                connected_at: crystalline_core::time::now(),
                 mounts: vec![MountRecord {
                     remote: "notes".to_string(),
                     local: "notes".to_string(),

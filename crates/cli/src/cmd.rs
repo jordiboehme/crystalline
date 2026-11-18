@@ -4122,7 +4122,7 @@ pub async fn connect_github(
             .clone()
             .unwrap_or_else(|| "github.com".to_string()),
         user: login.clone(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         refresh_token: None,
         expires_at: None,
         refresh_expires_at: None,
@@ -4386,7 +4386,7 @@ impl PersonalApp<'_> {
                 .map(str::to_string)
                 .unwrap_or_else(|| "github.com".to_string()),
             user: user.login.clone(),
-            created_at: chrono::Utc::now(),
+            created_at: crystalline_core::time::now(),
             refresh_token: grant.refresh_token,
             expires_at: grant.expires_at,
             refresh_expires_at: grant.refresh_expires_at,

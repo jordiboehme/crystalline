@@ -13,8 +13,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use chrono::Utc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ServiceConfig};
+use crystalline_core::time::{self, Delta};
 use crystalline_index::TursoStore;
 use crystalline_remote::UserTokenGrant;
 use crystalline_service::Scope;
@@ -154,16 +154,12 @@ async fn connect_with_change(eng: &Engine, tmp: &Path, repo: &str, name: &str) {
     .unwrap();
 }
 
-fn grant(
-    access: &str,
-    refresh: Option<&str>,
-    expires_in: Option<chrono::Duration>,
-) -> UserTokenGrant {
+fn grant(access: &str, refresh: Option<&str>, expires_in: Option<Delta>) -> UserTokenGrant {
     UserTokenGrant {
         access_token: access.to_string(),
         refresh_token: refresh.map(str::to_string),
-        expires_at: expires_in.map(|d| Utc::now() + d),
-        refresh_expires_at: refresh.map(|_| Utc::now() + chrono::Duration::days(180)),
+        expires_at: expires_in.map(|d| time::now() + d),
+        refresh_expires_at: refresh.map(|_| time::now() + time::days(180)),
     }
 }
 
@@ -237,11 +233,7 @@ async fn a_personal_share_with_the_app_refreshes_an_expiring_token_first() {
     let view = eng
         .link_github(
             "ada",
-            grant(
-                "ghu_old",
-                Some("ghr_old"),
-                Some(chrono::Duration::minutes(2)),
-            ),
+            grant("ghu_old", Some("ghr_old"), Some(time::minutes(2))),
         )
         .await
         .unwrap();
@@ -280,11 +272,7 @@ async fn a_revoked_refresh_keeps_the_link_and_refuses_the_share() {
     let eng = engine(tmp.path(), &url, "personal").await;
     eng.link_github(
         "ada",
-        grant(
-            "ghu_old",
-            Some("ghr_old"),
-            Some(chrono::Duration::minutes(2)),
-        ),
+        grant("ghu_old", Some("ghr_old"), Some(time::minutes(2))),
     )
     .await
     .unwrap();
@@ -386,11 +374,7 @@ async fn a_dead_user_token_keeps_the_github_role() {
     // The forge knows no refresh token: the renewal is refused.
     eng.link_github(
         "ada",
-        grant(
-            "ghu_old",
-            Some("ghr_old"),
-            Some(chrono::Duration::minutes(2)),
-        ),
+        grant("ghu_old", Some("ghr_old"), Some(time::minutes(2))),
     )
     .await
     .unwrap();
@@ -459,11 +443,7 @@ async fn two_concurrent_shares_refresh_once() {
     let eng = engine(tmp.path(), &url, "personal").await;
     eng.link_github(
         "ada",
-        grant(
-            "ghu_old",
-            Some("ghr_old"),
-            Some(chrono::Duration::minutes(2)),
-        ),
+        grant("ghu_old", Some("ghr_old"), Some(time::minutes(2))),
     )
     .await
     .unwrap();
@@ -510,11 +490,7 @@ async fn a_share_cancelled_during_the_refresh_still_saves_the_new_pair() {
     let eng = engine(tmp.path(), &url, "personal").await;
     eng.link_github(
         "ada",
-        grant(
-            "ghu_old",
-            Some("ghr_old"),
-            Some(chrono::Duration::minutes(2)),
-        ),
+        grant("ghu_old", Some("ghr_old"), Some(time::minutes(2))),
     )
     .await
     .unwrap();

@@ -2525,7 +2525,7 @@ mod tests {
             url: String::new(),
             branch: format!("share/{number}"),
             title: String::new(),
-            created_at: chrono::Utc::now(),
+            created_at: crystalline_core::time::now(),
             status,
             files: vec![crystalline_remote::state::ProposedFile {
                 path: "plan.md".to_string(),

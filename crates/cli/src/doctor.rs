@@ -1984,7 +1984,8 @@ fn check_kept(
         .into_iter()
         .filter(|k| domain_filter.is_none_or(|d| k.domain == d))
         .map(|k| {
-            let stale = now - k.kept_at > chrono::Duration::days(crate::kept::STALE_DAYS);
+            let stale =
+                now - k.kept_at.into_chrono() > chrono::Duration::days(crate::kept::STALE_DAYS);
             KeptDoctor {
                 line: format!(
                     "{} {}, kept {}, {}",
@@ -2000,7 +2001,10 @@ fn check_kept(
                 unfinished: k.unfinished,
                 kind: k.kind,
                 path: k.path.clone(),
-                kept_at: k.kept_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                kept_at: k
+                    .kept_at
+                    .into_chrono()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 bytes: k.bytes,
                 file: k.file.display().to_string(),
                 stale,
@@ -3605,10 +3609,10 @@ fn written_at(file: &StrayFile) -> Option<chrono::DateTime<chrono::Utc>> {
         .and_then(|f| f.generated.as_ref())
         .and_then(|g| g.at)
     {
-        return Some(at.with_timezone(&chrono::Utc));
+        return Some(at.into_chrono().with_timezone(&chrono::Utc));
     }
     if let Some(day) = frontmatter.and_then(|f| f.recorded_at) {
-        return day.and_hms_opt(0, 0, 0).map(|t| t.and_utc());
+        return day.into_chrono().and_hms_opt(0, 0, 0).map(|t| t.and_utc());
     }
     file.modified.map(chrono::DateTime::<chrono::Utc>::from)
 }
@@ -4762,7 +4766,7 @@ async fn check_github_app(
             let probe = app.probe().await;
             doctor.clock_skew_secs = probe
                 .server_date
-                .map(|date| (date - chrono::Utc::now()).num_seconds());
+                .map(|date| date.since(crystalline_core::time::now()).num_seconds());
             match &probe.info {
                 Ok(info) => {
                     doctor.jwt_accepted = Some(true);
@@ -7283,7 +7287,7 @@ mod tests {
             None,
             KeptKind::Reflection,
             "a.md",
-            now,
+            crystalline_core::time::Stamp::from_chrono(now),
             "x",
         )
         .unwrap();
@@ -7293,7 +7297,7 @@ mod tests {
             None,
             KeptKind::Engram,
             "b.md",
-            now - chrono::Duration::days(31),
+            crystalline_core::time::Stamp::from_chrono(now - chrono::Duration::days(31)),
             "y",
         )
         .unwrap();

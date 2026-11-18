@@ -9,6 +9,7 @@
 use turso::Connection;
 
 use crate::error::{IndexError, Result};
+use crystalline_core::time;
 
 /// One migration: a version number and the DDL that raises the schema to it.
 pub struct Migration {
@@ -1147,7 +1148,7 @@ async fn apply_migrations_in_order(conn: &Connection, migrations: &[Migration]) 
                 m.version, m.label
             )));
         }
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = time::now().rfc3339();
         if let Err(e) = conn
             .execute(
                 "INSERT INTO schema_migration (version, applied_at) VALUES (?1, ?2)",
@@ -2400,7 +2401,7 @@ mod tests {
             "INSERT INTO schema_migration (version, applied_at) VALUES (?1, ?2)",
             vec![
                 turso::Value::Integer(known + 1),
-                turso::Value::Text(chrono::Utc::now().to_rfc3339()),
+                turso::Value::Text(time::now().rfc3339()),
             ],
         )
         .await

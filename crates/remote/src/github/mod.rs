@@ -29,6 +29,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use crystalline_core::time::{self, Stamp};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -1126,15 +1127,12 @@ fn header(response: &Response, name: &str) -> Option<String> {
 /// Resolves a rate limit reset time: `x-ratelimit-reset` is a Unix epoch
 /// timestamp, `retry-after` is a delta in seconds from now. The former is
 /// preferred when both are present.
-fn parse_reset(
-    ratelimit_reset: Option<&str>,
-    retry_after: Option<&str>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_reset(ratelimit_reset: Option<&str>, retry_after: Option<&str>) -> Option<Stamp> {
     if let Some(epoch) = ratelimit_reset.and_then(|value| value.parse::<i64>().ok()) {
-        return chrono::DateTime::from_timestamp(epoch, 0);
+        return Stamp::from_unix(epoch, 0);
     }
     let delta = retry_after.and_then(|value| value.parse::<i64>().ok())?;
-    Some(chrono::Utc::now() + chrono::Duration::seconds(delta))
+    Some(time::now() + time::seconds(delta))
 }
 
 /// Reads a non-2xx response body and extracts a human-readable message: the

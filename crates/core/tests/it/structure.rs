@@ -20,23 +20,20 @@ fn full_frontmatter_fields_are_typed() {
     );
     assert_eq!(fm.tags, ["gardening", "tomatoes", "watering"]);
     assert_eq!(fm.status.as_deref(), Some("current"));
-    assert_eq!(fm.recorded_at.unwrap().to_string(), "2026-05-01");
-    assert_eq!(fm.valid_from.unwrap().to_string(), "2026-05-01");
-    assert_eq!(fm.valid_to.unwrap().to_string(), "2026-09-30");
+    assert_eq!(fm.recorded_at.unwrap().ymd(), "2026-05-01");
+    assert_eq!(fm.valid_from.unwrap().ymd(), "2026-05-01");
+    assert_eq!(fm.valid_to.unwrap().ymd(), "2026-09-30");
     assert_eq!(fm.temporal_confidence.as_deref(), Some("explicit"));
     assert_eq!(
         fm.resource.as_deref(),
         Some("https://example.org/tomato-guide")
     );
-    assert_eq!(
-        fm.timestamp.unwrap().to_rfc3339(),
-        "2026-05-01T09:15:00+00:00"
-    );
+    assert_eq!(fm.timestamp.unwrap().rfc3339(), "2026-05-01T09:15:00+00:00");
     // The fixture predates the `generated` migration, so recency falls back to
     // the legacy key (OKF v0.2 §13.1) and nothing is invented.
     assert!(fm.generated.is_none());
     assert_eq!(
-        fm.written_at().unwrap().to_rfc3339(),
+        fm.written_at().unwrap().rfc3339(),
         "2026-05-01T09:15:00+00:00"
     );
     assert!(fm.extra.is_empty());
@@ -51,10 +48,10 @@ fn generated_provenance_is_typed_and_drives_recency() {
         .as_ref()
         .expect("generated parses into the model");
     assert_eq!(g.by, "claude-code/1.0.5");
-    assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-27T09:15:00+00:00");
+    assert_eq!(g.at.unwrap().rfc3339(), "2026-07-27T09:15:00+00:00");
     assert!(fm.timestamp.is_none());
     assert_eq!(
-        fm.written_at().unwrap().to_rfc3339(),
+        fm.written_at().unwrap().rfc3339(),
         "2026-07-27T09:15:00+00:00"
     );
     // A recognized block never lands in the unknown-key bag.
@@ -136,15 +133,15 @@ fn trust_lifecycle_fields_are_typed() {
     assert_eq!(fm.verified.len(), 2);
     assert_eq!(fm.verified[0].by, "human:jordi");
     assert_eq!(
-        fm.verified[1].at.unwrap().to_rfc3339(),
+        fm.verified[1].at.unwrap().rfc3339(),
         "2026-06-14T11:30:00+00:00"
     );
     // The newest entry wins whatever order the list is written in.
     let latest = fm.latest_verified().expect("a verification is recorded");
     assert_eq!(latest.by, Some("claude-code/1.0.5"));
-    assert_eq!(latest.at.to_rfc3339(), "2026-06-14T11:30:00+00:00");
-    assert_eq!(fm.stale_after.unwrap().to_string(), "2026-12-01");
-    assert_eq!(fm.stale_on().unwrap().to_string(), "2026-12-01");
+    assert_eq!(latest.at.rfc3339(), "2026-06-14T11:30:00+00:00");
+    assert_eq!(fm.stale_after.unwrap().ymd(), "2026-12-01");
+    assert_eq!(fm.stale_on().unwrap().ymd(), "2026-12-01");
     assert!(fm.last_verified.is_none());
     assert!(fm.review_after.is_none());
     assert!(fm.extra.is_empty());
@@ -186,10 +183,10 @@ fn the_legacy_trust_keys_feed_the_canonical_accessors() {
     let fm = &e.frontmatter;
     assert!(fm.verified.is_empty());
     assert!(fm.stale_after.is_none());
-    assert_eq!(fm.stale_on().unwrap().to_string(), "2026-08-01");
+    assert_eq!(fm.stale_on().unwrap().ymd(), "2026-08-01");
     let latest = fm.latest_verified().expect("the legacy date still counts");
     assert_eq!(latest.by, None);
-    assert_eq!(latest.at.to_rfc3339(), "2026-05-01T00:00:00+00:00");
+    assert_eq!(latest.at.rfc3339(), "2026-05-01T00:00:00+00:00");
 }
 
 #[test]

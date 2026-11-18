@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use chrono::NaiveDate;
 pub use crystalline_core::config::DomainKind;
+use crystalline_core::time::Day;
 use crystalline_core::{Engram, slugify};
 use serde::{Deserialize, Serialize};
 
@@ -866,8 +866,8 @@ pub struct EngramRecord {
     pub tombstone: bool,
 }
 
-fn date_str(d: Option<NaiveDate>) -> Option<String> {
-    d.map(|d| d.format("%Y-%m-%d").to_string())
+fn date_str(d: Option<Day>) -> Option<String> {
+    d.map(|d| d.ymd())
 }
 
 impl EngramRecord {
@@ -932,7 +932,7 @@ impl EngramRecord {
             recorded_at: date_str(fm.recorded_at),
             valid_from: date_str(fm.valid_from),
             valid_to: date_str(fm.valid_to),
-            timestamp: fm.written_at().map(|t| t.to_rfc3339()),
+            timestamp: fm.written_at().map(|t| t.rfc3339()),
             description: fm.description.clone(),
             content: engram.body.clone(),
             metadata: serde_json::Value::Object(meta),

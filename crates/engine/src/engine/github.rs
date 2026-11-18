@@ -424,7 +424,7 @@ impl Engine {
                 access_token: token.to_string(),
                 host: token_host.unwrap_or_else(|| "github.com".to_string()),
                 user: user.clone(),
-                created_at: chrono::Utc::now(),
+                created_at: crystalline_core::time::now(),
                 refresh_token: None,
                 expires_at: None,
                 refresh_expires_at: None,
@@ -670,7 +670,7 @@ impl Engine {
                         .clone()
                         .unwrap_or_else(|| "github.com".to_string()),
                     user: user.clone(),
-                    created_at: chrono::Utc::now(),
+                    created_at: crystalline_core::time::now(),
                     refresh_token: None,
                     expires_at: None,
                     refresh_expires_at: None,
@@ -762,7 +762,7 @@ impl Engine {
                 .as_ref()
                 .and_then(|t| t.user_display())
                 .map(str::to_string),
-            connected_at: token.as_ref().map(|t| t.created_at),
+            connected_at: token.as_ref().map(|t| t.created_at.into_chrono()),
             token_store: token.is_some().then(|| store.kind().to_string()),
             pending,
             error,
@@ -809,7 +809,7 @@ impl Engine {
                 access_token: token.to_string(),
                 host: token_host.unwrap_or_else(|| "github.com".to_string()),
                 user,
-                created_at: chrono::Utc::now(),
+                created_at: crystalline_core::time::now(),
                 refresh_token: None,
                 expires_at: None,
                 refresh_expires_at: None,
@@ -1232,7 +1232,7 @@ impl Engine {
             login: link.as_ref().map(|l| l.login.clone()),
             github_id: link.as_ref().map(|l| l.github_id),
             host: link.as_ref().map(|l| l.host.clone()),
-            linked_at: link.as_ref().map(|l| l.linked_at),
+            linked_at: link.as_ref().map(|l| l.linked_at.into_chrono()),
             token_live: link.as_ref().is_some_and(|l| l.token_live),
             pending,
             error,
@@ -1593,7 +1593,7 @@ impl Engine {
         let identity = TokenIdentity::Personal(account.to_string());
         let host = self.github_token_host();
         let token = self.personal_token_on_file(&identity, host.as_deref())?;
-        if !due_for_refresh(&token, chrono::Utc::now()) {
+        if !due_for_refresh(&token, crystalline_core::time::now()) {
             return Ok(token);
         }
         let lock = self
@@ -1607,7 +1607,7 @@ impl Engine {
         // Read again under the lock: a share that held it before this one
         // has renewed the token, and the cache serves the new one.
         let token = self.personal_token_on_file(&identity, host.as_deref())?;
-        let now = chrono::Utc::now();
+        let now = crystalline_core::time::now();
         if !due_for_refresh(&token, now) {
             return Ok(token);
         }
@@ -1958,11 +1958,11 @@ const NO_ACCOUNTS_TO_LINK: &str =
 
 /// How long before its expiry an App user token is renewed: a token this
 /// close to the end could expire in the middle of a share.
-const REFRESH_BEFORE: chrono::Duration = chrono::Duration::minutes(5);
+const REFRESH_BEFORE: crystalline_core::time::Delta = crystalline_core::time::minutes(5);
 
 /// Whether `token` is renewed before use at `now`: it expires within
 /// [`REFRESH_BEFORE`]. A token without an expiry never is.
-fn due_for_refresh(token: &StoredToken, now: chrono::DateTime<chrono::Utc>) -> bool {
+fn due_for_refresh(token: &StoredToken, now: crystalline_core::time::Stamp) -> bool {
     token
         .expires_at
         .is_some_and(|at| at - REFRESH_BEFORE <= now)
@@ -2017,7 +2017,7 @@ async fn complete_link(
             access_token: grant.access_token,
             host: token_host.unwrap_or_else(|| "github.com".to_string()),
             user: user.login,
-            created_at: chrono::Utc::now(),
+            created_at: crystalline_core::time::now(),
             refresh_token: grant.refresh_token,
             expires_at: grant.expires_at,
             refresh_expires_at: grant.refresh_expires_at,

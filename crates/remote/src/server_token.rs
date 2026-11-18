@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RemoteError;
@@ -72,8 +72,8 @@ pub struct ServerCredential {
     pub refresh_token: Option<String>,
     /// When the access token stops working, on THIS machine's clock. `None`
     /// for a pasted token, which lives until it is revoked.
-    #[serde(default)]
-    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub expires_at: Option<Stamp>,
     /// The OAuth registration a refresh is made under.
     #[serde(default)]
     pub client_id: Option<String>,
@@ -83,7 +83,8 @@ pub struct ServerCredential {
     /// The account the server resolved the token to.
     pub account: String,
     /// When this credential was saved.
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub created_at: Stamp,
 }
 
 impl ServerCredential {
@@ -92,7 +93,7 @@ impl ServerCredential {
         access_token: String,
         resource: String,
         account: String,
-        now: DateTime<Utc>,
+        now: Stamp,
     ) -> ServerCredential {
         ServerCredential {
             kind: CredentialKind::Token,
@@ -116,14 +117,14 @@ impl ServerCredential {
         client_id: String,
         resource: String,
         account: String,
-        now: DateTime<Utc>,
+        now: Stamp,
     ) -> ServerCredential {
         let lifetime = i64::try_from(expires_in).unwrap_or(i64::MAX / 2);
         ServerCredential {
             kind: CredentialKind::Oauth,
             access_token,
             refresh_token: Some(refresh_token),
-            expires_at: Some(now + TimeDelta::seconds(lifetime)),
+            expires_at: Some(now + time::seconds(lifetime)),
             client_id: Some(client_id),
             resource,
             account,
@@ -134,11 +135,11 @@ impl ServerCredential {
     /// Whether the access token should be refreshed before the next request:
     /// an OAuth token within [`REFRESH_MARGIN_SECS`] of its expiry. A pasted
     /// token never is.
-    pub fn needs_refresh(&self, now: DateTime<Utc>) -> bool {
+    pub fn needs_refresh(&self, now: Stamp) -> bool {
         self.kind == CredentialKind::Oauth
             && self
                 .expires_at
-                .is_some_and(|at| at - TimeDelta::seconds(REFRESH_MARGIN_SECS) <= now)
+                .is_some_and(|at| at - time::seconds(REFRESH_MARGIN_SECS) <= now)
     }
 }
 
@@ -402,7 +403,7 @@ impl ServerCredentialStore {
                 token.clone(),
                 resource.clone(),
                 String::new(),
-                Utc::now(),
+                time::now(),
             ))),
         }
     }
@@ -517,8 +518,8 @@ fn from_json(json: &str) -> Result<ServerCredential, RemoteError> {
 mod tests {
     use super::*;
 
-    fn now() -> DateTime<Utc> {
-        DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    fn now() -> Stamp {
+        Stamp::from_unix(1_800_000_000, 0).unwrap()
     }
 
     fn sample_oauth() -> ServerCredential {
@@ -601,7 +602,7 @@ mod tests {
         let credential = sample_oauth();
         assert_eq!(
             credential.expires_at,
-            Some(now() + TimeDelta::seconds(3600)),
+            Some(now() + time::seconds(3600)),
             "the expiry is now plus expires_in"
         );
         assert!(
@@ -609,11 +610,11 @@ mod tests {
             "a token just issued is fresh"
         );
         assert!(
-            !credential.needs_refresh(now() + TimeDelta::seconds(3600 - REFRESH_MARGIN_SECS - 1)),
+            !credential.needs_refresh(now() + time::seconds(3600 - REFRESH_MARGIN_SECS - 1)),
             "fresh until the margin"
         );
         assert!(
-            credential.needs_refresh(now() + TimeDelta::seconds(3600 - REFRESH_MARGIN_SECS)),
+            credential.needs_refresh(now() + time::seconds(3600 - REFRESH_MARGIN_SECS)),
             "refreshed a margin before it runs out"
         );
         let pasted = ServerCredential::token(
@@ -623,7 +624,7 @@ mod tests {
             now(),
         );
         assert!(
-            !pasted.needs_refresh(now() + TimeDelta::days(400)),
+            !pasted.needs_refresh(now() + time::days(400)),
             "a pasted token has no expiry and nothing to refresh with"
         );
     }

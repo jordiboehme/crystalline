@@ -12,11 +12,11 @@ use crate::store::{ContradictionRow, EdgeKind, EngramId, GraphEdge, GraphNode, R
 
 const DOMAIN: &str = "engineering";
 
-fn day(s: &str) -> NaiveDate {
-    s.parse().expect("fixture dates are valid ISO dates")
+fn day(s: &str) -> Day {
+    time::parse_date(s).expect("fixture dates are valid ISO dates")
 }
 
-fn today() -> NaiveDate {
+fn today() -> Day {
     day("2026-08-02")
 }
 
@@ -297,7 +297,7 @@ fn v003_is_capped_at_the_ten_oldest_and_reports_it() {
         .map(|(i, name)| {
             let mut f = fact(i as i64 + 1, name);
             // One day older per position, so the cut is unambiguous.
-            f.recorded_at = Some(day("2025-01-01") - chrono::Duration::days(i as i64));
+            f.recorded_at = Some(day("2025-01-01") - time::days(i as i64));
             f
         })
         .collect();
@@ -516,7 +516,7 @@ fn sharing(unshared: usize, days: i64) -> SweepInput {
     let mut sweep = input(vec![fact(1, "alpha")]);
     sweep.share = Some(ShareFacts {
         unshared,
-        oldest_change: Some(today() - chrono::TimeDelta::days(days)),
+        oldest_change: Some(today() - time::days(days)),
     });
     sweep
 }
@@ -3875,7 +3875,7 @@ fn v302_drops_a_row_whose_engram_expired_by_the_sweeps_date() {
         "a window ending today counts"
     );
     let mut expired = a.clone();
-    expired.valid_to = today().pred_opt();
+    expired.valid_to = today().checked_add_days(-1);
     let gone = detect(&meaning_input(vec![expired, b], rows));
     assert!(
         !fired(&gone).contains(&"V302"),

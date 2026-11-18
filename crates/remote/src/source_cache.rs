@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -37,7 +37,8 @@ pub struct Cached {
     /// The etag it came with.
     pub etag: String,
     /// When the server last confirmed it.
-    pub fetched_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub fetched_at: Stamp,
     /// The answer.
     pub data: Value,
     /// Why the last try to refresh it failed, `None` when it succeeded.
@@ -122,7 +123,7 @@ pub async fn fetch_cached(
     match answer {
         Ok(CtlAnswer::NotModified { .. }) => match cached {
             Some(mut cached) => {
-                cached.fetched_at = Utc::now();
+                cached.fetched_at = time::now();
                 cached.last_failure = None;
                 let _ = write_cached(&host_dir, file, &cached);
                 Fetched::Fresh(cached)
@@ -135,7 +136,7 @@ pub async fn fetch_cached(
             let fresh = Cached {
                 account,
                 etag: etag.unwrap_or_default(),
-                fetched_at: Utc::now(),
+                fetched_at: time::now(),
                 data,
                 last_failure: None,
             };
@@ -186,8 +187,8 @@ pub fn cached_offers(
 /// The line for a source whose cached routing could not be confirmed in
 /// time: the hook stopped waiting for the daemon before its refresh ended,
 /// so the copy may be out of date even though its last refresh succeeded.
-pub fn unchecked_line(source: &str, url: &str, fetched_at: DateTime<Utc>) -> String {
-    let when = fetched_at.format("%Y-%m-%d %H:%M UTC");
+pub fn unchecked_line(source: &str, url: &str, fetched_at: Stamp) -> String {
+    let when = fetched_at.ymd_hm_utc();
     format!(
         "Note: {source} ({url}) could not be checked in time, so its domains in this routing block are the copy from {when} and may be out of date."
     )
@@ -199,13 +200,8 @@ pub fn unchecked_line(source: &str, url: &str, fetched_at: DateTime<Utc>) -> Str
 /// server that did not answer, a sign-in that ran out, a server too old for
 /// the remote protocol, any other error) and never quotes the failure, so no
 /// text a server sent reaches the routing block.
-pub fn stale_line(
-    source: &str,
-    url: &str,
-    fetched_at: DateTime<Utc>,
-    failure: Option<&str>,
-) -> String {
-    let when = fetched_at.format("%Y-%m-%d %H:%M UTC");
+pub fn stale_line(source: &str, url: &str, fetched_at: Stamp, failure: Option<&str>) -> String {
+    let when = fetched_at.ymd_hm_utc();
     match failure {
         Some(failure) if failure.contains("sign in again") => format!(
             "Note: the sign-in to {source} ({url}) has run out, so its domains in this routing block are the copy from {when} and may be out of date. Ask the user to run: crystalline connect {url}"

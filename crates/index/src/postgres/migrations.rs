@@ -13,6 +13,7 @@
 use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::error::{IndexError, Result};
+use crystalline_core::time;
 
 /// One migration: a version number and the DDL that raises the schema to it.
 pub struct Migration {
@@ -1156,7 +1157,7 @@ async fn apply_unlocked(conn: &mut PgConnection, set: &MigrationSet) -> Result<i
                 .await
                 .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
         }
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = time::now().rfc3339();
         sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {ledger} (version, applied_at) VALUES ($1, $2)"
         )))
@@ -1870,7 +1871,7 @@ mod tests {
 
         sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
             .bind(known + 1)
-            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(time::now().rfc3339())
             .execute(&mut conn)
             .await
             .unwrap();
@@ -1945,7 +1946,7 @@ mod tests {
         let last = 30;
         sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
             .bind(last - 1)
-            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(time::now().rfc3339())
             .execute(&mut conn)
             .await
             .unwrap();
@@ -2003,7 +2004,7 @@ mod tests {
             sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
             sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
                 .bind(m.version)
-                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(time::now().rfc3339())
                 .execute(&mut conn)
                 .await
                 .unwrap();
@@ -2046,7 +2047,7 @@ mod tests {
             sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
             sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
                 .bind(m.version)
-                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(time::now().rfc3339())
                 .execute(&mut conn)
                 .await
                 .unwrap();
@@ -2191,7 +2192,7 @@ mod tests {
             sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
             sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
                 .bind(m.version)
-                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(time::now().rfc3339())
                 .execute(&mut conn)
                 .await
                 .unwrap();

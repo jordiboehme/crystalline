@@ -23,7 +23,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +30,7 @@ use crate::emit::emit_engram;
 use crate::engram::{Engram, Generated};
 use crate::linked::{DirSource, LinkedNote, LinkedSource, NotTaken, take_linked_files};
 use crate::parse::{ParseError, parse_engram, parse_engram_lossless};
+use crate::time::{self, Day, OffsetStamp, Stamp};
 
 /// The OKF actor the importer records as the writer of the engrams it
 /// normalizes: an automated job, per the spec's `process:name` convention.
@@ -229,7 +229,7 @@ pub fn import_tree(options: &ImportOptions) -> Result<ImportReport, ImportError>
         .map(|e| e.rel.clone())
         .collect();
     let mut permalinks = existing_domain_permalinks(&options.domain_dir, &batch_rels);
-    let now = Utc::now().fixed_offset();
+    let now = time::now().to_offset_utc();
 
     let mut report = ImportReport::default();
 
@@ -401,7 +401,7 @@ fn prepare_markdown<'a>(
     entry: &'a Entry,
     options: &ImportOptions,
     strip_prefix: &str,
-    now: DateTime<FixedOffset>,
+    now: OffsetStamp,
     permalinks: &mut HashMap<String, String>,
     report: &mut ImportReport,
 ) -> Planned<'a> {
@@ -527,9 +527,9 @@ pub struct CompleteOptions<'a> {
     /// The leading permalink segment to strip.
     pub strip_prefix: &'a str,
     /// The file's modification date, used for a missing `recorded_at`.
-    pub mtime: Option<NaiveDate>,
+    pub mtime: Option<Day>,
     /// The time recorded as the write time of the provenance.
-    pub now: DateTime<FixedOffset>,
+    pub now: OffsetStamp,
     /// The `status` given to a file that has none.
     pub missing_status: MissingStatus,
 }
@@ -632,11 +632,11 @@ pub fn complete_engram(source: &str, opts: &CompleteOptions) -> Result<Completed
         // no route can leave `recorded_at` out by passing no mtime.
         let (date, from) = match mtime {
             Some(date) => (date, "file mtime"),
-            None => (now.date_naive(), "import date"),
+            None => (now.day(), "import date"),
         };
         fm.recorded_at = Some(date);
         temporal_backfilled += 1;
-        changes.push(format!("recorded_at: missing -> `{date}` ({from})"));
+        changes.push(format!("recorded_at: missing -> `{}` ({from})", date.ymd()));
     }
 
     // c. Drop sentinel far-future `valid_to` and far-past `valid_from`
@@ -646,14 +646,14 @@ pub fn complete_engram(source: &str, opts: &CompleteOptions) -> Result<Completed
     {
         fm.valid_to = None;
         sentinels_dropped += 1;
-        changes.push(format!("valid_to: dropped sentinel `{to}`"));
+        changes.push(format!("valid_to: dropped sentinel `{}`", to.ymd()));
     }
     if let Some(from) = fm.valid_from
         && from.year() <= SENTINEL_PAST_YEAR
     {
         fm.valid_from = None;
         sentinels_dropped += 1;
-        changes.push(format!("valid_from: dropped sentinel `{from}`"));
+        changes.push(format!("valid_from: dropped sentinel `{}`", from.ymd()));
     }
 
     // d. Strip a leading source-prefix permalink segment.
@@ -699,7 +699,7 @@ pub fn complete_engram(source: &str, opts: &CompleteOptions) -> Result<Completed
         });
         changes.push(format!(
             "generated: missing -> `{{ by: {IMPORT_ACTOR}, at: {} }}`",
-            now.to_rfc3339()
+            now.rfc3339()
         ));
     }
 
@@ -738,7 +738,7 @@ pub fn complete_engram(source: &str, opts: &CompleteOptions) -> Result<Completed
 pub fn complete_for_import(
     source: &str,
     rel_path: &str,
-    now: DateTime<FixedOffset>,
+    now: OffsetStamp,
 ) -> Result<Option<String>, ParseError> {
     let type_map = IndexMap::new();
     let completed = complete_engram(
@@ -761,11 +761,10 @@ pub fn complete_for_import(
     Ok(needed.then(|| crate::to_lf(&emit_engram(&completed.engram)).into_owned()))
 }
 
-fn mtime_date(path: &Path) -> Option<NaiveDate> {
+fn mtime_date(path: &Path) -> Option<Day> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
-    let dt: DateTime<Utc> = modified.into();
-    Some(dt.date_naive())
+    Some(Stamp::from_system_time(modified)?.day_utc())
 }
 
 // --- filesystem walking -------------------------------------------------------
@@ -871,14 +870,14 @@ fn existing_domain_permalinks(
 mod tests {
     use super::*;
 
-    fn now() -> DateTime<FixedOffset> {
-        DateTime::parse_from_rfc3339("2026-07-02T00:00:00+00:00").unwrap()
+    fn now() -> OffsetStamp {
+        time::parse_rfc3339("2026-07-02T00:00:00+00:00").unwrap()
     }
 
     fn opts<'a>(
         map: &'a IndexMap<String, String>,
         status: MissingStatus,
-        mtime: Option<NaiveDate>,
+        mtime: Option<Day>,
     ) -> CompleteOptions<'a> {
         CompleteOptions {
             rel_path: "Notes/My Pump.md",
@@ -1000,7 +999,7 @@ mod tests {
 
     #[test]
     fn missing_recorded_at_backfills_from_mtime() {
-        let date = NaiveDate::from_ymd_opt(2026, 3, 4).unwrap();
+        let date = Day::from_ymd(2026, 3, 4).unwrap();
         let r = complete_engram(
             "---\ntype: engram\ntitle: X\ntags:\n  - t\nstatus: current\n---\n\nbody\n",
             &opts(&default_type_map(), MissingStatus::Stable, Some(date)),
@@ -1110,7 +1109,7 @@ mod tests {
 
     #[test]
     fn a_completed_file_passes_verify() {
-        let date = NaiveDate::from_ymd_opt(2026, 3, 4);
+        let date = Day::from_ymd(2026, 3, 4);
         let r = complete_engram(
             "---\ntype: document\ntitle: Pump\n---\n\nbody text\n",
             &opts(&default_type_map(), MissingStatus::Stable, date),
@@ -1142,7 +1141,7 @@ mod tests {
         );
         assert!(r2.engram.frontmatter.generated.is_none());
         assert_eq!(
-            r2.engram.frontmatter.timestamp.unwrap().to_rfc3339(),
+            r2.engram.frontmatter.timestamp.unwrap().rfc3339(),
             "2020-01-01T00:00:00+00:00"
         );
         assert!(!r2.changes.iter().any(|c| c.starts_with("generated")));
@@ -1481,7 +1480,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             r.engram.frontmatter.recorded_at,
-            Some(NaiveDate::from_ymd_opt(2026, 7, 2).unwrap())
+            Some(Day::from_ymd(2026, 7, 2).unwrap())
         );
         assert!(r.changes.iter().any(|c| c.contains("import date")));
     }
@@ -1502,14 +1501,14 @@ mod tests {
         // No `generated`, which completion would add, and keys in an order
         // the emitter would not write: neither is a reason to rewrite it.
         let source = "---\ntitle: Alpha\ntype: engram\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n";
-        let now = Utc::now().fixed_offset();
+        let now = time::now().to_offset_utc();
         assert_eq!(complete_for_import(source, "alpha.md", now).unwrap(), None);
     }
 
     #[test]
     fn a_legacy_type_is_never_remapped_for_import() {
         let source = "---\ntype: note\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n";
-        let now = Utc::now().fixed_offset();
+        let now = time::now().to_offset_utc();
         assert_eq!(complete_for_import(source, "alpha.md", now).unwrap(), None);
         // A file that needs completing keeps its type too.
         let text = complete_for_import("---\ntype: howto\ntitle: H\n---\n\nbody\n", "h.md", now)
@@ -1524,7 +1523,7 @@ mod tests {
     #[test]
     fn a_converted_file_is_completed_for_import() {
         let source = "---\ntype: document\ntitle: Report\n---\n\n# Report\n";
-        let now = Utc::now().fixed_offset();
+        let now = time::now().to_offset_utc();
         let text = complete_for_import(source, "report.pdf.md", now)
             .unwrap()
             .expect("the file needs completing");
@@ -1533,7 +1532,7 @@ mod tests {
         assert_eq!(fm.status.as_deref(), Some("stable"));
         assert_eq!(fm.tags, vec![IMPORTED_TAG.to_string()]);
         assert_eq!(fm.permalink.as_deref(), Some("report-pdf"));
-        assert_eq!(fm.recorded_at, Some(now.date_naive()));
+        assert_eq!(fm.recorded_at, Some(now.day()));
         assert!(fm.generated.is_some());
     }
 

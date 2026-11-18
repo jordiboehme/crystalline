@@ -1033,7 +1033,7 @@ async fn run_archive(
     // completes a file, and only then verify it, so a note that lacks only
     // what completion adds is not refused for it. The notes that pass are
     // what the linked-file step reads.
-    let now = chrono::Utc::now().fixed_offset();
+    let now = crystalline_core::time::now().to_offset_utc();
     let mut pending: Vec<Pending> = Vec::new();
     let mut candidates: Vec<(String, String)> = Vec::new();
     let mut notes: Vec<crystalline_core::linked::LinkedNote> = Vec::new();

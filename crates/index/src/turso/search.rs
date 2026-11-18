@@ -21,6 +21,7 @@ use crate::store::{
     MetadataFilter, Page, SearchHit, SearchMode, SearchOrder, SearchQuery, is_current_status,
     link_frontier_sql, meta_value_union_sql, relation_frontier_sql, retired_factor, salience_prior,
 };
+use crystalline_core::time;
 use crystalline_core::{META_KEY_MAX_BYTES, meta_value_text};
 
 use super::{
@@ -856,12 +857,10 @@ fn build_scalar_filters(
     }
 
     if query.current_only {
-        let today = query.today.clone().unwrap_or_else(|| {
-            chrono::Utc::now()
-                .date_naive()
-                .format("%Y-%m-%d")
-                .to_string()
-        });
+        let today = query
+            .today
+            .clone()
+            .unwrap_or_else(|| time::today_utc().ymd());
         clauses.push(format!(
             "e.status IN ('stable', 'current') AND (e.valid_from IS NULL OR e.valid_from <= ?{n}) AND (e.valid_to IS NULL OR e.valid_to > ?{})",
             *n + 1

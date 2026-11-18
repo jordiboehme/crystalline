@@ -366,7 +366,7 @@ impl DurableStateReport {
             Some(o) => format!(
                 "owner of postgres {} since {}",
                 self.database,
-                stamp(o.since)
+                stamp(o.since.into_chrono())
             ),
             None => format!("owner of postgres {}", self.database),
         };
@@ -396,7 +396,7 @@ impl DurableStateReport {
                     .unwrap_or_default(),
                 o.pid,
                 o.version,
-                stamp(o.since)
+                stamp(o.since.into_chrono())
             ),
             (OwnerState::Owned | OwnerState::Unannounced, _) => {
                 "Owner: an instance that has not announced itself yet".to_string()
@@ -436,7 +436,7 @@ impl DurableStateReport {
                 "command": o.command,
                 "pid": o.pid,
                 "version": o.version,
-                "since": stamp(o.since),
+                "since": stamp(o.since.into_chrono()),
             })
         });
         let (state, error) = match &self.owner_state {
@@ -576,7 +576,7 @@ async fn read_document_state(cfg: &GlobalConfig) -> DocumentState {
         Err(e) => return DocumentState::Unreadable(e.to_string()),
     };
     match crystalline_index::postgres::read_config_document(&target).await {
-        Ok(Some(doc)) => DocumentState::Saved(doc.updated_at),
+        Ok(Some(doc)) => DocumentState::Saved(doc.updated_at.into_chrono()),
         Ok(None) => DocumentState::NotSaved,
         Err(e) => DocumentState::Unreadable(e.to_string()),
     }
@@ -689,7 +689,9 @@ mod tests {
                 pid: 42,
                 backend_pid: 7,
                 version: "0.33.0".to_string(),
-                since: Utc.with_ymd_and_hms(2026, 11, 16, 9, 30, 0).unwrap(),
+                since: crystalline_core::time::Stamp::from_chrono(
+                    Utc.with_ymd_and_hms(2026, 11, 16, 9, 30, 0).unwrap(),
+                ),
                 released_at: None,
             }),
             accounts: AccountsLocationKind::Postgres,

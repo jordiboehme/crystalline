@@ -646,7 +646,12 @@ impl Engine {
                 // order. An edit that skipped them would put a document in
                 // front of a person that the saver then refuses, minutes
                 // later, for a reason nobody watching could connect to this.
-                let edited = touch_generated(&edited, actor, model, now_offset());
+                let edited = touch_generated(
+                    &edited,
+                    actor,
+                    model,
+                    crystalline_core::time::now().to_offset_utc(),
+                );
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let (edited, normalized) = self
                     .normalize_domain_spellings_for(&edited, scope)
@@ -768,7 +773,12 @@ impl Engine {
             if unchanged(&current, &edited) {
                 return Ok(nothing_written());
             }
-            let edited = touch_generated(&edited, actor, model, now_offset());
+            let edited = touch_generated(
+                &edited,
+                actor,
+                model,
+                crystalline_core::time::now().to_offset_utc(),
+            );
             let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
             let (edited, normalized) = self
                 .normalize_domain_spellings_for(&edited, scope)
@@ -834,7 +844,12 @@ impl Engine {
                 if unchanged(&current, &edited) {
                     return Ok(nothing_written());
                 }
-                let edited = touch_generated(&edited, actor, model, now_offset());
+                let edited = touch_generated(
+                    &edited,
+                    actor,
+                    model,
+                    crystalline_core::time::now().to_offset_utc(),
+                );
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let (edited, count) = self
                     .normalize_domain_spellings_for(&edited, scope)
@@ -931,7 +946,12 @@ impl Engine {
                         }
                         return Ok(nothing_written());
                     }
-                    let edited = touch_generated(&edited, actor, model, now_offset());
+                    let edited = touch_generated(
+                        &edited,
+                        actor,
+                        model,
+                        crystalline_core::time::now().to_offset_utc(),
+                    );
                     let edited =
                         Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                     let (edited, count) = self
@@ -1277,7 +1297,7 @@ impl Engine {
                     // Migrates a legacy `review_after` line in place.
                     set_stale_after(source, date)
                 } else {
-                    set_frontmatter_field(source, key, &date.format("%Y-%m-%d").to_string())
+                    set_frontmatter_field(source, key, &date.ymd())
                 })
             }
             "resource" | "source_version" => Ok(match value {
@@ -1321,7 +1341,7 @@ impl Engine {
                 let entry = crystalline_core::Verified {
                     by,
                     model,
-                    at: Some(now_offset()),
+                    at: Some(crystalline_core::time::now().to_offset_utc()),
                 };
                 // Keep other actors' verifications and replace this actor's, so
                 // the trust record stays a history without growing a line on

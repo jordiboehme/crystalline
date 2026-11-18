@@ -2513,9 +2513,9 @@ async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
 fn seed_lab_feedback(ctx: &VisibilityCtx) {
     let mut state = crystalline_remote::state::OriginState::new("acme/lab", "main");
     state.last_checked = Some(
-        chrono::DateTime::parse_from_rfc3339("2026-11-01T09:30:00Z")
+        crystalline_core::time::parse_rfc3339("2026-11-01T09:30:00Z")
             .unwrap()
-            .with_timezone(&chrono::Utc),
+            .stamp(),
     );
     state.proposals.push(
         serde_json::from_value(serde_json::json!({

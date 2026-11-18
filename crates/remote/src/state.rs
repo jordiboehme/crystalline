@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -82,7 +82,8 @@ pub struct OriginState {
     /// The ETag of the last branch-ref probe, for conditional polling.
     pub ref_etag: Option<String>,
     /// When the branch was last checked for new upstream commits.
-    pub last_checked: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub last_checked: Option<Stamp>,
     /// The base snapshot manifest: relative path to stamp, the prefilter
     /// [`crate::changes::detect_local_changes`] uses to skip hashing files
     /// that plainly have not changed.
@@ -229,7 +230,8 @@ pub struct Proposal {
     /// The proposal title.
     pub title: String,
     /// When the proposal was opened.
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub created_at: Stamp,
     /// The proposal's current lifecycle state.
     pub status: ProposalStatus,
     /// The files the proposal changes.
@@ -266,8 +268,8 @@ pub struct Proposal {
     #[serde(default)]
     pub feedback: Vec<FeedbackItem>,
     /// Set on every share-update and feedback refresh.
-    #[serde(default)]
-    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub updated_at: Option<Stamp>,
     /// The GitHub login the share that opened this proposal acted as, recorded
     /// at share time from the acting credential's stored user.
     ///
@@ -353,7 +355,8 @@ pub struct DirectShare {
     /// The commit message's first line: the share's effective title.
     pub title: String,
     /// When the commit landed.
-    pub shared_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub shared_at: Stamp,
     /// The login the share acted as, as [`Proposal::author_login`] records it.
     pub author_login: Option<String>,
     /// The files the commit changed, the same record a proposal keeps.
@@ -378,7 +381,8 @@ pub struct DirectRefusal {
     /// The forge's sentence naming the rule, verbatim.
     pub message: String,
     /// When the refusal came back.
-    pub refused_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub refused_at: Stamp,
 }
 
 /// Reads `direct_refused` as a list, or as the single object (or null) an
@@ -417,7 +421,8 @@ pub struct Conflict {
     /// The upstream commit the conflicting change came from.
     pub upstream_commit: String,
     /// When the conflict was detected.
-    pub detected_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub detected_at: Stamp,
 }
 
 /// A share branch waiting to be deleted upstream once no open pull request is
@@ -1105,7 +1110,7 @@ mod tests {
             login: login.map(str::to_string),
             branch: "main".to_string(),
             message: "Changes must be made through a pull request.".to_string(),
-            refused_at: chrono::Utc::now(),
+            refused_at: time::now(),
         }
     }
 
@@ -1332,6 +1337,35 @@ mod tests {
         assert!(!reserialized.contains("lf_digests"));
     }
 
+    /// A `state.json` without `last_checked` loads as `None`, and a stamp
+    /// that is there reads and writes back as 0.33 wrote it.
+    #[test]
+    fn old_state_without_last_checked_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"version":1,"repo":"o/r","branch":"main","base_commit":"","ref_etag":null,"files":{},"proposals":[],"history":[],"conflicts":[]}"#;
+        std::fs::write(dir.path().join(STATE_FILE_NAME), old).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.last_checked, None);
+        let written = serde_json::to_string(&loaded).unwrap();
+        assert!(written.contains(r#""last_checked":null"#), "{written}");
+
+        let checked = old.replace(
+            r#""ref_etag":null,"#,
+            r#""ref_etag":null,"last_checked":"2026-01-05T10:17:19.120Z","#,
+        );
+        std::fs::write(dir.path().join(STATE_FILE_NAME), &checked).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.last_checked,
+            Stamp::from_unix(1_767_608_239, 120_000_000)
+        );
+        let written = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            written.contains(r#""last_checked":"2026-01-05T10:17:19.120Z""#),
+            "{written}"
+        );
+    }
+
     #[test]
     fn read_base_file_returns_none_when_absent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1349,7 +1383,7 @@ mod tests {
                 sha: format!("s{i}"),
                 url: None,
                 title: format!("Share {i}"),
-                shared_at: chrono::Utc::now(),
+                shared_at: time::now(),
                 author_login: None,
                 files: Vec::new(),
             });
@@ -1707,7 +1741,7 @@ mod tests {
                 url: format!("https://github.com/acme/brand-knowledge/pull/{i}"),
                 branch: format!("share/{i}"),
                 title: format!("Proposal {i}"),
-                created_at: chrono::Utc::now(),
+                created_at: time::now(),
                 status: ProposalStatus::Merged,
                 files: Vec::new(),
                 head_commit: None,
@@ -1956,7 +1990,7 @@ mod tests {
             url: "https://github.com/acme/brand-knowledge/pull/3".to_string(),
             branch: "crystalline/share-eng-260101120000-ab12".to_string(),
             title: "Share updates from eng".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: time::now(),
             status: ProposalStatus::Open,
             files: vec![],
             head_commit: Some("cafe".to_string()),
@@ -1971,7 +2005,7 @@ mod tests {
                 submitted_at: "2026-08-21T10:00:00Z".to_string(),
                 kind: FeedbackKind::ReviewComment,
             }],
-            updated_at: Some(chrono::Utc::now()),
+            updated_at: Some(time::now()),
             author_login: Some("octo".to_string()),
         });
         state.save(dir.path()).unwrap();

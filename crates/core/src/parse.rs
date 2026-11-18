@@ -12,13 +12,13 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
 use indexmap::IndexMap;
 
 use crate::engram::{
     Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, Relation, SchemaDef,
     Verified, WikiLink,
 };
+use crate::time::{self, Day, OffsetStamp};
 use crate::yaml::YamlValue;
 
 /// The generation of what the parser extracts from an engram: its
@@ -337,13 +337,13 @@ fn parse_tags(v: &serde_yaml_ng::Value) -> Vec<String> {
 }
 
 fn set_date(
-    field: &mut Option<NaiveDate>,
+    field: &mut Option<Day>,
     extra: &mut IndexMap<String, YamlValue>,
     key: &str,
     value: serde_yaml_ng::Value,
 ) {
     if let Some(s) = value.as_str()
-        && let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        && let Some(d) = time::parse_date(s)
     {
         *field = Some(d);
         return;
@@ -354,13 +354,13 @@ fn set_date(
 }
 
 fn set_timestamp(
-    field: &mut Option<DateTime<FixedOffset>>,
+    field: &mut Option<OffsetStamp>,
     extra: &mut IndexMap<String, YamlValue>,
     key: &str,
     value: serde_yaml_ng::Value,
 ) {
     if let Some(s) = value.as_str()
-        && let Ok(ts) = DateTime::parse_from_rfc3339(s)
+        && let Some(ts) = time::parse_rfc3339(s)
     {
         *field = Some(ts);
         return;
@@ -387,7 +387,7 @@ fn set_generated(
             let at = map
                 .get(serde_yaml_ng::Value::String("at".into()))
                 .and_then(|v| v.as_str())
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+                .and_then(time::parse_rfc3339);
             // The model the writer reported, when it reported one. Read as a
             // string and nothing else, the way a `verified` entry reads it
             // (`crystalline_core::engram::reported_model`), so the same value
@@ -1175,6 +1175,22 @@ fn find_wikilinks(masked: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::engram::LinkForm;
+
+    // Review Focus 1 of the time-module move: the date fields read
+    // `%Y-%m-%d` leniently, so an unpadded date and a
+    // leading space stay typed dates with no temporal finding, as in 0.33.
+    #[test]
+    fn frontmatter_lenient_dates_stay_valid() {
+        let source = "---\ntype: engram\ntitle: T\npermalink: t\nstatus: stable\nrecorded_at: 2026-1-5\nvalid_from: \" 2026-01-05\"\ngenerated: {by: human:a, at: 2026-01-05T10:00:00+00:00}\n---\n\n# T\n";
+        let engram = parse_engram(source).unwrap();
+        let fm = &engram.frontmatter;
+        let day = |y, m, d| Some(crate::time::Day::from_ymd(y, m, d).unwrap());
+        assert_eq!(fm.recorded_at, day(2026, 1, 5));
+        assert_eq!(fm.valid_from, day(2026, 1, 5));
+        assert!(fm.extra.is_empty(), "nothing parked: {:?}", fm.extra);
+        let issues = crate::verify::check_temporal(std::path::Path::new("t.md"), &engram);
+        assert!(issues.is_empty(), "no temporal finding: {issues:?}");
+    }
 
     // Pins the current mask_inline_code/scan_body behavior before the
     // single-buffer and contains-guard refactor so the refactor cannot

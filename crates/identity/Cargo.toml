@@ -31,7 +31,6 @@ anyhow = { workspace = true }
 # `KnowledgeGovernor` (scope.rs), the engine's GitHub role lookup.
 async-trait = { workspace = true }
 argon2 = { workspace = true }
-chrono = { workspace = true }
 getrandom = { workspace = true }
 # URL parsing for the OAuth redirect and resource checks (named directly
 # since Task 7b; the same crate openidconnect re-exports).

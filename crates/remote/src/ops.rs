@@ -41,10 +41,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use crystalline_core::Sharing;
 use crystalline_core::manifest::Manifest;
 use crystalline_core::parse_engram;
+use crystalline_core::time::{self, Stamp};
 
 use crate::archive::{extract_repo_subtree, extract_tarball};
 use crate::changes::{
@@ -154,7 +154,7 @@ pub struct OriginStatusReport {
     /// Conflicts still waiting to be resolved.
     pub conflicts: Vec<Conflict>,
     /// When the branch was last checked for new upstream commits.
-    pub last_checked: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_checked: Option<Stamp>,
     /// Numbers of open proposals whose live branch head no longer matches the
     /// recorded head_commit: a reviewer amended the branch. Empty when the
     /// live list was not consulted (offline, no probe, or the list call
@@ -523,7 +523,7 @@ pub async fn subscribe(
     let mut origin_state = OriginState::new(spec.repo.clone(), spec.branch.clone());
     origin_state.base_commit = head.clone();
     origin_state.ref_etag = etag;
-    origin_state.last_checked = Some(Utc::now());
+    origin_state.last_checked = Some(time::now());
     origin_state.files = files;
     origin_state.lf_digests = lf_digests;
     origin_state.save(state_dir)?;
@@ -858,7 +858,7 @@ pub async fn pull_with(
                         kind,
                         base_commit: base_commit_before.clone(),
                         upstream_commit: head.clone(),
-                        detected_at: Utc::now(),
+                        detected_at: time::now(),
                     };
                     state.conflicts.push(conflict.clone());
                     new_conflicts.push(conflict);
@@ -885,7 +885,7 @@ pub async fn pull_with(
 
     state.base_commit = head.clone();
     state.ref_etag = new_etag;
-    state.last_checked = Some(Utc::now());
+    state.last_checked = Some(time::now());
 
     // Consume merged proposals in memory, adopt the rebase the forge performed
     // on whatever still stands above them, then persist base advance,
@@ -1528,7 +1528,7 @@ pub async fn status(
                 if !is_behind {
                     state.ref_etag = etag;
                 }
-                state.last_checked = Some(Utc::now());
+                state.last_checked = Some(time::now());
                 state.save(state_dir)?;
             }
         }
@@ -3400,7 +3400,7 @@ async fn open_proposal_on_commit(
         url: handle.url.clone(),
         branch: branch.clone(),
         title,
-        created_at: Utc::now(),
+        created_at: time::now(),
         status: ProposalStatus::Open,
         files: collected.files,
         head_commit: Some(commit_sha),
@@ -3592,7 +3592,7 @@ async fn commit_direct(
                     login: options.author_login.map(str::to_string),
                     branch: branch.clone(),
                     message: message.clone(),
-                    refused_at: Utc::now(),
+                    refused_at: time::now(),
                 });
                 // Remembering the refusal only spares the next share a try at
                 // the branch. A save that fails must not cost the person the
@@ -3681,12 +3681,12 @@ fn advance_base_after_commit(
     }
     state.base_commit = commit_sha.to_string();
     state.ref_etag = None;
-    state.last_checked = Some(Utc::now());
+    state.last_checked = Some(time::now());
     state.push_direct_share(DirectShare {
         sha: commit_sha.to_string(),
         url,
         title: title.to_string(),
-        shared_at: Utc::now(),
+        shared_at: time::now(),
         author_login: author_login.map(str::to_string),
         files: collected.files.clone(),
     });
@@ -3966,7 +3966,7 @@ async fn update_open_proposal(
     // The push is finished and recorded: nothing is pending any more.
     record.pending_head_commit = None;
     record.base_commit = Some(state.base_commit.clone());
-    record.updated_at = Some(Utc::now());
+    record.updated_at = Some(time::now());
     if let Some(t) = title {
         record.title = t.to_string();
     }
@@ -4079,7 +4079,7 @@ async fn stack_new_layer(
         url: handle.url.clone(),
         branch: branch.clone(),
         title: effective_title,
-        created_at: Utc::now(),
+        created_at: time::now(),
         status: ProposalStatus::Open,
         files: collected.files,
         head_commit: Some(commit_sha),
@@ -4559,7 +4559,7 @@ async fn amend_layer(
         record.head_commit = Some(commit_sha.clone());
         record.pending_head_commit = None;
         record.base_commit = Some(below_head);
-        record.updated_at = Some(Utc::now());
+        record.updated_at = Some(time::now());
         if let Some(t) = title {
             record.title = t.to_string();
         }
@@ -4881,7 +4881,7 @@ async fn cascade_replays(
             record.head_commit = Some(commit_sha.clone());
             record.pending_head_commit = None;
             record.base_commit = Some(parent_head);
-            record.updated_at = Some(Utc::now());
+            record.updated_at = Some(time::now());
         }
         state.save(state_dir)?;
 
@@ -6050,7 +6050,7 @@ async fn settle_up_to_date(
     if let Some(etag) = new_etag {
         state.ref_etag = etag;
     }
-    state.last_checked = Some(Utc::now());
+    state.last_checked = Some(time::now());
     state.save(state_dir)?;
     // Branch cleanup once the state is durable, exactly as the moved-trunk
     // arm does it.
@@ -6148,7 +6148,7 @@ async fn rebaseline(
         .collect();
     state.base_commit = head;
     state.ref_etag = new_etag;
-    state.last_checked = Some(Utc::now());
+    state.last_checked = Some(time::now());
 
     // Consume merged proposals in memory and adopt whatever the forge did to
     // the layers still standing above them, then persist the base replacement
@@ -6223,7 +6223,7 @@ async fn refresh_proposals(
                 items.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
                 items.truncate(crate::state::FEEDBACK_CAP);
                 prop.feedback = items;
-                prop.updated_at = Some(Utc::now());
+                prop.updated_at = Some(time::now());
                 touched = true;
             }
             Err(e) => {
@@ -6951,7 +6951,7 @@ fn share_branch_name(domain_name: &str) -> String {
             }
         })
         .collect();
-    let timestamp = Utc::now().format("%y%m%d%H%M%S");
+    let timestamp = time::now().yymmddhhmmss();
     let suffix = &uuid::Uuid::new_v4().simple().to_string()[..4];
     format!("crystalline/share-{slug}-{timestamp}-{suffix}")
 }
@@ -7303,7 +7303,7 @@ mod share_route_tests {
             url: "https://example.test/pull/7".to_string(),
             branch: "crystalline/share-7".to_string(),
             title: "Seven".to_string(),
-            created_at: Utc::now(),
+            created_at: time::now(),
             status: ProposalStatus::Open,
             files: Vec::new(),
             head_commit: None,
@@ -7326,7 +7326,7 @@ mod share_route_tests {
             login: login.map(str::to_string),
             branch: "main".to_string(),
             message: "rule".to_string(),
-            refused_at: Utc::now(),
+            refused_at: time::now(),
         });
         state
     }

@@ -4,10 +4,10 @@
 //! body (observations, relations, wikilinks, headings). Parsing lives in
 //! [`crate::parse`] and deterministic emission in [`crate::emit`].
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
 use indexmap::IndexMap;
 use serde::Serialize;
 
+use crate::time::{self, Day, OffsetStamp};
 use crate::yaml::YamlValue;
 
 /// Recommended values for the `type` frontmatter field. These are guidance
@@ -85,24 +85,29 @@ pub struct Frontmatter {
     /// Free-form lifecycle status.
     pub status: Option<String>,
     /// When the knowledge was recorded.
-    pub recorded_at: Option<NaiveDate>,
+    #[serde(default, with = "time::serde::day_option")]
+    pub recorded_at: Option<Day>,
     /// Start of the validity window; absent means always valid.
-    pub valid_from: Option<NaiveDate>,
+    #[serde(default, with = "time::serde::day_option")]
+    pub valid_from: Option<Day>,
     /// End of the validity window; absent means valid forever.
-    pub valid_to: Option<NaiveDate>,
+    #[serde(default, with = "time::serde::day_option")]
+    pub valid_to: Option<Day>,
     /// Write provenance: who wrote the Engram last and when. The OKF v0.2
     /// `generated` family, which supersedes the v0.1 `timestamp` key.
     pub generated: Option<Generated>,
     /// Last write timestamp, RFC 3339 with offset. The legacy OKF v0.1 key,
     /// still read so an engram written before the `generated` migration keeps
     /// its recency; new writes emit [`Frontmatter::generated`] instead.
-    pub timestamp: Option<DateTime<FixedOffset>>,
+    #[serde(default, with = "time::serde::offset_stamp_option")]
+    pub timestamp: Option<OffsetStamp>,
     /// Short description; feeds search snippets.
     pub description: Option<String>,
     /// A resource locator associated with the Engram.
     pub resource: Option<String>,
     /// Date the underlying source material carries.
-    pub source_date: Option<NaiveDate>,
+    #[serde(default, with = "time::serde::day_option")]
+    pub source_date: Option<Day>,
     /// The verification trail: who checked this knowledge and when. The OKF
     /// v0.2 `verified` family, which supersedes the actorless `last_verified`
     /// key. Empty when the Engram carries no verification.
@@ -110,14 +115,17 @@ pub struct Frontmatter {
     /// Date the knowledge was last verified. The legacy key, still read so an
     /// Engram written before the `verified` migration keeps its trust record;
     /// new verifications are recorded as [`Frontmatter::verified`] entries.
-    pub last_verified: Option<NaiveDate>,
+    #[serde(default, with = "time::serde::day_option")]
+    pub last_verified: Option<Day>,
     /// Date at or after which the knowledge counts as stale. The OKF v0.2
     /// `stale_after` family, which supersedes `review_after`.
-    pub stale_after: Option<NaiveDate>,
+    #[serde(default, with = "time::serde::day_option")]
+    pub stale_after: Option<Day>,
     /// Date after which the knowledge should be reviewed. The legacy spelling
     /// of [`Frontmatter::stale_after`], still read so an Engram written before
     /// the migration keeps its staleness bound.
-    pub review_after: Option<NaiveDate>,
+    #[serde(default, with = "time::serde::day_option")]
+    pub review_after: Option<Day>,
     /// Whether temporal metadata was explicit or inferred.
     pub temporal_confidence: Option<String>,
     /// Picoschema definition, present when `type` is `schema`.
@@ -149,7 +157,8 @@ pub struct Generated {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// When it was written, RFC 3339 with offset.
-    pub at: Option<DateTime<FixedOffset>>,
+    #[serde(default, with = "time::serde::offset_stamp_option")]
+    pub at: Option<OffsetStamp>,
 }
 
 /// One verification, the OKF v0.2 `verified` entry `{ by, at }`: the actor that
@@ -168,7 +177,8 @@ pub struct Verified {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// When it was verified, RFC 3339 with offset.
-    pub at: Option<DateTime<FixedOffset>>,
+    #[serde(default, with = "time::serde::offset_stamp_option")]
+    pub at: Option<OffsetStamp>,
 }
 
 /// The model reported inside a provenance mapping: a non-empty string, or
@@ -207,7 +217,7 @@ impl Verified {
             return None;
         }
         let at = match map.get("at") {
-            Some(raw) => Some(DateTime::parse_from_rfc3339(raw.as_str()?).ok()?),
+            Some(raw) => Some(time::parse_rfc3339(raw.as_str()?)?),
             None => None,
         };
         Some(Verified {
@@ -242,7 +252,8 @@ pub struct EvolveAck {
     /// The actor that acknowledged it, the OKF actor convention.
     pub by: String,
     /// When it was acknowledged, RFC 3339 with offset.
-    pub at: Option<DateTime<FixedOffset>>,
+    #[serde(default, with = "time::serde::offset_stamp_option")]
+    pub at: Option<OffsetStamp>,
 }
 
 impl EvolveAck {
@@ -280,7 +291,7 @@ impl EvolveAck {
             at: map
                 .get("at")
                 .and_then(YamlValue::as_str)
-                .and_then(|raw| DateTime::parse_from_rfc3339(raw.trim()).ok()),
+                .and_then(|raw| time::parse_rfc3339(raw.trim())),
         })
     }
 }
@@ -293,7 +304,7 @@ pub struct Verification<'a> {
     /// `last_verified` date, which records no actor.
     pub by: Option<&'a str>,
     /// When the verification happened.
-    pub at: DateTime<FixedOffset>,
+    pub at: OffsetStamp,
 }
 
 /// The schema-defining frontmatter block of a `type: schema` Engram. The raw
@@ -606,7 +617,7 @@ impl Frontmatter {
     /// `timestamp` key otherwise (OKF v0.2 §13.1). Every recency consumer reads
     /// this rather than either field directly, so a file that has not been
     /// migrated yet ranks exactly as it did before.
-    pub fn written_at(&self) -> Option<DateTime<FixedOffset>> {
+    pub fn written_at(&self) -> Option<OffsetStamp> {
         self.generated
             .as_ref()
             .and_then(|g| g.at)
@@ -617,7 +628,7 @@ impl Frontmatter {
     /// falling back to the legacy `review_after` spelling. Every staleness
     /// consumer reads this rather than either field directly, so a file that
     /// has not been migrated yet behaves exactly as it did before.
-    pub fn stale_on(&self) -> Option<NaiveDate> {
+    pub fn stale_on(&self) -> Option<Day> {
         self.stale_after.or(self.review_after)
     }
 
@@ -634,10 +645,10 @@ impl Frontmatter {
         if let Some((at, by)) = newest {
             return Some(Verification { by: Some(by), at });
         }
-        let at = self.last_verified?.and_hms_opt(0, 0, 0)?.and_utc();
+        let at = self.last_verified?.start_utc()?;
         Some(Verification {
             by: None,
-            at: at.fixed_offset(),
+            at: at.to_offset_utc(),
         })
     }
 
@@ -657,7 +668,7 @@ impl Frontmatter {
     /// [`META_KEY_MAX_BYTES`], or when none of its values has a text (see
     /// [`meta_value_text`]).
     pub fn index_metadata(&self) -> serde_json::Map<String, serde_json::Value> {
-        let date_str = |d: Option<NaiveDate>| d.map(|d| d.format("%Y-%m-%d").to_string());
+        let date_str = |d: Option<Day>| d.map(|d| d.ymd());
         let mut meta = serde_json::Map::new();
         for (k, v) in &self.extra {
             if let Ok(jv) = serde_json::to_value(v) {
@@ -675,8 +686,7 @@ impl Frontmatter {
         // has migrated to the OKF keys and one that has not.
         add_str(
             "last_verified",
-            self.latest_verified()
-                .map(|v| v.at.date_naive().format("%Y-%m-%d").to_string()),
+            self.latest_verified().map(|v| v.at.day().ymd()),
         );
         add_str("stale_after", date_str(self.stale_on()));
         add_str("temporal_confidence", self.temporal_confidence.clone());

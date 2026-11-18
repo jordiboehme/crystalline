@@ -17,10 +17,9 @@
 //! field. [`normalize_verified`] does the same for the shape of a `verified`
 //! entry, which is a trust record rather than a date.
 
-use chrono::{Datelike, NaiveDate};
-
 use crate::engram::{Frontmatter, Verified};
 use crate::import::{SENTINEL_FUTURE_YEAR, SENTINEL_PAST_YEAR};
+use crate::time::{self, Day};
 use crate::yaml::YamlValue;
 
 /// Frontmatter keys holding a plain ISO date. Single source of truth for both
@@ -82,12 +81,10 @@ pub fn normalize_temporal_fields(
             // required (T001), so a null there cannot unset it and falls
             // through to the error arm below instead.
             YamlValue::Null if field != "recorded_at" => None,
-            YamlValue::String(s) => Some(NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(
-                |_| DateFieldError {
-                    field,
-                    value: describe(value),
-                },
-            )?),
+            YamlValue::String(s) => Some(time::parse_date(s).ok_or_else(|| DateFieldError {
+                field,
+                value: describe(value),
+            })?),
             other => {
                 return Err(DateFieldError {
                     field,
@@ -123,7 +120,7 @@ pub fn normalize_temporal_fields(
 
 /// Assign a parsed date to the typed frontmatter field named by `field`, which
 /// is always one of [`DATE_FIELDS`]. The catch-all is unreachable.
-fn assign_date_field(fm: &mut Frontmatter, field: &str, date: NaiveDate) {
+fn assign_date_field(fm: &mut Frontmatter, field: &str, date: Day) {
     match field {
         "recorded_at" => fm.recorded_at = Some(date),
         "valid_from" => fm.valid_from = Some(date),
@@ -214,10 +211,7 @@ mod tests {
         let mut fm = fm_with_extra("valid_from", YamlValue::String("2026-01-01".to_string()));
         let dropped = normalize_temporal_fields(&mut fm).unwrap();
         assert!(dropped.is_empty());
-        assert_eq!(
-            fm.valid_from,
-            Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
-        );
+        assert_eq!(fm.valid_from, Some(Day::from_ymd(2026, 1, 1).unwrap()));
         assert!(!fm.extra.contains_key("valid_from"));
     }
 
@@ -225,7 +219,7 @@ mod tests {
     fn sentinel_bounds_are_dropped_at_the_boundary() {
         // valid_to: year 9000 is a sentinel and dropped, 8999 is kept.
         let mut fm = Frontmatter {
-            valid_to: NaiveDate::from_ymd_opt(9000, 1, 1),
+            valid_to: Day::from_ymd(9000, 1, 1),
             ..Default::default()
         };
         let dropped = normalize_temporal_fields(&mut fm).unwrap();
@@ -233,16 +227,16 @@ mod tests {
         assert_eq!(fm.valid_to, None);
 
         let mut fm = Frontmatter {
-            valid_to: NaiveDate::from_ymd_opt(8999, 12, 31),
+            valid_to: Day::from_ymd(8999, 12, 31),
             ..Default::default()
         };
         let dropped = normalize_temporal_fields(&mut fm).unwrap();
         assert!(dropped.is_empty());
-        assert_eq!(fm.valid_to, NaiveDate::from_ymd_opt(8999, 12, 31));
+        assert_eq!(fm.valid_to, Day::from_ymd(8999, 12, 31));
 
         // valid_from: year 1 is a sentinel and dropped, year 2 is kept.
         let mut fm = Frontmatter {
-            valid_from: NaiveDate::from_ymd_opt(1, 6, 1),
+            valid_from: Day::from_ymd(1, 6, 1),
             ..Default::default()
         };
         let dropped = normalize_temporal_fields(&mut fm).unwrap();
@@ -250,12 +244,12 @@ mod tests {
         assert_eq!(fm.valid_from, None);
 
         let mut fm = Frontmatter {
-            valid_from: NaiveDate::from_ymd_opt(2, 6, 1),
+            valid_from: Day::from_ymd(2, 6, 1),
             ..Default::default()
         };
         let dropped = normalize_temporal_fields(&mut fm).unwrap();
         assert!(dropped.is_empty());
-        assert_eq!(fm.valid_from, NaiveDate::from_ymd_opt(2, 6, 1));
+        assert_eq!(fm.valid_from, Day::from_ymd(2, 6, 1));
     }
 
     #[test]
@@ -298,7 +292,7 @@ mod tests {
         let mut fm = fm_with_extra("review_after", YamlValue::String("2026-12-01".to_string()));
         let dropped = normalize_temporal_fields(&mut fm).unwrap();
         assert!(dropped.is_empty());
-        assert_eq!(fm.stale_after, NaiveDate::from_ymd_opt(2026, 12, 1));
+        assert_eq!(fm.stale_after, Day::from_ymd(2026, 12, 1));
         assert!(fm.review_after.is_none());
         assert!(!fm.extra.contains_key("review_after"));
     }

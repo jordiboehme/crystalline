@@ -1895,7 +1895,7 @@ async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
         url: "https://github.com/acme/brand-knowledge/pull/7".to_string(),
         branch: "share/glossary".to_string(),
         title: "Share glossary edits".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         status: ProposalStatus::Open,
         files: vec![],
         head_commit: None,
@@ -2843,7 +2843,7 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
         url: "https://github.test/pull/4".to_string(),
         branch: "crystalline/share-brand-x".to_string(),
         title: "Refine".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         status: ProposalStatus::Open,
         files: vec![],
         head_commit: None,
@@ -2973,7 +2973,7 @@ async fn the_status_shows_the_callers_own_refusal_and_not_on_a_proposal_domain()
         login: Some("alice".to_string()),
         branch: "main".to_string(),
         message: "Changes must be made through a pull request.".to_string(),
-        refused_at: chrono::Utc::now(),
+        refused_at: crystalline_core::time::now(),
     });
     state.save(&state_dir).unwrap();
     let refused = |status: &serde_json::Value| status["domains"][0]["direct_refused"].clone();
@@ -4011,7 +4011,7 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
         url: "https://github.test/pulls/5".to_string(),
         branch: "crystalline/share-brand-000101000000".to_string(),
         title: "Refine 1 engram in brand".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         status: ProposalStatus::Declined,
         files: vec![ProposedFile {
             path: "notes/keep.md".to_string(),
@@ -4105,7 +4105,7 @@ async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
         url: "https://github.test/pulls/5".to_string(),
         branch: "crystalline/share-brand-000101000000".to_string(),
         title: "Refine 1 engram in brand".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: crystalline_core::time::now(),
         status: ProposalStatus::Declined,
         files: vec![ProposedFile {
             path: "notes/keep.md".to_string(),

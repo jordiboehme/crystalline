@@ -31,15 +31,13 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::time::{self, Stamp};
+
 /// The folder in the state directory that holds kept texts.
 pub const KEPT_DIR: &str = "kept";
-
-/// The time format of a kept file's name, in UTC.
-const STAMP: &str = "%Y%m%dT%H%M%SZ";
 
 /// How many hex characters of the path's hash make an id.
 const ID_LEN: usize = 12;
@@ -58,7 +56,7 @@ pub const REMOVED_DIR: &str = ".removed";
 /// taken), so a domain registered later under the same name never reaches
 /// them. Nothing is deleted. Answers where they went, or `None` when the
 /// domain kept nothing.
-pub fn set_aside(root: &Path, domain: &str, at: DateTime<Utc>) -> std::io::Result<Option<PathBuf>> {
+pub fn set_aside(root: &Path, domain: &str, at: Stamp) -> std::io::Result<Option<PathBuf>> {
     let from = root.join(domain);
     if domain.is_empty()
         || domain.starts_with('.')
@@ -69,7 +67,7 @@ pub fn set_aside(root: &Path, domain: &str, at: DateTime<Utc>) -> std::io::Resul
     }
     let removed = root.join(REMOVED_DIR);
     std::fs::create_dir_all(&removed)?;
-    let stamp = at.format(STAMP).to_string();
+    let stamp = at.compact_z();
     for n in 1u32.. {
         let to = removed.join(match n {
             1 => format!("{domain}-{stamp}"),
@@ -92,7 +90,7 @@ fn removed_domain(folder: &str) -> Option<&str> {
         _ => folder,
     };
     let (domain, stamp) = folder.rsplit_once('-')?;
-    NaiveDateTime::parse_from_str(stamp, STAMP).ok()?;
+    time::parse_kept_stamp(stamp)?;
     (!domain.is_empty()).then_some(domain)
 }
 
@@ -157,7 +155,8 @@ pub struct KeptText {
     /// `reflections/`.
     pub path: String,
     /// When the text was kept, from the file name.
-    pub kept_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub kept_at: Stamp,
     /// The file's size in bytes.
     pub bytes: u64,
     /// The file on disk. Never sent over the JSON API.
@@ -229,7 +228,7 @@ pub fn write(
     owner: Option<&str>,
     kind: KeptKind,
     path: &str,
-    at: DateTime<Utc>,
+    at: Stamp,
     text: &str,
 ) -> std::io::Result<PathBuf> {
     write_bytes(root, domain, owner, kind, path, at, text.as_bytes())
@@ -246,7 +245,7 @@ pub fn write_bytes(
     owner: Option<&str>,
     kind: KeptKind,
     path: &str,
-    at: DateTime<Utc>,
+    at: Stamp,
     text: &[u8],
 ) -> std::io::Result<PathBuf> {
     let mut base = root.join(domain);
@@ -260,7 +259,7 @@ pub fn write_bytes(
         base = base.join(DRAFT_DIR).join(owner);
     }
     let base = base.join(kind.as_str()).join(path);
-    let stamp = at.format(STAMP).to_string();
+    let stamp = at.compact_z();
     let name = base
         .file_name()
         .unwrap_or_default()
@@ -587,15 +586,15 @@ fn walk(place: &Place<'_>, dir: &Path, rel: &str, found: &mut Vec<KeptText>) {
 
 /// `.<name>.<stamp>.<pid>[-<n>].keeping`, an unfinished keep's temporary
 /// name: the original file name and the time.
-fn parse_temp_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
+fn parse_temp_name(file: &str) -> Option<(&str, Stamp)> {
     let stem = file.strip_prefix('.')?.strip_suffix(TEMP_SUFFIX)?;
     let (head, process) = stem.rsplit_once('.')?;
     if process.is_empty() || !process.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
         return None;
     }
     let (name, stamp) = head.rsplit_once('.')?;
-    let at = NaiveDateTime::parse_from_str(stamp, STAMP).ok()?;
-    (!name.is_empty()).then(|| (name, at.and_utc()))
+    let at = time::parse_kept_stamp(stamp)?;
+    (!name.is_empty()).then_some((name, at))
 }
 
 /// The extension a kept copy of the file `name` is named with: the file's
@@ -615,7 +614,7 @@ fn kept_extension(name: &str) -> &str {
 /// original file's own ([`kept_extension`]), or `md`: a draft file kept before
 /// kept files took their own extension was named `.md`, and it may be the
 /// last copy of somebody's bytes. Answers the original file name and the time.
-fn parse_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
+fn parse_name(file: &str) -> Option<(&str, Stamp)> {
     let (stem, ext) = file.rsplit_once('.')?;
     let (name, tail) = stem.rsplit_once('.')?;
     if name.is_empty() || (ext != kept_extension(name) && ext != "md") {
@@ -630,8 +629,8 @@ fn parse_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
     {
         return None;
     }
-    let at = NaiveDateTime::parse_from_str(stamp, STAMP).ok()?;
-    Some((name, at.and_utc()))
+    let at = time::parse_kept_stamp(stamp)?;
+    Some((name, at))
 }
 
 /// The id of the file at `full`, its path inside the kept folder: the
@@ -699,7 +698,7 @@ mod tests {
             None,
             KeptKind::Comment,
             "guides/a.md",
-            Utc::now(),
+            time::now(),
             "Is this still true?",
         )
         .unwrap();
@@ -722,7 +721,6 @@ mod tests {
         assert!(!sender_file(&file).exists());
         assert!(scan(root).is_empty());
     }
-    use chrono::TimeZone;
     use std::cell::Cell;
 
     thread_local! {
@@ -941,8 +939,8 @@ mod tests {
         assert_eq!(removed_domain("eng"), None);
     }
 
-    fn at(h: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 15, h, 0, 0).unwrap()
+    fn at(h: u32) -> Stamp {
+        Stamp::from_ymd_hms(2026, 10, 15, h, 0, 0).unwrap()
     }
 
     /// Two refusals that map to one kept name both keep their text: the
@@ -1002,7 +1000,7 @@ mod tests {
         )
         .unwrap();
         let found = scan(root);
-        let rows: Vec<(&str, KeptKind, &str, DateTime<Utc>, u64)> = found
+        let rows: Vec<(&str, KeptKind, &str, Stamp, u64)> = found
             .iter()
             .map(|k| {
                 (
