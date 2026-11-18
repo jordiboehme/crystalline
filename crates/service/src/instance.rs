@@ -2231,14 +2231,29 @@ pub(crate) fn handover_stale(
     !alive(marker.pid) || past
 }
 
-/// Remove the stale marker at `path` that read as `text`, only while the
-/// file still holds exactly that text: a fresh marker another handover
-/// wrote in the meantime stays. The state folder is this user's own, so
-/// only a marker of this user's processes is ever removed.
-fn remove_stale_handover(path: &Path, text: &str) {
-    if std::fs::read_to_string(path).is_ok_and(|now| now == text) {
-        let _ = std::fs::remove_file(path);
+/// Remove the marker at `path` only if it holds exactly `text`: the one a
+/// guard wrote, or the stale one a reader read. Any other marker stays,
+/// such as the fresh one of another handover.
+///
+/// Exact, with no window between the compare and the remove: the file is
+/// first renamed to a name of this process's own in the same folder (one
+/// atomic step that takes whatever marker is there at that instant), then
+/// compared. The marker that holds `text` is deleted. Another one is put
+/// back with a hard link, which never replaces a file, so a still newer
+/// marker written to `path` meanwhile is kept and the taken one, older
+/// than it, goes. The state folder is this user's own, so only markers of
+/// this user's processes are ever touched.
+fn remove_marker_if(path: &Path, text: &str) {
+    static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let taken = path.with_file_name(format!(".{HANDOVER_FILE}.taken-{}-{n}", std::process::id()));
+    if std::fs::rename(path, &taken).is_err() {
+        return;
     }
+    if !std::fs::read_to_string(&taken).is_ok_and(|held| held == text) {
+        let _ = std::fs::hard_link(&taken, path);
+    }
+    let _ = std::fs::remove_file(&taken);
 }
 
 /// The handover marker's path, `<state_dir>/handover.json`.
@@ -2246,15 +2261,18 @@ fn handover_path() -> Option<PathBuf> {
     config::state_dir().ok().map(|dir| dir.join(HANDOVER_FILE))
 }
 
-/// The marker [`mark_handover`] wrote; dropping it removes the file.
+/// The marker [`mark_handover`] wrote; dropping it removes that marker,
+/// and only that one ([`remove_marker_if`]): a marker another displacement
+/// wrote over it since, in this process or another, stays.
 #[derive(Debug)]
 pub(crate) struct HandoverGuard {
     path: PathBuf,
+    text: String,
 }
 
 impl Drop for HandoverGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        remove_marker_if(&self.path, &self.text);
     }
 }
 
@@ -2282,7 +2300,7 @@ pub(crate) fn mark_handover() -> Option<HandoverGuard> {
     let text = serde_json::to_string(&marker).ok()?;
     // Written beside and renamed, so a reader never sees half a file.
     let staging = path.with_file_name(format!(".{HANDOVER_FILE}.{}", std::process::id()));
-    let written = std::fs::write(&staging, text).and_then(|()| std::fs::rename(&staging, &path));
+    let written = std::fs::write(&staging, &text).and_then(|()| std::fs::rename(&staging, &path));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&staging);
         tracing::warn!(
@@ -2291,7 +2309,7 @@ pub(crate) fn mark_handover() -> Option<HandoverGuard> {
         );
         return None;
     }
-    Some(HandoverGuard { path })
+    Some(HandoverGuard { path, text })
 }
 
 /// While another process hands the daemon over (a fresh handover marker),
@@ -2313,7 +2331,7 @@ pub(crate) async fn wait_out_handover() -> Option<Connection> {
             if let Some(text) = &text
                 && handover_stale(text, now, me, alive)
             {
-                remove_stale_handover(&path, text);
+                remove_marker_if(&path, text);
             }
             return None;
         }
@@ -5017,6 +5035,70 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// A guard removes its own marker and no other: a second displacement in
+    /// this process (a later `Displaced` replacing an earlier one in
+    /// `ensure_daemon_with`) and another process's marker both survive the
+    /// first guard's drop.
+    #[test]
+    fn a_handover_guard_removes_only_its_own_marker() {
+        let _home = ScratchHome::new("handover-own");
+        let path = handover_path().unwrap();
+
+        // Two displacements in this process, the first guard dropped last.
+        let first = mark_handover().expect("first");
+        std::thread::sleep(Duration::from_millis(2));
+        let second = mark_handover().expect("second");
+        let second_text = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(second_text, first.text, "two markers, two texts");
+        drop(first);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            second_text,
+            "the second marker stays"
+        );
+        drop(second);
+        assert!(!path.exists());
+
+        // Another process wrote its marker over this one.
+        let mine = mark_handover().expect("mine");
+        let theirs = r#"{"pid":4242,"until":"2999-01-01T00:00:00+00:00"}"#;
+        std::fs::write(&path, theirs).unwrap();
+        drop(mine);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        let left: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.contains(HANDOVER_FILE))
+            .collect();
+        assert_eq!(left, [HANDOVER_FILE], "no taken copy is left behind");
+    }
+
+    /// The exact removal: a marker that holds other text than the one read
+    /// is put back, one that holds it goes, and a missing one is no error.
+    #[test]
+    fn a_marker_is_removed_only_when_it_holds_the_text_read() {
+        let _home = ScratchHome::new("handover-exact");
+        let path = handover_path().unwrap();
+        remove_marker_if(&path, "anything");
+        std::fs::write(&path, "fresh").unwrap();
+        remove_marker_if(&path, "stale");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh");
+        remove_marker_if(&path, "fresh");
+        assert!(!path.exists());
+        let left = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(HANDOVER_FILE)
+            })
+            .count();
+        assert_eq!(left, 0, "no taken copy is left behind");
     }
 
     /// A reader removes only a marker that parses, names another process
