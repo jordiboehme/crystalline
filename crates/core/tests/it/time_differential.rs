@@ -719,7 +719,15 @@ fn our_expect(input: &str) -> Expect {
         lenient_date: parse_lenient_date(input).map(|v| leak(v.ymd())),
         kept: parse_kept_stamp(input).map(|v| leak(v.rfc3339())),
         rfc2822: parse_rfc2822(input).map(|v| leak(v.rfc3339())),
+        stamp_serde: parse_lenient_stamp(input).map(|v| leak(adapter_text(&StampField(v)))),
+        offset_stamp_serde: parse_lenient_offset(input)
+            .map(|v| leak(adapter_text(&OffsetField(v)))),
     }
+}
+
+/// The bytes an adapter writes: its JSON string without the quotes.
+fn adapter_text<T: Serialize>(value: &T) -> String {
+    serde_json::from_str(&json(value)).expect("an adapter writes a string")
 }
 
 /// chrono's bytes for an outcome, after the ruling that allows a
@@ -754,6 +762,40 @@ fn ruled_bytes(outcome: &Outcome) -> Option<String> {
 fn the_frozen_corpus_is_chronos_answer_after_the_rulings() {
     for (input, frozen) in CORPUS {
         assert_eq!(&our_expect(input), frozen, "{input:?}");
+        // chrono's serde of what its `Deserialize` read, for every row our
+        // side reads (a refusal ruled under J4 has no bytes either).
+        let serde = [
+            (
+                utc_outcome(serde_json::from_str(&json(input)).ok()),
+                frozen.stamp_serde,
+            ),
+            (
+                offset_outcome(serde_json::from_str(&json(input)).ok()),
+                frozen.offset_stamp_serde,
+            ),
+        ];
+        for (theirs, frozen_bytes) in serde {
+            let written = match &theirs {
+                Outcome::Instant {
+                    subsec_nanos,
+                    serialized,
+                    ..
+                } => {
+                    let text: String = serde_json::from_str(serialized).expect("a string");
+                    Some(if *subsec_nanos >= 1_000_000_000 {
+                        second_59(&text)
+                    } else {
+                        text
+                    })
+                }
+                _ => None,
+            };
+            assert_eq!(
+                frozen.lenient.and(written.as_deref()),
+                frozen_bytes,
+                "{input:?}: chrono serde {theirs:?}"
+            );
+        }
         let chrono = [
             offset_outcome(DateTime::parse_from_rfc3339(input).ok()),
             offset_outcome(input.parse::<DateTime<FixedOffset>>().ok()),
@@ -782,7 +824,9 @@ fn the_frozen_corpus_is_chronos_answer_after_the_rulings() {
             );
         }
     }
-    // Both rulings show in the corpus, and nothing else differs.
+    // Both rulings show in the corpus: at least two rows differ from
+    // chrono's `FromStr` (the per-row asserts above hold every difference
+    // to a ruling).
     let differing = CORPUS
         .iter()
         .filter(|(input, frozen)| {

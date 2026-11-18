@@ -809,6 +809,7 @@ fn day_from_parts(parts: Parts) -> Option<Day> {
 #[cfg(test)]
 mod tests {
     use super::corpus::{CORPUS, Expect};
+    use super::serde::{offset_stamp_json, stamp_json};
     use super::*;
     use std::collections::hash_map::DefaultHasher;
 
@@ -1075,7 +1076,8 @@ mod tests {
 
     /// Every row of the frozen corpus through every parser: the bytes our
     /// side writes for what it read, or `None` for a refusal. The serde
-    /// adapters read what the lenient parsers read.
+    /// adapters read what the lenient parsers read and write the frozen
+    /// `stamp_serde` and `offset_stamp_serde` bytes.
     #[test]
     fn corpus_holds() {
         #[derive(::serde::Deserialize)]
@@ -1130,6 +1132,17 @@ mod tests {
             lenient_date: parse_lenient_date(input).map(|v| leak(v.ymd())),
             kept: parse_kept_stamp(input).map(|v| leak(v.rfc3339())),
             rfc2822: parse_rfc2822(input).map(|v| leak(v.rfc3339())),
+            stamp_serde: parse_lenient_stamp(input).map(|v| leak(adapter_text(stamp_json(v)))),
+            offset_stamp_serde: parse_lenient_offset(input)
+                .map(|v| leak(adapter_text(offset_stamp_json(v)))),
+        }
+    }
+
+    /// The text inside a `*_json` value: the bytes the adapter writes.
+    fn adapter_text(value: serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(text) => text,
+            other => panic!("an adapter wrote {other}"),
         }
     }
 
@@ -1161,7 +1174,7 @@ mod tests {
         for (input, _) in CORPUS {
             let e = ours(input);
             println!(
-                "    (\n        {},\n        Expect {{\n            rfc3339: {},\n            lenient: {},\n            date: {},\n            lenient_date: {},\n            kept: {},\n            rfc2822: {},\n        }},\n    ),",
+                "    (\n        {},\n        Expect {{\n            rfc3339: {},\n            lenient: {},\n            date: {},\n            lenient_date: {},\n            kept: {},\n            rfc2822: {},\n            stamp_serde: {},\n            offset_stamp_serde: {},\n        }},\n    ),",
                 literal(input),
                 field(e.rfc3339),
                 field(e.lenient),
@@ -1169,6 +1182,8 @@ mod tests {
                 field(e.lenient_date),
                 field(e.kept),
                 field(e.rfc2822),
+                field(e.stamp_serde),
+                field(e.offset_stamp_serde),
             );
         }
     }

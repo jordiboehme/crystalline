@@ -8,7 +8,8 @@
 //! held every row against chrono, with only the differences a ruling
 //! allows (J4: a leap second read as `:59`, a year outside 0000 to 9999
 //! refused). Without chrono, `time::tests::corpus_holds` keeps the parsers
-//! to these rows, and `time::tests::print_corpus` prints them again.
+//! and the bytes the serde adapters write to these rows, and
+//! `time::tests::print_corpus` prints them again.
 
 /// What each parser makes of one input: the RFC 3339 bytes (`%Y-%m-%d`
 /// for a date) of the value it read, or `None` when it refuses the input.
@@ -27,6 +28,13 @@ pub struct Expect {
     pub kept: Option<&'static str>,
     /// `parse_rfc2822`, then `OffsetStamp::rfc3339`.
     pub rfc2822: Option<&'static str>,
+    /// What the `stamp` serde adapter writes for the value it read (the
+    /// `lenient` value in UTC): `Z` and the fraction in groups of none, 3,
+    /// 6 or 9 digits.
+    pub stamp_serde: Option<&'static str>,
+    /// What the `offset_stamp` serde adapter writes for the value it read
+    /// (the `lenient` value): `Z` for offset zero, else `+hh:mm`.
+    pub offset_stamp_serde: Option<&'static str>,
 }
 
 /// The rows, as (input, what each parser makes of it).
@@ -40,6 +48,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T08:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19+02:00"),
         },
     ),
     (
@@ -51,6 +61,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -62,6 +74,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -73,6 +87,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -84,6 +100,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -95,6 +113,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: Some("2026-01-05T10:17:19+00:00"),
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -106,6 +126,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -117,6 +139,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -128,6 +152,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -139,6 +165,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -150,6 +178,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -161,6 +191,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -172,6 +204,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19.123456789Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.123456789Z"),
         },
     ),
     (
@@ -183,6 +217,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T12:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19-02:00"),
         },
     ),
     (
@@ -194,6 +230,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -205,6 +243,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-12-31T23:59:59Z"),
+            offset_stamp_serde: Some("2026-12-31T23:59:59Z"),
         },
     ),
     (
@@ -216,6 +256,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:59Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:59Z"),
         },
     ),
     (
@@ -227,6 +269,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -238,6 +282,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -249,6 +295,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -260,6 +308,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -271,6 +321,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -282,6 +334,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -293,6 +347,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T04:47:19.120Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.120+05:30"),
         },
     ),
     (
@@ -304,6 +360,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T14:47:19.123456789Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.123456789-04:30"),
         },
     ),
     (
@@ -315,6 +373,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-04T10:18:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19+23:59"),
         },
     ),
     (
@@ -326,6 +386,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -337,6 +399,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -348,6 +412,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -359,6 +425,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -370,6 +438,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -381,6 +451,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -392,6 +464,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2024-02-29T00:00:00Z"),
+            offset_stamp_serde: Some("2024-02-29T00:00:00Z"),
         },
     ),
     (
@@ -403,6 +477,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -414,6 +490,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -425,6 +503,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("0000-01-01T00:00:00Z"),
+            offset_stamp_serde: Some("0000-01-01T00:00:00Z"),
         },
     ),
     (
@@ -436,6 +516,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -447,6 +529,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -458,6 +542,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -469,6 +555,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -480,6 +568,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -491,6 +581,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -502,6 +594,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -513,6 +607,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -524,6 +620,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -535,6 +633,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -546,6 +646,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T01:07:09Z"),
+            offset_stamp_serde: Some("2026-01-05T01:07:09Z"),
         },
     ),
     (
@@ -557,6 +659,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -568,6 +672,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -579,6 +685,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -590,6 +698,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T08:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19+02:00"),
         },
     ),
     (
@@ -601,6 +711,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T08:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19+02:00"),
         },
     ),
     (
@@ -612,6 +724,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T08:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19+02:00"),
         },
     ),
     (
@@ -623,6 +737,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -634,6 +750,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -645,6 +763,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -656,6 +776,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -667,6 +789,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -678,6 +802,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -689,6 +815,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -700,6 +828,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19.500Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.500Z"),
         },
     ),
     (
@@ -711,6 +841,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -722,6 +854,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -733,6 +867,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("0026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("0026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -744,6 +880,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -755,6 +893,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -766,6 +906,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -777,6 +919,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -788,6 +932,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -799,6 +945,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -810,6 +958,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -821,6 +971,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -832,6 +984,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -843,6 +997,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -854,6 +1010,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -865,6 +1023,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -876,6 +1036,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -887,6 +1049,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("0026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -898,6 +1062,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -909,6 +1075,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -920,6 +1088,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -931,6 +1101,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -942,6 +1114,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -953,6 +1127,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -964,6 +1140,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -975,6 +1153,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -986,6 +1166,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -997,6 +1179,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1008,6 +1192,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2024-02-29"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1019,6 +1205,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1030,6 +1218,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1041,6 +1231,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1052,6 +1244,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1063,6 +1257,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: Some("2026-01-05T10:17:19+00:00"),
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1074,6 +1270,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: Some("2026-01-05T10:17:19+00:00"),
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1085,6 +1283,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: Some("2026-01-05T10:17:59+00:00"),
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1096,6 +1296,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1107,6 +1309,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1118,6 +1322,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1129,6 +1335,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1140,6 +1348,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1151,6 +1361,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1162,6 +1374,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1173,6 +1387,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1184,6 +1400,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1195,6 +1413,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+02:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1206,6 +1426,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1217,6 +1439,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:00+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1228,6 +1452,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-12-31T23:59:59+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1239,6 +1465,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1250,6 +1478,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19-05:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1261,6 +1491,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19-05:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1272,6 +1504,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1283,6 +1517,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1294,6 +1530,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1305,6 +1543,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1316,6 +1556,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1327,6 +1569,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1338,6 +1582,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1349,6 +1595,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1360,6 +1608,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1371,6 +1621,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1382,6 +1634,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:19+00:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1393,6 +1647,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1404,6 +1660,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1415,6 +1673,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1426,6 +1686,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T08:17:19.120Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.120+02:00"),
         },
     ),
     (
@@ -1437,6 +1699,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19.123456789Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.123456789Z"),
         },
     ),
     (
@@ -1448,6 +1712,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T14:47:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19-04:30"),
         },
     ),
     (
@@ -1459,6 +1725,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1470,6 +1738,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("9999-12-30T22:00:00.999999999Z"),
+            offset_stamp_serde: Some("9999-12-30T22:00:00.999999999Z"),
         },
     ),
     (
@@ -1481,6 +1751,34 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("0000-01-01T23:59:00Z"),
+            offset_stamp_serde: Some("0000-01-01T00:00:00-23:59"),
+        },
+    ),
+    (
+        "0000-01-01T00:30:00+01:00",
+        Expect {
+            rfc3339: Some("0000-01-01T00:30:00+01:00"),
+            lenient: Some("0000-01-01T00:30:00+01:00"),
+            date: None,
+            lenient_date: None,
+            kept: None,
+            rfc2822: None,
+            stamp_serde: Some("-0001-12-31T23:30:00Z"),
+            offset_stamp_serde: Some("0000-01-01T00:30:00+01:00"),
+        },
+    ),
+    (
+        "2026-01-05T10:17:19.123456Z",
+        Expect {
+            rfc3339: Some("2026-01-05T10:17:19.123456+00:00"),
+            lenient: Some("2026-01-05T10:17:19.123456+00:00"),
+            date: None,
+            lenient_date: None,
+            kept: None,
+            rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19.123456Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.123456Z"),
         },
     ),
     (
@@ -1492,6 +1790,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2024-02-29T06:15:00.500Z"),
+            offset_stamp_serde: Some("2024-02-29T12:00:00.500+05:45"),
         },
     ),
     (
@@ -1503,6 +1803,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-04T23:07:09Z"),
+            offset_stamp_serde: Some("2026-01-05T01:07:09+02:00"),
         },
     ),
     (
@@ -1514,6 +1816,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -1525,6 +1829,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1536,6 +1842,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19.123456789Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19.123456789Z"),
         },
     ),
     (
@@ -1547,6 +1855,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: Some("2026-01-05"),
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1558,6 +1868,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: Some("2026-12-31T23:59:59+00:00"),
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1569,6 +1881,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-01-05T10:17:00-05:00"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1580,6 +1894,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: Some("2026-12-31T23:59:59-02:30"),
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1591,6 +1907,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T01:07:09Z"),
+            offset_stamp_serde: Some("2026-01-05T01:07:09Z"),
         },
     ),
     (
@@ -1602,6 +1920,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T08:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19+02:00"),
         },
     ),
     (
@@ -1613,6 +1933,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T08:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19+02:00"),
         },
     ),
     (
@@ -1624,6 +1946,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: Some("2026-01-05T10:17:19Z"),
+            offset_stamp_serde: Some("2026-01-05T10:17:19Z"),
         },
     ),
     (
@@ -1635,6 +1959,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
     (
@@ -1646,6 +1972,8 @@ pub const CORPUS: &[(&str, Expect)] = &[
             lenient_date: None,
             kept: None,
             rfc2822: None,
+            stamp_serde: None,
+            offset_stamp_serde: None,
         },
     ),
 ];
