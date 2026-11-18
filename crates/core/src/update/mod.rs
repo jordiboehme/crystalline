@@ -6,13 +6,16 @@
 //! exception is the debug-only key seam behind [`trusted_keys`].
 
 pub mod cache;
+pub mod facts;
 pub mod install;
 pub mod release;
 pub mod verify;
 
 pub use cache::{
-    CheckOutcome, Gate, KnownRelease, UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT, UpdateCache, age_gate,
+    CheckOutcome, FAILED_REASON, Gate, KnownRelease, UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT,
+    UpdateCache, age_gate,
 };
+pub use facts::{CheckState, OffReason, UpdateFacts};
 pub use install::{
     CHANNEL_ENV, DetectedInstall, Detection, InstallMethod, MARKER_FILE, Refusal, archive_member,
     asset_name, detect, display_path, official_build, release_platform,

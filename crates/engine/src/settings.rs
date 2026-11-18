@@ -4531,6 +4531,12 @@ mod tests {
         unset(&mut cfg, "update.min_age_hours").unwrap();
         assert_eq!(cfg.update, None);
         assert_eq!(cfg.update_min_age_hours(), 24);
+        // A hand-edited file past the bound reads as the bound.
+        cfg.update = Some(crystalline_core::config::UpdateConfig {
+            check: None,
+            min_age_hours: Some(100_000),
+        });
+        assert_eq!(cfg.update_min_age_hours(), 720);
     }
 
     #[test]

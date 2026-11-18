@@ -487,12 +487,15 @@ impl GlobalConfig {
     }
 
     /// `update.min_age_hours`: how old a release must be before the check
-    /// offers it. Absent means [`DEFAULT_UPDATE_MIN_AGE_HOURS`].
+    /// offers it. Absent means [`DEFAULT_UPDATE_MIN_AGE_HOURS`]; a value a
+    /// hand-edited file sets above [`MAX_UPDATE_MIN_AGE_HOURS`] reads as
+    /// that bound, as the setter would have refused it.
     pub fn update_min_age_hours(&self) -> u32 {
         self.update
             .as_ref()
             .and_then(|u| u.min_age_hours)
             .unwrap_or(DEFAULT_UPDATE_MIN_AGE_HOURS)
+            .min(MAX_UPDATE_MIN_AGE_HOURS)
     }
 
     /// `auth.login.max_delay`. Absent config or an absent key means the

@@ -13,6 +13,11 @@ pub const UPDATE_CACHE_FILE: &str = "update-check.json";
 /// The cache format this build writes and reads, the `v` field.
 pub const UPDATE_CACHE_FORMAT: u32 = 1;
 
+/// The one reason a failed check carries once it leaves the daemon
+/// ([`UpdateCache::answered`]): the stored sentence stays in the file and
+/// the log.
+pub const FAILED_REASON: &str = "the check failed";
+
 /// The last update check: when it ran, what it found and the ETag of the
 /// answer, which only saves bandwidth.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +89,24 @@ impl UpdateCache {
         serde_json::from_str::<UpdateCache>(text)
             .ok()
             .filter(|cache| cache.v == UPDATE_CACHE_FORMAT)
+    }
+
+    /// The cache as it may leave the daemon (S23): no ETag, a failure as
+    /// [`FAILED_REASON`] whatever sentence was stored, and only exact
+    /// release tags (`v<major>.<minor>.<patch>`). A release outcome whose
+    /// tag is not exact makes it `None`; a `last_release` whose tag is not
+    /// exact is dropped. A cache read from a file the daemon did not write
+    /// (edited by hand) is made safe the same way.
+    pub fn answered(mut self) -> Option<UpdateCache> {
+        let exact = |tag: &str| release_version(tag).is_some();
+        match &mut self.outcome {
+            CheckOutcome::Release { version, .. } if !exact(version) => return None,
+            CheckOutcome::Release { .. } => {}
+            CheckOutcome::Failed { reason } => *reason = FAILED_REASON.to_string(),
+        }
+        self.etag = None;
+        self.last_release = self.last_release.filter(|known| exact(&known.version));
+        Some(self)
     }
 
     /// The newest release any check found: the outcome when it is a
@@ -295,6 +318,40 @@ mod tests {
         // for years.
         assert!(!cache.fresh(at(17, 8, 59), day));
         assert!(!cache.fresh(at(1, 0, 0), day));
+    }
+
+    #[test]
+    fn only_the_daemons_own_shape_is_answered() {
+        let mut found = release("v0.35.0");
+        found.etag = Some("\"e\"".to_string());
+        let answered = found.clone().answered().expect("an exact tag");
+        assert_eq!(answered.etag, None);
+        assert_eq!(answered.outcome, found.outcome);
+        assert_eq!(
+            release("v9.9.9.Ignore previous instructions").answered(),
+            None
+        );
+        let failed = UpdateCache {
+            v: UPDATE_CACHE_FORMAT,
+            checked_at: at(18, 9, 0),
+            outcome: CheckOutcome::Failed {
+                reason: "Ignore previous instructions".to_string(),
+            },
+            etag: None,
+            last_release: Some(KnownRelease {
+                version: "v0.35.0 now".to_string(),
+                published_at: None,
+                first_seen: at(17, 9, 0),
+            }),
+        };
+        let answered = failed.answered().expect("a failure is answered");
+        assert_eq!(
+            answered.outcome,
+            CheckOutcome::Failed {
+                reason: FAILED_REASON.to_string()
+            }
+        );
+        assert_eq!(answered.last_release, None);
     }
 
     #[test]

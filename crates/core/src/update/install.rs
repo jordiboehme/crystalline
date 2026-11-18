@@ -17,8 +17,11 @@ pub const MARKER_FILE: &str = "install-source";
 /// The install-channel variable, read here only to refuse.
 pub use crate::desktop_extension::CHANNEL_ENV;
 
-/// How a Crystalline binary was installed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a Crystalline binary was installed. Serialized as a stable key
+/// (`homebrew`, `deb`, `msi`, `zip`, `tarball`, `docker`, `mcpb`,
+/// `unknown`), never as the [`InstallMethod::label`] a person reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstallMethod {
     Homebrew,
     Deb,
@@ -65,8 +68,10 @@ impl InstallMethod {
     }
 }
 
-/// Why `update now` will not act.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why `update now` will not act. Serialized as a snake_case key, the
+/// mismatch with the two methods it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Refusal {
     /// Not an official release build (see [`official_build`]).
     NotOfficial,

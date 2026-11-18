@@ -160,17 +160,18 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // never touch the store (`status` does).
         "holder" => (envelope_ok(holder_data(shared.pid)), false),
         // The install method detected at start, whether the update check is
-        // on, and the last check without its ETag, from memory: `status`
-        // asks this and reads the cache file only when the daemon cannot
-        // answer.
-        "update_facts" => (
-            envelope_ok(
-                shared
-                    .update
-                    .facts(shared.engine.config().update_check_enabled()),
-            ),
-            false,
-        ),
+        // on, and the last check in its answered shape (`UpdateFacts`), from
+        // memory: `status` asks this and reads the cache file only when the
+        // daemon cannot answer.
+        "update_facts" => {
+            let facts = shared
+                .update
+                .facts(shared.engine.config().update_check_enabled());
+            match serde_json::to_value(facts) {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "sessions" => (
             envelope_ok(json!({
                 "count": shared.session_count(),

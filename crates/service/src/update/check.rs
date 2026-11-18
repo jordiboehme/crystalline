@@ -18,11 +18,10 @@ use std::time::Duration;
 
 use crystalline_core::time::{self, Delta, Stamp};
 use crystalline_core::update::{
-    CheckOutcome, Detection, InstallMethod, LatestRelease, Lookup, UPDATE_CACHE_FILE,
-    UPDATE_CACHE_FORMAT, UpdateCache, detect, official_build,
+    CheckOutcome, CheckState, Detection, LatestRelease, Lookup, OffReason, UPDATE_CACHE_FILE,
+    UPDATE_CACHE_FORMAT, UpdateCache, UpdateFacts, detect, official_build,
 };
-use crystalline_core::version::{Precedence, release_version};
-use serde_json::{Value, json};
+use crystalline_core::version::Precedence;
 use tokio::sync::watch;
 
 use super::client::{UpdateError, latest_release};
@@ -34,8 +33,19 @@ pub fn check_interval() -> Delta {
 }
 
 /// How often the check task wakes to see whether a check is due. A
-/// `configure set update.check true` takes effect within this time.
-pub const CHECK_WAKE: Duration = Duration::from_secs(60 * 60);
+/// `configure set update.check true` takes effect within this time; a wake
+/// with nothing due reads one setting and, with the check on, one small
+/// file.
+pub const CHECK_WAKE: Duration = Duration::from_secs(5 * 60);
+
+/// How long a lookup may hold the check lock before another process takes
+/// it as left behind: well past the lookup's own limit (twice 15 s).
+fn lock_stale_after() -> Delta {
+    time::minutes(2)
+}
+
+/// How often a process that finds the check lock taken looks again.
+const LOCK_POLL: Duration = Duration::from_millis(250);
 
 /// The longest random wait before a daemon's first look: short, so a
 /// daemon that exits when idle still gets to check. Short-lived daemons
@@ -43,43 +53,20 @@ pub const CHECK_WAKE: Duration = Duration::from_secs(60 * 60);
 /// file the last attempt wrote.
 pub const MAX_START_JITTER: Duration = Duration::from_secs(60);
 
-/// The reason the check is off when nothing suppresses it but the setting.
-pub const OFF_BY_SETTING: &str = "not turned on";
-
-/// The reason the check is off when there is no state folder to cache it
-/// in, so no check could ever run.
-pub const OFF_NO_STATE_FOLDER: &str = "no state folder";
-
-/// The one reason a failed check carries in the ctl answer: the cached
-/// sentence stays in the file and the log (S23).
-pub const FAILED_REASON: &str = "the check failed";
-
 /// The file the .deb's package list is read from, as a file and never
 /// through `dpkg`.
 #[cfg(target_os = "linux")]
 const DPKG_LIST: &str = "/var/lib/dpkg/info/crystalline.list";
 
-/// Why the passive check must not run whatever the setting says, or `None`:
-/// `NO_UPDATE_NOTIFIER` or `CI` set to anything but an empty value, a
-/// Docker install or the Claude Desktop extension. The method is asked, not
-/// the refusal, since an unofficial build replaces the refusal and keeps the
-/// method. The setting itself is the caller's to add ([`OFF_BY_SETTING`]).
+/// Why the passive check must not run whatever the setting says, as its
+/// fixed sentence, or `None`: see [`OffReason::suppressing`]. The setting
+/// and the state folder are the caller's to add ([`OffReason::NotTurnedOn`],
+/// [`OffReason::NoStateFolder`]).
 pub fn check_suppressed(
     env: &dyn Fn(&str) -> Option<String>,
     detection: &Detection,
 ) -> Option<&'static str> {
-    let set = |name: &str| env(name).is_some_and(|value| !value.is_empty());
-    if set("NO_UPDATE_NOTIFIER") {
-        Some("NO_UPDATE_NOTIFIER is set")
-    } else if set("CI") {
-        Some("CI is set")
-    } else if detection.method == InstallMethod::Docker {
-        Some("Docker")
-    } else if detection.method == InstallMethod::Mcpb {
-        Some("Claude Desktop extension")
-    } else {
-        None
-    }
+    OffReason::suppressing(env, detection).map(|reason| reason.text())
 }
 
 /// The cache at `path`, or `None` when there is none, it cannot be read or
@@ -95,16 +82,42 @@ pub fn read_cache(path: &Path) -> Option<UpdateCache> {
 /// written through a temporary file and a rename, and returned. A write
 /// that fails is logged; the result is still returned.
 ///
+/// The lookup runs under a lock file beside the cache, so two processes
+/// that share a state folder never both ask: the second waits, then takes
+/// the check the first wrote. A lock older than two minutes was left by a
+/// process that died and is taken over. Under the lock, temporary files a
+/// killed writer left are removed.
+///
 /// The ETag is sent only when the cache holds a release, so a "not
 /// modified" always has one to keep. A release seen before keeps its
 /// `first_seen`, and its ETag and publish time when only the fallback
 /// answered. The first time a version newer than this binary is seen, one
 /// log line `newer release <version> seen` goes to the journal.
 pub async fn run_check(cache_path: &Path, now: Stamp) -> UpdateCache {
+    let fresh = || read_cache(cache_path).filter(|c| c.fresh(now, check_interval()));
+    if let Some(cache) = fresh() {
+        return cache;
+    }
+    // A folder the lock cannot be made in cannot hold the cache either:
+    // the check then goes on without the lock and its write fails.
+    let _lock = loop {
+        match CheckLock::try_take(cache_path) {
+            Ok(Some(lock)) => break Some(lock),
+            Ok(None) => {
+                tokio::time::sleep(LOCK_POLL).await;
+                if let Some(cache) = fresh() {
+                    return cache;
+                }
+            }
+            Err(_) => break None,
+        }
+    };
+    // Read again under the lock: the holder before may have just written.
     let previous = read_cache(cache_path);
     if let Some(cache) = previous.as_ref().filter(|c| c.fresh(now, check_interval())) {
         return cache.clone();
     }
+    remove_left_temp_files(cache_path);
     let etag = previous
         .as_ref()
         .filter(|c| matches!(c.outcome, CheckOutcome::Release { .. }))
@@ -236,10 +249,7 @@ fn write_atomically(
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let mut name = std::ffi::OsString::from(".");
-    name.push(path.file_name().unwrap_or_default());
-    name.push(format!(".tmp-{}", std::process::id()));
-    let temp = path.with_file_name(name);
+    let temp = sibling(path, &format!(".tmp-{}", std::process::id()));
     // Synced before the rename, so a power loss leaves the old cache or the
     // new one, never an empty file.
     let written = write_synced(&temp, bytes)
@@ -258,15 +268,99 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// The check lock, `.update-check.json.lock` beside the cache, removed
+/// when dropped (also when the lookup is cancelled by a shutdown).
+struct CheckLock(PathBuf);
+
+impl CheckLock {
+    /// The lock, `None` while another process holds it, or the error that
+    /// kept it from being made.
+    fn try_take(cache_path: &Path) -> std::io::Result<Option<CheckLock>> {
+        let path = sibling(cache_path, ".lock");
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Some(CheckLock(path))),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let left = std::fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(Stamp::from_system_time)
+                        .is_some_and(|at| time::now().since(at) >= lock_stale_after());
+                    if !left {
+                        return Ok(None);
+                    }
+                    // Left by a process that died: take it over once.
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for CheckLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `.<cache file name><suffix>` beside the cache.
+fn sibling(cache_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(cache_path.file_name().unwrap_or_default());
+    name.push(suffix);
+    cache_path.with_file_name(name)
+}
+
+/// Remove the temporary files a writer killed between its write and its
+/// rename left beside the cache. Called under the check lock, so no live
+/// writer's file is taken.
+fn remove_left_temp_files(cache_path: &Path) {
+    let prefix = sibling(cache_path, ".tmp-");
+    let (Some(dir), Some(prefix)) = (
+        cache_path.parent(),
+        prefix.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(prefix))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// What the daemon knows about updating, fixed at its start (S18) but for
 /// the cache: the install method detected once, so a package upgrade that
 /// removes the running exe does not turn it into "unknown"; whether the
-/// environment or the method suppresses the check; and the last check.
+/// environment or the method suppresses the check; and the last check,
+/// held only in the shape that may leave the daemon
+/// ([`UpdateCache::answered`]), so no reader of it ever sees the ETag, a
+/// stored failure sentence or an unchecked tag.
 #[derive(Debug)]
 pub struct UpdateState {
     detection: Detection,
     official: bool,
-    suppressed: Option<&'static str>,
+    suppressed: Option<OffReason>,
     cache_path: Option<PathBuf>,
     cache: watch::Sender<Option<UpdateCache>>,
 }
@@ -297,11 +391,14 @@ impl UpdateState {
         let official = official_build();
         let packaged = crate::runs_in::PackageContext::here().is_packaged();
         let detection = detection.for_build(official, packaged);
-        let cache = cache_path.as_deref().and_then(read_cache);
+        let cache = cache_path
+            .as_deref()
+            .and_then(read_cache)
+            .and_then(UpdateCache::answered);
         UpdateState {
             detection,
             official,
-            suppressed: check_suppressed(env, &detection),
+            suppressed: OffReason::suppressing(env, &detection),
             cache_path,
             cache: watch::Sender::new(cache),
         }
@@ -312,31 +409,31 @@ impl UpdateState {
         self.detection
     }
 
-    /// A receiver of the last check, which changes after every check.
+    /// A receiver of the last check, already [`UpdateCache::answered`],
+    /// which changes after every check.
     pub fn subscribe(&self) -> watch::Receiver<Option<UpdateCache>> {
         self.cache.subscribe()
     }
 
-    /// The `update_facts` answer: the method's label, whether this is an
-    /// official build, `on` or `off: <reason>` given whether `update.check`
-    /// is on, and the last check (`null` when there is none). The check is
-    /// passed on only in the shape this daemon writes (S23): no ETag, a
-    /// failure as [`FAILED_REASON`], and a release tag that is not exactly
-    /// `v<major>.<minor>.<patch>` (a cache edited by hand) not at all.
-    pub fn facts(&self, setting_on: bool) -> Value {
+    /// The `update_facts` answer: the method detected at start, whether
+    /// this is an official build, why `update now` would not act, whether
+    /// the check is on given `update.check` (the environment's reasons
+    /// win, and without a state folder no check could run), and the last
+    /// check, already answered.
+    pub fn facts(&self, setting_on: bool) -> UpdateFacts {
         let check = match (self.suppressed, setting_on) {
-            (Some(reason), _) => format!("off: {reason}"),
-            (None, false) => format!("off: {OFF_BY_SETTING}"),
-            (None, true) if self.cache_path.is_none() => format!("off: {OFF_NO_STATE_FOLDER}"),
-            (None, true) => "on".to_string(),
+            (Some(reason), _) => CheckState::Off(reason),
+            (None, false) => CheckState::Off(OffReason::NotTurnedOn),
+            (None, true) if self.cache_path.is_none() => CheckState::Off(OffReason::NoStateFolder),
+            (None, true) => CheckState::On,
         };
-        let cache = self.cache.borrow().clone().and_then(answered_cache);
-        json!({
-            "method": self.detection.method.label(),
-            "official": self.official,
-            "check": check,
-            "cache": cache,
-        })
+        UpdateFacts {
+            method: self.detection.method,
+            official: self.official,
+            refusal: self.detection.refusal,
+            check,
+            cache: self.cache.borrow().clone(),
+        }
     }
 
     /// Whether a check may run now: nothing suppresses it, the setting is
@@ -344,19 +441,6 @@ impl UpdateState {
     fn may_check(&self, setting_on: bool) -> bool {
         setting_on && self.suppressed.is_none() && self.cache_path.is_some()
     }
-}
-
-/// A cache as the ctl answer carries it: see [`UpdateState::facts`].
-fn answered_cache(mut cache: UpdateCache) -> Option<UpdateCache> {
-    let exact = |tag: &str| release_version(tag).is_some();
-    match &mut cache.outcome {
-        CheckOutcome::Release { version, .. } if !exact(version) => return None,
-        CheckOutcome::Release { .. } => {}
-        CheckOutcome::Failed { reason } => *reason = FAILED_REASON.to_string(),
-    }
-    cache.etag = None;
-    cache.last_release = cache.last_release.filter(|known| exact(&known.version));
-    Some(cache)
 }
 
 /// The text of the .deb's package list, when this system has one.
@@ -412,9 +496,10 @@ pub async fn run_update_checks(
         // `crystalline update check`, another daemon) reaches the answer
         // within one wake.
         if let Some(file) = read_cache(&path).filter(|c| c.fresh(now, check_interval())) {
+            let file = file.answered();
             state.cache.send_if_modified(|held| {
-                let changed = held.as_ref() != Some(&file);
-                *held = Some(file);
+                let changed = *held != file;
+                *held = file;
                 changed
             });
             continue;
@@ -434,7 +519,7 @@ pub async fn run_update_checks(
             _ = crate::daemon::wait_true(&mut shutdown) => break,
             cache = run_check(&path, now) => cache,
         };
-        state.cache.send_replace(Some(cache));
+        state.cache.send_replace(cache.answered());
     }
 }
 

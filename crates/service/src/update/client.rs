@@ -78,7 +78,7 @@ pub enum UpdateError {
     /// The download is larger than any release asset.
     TooLarge,
     /// A download was redirected to a place that is not GitHub, or over
-    /// plain http, or too often.
+    /// plain http, or more than three times.
     Redirect,
 }
 
@@ -96,7 +96,7 @@ impl std::fmt::Display for UpdateError {
             UpdateError::BadAsset => f.write_str("not the name of a release asset"),
             UpdateError::TooLarge => f.write_str("the download is larger than any release asset"),
             UpdateError::Redirect => {
-                f.write_str("the download was redirected to a place that is not GitHub")
+                f.write_str("the download was redirected away from GitHub or too often")
             }
         }
     }

@@ -131,6 +131,32 @@ fn redirect_to(tag: &str) -> Response<Body> {
     )
 }
 
+/// The header names of a request, sorted.
+fn header_names(request: &Seen) -> Vec<String> {
+    let mut names: Vec<String> = request
+        .headers
+        .keys()
+        .map(|name| name.as_str().to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// What every request may carry and nothing more: the privacy statement
+/// ("the address and the version") rests on this list.
+const ONLY_HEADERS: [&str; 3] = ["accept", "host", "user-agent"];
+
+fn assert_only(request: &Seen, extra: &[&str]) {
+    let mut allowed: Vec<String> = ONLY_HEADERS
+        .iter()
+        .chain(extra)
+        .map(|name| name.to_string())
+        .collect();
+    allowed.sort();
+    assert_eq!(header_names(request), allowed, "{request:?}");
+}
+
 fn fresh(lookup: Lookup) -> (LatestRelease, Option<String>) {
     match lookup {
         Lookup::Fresh(release, etag) => (release, etag),
@@ -203,11 +229,17 @@ async fn sends_only_the_user_agent() {
             "{request:?}"
         );
         assert!(!request.headers.contains_key("cookie"), "{request:?}");
+        // No ETag to send, and nothing else either: the lookup and the
+        // download carry exactly these headers.
+        assert_only(request, &[]);
     }
-    assert!(
-        !seen[0].headers.contains_key("if-none-match"),
-        "no ETag to send"
-    );
+
+    // With a cached release the lookup adds the ETag GitHub gave, and only
+    // that.
+    latest_release(Some("\"v1\"")).await.expect("a lookup");
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_only(&seen[2], &["if-none-match"]);
 }
 
 #[tokio::test]
@@ -260,6 +292,8 @@ async fn rate_limit_403_falls_back_to_the_redirect() {
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert_eq!(seen[1].method, Method::HEAD);
         assert_eq!(seen[1].path, WEB_PATH);
+        assert_only(&seen[0], &["if-none-match"]);
+        assert_only(&seen[1], &[]);
     }
 }
 
@@ -444,7 +478,7 @@ async fn a_download_follows_redirects_only_within_github() {
         assert!(matches!(err, UpdateError::Redirect), "{asset}: {err:?}");
         assert_eq!(
             err.to_string(),
-            "the download was redirected to a place that is not GitHub"
+            "the download was redirected away from GitHub or too often"
         );
     }
     let left: Vec<_> = std::fs::read_dir(dir.path())

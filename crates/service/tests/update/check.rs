@@ -12,8 +12,8 @@ use axum::http::{Method, StatusCode};
 use crystalline_core::config::UpdateConfig;
 use crystalline_core::time::{self, Stamp};
 use crystalline_core::update::{
-    CheckOutcome, Detection, InstallMethod, KnownRelease, Refusal, UPDATE_CACHE_FILE,
-    UPDATE_CACHE_FORMAT, UpdateCache,
+    CheckOutcome, CheckState, Detection, InstallMethod, KnownRelease, OffReason, Refusal,
+    UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT, UpdateCache, UpdateFacts,
 };
 use crystalline_core::version::Precedence;
 use crystalline_service::control::{answer_for_test, answer_for_test_with_update};
@@ -357,7 +357,14 @@ fn suppressed_by_no_update_notifier_ci_docker_mcpb() {
         &env_of(&[("CRYSTALLINE_CHANNEL", "mcpb")]),
         None,
     );
-    assert_eq!(state.facts(true)["check"], "off: Claude Desktop extension");
+    assert_eq!(
+        state.facts(true).check,
+        CheckState::Off(OffReason::DesktopExtension)
+    );
+    assert_eq!(
+        state.facts(true).check.text(),
+        "off: Claude Desktop extension"
+    );
 }
 
 #[test]
@@ -388,7 +395,7 @@ fn method_is_detected_once_at_start() {
         InstallMethod::Unknown
     );
     assert_eq!(state.detection().method, expected);
-    assert_eq!(state.facts(false)["method"], expected.label());
+    assert_eq!(state.facts(false).method, expected);
 }
 
 #[tokio::test]
@@ -425,7 +432,14 @@ async fn update_facts_over_ctl() {
     let answer = answer_for_test_with_update(fx.engine.clone(), state.clone(), &request).await;
     assert_eq!(answer["ok"], true, "{answer}");
     let data = &answer["data"];
-    assert_eq!(data["method"], state.detection().method.label());
+    // The method as a stable key, never its display label, and the
+    // refusal beside it: a test build is not official.
+    let key = if cfg!(windows) { "zip" } else { "tarball" };
+    assert_eq!(data["method"], key, "{answer}");
+    assert_eq!(data["refusal"], "not_official", "{answer}");
+    let facts: UpdateFacts = serde_json::from_value(data.clone()).unwrap();
+    assert_eq!(facts, state.facts(false));
+    assert_eq!(facts.refusal, Some(Refusal::NotOfficial));
     assert_eq!(data["check"], "off: not turned on");
     assert_eq!(data["cache"]["v"], 1);
     assert_eq!(data["cache"]["checked_at"], "2026-11-18T09:00:00Z");
@@ -755,4 +769,84 @@ async fn a_check_written_by_another_process_reaches_the_daemon() {
     stop.send_replace(true);
     task.await.unwrap();
     assert!(fake.seen().is_empty(), "nothing asked of GitHub");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_on_one_state_folder_ask_once() {
+    let _env = ENV.lock().await;
+    // A slow GitHub: the second check arrives while the first one waits.
+    let fake = Fake::start(|_, path, _| match path {
+        API_PATH => {
+            std::thread::sleep(Duration::from_millis(400));
+            respond(StatusCode::OK, &[], &api_release("v99.0.0"))
+        }
+        _ => respond(StatusCode::NOT_FOUND, &[], ""),
+    })
+    .await;
+    use_fake(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+    // A temporary file a writer killed before its rename left behind.
+    let left = dir.path().join(".update-check.json.tmp-999999");
+    std::fs::write(&left, "{").unwrap();
+
+    let first = tokio::spawn({
+        let path = path.clone();
+        async move { run_check(&path, t0()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second = run_check(&path, later(1)).await;
+    let first = first.await.unwrap();
+    assert_eq!(api_count(&fake), 1, "the second waited for the first");
+    assert_eq!(second, first, "and took its check");
+    assert!(!left.exists(), "the left temporary file is gone");
+    assert_eq!(names(dir.path()), vec![UPDATE_CACHE_FILE.to_string()]);
+
+    // A lock a dead process left two minutes ago or more is taken over.
+    let lock = dir.path().join(".update-check.json.lock");
+    let file = std::fs::File::create(&lock).unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(10 * 60))
+        .unwrap();
+    drop(file);
+    tokio::time::timeout(Duration::from_secs(10), run_check(&path, later(30)))
+        .await
+        .expect("a left lock does not hold the check");
+    assert_eq!(api_count(&fake), 2);
+    assert!(!lock.exists());
+}
+
+#[tokio::test]
+async fn the_watch_holds_only_the_answered_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+    let cache = UpdateCache {
+        v: UPDATE_CACHE_FORMAT,
+        checked_at: t0(),
+        outcome: CheckOutcome::Failed {
+            reason: "stored sentence".to_string(),
+        },
+        etag: Some("\"e\"".to_string()),
+        last_release: Some(KnownRelease {
+            version: "v99.0.0".to_string(),
+            published_at: None,
+            first_seen: t0(),
+        }),
+    };
+    std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
+    let exe = dir.path().join("crystalline");
+    std::fs::write(&exe, "binary").unwrap();
+    let none = |_: &str| None;
+    let state = UpdateState::detect(&exe, &none, Some(path));
+    let held = state.subscribe().borrow().clone().expect("loaded at start");
+    assert_eq!(held.etag, None);
+    assert_eq!(
+        held.outcome,
+        CheckOutcome::Failed {
+            reason: "the check failed".to_string()
+        }
+    );
+    assert_eq!(
+        held.known_release().map(|k| k.version),
+        Some("v99.0.0".to_string())
+    );
 }
