@@ -9,6 +9,7 @@ mod support;
 mod fixture;
 
 mod check;
+mod now;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

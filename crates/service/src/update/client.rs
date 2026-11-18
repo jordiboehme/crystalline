@@ -80,6 +80,15 @@ pub enum UpdateError {
     /// A download was redirected to a place that is not GitHub, or over
     /// plain http, or more than three times.
     Redirect,
+    /// Another `crystalline update now` holds the update lock.
+    Locked,
+    /// The release has no asset for this install method on this system.
+    NoAsset,
+    /// GitHub's API answered but lists no digest for the asset, so the
+    /// download cannot be checked against it (fail closed).
+    NoDigest,
+    /// A download failed its verification.
+    Verify(crystalline_core::update::VerifyError),
 }
 
 impl std::fmt::Display for UpdateError {
@@ -98,6 +107,12 @@ impl std::fmt::Display for UpdateError {
             UpdateError::Redirect => {
                 f.write_str("the download was redirected away from GitHub or too often")
             }
+            UpdateError::Locked => f.write_str("another update is running"),
+            UpdateError::NoAsset => {
+                f.write_str("the release has no download for this install on this system")
+            }
+            UpdateError::NoDigest => f.write_str("GitHub lists no sha256 digest for the download"),
+            UpdateError::Verify(err) => write!(f, "verification failed: {err}"),
         }
     }
 }
@@ -107,6 +122,7 @@ impl std::error::Error for UpdateError {
         match self {
             UpdateError::Http(err) => Some(err),
             UpdateError::Io(err) => Some(err),
+            UpdateError::Verify(err) => Some(err),
             _ => None,
         }
     }

@@ -2567,6 +2567,9 @@ fn run() -> anyhow::Result<()> {
             cmd: UpdateCommand::Check { ignore_age },
         }) => on_runtime(move || update::check(ignore_age, cli.json)),
         Some(Command::Update {
+            cmd: UpdateCommand::Now { yes, ignore_age },
+        }) => on_runtime(move || update::now(yes, ignore_age)),
+        Some(Command::Update {
             cmd: UpdateCommand::VerifySums { sums, minisig, tag },
         }) => verify_sums(&sums, &minisig, &tag),
         Some(Command::HoldLock {
@@ -5920,6 +5923,31 @@ enum UpdateCommand {
     /// install); 1 the check failed.
     Check {
         /// Offer a release however recently it was published (skips the
+        /// `update.min_age_hours` gate).
+        #[arg(long)]
+        ignore_age: bool,
+    },
+    /// Update to the newest stable release, as the install method allows.
+    ///
+    /// Homebrew: runs `brew upgrade jordiboehme/tap/crystalline`, then
+    /// says whether the version moved. .deb: downloads and verifies the
+    /// package, then prints the apt command; it never runs apt. MSI and zip:
+    /// downloads and verifies, then prints the steps. Every download is
+    /// verified first: the digest GitHub lists, the signed SHA256SUMS and
+    /// its minisign signature for the release tag.
+    ///
+    /// Homebrew and tar.gz installs change installed files, so they need
+    /// `--yes` or a yes at the terminal's question. Without either and with
+    /// no terminal, the plan is printed and nothing is done (exit 10).
+    ///
+    /// Exit codes: 0 done, or nothing to do (up to date, or the release is
+    /// younger than the release-age gate); 10 an update is available but
+    /// nothing was done; 1 refused (the reason is printed) or failed.
+    Now {
+        /// Act without asking (Homebrew and tar.gz installs).
+        #[arg(long)]
+        yes: bool,
+        /// Update however recently the release was published (skips the
         /// `update.min_age_hours` gate).
         #[arg(long)]
         ignore_age: bool,

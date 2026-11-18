@@ -152,11 +152,12 @@ fn the_test_key_seam_is_debug_only() {
 /// A fake GitHub on 127.0.0.1 for `update check`: the API's latest release
 /// answers with `status` and `body` and the ETag [`ETAG`], or with 304 to a
 /// request that sends that ETag back; anything else is a 404. It counts the
-/// API requests and the 304 answers. Plain HTTP/1.1, one request per
-/// connection.
+/// API requests and the 304 answers, and every request it saw. Plain
+/// HTTP/1.1, one request per connection.
 #[cfg(debug_assertions)]
 struct FakeGitHub {
     base: String,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     api_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     not_modified: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -172,6 +173,8 @@ impl FakeGitHub {
         use std::sync::atomic::Ordering;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_all = requests.clone();
         let api_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let not_modified = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = api_requests.clone();
@@ -179,6 +182,7 @@ impl FakeGitHub {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
+                count_all.fetch_add(1, Ordering::SeqCst);
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() {
@@ -219,9 +223,14 @@ impl FakeGitHub {
         });
         FakeGitHub {
             base,
+            requests,
             api_requests,
             not_modified,
         }
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn api_requests(&self) -> usize {
@@ -257,6 +266,18 @@ fn update_check(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> std::process::Output {
+    update(home, fake, "check", args, env)
+}
+
+/// `crystalline update <verb> <args>` in its own home against `fake`.
+#[cfg(debug_assertions)]
+fn update(
+    home: &std::path::Path,
+    fake: &FakeGitHub,
+    verb: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = crate::common::crystalline_std();
     for (name, value) in crate::common::isolation_env(home) {
         cmd.env(name, value);
@@ -279,7 +300,7 @@ fn update_check(
     for (name, value) in env {
         cmd.env(name, value);
     }
-    cmd.args(["update", "check"]).args(args).output().unwrap()
+    cmd.args(["update", verb]).args(args).output().unwrap()
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -527,6 +548,55 @@ fn update_is_listed_and_check_documents_exit_10() {
     let help = text(&out.stdout);
     assert!(help.contains("10 an update is available"), "{help}");
     assert!(help.contains("--ignore-age"), "{help}");
+}
+
+/// A test build is no official build, so `update now` refuses before it
+/// asks GitHub anything or writes a file, with `--yes` too.
+#[cfg(debug_assertions)]
+#[test]
+fn an_unofficial_build_refuses_before_any_download() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = FakeGitHub::start(200, release("v99.0.0", false, LONG_AGO));
+    for args in [&[][..], &["--yes", "--ignore-age"][..]] {
+        let out = update(home.path(), &fake, "now", args, &[]);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}: {}", text(&out.stdout));
+        assert!(
+            stderr.contains("update now does nothing: not an official release build"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert_eq!(fake.requests(), 0, "the fake saw no request");
+    // No lock and no download folder anywhere in the home.
+    let mut dirs = vec![home.path().to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                assert_ne!(path.file_name().unwrap(), "updates", "{}", path.display());
+                dirs.push(path);
+            }
+        }
+    }
+}
+
+#[test]
+fn now_documents_its_exit_codes_and_flags() {
+    let out = crate::common::crystalline()
+        .args(["update", "now", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = text(&out.stdout);
+    for needle in [
+        "--yes",
+        "--ignore-age",
+        "10 an update is available but nothing was done",
+        "brew upgrade jordiboehme/tap/crystalline",
+    ] {
+        assert!(help.contains(needle), "{needle}: {help}");
+    }
 }
 
 /// A Postgres schema of this test's own, with the configuration document

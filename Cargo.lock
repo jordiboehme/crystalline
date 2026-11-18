@@ -1656,6 +1656,7 @@ dependencies = [
  "interprocess",
  "jsonwebtoken",
  "libc",
+ "minisign",
  "notify",
  "openidconnect",
  "percent-encoding",
