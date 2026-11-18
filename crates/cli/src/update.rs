@@ -19,13 +19,14 @@ use crystalline_core::update::{
 use crystalline_core::version::{Precedence, release_tag, release_version};
 use crystalline_service::update::swap::finish_after_swap;
 use crystalline_service::update::{
-    Handover, Spawner, SystemSpawner, UpdateError, UpdateLock, download_dir, fetch_verified,
-    hand_over, install_tarball, latest_release, remove_older_tags, root_owned_install_dir,
-    take_lock, under_sudo, writable_install_dir,
+    Handover, Spawner, SystemSpawner, UpdateError, UpdateLock, download_dir, extract_zip_member,
+    fetch_verified, hand_over, install_tarball, latest_release, remove_older_tags,
+    root_owned_install_dir, take_lock, under_sudo, writable_install_dir,
 };
 use serde::{Serialize, Serializer};
 
 use crate::ExitWith;
+use crate::update_windows::{self, DaemonStart};
 
 /// The exit code of `update check` (and of a plan-only `update now`) when a
 /// newer stable release is available and old enough to be offered.
@@ -443,6 +444,11 @@ pub(crate) struct NowContext<'a> {
     /// The canonical exe the detection spoke for: the one file a tar.gz
     /// update replaces.
     pub(crate) exe: Option<PathBuf>,
+    /// How the running daemon was started, for the MSI steps; `None` when
+    /// no daemon runs.
+    pub(crate) daemon: Option<DaemonStart>,
+    /// `%ProgramFiles%`, which names the MSI's default folder.
+    pub(crate) program_files: Option<String>,
     /// When the run started.
     pub(crate) now: Stamp,
 }
@@ -496,6 +502,8 @@ pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
         euid,
         sudo,
         exe: detected.exe,
+        daemon: running_daemon(),
+        program_files: std::env::var("ProgramFiles").ok(),
         now: time::now(),
     };
     let result = run_now(&context, yes, ignore_age).await;
@@ -652,15 +660,20 @@ pub(crate) async fn act(
             );
             Ok(0)
         }
-        InstallMethod::Deb | InstallMethod::Msi | InstallMethod::Zip => {
+        InstallMethod::Deb => {
             let asset = asset_name(method, &release.version).ok_or(UpdateError::NoAsset)?;
             let dir = download_dir(&context.cache_dir, &release.tag);
             let (path, checks) = fetch_verified(release, &asset, &dir).await?;
             println!("{}", checks_line(&checks, &release.tag));
             println!("Downloaded: {}", display_path(&path));
-            if method == InstallMethod::Deb {
-                print!("{}", apt_steps(&dir, &asset, context.euid, context.sudo));
-            }
+            print!("{}", apt_steps(&dir, &asset, context.euid, context.sudo));
+            Ok(0)
+        }
+        InstallMethod::Msi | InstallMethod::Zip => {
+            let asset = asset_name(method, &release.version).ok_or(UpdateError::NoAsset)?;
+            let member = archive_member(&release.version).ok_or(UpdateError::NoAsset)?;
+            let steps = windows_steps(context, release, &asset, &member).await?;
+            print!("{steps}");
             Ok(0)
         }
         InstallMethod::Tarball => {
@@ -693,6 +706,72 @@ pub(crate) async fn act(
             anyhow::bail!(refused_line(&Refusal::Unknown))
         }
     }
+}
+
+/// The MSI and zip branch of [`act`] (S22): remove a `crystalline.old.exe`
+/// an earlier update left, download and verify the asset (and for the zip
+/// extract `crystalline.exe` into the download folder), then build the
+/// steps that install it, write them to `steps.txt` in the download folder
+/// and hand them back for printing, followed by the line that names that
+/// file. Nothing is run and the install folder is never written but for
+/// the leftover.
+pub(crate) async fn windows_steps(
+    context: &NowContext<'_>,
+    release: &LatestRelease,
+    asset: &str,
+    member: &str,
+) -> anyhow::Result<String> {
+    let exe = context
+        .exe
+        .as_deref()
+        .with_context(|| refused_line(&Refusal::Unknown))?;
+    let leftover = update_windows::remove_old_exe(exe);
+    let dir = download_dir(&context.cache_dir, &release.tag);
+    let (path, checks) = fetch_verified(release, asset, &dir).await?;
+    println!("{}", checks_line(&checks, &release.tag));
+    println!("Downloaded: {}", display_path(&path));
+    let steps = if context.detection.method == InstallMethod::Zip {
+        extract_zip_member(&path, member, &dir)?;
+        let mut steps = String::new();
+        if let Some(old) = &leftover {
+            steps.push_str(&format!(
+                "{} is still there and in use; delete it once nothing runs it, before step 2.\n",
+                display_path(old)
+            ));
+        }
+        steps.push_str(&update_windows::zip_steps(&dir, exe, &release.version));
+        steps
+    } else {
+        // The install root is the parent of bin\ (S3).
+        let root = exe
+            .parent()
+            .and_then(Path::parent)
+            .with_context(|| refused_line(&Refusal::Unknown))?;
+        update_windows::msi_steps(
+            &dir,
+            asset,
+            root,
+            context.daemon.as_ref(),
+            update_windows::is_default_folder(root, context.program_files.as_deref()),
+        )
+    };
+    let file = dir.join(update_windows::STEPS_FILE);
+    std::fs::write(&file, update_windows::steps_file_bytes(&steps))
+        .with_context(|| format!("cannot write {}", display_path(&file)))?;
+    Ok(format!(
+        "{steps}These steps are saved in {}.\n",
+        display_path(&file)
+    ))
+}
+
+/// How the daemon that runs now was started, from its record; `None` when
+/// none runs.
+fn running_daemon() -> Option<DaemonStart> {
+    let info = crystalline_service::instance::read_lock_info()?;
+    if !crystalline_service::instance::process_alive(info.pid) {
+        return None;
+    }
+    update_windows::daemon_start(&info)
 }
 
 /// Run `brew upgrade` (S13), then read the version of the binary Homebrew
@@ -1292,6 +1371,8 @@ mod tests {
             euid: Some(1000),
             sudo: false,
             exe: None,
+            daemon: None,
+            program_files: None,
             now: now(),
         }
     }
@@ -1303,6 +1384,248 @@ mod tests {
             published_at: Some(at(10)),
             digests: Default::default(),
             from_api: true,
+        }
+    }
+
+    /// A fake release download on 127.0.0.1 serving `files` under
+    /// `/jordiboehme/crystalline/releases/download/<tag>/`; anything else
+    /// is a 404. Plain HTTP/1.1, one request per connection.
+    #[cfg(debug_assertions)]
+    fn serve_release(tag: &str, files: Vec<(String, Vec<u8>)>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let prefix = format!("/jordiboehme/crystalline/releases/download/{tag}/");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if line == "\r\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                let path = request.split(' ').nth(1).unwrap_or_default();
+                let found = path
+                    .strip_prefix(&prefix)
+                    .and_then(|name| files.iter().find(|(file, _)| file == name));
+                let (status, body): (u16, &[u8]) = match found {
+                    Some((_, body)) => (200, body),
+                    None => (404, b""),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        base
+    }
+
+    /// Every file under `dir` with its bytes, by path.
+    #[cfg(debug_assertions)]
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(at) = todo.pop() {
+            for entry in std::fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    files.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// The download seam and the test key, set for one test at a time.
+    #[cfg(debug_assertions)]
+    static WINDOWS_SEAMS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// `update now`'s MSI or zip branch, [`windows_steps`], against a fake
+    /// release of `asset` (signed with the test key) for an install of
+    /// `method` at `<tmp>/Program Files/Crystalline/bin/crystalline.exe`.
+    /// Hands back the install folder before and after, what was printed,
+    /// and the download folder.
+    #[cfg(debug_assertions)]
+    async fn run_windows_branch(
+        method: InstallMethod,
+        asset: &str,
+        bytes: Vec<u8>,
+    ) -> (
+        Vec<(PathBuf, Vec<u8>)>,
+        Vec<(PathBuf, Vec<u8>)>,
+        String,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        use sha2::Digest;
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures/update");
+        let tag = "v0.34.0";
+        let hex: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let sums = format!("{hex}  {asset}\n");
+        let secret = std::fs::read_to_string(fixtures.join("test.key")).unwrap();
+        let sk = minisign::SecretKeyBox::from_string(&secret)
+            .unwrap()
+            .into_unencrypted_secret_key()
+            .unwrap();
+        let sig = minisign::sign(
+            None,
+            &sk,
+            sums.as_bytes(),
+            Some(&format!("tag:{tag}")),
+            None,
+        )
+        .unwrap()
+        .into_string();
+        let base = serve_release(
+            tag,
+            vec![
+                (asset.to_string(), bytes),
+                ("SHA256SUMS".to_string(), sums.into_bytes()),
+                ("SHA256SUMS.minisig".to_string(), sig.into_bytes()),
+            ],
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Program Files").join("Crystalline");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("crystalline.exe");
+        std::fs::write(&exe, b"the installed binary").unwrap();
+        std::fs::write(root.join("LICENSE"), b"license").unwrap();
+        if method == InstallMethod::Msi {
+            std::fs::write(bin.join("install-source"), b"msi\n").unwrap();
+        }
+        let before = snapshot(&root);
+
+        let spawner = Recording::new(0, Vec::new());
+        let mut context = ctx(method, &spawner, false, &never_asked);
+        context.cache_dir = tmp.path().join("cache");
+        context.exe = Some(exe);
+        context.daemon = Some(DaemonStart {
+            by_task: true,
+            serve_args: Vec::new(),
+            env: Vec::new(),
+        });
+        let release = LatestRelease {
+            from_api: false,
+            ..newer_release()
+        };
+        let printed = {
+            let _seams = WINDOWS_SEAMS.lock().await;
+            // SAFETY: the seams are read only by the download and the key
+            // lookup, which no other test of this binary runs, and the lock
+            // keeps the tests that set them apart.
+            unsafe {
+                std::env::set_var("CRYSTALLINE_TEST_UPDATE_DOWNLOAD", &base);
+                std::env::set_var("CRYSTALLINE_TEST_UPDATE_KEY", fixtures.join("test.pub"));
+            }
+            let printed = windows_steps(&context, &release, asset, "crystalline.exe").await;
+            // SAFETY: as above.
+            unsafe {
+                std::env::remove_var("CRYSTALLINE_TEST_UPDATE_DOWNLOAD");
+                std::env::remove_var("CRYSTALLINE_TEST_UPDATE_KEY");
+            }
+            printed.unwrap()
+        };
+        assert_eq!(spawner.calls(), Vec::<String>::new(), "nothing is run");
+        let after = snapshot(&root);
+        let dir = download_dir(&context.cache_dir, tag);
+        (before, after, printed, dir, tmp)
+    }
+
+    /// A zip holding `crystalline.exe` with `body`.
+    #[cfg(debug_assertions)]
+    fn zip_with_exe(body: &[u8]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("crystalline.exe", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(body).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn msi_and_zip_leave_the_install_folder_byte_identical() {
+        let msi = "crystalline-v0.34.0-windows-amd64.msi";
+        let (before, after, printed, dir, _tmp) =
+            run_windows_branch(InstallMethod::Msi, msi, b"the msi".to_vec()).await;
+        assert_eq!(
+            before, after,
+            "the MSI branch writes nothing in the install folder"
+        );
+        assert!(
+            printed.contains("Start-Process msiexec.exe -Wait -PassThru"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("schtasks.exe /Run /TN '\\Crystalline\\Daemon'"),
+            "{printed}"
+        );
+        assert_eq!(std::fs::read(dir.join(msi)).unwrap(), b"the msi");
+
+        let zip = "crystalline-v0.34.0-windows-amd64.zip";
+        let (before, after, printed, dir, _tmp) =
+            run_windows_branch(InstallMethod::Zip, zip, zip_with_exe(b"the new exe")).await;
+        assert_eq!(
+            before, after,
+            "the zip branch writes nothing in the install folder"
+        );
+        assert!(printed.contains("Rename-Item -LiteralPath"), "{printed}");
+        assert_eq!(
+            std::fs::read(dir.join("crystalline.exe")).unwrap(),
+            b"the new exe",
+            "the zip's exe is extracted into the download folder"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn steps_txt_matches_stdout() {
+        for (method, asset, bytes) in [
+            (
+                InstallMethod::Msi,
+                "crystalline-v0.34.0-windows-amd64.msi",
+                b"the msi".to_vec(),
+            ),
+            (
+                InstallMethod::Zip,
+                "crystalline-v0.34.0-windows-amd64.zip",
+                zip_with_exe(b"the new exe"),
+            ),
+        ] {
+            let (_, _, printed, dir, _tmp) = run_windows_branch(method, asset, bytes).await;
+            let file = dir.join("steps.txt");
+            let saved = std::fs::read(&file).unwrap();
+            let saved = saved
+                .strip_prefix("\u{feff}".as_bytes())
+                .expect("a byte order mark");
+            let saved = std::str::from_utf8(saved).unwrap();
+            assert_eq!(
+                printed,
+                format!("{saved}These steps are saved in {}.\n", display_path(&file)),
+            );
+            assert!(
+                saved.starts_with("Install it with") || saved.starts_with("Replace"),
+                "{saved}"
+            );
         }
     }
 

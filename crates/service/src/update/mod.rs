@@ -17,7 +17,9 @@ pub use check::{UpdateState, check_now, check_suppressed, detect_here, read_cach
 pub use client::{UpdateError, download, latest_release};
 pub use codesign::codesign_ok;
 pub use finish::{Handover, hand_over};
-pub use now::{UpdateLock, download_dir, fetch_verified, remove_older_tags, take_lock};
+pub use now::{
+    UpdateLock, download_dir, extract_zip_member, fetch_verified, remove_older_tags, take_lock,
+};
 pub use spawn::{Spawner, SystemSpawner};
 pub use swap::{
     extract_member, install_tarball, root_owned_install_dir, swap, under_sudo, version_matches,

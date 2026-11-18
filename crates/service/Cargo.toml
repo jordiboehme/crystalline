@@ -86,6 +86,8 @@ sha2 = { workspace = true }
 # The tar.gz update unpacks the one member that holds the binary.
 tar = { workspace = true }
 flate2 = { workspace = true }
+# The zip update on Windows unpacks crystalline.exe into the download folder.
+zip = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -144,7 +146,6 @@ walkdir = { workspace = true }
 reqwest = { workspace = true }
 openidconnect = { workspace = true }
 yrs = { workspace = true }
-zip = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,
 # and `tracing-subscriber` the capture layer one test asserts the sign-in's
 # log lines through; both are test-only additions to crates this package

@@ -120,6 +120,9 @@ serde_json = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 sha2 = { workspace = true }
+# The Windows update tests sign a fake release's SHA256SUMS with the test
+# key, as the release job signs the real one.
+minisign = { workspace = true }
 # The stand-in forge in `tests/team/origin.rs` answers a connect's download
 # with a real GitHub-shaped tar.gz archive, built in the test.
 flate2 = { workspace = true }

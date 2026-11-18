@@ -145,6 +145,82 @@ pub async fn fetch_verified(
     Ok((dir.join(asset), checks))
 }
 
+/// Extract exactly `member` (`crystalline.exe`) of the verified zip
+/// `archive` into `dir`, under that name, and hand back its path. Nothing
+/// else of the archive is ever written: every other entry is read past, and
+/// the name is matched byte for byte, so a `../` path or a folder prefix
+/// never matches. The member must be one plain file and appear once; a
+/// folder, a link, a second copy or no copy at all is
+/// [`UpdateError::NoMember`], and so is an archive that repeats any name.
+/// It is written under a staging name
+/// (`.<member>.part-<pid>`) and takes its final name only when complete, so
+/// the name the printed steps copy from never holds a partial file. Call it
+/// under the update lock.
+pub fn extract_zip_member(
+    archive: &Path,
+    member: &str,
+    dir: &Path,
+) -> Result<PathBuf, UpdateError> {
+    let staging = dir.join(format!(".{member}.part-{}", std::process::id()));
+    let _ = std::fs::remove_file(&staging);
+    let result = extract_zip_into(archive, member, &staging);
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&staging);
+        return Err(err);
+    }
+    let target = dir.join(member);
+    if let Err(err) = std::fs::rename(&staging, &target) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(UpdateError::Extract(err));
+    }
+    Ok(target)
+}
+
+fn extract_zip_into(archive: &Path, member: &str, staging: &Path) -> Result<(), UpdateError> {
+    let file = File::open(archive).map_err(UpdateError::Extract)?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|err| UpdateError::Extract(std::io::Error::other(err.to_string())))?;
+    // The reader keeps one entry per name, so a second copy is seen only
+    // here: an archive with any repeated name is refused.
+    if zip.has_duplicate_names() {
+        return Err(UpdateError::NoMember);
+    }
+    let mut found = None;
+    for index in 0..zip.len() {
+        let entry = zip
+            .by_index_raw(index)
+            .map_err(|err| UpdateError::Extract(std::io::Error::other(err.to_string())))?;
+        if entry.name_raw() != member.as_bytes() {
+            continue;
+        }
+        if found.is_some() || !entry.is_file() {
+            return Err(UpdateError::NoMember);
+        }
+        found = Some(index);
+    }
+    let index = found.ok_or(UpdateError::NoMember)?;
+    let mut entry = zip
+        .by_index(index)
+        .map_err(|err| UpdateError::Extract(std::io::Error::other(err.to_string())))?;
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staging)
+        .map_err(UpdateError::Extract)?;
+    let copied = std::io::copy(
+        &mut std::io::Read::take(&mut entry, super::swap::MAX_BINARY_BYTES + 1),
+        &mut out,
+    )
+    .map_err(UpdateError::Extract)?;
+    if copied > super::swap::MAX_BINARY_BYTES {
+        return Err(UpdateError::Extract(std::io::Error::other(
+            "the binary is larger than 1 GiB",
+        )));
+    }
+    out.sync_all().map_err(UpdateError::Extract)?;
+    Ok(())
+}
+
 fn remove_all(paths: &[PathBuf]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
@@ -251,6 +327,121 @@ mod tests {
             left,
             ["SHA256SUMS", "crystalline_0.34.0_amd64.deb", "unverified"]
         );
+    }
+
+    /// A zip of `entries`: (name, body); a name ending in `/` is a folder.
+    fn zip_of(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, body) in entries {
+            if name.ends_with('/') {
+                writer.add_directory(*name, options).unwrap();
+            } else {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(body).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn only_the_exe_is_extracted_from_the_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("crystalline-v0.34.0-windows-amd64.zip");
+        zip_of(
+            &archive,
+            &[
+                ("../crystalline.exe", b"escape"),
+                ("sub/crystalline.exe", b"nested"),
+                ("README.md", b"readme"),
+                ("crystalline.exe", b"the new binary"),
+                ("LICENSE", b"license"),
+            ],
+        );
+        let path = extract_zip_member(&archive, "crystalline.exe", dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("crystalline.exe"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"the new binary");
+        assert_eq!(
+            names_in(dir.path()),
+            ["crystalline-v0.34.0-windows-amd64.zip", "crystalline.exe"],
+            "nothing else is written, no staging file stays"
+        );
+        assert!(
+            !dir.path()
+                .parent()
+                .unwrap()
+                .join("crystalline.exe")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_zip_without_one_plain_exe_is_refused_and_leaves_nothing() {
+        let cases: [&[(&str, &[u8])]; 3] = [
+            &[("README.md", b"readme")],
+            &[("crystalline.exe", b"one"), ("crystalline.exe", b"two")],
+            &[("crystalline.exe/", b"")],
+        ];
+        for entries in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("a.zip");
+            // The writer refuses a duplicate name, so that archive is
+            // written by hand from two single-entry ones.
+            if entries.len() == 2 {
+                duplicate_zip(&archive);
+            } else {
+                zip_of(&archive, entries);
+            }
+            let err =
+                extract_zip_member(&archive, "crystalline.exe", dir.path()).expect_err("refused");
+            assert!(matches!(err, UpdateError::NoMember), "{err:?}");
+            assert_eq!(names_in(dir.path()), ["a.zip"], "{entries:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("not.zip");
+        std::fs::write(&archive, b"not a zip").unwrap();
+        let err = extract_zip_member(&archive, "crystalline.exe", dir.path()).expect_err("bad");
+        assert!(matches!(err, UpdateError::Extract(_)), "{err:?}");
+        assert_eq!(names_in(dir.path()), ["not.zip"]);
+    }
+
+    /// A zip holding `crystalline.exe` twice.
+    fn duplicate_zip(path: &Path) {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("crystalline.exe", options).unwrap();
+        writer.write_all(b"one").unwrap();
+        writer.start_file("crystalline.exf", options).unwrap();
+        writer.write_all(b"two").unwrap();
+        writer.finish().unwrap();
+        // Same length, so every offset stays: rename the second entry in
+        // both its local header and its central directory record.
+        let bytes = std::fs::read(path).unwrap();
+        let from = b"crystalline.exf";
+        let to = b"crystalline.exe";
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(from) {
+                out.extend_from_slice(to);
+                i += from.len();
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        std::fs::write(path, out).unwrap();
     }
 
     #[test]

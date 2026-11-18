@@ -2255,6 +2255,13 @@ pub async fn run(
             );
         }
     }
+    // The crystalline.old.exe the zip update steps leave beside the exe goes
+    // once nothing runs it (S22); best effort and silent.
+    if cfg!(windows)
+        && let Some(exe) = crystalline_service::update::detect_here().exe
+    {
+        let _ = crate::update_windows::remove_old_exe(&exe);
+    }
     // A domain filter nobody registers fails before anything is fixed.
     // On Postgres the registrations are read from the configuration
     // document without the lock (a report never owns the database).
@@ -7534,6 +7541,7 @@ mod tests {
             package: None,
             breakaway_refused: true,
             exits_when_idle: false,
+            from_task: false,
         });
 
         let out = render_human(&report);

@@ -35,7 +35,7 @@ use super::spawn::Spawner;
 pub const NEW_PREFIX: &str = ".crystalline-new-";
 
 /// The largest binary an archive member may unpack to.
-const MAX_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
+pub(super) const MAX_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Whether this process runs under `sudo`: effective user id 0 with
 /// `SUDO_UID` naming the person who ran it (S5). Root itself running `sudo`

@@ -38,6 +38,7 @@ mod render;
 mod skills_placement;
 mod sources;
 mod update;
+mod update_windows;
 mod users;
 
 /// What `-V` and `--version` print. clap's `version` attribute feeds both as
