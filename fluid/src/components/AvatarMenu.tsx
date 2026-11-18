@@ -26,16 +26,18 @@
 
 import { UserRoundX } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactElement, RefObject } from "react";
 
 import { useAuth } from "../auth/AuthContext";
 import type AvatarMenuBodyType from "./AvatarMenuBody";
+import { lazyChunk } from "../lazyChunk";
+import { LazyBoundary } from "./LazyBoundary";
 import { ITEM_CLASSES } from "./menu";
 import { Loading } from "./Loading";
 import { FOCUS_RING, Tooltip } from "./primitives";
 
-const UpdateNote = lazy(() => import("./UpdateNote"));
+const UpdateNote = lazyChunk(() => import("./UpdateNote"));
 
 let Menu: typeof AvatarMenuBodyType | undefined;
 let pending: Promise<void> | undefined;
@@ -67,7 +69,10 @@ export function AvatarMenu({
 }): ReactElement {
   const { user, capabilities } = useAuth();
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const [noteOpen, setNoteOpen] = useState(false);
+  // The version the open note names, taken when it opened: a later probe
+  // that drops or changes the field leaves an open note alone until the
+  // reader closes it.
+  const [noteFor, setNoteFor] = useState<string | null>(null);
   useEffect(() => {
     const timer = setTimeout(preload, 1500);
     return () => {
@@ -120,24 +125,24 @@ export function AvatarMenu({
                 // A tick later, so the menu has let go of the page (a modal
                 // menu holds the body's pointer events) before the note opens.
                 setTimeout(() => {
-                  setNoteOpen(true);
+                  setNoteFor(available);
                 });
               }}
             />
           </DropdownMenu.Content>
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
-      {noteOpen && available !== null && (
-        <Suspense fallback={null}>
+      {noteFor !== null && (
+        <LazyBoundary fallback={null}>
           <UpdateNote
             anchor={triggerRef}
             current={capabilities.serverVersion}
-            available={available}
+            available={noteFor}
             onClose={() => {
-              setNoteOpen(false);
+              setNoteFor(null);
             }}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
     </>
   );

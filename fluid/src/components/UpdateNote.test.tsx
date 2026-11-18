@@ -27,11 +27,19 @@ const apiMock = vi.mocked(api);
 
 /** Signed in as an admin, with the probe's update field as given. */
 function serveAdmin(update: string | null | undefined) {
+  serveAs("admin", update);
+}
+
+/** Signed in with the given role, with the probe's update field as given. */
+function serveAs(
+  role: "admin" | "editor" | "viewer",
+  update: string | null | undefined,
+) {
   apiMock.mockImplementation(
     answersFor({
       "/auth/me": () =>
         meResponse({
-          user: userFixture({ role: "admin" }),
+          user: userFixture({ role }),
           version: "0.34.0",
           ...(update === undefined ? {} : { update_available: update }),
         }),
@@ -87,6 +95,19 @@ describe("the update chip", () => {
       ).toBeNull();
       expect(menu.querySelector("img")).toBeNull();
       expect(menu).not.toHaveTextContent("0.35.0");
+      view.unmount();
+    }
+  });
+
+  it("an editor or a viewer never sees the chip", async () => {
+    const user = userEvent.setup();
+    for (const role of ["editor", "viewer"] as const) {
+      serveAs(role, "0.35.0");
+      const view = renderApp("/");
+      const menu = await openAvatar(user);
+      expect(
+        within(menu).queryByRole("menuitem", { name: /available/ }),
+      ).toBeNull();
       view.unmount();
     }
   });
@@ -171,5 +192,33 @@ describe("the update popover", () => {
     await waitFor(() => {
       expect(avatar).toHaveFocus();
     });
+  });
+
+  it("a click outside closes the note and leaves the focus where it went", async () => {
+    serveAdmin("0.35.0");
+    renderApp("/");
+    const user = userEvent.setup();
+    const avatar = await screen.findByRole("button", { name: "Ada Lovelace" });
+    await openAvatar(user);
+    await user.click(
+      screen.getByRole("menuitem", { name: "Crystalline 0.35.0 available" }),
+    );
+    await screen.findByRole("dialog", {
+      name: "Crystalline 0.35.0 available",
+    });
+    const outside = document.createElement("input");
+    outside.setAttribute("aria-label", "Outside");
+    document.body.append(outside);
+
+    await user.click(outside);
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    // The focus return runs a tick after the close; give it that tick.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(outside).toHaveFocus();
+    expect(avatar).not.toHaveFocus();
+    outside.remove();
   });
 });

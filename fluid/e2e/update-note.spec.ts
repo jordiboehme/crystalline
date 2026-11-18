@@ -52,12 +52,21 @@ test("the update chip opens the note and the keyboard closes it", async ({
     name: "Crystalline 0.35.0 available",
   });
 
+  const note = page.getByRole("dialog", {
+    name: "Crystalline 0.35.0 available",
+  });
+
+  // The chip and the note in both themes.
   for (const scheme of ["light", "dark"] as const) {
     await page.emulateMedia({ colorScheme: scheme });
     await avatar.click();
     await expect(chip).toBeVisible();
     await expect(chip).toContainText("0.35.0 available");
+    await chip.click();
+    await expect(note).toBeVisible();
+    await expect(note).toContainText("is available.");
     await page.keyboard.press("Escape");
+    await expect(note).toBeHidden();
     await expect(avatar).toBeFocused();
   }
 
@@ -66,9 +75,6 @@ test("the update chip opens the note and the keyboard closes it", async ({
   await page.keyboard.press("Enter");
   await expect(chip).toBeFocused();
   await page.keyboard.press("Enter");
-  const note = page.getByRole("dialog", {
-    name: "Crystalline 0.35.0 available",
-  });
   await expect(note).toBeVisible();
   await expect(note).toContainText("is available.");
   await expect(

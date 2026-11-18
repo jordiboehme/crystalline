@@ -5,7 +5,8 @@
  *
  * Anchored to the avatar rather than to the chip: the chip is inside the menu,
  * which closes when the chip is chosen. There is no popover trigger, so a
- * close hands the focus back to the avatar by hand.
+ * close by Escape hands the focus back to the avatar by hand. A close by a
+ * click or Tab elsewhere leaves the focus where the reader put it.
  *
  * Lazy, like the menu's body: only an admin with an update ever opens it.
  */
@@ -16,7 +17,7 @@ import type { ReactElement, RefObject } from "react";
 
 import { releaseNotesUrl, UPDATE_COMMAND } from "../auth/updateNote";
 import { FOCUS_RING } from "./primitives";
-import { useSaid } from "./useSaid";
+import { copyText, useSaid } from "./useSaid";
 
 export default function UpdateNote({
   anchor,
@@ -33,16 +34,6 @@ export default function UpdateNote({
   onClose: () => void;
 }): ReactElement {
   const [said, say] = useSaid();
-  const copy = () => {
-    void navigator.clipboard.writeText(UPDATE_COMMAND).then(
-      () => {
-        say("Copied");
-      },
-      () => {
-        say("Could not copy");
-      },
-    );
-  };
   return (
     <Popover.Root
       open
@@ -61,8 +52,15 @@ export default function UpdateNote({
           aria-label={`Crystalline ${available} available`}
           className="menu-face w-72 space-y-2.5 p-3 leading-snug"
           onCloseAutoFocus={(event) => {
+            // Radix would hand the focus to a trigger, and there is none.
+            // The focus goes back to the avatar only when the close left it
+            // nowhere (Escape inside the note); a click or Tab elsewhere has
+            // already put it where the reader wants it.
             event.preventDefault();
-            anchor.current?.focus();
+            const active = document.activeElement;
+            if (active === null || active === document.body) {
+              anchor.current?.focus();
+            }
           }}
         >
           <p className="text-ink">
@@ -86,7 +84,9 @@ export default function UpdateNote({
               <button
                 type="button"
                 aria-label="Copy the command"
-                onClick={copy}
+                onClick={() => {
+                  copyText(UPDATE_COMMAND, say);
+                }}
                 className={`rounded px-1 text-caption text-ink-3 hover:text-ink ${FOCUS_RING}`}
               >
                 Copy
