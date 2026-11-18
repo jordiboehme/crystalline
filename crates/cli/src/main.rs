@@ -2343,7 +2343,8 @@ fn run() -> anyhow::Result<()> {
     {
         anyhow::bail!(crystalline_service::runs_in::packaged_setup_refusal(step));
     }
-    match cli.command {
+    let hint = hints_after(cli.command.as_ref(), cli.json);
+    let result = match cli.command {
         None => {
             Cli::command().print_help()?;
             println!();
@@ -2571,6 +2572,9 @@ fn run() -> anyhow::Result<()> {
             cmd: UpdateCommand::Now { yes, ignore_age },
         }) => on_runtime(move || update::now(yes, ignore_age)),
         Some(Command::Update {
+            cmd: UpdateCommand::Auto { state },
+        }) => on_runtime(move || update::auto(state == OnOff::On, cli.json)),
+        Some(Command::Update {
             cmd: UpdateCommand::VerifySums { sums, minisig, tag },
         }) => verify_sums(&sums, &minisig, &tag),
         Some(Command::Update {
@@ -2716,7 +2720,41 @@ fn run() -> anyhow::Result<()> {
             }
             HookEvent::Unknown(_) => Ok(()),
         },
+    };
+    if hint && result.is_ok() {
+        update::print_hint();
     }
+    result
+}
+
+/// Whether the stderr update hint may follow this command: not with
+/// `--json`, and never after a command a program reads or one that says it
+/// already (`status`, `doctor`, `update`): the daemon, the MCP bridge,
+/// hooks, the routing prompt, `ctl`, `verify`, the health probe, install and
+/// the hidden helpers. The hint itself still needs a terminal on stderr
+/// ([`update::print_hint`]).
+fn hints_after(command: Option<&Command>, json: bool) -> bool {
+    !json
+        && command.is_some_and(|command| {
+            !matches!(
+                command,
+                Command::Verify { .. }
+                    | Command::Prompt { .. }
+                    | Command::Install { .. }
+                    | Command::Uninstall { .. }
+                    | Command::Status { .. }
+                    | Command::Doctor { .. }
+                    | Command::Healthcheck { .. }
+                    | Command::Update { .. }
+                    | Command::HoldLock { .. }
+                    | Command::DesktopBundle { .. }
+                    | Command::DaemonTask { .. }
+                    | Command::Serve { .. }
+                    | Command::Mcp { .. }
+                    | Command::Ctl { .. }
+                    | Command::Hook { .. }
+            )
+        })
 }
 
 /// The terminal setup step `command` is, when it is one that a process
@@ -3019,10 +3057,18 @@ async fn status_dispatch(
         // A standby has no index open: its report is who owns the database
         // it waits for.
         if data["role"] == "standby" {
+            // A standby answers `update_facts` as an unknown command, so
+            // the facts come from this binary and the cache file.
+            let update = update::report_here(config.as_deref(), false).await;
             if json {
+                let mut data = data;
+                if let serde_json::Value::Object(map) = &mut data {
+                    insert_update(map, &update.0)?;
+                }
                 println!("{data}");
             } else {
                 render_standby(&data);
+                print_update_lines(&update.1);
             }
             return Ok(());
         }
@@ -3069,9 +3115,13 @@ async fn status_dispatch(
             }
             Err(_) => None,
         };
+        // The daemon's own update facts (its install method, its check),
+        // the cache file only when it cannot answer.
+        let update = update::report_here(config.as_deref(), true).await;
         if json {
             let mut data = data;
             if let serde_json::Value::Object(map) = &mut data {
+                insert_update(map, &update.0)?;
                 if let Some(err) = &config_error {
                     map.insert("config_error".to_string(), json!(err));
                 }
@@ -3133,6 +3183,7 @@ async fn status_dispatch(
             if let Some((lines, _)) = &durable {
                 cmd::print_durable_state(lines);
             }
+            print_update_lines(&update.1);
         }
         return Ok(());
     }
@@ -3143,6 +3194,9 @@ async fn status_dispatch(
     let mut cfg = crystalline_service::config_for_report(config.as_deref())
         .await?
         .effective;
+    // No daemon answered (or an override bypassed it): the update facts
+    // come from this binary and the cache file.
+    let update = update::report_for(&cfg, false).await;
     // On Postgres a report opens no store (only the owner does): without a
     // daemon here it is the owner row and where the accounts live.
     if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none", config.as_deref()).await {
@@ -3155,12 +3209,14 @@ async fn status_dispatch(
                     "registered": registered,
                     "sources": source_rows,
                     "durable_state": block,
+                    "update": update.0,
                 })
             );
         } else {
             println!("Daemon: not running");
             sources::render_sources(&source_rows);
             cmd::print_durable_state(&lines);
+            print_update_lines(&update.1);
         }
         return Ok(());
     }
@@ -3190,6 +3246,7 @@ async fn status_dispatch(
                     json,
                     &format!("{state}; reading the index directly"),
                     &source_rows,
+                    &update,
                 )
                 .await;
             }
@@ -3223,7 +3280,22 @@ async fn status_dispatch(
     } else {
         "not running; reading the index directly"
     };
-    finish_status(route, &cfg, json, note, &source_rows).await
+    finish_status(route, &cfg, json, note, &source_rows, &update).await
+}
+
+/// `update` in `status --json`: the update facts this report used.
+fn insert_update(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    facts: &crystalline_core::update::UpdateFacts,
+) -> anyhow::Result<()> {
+    map.insert("update".to_string(), serde_json::to_value(facts)?);
+    Ok(())
+}
+
+/// The install and update lines of `status` ([`update::report_lines`]).
+fn print_update_lines(lines: &[String; 2]) {
+    println!("Install: {}", lines[0]);
+    println!("Updates: {}", lines[1]);
 }
 
 /// `kept_texts` in `status --json`: how many texts the server kept when a
@@ -3243,10 +3315,12 @@ async fn finish_status(
     json: bool,
     daemon_note: &str,
     source_rows: &[sources::SourceRow],
+    update: &(crystalline_core::update::UpdateFacts, [String; 2]),
 ) -> anyhow::Result<()> {
     let mut value = cmd::status_value(route, cfg).await?;
     if json {
         if let serde_json::Value::Object(map) = &mut value {
+            insert_update(map, &update.0)?;
             map.insert("sources".to_string(), serde_json::to_value(source_rows)?);
             map.insert(
                 "desktop_states".to_string(),
@@ -3264,6 +3338,7 @@ async fn finish_status(
         }
         sources::render_sources(source_rows);
         cmd::render_status(&value, daemon_note);
+        print_update_lines(&update.1);
     }
     Ok(())
 }
@@ -5913,6 +5988,13 @@ async fn domain_rename_dispatch(
     Ok(())
 }
 
+/// `update auto`'s argument.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
 #[derive(Subcommand, Debug)]
 enum UpdateCommand {
     /// Look up the newest stable release and what `update now` would do.
@@ -5958,6 +6040,19 @@ enum UpdateCommand {
         /// `update.min_age_hours` gate).
         #[arg(long)]
         ignore_age: bool,
+    },
+    /// Turn the daily update check on or off (the `update.check` setting).
+    ///
+    /// With it on, the daemon looks up the newest stable release once a
+    /// day; `status` and the session start say when one is available.
+    /// Nothing is installed without you. Writes where `config set
+    /// update.check` writes. On a .deb with its systemd service it also
+    /// says that the service reads `CRYSTALLINE_UPDATE_CHECK` from
+    /// `/etc/default/crystalline`.
+    Auto {
+        /// `on` or `off`.
+        #[arg(value_enum)]
+        state: OnOff,
     },
     /// Release: check a `SHA256SUMS` signature with the compiled-in release
     /// keys and the tag in its trusted comment, so the publish job proves the

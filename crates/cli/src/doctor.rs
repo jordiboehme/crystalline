@@ -1915,12 +1915,29 @@ pub struct DoctorReport {
     /// pairs. Each is a warning, never a counted problem: both keep
     /// working, and the remedy is a rename the person chooses.
     pub case_twins: Vec<[String; 2]>,
+    /// How this was installed, whether it is an official build and the
+    /// update check: the running daemon's own facts when it answers, else
+    /// this binary's and the cache file's. Never a problem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateDoctor>,
     /// The texts the server kept when a co-editing room could not save,
     /// oldest first; only the `--domain` one's on a `--domain` run. Never a
     /// problem and never touched by `--fix`: each is the last copy of
     /// somebody's work, and only a person drops one (`crystalline kept
     /// drop`). One older than [`crate::kept::STALE_DAYS`] days is a warning.
     pub kept: Vec<KeptDoctor>,
+}
+
+/// The update section of the `doctor` report: the facts as `status`
+/// reports them, and their two lines.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateDoctor {
+    #[serde(flatten)]
+    pub facts: crystalline_core::update::UpdateFacts,
+    /// The install line and the update check line
+    /// ([`crate::update::report_lines`]).
+    #[serde(skip)]
+    pub lines: [String; 2],
 }
 
 /// One kept text in the `doctor` report.
@@ -2544,6 +2561,13 @@ pub async fn run(
         .await
         .map(|(_, v)| v);
 
+    // The daemon's own update facts, as status asks them; an override
+    // names files, not the daemon, so it reads this binary's and the
+    // cache file's.
+    let (facts, lines) =
+        crate::update::report_for(cfg, config_override.is_none() && db_override.is_none()).await;
+    let update = Some(UpdateDoctor { facts, lines });
+
     Ok(DoctorReport {
         durable_state,
         index,
@@ -2571,6 +2595,7 @@ pub async fn run(
         merge_error,
         kept,
         case_twins,
+        update,
     })
 }
 
@@ -6391,6 +6416,12 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
     }
 
+    if let Some(update) = &report.update {
+        let _ = writeln!(out, "update:");
+        let _ = writeln!(out, "  install: {}", update.lines[0]);
+        let _ = writeln!(out, "  {}", update.lines[1]);
+    }
+
     let remaining = report.remaining_problems();
     let _ = writeln!(
         out,
@@ -7452,6 +7483,39 @@ mod tests {
         }
         let remote = render_human(&DoctorReport::default());
         assert!(!remote.contains("device:"), "{remote}");
+    }
+
+    /// The update section names the install method and whether this is an
+    /// official build, then the update check, and is never a problem.
+    #[test]
+    fn doctor_names_method_and_official_build() {
+        use crystalline_core::update::{CheckState, InstallMethod, OffReason, UpdateFacts};
+        let facts = UpdateFacts {
+            method: InstallMethod::Homebrew,
+            official: true,
+            refusal: None,
+            check: CheckState::Off(OffReason::NotTurnedOn),
+            cache: None,
+        };
+        let current = crystalline_core::version::Precedence::parse("0.34.0").unwrap();
+        let lines =
+            crate::update::report_lines(&facts, &current, crystalline_core::time::now(), 24);
+        let report = DoctorReport {
+            update: Some(UpdateDoctor { facts, lines }),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "update:\n  install: homebrew, official build\n  update check off (not turned on); turn it on with: crystalline update auto on\n"
+            ),
+            "{out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["update"]["method"], "homebrew");
+        assert_eq!(json["update"]["official"], true);
+        assert_eq!(json["update"]["check"], "off: not turned on");
     }
 
     /// A start on an older cached snapshot is a warning line under the

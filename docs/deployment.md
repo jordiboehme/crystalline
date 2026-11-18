@@ -255,6 +255,14 @@ already owns the index, which a restart cannot fix, so the unit stays
 `failed` there instead of flapping between active and failed where
 monitoring cannot see it. Carry that line into a hand-written unit too.
 
+The service runs as its own user and reads its settings from
+`/etc/default/crystalline`, not from the config of the person who installed
+it, so `crystalline update auto on` in a login shell does not reach it. To
+let the service check once a day for a newer release, add
+`CRYSTALLINE_UPDATE_CHECK=true` to `/etc/default/crystalline` and run
+`sudo systemctl restart crystalline`; `crystalline update auto on` says so
+on a machine with the .deb and its unit.
+
 ```mermaid
 flowchart LR
     M[Uptime monitor] -->|GET /health| D[Daemon under systemd]

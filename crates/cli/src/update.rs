@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use crystalline_core::time::{self, Stamp};
 use crystalline_core::update::{
-    CheckOutcome, Checks, Detection, FAILED_REASON, Gate, InstallMethod, LatestRelease, Lookup,
-    Refusal, UPDATE_CACHE_FILE, UpdateCache, age_gate, archive_member, asset_name, display_path,
+    CheckOutcome, CheckState, Checks, Detection, FAILED_REASON, Gate, InstallMethod, LatestRelease,
+    Lookup, OffReason, Refusal, UPDATE_CACHE_FILE, UpdateCache, UpdateFacts, age_gate,
+    archive_member, asset_name, display_path,
 };
 use crystalline_core::version::{Precedence, release_tag, release_version};
 use crystalline_service::update::swap::finish_after_swap;
@@ -1041,6 +1042,274 @@ fn gate<S: Serializer>(gate: &Gate, serializer: S) -> Result<S::Ok, S::Error> {
         Gate::Never => Wire::Never,
     }
     .serialize(serializer)
+}
+
+// --- update auto, status, doctor and the stderr hint ------------------------
+
+/// What `update auto on` (and a yes at install) prints.
+pub(crate) const AUTO_ON: &str = "Update check on. Turn it off with: crystalline update auto off";
+
+/// What `update auto off` prints.
+pub(crate) const AUTO_OFF: &str = "Update check off. Turn it on with: crystalline update auto on";
+
+/// Where a systemd unit for the .deb's service can be, relative to the
+/// file system root.
+const SYSTEMD_UNITS: [&str; 3] = [
+    "lib/systemd/system/crystalline.service",
+    "usr/lib/systemd/system/crystalline.service",
+    "etc/systemd/system/crystalline.service",
+];
+
+/// `update.check` set to `on` the way `config set update.check` sets it:
+/// through a running daemon, else in the config file, or in the
+/// configuration document on Postgres, with the same owner rules. Answers
+/// the setting's result (`key`, `value`, `source` and any `note`).
+pub(crate) async fn set_update_check(on: bool) -> anyhow::Result<serde_json::Value> {
+    let value = if on { "true" } else { "false" };
+    crystalline_service::configure("set", Some("update.check"), Some(value), None).await
+}
+
+/// The line for the .deb's systemd service, which runs as its own user and
+/// reads its settings from `/etc/default/crystalline`, never from the
+/// config this command wrote (S10, S27): `Some` only for a .deb install
+/// with a unit under `root` (`/` outside tests).
+pub(crate) fn deb_service_line(detection: &Detection, root: &Path, on: bool) -> Option<String> {
+    if detection.method != InstallMethod::Deb
+        || !SYSTEMD_UNITS.iter().any(|unit| root.join(unit).is_file())
+    {
+        return None;
+    }
+    let value = if on { "true" } else { "false" };
+    Some(format!(
+        "The crystalline service reads its settings from /etc/default/crystalline, not from this config: set CRYSTALLINE_UPDATE_CHECK={value} there, then run: sudo systemctl restart crystalline"
+    ))
+}
+
+/// `crystalline update auto on|off`: set `update.check` and say what it is
+/// now, plus the service's own line on a .deb with its systemd unit.
+pub(crate) async fn auto(on: bool, json: bool) -> anyhow::Result<()> {
+    let data = set_update_check(on).await?;
+    if json {
+        println!("{data}");
+        return Ok(());
+    }
+    // The effective value, so a CRYSTALLINE_UPDATE_CHECK that wins over the
+    // saved setting is said as it is, with the note that names it.
+    println!(
+        "{}",
+        if data["value"] == "true" {
+            AUTO_ON
+        } else {
+            AUTO_OFF
+        }
+    );
+    if let Some(note) = data["note"].as_str() {
+        println!("  {note}");
+    }
+    let detection = crystalline_service::update::detect_here().detection;
+    if let Some(line) = deb_service_line(&detection, Path::new("/"), on) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The two update lines `status` and `doctor` show, without their labels:
+/// how this was installed and whether it is an official build, then
+/// whether the check is on and what its last check found. With the check
+/// off nothing from the cache is said, since `update check` writes it
+/// whatever the setting is. Pure.
+pub(crate) fn report_lines(
+    facts: &UpdateFacts,
+    current: &Precedence,
+    now: Stamp,
+    min_age_hours: u32,
+) -> [String; 2] {
+    let build = if facts.official {
+        "official build"
+    } else {
+        "not an official release build"
+    };
+    let install = format!("{}, {build}", facts.method.label());
+    let check = match facts.check {
+        CheckState::Off(OffReason::NotTurnedOn) => format!(
+            "update check off ({}); turn it on with: crystalline update auto on",
+            OffReason::NotTurnedOn.text()
+        ),
+        CheckState::Off(reason) => format!("update check off ({})", reason.text()),
+        CheckState::On => format!(
+            "update check on; {}",
+            last_check_text(facts, current, now, min_age_hours)
+        ),
+    };
+    [install, check]
+}
+
+/// What the last check found, as `status` says it with the check on. The
+/// version is rendered from the parsed one (S23), and a failure in a fixed
+/// sentence.
+fn last_check_text(
+    facts: &UpdateFacts,
+    current: &Precedence,
+    now: Stamp,
+    min_age_hours: u32,
+) -> String {
+    let Some(cache) = &facts.cache else {
+        return "no check yet".to_string();
+    };
+    let checked = cache.checked_at.rfc3339_secs_z();
+    if let CheckOutcome::Failed { .. } = cache.outcome {
+        return format!("the last check failed ({checked})");
+    }
+    let Some(newer) = cache.newer_release(current) else {
+        return format!("up to date (checked {checked})");
+    };
+    let (newer, current) = (newer.render(), current.render());
+    match cache.gate(now, min_age_hours) {
+        Some(Gate::OpensAt(at)) => format!(
+            "Crystalline {newer} is out, offered from {}",
+            at.rfc3339_secs_z()
+        ),
+        Some(Gate::Never) => {
+            format!("Crystalline {newer} is out, but the release-age gate never opens for it")
+        }
+        _ => match &facts.refusal {
+            Some(refusal) => format!(
+                "Crystalline {newer} is available (this is {current}); update now does nothing here ({})",
+                refusal_text(refusal)
+            ),
+            None if !facts.method.acts() => format!(
+                "Crystalline {newer} is available (this is {current}); update now does nothing here ({})",
+                refusal_text(&Refusal::Unknown)
+            ),
+            None => format!(
+                "Crystalline {newer} is available (this is {current}); run: crystalline update now"
+            ),
+        },
+    }
+}
+
+/// The update facts `status` and `doctor` report: the daemon's own
+/// `update_facts` answer when `ask_daemon` and one answers, else the same
+/// facts made here from this binary and the cache file (no daemon, a
+/// standby, or a daemon from before 0.34.0), with `setting_on` the
+/// effective `update.check`.
+pub(crate) async fn report_facts(ask_daemon: bool, setting_on: bool) -> UpdateFacts {
+    if ask_daemon
+        && let Ok(Some(data)) = crystalline_service::ctl_if_running_passive(
+            serde_json::json!({ "v": 1, "cmd": "update_facts" }),
+        )
+        .await
+        && let Ok(facts) = serde_json::from_value::<UpdateFacts>(data)
+    {
+        return facts;
+    }
+    crystalline_service::update::UpdateState::at_start().facts(setting_on)
+}
+
+/// [`report_facts`] and its [`report_lines`] for `status`, with the
+/// effective settings of `config` (a Postgres configuration document
+/// included); defaults when they do not load.
+pub(crate) async fn report_here(
+    config: Option<&Path>,
+    ask_daemon: bool,
+) -> (UpdateFacts, [String; 2]) {
+    let cfg = crystalline_service::config_for_report(config)
+        .await
+        .map(|loaded| loaded.effective)
+        .unwrap_or_default();
+    report_for(&cfg, ask_daemon).await
+}
+
+/// [`report_facts`] and its [`report_lines`] under the effective settings
+/// `cfg`.
+pub(crate) async fn report_for(
+    cfg: &crystalline_core::config::GlobalConfig,
+    ask_daemon: bool,
+) -> (UpdateFacts, [String; 2]) {
+    let facts = report_facts(ask_daemon, cfg.update_check_enabled()).await;
+    let lines = report_lines(
+        &facts,
+        &this_version(),
+        time::now(),
+        cfg.update_min_age_hours(),
+    );
+    (facts, lines)
+}
+
+/// This binary's version.
+fn this_version() -> Precedence {
+    // The crate version always parses; a zero version offers anything.
+    Precedence::parse(crystalline_core::VERSION)
+        .unwrap_or_else(|| Precedence::parse("0.0.0").expect("a version"))
+}
+
+/// The hint the plain CLI prints on stderr when the cache holds a stable
+/// release newer than `current`. Pure; [`hint_may_show`] and the setting
+/// decide whether it is printed.
+pub(crate) fn stderr_hint(cache: &UpdateCache, current: &Precedence) -> Option<String> {
+    let newer = cache.newer_release(current)?;
+    Some(format!(
+        "Crystalline {} is available (this is {}). Update with: crystalline update now",
+        newer.render(),
+        current.render()
+    ))
+}
+
+/// Whether the stderr hint may show at all: stderr is a terminal, nothing
+/// in `env` suppresses the check (`NO_UPDATE_NOTIFIER`, `CI`, Docker, the
+/// Claude Desktop extension) and `update now` would act for this binary.
+pub(crate) fn hint_may_show(
+    stderr_tty: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+    detection: &Detection,
+) -> bool {
+    stderr_tty && OffReason::suppressing(env, detection).is_none() && detection.acts()
+}
+
+/// After a command: print [`stderr_hint`] on stderr when [`hint_may_show`]
+/// holds, the effective `update.check` is on (`update check` writes the
+/// cache whatever it says) and the release's age gate is open. Reads only
+/// the cache file and the settings, and only the settings once the cache
+/// names a newer release. Silent on every failure.
+pub(crate) fn print_hint() {
+    let tty = std::io::stderr().is_terminal();
+    if !tty {
+        return;
+    }
+    let env = |name: &str| std::env::var(name).ok();
+    let Some(cache) = crystalline_core::config::state_dir()
+        .ok()
+        .and_then(|dir| crystalline_service::update::read_cache(&dir.join(UPDATE_CACHE_FILE)))
+        .and_then(UpdateCache::answered)
+    else {
+        return;
+    };
+    let current = this_version();
+    let Some(line) = stderr_hint(&cache, &current) else {
+        return;
+    };
+    let detection = crystalline_service::update::detect_here().detection;
+    if !hint_may_show(tty, &env, &detection) {
+        return;
+    }
+    let Some(cfg) = settings_for_hint() else {
+        return;
+    };
+    if cfg.update_check_enabled()
+        && cache.gate(time::now(), cfg.update_min_age_hours()) == Some(Gate::Open)
+    {
+        eprintln!("{line}");
+    }
+}
+
+/// The effective settings for the hint, a Postgres configuration document
+/// included, read on the command runtime's deep-stack thread; `None` when
+/// they do not load.
+fn settings_for_hint() -> Option<crystalline_core::config::GlobalConfig> {
+    crate::on_runtime_value_current_thread(|| crystalline_service::config_for_report(None))
+        .ok()?
+        .ok()
+        .map(|loaded| loaded.effective)
 }
 
 #[cfg(test)]
@@ -2229,5 +2498,240 @@ mod tests {
             Some(true),
             "the lock was free"
         );
+    }
+
+    // --- update auto, status, doctor and the stderr hint --------------------
+
+    fn release_cache(tag: &str, published_at: Option<Stamp>, checked_at: Stamp) -> UpdateCache {
+        UpdateCache {
+            v: crystalline_core::update::UPDATE_CACHE_FORMAT,
+            checked_at,
+            outcome: CheckOutcome::Release {
+                version: tag.to_string(),
+                published_at,
+                first_seen: checked_at,
+            },
+            etag: None,
+            last_release: None,
+        }
+    }
+
+    fn facts(
+        method: InstallMethod,
+        official: bool,
+        refusal: Option<Refusal>,
+        check: CheckState,
+        cache: Option<UpdateCache>,
+    ) -> UpdateFacts {
+        UpdateFacts {
+            method,
+            official,
+            refusal,
+            check,
+            cache,
+        }
+    }
+
+    const OFF_REASONS: [OffReason; 6] = [
+        OffReason::NotTurnedOn,
+        OffReason::NoUpdateNotifier,
+        OffReason::Ci,
+        OffReason::Docker,
+        OffReason::DesktopExtension,
+        OffReason::NoStateFolder,
+    ];
+
+    /// Every off reason says "update check off" with its reason, and with
+    /// the check off nothing from the cache is said, though `update check`
+    /// writes the cache whatever the setting is.
+    #[test]
+    fn status_shows_update_check_off() {
+        let newer = release_cache("v0.35.0", Some(at(1)), at(17));
+        for reason in OFF_REASONS {
+            let lines = report_lines(
+                &facts(
+                    InstallMethod::Tarball,
+                    true,
+                    None,
+                    CheckState::Off(reason),
+                    Some(newer.clone()),
+                ),
+                &v("0.34.0"),
+                now(),
+                24,
+            );
+            assert!(
+                lines[1].starts_with(&format!("update check off ({})", reason.text())),
+                "{reason:?}: {}",
+                lines[1]
+            );
+            assert!(!lines[1].contains("0.35.0"), "{}", lines[1]);
+        }
+        let lines = report_lines(
+            &facts(
+                InstallMethod::Tarball,
+                true,
+                None,
+                CheckState::Off(OffReason::NotTurnedOn),
+                None,
+            ),
+            &v("0.34.0"),
+            now(),
+            24,
+        );
+        assert_eq!(
+            lines[1],
+            "update check off (not turned on); turn it on with: crystalline update auto on"
+        );
+        assert_eq!(lines[0], "tar.gz, official build");
+    }
+
+    /// The method and the build, and a newer release whose gate is open as
+    /// "available" with the command that installs it.
+    #[test]
+    fn status_shows_method_official_and_available_version() {
+        let lines = report_lines(
+            &facts(
+                InstallMethod::Homebrew,
+                true,
+                None,
+                CheckState::On,
+                Some(release_cache("v0.35.0", Some(at(1)), at(17))),
+            ),
+            &v("0.34.0"),
+            now(),
+            24,
+        );
+        assert_eq!(lines[0], "homebrew, official build");
+        assert_eq!(
+            lines[1],
+            "update check on; Crystalline 0.35.0 is available (this is 0.34.0); run: crystalline update now"
+        );
+        // An unofficial build names the release and why update now does
+        // nothing for it.
+        let lines = report_lines(
+            &facts(
+                InstallMethod::Tarball,
+                false,
+                Some(Refusal::NotOfficial),
+                CheckState::On,
+                Some(release_cache("v0.35.0", Some(at(1)), at(17))),
+            ),
+            &v("0.34.0"),
+            now(),
+            24,
+        );
+        assert_eq!(lines[0], "tar.gz, not an official release build");
+        assert_eq!(
+            lines[1],
+            "update check on; Crystalline 0.35.0 is available (this is 0.34.0); update now does nothing here (not an official release build)"
+        );
+    }
+
+    /// With the check on: up to date, too new to offer, a failed check and
+    /// no check yet, each with when it ran.
+    #[test]
+    fn status_says_what_the_last_check_found() {
+        let on = |cache| {
+            report_lines(
+                &facts(InstallMethod::Deb, true, None, CheckState::On, cache),
+                &v("0.34.0"),
+                now(),
+                24,
+            )[1]
+            .clone()
+        };
+        assert_eq!(
+            on(Some(release_cache("v0.34.0", Some(at(1)), at(17)))),
+            "update check on; up to date (checked 2026-11-17T10:00:00Z)"
+        );
+        // An older or a pre-release tag is not newer.
+        assert_eq!(
+            on(Some(release_cache("v0.35.0-rc.1", Some(at(1)), at(17)))),
+            "update check on; up to date (checked 2026-11-17T10:00:00Z)"
+        );
+        assert_eq!(
+            on(Some(release_cache("v0.35.0", Some(at(17)), at(17)))),
+            "update check on; Crystalline 0.35.0 is out, offered from 2026-11-18T10:00:00Z"
+        );
+        let failed = UpdateCache {
+            outcome: CheckOutcome::Failed {
+                reason: FAILED_REASON.to_string(),
+            },
+            ..release_cache("v0.35.0", None, at(17))
+        };
+        assert_eq!(
+            on(Some(failed)),
+            "update check on; the last check failed (2026-11-17T10:00:00Z)"
+        );
+        assert_eq!(on(None), "update check on; no check yet");
+    }
+
+    /// With the .deb marker and the service's unit, `update auto` names the
+    /// file the service reads; without the unit, or for another method,
+    /// nothing.
+    #[test]
+    fn auto_on_with_deb_marker_and_unit_names_etc_default() {
+        let root = tempfile::tempdir().unwrap();
+        let deb = acting(InstallMethod::Deb);
+        assert_eq!(deb_service_line(&deb, root.path(), true), None);
+        let unit = root.path().join("lib/systemd/system");
+        std::fs::create_dir_all(&unit).unwrap();
+        std::fs::write(unit.join("crystalline.service"), "[Unit]\n").unwrap();
+        let line = deb_service_line(&deb, root.path(), true).expect("the service line");
+        assert!(
+            line.contains("CRYSTALLINE_UPDATE_CHECK=true")
+                && line.contains("/etc/default/crystalline"),
+            "{line}"
+        );
+        let off = deb_service_line(&deb, root.path(), false).expect("the service line");
+        assert!(off.contains("CRYSTALLINE_UPDATE_CHECK=false"), "{off}");
+        assert_eq!(
+            deb_service_line(&acting(InstallMethod::Tarball), root.path(), true),
+            None
+        );
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn hint_only_on_a_tty_stderr() {
+        let tarball = acting(InstallMethod::Tarball);
+        assert!(hint_may_show(true, &no_env, &tarball));
+        assert!(!hint_may_show(false, &no_env, &tarball));
+        // Nor when update now would not act.
+        let refused = Detection {
+            method: InstallMethod::Tarball,
+            refusal: Some(Refusal::NotOfficial),
+        };
+        assert!(!hint_may_show(true, &no_env, &refused));
+    }
+
+    #[test]
+    fn hint_never_with_no_update_notifier() {
+        let tarball = acting(InstallMethod::Tarball);
+        for name in ["NO_UPDATE_NOTIFIER", "CI"] {
+            let env = |asked: &str| (asked == name).then(|| "1".to_string());
+            assert!(!hint_may_show(true, &env, &tarball), "{name}");
+        }
+        // An empty value does not count, as for the daemon's check.
+        let empty = |asked: &str| (asked == "NO_UPDATE_NOTIFIER").then(String::new);
+        assert!(hint_may_show(true, &empty, &tarball));
+    }
+
+    #[test]
+    fn the_hint_names_the_release_from_the_parsed_version() {
+        let cache = release_cache("v0.35.0", Some(at(1)), at(17));
+        assert_eq!(
+            stderr_hint(&cache, &v("0.34.0")).as_deref(),
+            Some(
+                "Crystalline 0.35.0 is available (this is 0.34.0). Update with: crystalline update now"
+            )
+        );
+        assert_eq!(stderr_hint(&cache, &v("0.35.0")), None);
+        let odd = release_cache("v0.35.0<b>", Some(at(1)), at(17));
+        assert_eq!(stderr_hint(&odd, &v("0.34.0")), None);
     }
 }

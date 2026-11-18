@@ -1802,6 +1802,50 @@ fn search_total(env: &Env) -> u64 {
         .unwrap_or_else(|| panic!("no total: {v}"))
 }
 
+/// `status` asks the daemon for its update facts: a daemon started with
+/// `NO_UPDATE_NOTIFIER` says its check is off for that reason, though the
+/// shell that runs `status` has no such variable and `update.check` is on.
+#[test]
+fn status_shows_the_daemons_update_facts() {
+    let env = Env::new("updfacts");
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    std::fs::write(env.config_path(), "update:\n  check: true\n").unwrap();
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut daemon = cmd
+        .env("NO_UPDATE_NOTIFIER", "1")
+        .args(["serve", "--daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    env.wait_ready();
+    let status = |args: &[&str]| {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        let out = cmd
+            .env_remove("NO_UPDATE_NOTIFIER")
+            .env_remove("CI")
+            .env_remove("CRYSTALLINE_UPDATE_CHECK")
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy_owned(out.stdout)
+    };
+    let out = status(&["status"]);
+    assert!(
+        out.contains("\nUpdates: update check off (NO_UPDATE_NOTIFIER is set)\n"),
+        "{out}"
+    );
+    assert!(out.contains("\nInstall: "), "{out}");
+    let json: Value = serde_json::from_str(&status(&["--json", "status"])).unwrap();
+    assert_eq!(json["update"]["check"], "off: NO_UPDATE_NOTIFIER is set");
+    assert_eq!(json["update"]["official"], false);
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = daemon.wait();
+}
+
 fn status_json(env: &Env) -> Value {
     let (ok, out) = env.run(&["ctl", "status", "--json"]);
     assert!(ok, "ctl status failed: {out}");

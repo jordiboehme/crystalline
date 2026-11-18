@@ -719,3 +719,172 @@ fn the_real_binary_passes_the_version_check_under_its_staging_name() {
     )
     .expect("the real binary names its own version");
 }
+
+/// `crystalline <args>` in its own home, with nothing in the environment
+/// that turns the update check on or off.
+fn isolated(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = crate::common::crystalline_std();
+    for (name, value) in crate::common::isolation_env(home) {
+        cmd.env(name, value);
+    }
+    cmd.env_remove("CRYSTALLINE_UPDATE_CHECK")
+        .env_remove("CRYSTALLINE_UPDATE_MIN_AGE_HOURS")
+        .env_remove("CRYSTALLINE_CONFIG")
+        .env_remove("NO_UPDATE_NOTIFIER")
+        .env_remove("CI")
+        .env("CRYSTALLINE_SERVICE_HTTP", "false")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// `update.check` as `config show` reads it: its value and its source.
+fn update_check_setting(home: &std::path::Path) -> (String, String) {
+    let out = isolated(home, &["--json", "config", "show"]);
+    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = shown["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["key"] == "update.check")
+        .unwrap()
+        .clone();
+    (
+        row["value"].as_str().unwrap().to_string(),
+        row["source"].as_str().unwrap().to_string(),
+    )
+}
+
+#[test]
+fn auto_on_sets_update_check() {
+    let home = tempfile::tempdir().unwrap();
+    let out = isolated(home.path(), &["update", "auto", "on"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "Update check on. Turn it off with: crystalline update auto off\n"
+    );
+    assert_eq!(
+        update_check_setting(home.path()),
+        ("true".to_string(), "config".to_string())
+    );
+    #[cfg(unix)]
+    {
+        let config =
+            std::fs::read_to_string(home.path().join("config/crystalline/config.yaml")).unwrap();
+        assert!(config.contains("update:\n  check: true"), "{config}");
+    }
+    let out = isolated(home.path(), &["update", "auto", "off"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "Update check off. Turn it on with: crystalline update auto on\n"
+    );
+    assert_eq!(
+        update_check_setting(home.path()),
+        ("false".to_string(), "config".to_string())
+    );
+}
+
+/// A cache in the isolated state folder whose release is far newer than
+/// this binary and old enough to offer.
+fn seed_newer_cache(home: &std::path::Path) {
+    let state = crate::common::isolated_state_dir(home);
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("update-check.json"),
+        r#"{"v":1,"checked_at":"2026-11-18T08:00:00Z","outcome":{"kind":"release","version":"v99.0.0","published_at":"2026-01-01T00:00:00Z","first_seen":"2026-11-18T08:00:00Z"}}"#,
+    )
+    .unwrap();
+}
+
+/// With the check off, `status` says so and nothing from the cache, which
+/// `update check` writes whatever the setting is.
+#[test]
+fn status_with_the_check_off_ignores_the_cache() {
+    let home = tempfile::tempdir().unwrap();
+    seed_newer_cache(home.path());
+    let out = isolated(home.path(), &["status"]);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", text(&out.stderr));
+    assert!(
+        stdout.contains(
+            "\nUpdates: update check off (not turned on); turn it on with: crystalline update auto on\n"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("99.0.0"), "{stdout}");
+}
+
+/// Without a daemon, `status` reads the cache file: the method line says
+/// this test build is not an official one, and the newer release is named
+/// with why `update now` would not act. stderr is no terminal here, so no
+/// hint follows any command.
+#[test]
+fn status_reads_the_cache_file_without_a_daemon() {
+    let home = tempfile::tempdir().unwrap();
+    seed_newer_cache(home.path());
+    assert!(
+        isolated(home.path(), &["update", "auto", "on"])
+            .status
+            .success()
+    );
+    let out = isolated(home.path(), &["status"]);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", text(&out.stderr));
+    assert!(
+        stdout.contains(", not an official release build\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "\nUpdates: update check on; Crystalline 99.0.0 is available (this is {}); update now does nothing here (not an official release build)\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{stdout}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&isolated(home.path(), &["--json", "status"]).stdout).unwrap();
+    assert_eq!(json["update"]["check"], "on");
+    assert_eq!(json["update"]["refusal"], "not_official");
+    let out = isolated(home.path(), &["config", "show"]);
+    assert!(out.status.success());
+    assert!(
+        !text(&out.stderr).contains("is available"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// `update auto` is listed with its two values.
+#[test]
+fn auto_is_documented() {
+    let out = crate::common::crystalline_std()
+        .args(["update", "auto", "--help"])
+        .output()
+        .unwrap();
+    let help = text(&out.stdout);
+    assert!(out.status.success());
+    for needle in ["update.check", "/etc/default/crystalline", "on", "off"] {
+        assert!(help.contains(needle), "{needle}: {help}");
+    }
+}
+
+/// `doctor` names the install method, the build and the update check.
+#[test]
+fn doctor_names_the_install_method_and_the_build() {
+    let home = tempfile::tempdir().unwrap();
+    let out = isolated(home.path(), &["doctor"]);
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("\nupdate:\n  install: ")
+            && stdout
+                .contains(", not an official release build\n  update check off (not turned on)"),
+        "{stdout}{}",
+        text(&out.stderr)
+    );
+    let out = isolated(home.path(), &["--json", "doctor"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["update"]["official"], false);
+    assert_eq!(json["update"]["check"], "off: not turned on");
+}
