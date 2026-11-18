@@ -4763,7 +4763,7 @@ async fn check_github_app(
             let probe = app.probe().await;
             doctor.clock_skew_secs = probe
                 .server_date
-                .map(|date| date.since(crystalline_core::time::now()).num_seconds());
+                .map(|date| date.since(time::now()).num_seconds());
             match &probe.info {
                 Ok(info) => {
                     doctor.jwt_accepted = Some(true);
@@ -7499,8 +7499,7 @@ mod tests {
             cache: None,
         };
         let current = crystalline_core::version::Precedence::parse("0.34.0").unwrap();
-        let lines =
-            crate::update::report_lines(&facts, &current, crystalline_core::time::now(), 24, None);
+        let lines = crate::update::report_lines(&facts, &current, time::now(), 24, None);
         let report = DoctorReport {
             update: Some(UpdateDoctor { facts, lines }),
             ..DoctorReport::default()

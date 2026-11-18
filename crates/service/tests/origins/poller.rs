@@ -638,7 +638,8 @@ async fn rate_limited_poller_pauses_every_domain_until_the_reported_reset() {
     .unwrap();
 
     let now = Instant::now();
-    let wall_now = crystalline_core::time::now();
+    // A fixed wall clock, so the reported reset is a known literal.
+    let wall_now = crystalline_core::time::Stamp::from_ymd_hms(2026, 1, 5, 10, 17, 19).unwrap();
     let reset = wall_now + crystalline_core::time::minutes(10);
     mock.fail_branch_head_rate_limited("main", Some(reset));
 
@@ -651,7 +652,7 @@ async fn rate_limited_poller_pauses_every_domain_until_the_reported_reset() {
     let status = eng.status_report().await.unwrap();
     assert_eq!(
         status["origins"]["rate_limit_wait_until"],
-        crystalline_core::time::serde::stamp_json(reset)
+        "2026-01-05T10:27:19Z"
     );
 
     // Still within the pause window: no further provider calls at all, even

@@ -245,8 +245,12 @@ mod tests {
         1_767_608_239,
         0,
         -1,
-        253_402_300_799,
-        -62_167_219_200,
+        // jiff's latest whole second (J4: 9999-12-31T23:59:59Z is past it).
+        253_402_207_200,
+        // 0000-01-02: a day later than the year's first, so every offset
+        // below still writes the year 0000 (J4 refuses to read a year
+        // before it).
+        -62_167_132_800,
         // Leap year day at noon.
         1_709_208_000,
     ];
@@ -269,14 +273,16 @@ mod tests {
                     let written = utc.with_timezone(&zone);
                     let on = utc.date_naive();
                     let present = nanos != 1;
+                    let at = Stamp::from_unix(secs, nanos).unwrap();
+                    let ours_written = OffsetStamp::at_offset(at, offset).unwrap();
                     out.push((
                         Ours {
-                            at: Stamp::from_chrono(utc),
-                            written: OffsetStamp::from_chrono(written),
-                            on: Day::from_chrono(on),
-                            maybe_at: present.then(|| Stamp::from_chrono(utc)),
-                            maybe_written: present.then(|| OffsetStamp::from_chrono(written)),
-                            maybe_on: present.then(|| Day::from_chrono(on)),
+                            at,
+                            written: ours_written,
+                            on: at.day_utc(),
+                            maybe_at: present.then_some(at),
+                            maybe_written: present.then_some(ours_written),
+                            maybe_on: present.then(|| at.day_utc()),
                         },
                         Theirs {
                             at: utc,
@@ -320,8 +326,7 @@ mod tests {
     fn written_bytes_are_the_documented_ones() {
         let at = Stamp::from_unix(1_767_608_239, 120_000_000).unwrap();
         assert_eq!(stamp_json(at), Value::from("2026-01-05T10:17:19.120Z"));
-        let zone = chrono::FixedOffset::east_opt(7200).unwrap();
-        let plus_two = OffsetStamp::from_chrono(at.into_chrono().with_timezone(&zone));
+        let plus_two = OffsetStamp::at_offset(at, 7200).unwrap();
         assert_eq!(
             offset_stamp_json(plus_two),
             Value::from("2026-01-05T12:17:19.120+02:00")
@@ -395,6 +400,8 @@ mod tests {
             };
             for field in ["at", "written", "on"] {
                 let (ours, theirs) = one(field);
+                // J4: chrono kept a leap second, jiff reads it as `:59`.
+                let theirs = theirs.map(|t| t.replace(":60", ":59"));
                 assert_eq!(ours.ok(), theirs.ok(), "{field} {input:?}");
             }
         }
@@ -524,7 +531,10 @@ mod tests {
             let ours = OursMap {
                 nudges: entries
                     .iter()
-                    .map(|(k, t)| (k.clone(), Stamp::from_chrono(*t)))
+                    .map(|(k, t)| {
+                        let at = Stamp::from_unix(t.timestamp(), t.timestamp_subsec_nanos());
+                        (k.clone(), at.unwrap())
+                    })
                     .collect(),
             };
             let json = serde_json::to_string(&theirs).unwrap();
@@ -539,7 +549,7 @@ mod tests {
         let lenient = r#"{"nudges":{"a":" 2026-1-5T1:7:9 +0200 "}}"#;
         let ours: OursMap = serde_json::from_str(lenient).unwrap();
         let theirs: TheirsMap = serde_json::from_str(lenient).unwrap();
-        assert_eq!(ours.nudges["a"].into_chrono(), theirs.nudges["a"]);
+        assert_eq!(ours.nudges["a"].rfc3339(), theirs.nudges["a"].to_rfc3339());
         let missing: OursMap = serde_json::from_str("{}").unwrap();
         assert!(missing.nudges.is_empty());
         let bad = r#"{"nudges":{"a":"2026-02-30T00:00:00Z"}}"#;

@@ -1830,10 +1830,19 @@ mod tests {
             r#"{"v":1,"stops":2,"nudged":true,"updated_at":"2026-09-01T08:00:00Z","recalled":["crystalline://a/b"]}"#,
             r#"{"v":1,"stops":0,"nudged":false,"updated_at":"2026-09-01T08:00:00.120Z","recalled":[]}"#,
             r#"{"v":1,"stops":5,"nudged":false,"updated_at":"2026-09-01T08:00:00.123456789Z","recalled":[]}"#,
+            r#"{"v":1,"stops":3,"nudged":false,"updated_at":"2026-09-01T08:00:00.123456Z","recalled":[]}"#,
         ] {
             let state: SessionState = serde_json::from_str(written).expect("0.33.0 state loads");
             assert_eq!(serde_json::to_string(&state).unwrap(), written);
         }
+        // A stamp written with an offset loads as the same instant and is
+        // written back in UTC with `Z`, as 0.33.0 did.
+        let offset = r#"{"v":1,"stops":1,"nudged":false,"updated_at":"2026-09-01T10:00:00.120+02:00","recalled":[]}"#;
+        let state: SessionState = serde_json::from_str(offset).expect("an offset stamp loads");
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            r#"{"v":1,"stops":1,"nudged":false,"updated_at":"2026-09-01T08:00:00.120Z","recalled":[]}"#
+        );
     }
 
     // --- decide ----------------------------------------------------------------

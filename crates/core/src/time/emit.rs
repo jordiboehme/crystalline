@@ -5,15 +5,19 @@
 use super::calendar::{civil_from_days, weekday_from_monday};
 use std::fmt::Write;
 
-/// A year, month and day as `YYYY-MM-DD`: four digits within 0000 to 9999,
-/// a sign and at least four digits outside it.
-pub(super) fn date(year: i64, month: u8, day: u8) -> String {
-    let mut out = String::with_capacity(12);
+/// A year as chrono's `%Y` wrote it: four digits within 0000 to 9999, a
+/// sign and at least four digits outside it.
+pub(super) fn year(year: i64) -> String {
     if (0..=9999).contains(&year) {
-        let _ = write!(out, "{year:04}");
+        format!("{year:04}")
     } else {
-        let _ = write!(out, "{year:+05}");
+        format!("{year:+05}")
     }
+}
+
+/// A year, month and day as `YYYY-MM-DD`, the year as [`year`] writes it.
+pub(super) fn date(year: i64, month: u8, day: u8) -> String {
+    let mut out = self::year(year);
     let _ = write!(out, "-{month:02}-{day:02}");
     out
 }
@@ -118,10 +122,6 @@ pub(super) fn http_date(secs: i64, nanos: u32) -> String {
     let second = second_of_day % 60 + i64::from(nanos >= 1_000_000_000);
     let weekday = WEEKDAYS[usize::from(weekday_from_monday(days))];
     let month = MONTHS[usize::from(month - 1)];
-    let year = if (0..=9999).contains(&year) {
-        format!("{year:04}")
-    } else {
-        format!("{year:+05}")
-    };
+    let year = self::year(year);
     format!("{weekday}, {day:02} {month} {year} {hour:02}:{minute:02}:{second:02} GMT")
 }

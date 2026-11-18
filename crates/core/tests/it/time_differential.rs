@@ -9,14 +9,21 @@
 //! needs no bridge between the two and runs unchanged once jiff is behind
 //! the module.
 //!
-//! While chrono is behind the module no difference is allowed; once jiff
-//! is, `known_difference` names a difference that a ruling allows (and only
-//! when our side gives exactly the ruled result), and `KNOWN_DIFFERENCES`
-//! lists the names that may be skipped.
+//! jiff is behind the module, so `known_difference` names a difference
+//! that a ruling allows (and only when our side gives exactly the ruled
+//! result), and `KNOWN_DIFFERENCES` lists the names that may be skipped.
+//!
+//! The frozen corpus (`crates/core/src/time/corpus.rs`) is included here
+//! and held against chrono row by row, so its literal strings carry
+//! chrono's answers once chrono leaves the build.
+
+#[path = "../../src/time/corpus.rs"]
+mod corpus;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
+use corpus::{CORPUS, Expect};
 use crystalline_core::time::{
-    Day, OffsetStamp, Stamp, parse_date, parse_kept_stamp, parse_lenient_date,
+    self as time, Day, OffsetStamp, Stamp, parse_date, parse_kept_stamp, parse_lenient_date,
     parse_lenient_offset, parse_lenient_stamp, parse_rfc2822, parse_rfc3339,
 };
 use serde::{Deserialize, Serialize};
@@ -46,9 +53,17 @@ struct OffsetField(#[serde(with = "crystalline_core::time::serde::offset_stamp")
 struct DayField(#[serde(with = "crystalline_core::time::serde::day")] Day);
 
 /// The differences a ruling allows, as (name, reason), each one a name
-/// [`known_difference`] can return. Empty while chrono is behind
-/// `crystalline_core::time`.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
+/// [`known_difference`] can return.
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
+    (
+        LEAP_SECOND_CLAMPED,
+        "J4: jiff's Timestamp holds no leap second, so `:60` is read as `:59`",
+    ),
+    (
+        OUT_OF_RANGE_REFUSED,
+        "J4: years 0000 to 9999 only, and only instants jiff's Timestamp holds",
+    ),
+];
 
 /// J4: chrono keeps `:60`; the ruled result is the same instant with the
 /// second held at 59 and the same fraction.
@@ -80,6 +95,7 @@ const SEEDS: &[&str] = &[
     "2026-01-05 10:17:19-04:30",
     "2026-12-31T23:59:60Z",
     "9999-12-31T23:59:59.999999999-00:00",
+    "9999-12-30T22:00:00.999999999Z",
     "0000-01-01T00:00:00\u{2212}23:59",
     "2024-02-29T12:00:00.5+05:45",
     " 2026-1-5T1:7:9 +0200 ",
@@ -623,13 +639,6 @@ fn known_difference_needs_the_exact_ruled_result() {
 
 #[test]
 fn helpers_agree_with_chrono_on_mutated_inputs() {
-    // Stages 1 and 2: chrono is behind the module, so no difference is
-    // allowed. Task 3.1 drops this assert when it fills KNOWN_DIFFERENCES
-    // with the named rulings.
-    assert!(
-        KNOWN_DIFFERENCES.is_empty(),
-        "chrono is behind crystalline_core::time, so no difference is allowed"
-    );
     let started = Instant::now();
     let mut rng = Rng(0x5eed_2026_0105_1017);
     let names: Vec<&str> = compare("", true)
@@ -659,12 +668,15 @@ fn helpers_agree_with_chrono_on_mutated_inputs() {
         }
     };
     for seed in SEEDS {
-        let before = accepted.iter().sum::<usize>();
+        // A seed past jiff's range is read by chrono only (J4).
+        let read = compare(seed, true)
+            .iter()
+            .any(|(_, ours, theirs)| *ours != Outcome::Refused || *theirs != Outcome::Refused);
+        assert!(read, "seed {seed:?} is read by no parser");
         check(seed, true, &mut accepted);
-        assert!(
-            accepted.iter().sum::<usize>() > before,
-            "seed {seed:?} is read by no parser"
-        );
+    }
+    for (input, _) in CORPUS {
+        check(input, true, &mut accepted);
     }
     let mut exhaustive = 0usize;
     for seed in SEEDS {
@@ -693,4 +705,276 @@ fn helpers_agree_with_chrono_on_mutated_inputs() {
         "{exhaustive} strings one edit away and {STRINGS} random ones (adapters on every {ADAPTER_EVERY}th) in {:?}",
         started.elapsed()
     );
+}
+
+/// What every parser makes of `input`, in the corpus's shape.
+fn our_expect(input: &str) -> Expect {
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    Expect {
+        rfc3339: parse_rfc3339(input).map(|v| leak(v.rfc3339())),
+        lenient: parse_lenient_offset(input).map(|v| leak(v.rfc3339())),
+        date: parse_date(input).map(|v| leak(v.ymd())),
+        lenient_date: parse_lenient_date(input).map(|v| leak(v.ymd())),
+        kept: parse_kept_stamp(input).map(|v| leak(v.rfc3339())),
+        rfc2822: parse_rfc2822(input).map(|v| leak(v.rfc3339())),
+    }
+}
+
+/// chrono's bytes for an outcome, after the ruling that allows a
+/// difference (a leap second read as `:59`, a value out of range refused).
+fn ruled_bytes(outcome: &Outcome) -> Option<String> {
+    match outcome {
+        Outcome::Refused => None,
+        Outcome::Instant {
+            unix_seconds,
+            rfc3339,
+            ..
+        } if !(TIMESTAMP_MIN_SECONDS..=TIMESTAMP_MAX_SECONDS).contains(unix_seconds)
+            || rfc3339.starts_with(['+', '-']) =>
+        {
+            None
+        }
+        Outcome::Instant {
+            subsec_nanos,
+            rfc3339,
+            ..
+        } if *subsec_nanos >= 1_000_000_000 => Some(second_59(rfc3339)),
+        Outcome::Instant { rfc3339, .. } => Some(rfc3339.clone()),
+        Outcome::Date { year, .. } if !(0..=9999).contains(year) => None,
+        Outcome::Date { ymd, .. } => Some(ymd.clone()),
+    }
+}
+
+/// The frozen corpus is what our parsers read now, and what chrono read
+/// with only the ruled differences: each row's strings stand for chrono's
+/// answer once chrono is gone.
+#[test]
+fn the_frozen_corpus_is_chronos_answer_after_the_rulings() {
+    for (input, frozen) in CORPUS {
+        assert_eq!(&our_expect(input), frozen, "{input:?}");
+        let chrono = [
+            offset_outcome(DateTime::parse_from_rfc3339(input).ok()),
+            offset_outcome(input.parse::<DateTime<FixedOffset>>().ok()),
+            chrono_day(NaiveDate::parse_from_str(input, "%Y-%m-%d").ok()),
+            chrono_day(input.parse::<NaiveDate>().ok()),
+            utc_outcome(
+                NaiveDateTime::parse_from_str(input, "%Y%m%dT%H%M%SZ")
+                    .ok()
+                    .map(|t| t.and_utc()),
+            ),
+            offset_outcome(DateTime::parse_from_rfc2822(input).ok()),
+        ];
+        let frozen = [
+            frozen.rfc3339,
+            frozen.lenient,
+            frozen.date,
+            frozen.lenient_date,
+            frozen.kept,
+            frozen.rfc2822,
+        ];
+        for (theirs, frozen) in chrono.iter().zip(frozen) {
+            assert_eq!(
+                ruled_bytes(theirs).as_deref(),
+                frozen,
+                "{input:?}: chrono {theirs:?}"
+            );
+        }
+    }
+    // Both rulings show in the corpus, and nothing else differs.
+    let differing = CORPUS
+        .iter()
+        .filter(|(input, frozen)| {
+            frozen.lenient
+                != offset_outcome(input.parse::<DateTime<FixedOffset>>().ok())
+                    .rfc3339()
+                    .as_deref()
+        })
+        .count();
+    assert!(differing >= 2, "{differing}");
+}
+
+impl Outcome {
+    fn rfc3339(&self) -> Option<String> {
+        match self {
+            Outcome::Instant { rfc3339, .. } => Some(rfc3339.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The printers that read a whole value (the compact forms, RFC 3339 in
+/// whole seconds, chrono's `Display` and `Debug`, the HTTP date) against
+/// chrono on instants across jiff's whole range, years before 0000
+/// included.
+#[test]
+fn printers_match_chrono_across_the_range() {
+    let mut secs = TIMESTAMP_MIN_SECONDS + 1;
+    let mut n: u32 = 0;
+    while secs < TIMESTAMP_MAX_SECONDS {
+        let nanos = n.wrapping_mul(2_654_435_761) % 1_000_000_000;
+        let ours = Stamp::from_unix(secs, nanos).expect("in jiff's range");
+        let theirs = DateTime::from_timestamp(secs, nanos).expect("in chrono's range");
+        let day = theirs.date_naive();
+        let pairs = [
+            (ours.rfc3339(), theirs.to_rfc3339()),
+            (
+                ours.rfc3339_secs_z(),
+                theirs.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            (
+                ours.rfc3339_secs(),
+                theirs.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            ),
+            (ours.display_utc(), theirs.to_string()),
+            (format!("{ours:?}"), format!("{theirs:?}")),
+            (
+                ours.http_date(),
+                theirs.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+            ),
+            (
+                ours.ymd_hm_utc(),
+                theirs.format("%Y-%m-%d %H:%M UTC").to_string(),
+            ),
+            (
+                ours.compact_millis_z(),
+                theirs.format("%Y%m%dT%H%M%S%.3fZ").to_string(),
+            ),
+            (
+                ours.compact_z(),
+                theirs.format("%Y%m%dT%H%M%SZ").to_string(),
+            ),
+            (
+                ours.yymmddhhmmss(),
+                theirs.format("%y%m%d%H%M%S").to_string(),
+            ),
+            (ours.day_utc().ymd(), day.format("%Y-%m-%d").to_string()),
+            (format!("{:?}", ours.day_utc()), format!("{day:?}")),
+            (
+                ours.unix_millis().to_string(),
+                theirs.timestamp_millis().to_string(),
+            ),
+            (
+                ours.unix_micros().to_string(),
+                theirs.timestamp_micros().to_string(),
+            ),
+        ];
+        for (ours, theirs) in pairs {
+            assert_eq!(ours, theirs, "{secs} {nanos}");
+        }
+        let (zone_secs, ours_day) = (theirs.timestamp(), ours.day_utc());
+        assert_eq!(ours.unix_seconds(), zone_secs);
+        assert_eq!(
+            (ours_day.year(), ours_day.month(), ours_day.day()),
+            (
+                chrono::Datelike::year(&day),
+                chrono::Datelike::month(&day),
+                chrono::Datelike::day(&day)
+            )
+        );
+        secs += 7_919_993 + i64::from(n % 86_400);
+        n += 1;
+    }
+    assert!(n > 75_000, "{n}");
+}
+
+/// The spans against chrono's `TimeDelta`: whole units, `Debug`, the range
+/// edges and the moves of a date.
+#[test]
+fn deltas_match_chrono() {
+    use chrono::TimeDelta;
+    let millis = [
+        0,
+        1,
+        -1,
+        999,
+        -1_001,
+        1_999,
+        -1_999,
+        86_399_999,
+        -86_400_001,
+        i64::MAX,
+        -i64::MAX,
+        1_767_608_239_120,
+    ];
+    for ms in millis {
+        let ours = time::millis(ms);
+        let theirs = TimeDelta::milliseconds(ms);
+        assert_eq!(
+            (
+                ours.num_days(),
+                ours.num_hours(),
+                ours.num_minutes(),
+                ours.num_seconds(),
+                ours.num_millis()
+            ),
+            (
+                theirs.num_days(),
+                theirs.num_hours(),
+                theirs.num_minutes(),
+                theirs.num_seconds(),
+                theirs.num_milliseconds()
+            ),
+            "{ms}"
+        );
+        assert_eq!(format!("{ours:?}"), format!("{theirs:?}"), "{ms}");
+        assert_eq!(ours.to_std(), theirs.to_std().ok(), "{ms}");
+        let day = Day::from_ymd(2026, 1, 5).unwrap();
+        let chrono_day = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        if ms.unsigned_abs() < 1_000_000_000_000 {
+            assert_eq!(
+                (day + ours).ymd(),
+                (chrono_day + theirs).format("%Y-%m-%d").to_string()
+            );
+            assert_eq!(
+                (day - ours).ymd(),
+                (chrono_day - theirs).format("%Y-%m-%d").to_string()
+            );
+        }
+    }
+    for secs in [
+        0,
+        1,
+        -1,
+        i64::MAX / 1000,
+        -(i64::MAX / 1000),
+        i64::MAX / 1000 + 1,
+        -(i64::MAX / 1000) - 1,
+        i64::MAX,
+        i64::MIN,
+    ] {
+        assert_eq!(
+            time::try_seconds(secs).map(|d| d.num_millis()),
+            TimeDelta::try_seconds(secs).map(|d| d.num_milliseconds()),
+            "{secs}"
+        );
+    }
+    for value in [
+        std::time::Duration::new(9_223_372_036_854_775, 807_000_000),
+        std::time::Duration::new(9_223_372_036_854_775, 807_000_001),
+        std::time::Duration::new(301, 123_456_789),
+        std::time::Duration::MAX,
+    ] {
+        assert_eq!(
+            time::Delta::from_std(value).map(|d| format!("{d:?}")),
+            TimeDelta::from_std(value).ok().map(|d| format!("{d:?}")),
+            "{value:?}"
+        );
+    }
+    let start = NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+    let ours_start = Day::from_ymd(1, 1, 1).unwrap();
+    for step in [0i64, 1, 59, 365, 1_461, 36_524, 146_097, 3_000_000] {
+        let later = start + chrono::Days::new(step as u64);
+        let ours_later = ours_start.checked_add_days(step).unwrap();
+        assert_eq!(ours_later.ymd(), later.format("%Y-%m-%d").to_string());
+        assert_eq!(
+            ours_start.days_until(ours_later),
+            later.signed_duration_since(start).num_days()
+        );
+        assert_eq!(
+            ours_later.days_until(ours_start),
+            start.signed_duration_since(later).num_days()
+        );
+    }
 }
