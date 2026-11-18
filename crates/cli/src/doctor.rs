@@ -168,6 +168,10 @@ pub struct DomainDoctor {
     /// Files whose frontmatter holds a key more than once (`verify` rule
     /// `E010`). Kept apart from `unsyncable`, since `--fix` can repair them.
     pub duplicate_keys: Vec<DuplicateKeyFile>,
+    /// Engrams whose body opens with a second frontmatter block (`verify`
+    /// rule `E012`), which 0.33.0 stored when a capture's content opened
+    /// with one. `--fix` merges the block into the engram's own.
+    pub second_blocks: Vec<SecondBlockFile>,
     /// Second copies 0.20.0's overwrite left beside an engram. Both files
     /// leave `unindexed`, since neither is merely unsynced.
     pub stray_copies: Vec<StrayCopy>,
@@ -232,6 +236,26 @@ pub struct DuplicateKeyFile {
     /// sends a person to `--fix` when it would work.
     pub fixable: bool,
     /// Whether `--fix` removed the extra copies in this run.
+    pub fixed: bool,
+    /// Why `--fix` leaves (or left) the file as it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_fixed: Option<String>,
+}
+
+/// An engram whose body opens with a second frontmatter block.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SecondBlockFile {
+    /// The file path, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// The line of the second block's opening rule.
+    pub line: usize,
+    /// The second block's keys.
+    pub keys: Vec<String>,
+    /// Whether `--fix` would merge the block (it merges by the rules a write
+    /// lifts a block by, the result parses, the instance and the domain take
+    /// writes and the domain does not review changes).
+    pub fixable: bool,
+    /// Whether `--fix` merged the block in this run.
     pub fixed: bool,
     /// Why `--fix` leaves (or left) the file as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2116,6 +2140,7 @@ impl DoctorReport {
             n += d.unsyncable.len();
             n += d.encoding_issues.len();
             n += d.duplicate_keys.iter().filter(|f| !f.fixed).count();
+            n += d.second_blocks.iter().filter(|f| !f.fixed).count();
             n += d.stray_copies.iter().filter(|s| !s.fixed).count();
         }
         if self.service.lock_stale && !self.service.lock_removed {
@@ -3220,6 +3245,7 @@ async fn check_domain_checks(
     // shape before comparing.
     let mut unsyncable_by_path: BTreeMap<String, String> = BTreeMap::new();
     let mut duplicate_paths: BTreeSet<String> = BTreeSet::new();
+    let mut second_block_paths: BTreeSet<String> = BTreeSet::new();
     if let Ok(report) = verify::verify_paths([&path], &VerifyOptions::default()) {
         for issue in report.issues {
             match issue.rule {
@@ -3236,6 +3262,9 @@ async fn check_domain_checks(
                 }
                 "E010" => {
                     duplicate_paths.insert(relative_slash_path(&path, &issue.path));
+                }
+                "E012" => {
+                    second_block_paths.insert(relative_slash_path(&path, &issue.path));
                 }
                 _ => {}
             }
@@ -3285,6 +3314,50 @@ async fn check_domain_checks(
             }
         }
         d.duplicate_keys.push(report);
+    }
+
+    // (n) 0.33.0's second frontmatter blocks (E012): with --fix the block
+    // is merged into the engram's own, by the rules a write lifts a block in
+    // its content by. A reviewing domain's folder only moves through a
+    // merge, so there the file is left for a rewrite through a write.
+    for rel in second_block_paths {
+        let file = path.join(&rel);
+        let Ok(source) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Some(block) = crystalline_core::frontmatter::second_block(&source) else {
+            continue;
+        };
+        let mut plan = match crystalline_core::frontmatter::merge_second_block(&source) {
+            Some(crystalline_core::frontmatter::BlockMerge::Merged(text)) => Ok(text),
+            Some(crystalline_core::frontmatter::BlockMerge::NotRepairable(why)) => Err(format!(
+                "--fix leaves it: {why}. Rewrite the engram with write_engram and overwrite: true"
+            )),
+            None => continue,
+        };
+        if let Some(note) = &refusal
+            && plan.is_ok()
+        {
+            plan = Err(note.clone());
+        }
+        if entry.is_overlay() && plan.is_ok() {
+            plan = Err(REVIEWED_NOTE.to_string());
+        }
+        let mut report = SecondBlockFile {
+            path: rel,
+            line: block.line,
+            keys: block.keys,
+            fixable: plan.is_ok(),
+            fixed: false,
+            not_fixed: plan.as_ref().err().cloned(),
+        };
+        if fix && let Ok(text) = plan {
+            match write_fix(&file, &source, &text) {
+                Ok(()) => report.fixed = true,
+                Err(note) => report.not_fixed = Some(note),
+            }
+        }
+        d.second_blocks.push(report);
     }
 
     // (m) 0.20.0's stray second copies. In every domain, team domains
@@ -5532,6 +5605,28 @@ pub fn render_human(report: &DoctorReport) -> String {
                 };
             }
         }
+        for f in &d.second_blocks {
+            let keys = f.keys.join(", ");
+            let _ = if f.fixed {
+                writeln!(
+                    out,
+                    "  fixed {}: merged the second frontmatter block ({keys}) into the engram's own",
+                    f.path
+                )
+            } else if let Some(note) = &f.not_fixed {
+                writeln!(
+                    out,
+                    "  [problem] {} opens its body with a second frontmatter block on line {} ({keys}), which readers take for text (verify rule E012). {note}",
+                    f.path, f.line
+                )
+            } else {
+                writeln!(
+                    out,
+                    "  [problem] {} opens its body with a second frontmatter block on line {} ({keys}), which readers take for text (verify rule E012), rerun with --fix to merge it into the engram's own",
+                    f.path, f.line
+                )
+            };
+        }
         for s in &d.stray_copies {
             let head = format!(
                 "{} is a second copy of {}, left by an overwrite in 0.20.0.",
@@ -5585,6 +5680,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
             && d.duplicate_keys.iter().all(|f| f.fixed)
+            && d.second_blocks.iter().all(|f| f.fixed)
             && d.stray_copies.iter().all(|s| s.fixed)
             && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {

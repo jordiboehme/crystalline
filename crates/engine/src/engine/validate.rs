@@ -89,6 +89,10 @@ impl Engine {
                 Path::new(&d.path),
                 &engram,
             ));
+            raw.extend(crystalline_core::verify::check_second_block(
+                Path::new(&d.path),
+                &engram,
+            ));
             for issue in crystalline_core::verify::apply_overrides(raw, verify) {
                 let message = match issue.fix {
                     Some(fix) => format!("{} (fix: {fix})", issue.message),

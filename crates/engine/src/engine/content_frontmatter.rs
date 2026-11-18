@@ -19,8 +19,9 @@ use serde_yaml_ng::Value as Yaml;
 use super::{EngineError, Result};
 use crate::params::WriteParams;
 
-/// Keys the write owns outright: a block cannot set them.
-const ENGINE_OWNED: [&str; 4] = ["permalink", "recorded_at", "timestamp", "generated"];
+// Keys the write owns outright: a block cannot set them.
+use crystalline_core::frontmatter::ENGINE_OWNED_KEYS as ENGINE_OWNED;
+use crystalline_core::frontmatter::frontmatter_block;
 
 /// What lifting a leading block did to the parameters, for the receipt.
 #[derive(Debug, Default, PartialEq)]
@@ -33,11 +34,20 @@ pub(super) struct Lifted {
     ignored: Vec<String>,
     /// Keys the block named with no value (`status:`), left out.
     empty: Vec<String>,
+    /// The block was two rules with nothing between them, and was dropped.
+    empty_block: bool,
 }
 
 impl Lifted {
     /// The receipt notice, or `None` when the block held no keys at all.
     pub(super) fn notice(&self) -> Option<String> {
+        if self.empty_block {
+            return Some(
+                "content opened with an empty frontmatter block (two rules with nothing \
+                 between them), so it was left out of the body."
+                    .to_string(),
+            );
+        }
         if self.taken.is_empty()
             && self.overridden.is_empty()
             && self.ignored.is_empty()
@@ -111,9 +121,11 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
     let Some(parts) = crystalline_core::frontmatter::split_frontmatter(content) else {
         return Ok((out, lifted));
     };
-    // Two rules with nothing between them carry nothing.
+    // Two rules with nothing between them carry nothing, and the receipt
+    // says they were dropped.
     if parts.yaml.trim().is_empty() {
         out.content = Some(parts.body.to_string());
+        lifted.empty_block = true;
         return Ok((out, lifted));
     }
     let Some(mapping) = frontmatter_block(parts.yaml) else {
@@ -183,35 +195,12 @@ pub(super) fn lift_content_frontmatter(p: &WriteParams) -> Result<(WriteParams, 
     Ok((out, lifted))
 }
 
-/// The block between two rules as frontmatter, when it looks like engram
-/// frontmatter: a YAML mapping, with no `#` comment line (between two rules
-/// that is a markdown heading, which YAML would read as a comment and drop),
-/// that names at least one key the engram schema knows
-/// ([`crystalline_core::frontmatter::RECOGNIZED_FRONTMATTER_KEYS`]). Anything
-/// else, `Note: remember this` among them, is markdown that stays body text.
-fn frontmatter_block(yaml: &str) -> Option<serde_yaml_ng::Mapping> {
-    if yaml.lines().any(|line| line.trim_start().starts_with('#')) {
-        return None;
-    }
-    let Ok(Yaml::Mapping(mapping)) = serde_yaml_ng::from_str::<Yaml>(yaml) else {
-        return None;
-    };
-    mapping
-        .keys()
-        .any(|key| {
-            crystalline_core::frontmatter::RECOGNIZED_FRONTMATTER_KEYS
-                .contains(&key_text(key).as_str())
-        })
-        .then_some(mapping)
-}
-
 /// Whether `content` opens with a block that looks like engram frontmatter,
 /// by the rule a capture lifts one by ([`frontmatter_block`]). A prepend puts
 /// its content right under the engram's frontmatter, where such a block is a
 /// second one that every reader takes for body text, so a prepend refuses it.
 pub(super) fn opens_with_frontmatter(content: &str) -> bool {
-    crystalline_core::frontmatter::split_frontmatter(content.trim_start_matches('\n'))
-        .is_some_and(|parts| frontmatter_block(parts.yaml).is_some())
+    crystalline_core::frontmatter::opens_with_frontmatter(content)
 }
 
 /// The refusal a prepend that opens with a frontmatter block gets.
@@ -219,6 +208,13 @@ pub(super) const PREPEND_FRONTMATTER_REFUSAL: &str = "content opens with a front
     and a prepend would leave it as a second block under the engram's own. Set the settable keys \
     with set_frontmatter, or rewrite the whole engram with write_engram and overwrite: true, \
     where a leading block is merged, custom keys included";
+
+/// The refusal an edit gets whose result would open the body with a block
+/// that looks like engram frontmatter.
+pub(super) const SECOND_BLOCK_REFUSAL: &str = "this edit would put a frontmatter block at the \
+    top of the body, where it is a second block under the engram's own that every reader takes \
+    for body text. Set the settable keys with set_frontmatter, or rewrite the whole engram with \
+    write_engram and overwrite: true, where a leading block is merged, custom keys included";
 
 /// A key as text: `1:` reads `1`.
 fn key_text(key: &Yaml) -> String {
@@ -392,6 +388,14 @@ mod tests {
             assert_eq!(lifted, Lifted::default(), "{content}");
             assert!(!opens_with_frontmatter(content), "{content}");
         }
+    }
+
+    #[test]
+    fn an_empty_block_is_dropped_with_a_notice() {
+        let (out, lifted) = lift_content_frontmatter(&params("---\n---\nBody\n")).unwrap();
+        assert_eq!(out.content.as_deref(), Some("Body\n"));
+        let notice = lifted.notice().expect("the drop is named");
+        assert!(notice.contains("empty frontmatter block"), "{notice}");
     }
 
     #[test]
