@@ -1802,6 +1802,50 @@ fn search_total(env: &Env) -> u64 {
         .unwrap_or_else(|| panic!("no total: {v}"))
 }
 
+/// `status` asks the daemon for its update facts: a daemon started with
+/// `NO_UPDATE_NOTIFIER` says its check is off for that reason, though the
+/// shell that runs `status` has no such variable and `update.check` is on.
+#[test]
+fn status_shows_the_daemons_update_facts() {
+    let env = Env::new("updfacts");
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    std::fs::write(env.config_path(), "update:\n  check: true\n").unwrap();
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut daemon = cmd
+        .env("NO_UPDATE_NOTIFIER", "1")
+        .args(["serve", "--daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    env.wait_ready();
+    let status = |args: &[&str]| {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        let out = cmd
+            .env_remove("NO_UPDATE_NOTIFIER")
+            .env_remove("CI")
+            .env_remove("CRYSTALLINE_UPDATE_CHECK")
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy_owned(out.stdout)
+    };
+    let out = status(&["status"]);
+    assert!(
+        out.contains("\nUpdates: update check off (NO_UPDATE_NOTIFIER is set)\n"),
+        "{out}"
+    );
+    assert!(out.contains("\nInstall: "), "{out}");
+    let json: Value = serde_json::from_str(&status(&["--json", "status"])).unwrap();
+    assert_eq!(json["update"]["check"], "off: NO_UPDATE_NOTIFIER is set");
+    assert_eq!(json["update"]["official"], false);
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = daemon.wait();
+}
+
 fn status_json(env: &Env) -> Value {
     let (ok, out) = env.run(&["ctl", "status", "--json"]);
     assert!(ok, "ctl status failed: {out}");
@@ -5440,6 +5484,93 @@ fn a_displaced_daemon_whose_environment_is_missing_here_is_not_restarted() {
         env.lock_record().is_none(),
         "no successor was started: {:?}",
         env.lock_record()
+    );
+}
+
+/// S4: `update finish`, which the old binary runs as the new one after a
+/// tar.gz swap, hands an older daemon over to this binary through the
+/// displacement path: the old one stops, and its successor runs this
+/// version with the old one's start options. No bridge is connected, so
+/// `update finish` is the only spawner. Then it refreshes the installs and
+/// says for which scope.
+#[test]
+fn update_finish_displaces_a_daemon() {
+    let env = Env::new("upd-finish");
+    env.setup_domain("eng");
+    let old = OldDaemonStandIn::spawn_with(
+        &env,
+        Some(json!({
+            "config": env.config_path().display().to_string(),
+            "read_only": true,
+        })),
+        true,
+    );
+    let (ok, stdout, stderr) = env.run_full(&["update", "finish"]);
+    assert!(ok, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Handed the daemon over from {OLD_DAEMON_VERSION} to {}.",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("for user scope and for this folder's project only"),
+        "{stdout}"
+    );
+    let record = env
+        .lock_record()
+        .unwrap_or_else(|| panic!("no successor under {}", env.state_dir().display()));
+    assert_ne!(record["pid"], json!(old.pid), "{record}");
+    assert_eq!(
+        record["version"],
+        json!(env!("CARGO_PKG_VERSION")),
+        "{record}"
+    );
+    let status = status_json(&env);
+    assert_eq!(
+        status["read_only"],
+        json!(true),
+        "the successor runs with the old one's options: {status}"
+    );
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// S4: a daemon that read a variable this shell does not have is not
+/// stopped by `update finish`, which could not start it again the way it
+/// ran; the reason is printed instead of a wait.
+#[test]
+fn update_finish_keeps_a_daemon_whose_environment_is_missing_and_says_why() {
+    let env = Env::new("upd-finish-env");
+    env.setup_domain("eng");
+    let old = OldDaemonStandIn::spawn_with(
+        &env,
+        Some(json!({
+            "config": env.config_path().display().to_string(),
+            "read_only": false,
+            "env": ["CRYSTALLINE_DATABASE_URL"],
+        })),
+        true,
+    );
+    let began = Instant::now();
+    let (ok, stdout, stderr) = env.run_full(&["update", "finish"]);
+    assert!(ok, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "The daemon ({OLD_DAEMON_VERSION}) was left running, because it cannot be started again from here the way it ran: it read CRYSTALLINE_DATABASE_URL from its environment and that variable is not set here."
+        )),
+        "{stdout}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "no wait for a successor: {:?}",
+        began.elapsed()
+    );
+    let record = env.lock_record().expect("the old daemon's record stays");
+    assert_eq!(
+        record["pid"],
+        json!(old.pid),
+        "the old daemon still runs: {record}"
     );
 }
 

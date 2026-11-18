@@ -37,6 +37,8 @@ mod receipt;
 mod render;
 mod skills_placement;
 mod sources;
+mod update;
+mod update_windows;
 mod users;
 
 /// What `-V` and `--version` print. clap's `version` attribute feeds both as
@@ -402,10 +404,7 @@ enum Command {
         #[arg(default_value = "127.0.0.1:7411")]
         addr: String,
     },
-    /// Update Crystalline to the newest release.
-    // Hidden while its only verb is the hidden `verify-sums`; PR D of the
-    // self-update plan unhides it when `check`, `now` and `auto` arrive.
-    #[command(hide = true)]
+    /// Update Crystalline to the newest stable release.
     Update {
         #[command(subcommand)]
         cmd: UpdateCommand,
@@ -2344,7 +2343,8 @@ fn run() -> anyhow::Result<()> {
     {
         anyhow::bail!(crystalline_service::runs_in::packaged_setup_refusal(step));
     }
-    match cli.command {
+    let hint = hints_after(cli.command.as_ref(), cli.json);
+    let result = match cli.command {
         None => {
             Cli::command().print_help()?;
             println!();
@@ -2566,8 +2566,25 @@ fn run() -> anyhow::Result<()> {
         }) => desktop_bundle::run(kind, &outdir, binary, pack),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::Update {
+            cmd: UpdateCommand::Check { ignore_age },
+        }) => on_runtime(move || update::check(ignore_age, cli.json)),
+        Some(Command::Update {
+            cmd: UpdateCommand::Now { .. },
+        }) if cli.json => Err(anyhow::anyhow!(
+            "update now prints text only: run it without --json (update check --json gives the plan as JSON)"
+        )),
+        Some(Command::Update {
+            cmd: UpdateCommand::Now { yes, ignore_age },
+        }) => on_runtime(move || update::now(yes, ignore_age)),
+        Some(Command::Update {
+            cmd: UpdateCommand::Auto { state },
+        }) => on_runtime(move || update::auto(state == OnOff::On, cli.json)),
+        Some(Command::Update {
             cmd: UpdateCommand::VerifySums { sums, minisig, tag },
         }) => verify_sums(&sums, &minisig, &tag),
+        Some(Command::Update {
+            cmd: UpdateCommand::Finish,
+        }) => on_runtime(update::finish),
         Some(Command::HoldLock {
             secs,
             standalone,
@@ -2708,7 +2725,41 @@ fn run() -> anyhow::Result<()> {
             }
             HookEvent::Unknown(_) => Ok(()),
         },
+    };
+    if hint && result.is_ok() {
+        update::print_hint();
     }
+    result
+}
+
+/// Whether the stderr update hint may follow this command: not with
+/// `--json`, and never after a command a program reads or one that says it
+/// already (`status`, `doctor`, `update`): the daemon, the MCP bridge,
+/// hooks, the routing prompt, `ctl`, `verify`, the health probe, install and
+/// the hidden helpers. The hint itself still needs a terminal on stderr
+/// ([`update::print_hint`]).
+fn hints_after(command: Option<&Command>, json: bool) -> bool {
+    !json
+        && command.is_some_and(|command| {
+            !matches!(
+                command,
+                Command::Verify { .. }
+                    | Command::Prompt { .. }
+                    | Command::Install { .. }
+                    | Command::Uninstall { .. }
+                    | Command::Status { .. }
+                    | Command::Doctor { .. }
+                    | Command::Healthcheck { .. }
+                    | Command::Update { .. }
+                    | Command::HoldLock { .. }
+                    | Command::DesktopBundle { .. }
+                    | Command::DaemonTask { .. }
+                    | Command::Serve { .. }
+                    | Command::Mcp { .. }
+                    | Command::Ctl { .. }
+                    | Command::Hook { .. }
+            )
+        })
 }
 
 /// The terminal setup step `command` is, when it is one that a process
@@ -3011,10 +3062,18 @@ async fn status_dispatch(
         // A standby has no index open: its report is who owns the database
         // it waits for.
         if data["role"] == "standby" {
+            // A standby answers `update_facts` as an unknown command, so
+            // the facts come from this binary and the cache file.
+            let update = update::report_here(config.as_deref(), false).await;
             if json {
+                let mut data = data;
+                if let serde_json::Value::Object(map) = &mut data {
+                    insert_update(map, &update.0)?;
+                }
                 println!("{data}");
             } else {
                 render_standby(&data);
+                print_update_lines(&update.1);
             }
             return Ok(());
         }
@@ -3061,9 +3120,13 @@ async fn status_dispatch(
             }
             Err(_) => None,
         };
+        // The daemon's own update facts (its install method, its check),
+        // the cache file only when it cannot answer.
+        let update = update::report_here(config.as_deref(), true).await;
         if json {
             let mut data = data;
             if let serde_json::Value::Object(map) = &mut data {
+                insert_update(map, &update.0)?;
                 if let Some(err) = &config_error {
                     map.insert("config_error".to_string(), json!(err));
                 }
@@ -3125,6 +3188,7 @@ async fn status_dispatch(
             if let Some((lines, _)) = &durable {
                 cmd::print_durable_state(lines);
             }
+            print_update_lines(&update.1);
         }
         return Ok(());
     }
@@ -3135,6 +3199,9 @@ async fn status_dispatch(
     let mut cfg = crystalline_service::config_for_report(config.as_deref())
         .await?
         .effective;
+    // No daemon answered (or an override bypassed it): the update facts
+    // come from this binary and the cache file.
+    let update = update::report_for(&cfg, false).await;
     // On Postgres a report opens no store (only the owner does): without a
     // daemon here it is the owner row and where the accounts live.
     if let Some((lines, block)) = cmd::durable_state_block(&cfg, "none", config.as_deref()).await {
@@ -3147,12 +3214,14 @@ async fn status_dispatch(
                     "registered": registered,
                     "sources": source_rows,
                     "durable_state": block,
+                    "update": update.0,
                 })
             );
         } else {
             println!("Daemon: not running");
             sources::render_sources(&source_rows);
             cmd::print_durable_state(&lines);
+            print_update_lines(&update.1);
         }
         return Ok(());
     }
@@ -3182,6 +3251,7 @@ async fn status_dispatch(
                     json,
                     &format!("{state}; reading the index directly"),
                     &source_rows,
+                    &update,
                 )
                 .await;
             }
@@ -3215,7 +3285,22 @@ async fn status_dispatch(
     } else {
         "not running; reading the index directly"
     };
-    finish_status(route, &cfg, json, note, &source_rows).await
+    finish_status(route, &cfg, json, note, &source_rows, &update).await
+}
+
+/// `update` in `status --json`: the update facts this report used.
+fn insert_update(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    facts: &crystalline_core::update::UpdateFacts,
+) -> anyhow::Result<()> {
+    map.insert("update".to_string(), serde_json::to_value(facts)?);
+    Ok(())
+}
+
+/// The install and update lines of `status` ([`update::report_lines`]).
+fn print_update_lines(lines: &[String; 2]) {
+    println!("Install: {}", lines[0]);
+    println!("Updates: {}", lines[1]);
 }
 
 /// `kept_texts` in `status --json`: how many texts the server kept when a
@@ -3235,10 +3320,12 @@ async fn finish_status(
     json: bool,
     daemon_note: &str,
     source_rows: &[sources::SourceRow],
+    update: &(crystalline_core::update::UpdateFacts, [String; 2]),
 ) -> anyhow::Result<()> {
     let mut value = cmd::status_value(route, cfg).await?;
     if json {
         if let serde_json::Value::Object(map) = &mut value {
+            insert_update(map, &update.0)?;
             map.insert("sources".to_string(), serde_json::to_value(source_rows)?);
             map.insert(
                 "desktop_states".to_string(),
@@ -3256,6 +3343,7 @@ async fn finish_status(
         }
         sources::render_sources(source_rows);
         cmd::render_status(&value, daemon_note);
+        print_update_lines(&update.1);
     }
     Ok(())
 }
@@ -5905,8 +5993,72 @@ async fn domain_rename_dispatch(
     Ok(())
 }
 
+/// `update auto`'s argument.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
 #[derive(Subcommand, Debug)]
 enum UpdateCommand {
+    /// Look up the newest stable release and what `update now` would do.
+    ///
+    /// Asks GitHub now, whether or not the daily check is on, and names the
+    /// install method, the action and the release notes; `--json` prints
+    /// the plan as JSON.
+    ///
+    /// Exit codes: 0 up to date, or the newer release is younger than the
+    /// release-age gate (the output says when it is offered); 10 an update
+    /// is available (the output says if `update now` cannot act on this
+    /// install); 1 the check failed.
+    Check {
+        /// Offer a release however recently it was published (skips the
+        /// `update.min_age_hours` gate).
+        #[arg(long)]
+        ignore_age: bool,
+    },
+    /// Update to the newest stable release, as the install method allows.
+    ///
+    /// Homebrew: runs `brew upgrade jordiboehme/tap/crystalline`, then
+    /// says whether the version moved. tar.gz: downloads and verifies the
+    /// archive, checks the new binary (its code signature on macOS, then its
+    /// version), puts it in place of this one and hands the daemon over to
+    /// it; under sudo the daemon is not touched. .deb: downloads and verifies
+    /// the package, then prints the apt command; it never runs apt. MSI and
+    /// zip: downloads and verifies, then prints the steps. Every download is
+    /// verified first: the digest GitHub lists, the signed SHA256SUMS and
+    /// its minisign signature for the release tag.
+    ///
+    /// Homebrew and tar.gz installs change installed files, so they need
+    /// `--yes` or a yes at the terminal's question. Without either and with
+    /// no terminal, the plan is printed and nothing is done (exit 10).
+    ///
+    /// Exit codes: 0 done, or nothing to do (up to date, or the release is
+    /// younger than the release-age gate); 10 an update is available but
+    /// nothing was done; 1 refused (the reason is printed) or failed.
+    Now {
+        /// Act without asking (Homebrew and tar.gz installs).
+        #[arg(long)]
+        yes: bool,
+        /// Update however recently the release was published (skips the
+        /// `update.min_age_hours` gate).
+        #[arg(long)]
+        ignore_age: bool,
+    },
+    /// Turn the daily update check on or off (the `update.check` setting).
+    ///
+    /// With it on, the daemon looks up the newest stable release once a
+    /// day; `status` and the session start say when one is available.
+    /// Nothing is installed without you. Writes where `config set
+    /// update.check` writes. On a .deb with its systemd service it also
+    /// says that the service reads `CRYSTALLINE_UPDATE_CHECK` from
+    /// `/etc/default/crystalline`.
+    Auto {
+        /// `on` or `off`.
+        #[arg(value_enum)]
+        state: OnOff,
+    },
     /// Release: check a `SHA256SUMS` signature with the compiled-in release
     /// keys and the tag in its trusted comment, so the publish job proves the
     /// key pair before anything is published. It checks no asset line: an
@@ -5921,6 +6073,12 @@ enum UpdateCommand {
         #[arg(long)]
         tag: String,
     },
+    /// After a tar.gz update, run by the old binary as the new one: hand
+    /// the daemon over to this binary with its own start options, then
+    /// refresh the installed hooks and skills for user scope and this
+    /// folder's project. Hidden, and not a user step.
+    #[command(hide = true)]
+    Finish,
 }
 
 #[derive(Subcommand, Debug)]
@@ -6321,21 +6479,41 @@ fn run_prompt(
         eprintln!("crystalline prompt system: warning: {w}");
     }
 
+    // The update block (spec S19): an update is ready, once per 24 h per
+    // version, never in a subagent and only on a fresh start. Decided from
+    // the cache and the stamp before anything else is read. Never for a
+    // person who runs the command at a terminal (a hook runner always pipes
+    // stdin), so a hand run does not use up the day's block.
+    let update_block = (!std::io::stdin().is_terminal())
+        .then(|| {
+            update::session_block_here(
+                session_start
+                    .as_ref()
+                    .is_some_and(SessionStartPayload::in_subagent),
+                session_start.as_ref().and_then(|p| p.source.as_deref()),
+            )
+        })
+        .flatten();
+    let update_text = update_block.as_ref().map(|block| block.text.as_str());
+
     // Notices go to stderr in every format, and they go there for the same
     // reason each time: what stdout carries is an agent's context, and a
     // notice telling the reader to ask a human something would either stall an
     // unattended run or be answered by invention. A person reading a session
     // hook's output still sees them, because a hook's stderr is where a
-    // harness shows them.
+    // harness shows them. The one exception is the update block (S19): it
+    // names an action the agent can take or offer, and says to do nothing
+    // when no user is there, so it goes into the payload after the routing
+    // block and the stale lines.
     match format {
-        PromptFormat::Json if stale.is_empty() => {
+        PromptFormat::Json if stale.is_empty() && update_text.is_none() => {
             println!("{}", crystalline_core::render_json(&output))
         }
         PromptFormat::Json => println!(
             "{}",
-            json_with_stale(&crystalline_core::render_json(&output), &stale)?
+            json_with_extras(&crystalline_core::render_json(&output), &stale, update_text)?
         ),
-        PromptFormat::Text => print!("{}", rendered(&output, &stale)),
+        PromptFormat::Text => print!("{}", rendered(&output, &stale, update_text)),
         PromptFormat::Copilot => {
             // Copilot parses stdout as one JSON document, so a bare line
             // printed beside the envelope would corrupt it - which is why the
@@ -6345,7 +6523,7 @@ fn run_prompt(
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "additionalContext": rendered(&output, &stale),
+                    "additionalContext": rendered(&output, &stale, update_text),
                 }))?
             );
         }
@@ -6356,7 +6534,7 @@ fn run_prompt(
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "additional_context": rendered(&output, &stale),
+                    "additional_context": rendered(&output, &stale, update_text),
                 }))?
             );
         }
@@ -6366,11 +6544,14 @@ fn run_prompt(
                 serde_json::to_string(&serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": rendered(&output, &stale),
+                        "additionalContext": rendered(&output, &stale, update_text),
                     },
                 }))?
             );
         }
+    }
+    if let Some(block) = &update_block {
+        block.printed();
     }
     for note in &reconcile_notices {
         eprintln!("{note}");
@@ -6408,10 +6589,15 @@ async fn daemon_routing_config() -> Option<(crystalline_core::config::GlobalConf
     Some((config, env))
 }
 
-/// The text block with each stale source's line after it.
-fn rendered(output: &crystalline_core::PromptOutput, stale: &[String]) -> String {
+/// The text block with each stale source's line after it, then the update
+/// block when there is one.
+fn rendered(
+    output: &crystalline_core::PromptOutput,
+    stale: &[String],
+    update: Option<&str>,
+) -> String {
     let mut text = crystalline_core::render_text(output);
-    for line in stale {
+    for line in stale.iter().map(String::as_str).chain(update) {
         if !text.ends_with('\n') {
             text.push('\n');
         }
@@ -6577,16 +6763,32 @@ fn mounted_part(
     }
 }
 
-/// `render_json`'s document with a `stale` array after its last field. The
-/// fields before it keep `render_json`'s own order and bytes, so the shape
-/// only gains a field.
-fn json_with_stale(rendered: &str, stale: &[String]) -> anyhow::Result<String> {
+/// `render_json`'s document with a `stale` array (when there are stale
+/// lines) and an `update` string (when there is an update block) after its
+/// last field. The fields before them keep `render_json`'s own order and
+/// bytes, so the shape only gains fields.
+fn json_with_extras(
+    rendered: &str,
+    stale: &[String],
+    update: Option<&str>,
+) -> anyhow::Result<String> {
     let body = rendered.trim_end();
     let Some(open) = body.strip_suffix('}') else {
         anyhow::bail!("the routing block is not a JSON object");
     };
-    let lines = serde_json::to_string_pretty(&stale)?.replace('\n', "\n  ");
-    Ok(format!("{},\n  \"stale\": {lines}\n}}", open.trim_end()))
+    let mut text = open.trim_end().to_string();
+    if !stale.is_empty() {
+        let lines = serde_json::to_string_pretty(&stale)?.replace('\n', "\n  ");
+        text.push_str(&format!(",\n  \"stale\": {lines}"));
+    }
+    if let Some(update) = update {
+        text.push_str(&format!(
+            ",\n  \"update\": {}",
+            serde_json::to_string(update)?
+        ));
+    }
+    text.push_str("\n}");
+    Ok(text)
 }
 
 /// Whether this routing hook must stay silent because it was written for
@@ -6964,12 +7166,47 @@ mod tests {
         };
         let plain = crystalline_core::render_json(&output);
         let stale = vec!["Note: a".to_string(), "Note: b".to_string()];
-        let with = json_with_stale(&plain, &stale).unwrap();
+        let with = json_with_extras(&plain, &stale, None).unwrap();
         let head = plain.trim_end().strip_suffix('}').unwrap().trim_end();
         assert!(with.starts_with(head), "{with}");
         let value: Value = serde_json::from_str(&with).unwrap();
         assert_eq!(value["stale"], json!(stale));
         assert_eq!(value["version"], 1);
+        assert!(value.get("update").is_none(), "{with}");
+    }
+
+    /// The update block is an `update` string after the last field, after
+    /// `stale` when both are there; without stale lines no `stale` field.
+    #[test]
+    fn the_json_block_gains_an_update_field_only_with_a_block() {
+        let output = crystalline_core::PromptOutput {
+            workspace: PathBuf::from("/w"),
+            domains: Vec::new(),
+            warnings: Vec::new(),
+            read_only: false,
+            skills_tool: true,
+        };
+        let plain = crystalline_core::render_json(&output);
+        let head = plain.trim_end().strip_suffix('}').unwrap().trim_end();
+        let block = "Crystalline 9.9.9 is available.\nTell the user once.";
+        let only = json_with_extras(&plain, &[], Some(block)).unwrap();
+        assert!(only.starts_with(head), "{only}");
+        let value: Value = serde_json::from_str(&only).unwrap();
+        assert_eq!(value["update"], block);
+        assert!(value.get("stale").is_none(), "{only}");
+        let stale = vec!["Note: a".to_string()];
+        let both = json_with_extras(&plain, &stale, Some(block)).unwrap();
+        let value: Value = serde_json::from_str(&both).unwrap();
+        assert_eq!(value["stale"], json!(stale));
+        assert_eq!(value["update"], block);
+        assert!(both.find("\"stale\"") < both.find("\"update\""), "{both}");
+        // The text shape: the block after the stale lines.
+        let text = rendered(&output, &stale, Some(block));
+        assert!(text.ends_with(&format!("Note: a\n{block}\n")), "{text}");
+        assert_eq!(
+            rendered(&output, &[], None),
+            crystalline_core::render_text(&output)
+        );
     }
 
     /// One domain entry as `origin status` receives it, carrying the detail

@@ -474,7 +474,7 @@ pub async fn run_serve(
     // Where this daemon runs, as far as its own command line knows it; the
     // rest is read from the OS when the report is built. Recorded before the
     // lock for the same reason as the intent: `publish` reads it.
-    crate::runs_in::record_start(breakaway_refused, exit_when_idle);
+    crate::runs_in::record_start(breakaway_refused, exit_when_idle, from_task);
     // How this daemon was started, for whoever displaces it after an upgrade:
     // its successor is started the same way. Recorded before the lock, like
     // the two above, because `publish` reads it.

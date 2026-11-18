@@ -253,6 +253,29 @@ fn second_serve_waits_as_standby() {
     let status: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["role"], "standby");
     assert_eq!(status["pid"].as_u64(), Some(standby.child.id() as u64));
+    // A standby answers no `update_facts`, so `status` reads the update
+    // facts from this binary and the cache file in its state folder.
+    std::fs::create_dir_all(standby_env.state_dir()).unwrap();
+    std::fs::write(
+        standby_env.state_dir().join("update-check.json"),
+        r#"{"v":1,"checked_at":"2026-11-18T08:00:00Z","outcome":{"kind":"release","version":"v99.0.0","published_at":"2026-01-01T00:00:00Z","first_seen":"2026-11-18T08:00:00Z"}}"#,
+    )
+    .unwrap();
+    let mut cmd = Command::new(bin());
+    standby_env.apply(&mut cmd);
+    let out = cmd
+        .env_remove("NO_UPDATE_NOTIFIER")
+        .env_remove("CI")
+        .env("CRYSTALLINE_UPDATE_CHECK", "true")
+        .arg("status")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("Daemon: standby"), "{out}");
+    assert!(
+        out.contains("\nUpdates: update check on; Crystalline 99.0.0 is available"),
+        "{out}"
+    );
 
     let log = standby.log();
     assert!(
@@ -2453,6 +2476,26 @@ fn configure_set_without_daemon_writes_document_when_free() {
             .contains(&pg.schema)
     );
     assert_eq!(pg.document_value("{database}"), "");
+}
+
+/// `update auto` writes where `config set update.check` writes: on
+/// Postgres the configuration document, with config.yaml untouched.
+#[cfg(feature = "postgres")]
+#[test]
+fn update_auto_writes_the_document_like_config_set() {
+    let Some(pg) = PgScratch::new("cdauto") else {
+        return;
+    };
+    let env = Env::new("cdauto").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["update", "auto", "on"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.starts_with("Update check on."), "{out}{err}");
+    assert_eq!(pg.document_value("{update,check}"), "true");
+    assert!(!env.config_path().exists(), "update auto wrote config.yaml");
+    let (ok, out, err) = env.run_full(&["update", "auto", "off"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.starts_with("Update check off."), "{out}{err}");
+    assert_eq!(pg.document_value("{update,check}"), "false");
 }
 
 /// Without a daemon of its own, `config show` reads the document over a

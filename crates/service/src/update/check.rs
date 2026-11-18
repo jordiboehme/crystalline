@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use crystalline_core::time::{self, Delta, Stamp};
 use crystalline_core::update::{
-    CheckOutcome, CheckState, Detection, LatestRelease, Lookup, OffReason, UPDATE_CACHE_FILE,
-    UPDATE_CACHE_FORMAT, UpdateCache, UpdateFacts, detect, official_build,
+    CheckOutcome, CheckState, DetectedInstall, Detection, LatestRelease, Lookup, OffReason,
+    UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT, UpdateCache, UpdateFacts, detect, official_build,
 };
 use crystalline_core::version::Precedence;
 use tokio::sync::watch;
@@ -113,16 +113,47 @@ pub fn read_cache(path: &Path) -> Option<UpdateCache> {
 /// answered. The first time a version newer than this binary is seen, one
 /// log line `newer release <version> seen` goes to the journal.
 pub async fn run_check(cache_path: &Path, now: Stamp) -> UpdateCache {
-    let fresh = || read_cache(cache_path).filter(|c| still_fresh(c, now));
+    checked(cache_path, now, |cache| still_fresh(cache, now), || {}).await
+}
+
+/// The check `crystalline update check` asks for: always a lookup, unless
+/// another process wrote a check since `now` (its `checked_at` lies
+/// between `now` and the clock's present, so a cache dated in the future
+/// never counts), which is as new as a second lookup would be.
+/// It takes the same lock and writes the same cache as [`run_check`], so
+/// the daemon and the CLI never both ask and the file has one writer.
+///
+/// `on_wait` runs once, the first time the lock is found taken, so the
+/// caller can say why it waits: a lock a process left when it died is
+/// taken over only after two minutes.
+pub async fn check_now(cache_path: &Path, now: Stamp, on_wait: impl FnOnce()) -> UpdateCache {
+    let since_now =
+        |cache: &UpdateCache| cache.checked_at >= now && cache.checked_at <= time::now();
+    checked(cache_path, now, since_now, on_wait).await
+}
+
+/// [`run_check`] and [`check_now`]: `stands` says whether a cache on disk
+/// answers without a lookup.
+async fn checked(
+    cache_path: &Path,
+    now: Stamp,
+    stands: impl Fn(&UpdateCache) -> bool,
+    on_wait: impl FnOnce(),
+) -> UpdateCache {
+    let fresh = || read_cache(cache_path).filter(|c| stands(c));
     if let Some(cache) = fresh() {
         return cache;
     }
+    let mut on_wait = Some(on_wait);
     // A folder the lock cannot be made in cannot hold the cache either:
     // the check then goes on without the lock and its write fails.
     let _lock = loop {
         match CheckLock::try_take(cache_path) {
             Ok(Some(lock)) => break Some(lock),
             Ok(None) => {
+                if let Some(say) = on_wait.take() {
+                    say();
+                }
                 tokio::time::sleep(LOCK_POLL).await;
                 if let Some(cache) = fresh() {
                     return cache;
@@ -133,7 +164,7 @@ pub async fn run_check(cache_path: &Path, now: Stamp) -> UpdateCache {
     };
     // Read again under the lock: the holder before may have just written.
     let previous = read_cache(cache_path);
-    if let Some(cache) = previous.as_ref().filter(|c| still_fresh(c, now)) {
+    if let Some(cache) = previous.as_ref().filter(|c| stands(c)) {
         return cache.clone();
     }
     remove_left_temp_files(cache_path);
@@ -438,10 +469,8 @@ impl UpdateState {
         env: &dyn Fn(&str) -> Option<String>,
         cache_path: Option<PathBuf>,
     ) -> UpdateState {
-        let detection = detect(exe, env, dpkg_list().as_deref()).detection;
+        let detection = detect_at(exe, env).detection;
         let official = official_build();
-        let packaged = crate::runs_in::PackageContext::here().is_packaged();
-        let detection = detection.for_build(official, packaged);
         let cache = cache_path
             .as_deref()
             .and_then(read_cache)
@@ -491,6 +520,32 @@ impl UpdateState {
     /// on and there is a state folder to cache it in.
     fn may_check(&self, setting_on: bool) -> bool {
         setting_on && self.suppressed.is_none() && self.cache_path.is_some()
+    }
+}
+
+/// How the running binary was installed, as `update check` and `update
+/// now` act on it: its own canonical exe under the process environment,
+/// with the unofficial-build and app-package refusals added
+/// ([`Detection::for_build`]). The daemon keeps its own detection from its
+/// start instead (S18).
+pub fn detect_here() -> DetectedInstall {
+    let env = |name: &str| std::env::var(name).ok();
+    // An exe that cannot be named is an empty path, which detects as
+    // unknown.
+    let exe = std::env::current_exe().unwrap_or_default();
+    detect_at(&exe, &env)
+}
+
+/// The detection of the binary at `exe` under `env`, the one rule the
+/// daemon ([`UpdateState::detect`]) and the CLI ([`detect_here`]) share:
+/// [`detect`] with this system's dpkg list, then the unofficial-build and
+/// app-package refusals ([`Detection::for_build`]).
+fn detect_at(exe: &Path, env: &dyn Fn(&str) -> Option<String>) -> DetectedInstall {
+    let found = detect(exe, env, dpkg_list().as_deref());
+    let packaged = crate::runs_in::PackageContext::here().is_packaged();
+    DetectedInstall {
+        exe: found.exe,
+        detection: found.detection.for_build(official_build(), packaged),
     }
 }
 

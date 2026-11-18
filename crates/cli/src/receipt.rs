@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crystalline_core::config;
+use crystalline_core::time::{self, Stamp};
 
 /// The receipt format this binary writes. Bumped only on an incompatible
 /// shape change; a reader skips a file carrying an unknown format rather
@@ -31,6 +32,25 @@ pub(crate) struct Receipt {
     /// One record per install target.
     #[serde(default)]
     pub(crate) installs: Vec<InstallRecord>,
+    /// When `crystalline install` asked whether to check daily for a newer
+    /// Crystalline (the answer itself lives in `update.check`). Set once per
+    /// machine, so a second harness or a per-project install does not ask
+    /// again. Absent in a receipt written before 0.34.0.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::stamp_option"
+    )]
+    pub(crate) update_check_asked: Option<Stamp>,
+    /// When a non-interactive `crystalline install` said once that the
+    /// daily update check is off, so later scripted installs stay silent.
+    /// An interactive install still asks. Absent before 0.34.0.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::stamp_option"
+    )]
+    pub(crate) update_check_hinted: Option<Stamp>,
 }
 
 impl Default for Receipt {
@@ -38,6 +58,8 @@ impl Default for Receipt {
         Receipt {
             format: FORMAT,
             installs: Vec::new(),
+            update_check_asked: None,
+            update_check_hinted: None,
         }
     }
 }
@@ -277,6 +299,40 @@ mod tests {
             "second remove finds nothing"
         );
         assert!(receipt.installs.is_empty());
+    }
+
+    #[test]
+    fn an_old_receipt_without_the_stamp_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installs.json");
+        std::fs::write(
+            &path,
+            r#"{ "format": 1, "installs": [ { "harness": "claude-code", "scope": "user", "version": "0.33.0", "parts": { "mcp": true, "hooks": true, "skills": true }, "skills": [] } ] }"#,
+        )
+        .unwrap();
+        let receipt = load(&path).unwrap();
+        assert_eq!(receipt.update_check_asked, None);
+        assert_eq!(receipt.installs.len(), 1);
+        // Saved again it stays format 1 and carries no stamp field.
+        save(&path, &receipt).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"format\": 1"), "{text}");
+        assert!(!text.contains("update_check_asked"), "{text}");
+    }
+
+    #[test]
+    fn the_stamp_round_trips_at_format_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installs.json");
+        let at = Stamp::from_ymd_hms(2026, 11, 18, 9, 30, 0).unwrap();
+        let receipt = Receipt {
+            update_check_asked: Some(at),
+            ..Receipt::default()
+        };
+        save(&path, &receipt).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.format, 1);
+        assert_eq!(loaded.update_check_asked, Some(at));
     }
 
     #[test]

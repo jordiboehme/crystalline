@@ -26,13 +26,14 @@ pub const BREAKAWAY_REFUSED_WARNING: &str = "the daemon could not leave the job 
 /// What a warning adds: the effect a person saw in #115, and the way out.
 const MAY_HOLD_FILES: &str = "It may keep that program's files in use, for example while that program updates itself. `crystalline ctl shutdown` stops it";
 
-/// (breakaway refused, exits when idle), recorded once by `run_serve`.
-static START: OnceLock<(bool, bool)> = OnceLock::new();
+/// (breakaway refused, exits when idle, started by the task), recorded once
+/// by `run_serve`.
+static START: OnceLock<(bool, bool, bool)> = OnceLock::new();
 
-/// Record the two start facts only the daemon's own command line knows. The
-/// first call wins, like `record_serve_intent`.
-pub fn record_start(breakaway_refused: bool, exits_when_idle: bool) {
-    let _ = START.set((breakaway_refused, exits_when_idle));
+/// Record the three start facts only the daemon's own command line knows.
+/// The first call wins, like `record_serve_intent`.
+pub fn record_start(breakaway_refused: bool, exits_when_idle: bool, from_task: bool) {
+    let _ = START.set((breakaway_refused, exits_when_idle, from_task));
 }
 
 /// Where a daemon runs. Every key is present on every platform, `null` where
@@ -59,12 +60,18 @@ pub struct RunsIn {
     /// A bounded life (`--exit-when-idle`): the Claude Desktop extension's
     /// daemon, which stays in Desktop's job on purpose.
     pub exits_when_idle: bool,
+    /// Started by the Windows task (`serve --from-task`), which the record
+    /// otherwise shows as an autostart. `crystalline update now` reads it to
+    /// say how to start the daemon again after an MSI install. `false` on a
+    /// record from an older daemon.
+    pub from_task: bool,
 }
 
 impl RunsIn {
     /// This process, now. Cheap: a handful of system calls.
     pub fn here() -> RunsIn {
-        let (breakaway_refused, exits_when_idle) = START.get().copied().unwrap_or_default();
+        let (breakaway_refused, exits_when_idle, from_task) =
+            START.get().copied().unwrap_or_default();
         let (in_job, job_allows_breakaway, package) = job_and_package();
         RunsIn {
             working_dir: std::env::current_dir()
@@ -75,6 +82,7 @@ impl RunsIn {
             package,
             breakaway_refused,
             exits_when_idle,
+            from_task,
         }
     }
 
