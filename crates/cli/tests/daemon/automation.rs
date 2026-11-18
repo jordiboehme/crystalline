@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::daemon_env::DaemonEnv;
 
@@ -108,9 +108,11 @@ impl DaemonEnv {
         let script = format!(
             r#"#!/bin/sh
 cfg=""
+skills=""
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--mcp-config" ]; then cfg="$a"; fi
+  if [ "$prev" = "--append-system-prompt-file" ]; then skills="$a"; fi
   prev="$a"
 done
 mode=$(stat -c %a "$cfg" 2>/dev/null || stat -f %Lp "$cfg")
@@ -119,6 +121,12 @@ mode=$(stat -c %a "$cfg" 2>/dev/null || stat -f %Lp "$cfg")
   echo "cfg=$cfg"
   echo "mode=$mode"
   for a in "$@"; do echo "arg=$a"; done
+  if [ -n "$skills" ]; then
+    echo "skills_mode=$(stat -c %a "$skills" 2>/dev/null || stat -f %Lp "$skills")"
+    echo "skills<<"
+    cat "$skills"
+    echo ">>skills"
+  fi
 }} >> "{calls}"
 echo '{{"type":"system","subtype":"init","tools":[]}}'
 {extra}
@@ -587,9 +595,11 @@ fn prompt_json_prints_the_runner_setup() {
 
 /// A run takes its prompt from the daemon, which knows whether it serves
 /// the `skills` tool: with `skills.serve: false` the agent is told its
-/// skills are already loaded instead of calling a tool it cannot list.
+/// skills are already loaded instead of calling a tool it cannot list, and
+/// the run makes that true by appending the shipped skill text to the
+/// agent's system prompt, from a private file that goes away with the run.
 #[test]
-fn a_run_on_a_daemon_that_hides_the_skills_tool_says_they_are_loaded() {
+fn a_run_on_a_daemon_that_hides_the_skills_tool_hands_the_skills_over() {
     let env = env_with_domains_and("sk", "skills:\n  serve: false\n");
     env.fake_claude("", SUMMARY, 0);
     let out = env.output(&["evolve", "run", "--domain", "busy"]);
@@ -600,6 +610,141 @@ fn a_run_on_a_daemon_that_hides_the_skills_tool_says_they_are_loaded() {
         "{calls}"
     );
     assert!(!calls.contains("call the `skills` tool"), "{calls}");
+    let handed = calls
+        .split("skills<<\n")
+        .nth(1)
+        .and_then(|rest| rest.split(">>skills").next())
+        .unwrap_or_else(|| panic!("no skills file was handed over: {calls}"));
+    assert_eq!(
+        handed.trim_end(),
+        crystalline_core::automation::loaded_skills_text(
+            crystalline_core::automation::Loop::Evolve
+        )
+        .trim_end()
+    );
+    let skill = crystalline_core::skills::skill("crystalline-intelligence").unwrap();
+    assert!(handed.contains(skill.content.trim()), "{handed}");
+    assert!(calls.contains("skills_mode=600"), "{calls}");
+    let file = calls
+        .lines()
+        .skip_while(|l| *l != "arg=--append-system-prompt-file")
+        .nth(1)
+        .and_then(|l| l.strip_prefix("arg="))
+        .unwrap();
+    assert!(!Path::new(file).exists(), "the skills file was left behind");
+}
+
+/// On a daemon that serves the `skills` tool the prompt calls it, and the
+/// run hands no skill text over.
+#[test]
+fn a_run_on_a_daemon_that_serves_the_skills_tool_hands_nothing_over() {
+    let env = env_with_domains("sn");
+    env.fake_claude("", SUMMARY, 0);
+    let out = env.output(&["evolve", "run", "--domain", "busy"]);
+    assert_eq!(code(&out), Some(0), "{}", explain(&out));
+    let calls = env.calls();
+    assert!(calls.contains("call the `skills` tool"), "{calls}");
+    assert!(!calls.contains("--append-system-prompt-file"), "{calls}");
+}
+
+/// One ctl command sent straight to the running daemon's socket: the `ctl`
+/// mode line, the command, one answer line.
+fn ctl_over_the_socket(env: &DaemonEnv, cmd: &Value) -> Value {
+    use std::io::{BufRead, BufReader, Write};
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.info_path()).unwrap()).unwrap();
+    let socket = record["socket_path"].as_str().unwrap();
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream.write_all(b"ctl\n").unwrap();
+    writeln!(stream, "{cmd}").unwrap();
+    stream.flush().unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(line.trim()).unwrap()
+}
+
+/// `prompt --json` without `--skills-loaded` answers what the daemon's
+/// `automation_prompt` verb answers for the same server config, prompt and
+/// checksum alike: with `skills.serve` false, true and unset in the config,
+/// and with `CRYSTALLINE_SKILLS_SERVE=false` in the environment. A domain
+/// asked for by an alias is named by its local name on both sides.
+#[test]
+fn prompt_json_answers_what_the_verb_answers_for_the_same_config() {
+    for (tag, extra, vars) in [
+        ("pv-off", "skills:\n  serve: false\n", &[][..]),
+        ("pv-on", "skills:\n  serve: true\n", &[][..]),
+        ("pv-unset", "", &[][..]),
+        ("pv-env", "", &[("CRYSTALLINE_SKILLS_SERVE", "false")][..]),
+    ] {
+        let mut env = DaemonEnv::new(tag);
+        let kb = env.dir.join("kb-work");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join("MANIFEST.md"), manifest("work")).unwrap();
+        let config = env.config_path();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "domains:\n  work:\n    path: {}\n    aliases:\n      - job\n{extra}",
+                kb.display()
+            ),
+        )
+        .unwrap();
+        env.serve_with_env(vars);
+        for (lp, word) in [("reflect", "reflect"), ("evolve", "evolve")] {
+            let answer = ctl_over_the_socket(
+                &env,
+                &json!({"v": 1, "cmd": "automation_prompt", "loop": lp, "domain": "job", "max_items": 7}),
+            );
+            assert_eq!(answer["ok"], true, "{tag} {answer}");
+            let mut cmd = env.cli(&[
+                word,
+                "prompt",
+                "--json",
+                "--domain",
+                "job",
+                "--max-items",
+                "7",
+            ]);
+            for (name, value) in vars {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().unwrap();
+            assert_eq!(code(&out), Some(0), "{}", explain(&out));
+            let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(printed, answer["data"], "{tag} {word}");
+            let loaded = printed["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Your skills are already loaded");
+            assert_eq!(loaded, tag == "pv-off" || tag == "pv-env", "{tag} {word}");
+            assert!(
+                printed["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("domain `work`"),
+                "{tag} {printed}"
+            );
+        }
+        // The flag still wins over the config, both ways.
+        let out = env.output(&[
+            "evolve",
+            "prompt",
+            "--json",
+            "--domain",
+            "work",
+            "--skills-loaded",
+            "false",
+        ]);
+        let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            printed["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("call the `skills` tool"),
+            "{tag}"
+        );
+    }
 }
 
 /// The daemon's own process id, from the record it published.

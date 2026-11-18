@@ -144,6 +144,7 @@ pub(super) async fn run_one(
             program: claude.to_path_buf(),
             mcp_config: PathBuf::from("<mcp config>"),
             prompt: "<prompt>".to_string(),
+            skills_file: setup.skills_loaded().then(|| PathBuf::from("<skills>")),
             disallowed_tools: setup.disallowed_tools,
             max_turns: args.max_turns,
             model: args.model.clone(),
@@ -217,6 +218,17 @@ pub(super) async fn run_one(
         Ok(config) => config,
         Err(e) => return lease.fail_and_err(&started, e, stop.clone()).await,
     };
+    // A prompt that says the skills are loaded (the server hides the
+    // `skills` tool) is made true here: the agent gets the skills this
+    // binary ships, appended to its system prompt.
+    let skills_file = if setup.skills_loaded() {
+        match config.write_skills(&loaded_skills_text(lp)) {
+            Ok(path) => Some(path),
+            Err(e) => return lease.fail_and_err(&started, e, stop.clone()).await,
+        }
+    } else {
+        None
+    };
     if !opts.json {
         println!(
             "Running the {lp} loop on {domain}. The stream goes to {}.",
@@ -228,6 +240,7 @@ pub(super) async fn run_one(
         mcp_config: config.path.clone(),
         prompt: setup.prompt,
         disallowed_tools: setup.disallowed_tools,
+        skills_file,
         max_turns: args.max_turns,
         model: args.model.clone(),
     };
@@ -392,6 +405,12 @@ pub(super) struct RunPrompt {
 }
 
 impl RunPrompt {
+    /// Whether the prompt says the agent's skills are already loaded, so the
+    /// run hands them over itself.
+    pub(super) fn skills_loaded(&self) -> bool {
+        self.prompt.contains(SKILLS_LOADED_LINE)
+    }
+
     /// This binary's shipped prompt and its own list of forbidden tools.
     fn shipped(lp: Loop, domain: &str, max_items: u32) -> RunPrompt {
         RunPrompt {
@@ -1012,6 +1031,7 @@ mod tests {
             mcp_config: PathBuf::from("mcp.json"),
             prompt: setup.prompt,
             disallowed_tools: setup.disallowed_tools,
+            skills_file: None,
             max_turns: 60,
             model: None,
         };

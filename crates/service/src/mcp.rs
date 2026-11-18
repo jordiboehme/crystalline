@@ -2873,13 +2873,22 @@ impl McpServer {
         if let Some(refusal) = self.refuse_unwritable(&p.domain, scope).await? {
             return Ok(Verdict::Refused(refusal));
         }
+        let mut left = Vec::new();
         let receipt = match self
             .engine
-            .split_engram_as(&p, caller.actor().as_deref(), scope)
+            .split_engram_noting(&p, caller.actor().as_deref(), scope, &mut left)
             .await
         {
             Ok(receipt) => receipt,
-            Err(e) => return overlay_refusal(e).map(Verdict::Refused),
+            Err(e) => {
+                // A split that failed after it changed files on disk still
+                // leaves them for the run's pull request to carry.
+                for (domain, path) in left {
+                    let written = json!({ "domain": domain, "path": path });
+                    self.note_run_writes(caller, &written).await;
+                }
+                return overlay_refusal(e).map(Verdict::Refused);
+            }
         };
         self.note_run_writes(caller, &receipt).await;
         Ok(Verdict::Done(receipt))

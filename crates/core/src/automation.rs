@@ -214,15 +214,45 @@ pub const DEFAULT_MAX_ITEMS: u32 = 20;
 /// already loaded, in place of the call to the `skills` tool.
 pub const SKILLS_LOADED_LINE: &str = "Your skills are already loaded";
 
+/// The shipped skills a headless run of `lp` works with, in the order its
+/// prompt names them: the ones the prompt has the agent read through the
+/// `skills` tool, or says are loaded, and the ones `crystalline <loop> run`
+/// hands its agent itself when the prompt says so ([`loaded_skills_text`]).
+pub fn loop_skills(lp: Loop) -> &'static [&'static str] {
+    match lp {
+        Loop::Reflect => &["crystalline-intelligence", "crystalline-presentation"],
+        Loop::Evolve => &["crystalline-intelligence"],
+    }
+}
+
+/// The text of [`loop_skills`] as this binary ships them, for a runner that
+/// hands the skills to its agent itself when the prompt says they are
+/// loaded (`crystalline <loop> run` appends it to Claude Code's system
+/// prompt). Each skill opens with a line that names it.
+pub fn loaded_skills_text(lp: Loop) -> String {
+    let mut out = String::from(
+        "The Crystalline skills below are loaded for this run. Where the run's prompt says something else, the prompt wins.\n",
+    );
+    for name in loop_skills(lp) {
+        let skill = crate::skills::skill(name).expect("every loop skill ships");
+        out.push_str(&format!(
+            "\n# Skill `{name}`\n\n{}\n",
+            skill.content.trim_end()
+        ));
+    }
+    out
+}
+
 /// The sentence the start of `lp`'s prompt opens with: the call to the
 /// `skills` tool, or with `skills_loaded` the words that say they are there.
 /// The rest of that paragraph (what the skills teach and that this prompt
 /// wins over them) stays the same either way.
 fn skills_sentence(lp: Loop, skills_loaded: bool) -> String {
-    let skills = match lp {
-        Loop::Reflect => "`crystalline-intelligence` and `crystalline-presentation`",
-        Loop::Evolve => "`crystalline-intelligence`",
-    };
+    let skills = loop_skills(lp)
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
     match (lp, skills_loaded) {
         (_, true) => format!("{SKILLS_LOADED_LINE}: {skills}."),
         (Loop::Reflect, false) => "Start: call the `skills` tool with name `crystalline-intelligence` and read it, then with name `crystalline-presentation`.".to_string(),
@@ -382,6 +412,92 @@ fn next_count(lines: &[&str], from: usize, key: &str) -> Option<(usize, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The n8n loop workflows exclude exactly the tools a headless run may
+    /// not call, and their guard stops a run when the server forbids another
+    /// list: a new forbidden tool fails this test instead of drifting.
+    #[test]
+    fn the_n8n_workflows_exclude_and_guard_exactly_the_headless_tools() {
+        let joined = HEADLESS_DISALLOWED_TOOLS.join(",");
+        for (name, text) in [
+            (
+                "reflect",
+                include_str!("../../../examples/n8n/reflect-loop.json"),
+            ),
+            (
+                "evolve",
+                include_str!("../../../examples/n8n/evolve-loop.json"),
+            ),
+        ] {
+            let workflow: serde_json::Value = serde_json::from_str(text).unwrap();
+            let node = |wanted: &str| {
+                workflow["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|n| n["name"] == wanted)
+                    .unwrap_or_else(|| panic!("{name}: no node {wanted}"))
+                    .clone()
+            };
+            let mcp = node("Crystalline MCP");
+            let excluded: Vec<&str> = mcp["parameters"]["excludeTools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap())
+                .collect();
+            assert_eq!(excluded, HEADLESS_DISALLOWED_TOOLS, "{name}");
+            let guard = node("Same forbidden tools?");
+            let condition = guard["parameters"]["conditions"]["conditions"][0]["leftValue"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                condition.contains(&format!("=== '{joined}'")),
+                "{name}: {condition}"
+            );
+            let connections = &workflow["connections"];
+            assert_eq!(
+                connections["Prompt fetched?"]["main"][0][0]["node"], "Same forbidden tools?",
+                "{name}"
+            );
+            assert_eq!(
+                connections["Same forbidden tools?"]["main"][0][0]["node"], "Status",
+                "{name}"
+            );
+            assert_eq!(
+                connections["Same forbidden tools?"]["main"][1][0]["node"],
+                "Forbidden tools changed",
+                "{name}"
+            );
+        }
+    }
+
+    /// The skills a loop's prompt names are the ones a run hands over, and
+    /// the handed text carries each shipped skill whole.
+    #[test]
+    fn the_handed_skills_are_the_ones_the_prompt_names() {
+        for lp in [Loop::Reflect, Loop::Evolve] {
+            let prompt = headless_prompt(lp, "eng", 5, true);
+            let text = loaded_skills_text(lp);
+            for name in loop_skills(lp) {
+                assert!(prompt.contains(&format!("`{name}`")), "{name}");
+                let skill = crate::skills::skill(name).unwrap();
+                assert!(text.contains(skill.content.trim_end()), "{name}");
+                assert!(text.contains(&format!("# Skill `{name}`")), "{name}");
+            }
+        }
+        assert_eq!(
+            headless_prompt(Loop::Reflect, "eng", 5, true)
+                .lines()
+                .find(|l| l.starts_with(SKILLS_LOADED_LINE))
+                .unwrap()
+                .split(" They teach")
+                .next()
+                .unwrap(),
+            "Your skills are already loaded: `crystalline-intelligence` and `crystalline-presentation`."
+        );
+    }
 
     #[test]
     fn the_backoff_doubles_from_five_minutes_up_to_six_hours() {

@@ -22,7 +22,7 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 use crystalline_core::automation::{
     DEFAULT_MAX_ITEMS, HEADLESS_DISALLOWED_TOOLS, LEASE_RENEW_SECS, Loop, RunOutcome, RunSummary,
-    headless_prompt, parse_run_summary, runner_setup,
+    SKILLS_LOADED_LINE, headless_prompt, loaded_skills_text, parse_run_summary, runner_setup,
 };
 use crystalline_remote::{Connection, RemoteFailure};
 use serde_json::{Value, json};
@@ -151,9 +151,53 @@ pub enum LoopCommand {
         max_items: u32,
         /// Say the agent's skills are already loaded instead of calling the
         /// skills tool, for a runner that hands them to its agent itself.
+        /// `--skills-loaded false` asks for the call to the skills tool.
+        /// Without it the answer follows this machine's skills.serve, as
+        /// the automation_prompt verb of a daemon started here does.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+        skills_loaded: Option<bool>,
+        /// The config file to read skills.serve and the domain names from,
+        /// for a daemon started with --config. Defaults to
+        /// CRYSTALLINE_CONFIG, then the default config path.
         #[arg(long)]
-        skills_loaded: bool,
+        config: Option<PathBuf>,
     },
+}
+
+/// The domain and the skills line `<loop> prompt` fills in, read from this
+/// machine's configuration as a daemon started here reads them: the local
+/// name `domain` resolves to (an alias, a canonical name), and whether the
+/// skills are loaded (`skills_loaded` when given, else `skills.serve`
+/// through the environment overlay). A spelling the configuration does not
+/// know stays as typed.
+fn local_prompt_inputs(
+    domain: &str,
+    skills_loaded: Option<bool>,
+    config: Option<&Path>,
+) -> anyhow::Result<(String, bool)> {
+    let loaded = match crate::cmd::load(config) {
+        Ok(loaded) => loaded,
+        // Nothing to read is needed when the flag says it: the domain then
+        // stays as typed.
+        Err(_) if skills_loaded.is_some() => {
+            return Ok((domain.to_string(), skills_loaded.unwrap_or_default()));
+        }
+        Err(e) => {
+            return Err(e.context(
+                "could not read the configuration for skills.serve; pass --skills-loaded true or false",
+            ));
+        }
+    };
+    let local = loaded
+        .name_table()
+        .resolve(domain)
+        .unwrap_or(domain)
+        .to_string();
+    let serve = loaded.effective.skills_serve();
+    Ok((
+        local,
+        crystalline_core::automation::skills_loaded(serve, skills_loaded),
+    ))
 }
 
 /// Run `command` for loop `lp`.
@@ -162,16 +206,15 @@ pub async fn run(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<(
         domain,
         max_items,
         skills_loaded,
+        config,
     } = &command
     {
+        let (domain, loaded) = local_prompt_inputs(domain, *skills_loaded, config.as_deref())?;
         if json {
-            let setup = runner_setup(lp, domain, *max_items, *skills_loaded);
+            let setup = runner_setup(lp, &domain, *max_items, loaded);
             println!("{}", serde_json::to_string(&setup)?);
         } else {
-            print!(
-                "{}",
-                headless_prompt(lp, domain, *max_items, *skills_loaded)
-            );
+            print!("{}", headless_prompt(lp, &domain, *max_items, loaded));
         }
         return Ok(());
     }

@@ -1110,6 +1110,23 @@ impl Engine {
         client: Option<&str>,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
+        self.split_engram_noting(p, client, scope, &mut Vec::new())
+            .await
+    }
+
+    /// [`Engine::split_engram_as`], which also pushes onto `left` the
+    /// `(domain, path)` of every file a failed split leaves changed on disk:
+    /// both engrams when it wrote both and the index update failed after, and
+    /// the new engram when taking it back failed. A headless run notes them,
+    /// so its pull request carries what the failed split left behind. A split
+    /// that succeeds names its paths in its receipt and pushes nothing.
+    pub async fn split_engram_noting(
+        &self,
+        p: &SplitParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        left: &mut Vec<(String, String)>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -1255,6 +1272,10 @@ impl Engine {
                     // The source's bytes are the edited ones, so the moved
                     // observations live in the new engram and nowhere else.
                     // Deleting it here is the one thing that would lose them.
+                    left.push((desc.domain.clone(), desc.path.clone()));
+                    if !new_path.is_empty() {
+                        left.push((desc.domain.clone(), new_path.clone()));
+                    }
                     return Err(EngineError::Internal(format!(
                         "the split wrote both engrams but the index update for '{}' failed: {}. Both are kept and neither was undone ({} and {}); the index row for '{}' may be stale until the next sync or reindex picks it up",
                         desc.permalink, failure.error, desc.path, new_path, desc.permalink
@@ -1266,7 +1287,7 @@ impl Engine {
                 // that the source moved under them.
                 match new_permalink {
                     Some(permalink) => {
-                        let _ = self
+                        let taken_back = self
                             .delete_engram_as(
                                 &DeleteParams {
                                     identifier: permalink,
@@ -1281,11 +1302,24 @@ impl Engine {
                                 scope,
                             )
                             .await;
+                        // A take-back that failed leaves the new engram on
+                        // disk, written by this split.
+                        if let Err(e) = taken_back {
+                            tracing::warn!("split rollback of '{new_path}' failed: {e}");
+                            if !new_path.is_empty() {
+                                left.push((desc.domain.clone(), new_path.clone()));
+                            }
+                        }
                     }
-                    None => tracing::warn!(
-                        receipt = %created,
-                        "split rollback skipped: the capture receipt named no permalink"
-                    ),
+                    None => {
+                        tracing::warn!(
+                            receipt = %created,
+                            "split rollback skipped: the capture receipt named no permalink"
+                        );
+                        if !new_path.is_empty() {
+                            left.push((desc.domain.clone(), new_path.clone()));
+                        }
+                    }
                 }
                 return Err(failure.error);
             }
