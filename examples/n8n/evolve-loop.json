@@ -3,7 +3,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Crystalline evolve loop\n\nRuns the evolve loop of one domain when something is due. See docs/automation.md in the Crystalline repository.\n\n1. Create a Bearer Auth credential **Crystalline runner token** with the `cmt_` token of an agent account that may write the domain. Use another account than the reflect workflow. Pick it on every HTTP Request node and on **Crystalline MCP**.\n2. Create an Anthropic credential and pick a model on **Claude**.\n3. Edit **Settings**: the server address, the domain and the item cap.\n4. Nothing to paste: **Fetch the prompt** asks the server for the shipped prompt (`automation_prompt`) at the start of every run, so the agent always gets the prompt of the version the server runs.\n5. Optional: turn on `evolve_trigger: webhook` in the domain's MANIFEST, set the instance's `automation.webhook.url` to this workflow's production webhook URL and `automation.webhook.secret` to a long random value, and give n8n the same value as `CRYSTALLINE_WEBHOOK_SECRET`. An instance has one webhook URL for both loops and every domain, so only one of the two loop workflows takes the webhook; the other runs on its schedule. **Check the signature** drops an event for the other loop. A webhook for another domain only starts a status check of the domain in **Settings**.\n\n6. Import `renew-lease.json` too, pick the credential on its HTTP Request node, and pick that workflow on **Keep the lease fresh**. It renews the lease every 60 seconds while the agent works, without holding up this workflow, and stops when the run is recorded.\n\nIf a renew fails three times, the renewing stops and the lease is stale 5 minutes after the last renew. Another run may then take it over: this run's share and record are refused, and the writes it made are not in a pull request. For long runs use `crystalline evolve run`.",
+        "content": "## Crystalline evolve loop\n\nRuns the evolve loop of one domain when something is due. See docs/automation.md in the Crystalline repository.\n\n1. Create a Bearer Auth credential **Crystalline runner token** with the `cmt_` token of an agent account that may write the domain. Use another account than the reflect workflow. Pick it on every HTTP Request node and on **Crystalline MCP**.\n2. Create an Anthropic credential and pick a model on **Claude**.\n3. Edit **Settings**: the server address, the domain and the item cap.\n4. Nothing to paste: **Fetch the prompt** asks the server for the shipped prompt (`automation_prompt`) at the start of every run, so the agent always gets the prompt of the version the server runs. When the server refuses it (a token that may not run the loop, an unknown domain, a server older than 0.34.0), **Prompt refused** stops the workflow with the server's error, and no lease is taken.\n5. Optional: turn on `evolve_trigger: webhook` in the domain's MANIFEST, set the instance's `automation.webhook.url` to this workflow's production webhook URL and `automation.webhook.secret` to a long random value, and give n8n the same value as `CRYSTALLINE_WEBHOOK_SECRET`. An instance has one webhook URL for both loops and every domain, so only one of the two loop workflows takes the webhook; the other runs on its schedule. **Check the signature** drops an event for the other loop. A webhook for another domain only starts a status check of the domain in **Settings**.\n\n6. Import `renew-lease.json` too, pick the credential on its HTTP Request node, and pick that workflow on **Keep the lease fresh**. It renews the lease every 60 seconds while the agent works, without holding up this workflow, and stops when the run is recorded.\n\nIf a renew fails three times, the renewing stops and the lease is stale 5 minutes after the last renew. Another run may then take it over: this run's share and record are refused, and the writes it made are not in a pull request. For long runs use `crystalline evolve run`.",
         "height": 520,
         "width": 620
       },
@@ -119,6 +119,54 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "781c9611-b6dc-540b-8bb9-261064483a55",
+              "leftValue": "={{ $json.ok === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      },
+      "id": "f3dfca81-c6e6-5232-be4d-0a9ed59b837b",
+      "name": "Prompt fetched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ 'The server refused the prompt: ' + $json.error }}"
+      },
+      "id": "abde2dc8-3d8d-5f53-981c-5ccb635836fd",
+      "name": "Prompt refused",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        140
+      ]
+    },
+    {
+      "parameters": {
         "method": "POST",
         "url": "={{ $('Settings').first().json.url }}/api/v1/ctl",
         "authentication": "genericCredentialType",
@@ -155,7 +203,7 @@
           "conditions": [
             {
               "id": "2032f37f-84f1-5a85-b679-ed4a6a98dc37",
-              "leftValue": "={{ $json.ok === true && $json.data.domains[0].due === true && $('Fetch the prompt').first().json.ok === true }}",
+              "leftValue": "={{ $json.ok === true && $json.data.domains[0].due === true }}",
               "rightValue": "",
               "operator": {
                 "type": "boolean",
@@ -510,7 +558,25 @@
       "main": [
         [
           {
+            "node": "Prompt fetched?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt fetched?": {
+      "main": [
+        [
+          {
             "node": "Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prompt refused",
             "type": "main",
             "index": 0
           }

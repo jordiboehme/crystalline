@@ -13,7 +13,7 @@ Every runner asks first. When nothing is due, it ends at once and starts no agen
 | Command | What it does |
 |---|---|
 | `crystalline <loop> status [--domain D]...` | Shows per domain what is due, as counts, plus a run that is going, the last run and the webhook state. `--json` prints the answer as it came. |
-| `crystalline <loop> run [--domain D]` | Works what is due with a headless Claude Code agent: takes the lease, runs the agent with the shipped prompt, shares its changes as a pull request, records the run and releases the lease. Without `--domain` it works every due domain in turn. |
+| `crystalline <loop> run [--domain D]` | Works what is due with a headless Claude Code agent: takes the lease, runs the agent with the prompt the server answers (`automation_prompt`), shares its changes as a pull request, records the run and releases the lease. Without `--domain` it works every due domain in turn. |
 | `crystalline <loop> watch [--domain D]... [--interval S]` | Checks the status every `--interval` seconds (default 60) and runs when something is due. Runs until it gets SIGTERM or Ctrl-C. |
 | `crystalline <loop> prompt --domain D [--max-items N] [--skills-loaded]` | Prints the shipped prompt, for a runner that starts its own agent. `--json` prints what the `automation_prompt` verb answers (see [The prompt for your own agent](#the-prompt-for-your-own-agent)). |
 
@@ -54,7 +54,7 @@ The server checks the `Host` header of every request. When a runner reaches the 
 ```sh
 claude --mcp-config <config> --strict-mcp-config --setting-sources "" --tools "" \
   --allowedTools mcp__crystalline --disallowedTools <the forbidden tools> \
-  --output-format stream-json --verbose --max-turns 60 -p "<the shipped prompt>"
+  --output-format stream-json --verbose --max-turns 60 -p "<the prompt>"
 ```
 
 So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. The local MCP config starts `crystalline mcp --unattended --domain <domain>`, one agent per domain. Against a server the config carries the bearer and the header `X-Crystalline-Run-Domain: <domain>`, which the server believes only while that account holds the run's lease there. Both mark the session as one nobody is behind and bind it to the domain the run works on: it is never asked to share Reflection text from a domain fewer people may read, and it reads only the domains every reader of that domain may read (see [What an unattended run may read](reflection.md#what-an-unattended-run-may-read)). You set none of this: `run` writes it into the config. Custom automation that starts its own agent marks it the same way. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config and the prompt. These flags were checked against Claude Code 2.1.312.
@@ -113,7 +113,7 @@ It answers the prompt as a run of this server starts its agent with, filled in f
 - `checksum` is `sha256:` and the lowercase hex SHA-256 of the prompt's UTF-8 bytes, one NUL byte, then the tool names joined by a line feed, with nothing after the last one. In JavaScript: `prompt + "\0" + disallowed_tools.join("\n")`. A change to the prompt or to the tools changes it, and `version` is not part of it. A runner that adds its own rules on top can keep the last checksum and stop for a person when it changes.
 - The rights are those of `automation_status` for that loop and domain: a token that may not run the loop there is refused, and a domain it may not see is answered as an unknown one.
 
-The prompt starts by calling the `skills` tool. Where the server does not serve it (`skills.serve: false`, or `CRYSTALLINE_SKILLS_SERVE=false`), that sentence becomes "Your skills are already loaded" with the skills it names, and the runner hands the skills to its agent in another way. `skills_loaded: true` asks for that sentence on any server, and `skills_loaded: false` asks for the call to the `skills` tool. `crystalline <loop> run` takes its prompt and the forbidden tools from the server the same way, so a run against a newer server never misses a tool it forbids. A server older than the verb refuses it, and the run then uses the prompt and the list of its own binary.
+The prompt starts by calling the `skills` tool. Where the server does not serve it (`skills.serve: false`, or `CRYSTALLINE_SKILLS_SERVE=false`), that sentence becomes "Your skills are already loaded" with the skills it names, and the runner hands the skills to its agent in another way. `skills_loaded: true` asks for that sentence on any server, and `skills_loaded: false` asks for the call to the `skills` tool. `crystalline <loop> run` takes its prompt and the forbidden tools from the server the same way, so a run against a newer server never misses a tool it forbids. Only a server older than the verb, which does not know it, makes the run fall back to the prompt and the list of its own binary; any other refusal ends the run with its error before it takes the lease. `--dry-run` asks too and shows the server's list.
 
 `crystalline <loop> prompt --json --domain eng` prints the same `data` without asking a server, from the prompt in this binary; `--skills-loaded` mirrors the field, and without it the prompt calls the `skills` tool.
 
@@ -191,7 +191,7 @@ Each workflow has a note with its setup steps. In short:
 1. Create a Bearer Auth credential with the `cmt_` token of an agent account and pick it on every HTTP Request node and on the MCP Client Tool. The MCP Client Tool's endpoint is the server root URL with a trailing slash, over HTTP Streamable.
 2. Create an Anthropic credential and pick a model.
 3. Edit the Settings node: the server address, the domain and the item cap.
-4. There is nothing to paste: the node Fetch the prompt asks the server for the prompt with `automation_prompt` at the start of every run, so after an upgrade the agent gets the new prompt at once. A run whose fetch fails takes no lease.
+4. There is nothing to paste: the node Fetch the prompt asks the server for the prompt with `automation_prompt` at the start of every run, so after an upgrade the agent gets the new prompt at once. When the server refuses it (a token that may not run the loop, an unknown domain, a server older than 0.34.0), the node Prompt refused stops the workflow with the server's error, and no lease is taken.
 5. Import `renew-lease.json`, pick the credential on its HTTP Request node and pick that workflow on the node Keep the lease fresh.
 
 The MCP Client Tool leaves out the eleven tools a headless run may not call. That list is fixed in the workflow, so compare it with the `disallowed_tools` that Fetch the prompt answers after an upgrade. The HTTP Request nodes send the ctl verbs the CLI sends: `automation_prompt`, `automation_status`, `automation_lease_take`, `automation_lease_renew`, `automation_share` and `automation_run_record`, each a `POST /api/v1/ctl` with a body such as `{"v": 1, "cmd": "automation_status", "loop": "reflect", "domains": ["eng"]}`. The answer is `{"v": 1, "ok": true, "data": ...}`, or `ok: false` with an `error` such as `already running`.

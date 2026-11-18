@@ -131,15 +131,19 @@ pub(super) async fn run_one(
     stop: &watch::Receiver<bool>,
 ) -> anyhow::Result<Ran> {
     let args = &opts.args;
+    // A stop never waits on the server: no lease is taken yet. A dry run
+    // asks too, so it shows the tools the server forbids.
+    let Some(setup) = unless_stopped(run_prompt(lp, client, domain, args.max_items), stop).await
+    else {
+        return Ok(Ran::Busy);
+    };
+    let setup = setup?;
     if opts.dry_run {
         let shown = ClaudeRun {
             program: claude.to_path_buf(),
             mcp_config: PathBuf::from("<mcp config>"),
             prompt: "<prompt>".to_string(),
-            disallowed_tools: HEADLESS_DISALLOWED_TOOLS
-                .iter()
-                .map(|t| t.to_string())
-                .collect(),
+            disallowed_tools: setup.disallowed_tools,
             max_turns: args.max_turns,
             model: args.model.clone(),
         };
@@ -155,20 +159,13 @@ pub(super) async fn run_one(
         println!("  {}", words.join(" "));
         return Ok(Ran::Exited(0));
     }
-    // A stop never waits on the server: no lease is taken yet.
-    let mut stopping = stop.clone();
-    let setup = tokio::select! {
-        setup = run_prompt(lp, client, domain, args.max_items) => setup?,
-        _ = stopping.wait_for(|stopped| *stopped) => return Ok(Ran::Busy),
-    };
     let take = client.verb(
         "automation_lease_take",
         lp,
         json!({ "domain": domain, "runner": args.runner }),
     );
-    let take = tokio::select! {
-        take = take => take,
-        _ = stopping.wait_for(|stopped| *stopped) => return Ok(Ran::Busy),
+    let Some(take) = unless_stopped(take, stop).await else {
+        return Ok(Ran::Busy);
     };
     let take = match take {
         Ok(take) => take,
@@ -384,8 +381,6 @@ fn share_failure(domain: &str, error: &str, remote: bool) -> String {
     text
 }
 
-/// A take refusal that means "not now": a run is going, or the loop runs on
-/// another instance.
 /// What a run starts its agent with: the prompt and the tools it may never
 /// call.
 #[derive(Debug, PartialEq, Eq)]
@@ -429,13 +424,24 @@ impl RunPrompt {
     }
 }
 
+/// `fut`'s output, or `None` when a stop comes first.
+pub(super) async fn unless_stopped<F: std::future::Future>(
+    fut: F,
+    stop: &watch::Receiver<bool>,
+) -> Option<F::Output> {
+    let mut stopping = stop.clone();
+    tokio::select! {
+        out = fut => Some(out),
+        _ = stopping.wait_for(|stopped| *stopped) => None,
+    }
+}
+
 /// The prompt a run on `domain` starts its agent with and the tools it may
 /// never call, as the server it talks to answers them (`automation_prompt`):
 /// the server knows whether its MCP surface serves the `skills` tool the
 /// prompt starts with, and which tools it forbids, also when it is newer
-/// than this binary. A server older than the verb refuses it, and the run
-/// then starts with this binary's shipped prompt and its own list. Asked
-/// before the lease is taken, so a failure here leaves no lease behind.
+/// than this binary. Asked before the lease is taken, so a failure here
+/// leaves no lease behind. See [`prompt_of`] for the answer.
 pub(super) async fn run_prompt(
     lp: Loop,
     client: &AutomationClient,
@@ -449,16 +455,48 @@ pub(super) async fn run_prompt(
             json!({ "domain": domain, "max_items": max_items }),
         )
         .await;
+    prompt_of(answer, lp, domain, max_items)
+}
+
+/// What a run starts with after `answer` to its `automation_prompt`: the
+/// server's prompt and tools; this binary's shipped prompt and its own list
+/// when the server does not know the verb (a server older than it, see
+/// [`verb_unknown`]); and every other failure (a refusal of the caller's
+/// rights, an unknown domain, a server or network error) as it is, so the
+/// run ends before it takes a lease.
+pub(super) fn prompt_of(
+    answer: anyhow::Result<Value>,
+    lp: Loop,
+    domain: &str,
+    max_items: u32,
+) -> anyhow::Result<RunPrompt> {
     match answer {
         Ok(setup) => RunPrompt::of_answer(&setup),
-        Err(e) if is_refusal(&e) => {
-            eprintln!("{domain}: the server sent no prompt ({e}); this run uses the shipped one.");
+        Err(e) if verb_unknown(&e) => {
+            eprintln!(
+                "{domain}: the server does not know automation_prompt yet ({e}); this run uses the shipped prompt."
+            );
             Ok(RunPrompt::shipped(lp, domain, max_items))
         }
         Err(e) => Err(e),
     }
 }
 
+/// Whether `e` is a server's answer that it does not know
+/// `automation_prompt`: an older local daemon's "unknown ctl command" or an
+/// older remote server's refusal of a command it does not serve.
+pub(super) fn verb_unknown(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    text.starts_with("unknown ctl command 'automation_prompt'")
+        || text
+            == format!(
+                "'automation_prompt' {}",
+                crystalline_service::remote_ctl::NOT_REMOTE
+            )
+}
+
+/// A take refusal that means "not now": a run is going, or the loop runs on
+/// another instance.
 pub(super) fn is_busy(e: &anyhow::Error) -> bool {
     let text = e.to_string();
     text == "already running" || text.starts_with("runs on ")
@@ -999,14 +1037,61 @@ mod tests {
         }
     }
 
+    /// An older server that does not know the verb, locally or remotely:
+    /// the run falls back to this binary's shipped prompt and its own list.
     #[test]
-    fn the_fallback_is_the_shipped_prompt_with_this_binarys_tools() {
-        let shipped = RunPrompt::shipped(Loop::Evolve, "kb", 7);
-        assert_eq!(
-            shipped.prompt,
-            headless_prompt(Loop::Evolve, "kb", 7, false)
-        );
-        assert_eq!(shipped.disallowed_tools, HEADLESS_DISALLOWED_TOOLS);
+    fn an_unknown_verb_falls_back_to_the_shipped_prompt_and_this_binarys_tools() {
+        for refusal in [
+            anyhow::Error::msg(
+                "unknown ctl command 'automation_prompt'; expected status, sessions, holder",
+            ),
+            anyhow::Error::new(RemoteFailure::Refused(
+                "'automation_prompt' is not available over a remote connection".to_string(),
+            )),
+        ] {
+            let text = refusal.to_string();
+            let shipped = prompt_of(Err(refusal), Loop::Evolve, "kb", 7).unwrap();
+            assert_eq!(
+                shipped.prompt,
+                headless_prompt(Loop::Evolve, "kb", 7, false),
+                "{text}"
+            );
+            assert_eq!(
+                shipped.disallowed_tools, HEADLESS_DISALLOWED_TOOLS,
+                "{text}"
+            );
+        }
+    }
+
+    /// Every other failure ends the run with its own error, before a take.
+    #[test]
+    fn a_refused_prompt_is_an_error_and_no_fallback() {
+        for refusal in [
+            anyhow::Error::new(RemoteFailure::Refused(
+                "you may not write to 'kb', so you may not run its evolve loop".to_string(),
+            )),
+            anyhow::Error::new(RemoteFailure::Invalid(
+                "max_items must be a whole number from 0 to 4294967295".to_string(),
+            )),
+            anyhow::Error::msg("unknown domain 'kb'"),
+            anyhow::Error::msg("unknown ctl command 'automation_status'; expected status"),
+            anyhow::Error::new(std::io::Error::other("connection reset")),
+        ] {
+            let text = refusal.to_string();
+            let err = prompt_of(Err(refusal), Loop::Evolve, "kb", 7).unwrap_err();
+            assert_eq!(err.to_string(), text);
+        }
+    }
+
+    /// A stop that comes first ends the wait for the server; without one
+    /// the answer comes through.
+    #[tokio::test]
+    async fn a_stop_ends_the_wait_for_the_server() {
+        let (tx, rx) = watch::channel(false);
+        assert_eq!(unless_stopped(async { 1 }, &rx).await, Some(1));
+        tx.send(true).unwrap();
+        let never = std::future::pending::<u8>();
+        assert_eq!(unless_stopped(never, &rx).await, None);
     }
 
     #[test]

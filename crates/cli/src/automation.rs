@@ -106,10 +106,10 @@ pub enum LoopCommand {
         domain: Vec<String>,
     },
     /// Work what is due with a headless Claude Code agent: take the lease,
-    /// run the agent with the shipped prompt, share its changes as a pull
-    /// request, record the run and release the lease. Exit 0 when the run is
-    /// done or stopped at its item cap, 1 when nothing is due or a run is
-    /// already going, 2 when the run failed or on an error.
+    /// run the agent with the prompt the server answers, share its changes
+    /// as a pull request, record the run and release the lease. Exit 0 when
+    /// the run is done or stopped at its item cap, 1 when nothing is due or a
+    /// run is already going, 2 when the run failed or on an error.
     Run {
         /// The domain to work. Omit to work every due domain in turn.
         #[arg(long)]
