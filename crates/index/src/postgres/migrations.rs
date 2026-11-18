@@ -1057,7 +1057,7 @@ pub(crate) async fn apply_locked(conn: &mut PgConnection, schema: Option<&str>) 
 /// and release, over the set's own ledger.
 ///
 /// A ledger that already holds the set's last step is answered without the
-/// lock ([`already_current`]): there is nothing to run, and the one key is
+/// lock (`already_current`): there is nothing to run, and the one key is
 /// shared by every schema of the database, so a start of an up-to-date
 /// schema would otherwise queue behind every other schema's migration run.
 pub async fn apply_locked_set(
