@@ -4,18 +4,20 @@
 //! answer `status` reads.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
 use crystalline_core::config::UpdateConfig;
 use crystalline_core::time::{self, Stamp};
 use crystalline_core::update::{
-    CheckOutcome, Detection, InstallMethod, Refusal, UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT,
-    UpdateCache,
+    CheckOutcome, Detection, InstallMethod, KnownRelease, Refusal, UPDATE_CACHE_FILE,
+    UPDATE_CACHE_FORMAT, UpdateCache,
 };
 use crystalline_core::version::Precedence;
 use crystalline_service::control::{answer_for_test, answer_for_test_with_update};
+use crystalline_service::update::check::run_update_checks;
 use crystalline_service::update::{UpdateState, check_suppressed, read_cache, run_check};
 use serde_json::json;
 
@@ -413,6 +415,7 @@ async fn update_facts_over_ctl() {
             first_seen: t0(),
         },
         etag: Some("\"secret-etag\"".to_string()),
+        last_release: None,
     };
     std::fs::write(&cache_path, serde_json::to_string(&cache).unwrap()).unwrap();
     let exe = dir.path().join("crystalline");
@@ -456,4 +459,202 @@ async fn update_facts_over_ctl() {
         answer["data"]["check"], "off: NO_UPDATE_NOTIFIER is set",
         "{answer}"
     );
+}
+
+/// The log lines written while the guard lives, on this thread: every
+/// `#[tokio::test]` here runs on one thread, so the lookup's own log lines
+/// land here too.
+struct Journal(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Journal {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_journal() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+    let lines: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || Journal(writer.clone()))
+        .finish();
+    (lines, tracing::subscriber::set_default(subscriber))
+}
+
+fn journal_count(lines: &Arc<Mutex<Vec<u8>>>, needle: &str) -> usize {
+    String::from_utf8_lossy(&lines.lock().unwrap())
+        .matches(needle)
+        .count()
+}
+
+#[tokio::test]
+async fn a_failed_check_keeps_the_known_release_and_logs_each_version_once() {
+    let _env = ENV.lock().await;
+    // 0: the API names v99.0.0; 1: GitHub is down; 2: rate limited, the
+    // fallback names v99.0.0; 3: the API names v99.0.0 again; 4: down
+    // again; 5: the API names v99.0.1.
+    let phase = Arc::new(AtomicUsize::new(0));
+    let answering = phase.clone();
+    let fake = Fake::start(move |method, path, _| {
+        match (answering.load(Ordering::SeqCst), method, path) {
+            (0 | 3, &Method::GET, API_PATH) => respond(
+                StatusCode::OK,
+                &[("etag", "\"e1\"")],
+                &api_release("v99.0.0"),
+            ),
+            (1 | 4, _, _) => respond(StatusCode::BAD_GATEWAY, &[], "down"),
+            (2, &Method::GET, API_PATH) => respond(
+                StatusCode::FORBIDDEN,
+                &[("x-ratelimit-remaining", "0")],
+                "{}",
+            ),
+            (2, &Method::HEAD, WEB_PATH) => redirect_to("v99.0.0"),
+            (5, &Method::GET, API_PATH) => respond(StatusCode::OK, &[], &api_release("v99.0.1")),
+            _ => respond(StatusCode::NOT_FOUND, &[], ""),
+        }
+    })
+    .await;
+    use_fake(&fake);
+    let (journal, _guard) = capture_journal();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+    let known = KnownRelease {
+        version: "v99.0.0".to_string(),
+        published_at: Some(published()),
+        first_seen: t0(),
+    };
+
+    run_check(&path, t0()).await;
+    assert_eq!(journal_count(&journal, "newer release 99.0.0 seen"), 1);
+
+    phase.store(1, Ordering::SeqCst);
+    let failed = run_check(&path, later(24)).await;
+    assert!(matches!(failed.outcome, CheckOutcome::Failed { .. }));
+    assert_eq!(failed.known_release(), Some(known.clone()), "not forgotten");
+    assert_eq!(
+        read_cache(&path).unwrap().known_release(),
+        Some(known.clone())
+    );
+
+    phase.store(2, Ordering::SeqCst);
+    let fallback = run_check(&path, later(48)).await;
+    assert_eq!(
+        release_outcome(&fallback),
+        ("v99.0.0".to_string(), Some(published()), t0()),
+        "first_seen and the publish time survive the failure"
+    );
+    assert_eq!(fallback.last_release, None);
+
+    phase.store(3, Ordering::SeqCst);
+    run_check(&path, later(72)).await;
+    phase.store(4, Ordering::SeqCst);
+    let failed_again = run_check(&path, later(96)).await;
+    assert_eq!(failed_again.known_release(), Some(known));
+    assert_eq!(
+        journal_count(&journal, "newer release 99.0.0 seen"),
+        1,
+        "a failure or a fallback in between repeats nothing"
+    );
+
+    phase.store(5, Ordering::SeqCst);
+    let newer = run_check(&path, later(120)).await;
+    assert_eq!(release_outcome(&newer).2, later(120));
+    assert_eq!(journal_count(&journal, "newer release 99.0.1 seen"), 1);
+    assert_eq!(journal_count(&journal, "newer release"), 2);
+}
+
+#[tokio::test]
+async fn short_lived_daemons_check_at_most_once_a_day() {
+    let _env = ENV.lock().await;
+    let fake = Fake::start(|_, path, _| match path {
+        API_PATH => respond(StatusCode::OK, &[], &api_release("v99.0.0")),
+        _ => respond(StatusCode::NOT_FOUND, &[], ""),
+    })
+    .await;
+    use_fake(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+    let exe = dir.path().join("crystalline");
+    std::fs::write(&exe, "binary").unwrap();
+    let none = |_: &str| None;
+    // A daemon started before any check, which stays up past the others.
+    let early = Arc::new(UpdateState::detect(&exe, &none, Some(path.clone())));
+
+    // A daemon's life: the check task with no first wait and a fast wake,
+    // for `life`, then the shutdown.
+    async fn live(state: Arc<UpdateState>, life: Duration) {
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_update_checks(
+            state,
+            || true,
+            Duration::ZERO,
+            Duration::from_millis(20),
+            rx,
+        ));
+        tokio::time::sleep(life).await;
+        stop.send_replace(true);
+        task.await.unwrap();
+    }
+
+    // The first daemon checks at once and writes the file.
+    let first = Arc::new(UpdateState::detect(&exe, &none, Some(path.clone())));
+    let mut seen = first.subscribe();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(run_update_checks(
+        first.clone(),
+        || true,
+        Duration::ZERO,
+        Duration::from_millis(20),
+        rx,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), seen.changed())
+        .await
+        .expect("the first check runs at once")
+        .unwrap();
+    stop.send_replace(true);
+    task.await.unwrap();
+    assert_eq!(api_count(&fake), 1);
+    assert!(read_cache(&path).is_some());
+
+    // Daemons started after it load the file and ask nothing.
+    for _ in 0..3 {
+        let state = Arc::new(UpdateState::detect(&exe, &none, Some(path.clone())));
+        live(state, Duration::from_millis(150)).await;
+    }
+    // One whose memory is older than the file reads the file and asks
+    // nothing either.
+    live(early.clone(), Duration::from_millis(150)).await;
+    assert_eq!(api_count(&fake), 1, "at most once a day");
+    assert!(
+        early.subscribe().borrow().is_some(),
+        "it took the file's check"
+    );
+
+    // A check off asks nothing, whatever is due.
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let off = Arc::new(UpdateState::detect(
+        &exe,
+        &none,
+        Some(fresh_dir.path().join(UPDATE_CACHE_FILE)),
+    ));
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(run_update_checks(
+        off,
+        || false,
+        Duration::ZERO,
+        Duration::from_millis(20),
+        rx,
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    stop.send_replace(true);
+    task.await.unwrap();
+    assert_eq!(api_count(&fake), 1);
+    assert!(!fresh_dir.path().join(UPDATE_CACHE_FILE).exists());
 }

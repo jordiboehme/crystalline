@@ -1077,6 +1077,31 @@ mod pg {
             }
         }
 
+        /// Before the daemon serves, `update_facts` is answered at once as
+        /// an unknown command, so `status` falls back to the cache file
+        /// instead of waiting out a standby or a slow start.
+        #[tokio::test]
+        async fn update_facts_is_answered_at_once_before_the_daemon_serves() {
+            let (_status, status) = watch::channel(StandbyStatus::new());
+            let view = StandbyView {
+                status,
+                database: "db:5432/c".to_string(),
+                started: Instant::now(),
+            };
+            let (_handover, mut handover) = watch::channel(None);
+            let request = json!({"v": 1, "cmd": "update_facts"});
+            let (answer, stop) = tokio::time::timeout(
+                Duration::from_secs(5),
+                answer_early(&request, &view, &mut handover),
+            )
+            .await
+            .expect("never parked");
+            assert!(matches!(stop, Stop::No));
+            assert_eq!(answer["ok"], false, "{answer}");
+            assert_eq!(answer["error"], UPDATE_FACTS_UNKNOWN, "{answer}");
+            assert!(UPDATE_FACTS_UNKNOWN.starts_with("unknown ctl command 'update_facts'"));
+        }
+
         /// The sentences name the active instance when it announced itself,
         /// and say that it has not otherwise; a released row is a
         /// predecessor's and names nobody.

@@ -37,8 +37,11 @@ pub fn check_interval() -> Delta {
 /// `configure set update.check true` takes effect within this time.
 pub const CHECK_WAKE: Duration = Duration::from_secs(60 * 60);
 
-/// The longest random wait before a daemon's first look.
-pub const MAX_START_JITTER: Duration = Duration::from_secs(10 * 60);
+/// The longest random wait before a daemon's first look: short, so a
+/// daemon that exits when idle still gets to check. Short-lived daemons
+/// still ask at most once a day, since every look starts from the cache
+/// file the last attempt wrote.
+pub const MAX_START_JITTER: Duration = Duration::from_secs(60);
 
 /// The reason the check is off when nothing suppresses it but the setting.
 pub const OFF_BY_SETTING: &str = "not turned on";
@@ -121,11 +124,14 @@ fn next_cache(
     lookup: Result<Lookup, UpdateError>,
     now: Stamp,
 ) -> UpdateCache {
+    // A failed attempt keeps the release a check found before it, with its
+    // first_seen, beside it.
     let failed = |reason: String| UpdateCache {
         v: UPDATE_CACHE_FORMAT,
         checked_at: now,
         outcome: CheckOutcome::Failed { reason },
         etag: None,
+        last_release: previous.and_then(UpdateCache::known_release),
     };
     match lookup {
         Err(err) => failed(failure_reason(&err)),
@@ -148,17 +154,17 @@ fn fresh_cache(
     etag: Option<String>,
     now: Stamp,
 ) -> UpdateCache {
-    let same = previous.and_then(|cache| match &cache.outcome {
-        CheckOutcome::Release {
-            version,
-            published_at,
-            first_seen,
-        } if *version == release.tag => Some((*published_at, *first_seen, cache.etag.clone())),
-        _ => None,
+    // The release known before, also across a failed attempt in between.
+    let same = previous.and_then(|cache| {
+        cache
+            .known_release()
+            .filter(|known| known.version == release.tag)
+            .map(|known| (known.published_at, known.first_seen, cache.etag.clone()))
     });
     let (published_at, first_seen, etag) = match same {
         // The fallback carries neither an ETag nor a publish time: keep the
-        // ones the API gave for this same release.
+        // ones the API gave for this same release. A failed attempt keeps
+        // no ETag, so there is none to keep after one.
         Some((published_before, first_seen, etag_before)) => (
             release.published_at.or(published_before),
             first_seen,
@@ -175,20 +181,22 @@ fn fresh_cache(
             first_seen,
         },
         etag,
+        last_release: None,
     }
 }
 
 /// The version `next` names when it is newer than this binary and was not
-/// what `previous` named, the one moment the journal hears of it.
+/// the release `previous` knew, also across a failed attempt, the one
+/// moment the journal hears of it.
 fn newly_seen(previous: Option<&UpdateCache>, next: &UpdateCache) -> Option<Precedence> {
     let current = Precedence::parse(crystalline_core::VERSION)?;
     let found = next.newer_release(&current)?;
     let CheckOutcome::Release { version, .. } = &next.outcome else {
         return None;
     };
-    let seen_before = previous.is_some_and(|cache| {
-        matches!(&cache.outcome, CheckOutcome::Release { version: before, .. } if before == version)
-    });
+    let seen_before = previous
+        .and_then(UpdateCache::known_release)
+        .is_some_and(|known| known.version == *version);
     (!seen_before).then_some(found)
 }
 
@@ -287,6 +295,11 @@ impl UpdateState {
         self.detection
     }
 
+    /// A receiver of the last check, which changes after every check.
+    pub fn subscribe(&self) -> watch::Receiver<Option<UpdateCache>> {
+        self.cache.subscribe()
+    }
+
     /// The `update_facts` answer: the method's label, whether this is an
     /// official build, `on` or `off: <reason>` given whether `update.check`
     /// is on, and the last check without its ETag (`null` when there is
@@ -340,9 +353,11 @@ pub fn start_jitter() -> Duration {
 
 /// The daemon's check task: waits `first_wait`, then every `wake` runs a
 /// check when one may run (`setting_on` is read each time, so a change of
-/// `update.check` needs no restart) and the last one is a day old. Ends on
-/// the shutdown signal, also in the middle of a lookup.
-pub(crate) async fn run_update_checks(
+/// `update.check` needs no restart) and the last one is a day old. "A day
+/// old" is decided by [`run_check`] from the cache file, so a new daemon
+/// never asks sooner than the last attempt of an earlier one allows. Ends
+/// on the shutdown signal, also in the middle of a lookup.
+pub async fn run_update_checks(
     state: std::sync::Arc<UpdateState>,
     setting_on: impl Fn() -> bool,
     first_wait: Duration,
@@ -408,6 +423,7 @@ mod tests {
                 first_seen,
             },
             etag: Some("\"e1\"".to_string()),
+            last_release: None,
         }
     }
 

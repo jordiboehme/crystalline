@@ -27,6 +27,28 @@ pub struct UpdateCache {
     /// The ETag of the API answer, when there was one.
     #[serde(default)]
     pub etag: Option<String>,
+    /// The last release a check found, kept here while `outcome` is a
+    /// failure, so a failed check neither forgets a known release nor
+    /// restarts its `first_seen`. Absent while `outcome` is that release
+    /// itself, and before any check found one. Read it through
+    /// [`UpdateCache::known_release`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_release: Option<KnownRelease>,
+}
+
+/// A release a check found: the fields of [`CheckOutcome::Release`], kept
+/// beside a later failed attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnownRelease {
+    /// The release tag as GitHub names it, `v0.34.0`; never shown as
+    /// written (see [`CheckOutcome::Release`]).
+    pub version: String,
+    /// When GitHub published it; absent when only the fallback answered.
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub published_at: Option<Stamp>,
+    /// When this machine first saw this version.
+    #[serde(with = "time::serde::stamp")]
+    pub first_seen: Stamp,
 }
 
 /// What an update check found. Failed checks are cached too, so a broken
@@ -62,6 +84,28 @@ impl UpdateCache {
         serde_json::from_str::<UpdateCache>(text)
             .ok()
             .filter(|cache| cache.v == UPDATE_CACHE_FORMAT)
+    }
+
+    /// The newest release any check found: the outcome when it is a
+    /// release, else the one kept beside a failed attempt. [`newer_release`]
+    /// and [`gate`] still read only the latest outcome, so a failed check
+    /// offers nothing (S29).
+    ///
+    /// [`newer_release`]: UpdateCache::newer_release
+    /// [`gate`]: UpdateCache::gate
+    pub fn known_release(&self) -> Option<KnownRelease> {
+        match &self.outcome {
+            CheckOutcome::Release {
+                version,
+                published_at,
+                first_seen,
+            } => Some(KnownRelease {
+                version: version.clone(),
+                published_at: *published_at,
+                first_seen: *first_seen,
+            }),
+            CheckOutcome::Failed { .. } => self.last_release.clone(),
+        }
     }
 
     /// The cached release when its tag is an exact release tag
@@ -146,6 +190,7 @@ mod tests {
                 first_seen: at(17, 9, 0),
             },
             etag: None,
+            last_release: None,
         }
     }
 
@@ -163,6 +208,7 @@ mod tests {
                 reason: "timed out".to_string(),
             },
             etag: None,
+            last_release: None,
         };
         let text = serde_json::to_string(&failed).unwrap();
         assert_eq!(UpdateCache::parse(&text), Some(failed));
@@ -249,6 +295,33 @@ mod tests {
         // for years.
         assert!(!cache.fresh(at(17, 8, 59), day));
         assert!(!cache.fresh(at(1, 0, 0), day));
+    }
+
+    #[test]
+    fn a_failure_keeps_the_known_release_beside_it() {
+        let found = release("v0.35.0");
+        let known = found.known_release().expect("a release is known");
+        assert_eq!(known.version, "v0.35.0");
+        assert_eq!(known.first_seen, at(17, 9, 0));
+        let failed = UpdateCache {
+            v: UPDATE_CACHE_FORMAT,
+            checked_at: at(18, 9, 0),
+            outcome: CheckOutcome::Failed {
+                reason: "timed out".to_string(),
+            },
+            etag: None,
+            last_release: Some(known.clone()),
+        };
+        assert_eq!(failed.known_release(), Some(known));
+        // The latest outcome still decides what is offered (S29).
+        let current = Precedence::parse("0.34.0").unwrap();
+        assert_eq!(failed.newer_release(&current), None);
+        assert_eq!(failed.gate(at(20, 9, 0), 24), None);
+        let text = serde_json::to_string(&failed).unwrap();
+        assert_eq!(UpdateCache::parse(&text), Some(failed));
+        // A release outcome writes no second copy of itself.
+        let text = serde_json::to_string(&found).unwrap();
+        assert!(!text.contains("last_release"), "{text}");
     }
 
     #[test]

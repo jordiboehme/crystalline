@@ -11,7 +11,7 @@ pub mod release;
 pub mod verify;
 
 pub use cache::{
-    CheckOutcome, Gate, UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT, UpdateCache, age_gate,
+    CheckOutcome, Gate, KnownRelease, UPDATE_CACHE_FILE, UPDATE_CACHE_FORMAT, UpdateCache, age_gate,
 };
 pub use install::{
     CHANNEL_ENV, DetectedInstall, Detection, InstallMethod, MARKER_FILE, Refusal, archive_member,
