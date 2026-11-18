@@ -2,6 +2,14 @@
 //! ETag, the rate-limit fallback to the release page redirect, and that only
 //! a stable release is ever taken.
 
+#[path = "../support/mod.rs"]
+mod support;
+
+#[path = "../reflection/fixture.rs"]
+mod fixture;
+
+mod check;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 

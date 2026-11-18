@@ -182,6 +182,9 @@ pub struct Shared {
     /// Why the daemon is stopping, recorded by whoever asked first, for the
     /// shutdown's first log line.
     shutdown_reason: std::sync::OnceLock<&'static str>,
+    /// The install method detected at start and the last update check,
+    /// which the ctl `update_facts` answer reads.
+    pub(crate) update: Arc<crate::update::UpdateState>,
 }
 
 impl Shared {
@@ -203,6 +206,11 @@ impl Shared {
             sessions_tx,
             idle_exit: None,
             shutdown_reason: std::sync::OnceLock::new(),
+            update: Arc::new(crate::update::UpdateState::detect(
+                std::path::Path::new(""),
+                &|_| None,
+                None,
+            )),
         }
     }
 
@@ -363,6 +371,11 @@ pub async fn run_serve(
         None => crate::logging::init_subscriber(std::io::stderr, None, filter),
     }
     crate::logging::log_thread_plan();
+    // How this binary was installed, detected once now and kept (S18):
+    // after a package upgrade the running exe may no longer exist. The last
+    // update check is loaded with it, so `status` has its facts before the
+    // first check runs.
+    let update = Arc::new(crate::update::UpdateState::at_start());
 
     // The single load chokepoint: parse the environment overlay, resolve the
     // config path (flag, then CRYSTALLINE_CONFIG, then the default) and layer
@@ -779,6 +792,7 @@ pub async fn run_serve(
         sessions_tx,
         idle_exit: exit_when_idle.then_some(IDLE_EXIT_GRACE),
         shutdown_reason: std::sync::OnceLock::new(),
+        update: update.clone(),
     });
     // The extension's bounded life: started now, so a stub that dies before
     // it ever attaches (Desktop quitting mid-spawn) still ends this daemon.
@@ -1132,6 +1146,22 @@ pub async fn run_serve(
         tokio::spawn(async move {
             run_orphan_sweep(e, ORPHAN_SWEEP, rx).await;
         });
+    }
+
+    // The update check: once a day while `update.check` is on and nothing
+    // suppresses it, after a random wait so daemons started together do not
+    // ask GitHub at the same second. Its own task, so neither the start nor
+    // a request ever waits on GitHub.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(crate::update::check::run_update_checks(
+            update.clone(),
+            move || e.config().update_check_enabled(),
+            crate::update::check::start_jitter(),
+            crate::update::check::CHECK_WAKE,
+            rx,
+        ));
     }
 
     // The HTTP endpoint, which is on unless it was turned off. On Postgres it

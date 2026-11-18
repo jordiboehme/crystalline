@@ -9,7 +9,8 @@
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, domain_register, routing_config, maintenance_stamp, desktop_offer,
-//! forget_domain, forget_credential, sources_reload, mounted_routing, shutdown. This is the
+//! forget_domain, forget_credential, sources_reload, mounted_routing, update_facts,
+//! shutdown. This is the
 //! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
@@ -72,6 +73,20 @@ pub async fn serve_ctl(stream: IpcStream, shared: Arc<Shared>) {
 #[doc(hidden)]
 pub async fn answer_for_test(engine: Arc<Engine>, req: &Value) -> Value {
     handle(req, &Arc::new(Shared::for_test(engine))).await.0
+}
+
+/// [`answer_for_test`] with the daemon's update state in place of the one
+/// a test daemon detects for an exe it does not have.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub async fn answer_for_test_with_update(
+    engine: Arc<Engine>,
+    update: Arc<crate::update::UpdateState>,
+    req: &Value,
+) -> Value {
+    let mut shared = Shared::for_test(engine);
+    shared.update = update;
+    handle(req, &Arc::new(shared)).await.0
 }
 
 /// Handle one ctl request, returning the response envelope and whether the
@@ -145,6 +160,18 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // trusting a `service.json` that may be stale or private, so it must
         // never touch the store (`status` does).
         "holder" => (envelope_ok(holder_data(shared.pid)), false),
+        // The install method detected at start, whether the update check is
+        // on, and the last check without its ETag, from memory: `status`
+        // asks this and reads the cache file only when the daemon cannot
+        // answer.
+        "update_facts" => (
+            envelope_ok(
+                shared
+                    .update
+                    .facts(shared.engine.config().update_check_enabled()),
+            ),
+            false,
+        ),
         "sessions" => (
             envelope_ok(json!({
                 "count": shared.session_count(),
@@ -1111,7 +1138,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
                  origin_resolve, provision, domain_register, routing_config, maintenance_stamp, \
-                 desktop_offer, forget_domain or shutdown"
+                 desktop_offer, forget_domain, update_facts or shutdown"
             )),
             false,
         ),
