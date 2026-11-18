@@ -43,7 +43,7 @@ impl InstallMethod {
             Self::Zip => "zip",
             Self::Tarball => "tar.gz",
             Self::Docker => "docker",
-            Self::Mcpb => "Claude Desktop extension",
+            Self::Mcpb => "Claude Desktop-only bundle",
             Self::Unknown => "unknown",
         }
     }
@@ -603,7 +603,7 @@ mod tests {
                 "zip",
                 "tar.gz",
                 "docker",
-                "Claude Desktop extension",
+                "Claude Desktop-only bundle",
                 "unknown"
             ]
         );

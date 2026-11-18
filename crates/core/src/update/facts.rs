@@ -19,7 +19,9 @@ pub enum OffReason {
     Ci,
     /// A Docker install: pull the new image.
     Docker,
-    /// The Claude Desktop-only bundle: the newer .mcpb is opened by hand.
+    /// The Claude Desktop-only bundle (`CRYSTALLINE_CHANNEL=mcpb`): the
+    /// newer .mcpb is opened by hand. The standard extension starts the
+    /// installed `crystalline` and keeps its check.
     DesktopExtension,
     /// There is no state folder to cache a check in, so none could run.
     NoStateFolder,
@@ -42,14 +44,14 @@ impl OffReason {
             OffReason::NoUpdateNotifier => "NO_UPDATE_NOTIFIER is set",
             OffReason::Ci => "CI is set",
             OffReason::Docker => "Docker",
-            OffReason::DesktopExtension => "Claude Desktop extension",
+            OffReason::DesktopExtension => "Claude Desktop-only bundle",
             OffReason::NoStateFolder => "no state folder",
         }
     }
 
     /// Why the passive check must not run whatever the setting says, or
     /// `None`: `NO_UPDATE_NOTIFIER` or `CI` set to anything but an empty
-    /// value, a Docker install or the Claude Desktop extension. The method
+    /// value, a Docker install or the Claude Desktop-only bundle. The method
     /// is asked, not the refusal, since an unofficial build replaces the
     /// refusal and keeps the method. The setting and the state folder are
     /// the caller's to add.
