@@ -745,9 +745,10 @@ jobs:
           bin=$(find "$dir" -type f -name crystalline | head -n1)
           [ -n "$bin" ] || { echo "::error::no crystalline binary in the linux-amd64 archive"; exit 1; }
           chmod +x "$bin"
-          # The test seams exist only in debug builds; the shipped binary
-          # must not even carry their names. A new seam adds its name here
-          # (packaging.rs checks that every updater seam is listed).
+          # The updater's seams exist only in debug builds; the shipped
+          # binary must not even carry their names. A new one adds its name
+          # here (packaging.rs checks that every updater seam in the sources
+          # is listed).
           for seam in CRYSTALLINE_TEST_UPDATE_API CRYSTALLINE_TEST_UPDATE_DOWNLOAD CRYSTALLINE_TEST_UPDATE_KEY CRYSTALLINE_TEST_UPDATE_METHOD; do
             if grep -a -q "$seam" "$bin"; then
               echo "::error::the release binary carries the test seam $seam"

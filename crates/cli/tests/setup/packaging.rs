@@ -228,8 +228,8 @@ fn the_two_checksum_steps_are_the_same() {
     assert_eq!(checksums, collect("publish"));
 }
 
-/// Every `CRYSTALLINE_TEST_UPDATE_*` name the sources hold is in the seam
-/// loop of release.yml's `check-signature` job, which fails a release
+/// Every `CRYSTALLINE_TEST_UPDATE_*` name any crate under crates/ holds is
+/// in the seam loop of release.yml's `check-signature` job, which fails a release
 /// whose binary carries one. A seam added to the code and not to the loop
 /// would ship unseen.
 #[test]
@@ -253,9 +253,11 @@ fn the_release_checks_every_updater_seam() {
         .collect();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found = std::collections::BTreeSet::new();
-    let mut dirs: Vec<PathBuf> = ["cli", "core", "engine", "service"]
-        .iter()
-        .map(|krate| root.join(krate).join("src"))
+    // Every crate under crates/, its sources, tests and build scripts alike.
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .expect("the crates folder")
+        .map(|entry| entry.expect("a crate").path())
+        .filter(|path| path.is_dir())
         .collect();
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).expect("a source folder") {
@@ -268,12 +270,29 @@ fn the_release_checks_every_updater_seam() {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("a source file");
-            for (at, _) in text.match_indices("\"CRYSTALLINE_TEST_UPDATE_") {
-                let name: String = text[at + 1..]
+            for (at, _) in text.match_indices("CRYSTALLINE_TEST_UPDATE_") {
+                let name: String = text[at..]
                     .chars()
                     .take_while(|c| c.is_ascii_uppercase() || *c == '_')
                     .collect();
-                found.insert(name);
+                if name != "CRYSTALLINE_TEST_UPDATE_" {
+                    found.insert(name);
+                }
+            }
+            // A name built another way (`concat!`, `format!` or a prefix
+            // constant) would never show whole: every `TEST_UPDATE_` in the
+            // shipped sources must be part of a whole name the loop above
+            // saw. Tests (this one among them) may name the prefix alone.
+            let shipped = path.components().any(|part| part.as_os_str() == "src");
+            for (at, _) in text.match_indices("TEST_UPDATE_").filter(|_| shipped) {
+                let whole = text[..at].ends_with("CRYSTALLINE_")
+                    && text[at + "TEST_UPDATE_".len()..]
+                        .starts_with(|c: char| c.is_ascii_uppercase());
+                assert!(
+                    whole,
+                    "{}: a seam name built in pieces near byte {at}; spell it whole so the release check sees it",
+                    path.display()
+                );
             }
         }
     }
@@ -305,13 +324,22 @@ fn build_yml_reads_the_compiled_in_team_id() {
         "the Team ID is not taken from the secret"
     );
     let source = repo_file("crates/core/src/update/mod.rs");
-    let line = format!(
-        "pub const APPLE_TEAM_ID: &str = \"{}\";",
-        crystalline_core::update::APPLE_TEAM_ID
-    );
-    assert!(
-        source.lines().any(|l| l == line),
-        "mod.rs holds `{line}` on a line of its own"
+    // The lines the `sed` prints a value for: the whole line in this shape.
+    let matched: Vec<&str> = source
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("pub const APPLE_TEAM_ID: &str = \"")?
+                .strip_suffix("\";")
+                .filter(|id| {
+                    id.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                })
+        })
+        .collect();
+    assert_eq!(
+        matched,
+        [crystalline_core::update::APPLE_TEAM_ID],
+        "exactly one line the sed reads, holding the constant's value"
     );
     assert!(
         crystalline_core::update::APPLE_TEAM_ID

@@ -326,8 +326,8 @@ jobs:
           # never from the secret: a certificate of another team must fail
           # here, not in every macOS tar.gz update one release later.
           team_id="$(sed -n 's/^pub const APPLE_TEAM_ID: &str = "\([A-Z0-9]*\)";$/\1/p' "$GITHUB_WORKSPACE/crates/core/src/update/mod.rs")"
-          if [ -z "$team_id" ]; then
-            echo "::error::no APPLE_TEAM_ID constant found in crates/core/src/update/mod.rs"
+          if [ -z "$team_id" ] || [ "$(printf '%s\n' "$team_id" | wc -l)" -ne 1 ]; then
+            echo "::error::expected exactly one APPLE_TEAM_ID constant in crates/core/src/update/mod.rs, found: ${team_id:-none}"
             exit 1
           fi
           keychain="$RUNNER_TEMP/signing.keychain-db"
