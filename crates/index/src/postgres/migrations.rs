@@ -1026,7 +1026,8 @@ pub const INSTANCE_TABLES: &[&str] = &["instance_owner", "instance_config", "ins
 /// empty database both read version 0 and race on `CREATE EXTENSION vector`,
 /// on v1's tables and on the stamps. Advisory locks belong to the database,
 /// so this one key also serializes runs into different schemas of one
-/// database, which is what the database-wide extension needs.
+/// database, which is what the database-wide extension needs. A schema that
+/// is already up to date does not take it (see [`apply_locked_set`]).
 pub(crate) const MIGRATION_LOCK: i64 = 7301551;
 
 /// What a locked migration run left behind.
@@ -1054,11 +1055,22 @@ pub(crate) async fn apply_locked(conn: &mut PgConnection, schema: Option<&str>) 
 
 /// `apply_locked` for any [`MigrationSet`]: the same lock, schema creation
 /// and release, over the set's own ledger.
+///
+/// A ledger that already holds the set's last step is answered without the
+/// lock ([`already_current`]): there is nothing to run, and the one key is
+/// shared by every schema of the database, so a start of an up-to-date
+/// schema would otherwise queue behind every other schema's migration run.
 pub async fn apply_locked_set(
     conn: &mut PgConnection,
     schema: Option<&str>,
     set: &MigrationSet,
 ) -> LockedRun {
+    if let Some(version) = already_current(conn, schema, set).await {
+        return LockedRun {
+            version: Ok(version),
+            tainted: false,
+        };
+    }
     if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(MIGRATION_LOCK)
         .execute(&mut *conn)
@@ -1171,6 +1183,36 @@ async fn apply_unlocked(conn: &mut PgConnection, set: &MigrationSet) -> Result<i
             .map_err(|e| IndexError::Migration(e.to_string()))?;
     }
     current_version(conn, ledger).await
+}
+
+/// The set's last version when `set`'s ledger already holds it, read
+/// without [`MIGRATION_LOCK`]; `None` sends the caller down the locked path
+/// (no such step list, no ledger yet, a version below or above the last
+/// step, or a failed read). Every step commits with its stamp, so a ledger
+/// at the last version means every step is done. With a `schema` the ledger
+/// is named in it: on a schema that does not exist yet the search path
+/// would otherwise find another schema's ledger (`public`'s, say) and skip a
+/// migration that was never run.
+async fn already_current(
+    conn: &mut PgConnection,
+    schema: Option<&str>,
+    set: &MigrationSet,
+) -> Option<i64> {
+    let known = set.steps.last()?.version;
+    let ledger = match schema {
+        Some(schema) => format!("{}.{}", super::quote_ident(schema), set.ledger),
+        None => set.ledger.to_string(),
+    };
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(&ledger)
+        .fetch_one(&mut *conn)
+        .await
+        .ok()?;
+    if !exists {
+        return None;
+    }
+    let found = current_version(conn, &ledger).await.ok()?;
+    (found == known).then_some(known)
 }
 
 async fn current_version(conn: &mut PgConnection, ledger: &str) -> Result<i64> {
@@ -3165,6 +3207,115 @@ mod tests {
             .execute(&mut setup)
             .await
             .unwrap();
+    }
+
+    /// An up-to-date schema opens while another session holds the migration
+    /// lock (another schema's run, on a shared database), and a schema one
+    /// step behind waits for the lock and then runs that step. The first
+    /// waited behind every other schema's run before: a standby that took
+    /// over a migrated schema queued twice (index and accounts) behind the
+    /// first opens of every other schema on the database.
+    #[tokio::test]
+    async fn an_up_to_date_schema_opens_without_the_migration_lock() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_nolock_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut conn, &schema).await;
+        apply(&mut conn).await.unwrap();
+
+        let mut holder = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_LOCK)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            apply_locked_set(&mut conn, Some(&schema), &INDEX_SET),
+        )
+        .await
+        .expect("an up-to-date schema does not wait for the migration lock");
+        assert!(!run.tainted);
+        assert_eq!(run.version.unwrap(), MIGRATIONS.last().unwrap().version);
+
+        // One step behind: the run waits while the lock is held elsewhere.
+        let last = MIGRATIONS.last().unwrap().version;
+        sqlx::query("DELETE FROM schema_migration WHERE version = $1")
+            .bind(last)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let behind = apply_locked_set(&mut conn, Some(&schema), &INDEX_SET);
+        tokio::pin!(behind);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut behind)
+                .await
+                .is_err(),
+            "a schema behind waits for the migration lock"
+        );
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_LOCK)
+            .fetch_one(&mut holder)
+            .await
+            .unwrap();
+        assert!(released);
+        let run = behind.await;
+        assert!(!run.tainted);
+        assert_eq!(run.version.unwrap(), last);
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut holder)
+            .await
+            .unwrap();
+    }
+
+    /// The check without the lock reads the ledger in the schema it was
+    /// given, not through the search path: a first open of a schema that
+    /// does not exist yet, on a session whose search path also names a
+    /// migrated schema (as `public` can be), runs every step.
+    #[tokio::test]
+    async fn the_unlocked_check_reads_the_ledger_of_the_schema_it_opens() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let migrated = format!("mig_qual_a_{}", std::process::id());
+        let fresh = format!("mig_qual_b_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut conn, &migrated).await;
+        apply(&mut conn).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {fresh} CASCADE; SET search_path TO {fresh}, {migrated}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let run = apply_locked_set(&mut conn, Some(&fresh), &INDEX_SET).await;
+        assert!(!run.tainted);
+        assert_eq!(run.version.unwrap(), MIGRATIONS.last().unwrap().version);
+        let stamps: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {fresh}.schema_migration"
+        )))
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(stamps, MIGRATIONS.len() as i64, "every step ran in {fresh}");
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {fresh} CASCADE; DROP SCHEMA {migrated} CASCADE"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
     }
 
     /// What a v30 binary sees of a v31 or later schema: a ledger stamped
