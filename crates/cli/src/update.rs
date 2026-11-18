@@ -425,6 +425,15 @@ const RUN_WITH_YES: &str = "Nothing was changed. Run crystalline update now --ye
 const RUN_WITH_SUDO_YES: &str =
     "Nothing was changed. Run sudo crystalline update now --yes to update.";
 
+/// The line a plan-only `update now` ends with, under `sudo` or not.
+pub(crate) fn plan_only_line(sudo: bool) -> &'static str {
+    if sudo {
+        RUN_WITH_SUDO_YES
+    } else {
+        RUN_WITH_YES
+    }
+}
+
 /// What `brew upgrade` is said with when it left the version where it was
 /// (S13).
 pub(crate) const BREW_DID_NOT_UPGRADE: &str = "brew did not upgrade (tap not refreshed?)";
@@ -687,14 +696,7 @@ pub(crate) async fn act(
             }
         }
         Consent::PlanOnly => {
-            println!(
-                "{}",
-                if context.sudo {
-                    RUN_WITH_SUDO_YES
-                } else {
-                    RUN_WITH_YES
-                }
-            );
+            println!("{}", plan_only_line(context.sudo));
             return Ok(EXIT_UPDATE_AVAILABLE);
         }
     }
@@ -1314,10 +1316,18 @@ pub(crate) async fn report_facts(ask_daemon: bool, setting_on: bool) -> UpdateFa
     } else {
         None
     };
-    let mut facts = asked
-        .unwrap_or_else(|| crystalline_service::update::UpdateState::at_start().facts(setting_on));
-    // Applied here too, whatever the daemon did, so a cached failure
-    // reason or an unanswered cache never reaches a report (S23).
+    client_facts(
+        asked.unwrap_or_else(|| {
+            crystalline_service::update::UpdateState::at_start().facts(setting_on)
+        }),
+    )
+}
+
+/// The facts as a report may show them, whoever made them:
+/// [`UpdateCache::answered`] applied here too, whatever the daemon did, so
+/// a cached failure reason or an inexact tag never reaches a report (S23),
+/// and no cache at all while the check is off. Pure.
+pub(crate) fn client_facts(mut facts: UpdateFacts) -> UpdateFacts {
     facts.cache = facts.cache.and_then(UpdateCache::answered);
     if facts.check != CheckState::On {
         facts.cache = None;
@@ -1557,6 +1567,19 @@ pub(crate) fn hint_due(stamp: Option<&HintStamp>, newer: &Precedence, now: Stamp
     }
 }
 
+/// Whether the hint must read the Postgres configuration document: only in
+/// document mode, and not when `CRYSTALLINE_UPDATE_CHECK` (`env`, an empty
+/// value counting as unset) already turns the check off, which config.yaml
+/// and the environment (`effective_on`) then say alone. Pure.
+pub(crate) fn hint_needs_document(
+    document_mode: bool,
+    env: Option<&str>,
+    effective_on: bool,
+) -> bool {
+    let env_off = env.is_some_and(|value| !value.is_empty()) && !effective_on;
+    document_mode && !env_off
+}
+
 /// The effective `update.check` and `update.min_age_hours` for the hint,
 /// read on the command runtime's deep-stack thread; `None` when they do not
 /// load. config.yaml and the environment first: the Postgres configuration
@@ -1564,13 +1587,14 @@ pub(crate) fn hint_due(stamp: Option<&HintStamp>, newer: &Precedence, now: Stamp
 /// does not already turn the check off. The default config, also after a
 /// command run with `--config`: the hint is advisory.
 fn settings_for_hint() -> Option<(bool, u32)> {
-    let env_off = std::env::var("CRYSTALLINE_UPDATE_CHECK")
-        .ok()
-        .is_some_and(|value| !value.is_empty());
+    let env = std::env::var("CRYSTALLINE_UPDATE_CHECK").ok();
     let loaded = crate::on_runtime_value_current_thread(move || {
         crystalline_service::config_for_hint(move |loaded| {
-            loaded.mode == crystalline_service::overlay::ConfigMode::Document
-                && !(env_off && !loaded.effective.update_check_enabled())
+            hint_needs_document(
+                loaded.mode == crystalline_service::overlay::ConfigMode::Document,
+                env.as_deref(),
+                loaded.effective.update_check_enabled(),
+            )
         })
     })
     .ok()??;
@@ -2047,6 +2071,10 @@ mod tests {
             std::fs::write(bin.join("install-source"), b"msi\n").unwrap();
         }
         let before = snapshot(&root);
+        // An older download folder, which a verified newer download removes.
+        let older = tmp.path().join("cache").join("updates").join("v0.33.0");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::write(older.join("steps.txt"), b"old steps").unwrap();
 
         let spawner = Recording::new(0, Vec::new());
         let mut context = ctx(method, &spawner, false, &never_asked);
@@ -2071,6 +2099,11 @@ mod tests {
         assert_eq!(spawner.calls(), Vec::<String>::new(), "nothing is run");
         let after = snapshot(&root);
         let dir = download_dir(&context.cache_dir, tag);
+        assert!(
+            !older.exists(),
+            "the verified download removed the older folder"
+        );
+        assert!(dir.join("steps.txt").is_file(), "the newest folder stays");
         (before, after, printed, dir, tmp)
     }
 
@@ -2156,6 +2189,354 @@ mod tests {
                 "{saved}"
             );
         }
+    }
+
+    /// A cache folder with an older release's download folder in it.
+    fn cache_with_older_download() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = tmp.path().join("updates").join("v0.33.0");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::write(older.join("steps.txt"), b"saved steps").unwrap();
+        (tmp, older)
+    }
+
+    /// R1 (S1): a run that stops before a verified download (the gate
+    /// closed, a no, plan only) removes no download folder.
+    #[tokio::test]
+    async fn a_stopped_update_keeps_the_older_download_folders() {
+        let spawner = Recording::new(0, Vec::new());
+        let no = |_: &str| false;
+        // Gate closed: published just now, 24 h asked for.
+        let (tmp, older) = cache_with_older_download();
+        let mut context = ctx(InstallMethod::Deb, &spawner, false, &never_asked);
+        context.cache_dir = tmp.path().to_path_buf();
+        let fresh = LatestRelease {
+            published_at: Some(now()),
+            ..newer_release()
+        };
+        assert_eq!(
+            act(&context, &fresh, true, false, &mut None).await.unwrap(),
+            0
+        );
+        assert!(older.join("steps.txt").is_file(), "gated");
+        // Declined at the terminal.
+        let mut context = ctx(InstallMethod::Tarball, &spawner, true, &no);
+        context.cache_dir = tmp.path().to_path_buf();
+        assert_eq!(
+            act(&context, &newer_release(), false, false, &mut None)
+                .await
+                .unwrap(),
+            EXIT_UPDATE_AVAILABLE
+        );
+        assert!(older.join("steps.txt").is_file(), "declined");
+        // Plan only: no terminal, no --yes.
+        let mut context = ctx(InstallMethod::Tarball, &spawner, false, &never_asked);
+        context.cache_dir = tmp.path().to_path_buf();
+        assert_eq!(
+            act(&context, &newer_release(), false, false, &mut None)
+                .await
+                .unwrap(),
+            EXIT_UPDATE_AVAILABLE
+        );
+        assert!(older.join("steps.txt").is_file(), "plan only");
+        assert_eq!(spawner.calls(), Vec::<String>::new());
+    }
+
+    /// R1 (S1): a download that fails removes no download folder either.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_failed_download_keeps_the_older_download_folders() {
+        let (tmp, older) = cache_with_older_download();
+        // A port nothing listens on any more.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let install = tempfile::tempdir().unwrap();
+        let exe = install.path().join("crystalline.exe");
+        std::fs::write(&exe, b"bin").unwrap();
+        let spawner = Recording::new(0, Vec::new());
+        let mut context = ctx(InstallMethod::Zip, &spawner, false, &never_asked);
+        context.cache_dir = tmp.path().to_path_buf();
+        context.exe = Some(exe);
+        context.source = ReleaseSource::for_test(&closed, "not a key");
+        let release = LatestRelease {
+            from_api: false,
+            ..newer_release()
+        };
+        let err = windows_steps(
+            &context,
+            &release,
+            "crystalline-v0.34.0-windows-amd64.zip",
+            "crystalline.exe",
+        )
+        .await;
+        assert!(err.is_err());
+        assert!(older.join("steps.txt").is_file());
+    }
+
+    /// N6: under sudo the plan-only line keeps `sudo`.
+    #[test]
+    fn the_plan_only_line_keeps_sudo() {
+        assert_eq!(
+            plan_only_line(false),
+            "Nothing was changed. Run crystalline update now --yes to update."
+        );
+        assert_eq!(
+            plan_only_line(true),
+            "Nothing was changed. Run sudo crystalline update now --yes to update."
+        );
+    }
+
+    /// N8: every download in `update now` is announced first. A source
+    /// check: the line must come right before each call that downloads.
+    #[test]
+    fn every_download_is_announced() {
+        let source = include_str!("update.rs");
+        let body = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let lines: Vec<&str> = body.lines().collect();
+        let mut downloads = 0;
+        for (at, line) in lines.iter().enumerate() {
+            let calls = line.contains("fetch_verified_from(&context.source")
+                || line.contains("install_tarball(");
+            if !calls || line.trim_start().starts_with("//") {
+                continue;
+            }
+            downloads += 1;
+            assert!(
+                lines[at.saturating_sub(3)..at]
+                    .iter()
+                    .any(|l| l.contains("println!(\"Downloading {asset}\")")),
+                "line {}: a download without the Downloading line",
+                at + 1
+            );
+        }
+        assert_eq!(downloads, 3, "the .deb, the tar.gz and the MSI or zip");
+    }
+
+    /// A spawner whose unbounded calls fail the test: every program must
+    /// be run with a time limit. It records the limit of each call.
+    struct BoundedOnly {
+        outputs: Vec<(&'static str, String)>,
+        run_answer: fn() -> std::io::Result<i32>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Spawner for BoundedOnly {
+        fn run(&self, program: &str, _: &[&str]) -> std::io::Result<i32> {
+            if program.ends_with("brew") {
+                return Ok(0);
+            }
+            panic!("{program} run without a time limit")
+        }
+
+        fn output(&self, program: &str, _: &[&str]) -> std::io::Result<String> {
+            panic!("{program} run without a time limit")
+        }
+
+        fn run_within(
+            &self,
+            program: &str,
+            args: &[&str],
+            limit: std::time::Duration,
+        ) -> std::io::Result<i32> {
+            self.calls.lock().unwrap().push(format!(
+                "{program} {} within {} s",
+                args.join(" "),
+                limit.as_secs()
+            ));
+            (self.run_answer)()
+        }
+
+        fn output_within(
+            &self,
+            program: &str,
+            args: &[&str],
+            limit: std::time::Duration,
+        ) -> std::io::Result<String> {
+            self.calls.lock().unwrap().push(format!(
+                "{program} {} within {} s",
+                args.join(" "),
+                limit.as_secs()
+            ));
+            self.outputs
+                .iter()
+                .find(|(name, _)| *name == program)
+                .map(|(_, out)| out.clone())
+                .ok_or_else(|| std::io::Error::other("no such program"))
+        }
+    }
+
+    /// N2: after `brew upgrade` (which may run as long as it needs) the
+    /// prefix and the version are read with a time limit.
+    #[test]
+    fn brew_reads_after_the_upgrade_have_a_time_limit() {
+        let spawner = BoundedOnly {
+            outputs: brew_outputs("0.34.0"),
+            run_answer: || Ok(0),
+            calls: std::sync::Mutex::default(),
+        };
+        assert_eq!(
+            brew_upgrade(&spawner, "brew", &v("0.33.0")).unwrap(),
+            "upgraded to 0.34.0"
+        );
+        assert_eq!(
+            *spawner.calls.lock().unwrap(),
+            [
+                "brew --prefix within 60 s",
+                "/opt/homebrew/bin/crystalline --version within 30 s"
+            ]
+        );
+    }
+
+    /// N3: an `update finish` past its time limit is said as such, not as
+    /// a program that could not be started.
+    #[test]
+    fn a_timed_out_update_finish_says_it_did_not_finish() {
+        let spawner = BoundedOnly {
+            outputs: Vec::new(),
+            run_answer: || Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow")),
+            calls: std::sync::Mutex::default(),
+        };
+        let err = after_swap(&spawner, Path::new("/opt/bin/crystalline"), false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the binary is updated, but update finish did not finish in time: run crystalline status to hand the daemon over"
+        );
+        let spawner = BoundedOnly {
+            outputs: Vec::new(),
+            run_answer: || Err(std::io::Error::other("no such file")),
+            calls: std::sync::Mutex::default(),
+        };
+        let err = after_swap(&spawner, Path::new("/opt/bin/crystalline"), false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the binary is updated, but update finish could not be started"
+        );
+    }
+
+    /// N5: what a report says for a tar.gz folder this process cannot
+    /// write.
+    #[cfg(unix)]
+    #[test]
+    fn a_tarball_folder_that_is_not_writable_changes_the_action() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let install = tempfile::tempdir().unwrap();
+        let exe = install.path().join("crystalline");
+        std::fs::write(&exe, b"bin").unwrap();
+        assert_eq!(tarball_action(Some(&exe), Some(1000)), None, "writable");
+        std::fs::set_permissions(install.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mine = tarball_action(Some(&exe), Some(1000));
+        std::fs::set_permissions(install.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            mine.unwrap(),
+            format!(
+                "update now does nothing here (you cannot write to {})",
+                display_path(install.path())
+            )
+        );
+        let root_owned = Path::new("/usr/bin/true");
+        assert_eq!(
+            tarball_action(Some(root_owned), Some(1000)).unwrap(),
+            "run: sudo crystalline update now"
+        );
+        assert!(
+            !tarball_action(Some(root_owned), Some(0))
+                .unwrap()
+                .contains("sudo"),
+            "root is not told to use sudo"
+        );
+        assert_eq!(tarball_action(None, Some(1000)), None);
+
+        // The report line takes it for a tar.gz install only.
+        let newer = release_cache("v0.35.0", Some(at(1)), at(16));
+        let line = |method| {
+            report_lines(
+                &facts(method, true, None, CheckState::On, Some(newer.clone())),
+                &v("0.34.0"),
+                now(),
+                24,
+                Some("run: sudo crystalline update now"),
+            )[1]
+            .clone()
+        };
+        assert!(
+            line(InstallMethod::Tarball).ends_with("; run: sudo crystalline update now"),
+            "{}",
+            line(InstallMethod::Tarball)
+        );
+        assert!(
+            line(InstallMethod::Homebrew).ends_with("; run: crystalline update now"),
+            "{}",
+            line(InstallMethod::Homebrew)
+        );
+    }
+
+    /// N10: the facts a report shows are made safe on the client too,
+    /// whatever the daemon sent.
+    #[test]
+    fn report_facts_are_made_safe_on_the_client() {
+        let mut failed = release_cache("v0.35.0", Some(at(1)), at(16));
+        failed.outcome = CheckOutcome::Failed {
+            reason: "https://example.com/<b>".to_string(),
+        };
+        failed.etag = Some("\"e1\"".to_string());
+        let shown = client_facts(facts(
+            InstallMethod::Tarball,
+            true,
+            None,
+            CheckState::On,
+            Some(failed),
+        ));
+        let cache = shown.cache.unwrap();
+        assert_eq!(
+            cache.outcome,
+            CheckOutcome::Failed {
+                reason: FAILED_REASON.to_string()
+            }
+        );
+        assert_eq!(cache.etag, None);
+        let inexact = client_facts(facts(
+            InstallMethod::Tarball,
+            true,
+            None,
+            CheckState::On,
+            Some(release_cache("v0.35.0<b>", Some(at(1)), at(16))),
+        ));
+        assert_eq!(inexact.cache, None, "an inexact tag never reaches a report");
+        let off = client_facts(facts(
+            InstallMethod::Tarball,
+            true,
+            None,
+            CheckState::Off(OffReason::NotTurnedOn),
+            Some(release_cache("v0.35.0", Some(at(1)), at(16))),
+        ));
+        assert_eq!(off.cache, None);
+    }
+
+    /// R2: the hint reads the configuration document only in document
+    /// mode, and not when the environment already turns the check off.
+    #[test]
+    fn the_hint_reads_the_document_only_when_it_decides() {
+        assert!(!hint_needs_document(false, None, false), "file mode");
+        assert!(!hint_needs_document(false, Some("true"), true));
+        assert!(hint_needs_document(true, None, false));
+        assert!(
+            !hint_needs_document(true, Some("false"), false),
+            "the environment turns it off"
+        );
+        assert!(
+            hint_needs_document(true, Some(""), false),
+            "an empty variable is unset"
+        );
+        assert!(
+            hint_needs_document(true, Some("true"), true),
+            "on: the document still names the age gate"
+        );
     }
 
     fn never_asked(_: &str) -> bool {

@@ -60,6 +60,33 @@ mod tests {
     use super::*;
     use crate::update::spawn::Scripted;
 
+    /// N2: codesign runs with a time limit, never unbounded.
+    #[test]
+    fn codesign_runs_with_a_time_limit() {
+        struct BoundedOnly(std::sync::Mutex<Vec<u64>>);
+        impl Spawner for BoundedOnly {
+            fn run(&self, program: &str, _: &[&str]) -> std::io::Result<i32> {
+                panic!("{program} run without a time limit")
+            }
+            fn output(&self, program: &str, _: &[&str]) -> std::io::Result<String> {
+                panic!("{program} run without a time limit")
+            }
+            fn output_within(
+                &self,
+                _: &str,
+                _: &[&str],
+                limit: std::time::Duration,
+            ) -> std::io::Result<String> {
+                self.0.lock().unwrap().push(limit.as_secs());
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow"))
+            }
+        }
+        let spawner = BoundedOnly(std::sync::Mutex::default());
+        let err = codesign_ok(&spawner, std::path::Path::new("/b")).unwrap_err();
+        assert!(matches!(err, UpdateError::Codesign), "{err}");
+        assert_eq!(*spawner.0.lock().unwrap(), [CODESIGN_TIME_LIMIT.as_secs()]);
+    }
+
     #[test]
     fn codesign_requirement_text() {
         let spawner = Scripted::new(|_, _| Ok(String::new()));

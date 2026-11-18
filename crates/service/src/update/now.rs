@@ -502,6 +502,29 @@ mod tests {
     }
 
     #[test]
+    fn older_tag_folders_go_and_everything_else_stays() {
+        let cache = tempfile::tempdir().unwrap();
+        let updates = cache.path().join(UPDATES_DIR);
+        for tag in ["v0.33.0", "v0.34.0", "v0.34.1"] {
+            std::fs::create_dir_all(updates.join(tag)).unwrap();
+            std::fs::write(updates.join(tag).join("steps.txt"), b"x").unwrap();
+        }
+        std::fs::create_dir_all(updates.join("notes")).unwrap();
+        std::fs::write(updates.join("v0.32.0"), b"a file, not a folder").unwrap();
+        std::fs::write(updates.join(LOCK_FILE), b"").unwrap();
+        remove_older_tags(cache.path(), "v0.34.0");
+        let mut left: Vec<String> = std::fs::read_dir(&updates)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, [".lock", "notes", "v0.32.0", "v0.34.0"]);
+        assert!(updates.join("v0.34.0/steps.txt").is_file());
+        // No updates folder at all is nothing to do.
+        remove_older_tags(&cache.path().join("missing"), "v0.34.0");
+    }
+
+    #[test]
     fn the_download_folder_is_per_tag_under_the_cache() {
         let cache = Path::new("/c");
         assert_eq!(
