@@ -686,7 +686,11 @@ async fn a_failed_check_keeps_the_known_release_and_logs_each_version_once() {
 async fn short_lived_daemons_check_at_most_once_a_day() {
     let _env = ENV.lock().await;
     let fake = Fake::start(|_, path, _| match path {
-        API_PATH => respond(StatusCode::OK, &[], &api_release("v99.0.0")),
+        API_PATH => respond(
+            StatusCode::OK,
+            &[("etag", "\"secret-etag\"")],
+            &api_release("v99.0.0"),
+        ),
         _ => respond(StatusCode::NOT_FOUND, &[], ""),
     })
     .await;
@@ -733,7 +737,13 @@ async fn short_lived_daemons_check_at_most_once_a_day() {
     stop.send_replace(true);
     task.await.unwrap();
     assert_eq!(api_count(&fake), 1);
-    assert!(read_cache(&path).is_some());
+    assert_eq!(
+        read_cache(&path).and_then(|c| c.etag).as_deref(),
+        Some("\"secret-etag\""),
+        "the file keeps the ETag"
+    );
+    let held = first.subscribe().borrow().clone().expect("a check is held");
+    assert_eq!(held.etag, None, "the watch holds no ETag after a check");
 
     // Daemons started after it load the file and ask nothing.
     for _ in 0..3 {
@@ -801,7 +811,9 @@ async fn a_check_written_by_another_process_reaches_the_daemon() {
     // `crystalline update check` writes a newer check while the daemon's
     // own copy is still fresh.
     let second = checked(now, "v99.0.1");
-    std::fs::write(&path, serde_json::to_string(&second).unwrap()).unwrap();
+    let mut written = second.clone();
+    written.etag = Some("\"secret-etag\"".to_string());
+    std::fs::write(&path, serde_json::to_string(&written).unwrap()).unwrap();
     let mut seen = state.subscribe();
     let (stop, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(run_update_checks(
@@ -863,6 +875,18 @@ async fn two_processes_on_one_state_folder_ask_once() {
         .await
         .expect("a left lock does not hold the check");
     assert_eq!(api_count(&fake), 2);
+    assert!(!lock.exists());
+
+    // A lock dated in the future (a clock set back after a crash) is taken
+    // over too.
+    let file = std::fs::File::create(&lock).unwrap();
+    file.set_modified(std::time::SystemTime::now() + Duration::from_secs(10 * 60))
+        .unwrap();
+    drop(file);
+    tokio::time::timeout(Duration::from_secs(10), run_check(&path, later(60)))
+        .await
+        .expect("a lock from the future does not hold the check");
+    assert_eq!(api_count(&fake), 3);
     assert!(!lock.exists());
 }
 

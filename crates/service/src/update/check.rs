@@ -96,9 +96,10 @@ pub fn read_cache(path: &Path) -> Option<UpdateCache> {
 
 /// One check against the cache at `cache_path`: while the cached check
 /// still stands ([`still_fresh`]: a release for a day, a failure for four
-/// hours) it is returned as it is and nothing is asked. Otherwise the newest release is looked up, the result
-/// written through a temporary file and a rename, and returned. A write
-/// that fails is logged; the result is still returned.
+/// hours) it is returned as it is and nothing is asked. Otherwise the
+/// newest release is looked up, the result written through a temporary
+/// file and a rename, and returned. A write that fails is logged; the
+/// result is still returned.
 ///
 /// The lookup runs under a lock file beside the cache, so two processes
 /// that share a state folder never both ask: the second waits, then takes
@@ -286,35 +287,47 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// The check lock, `.update-check.json.lock` beside the cache, removed
-/// when dropped (also when the lookup is cancelled by a shutdown).
-struct CheckLock(PathBuf);
+/// The check lock, `.update-check.json.lock` beside the cache. It holds a
+/// token of its own, and is removed when dropped (also when the lookup is
+/// cancelled by a shutdown) only while it still holds that token: a holder
+/// whose lock was taken over (a machine that slept in the middle of a
+/// lookup) leaves its successor's lock alone.
+struct CheckLock {
+    path: PathBuf,
+    token: String,
+}
 
 impl CheckLock {
     /// The lock, `None` while another process holds it, or the error that
     /// kept it from being made.
     fn try_take(cache_path: &Path) -> std::io::Result<Option<CheckLock>> {
+        use std::io::Write as _;
         let path = sibling(cache_path, ".lock");
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        for _ in 0..2 {
+        for _ in 0..3 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Some(CheckLock(path))),
+                Ok(mut file) => {
+                    let token = lock_token();
+                    file.write_all(token.as_bytes())?;
+                    return Ok(Some(CheckLock { path, token }));
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let left = std::fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(Stamp::from_system_time)
-                        .is_some_and(|at| time::now().since(at) >= lock_stale_after());
-                    if !left {
+                    let modified = match std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+                        // Released in between: try again.
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => None,
+                        Ok(at) => Stamp::from_system_time(at),
+                    };
+                    if !lock_left(modified, time::now()) {
                         return Ok(None);
                     }
-                    // Left by a process that died: take it over once.
+                    // Left by a process that died: take it over.
                     let _ = std::fs::remove_file(&path);
                 }
                 Err(err) => return Err(err),
@@ -326,8 +339,28 @@ impl CheckLock {
 
 impl Drop for CheckLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if std::fs::read_to_string(&self.path).is_ok_and(|held| held == self.token) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Whether a lock last written at `modified` was left by a process that
+/// died: two minutes old or more, written in the future (a clock set back
+/// after a crash, as a future `checked_at` is stale too), or of no readable
+/// age.
+fn lock_left(modified: Option<Stamp>, now: Stamp) -> bool {
+    match modified {
+        Some(at) => at > now || now.since(at) >= lock_stale_after(),
+        None => true,
+    }
+}
+
+/// A token no other lock holder has: this process and a random number.
+fn lock_token() -> String {
+    let mut bytes = [0u8; 8];
+    let _ = getrandom::fill(&mut bytes);
+    format!("{}-{:016x}", std::process::id(), u64::from_le_bytes(bytes))
 }
 
 /// `.<cache file name><suffix>` beside the cache.
@@ -679,6 +712,35 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(UPDATE_CACHE_FILE)]);
+    }
+
+    #[test]
+    fn a_lock_is_left_when_old_in_the_future_or_of_no_age() {
+        let now = at(18, 9);
+        assert!(!lock_left(Some(now), now));
+        assert!(!lock_left(now.checked_sub(time::seconds(119)), now));
+        assert!(lock_left(now.checked_sub(time::minutes(2)), now));
+        assert!(
+            lock_left(now.checked_add(time::minutes(1)), now),
+            "a clock set back"
+        );
+        assert!(lock_left(None, now), "an age that cannot be read");
+    }
+
+    #[test]
+    fn a_lock_taken_over_is_not_removed_by_its_old_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join(UPDATE_CACHE_FILE);
+        let first = CheckLock::try_take(&cache).unwrap().expect("free");
+        assert!(CheckLock::try_take(&cache).unwrap().is_none(), "held");
+        // A successor took it over while the first slept.
+        std::fs::remove_file(&first.path).unwrap();
+        let second = CheckLock::try_take(&cache).unwrap().expect("free again");
+        drop(first);
+        assert!(second.path.exists(), "the successor's lock stays");
+        assert!(CheckLock::try_take(&cache).unwrap().is_none());
+        drop(second);
+        assert!(!dir.path().join(".update-check.json.lock").exists());
     }
 
     #[test]
