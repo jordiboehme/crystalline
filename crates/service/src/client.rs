@@ -3379,9 +3379,19 @@ pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
     let conn = match crate::instance::try_attach_displacing().await {
         (Some(conn), _) => conn,
         // The handover marker in `displaced` holds until the successor
-        // answers, so a connected bridge waits for it.
+        // answers, so a connected bridge waits for it, but only when this
+        // call starts the successor itself. When it cannot (no record, a
+        // variable missing here), it lets the marker go at once: a
+        // connected bridge is then the one that starts it ("first spawner
+        // decides").
         (None, Some(displaced)) => {
             let crate::instance::Displaced { start, marker } = displaced;
+            let marker = matches!(
+                crate::instance::successor_plan_here(start.as_ref()),
+                crate::instance::SuccessorPlan::Spawn(_)
+            )
+            .then_some(marker)
+            .flatten();
             let conn = crate::instance::attach_after_displacement(start).await;
             drop(marker);
             match conn {

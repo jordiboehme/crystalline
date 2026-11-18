@@ -688,7 +688,9 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
 /// The marker holds while this value lives, so the caller keeps it until
 /// its successor answers (or it gave up): meanwhile a connected bridge,
 /// which reconnects the moment its socket closes, waits for that successor
-/// instead of starting one with its own flags.
+/// instead of starting one with its own flags. A caller that will not start
+/// the successor itself (its plan is to wait for another client's) drops
+/// the marker at once, so that other client is not held back.
 #[derive(Debug)]
 pub struct Displaced {
     /// What the displaced daemon's record said about how it was started;
