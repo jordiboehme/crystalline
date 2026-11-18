@@ -10,7 +10,7 @@ use anyhow::Context;
 use crystalline_core::time::{self, Stamp};
 use crystalline_core::update::{
     CheckOutcome, Detection, FAILED_REASON, Gate, InstallMethod, Refusal, UPDATE_CACHE_FILE,
-    UpdateCache,
+    UpdateCache, age_gate,
 };
 use crystalline_core::version::{Precedence, release_tag, release_version};
 use serde::{Serialize, Serializer};
@@ -49,6 +49,9 @@ pub(crate) struct Plan {
     pub(crate) action: Action,
     /// The release notes of the newest release.
     pub(crate) notes_url: String,
+    /// When the plan was made: the publish age is counted to it.
+    #[serde(skip)]
+    pub(crate) made_at: Stamp,
 }
 
 /// What `update now` would do, by install method.
@@ -72,15 +75,17 @@ pub(crate) enum Action {
 }
 
 /// The plan for `current` given the newest stable release the check found,
-/// its publish time, its gate (pass [`Gate::Open`] for `--ignore-age`) and
-/// this binary's detection. Only a strictly newer version is an update; an
-/// older or equal one is [`Action::UpToDate`]. Pure.
+/// its publish time, its gate (pass [`Gate::Open`] for `--ignore-age`),
+/// this binary's detection and the time the plan is made at (`now`). Only a
+/// strictly newer version is an update; an older or equal one is
+/// [`Action::UpToDate`]. Pure.
 pub(crate) fn plan(
     current: Precedence,
     newest: Option<Precedence>,
     published_at: Option<Stamp>,
     gate: Gate,
     detection: Detection,
+    now: Stamp,
 ) -> Plan {
     let newer = newest.as_ref().is_some_and(|found| *found > current);
     let action = if !newer {
@@ -113,6 +118,7 @@ pub(crate) fn plan(
         method: detection.method,
         action,
         notes_url,
+        made_at: now,
     }
 }
 
@@ -170,8 +176,8 @@ fn action_text(action: &Action) -> String {
             "download and verify the zip, then print the steps that replace crystalline.exe"
                 .to_string()
         }
-        Action::Refuse(refusal) => format!("nothing: {}", refusal_text(refusal)),
-        Action::UpToDate => "nothing: this is the newest stable release".to_string(),
+        Action::Refuse(refusal) => format!("does nothing ({})", refusal_text(refusal)),
+        Action::UpToDate => "does nothing (this is the newest stable release)".to_string(),
     }
 }
 
@@ -200,12 +206,38 @@ pub(crate) fn render_plan(plan: &Plan) -> String {
         (None, _, _) => out.push_str(&format!("Crystalline {current} is up to date.\n")),
     }
     if let Some(at) = plan.published_at {
-        out.push_str(&format!("Published: {}\n", at.rfc3339_secs_z()));
+        out.push_str(&format!(
+            "Published: {} ({})\n",
+            at.rfc3339_secs_z(),
+            age_text(plan.made_at.since(at))
+        ));
     }
     out.push_str(&format!("Install method: {}\n", plan.method.label()));
     out.push_str(&format!("update now: {}\n", action_text(&plan.action)));
     out.push_str(&format!("Release notes: {}\n", plan.notes_url));
     out
+}
+
+/// How long ago a release was published, as a person reads it: whole days
+/// from one day on, else whole hours, else "less than an hour ago". A
+/// publish time later than now (a wrong clock) is "in the future".
+fn age_text(age: time::Delta) -> String {
+    let plural = |n: i64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{n} {unit}s ago")
+        }
+    };
+    if age < time::Delta::ZERO {
+        "in the future".to_string()
+    } else if age.num_days() >= 1 {
+        plural(age.num_days(), "day")
+    } else if age.num_hours() >= 1 {
+        plural(age.num_hours(), "hour")
+    } else {
+        "less than an hour ago".to_string()
+    }
 }
 
 /// The line `update check` prints on stderr when another process holds the
@@ -219,7 +251,10 @@ pub(crate) const WAITING_FOR_LOCK: &str = "Another update check is running; wait
 pub(crate) async fn check(ignore_age: bool, json: bool) -> anyhow::Result<()> {
     let current = Precedence::parse(crystalline_core::VERSION)
         .context("this binary's version could not be read")?;
-    let min_age_hours = crystalline_service::overlay::load(None)?
+    // The effective settings, a Postgres configuration document included,
+    // so the gate is the one the daemon, the session block and Fluid use.
+    let min_age_hours = crystalline_service::config_for_report(None)
+        .await?
         .effective
         .update_min_age_hours();
     let state = crystalline_core::config::state_dir()
@@ -231,7 +266,7 @@ pub(crate) async fn check(ignore_age: bool, json: bool) -> anyhow::Result<()> {
     .await;
     let found = found_release(&cache, now, min_age_hours, ignore_age)?;
     let detection = crystalline_service::update::detect_here().detection;
-    let plan = plan(current, Some(found.0), found.1, found.2, detection);
+    let plan = plan(current, Some(found.0), found.1, found.2, detection, now);
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
@@ -251,26 +286,41 @@ fn found_release(
     min_age_hours: u32,
     ignore_age: bool,
 ) -> anyhow::Result<(Precedence, Option<Stamp>, Gate)> {
-    let (version, published_at) = match &cache.outcome {
+    let (version, published_at, first_seen) = match &cache.outcome {
         CheckOutcome::Release {
             version,
             published_at,
-            ..
-        } => (version, *published_at),
-        CheckOutcome::Failed { reason } => {
-            anyhow::bail!("update check failed: {}", plain_reason(reason))
-        }
+            first_seen,
+        } => (version, *published_at, *first_seen),
+        CheckOutcome::Failed { reason } => anyhow::bail!(failure_line(reason)),
     };
     let Some(found) = release_version(version) else {
         anyhow::bail!("update check failed: {FAILED_REASON}");
     };
+    // Counted from the publish time, else from when this machine first saw
+    // the release, as `UpdateCache::gate` does.
     let gate = if ignore_age {
         Gate::Open
     } else {
-        cache.gate(now, min_age_hours).unwrap_or(Gate::Open)
+        age_gate(published_at.unwrap_or(first_seen), now, min_age_hours)
     };
     Ok((found, published_at, gate))
 }
+
+/// The error line of a failed check. A connection failure's cause (proxy,
+/// name lookup, TLS, timeout) is logged at info level and never cached
+/// (S23), so the line says how to see it.
+fn failure_line(reason: &str) -> String {
+    let reason = plain_reason(reason);
+    if reason == CANNOT_REACH {
+        format!("update check failed: {reason} (RUST_LOG=info shows why)")
+    } else {
+        format!("update check failed: {reason}")
+    }
+}
+
+/// The sentence the check caches when GitHub could not be reached.
+const CANNOT_REACH: &str = "cannot reach GitHub";
 
 /// A failure sentence as the cache stores it, when it is one of the plain
 /// sentences the check writes (letters, digits, spaces and `'`); anything
@@ -334,6 +384,11 @@ mod tests {
         Stamp::from_ymd_hms(2026, 11, day, 10, 0, 0).unwrap()
     }
 
+    /// When the plans here are made: three hours after `at(17)`.
+    fn now() -> Stamp {
+        Stamp::from_ymd_hms(2026, 11, 17, 13, 0, 0).unwrap()
+    }
+
     #[test]
     fn each_method_has_its_action() {
         for (method, action) in [
@@ -357,6 +412,7 @@ mod tests {
                 None,
                 Gate::Open,
                 acting(method),
+                now(),
             );
             assert_eq!(plan.action, action, "{method:?}");
             assert_eq!(plan.method, method);
@@ -377,7 +433,14 @@ mod tests {
                 method: InstallMethod::Tarball,
                 refusal: Some(refusal),
             };
-            let plan = plan(v("0.33.0"), Some(v("0.34.0")), None, Gate::Open, detection);
+            let plan = plan(
+                v("0.33.0"),
+                Some(v("0.34.0")),
+                None,
+                Gate::Open,
+                detection,
+                now(),
+            );
             assert_eq!(plan.action, Action::Refuse(refusal));
             assert_eq!(plan.method, InstallMethod::Tarball);
             assert_eq!(plan.exit_code(), 10, "an update is still available");
@@ -393,6 +456,7 @@ mod tests {
                 None,
                 Gate::Open,
                 acting(InstallMethod::Tarball),
+                now(),
             );
             assert_eq!(plan.action, Action::UpToDate, "{newest}");
             assert_eq!(plan.exit_code(), 0);
@@ -410,12 +474,13 @@ mod tests {
             Some(at(17)),
             Gate::OpensAt(at(18)),
             acting(InstallMethod::Deb),
+            now(),
         );
         assert_eq!(plan.exit_code(), 0);
         assert_eq!(
             render_plan(&plan),
             "Crystalline 0.34.0 is out (this is 0.33.0), but too new to offer: it is offered from 2026-11-18T10:00:00Z. --ignore-age offers it now.\n\
-             Published: 2026-11-17T10:00:00Z\n\
+             Published: 2026-11-17T10:00:00Z (3 hours ago)\n\
              Install method: deb\n\
              update now: download and verify the .deb, then print the apt command that installs it\n\
              Release notes: https://github.com/jordiboehme/crystalline/releases/tag/v0.34.0\n"
@@ -440,6 +505,7 @@ mod tests {
             None,
             Gate::Open,
             acting(InstallMethod::Homebrew),
+            now(),
         );
         assert_eq!(plan.exit_code(), 10);
         assert_eq!(
@@ -449,6 +515,30 @@ mod tests {
              update now: run brew upgrade jordiboehme/tap/crystalline (asks first; --yes skips the question)\n\
              Release notes: https://github.com/jordiboehme/crystalline/releases/tag/v0.34.0\n"
         );
+    }
+
+    #[test]
+    fn the_publish_age_reads_at_a_glance() {
+        let hours = |n: i64| time::hours(n);
+        assert_eq!(age_text(time::minutes(59)), "less than an hour ago");
+        assert_eq!(age_text(hours(1)), "1 hour ago");
+        assert_eq!(age_text(hours(23)), "23 hours ago");
+        assert_eq!(age_text(hours(24)), "1 day ago");
+        assert_eq!(age_text(hours(24 * 3 + 5)), "3 days ago");
+        assert_eq!(age_text(hours(-2)), "in the future");
+    }
+
+    #[test]
+    fn a_failure_line_says_how_to_see_a_connection_cause() {
+        assert_eq!(
+            failure_line("cannot reach GitHub"),
+            "update check failed: cannot reach GitHub (RUST_LOG=info shows why)"
+        );
+        assert_eq!(
+            failure_line("GitHub answered with status 502"),
+            "update check failed: GitHub answered with status 502"
+        );
+        assert_eq!(failure_line("<b>"), "update check failed: the check failed");
     }
 
     #[test]
@@ -478,6 +568,7 @@ mod tests {
                 method: InstallMethod::Tarball,
                 refusal: Some(Refusal::NotOfficial),
             },
+            now(),
         );
         assert_eq!(
             serde_json::to_value(&plan).unwrap(),
@@ -506,7 +597,7 @@ mod tests {
     }
 
     fn plan_with(gate: Gate, detection: Detection) -> Plan {
-        plan(v("0.33.0"), Some(v("0.34.0")), None, gate, detection)
+        plan(v("0.33.0"), Some(v("0.34.0")), None, gate, detection, now())
     }
 
     #[test]

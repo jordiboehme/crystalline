@@ -469,10 +469,8 @@ impl UpdateState {
         env: &dyn Fn(&str) -> Option<String>,
         cache_path: Option<PathBuf>,
     ) -> UpdateState {
-        let detection = detect(exe, env, dpkg_list().as_deref()).detection;
+        let detection = detect_at(exe, env).detection;
         let official = official_build();
-        let packaged = crate::runs_in::PackageContext::here().is_packaged();
-        let detection = detection.for_build(official, packaged);
         let cache = cache_path
             .as_deref()
             .and_then(read_cache)
@@ -535,7 +533,15 @@ pub fn detect_here() -> DetectedInstall {
     // An exe that cannot be named is an empty path, which detects as
     // unknown.
     let exe = std::env::current_exe().unwrap_or_default();
-    let found = detect(&exe, &env, dpkg_list().as_deref());
+    detect_at(&exe, &env)
+}
+
+/// The detection of the binary at `exe` under `env`, the one rule the
+/// daemon ([`UpdateState::detect`]) and the CLI ([`detect_here`]) share:
+/// [`detect`] with this system's dpkg list, then the unofficial-build and
+/// app-package refusals ([`Detection::for_build`]).
+fn detect_at(exe: &Path, env: &dyn Fn(&str) -> Option<String>) -> DetectedInstall {
+    let found = detect(exe, env, dpkg_list().as_deref());
     let packaged = crate::runs_in::PackageContext::here().is_packaged();
     DetectedInstall {
         exe: found.exe,

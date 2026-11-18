@@ -5916,7 +5916,8 @@ enum UpdateCommand {
     ///
     /// Exit codes: 0 up to date, or the newer release is younger than the
     /// release-age gate (the output says when it is offered); 10 an update
-    /// is available; 1 the check failed.
+    /// is available (the output says if `update now` cannot act on this
+    /// install); 1 the check failed.
     Check {
         /// Offer a release however recently it was published (skips the
         /// `update.min_age_hours` gate).
