@@ -46,8 +46,8 @@ struct Fixture {
 /// `V006`: the rule leaves an engram recorded today alone, because it is still
 /// being worked on. The route never takes a `today` parameter, so the fixture
 /// dates itself against the real clock rather than pinning one.
-fn yesterday() -> chrono::NaiveDate {
-    chrono::Utc::now().date_naive() - chrono::Duration::days(1)
+fn yesterday() -> String {
+    (crystalline_core::time::today_utc() - crystalline_core::time::days(1)).ymd()
 }
 
 /// One engram file's markdown. `generated_by` writes the provenance block a

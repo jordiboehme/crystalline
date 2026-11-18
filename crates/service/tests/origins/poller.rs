@@ -12,7 +12,7 @@
 //!
 //! `poll_secs`' 60-second floor makes waiting out real intervals
 //! impractical, so every test drives `Engine::origin_poll_tick` directly
-//! with explicit `Instant`/`DateTime<Utc>` values instead of sleeping: a
+//! with explicit `Instant`/`Stamp` values instead of sleeping: a
 //! domain never scheduled before is always due on its first tick, and later
 //! ticks pass whatever synthetic time is needed to prove due/not-due and
 //! backoff behavior, with no real waiting at all.
@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::support::MockProvider;
-use chrono::Utc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
@@ -191,11 +190,8 @@ async fn poller_applies_an_upstream_edit_without_a_user_call() {
     // No `origin_update` call: only the poller's own tick function runs. The
     // domain has never been scheduled before, so it is due on this first
     // tick regardless of the configured 60-second floor.
-    eng.origin_poll_tick(
-        Instant::now(),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
-    )
-    .await;
+    eng.origin_poll_tick(Instant::now(), crystalline_core::time::now())
+        .await;
 
     let content = std::fs::read_to_string(root.join("notes/alpha.md")).unwrap();
     assert!(content.contains("version two"), "{content}");
@@ -238,11 +234,8 @@ async fn a_poll_tick_bootstraps_a_due_env_origin_domain() {
 
     // The env-origin domain has never been scheduled, so it is due on the very
     // first tick; no `origin_add` and no `origin_update` were ever called.
-    eng.origin_poll_tick(
-        Instant::now(),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
-    )
-    .await;
+    eng.origin_poll_tick(Instant::now(), crystalline_core::time::now())
+        .await;
 
     // Bootstrapped end to end: files on disk and origin state written.
     assert!(root.join("notes/alpha.md").exists());
@@ -290,11 +283,8 @@ async fn a_poll_tick_proceeds_with_an_env_token_and_no_saved_token_file() {
     // must pass through `origin_connection_offline` is satisfied by the
     // environment token alone, not by anything on disk in `token_dir`.
 
-    eng.origin_poll_tick(
-        Instant::now(),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
-    )
-    .await;
+    eng.origin_poll_tick(Instant::now(), crystalline_core::time::now())
+        .await;
 
     assert!(
         root.join("notes/alpha.md").exists(),
@@ -339,7 +329,7 @@ async fn poller_does_not_repoll_a_domain_before_its_next_due_instant() {
     let calls_after_add = mock.branch_head_calls();
 
     let now = Instant::now();
-    eng.origin_poll_tick(now, crystalline_core::time::Stamp::from_chrono(Utc::now()))
+    eng.origin_poll_tick(now, crystalline_core::time::now())
         .await;
     let calls_after_first_tick = mock.branch_head_calls();
     assert!(
@@ -352,7 +342,7 @@ async fn poller_does_not_repoll_a_domain_before_its_next_due_instant() {
     // again.
     eng.origin_poll_tick(
         now + std::time::Duration::from_secs(1),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
+        crystalline_core::time::now(),
     )
     .await;
     assert_eq!(
@@ -408,7 +398,7 @@ async fn disabled_poller_makes_no_calls_and_enabling_mid_run_starts_activity() {
     for i in 0..5u64 {
         eng.origin_poll_tick(
             now + std::time::Duration::from_secs(i * 10),
-            crystalline_core::time::Stamp::from_chrono(Utc::now()),
+            crystalline_core::time::now(),
         )
         .await;
     }
@@ -428,7 +418,7 @@ async fn disabled_poller_makes_no_calls_and_enabling_mid_run_starts_activity() {
     .unwrap();
     eng.origin_poll_tick(
         now + std::time::Duration::from_secs(60),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
+        crystalline_core::time::now(),
     )
     .await;
     assert!(
@@ -478,7 +468,7 @@ async fn unauthenticated_poller_makes_no_calls_and_a_landed_token_starts_activit
     for i in 0..5u64 {
         eng.origin_poll_tick(
             now + std::time::Duration::from_secs(i * 10),
-            crystalline_core::time::Stamp::from_chrono(Utc::now()),
+            crystalline_core::time::now(),
         )
         .await;
     }
@@ -494,7 +484,7 @@ async fn unauthenticated_poller_makes_no_calls_and_a_landed_token_starts_activit
     write_fake_token(&token_dir);
     eng.origin_poll_tick(
         now + std::time::Duration::from_secs(60),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
+        crystalline_core::time::now(),
     )
     .await;
     assert!(
@@ -539,7 +529,7 @@ async fn poller_keeps_polling_with_the_cached_token_after_the_backing_file_disap
     // The first tick reads the token once through the connectivity gate,
     // caching it for the process lifetime, and polls the domain.
     let now = Instant::now();
-    eng.origin_poll_tick(now, crystalline_core::time::Stamp::from_chrono(Utc::now()))
+    eng.origin_poll_tick(now, crystalline_core::time::now())
         .await;
     let calls_after_first_tick = mock.branch_head_calls();
     assert!(
@@ -553,7 +543,7 @@ async fn poller_keeps_polling_with_the_cached_token_after_the_backing_file_disap
     std::fs::remove_file(token_dir.join("github-token.json")).unwrap();
     eng.origin_poll_tick(
         now + std::time::Duration::from_secs(3600),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
+        crystalline_core::time::now(),
     )
     .await;
     assert!(
@@ -598,7 +588,7 @@ async fn an_auth_expired_pull_drops_the_cached_token_so_the_gate_rereads() {
     // pull fails and drops the whole cache.
     mock.fail_branch_head_auth_expired("main");
     let now = Instant::now();
-    eng.origin_poll_tick(now, crystalline_core::time::Stamp::from_chrono(Utc::now()))
+    eng.origin_poll_tick(now, crystalline_core::time::now())
         .await;
     assert!(
         mock.branch_head_calls() > 0,
@@ -648,42 +638,35 @@ async fn rate_limited_poller_pauses_every_domain_until_the_reported_reset() {
     .unwrap();
 
     let now = Instant::now();
-    let wall_now = Utc::now();
-    let reset = wall_now + chrono::Duration::minutes(10);
+    let wall_now = crystalline_core::time::now();
+    let reset = wall_now + crystalline_core::time::minutes(10);
     mock.fail_branch_head_rate_limited("main", Some(reset));
 
     // The domain is due on this first real poll attempt; it trips the rate
     // limit, which must pause every domain, not just this one.
-    eng.origin_poll_tick(now, crystalline_core::time::Stamp::from_chrono(wall_now))
-        .await;
+    eng.origin_poll_tick(now, wall_now).await;
     let calls_after_limit = mock.branch_head_calls();
     assert!(calls_after_limit > 0);
 
     let status = eng.status_report().await.unwrap();
     assert_eq!(
         status["origins"]["rate_limit_wait_until"],
-        serde_json::to_value(reset).unwrap()
+        crystalline_core::time::serde::stamp_json(reset)
     );
 
     // Still within the pause window: no further provider calls at all, even
     // though the mock would still refuse if asked.
-    eng.origin_poll_tick(
-        now + std::time::Duration::from_secs(30),
-        crystalline_core::time::Stamp::from_chrono(wall_now),
-    )
-    .await;
+    eng.origin_poll_tick(now + std::time::Duration::from_secs(30), wall_now)
+        .await;
     assert_eq!(mock.branch_head_calls(), calls_after_limit);
 
     // Past the reset: the pause lifts and polling resumes. The mock's own
     // injected failure is cleared first, mirroring GitHub's rate limit
     // window actually resetting.
     mock.clear_branch_head_rate_limited("main");
-    let past_reset = wall_now + chrono::Duration::minutes(11);
-    eng.origin_poll_tick(
-        now + std::time::Duration::from_secs(700),
-        crystalline_core::time::Stamp::from_chrono(past_reset),
-    )
-    .await;
+    let past_reset = wall_now + crystalline_core::time::minutes(11);
+    eng.origin_poll_tick(now + std::time::Duration::from_secs(700), past_reset)
+        .await;
     assert!(
         mock.branch_head_calls() > calls_after_limit,
         "polling should resume once the rate limit window has passed"
@@ -765,11 +748,8 @@ async fn status_report_origins_block_shape_when_enabled() {
     assert!(domains[0]["last_result"].is_null());
 
     // After a tick, the schedule and last result are filled in.
-    eng.origin_poll_tick(
-        Instant::now(),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
-    )
-    .await;
+    eng.origin_poll_tick(Instant::now(), crystalline_core::time::now())
+        .await;
     let status = eng.status_report().await.unwrap();
     let domains = status["origins"]["domains"].as_array().unwrap();
     assert!(!domains[0]["next_due"].is_null());
@@ -858,11 +838,8 @@ async fn a_poll_tick_converges_a_merged_draft() {
     ]));
     mock.set_branch("main", &merged);
 
-    eng.origin_poll_tick(
-        Instant::now(),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
-    )
-    .await;
+    eng.origin_poll_tick(Instant::now(), crystalline_core::time::now())
+        .await;
 
     let left = {
         let store = eng.store();
@@ -921,11 +898,8 @@ async fn a_poll_tick_adopts_a_pulled_domain_name() {
     ]));
     mock.set_branch("main", &c2);
 
-    eng.origin_poll_tick(
-        Instant::now(),
-        crystalline_core::time::Stamp::from_chrono(Utc::now()),
-    )
-    .await;
+    eng.origin_poll_tick(Instant::now(), crystalline_core::time::now())
+        .await;
 
     let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
     assert!(!cfg.domains.contains_key("brand-knowledge"));

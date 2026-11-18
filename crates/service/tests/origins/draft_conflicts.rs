@@ -5811,10 +5811,7 @@ async fn status_names_a_merge_a_poller_did() {
         .engine_over(t.eng.store(), |_| {})
         .with_token_store_dir(tokens);
     poller
-        .origin_poll_tick(
-            std::time::Instant::now(),
-            crystalline_core::time::Stamp::from_chrono(chrono::Utc::now()),
-        )
+        .origin_poll_tick(std::time::Instant::now(), crystalline_core::time::now())
         .await;
     assert!(t.row("alice", "plan.md").await.contains(BOB_LINE));
 

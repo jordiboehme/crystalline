@@ -1157,7 +1157,7 @@ async fn the_registration_table_is_capped_rather_than_grown_forever() {
             vec![
                 turso::Value::Text(format!("coc_{i:032x}")),
                 turso::Value::Text(json!([HOSTED_REDIRECT]).to_string()),
-                turso::Value::Text(chrono::Utc::now().to_rfc3339()),
+                turso::Value::Text(crystalline_core::time::now().rfc3339()),
             ],
         )
         .await

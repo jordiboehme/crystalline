@@ -478,7 +478,7 @@ async fn idp_token(
         )
             .into_response();
     }
-    let now = chrono::Utc::now().timestamp();
+    let now = crystalline_core::time::now().unix_seconds();
     let user = state.user.lock().unwrap().clone();
     let issuer = state
         .token_issuer

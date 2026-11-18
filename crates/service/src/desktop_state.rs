@@ -148,10 +148,8 @@ fn describe(folder: &Path) -> DesktopState {
         .filter_map(Result::ok)
         .filter_map(|e| e.metadata().ok()?.modified().ok())
         .max()
-        .map(|time| {
-            chrono::DateTime::<chrono::Utc>::from(time)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-        });
+        .and_then(crystalline_core::time::Stamp::from_system_time)
+        .map(|time| time.rfc3339_secs());
     let daemon_alive = std::fs::read_to_string(folder.join("service.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<crate::instance::LockInfo>(&text).ok())

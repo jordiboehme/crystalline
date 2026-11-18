@@ -294,7 +294,7 @@ struct Inner {
     /// `RemoteError::RateLimited`, simulating GitHub throttling this
     /// machine. Set through `MockProvider::fail_branch_head_rate_limited`,
     /// cleared through `MockProvider::clear_branch_head_rate_limited`.
-    rate_limited_branches: HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
+    rate_limited_branches: HashMap<String, Option<crystalline_core::time::Stamp>>,
     /// Branches whose `branch_head` probe should fail with
     /// `RemoteError::AuthExpired`, the mapped GitHub 401, simulating a token
     /// revoked or rotated out from under this machine while a connection was
@@ -321,7 +321,7 @@ struct Inner {
     refuse_missing_deletes: bool,
     /// When set, `branch_ref` answers `RemoteError::RateLimited` with this
     /// reset. Set through `MockProvider::rate_limit_branch_ref`.
-    branch_ref_rate_limited: Option<chrono::DateTime<chrono::Utc>>,
+    branch_ref_rate_limited: Option<crystalline_core::time::Stamp>,
     proposal_counter: u64,
     /// How many times `branch_head` has been called, for the daemon poller
     /// tests: it is always the first call any `origin_update`/`origin_status`
@@ -588,7 +588,7 @@ impl MockProvider {
     pub fn fail_branch_head_rate_limited(
         &self,
         branch: &str,
-        reset: Option<chrono::DateTime<chrono::Utc>>,
+        reset: Option<crystalline_core::time::Stamp>,
     ) {
         let mut inner = self.inner.lock().unwrap();
         inner
@@ -735,7 +735,7 @@ impl MockProvider {
 
     /// Makes `branch_ref` answer a rate limit that resets at `reset`, or
     /// answer normally again with `None`.
-    pub fn rate_limit_branch_ref(&self, reset: Option<chrono::DateTime<chrono::Utc>>) {
+    pub fn rate_limit_branch_ref(&self, reset: Option<crystalline_core::time::Stamp>) {
         self.inner.lock().unwrap().branch_ref_rate_limited = reset;
     }
 
@@ -872,9 +872,7 @@ impl Provider for MockProvider {
             return Err(RemoteError::AuthExpired);
         }
         if let Some(reset) = inner.rate_limited_branches.get(&origin.branch) {
-            return Err(RemoteError::RateLimited {
-                reset: reset.map(crystalline_core::time::Stamp::from_chrono),
-            });
+            return Err(RemoteError::RateLimited { reset: *reset });
         }
         let commit = inner.branches.get(&origin.branch).cloned().ok_or_else(|| {
             RemoteError::RepoNotFound {
@@ -1195,9 +1193,7 @@ impl Provider for MockProvider {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(format!("branch_ref:{name}"));
         if let Some(reset) = inner.branch_ref_rate_limited {
-            return Err(RemoteError::RateLimited {
-                reset: Some(crystalline_core::time::Stamp::from_chrono(reset)),
-            });
+            return Err(RemoteError::RateLimited { reset: Some(reset) });
         }
         Ok(inner.branches.get(name).cloned())
     }

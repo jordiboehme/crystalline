@@ -389,7 +389,7 @@ async fn a_password_reset_is_listed_as_the_reason() {
 async fn a_replayed_grant_is_listed_with_its_reason() {
     let ctx = RestCtx::with_user("ada", Role::Editor).await;
     let (client_id, grant) = grant_for(&ctx.auth, "ada", "http://example.test").await;
-    let now = chrono::Utc::now().timestamp();
+    let now = crystalline_core::time::now().unix_seconds();
     ctx.auth
         .refresh_oauth_grant_at(&grant.refresh_token, &client_id, None, now - 3600)
         .await

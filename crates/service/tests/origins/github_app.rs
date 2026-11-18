@@ -460,10 +460,10 @@ async fn handle(
             return not_found();
         }
         forge.mints.lock().unwrap().push(id);
-        let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+        let expires = crystalline_core::time::now() + crystalline_core::time::hours(1);
         return created(json!({
             "token": forge.tokens[&id],
-            "expires_at": expires.to_rfc3339(),
+            "expires_at": expires.rfc3339(),
         }));
     }
     if let Some(login) = path.strip_prefix("/users/")
@@ -632,7 +632,7 @@ async fn repo_route(
                 .into_response();
         }
         if forge.collaborators_rate_limited.load(Ordering::SeqCst) {
-            let reset = (chrono::Utc::now().timestamp() + 3600).to_string();
+            let reset = (crystalline_core::time::now().unix_seconds() + 3600).to_string();
             return (
                 StatusCode::FORBIDDEN,
                 [

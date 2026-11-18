@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, FixedOffset};
 use crystalline_core::automation::Loop;
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ServiceConfig};
+use crystalline_core::time::{self, OffsetStamp};
 use crystalline_index::TursoStore;
 use crystalline_remote::provider::ProposalState;
 use crystalline_service::engine::{PolicyEdit, ShareActor};
@@ -27,8 +27,8 @@ const HERE: &str = "https://kb.example.com";
 /// Another instance.
 const THERE: &str = "https://home.example";
 
-fn start() -> DateTime<FixedOffset> {
-    DateTime::parse_from_rfc3339("2026-10-21T10:00:00+00:00").unwrap()
+fn start() -> OffsetStamp {
+    time::parse_rfc3339("2026-10-21T10:00:00+00:00").unwrap()
 }
 
 /// A team MANIFEST that shares directly and carries the team marker, with
@@ -92,9 +92,7 @@ async fn clone_at(
     )
     .await
     .unwrap();
-    eng.set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
-        start(),
-    )));
+    eng.set_automation_now(Some(start()));
     std::fs::create_dir_all(root.join("notes")).unwrap();
     (eng, root)
 }
@@ -559,14 +557,8 @@ async fn on_postgres_the_home_comes_first_and_the_host_lock_decides_among_the_ho
     let files = [("MANIFEST.md", marked.as_str())];
     let a = instance_at(open().await, "alpha", "https://a.example", &files).await;
     let b = instance_at(open().await, "beta", "https://b.example", &files).await;
-    a.engine
-        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
-            start(),
-        )));
-    b.engine
-        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
-            start(),
-        )));
+    a.engine.set_automation_now(Some(start()));
+    b.engine.set_automation_now(Some(start()));
 
     let s = status_of(&b.engine, "eng").await;
     assert_eq!(s["runs_on"], "https://a.example", "{s}");

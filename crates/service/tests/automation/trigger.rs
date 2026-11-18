@@ -147,10 +147,9 @@ async fn reflecting(extra: &str, url: Option<&str>) -> Fx {
         |cfg, _| webhook(cfg, url, None),
     )
     .await;
-    fx.engine
-        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
-            chrono::DateTime::parse_from_rfc3339("2026-10-21T10:00:00+00:00").unwrap(),
-        )));
+    fx.engine.set_automation_now(Some(
+        crystalline_core::time::parse_rfc3339("2026-10-21T10:00:00+00:00").unwrap(),
+    ));
     fx.engine
         .write_reflection(
             &WriteReflectionParams {
@@ -269,7 +268,7 @@ async fn a_new_thread_sends_one_signed_webhook_within_a_minute() {
     assert_eq!(hit.header("content-type"), "application/json");
     let timestamp = hit.header("x-crystalline-timestamp");
     let seconds: i64 = timestamp.parse().expect("unix seconds");
-    assert!((chrono::Utc::now().timestamp() - seconds).abs() < 120);
+    assert!((crystalline_core::time::now().unix_seconds() - seconds).abs() < 120);
     assert_eq!(
         hit.header("x-crystalline-signature"),
         webhook_signature(SECRET.as_bytes(), timestamp, &hit.body)
@@ -290,7 +289,7 @@ async fn a_new_thread_sends_one_signed_webhook_within_a_minute() {
     assert_eq!(body["domain"], "eng");
     assert!(body["instance"].is_string(), "{body}");
     assert!(
-        chrono::DateTime::parse_from_rfc3339(body["sent_at"].as_str().unwrap()).is_ok(),
+        crystalline_core::time::parse_rfc3339(body["sent_at"].as_str().unwrap()).is_some(),
         "{body}"
     );
     assert_eq!(body["counts"]["waiting_for_the_agent"], 1, "{body}");
@@ -738,9 +737,9 @@ async fn the_wire_carries_the_signed_request() {
     let (addr, mut taken, status) = listener().await;
     let url = reqwest::Url::parse(&format!("http://{addr}/webhook/abc")).unwrap();
     let counts = serde_json::json!({"waiting_for_the_agent": 2, "feedback": 0, "updates": 1, "pages_to_update": 1});
-    let now = chrono::DateTime::parse_from_rfc3339("2026-10-22T08:00:00Z")
+    let now = crystalline_core::time::parse_rfc3339("2026-10-22T08:00:00Z")
         .unwrap()
-        .with_timezone(&chrono::Utc);
+        .stamp();
     let request = webhook_request(
         &url,
         SECRET,
@@ -897,10 +896,9 @@ async fn a_failed_run_waits_out_its_backoff_then_sends() {
         "nothing while the loop backs off"
     );
     // The five minutes after the failure are over.
-    fx.engine
-        .set_automation_now(Some(crystalline_core::time::OffsetStamp::from_chrono(
-            chrono::DateTime::parse_from_rfc3339("2026-10-21T10:06:00+00:00").unwrap(),
-        )));
+    fx.engine.set_automation_now(Some(
+        crystalline_core::time::parse_rfc3339("2026-10-21T10:06:00+00:00").unwrap(),
+    ));
     let hit = hook
         .next(minutes(6))
         .await
@@ -1106,7 +1104,7 @@ fn some_request(url: &str) -> WebhookRequest {
         "eng",
         "home.example",
         &serde_json::json!({"waiting_for_the_agent": 1}),
-        chrono::Utc::now(),
+        crystalline_core::time::now(),
     )
 }
 

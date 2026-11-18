@@ -407,7 +407,9 @@ async fn a_rate_limit_pauses_the_backup() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
     let fx = home(mock.clone()).await;
-    mock.rate_limit_branch_ref(Some(chrono::Utc::now() + chrono::Duration::hours(1)));
+    mock.rate_limit_branch_ref(Some(
+        crystalline_core::time::now() + crystalline_core::time::hours(1),
+    ));
     fx.engine
         .write_reflection(&write("a.md", "# A\n"), &agent())
         .await

@@ -105,7 +105,7 @@ pub fn build_extension(
         binary: built.binary.clone(),
         shim_sha256: shim_sha256(),
         file: built.file.clone(),
-        built_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        built_at: crystalline_core::time::now().rfc3339_secs_z(),
         opened,
     });
     if opened {

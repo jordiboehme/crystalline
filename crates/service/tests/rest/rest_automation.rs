@@ -52,7 +52,7 @@ async fn serve_with(anonymous: bool) -> Fixture {
     .unwrap();
     // A mechanical finding (V103: a summary the full text never mentions) and
     // a judgment one (V006: a human capture nobody reviewed).
-    let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+    let yesterday = (crystalline_core::time::today_utc() - crystalline_core::time::days(1)).ymd();
     let note = |title: &str, permalink: &str, by: Option<&str>, body: &str| {
         let generated = by
             .map(|by| format!("generated: {{ by: \"{by}\", at: {yesterday}T09:12:00+00:00 }}\n"))

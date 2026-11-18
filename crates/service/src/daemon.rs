@@ -250,7 +250,7 @@ impl Shared {
             SessionInfo {
                 id,
                 kind: kind.to_string(),
-                since: chrono::Utc::now().to_rfc3339(),
+                since: crystalline_core::time::now().rfc3339(),
             },
         );
         // Nobody listens unless the idle exit runs; a send with no receiver
@@ -1364,7 +1364,7 @@ async fn read_document_at_takeover(
     };
     let doc = side.load_config().await.map_err(|e| fatal(e.to_string()))?;
     let state = match &doc {
-        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at.into_chrono()),
+        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at),
         None => crate::durable::DocumentState::NotSaved,
     };
     loaded
