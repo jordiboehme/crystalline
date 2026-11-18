@@ -990,7 +990,7 @@ fn shell_quoted(text: &str) -> String {
 }
 
 /// The question at the terminal, on stderr; yes only for `y` or `yes`.
-fn ask_at_terminal(question: &str) -> bool {
+pub(crate) fn ask_at_terminal(question: &str) -> bool {
     eprint!("{question}");
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
@@ -1108,24 +1108,38 @@ pub(crate) async fn auto(on: bool, json: bool) -> anyhow::Result<()> {
         println!("{data}");
         return Ok(());
     }
-    // The effective value, so a CRYSTALLINE_UPDATE_CHECK that wins over the
-    // saved setting is said as it is, with the note that names it.
-    println!(
-        "{}",
+    let detection = crystalline_service::update::detect_here().detection;
+    for line in auto_lines(&data, &detection, Path::new("/"), on) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What `update auto on|off` (and a yes at install) says after
+/// [`set_update_check`] answered `data`: [`AUTO_ON`] or [`AUTO_OFF`] for the
+/// effective value, so a `CRYSTALLINE_UPDATE_CHECK` that wins over the saved
+/// setting is said as it is, the setting's note indented below it, then
+/// [`deb_service_line`] for the binary `detection` names under `root`. Pure
+/// apart from that line's file reads.
+pub(crate) fn auto_lines(
+    data: &serde_json::Value,
+    detection: &Detection,
+    root: &Path,
+    on: bool,
+) -> Vec<String> {
+    let mut lines = vec![
         if data["value"] == "true" {
             AUTO_ON
         } else {
             AUTO_OFF
         }
-    );
+        .to_string(),
+    ];
     if let Some(note) = data["note"].as_str() {
-        println!("  {note}");
+        lines.push(format!("  {note}"));
     }
-    let detection = crystalline_service::update::detect_here().detection;
-    if let Some(line) = deb_service_line(&detection, Path::new("/"), on) {
-        println!("{line}");
-    }
-    Ok(())
+    lines.extend(deb_service_line(detection, root, on));
+    lines
 }
 
 /// The two update lines `status` and `doctor` show, without their labels:
@@ -1291,7 +1305,16 @@ pub(crate) fn hint_may_show(
     env: &dyn Fn(&str) -> Option<String>,
     detection: &Detection,
 ) -> bool {
-    stderr_tty && OffReason::suppressing(env, detection).is_none() && detection.acts()
+    stderr_tty && may_offer(env, detection)
+}
+
+/// Whether an update may be offered for this binary at all: nothing in
+/// `env` suppresses the check (`NO_UPDATE_NOTIFIER`, `CI`, Docker, the
+/// Claude Desktop extension) and `update now` would act for it, which rules
+/// out an unofficial build, an app package and an unknown method too. The
+/// stderr hint and the install-time question share it. Pure.
+pub(crate) fn may_offer(env: &dyn Fn(&str) -> Option<String>, detection: &Detection) -> bool {
+    OffReason::suppressing(env, detection).is_none() && detection.acts()
 }
 
 /// After a command: print [`stderr_hint`] on stderr when [`hint_may_show`]

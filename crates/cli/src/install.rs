@@ -61,17 +61,20 @@
 //! instead of an MCP entry, hooks and skill copies, and keeps its own record
 //! instead of a receipt row. That flow lives in `install_desktop.rs`.
 
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crystalline_core::time::{self, Stamp};
 use crystalline_core::{HarnessKind, HarnessPaths, SessionFormat, config, harness_paths};
 use crystalline_service::{CliCapture, CliRun, run_harness_cli, run_harness_cli_capture};
 
 use crate::install_profile;
 use crate::receipt;
 use crate::skills_placement;
+use crate::update;
 
 /// The command the `SessionStart` hook runs: re-inject the knowledge routing
 /// prompt at session start.
@@ -2230,10 +2233,21 @@ fn pointer_label(status: &str) -> &str {
 /// error for a missing or failing harness CLI (that degrades to a printed
 /// manual command); a genuinely unreadable or unparseable settings file, or a
 /// filesystem error writing a skill, does surface as an error.
+///
+/// After a successful install, [`ask_update_check`] asks once per machine
+/// whether to check daily for a newer Crystalline.
 pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
-    if !opts.harness.profile().is_legacy() {
-        return install_profile::run_install(&opts, json);
+    if opts.harness.profile().is_legacy() {
+        install_legacy(opts, json)?;
+    } else {
+        install_profile::run_install(&opts, json)?;
     }
+    ask_update_check(json);
+    Ok(())
+}
+
+/// [`run_install`] for the legacy harnesses (Claude Code, Codex, Copilot).
+fn install_legacy(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
     let paths = harness_paths(opts.harness, opts.project);
     let scope = if opts.project { "project" } else { "user" };
 
@@ -2747,6 +2761,662 @@ fn reconcile_entry(
         entry.skills = records;
     }
     Ok(())
+}
+
+// --- the install-time update question (S25-S27) ---------------------------
+
+/// The question `crystalline install` asks once per machine, on stderr.
+pub(crate) const UPDATE_QUESTION: &str =
+    "Check once a day for a newer Crystalline? Nothing is installed without you. [y/N] ";
+
+/// What a no prints, and the one stderr line a non-interactive install
+/// prints where it would have asked.
+pub(crate) const UPDATE_STAYS_OFF: &str =
+    "Update check stays off. Turn it on with: crystalline update auto on";
+
+/// What [`should_ask`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ask {
+    /// Ask at the terminal.
+    Question,
+    /// Not a terminal: print [`UPDATE_STAYS_OFF`] on stderr, record nothing.
+    Hint,
+    /// Say nothing and record nothing.
+    Silent,
+}
+
+/// What [`ask_update_check`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskOutcome {
+    /// Asked; `true` for a yes.
+    Asked(bool),
+    /// Printed [`UPDATE_STAYS_OFF`] instead of asking.
+    Hint,
+    /// Nothing said.
+    Silent,
+}
+
+/// Whether the install asks (S25, S26): never with `--json`, when anyone
+/// set `update.check` (the config or `CRYSTALLINE_UPDATE_CHECK`), when this
+/// machine was asked before, or when an update may not be offered for this
+/// binary (`suppressed`: `CI`, `NO_UPDATE_NOTIFIER`, Docker, mcpb, an app
+/// package, an unofficial build). Otherwise it asks when stdin and stdout
+/// are terminals (`tty`) and prints the hint when they are not. Pure.
+pub(crate) fn should_ask(
+    tty: bool,
+    json: bool,
+    config_set: bool,
+    env_set: bool,
+    asked: bool,
+    suppressed: bool,
+) -> Ask {
+    if json || config_set || env_set || asked || suppressed {
+        Ask::Silent
+    } else if tty {
+        Ask::Question
+    } else {
+        Ask::Hint
+    }
+}
+
+/// Everything [`ask_with`] reads, writes and asks through, so the flow runs
+/// in tests without a terminal, a daemon or this machine's receipt.
+pub(crate) struct AskSeams<'a> {
+    /// stdin and stdout are terminals.
+    pub(crate) tty: bool,
+    pub(crate) json: bool,
+    /// `CRYSTALLINE_UPDATE_CHECK` is set.
+    pub(crate) env_set: bool,
+    /// See [`should_ask`].
+    pub(crate) suppressed: bool,
+    /// The receipt that holds the stamp.
+    pub(crate) receipt: &'a Path,
+    pub(crate) now: Stamp,
+    /// Whether the stored config sets `update.check`; `None` when it does
+    /// not load. Read last, since it may open the database.
+    pub(crate) config_set: &'a mut dyn FnMut() -> Option<bool>,
+    /// Asks the question; `true` for a yes.
+    pub(crate) answer: &'a mut dyn FnMut() -> bool,
+    /// Turns the check on the way `update auto on` does and answers the
+    /// lines to print.
+    pub(crate) turn_on: &'a mut dyn FnMut() -> anyhow::Result<Vec<String>>,
+    /// Where the lines go (stderr outside tests).
+    pub(crate) err: &'a mut dyn Write,
+}
+
+/// The install-time question over `seams`: the cheap checks first and the
+/// config last, then [`should_ask`]. Before it asks, the stamp is written,
+/// so an interrupt counts as a no; a receipt that cannot be read or a config
+/// that does not load is silence, never a question asked again and again.
+pub(crate) fn ask_with(seams: AskSeams<'_>) -> AskOutcome {
+    if seams.json || seams.suppressed {
+        return AskOutcome::Silent;
+    }
+    let Ok(mut book) = receipt::load(seams.receipt) else {
+        return AskOutcome::Silent;
+    };
+    let asked = book.update_check_asked.is_some();
+    if asked || seams.env_set {
+        return AskOutcome::Silent;
+    }
+    let Some(config_set) = (seams.config_set)() else {
+        return AskOutcome::Silent;
+    };
+    match should_ask(
+        seams.tty,
+        seams.json,
+        config_set,
+        seams.env_set,
+        asked,
+        seams.suppressed,
+    ) {
+        Ask::Silent => AskOutcome::Silent,
+        Ask::Hint => {
+            let _ = writeln!(seams.err, "{UPDATE_STAYS_OFF}");
+            AskOutcome::Hint
+        }
+        Ask::Question => {
+            book.update_check_asked = Some(seams.now);
+            if receipt::save(seams.receipt, &book).is_err() {
+                // Unrecorded, it would be asked at every install.
+                return AskOutcome::Silent;
+            }
+            let yes = (seams.answer)();
+            if yes {
+                match (seams.turn_on)() {
+                    Ok(lines) => {
+                        for line in lines {
+                            let _ = writeln!(seams.err, "{line}");
+                        }
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            seams.err,
+                            "Could not turn the update check on ({e:#}). Turn it on with: crystalline update auto on"
+                        );
+                    }
+                }
+            } else {
+                let _ = writeln!(seams.err, "{UPDATE_STAYS_OFF}");
+            }
+            AskOutcome::Asked(yes)
+        }
+    }
+}
+
+/// Ask once per machine, after a successful install, whether to check daily
+/// for a newer Crystalline (S25-S27). Never called by [`auto_reconcile`].
+/// The question, the answer's line and the hint go to stderr; `--json`
+/// output is untouched. Every failure is silence: the install already
+/// succeeded.
+pub(crate) fn ask_update_check(json: bool) -> AskOutcome {
+    if json {
+        return AskOutcome::Silent;
+    }
+    let env = |name: &str| std::env::var(name).ok();
+    let detection = crystalline_service::update::detect_here().detection;
+    let Ok(receipt_path) = receipt::receipt_path() else {
+        return AskOutcome::Silent;
+    };
+    // The install summary on stdout comes before the question.
+    let _ = std::io::stdout().flush();
+    ask_with(AskSeams {
+        tty: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        json,
+        env_set: std::env::var_os(UPDATE_CHECK_ENV).is_some(),
+        suppressed: !update::may_offer(&env, &detection),
+        receipt: &receipt_path,
+        now: time::now(),
+        config_set: &mut config_sets_update_check,
+        answer: &mut || update::ask_at_terminal(UPDATE_QUESTION),
+        turn_on: &mut || {
+            let data = crate::on_runtime_value_current_thread(|| update::set_update_check(true))??;
+            Ok(update::auto_lines(&data, &detection, Path::new("/"), true))
+        },
+        err: &mut std::io::stderr(),
+    })
+}
+
+/// The variable that sets `update.check` from the environment.
+const UPDATE_CHECK_ENV: &str = "CRYSTALLINE_UPDATE_CHECK";
+
+/// Whether the stored configuration sets `update.check`, true or false:
+/// config.yaml, or the configuration document on Postgres together with the
+/// config.yaml under it. `None` when it does not load.
+fn config_sets_update_check() -> Option<bool> {
+    let loaded =
+        crate::on_runtime_value_current_thread(|| crystalline_service::config_for_report(None))
+            .ok()?
+            .ok()?;
+    let sets =
+        |config: &config::GlobalConfig| config.update.as_ref().and_then(|u| u.check).is_some();
+    Some(sets(&loaded.file) || loaded.base.as_ref().is_some_and(sets))
+}
+
+#[cfg(test)]
+mod update_question_tests {
+    use super::*;
+    use crystalline_core::update::{Detection, InstallMethod, Refusal};
+
+    fn at() -> Stamp {
+        Stamp::from_ymd_hms(2026, 11, 18, 9, 0, 0).unwrap()
+    }
+
+    /// What one run of [`ask_with`] did besides its outcome.
+    struct Run {
+        outcome: AskOutcome,
+        err: String,
+        asked: usize,
+        turned_on: usize,
+        config_read: usize,
+    }
+
+    /// The inputs of one run: see [`AskSeams`]; `yes` is the answer.
+    struct Case {
+        tty: bool,
+        json: bool,
+        env_set: bool,
+        suppressed: bool,
+        config_set: Option<bool>,
+        yes: bool,
+    }
+
+    /// One run of [`ask_with`] against `receipt` for `case`, with
+    /// `turn_on` standing in for the setter.
+    fn run(
+        receipt: &Path,
+        case: Case,
+        turn_on: &mut dyn FnMut() -> anyhow::Result<Vec<String>>,
+    ) -> Run {
+        let Case {
+            tty,
+            json,
+            env_set,
+            suppressed,
+            config_set,
+            yes,
+        } = case;
+        let mut err = Vec::new();
+        let (mut asked, mut turned_on, mut config_read) = (0, 0, 0);
+        let outcome = ask_with(AskSeams {
+            tty,
+            json,
+            env_set,
+            suppressed,
+            receipt,
+            now: at(),
+            config_set: &mut || {
+                config_read += 1;
+                config_set
+            },
+            answer: &mut || {
+                asked += 1;
+                yes
+            },
+            turn_on: &mut || {
+                turned_on += 1;
+                turn_on()
+            },
+            err: &mut err,
+        });
+        Run {
+            outcome,
+            err: String::from_utf8(err).unwrap(),
+            asked,
+            turned_on,
+            config_read,
+        }
+    }
+
+    fn on() -> anyhow::Result<Vec<String>> {
+        Ok(vec![update::AUTO_ON.to_string()])
+    }
+
+    fn stamp(receipt: &Path) -> Option<Stamp> {
+        receipt::load(receipt).unwrap().update_check_asked
+    }
+
+    #[test]
+    fn the_question_text_is_pinned() {
+        assert_eq!(
+            UPDATE_QUESTION,
+            "Check once a day for a newer Crystalline? Nothing is installed without you. [y/N] "
+        );
+        assert_eq!(
+            UPDATE_STAYS_OFF,
+            "Update check stays off. Turn it on with: crystalline update auto on"
+        );
+        assert_eq!(
+            update::AUTO_ON,
+            "Update check on. Turn it off with: crystalline update auto off"
+        );
+    }
+
+    #[test]
+    fn should_ask_asks_only_an_interactive_install_nobody_decided_for() {
+        assert_eq!(
+            should_ask(true, false, false, false, false, false),
+            Ask::Question
+        );
+        assert_eq!(
+            should_ask(false, false, false, false, false, false),
+            Ask::Hint
+        );
+        // Each reason for silence on its own, with and without a terminal.
+        for tty in [true, false] {
+            assert_eq!(
+                should_ask(tty, true, false, false, false, false),
+                Ask::Silent
+            );
+            assert_eq!(
+                should_ask(tty, false, true, false, false, false),
+                Ask::Silent
+            );
+            assert_eq!(
+                should_ask(tty, false, false, true, false, false),
+                Ask::Silent
+            );
+            assert_eq!(
+                should_ask(tty, false, false, false, true, false),
+                Ask::Silent
+            );
+            assert_eq!(
+                should_ask(tty, false, false, false, false, true),
+                Ask::Silent
+            );
+        }
+    }
+
+    #[test]
+    fn asks_once_per_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        let first = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: false,
+            },
+            &mut on,
+        );
+        assert_eq!(first.outcome, AskOutcome::Asked(false));
+        assert_eq!(first.asked, 1);
+        assert_eq!(stamp(&receipt), Some(at()));
+        // A second install (another harness, a project) finds the stamp.
+        let second = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: true,
+            },
+            &mut on,
+        );
+        assert_eq!(second.outcome, AskOutcome::Silent);
+        assert_eq!(second.asked, 0);
+        assert_eq!(second.err, "");
+        assert_eq!(second.config_read, 0, "the stamp is read before the config");
+    }
+
+    #[test]
+    fn never_asks_when_update_check_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        // In the config, true or false alike.
+        let config = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(true),
+                yes: true,
+            },
+            &mut on,
+        );
+        assert_eq!(config.outcome, AskOutcome::Silent);
+        assert_eq!((config.asked, config.turned_on), (0, 0));
+        // In the environment, decided before the config is read.
+        let env = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: true,
+                suppressed: false,
+                config_set: Some(false),
+                yes: true,
+            },
+            &mut on,
+        );
+        assert_eq!(env.outcome, AskOutcome::Silent);
+        assert_eq!((env.asked, env.config_read), (0, 0));
+        // A config that does not load is silence too.
+        let unloaded = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: None,
+                yes: true,
+            },
+            &mut on,
+        );
+        assert_eq!(unloaded.outcome, AskOutcome::Silent);
+        assert_eq!(unloaded.err, "");
+        assert_eq!(stamp(&receipt), None, "nothing recorded");
+    }
+
+    #[test]
+    fn non_interactive_prints_the_hint_and_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        let hint = run(
+            &receipt,
+            Case {
+                tty: false,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: true,
+            },
+            &mut on,
+        );
+        assert_eq!(hint.outcome, AskOutcome::Hint);
+        assert_eq!(hint.err, format!("{UPDATE_STAYS_OFF}\n"));
+        assert_eq!((hint.asked, hint.turned_on), (0, 0));
+        assert!(!receipt.exists(), "no stamp, so a later install still asks");
+        // A later interactive install does ask.
+        let later = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: false,
+            },
+            &mut on,
+        );
+        assert_eq!(later.outcome, AskOutcome::Asked(false));
+    }
+
+    #[test]
+    fn json_never_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        for tty in [true, false] {
+            let json = run(
+                &receipt,
+                Case {
+                    tty,
+                    json: true,
+                    env_set: false,
+                    suppressed: false,
+                    config_set: Some(false),
+                    yes: true,
+                },
+                &mut on,
+            );
+            assert_eq!(json.outcome, AskOutcome::Silent);
+            assert_eq!(json.err, "", "no hint beside the JSON either");
+            assert_eq!(json.asked, 0);
+        }
+        assert!(!receipt.exists());
+        assert_eq!(ask_update_check(true), AskOutcome::Silent);
+    }
+
+    #[test]
+    fn each_suppression_is_silent() {
+        let none = |_: &str| None;
+        let acting = |method| Detection {
+            method,
+            refusal: None,
+        };
+        // The environment.
+        for name in ["CI", "NO_UPDATE_NOTIFIER"] {
+            let env = |asked: &str| (asked == name).then(|| "1".to_string());
+            assert!(
+                !update::may_offer(&env, &acting(InstallMethod::Tarball)),
+                "{name}"
+            );
+        }
+        // Docker, mcpb, an app package, an unofficial build.
+        for detection in [
+            Detection {
+                method: InstallMethod::Docker,
+                refusal: Some(Refusal::Docker),
+            },
+            Detection {
+                method: InstallMethod::Mcpb,
+                refusal: Some(Refusal::Mcpb),
+            },
+            acting(InstallMethod::Homebrew).for_build(true, true),
+            acting(InstallMethod::Homebrew).for_build(false, false),
+        ] {
+            assert!(!update::may_offer(&none, &detection), "{detection:?}");
+        }
+        assert!(update::may_offer(&none, &acting(InstallMethod::Homebrew)));
+        // Suppressed: nothing said, nothing read, nothing recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        for tty in [true, false] {
+            let quiet = run(
+                &receipt,
+                Case {
+                    tty,
+                    json: false,
+                    env_set: false,
+                    suppressed: true,
+                    config_set: Some(false),
+                    yes: true,
+                },
+                &mut on,
+            );
+            assert_eq!(quiet.outcome, AskOutcome::Silent);
+            assert_eq!(quiet.err, "");
+            assert_eq!((quiet.asked, quiet.config_read), (0, 0));
+        }
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn yes_writes_update_check_and_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        let yes = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: true,
+            },
+            &mut on,
+        );
+        assert_eq!(yes.outcome, AskOutcome::Asked(true));
+        assert_eq!(yes.turned_on, 1, "the setter update auto on uses");
+        assert_eq!(yes.err, format!("{}\n", update::AUTO_ON));
+        assert_eq!(stamp(&receipt), Some(at()));
+        // A setter that fails names the command instead.
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        let failed = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: true,
+            },
+            &mut || Err(anyhow::anyhow!("read-only")),
+        );
+        assert_eq!(failed.outcome, AskOutcome::Asked(true));
+        assert!(
+            failed.err.contains("read-only") && failed.err.contains("crystalline update auto on"),
+            "{}",
+            failed.err
+        );
+    }
+
+    #[test]
+    fn no_writes_only_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        // An earlier install's rows stay as they were.
+        let mut book = receipt::Receipt::default();
+        book.upsert(receipt::InstallRecord {
+            harness: "claude-code".to_string(),
+            scope: "user".to_string(),
+            project_path: None,
+            version: "0.33.0".to_string(),
+            parts: receipt::Parts {
+                mcp: true,
+                hooks: true,
+                skills: true,
+            },
+            skills: Vec::new(),
+        });
+        receipt::save(&receipt, &book).unwrap();
+        let no = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: false,
+            },
+            &mut on,
+        );
+        assert_eq!(no.outcome, AskOutcome::Asked(false));
+        assert_eq!(no.turned_on, 0, "the config is not touched");
+        assert_eq!(no.err, format!("{UPDATE_STAYS_OFF}\n"));
+        let loaded = receipt::load(&receipt).unwrap();
+        assert_eq!(loaded.update_check_asked, Some(at()));
+        assert_eq!(loaded.installs.len(), 1);
+        assert_eq!(loaded.installs[0].version, "0.33.0");
+    }
+
+    #[test]
+    fn yes_on_a_deb_service_names_etc_default() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("lib/systemd/system/crystalline.service");
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, "[Service]\n").unwrap();
+        let deb = Detection {
+            method: InstallMethod::Deb,
+            refusal: None,
+        };
+        let data =
+            serde_json::json!({ "key": "update.check", "value": "true", "source": "config" });
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("installs.json");
+        let yes = run(
+            &receipt,
+            Case {
+                tty: true,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: true,
+            },
+            &mut || Ok(update::auto_lines(&data, &deb, root.path(), true)),
+        );
+        assert_eq!(yes.outcome, AskOutcome::Asked(true));
+        let lines: Vec<&str> = yes.err.lines().collect();
+        assert_eq!(lines[0], update::AUTO_ON);
+        assert!(
+            lines[1].contains("/etc/default/crystalline")
+                && lines[1].contains("CRYSTALLINE_UPDATE_CHECK=true"),
+            "{}",
+            yes.err
+        );
+        // Without the unit, no service line.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            update::auto_lines(&data, &deb, bare.path(), true),
+            vec![update::AUTO_ON.to_string()]
+        );
+    }
 }
 
 #[cfg(test)]
