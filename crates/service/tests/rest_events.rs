@@ -150,6 +150,7 @@ async fn serve_config(
         auth.clone(),
         None,
         rx,
+        None,
     )
     .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

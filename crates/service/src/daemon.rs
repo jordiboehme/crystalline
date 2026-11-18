@@ -1180,6 +1180,9 @@ pub async fn run_serve(
         // a browser; see `rest::RestState::with_shutdown`.
         let streams_rx = shared.watch();
         let token = setup_token.as_ref().map(|t| t.value().to_string());
+        // The update facts `GET /auth/me` names an available release from,
+        // asked per request from the state loaded at start (S31).
+        let update_facts = update_facts_source(update.clone());
         tokio::spawn(async move {
             // Three failure classes, three sentences, because the remedy
             // differs: the endpoint never came up at all, the address was
@@ -1191,8 +1194,16 @@ pub async fn run_serve(
             // actually applies: a `--http` address beats both `service.http`
             // spellings, so telling a flag user to edit the config would be
             // advice that does nothing.
-            let router = match http_service(accounts, allowed_hosts, e, sessions, token, streams_rx)
-                .await
+            let router = match http_service(
+                accounts,
+                allowed_hosts,
+                e,
+                sessions,
+                token,
+                streams_rx,
+                update_facts,
+            )
+            .await
             {
                 Ok(router) => router,
                 Err(err) => {
@@ -2207,6 +2218,7 @@ async fn http_service(
     http_sessions: Arc<AtomicUsize>,
     setup_token: Option<String>,
     shutdown: watch::Receiver<bool>,
+    update: crate::rest::UpdateFactsSource,
 ) -> anyhow::Result<axum::Router> {
     // The store the daemon opened at start, so the engine's resolver and the
     // HTTP surface read one handle.
@@ -2218,6 +2230,7 @@ async fn http_service(
             auth,
             setup_token,
             shutdown,
+            Some(update),
         );
     }
     // Only the accounts file is opened here: on Postgres the accounts open
@@ -2237,6 +2250,7 @@ async fn http_service(
         http_sessions,
         setup_token,
         shutdown,
+        Some(update),
     )
     .await
 }
@@ -2251,6 +2265,7 @@ async fn http_service_at(
     http_sessions: Arc<AtomicUsize>,
     setup_token: Option<String>,
     shutdown: watch::Receiver<bool>,
+    update: Option<crate::rest::UpdateFactsSource>,
 ) -> anyhow::Result<axum::Router> {
     let auth = Arc::new(crate::rest::AuthStore::open(auth_db).await?);
     http_router_with_shutdown(
@@ -2260,6 +2275,7 @@ async fn http_service_at(
         auth,
         setup_token,
         shutdown,
+        update,
     )
 }
 
@@ -2837,12 +2853,45 @@ pub fn http_router(
         auth,
         setup_token,
         None,
+        None,
     )
 }
 
+/// [`http_router`] with the daemon's update facts, which `GET /auth/me`
+/// names an available release from for an admin. A test builds the router
+/// it serves through this, with facts of its own.
+pub fn http_router_with_update(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
+    update: crate::rest::UpdateFactsSource,
+) -> anyhow::Result<axum::Router> {
+    http_router_inner(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        setup_token,
+        None,
+        Some(update),
+    )
+}
+
+/// The update facts the REST surface reads, from the daemon's update state:
+/// [`crate::update::UpdateState::facts`] for the `update.check` setting it is
+/// asked with.
+pub fn update_facts_source(
+    update: Arc<crate::update::UpdateState>,
+) -> crate::rest::UpdateFactsSource {
+    Arc::new(move |setting_on| update.facts(setting_on))
+}
+
 /// [`http_router`] for the daemon itself: the same router, with the
-/// shutdown watch every event stream selects on. See
-/// `rest::RestState::with_shutdown`.
+/// shutdown watch every event stream selects on (see
+/// `rest::RestState::with_shutdown`) and the daemon's update facts (see
+/// `rest::RestState::with_update`), `None` where there are none.
 pub fn http_router_with_shutdown(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -2850,6 +2899,7 @@ pub fn http_router_with_shutdown(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
     shutdown: watch::Receiver<bool>,
+    update: Option<crate::rest::UpdateFactsSource>,
 ) -> anyhow::Result<axum::Router> {
     http_router_inner(
         engine,
@@ -2858,6 +2908,7 @@ pub fn http_router_with_shutdown(
         auth,
         setup_token,
         Some(shutdown),
+        update,
     )
 }
 
@@ -2926,8 +2977,8 @@ impl tower_service::Service<axum::extract::Request> for StripBasePath {
     }
 }
 
-/// The body both router builders above share; `shutdown` is `None` for a
-/// router with no daemon behind it.
+/// The body the router builders above share; `shutdown` and `update` are
+/// `None` for a router with no daemon behind it.
 fn http_router_inner(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -2935,6 +2986,7 @@ fn http_router_inner(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
     shutdown: Option<watch::Receiver<bool>>,
+    update: Option<crate::rest::UpdateFactsSource>,
 ) -> anyhow::Result<axum::Router> {
     #[cfg(feature = "fluid-ui")]
     {
@@ -2945,6 +2997,7 @@ fn http_router_inner(
             auth,
             setup_token,
             shutdown,
+            update,
         )
     }
     #[cfg(not(feature = "fluid-ui"))]
@@ -2964,6 +3017,7 @@ fn http_router_inner(
             setup_token,
             mcp_auth,
             shutdown,
+            update,
         )?;
         Ok(under_base_path(router.fallback_service(service), base_path))
     }
@@ -2981,6 +3035,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
     shutdown: Option<watch::Receiver<bool>>,
+    update: Option<crate::rest::UpdateFactsSource>,
 ) -> anyhow::Result<axum::Router> {
     // One snapshot for all three keys: they are read once when the HTTP surface
     // starts, like `service.read_only`, and `ui_enabled`
@@ -3008,6 +3063,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
         setup_token,
         mcp_auth,
         shutdown,
+        update,
     )?;
     if !ui {
         return Ok(under_base_path(router.fallback_service(service), base_path));
@@ -3099,12 +3155,13 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 /// `mcp_auth` is the store the identity gate resolves agent tokens through,
 /// `Some` exactly when `auth.mcp` is on and `None` for the legacy open tier.
 /// `shutdown` is the daemon's shutdown watch, which every event stream ends
-/// on; `None` for a router with no daemon behind it.
+/// on, and `update` the daemon's update facts `GET /auth/me` reads; both
+/// `None` for a router with no daemon behind it.
 ///
 /// Also where the engine is handed its private-domain resolver, since this is
 /// the one place an accounts store and the engine meet on every HTTP path.
 ///
-/// Eight parameters, each a separate startup setting both router builders
+/// Nine parameters, each a separate startup setting both router builders
 /// resolve and hand down; a struct for this one private seam would only
 /// rename them.
 #[allow(clippy::too_many_arguments)]
@@ -3117,6 +3174,7 @@ fn http_base(
     setup_token: Option<String>,
     mcp_auth: Option<Arc<crate::rest::AuthStore>>,
     shutdown: Option<watch::Receiver<bool>>,
+    update: Option<crate::rest::UpdateFactsSource>,
 ) -> anyhow::Result<(axum::Router, GatedMcpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
@@ -3230,6 +3288,10 @@ fn http_base(
             .with_setup_token(setup_token);
         let state = match shutdown {
             Some(rx) => state.with_shutdown(rx),
+            None => state,
+        };
+        let state = match update {
+            Some(update) => state.with_update(update),
             None => state,
         };
         Some(crate::rest::router(state))
@@ -4948,6 +5010,7 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             None,
             rx,
+            None,
         )
         .await
         .unwrap();

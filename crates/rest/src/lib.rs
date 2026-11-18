@@ -500,7 +500,21 @@ pub struct RestState {
     /// How many GitHub webhook deliveries are read and handled at once. One
     /// count for the whole process. See [`github_webhook::CONCURRENT`].
     pub(crate) webhook_slots: Arc<Semaphore>,
+    /// The daemon's update facts for a given `update.check` setting, asked
+    /// per request so a changed setting shows on the next probe. Only
+    /// `GET /auth/me` reads it, for an admin (S28, S29). `None` on a router
+    /// with no daemon behind it, which then never names an update. Set
+    /// through [`RestState::with_update`].
+    update: Option<UpdateFactsSource>,
 }
+
+/// Where the REST surface reads the daemon's update facts from: called with
+/// the live `update.check` setting, it answers what the ctl `update_facts`
+/// answer would, the last check already in the shape that may leave the
+/// daemon. A function rather than the daemon's state, since this crate never
+/// reaches the daemon.
+pub type UpdateFactsSource =
+    Arc<dyn Fn(bool) -> crystalline_core::update::UpdateFacts + Send + Sync>;
 
 impl RestState {
     /// Assemble the state, resolving and validating the auth settings out of
@@ -557,6 +571,7 @@ impl RestState {
             shutdown: None,
             streams: Arc::new(events::StreamSlots::default()),
             webhook_slots: Arc::new(Semaphore::new(github_webhook::CONCURRENT)),
+            update: None,
         })
     }
 
@@ -586,6 +601,32 @@ impl RestState {
     pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> RestState {
         self.shutdown = Some(shutdown);
         self
+    }
+
+    /// Hand this state the daemon's update facts, which `GET /auth/me` names
+    /// an available update from for an admin. A builder for the reason
+    /// `with_setup_token` is one: every test state stays as it is.
+    pub fn with_update(mut self, update: UpdateFactsSource) -> RestState {
+        self.update = Some(update);
+        self
+    }
+
+    /// The release an admin is told about, rendered: `None` without a
+    /// daemon's facts, or when [`crystalline_core::update::offer`] offers
+    /// nothing for them, the live `update.check` and `update.min_age_hours`
+    /// and this server's own version.
+    pub(crate) fn update_available(&self) -> Option<String> {
+        let source = self.update.as_ref()?;
+        let config = self.engine.config();
+        let facts = source(config.update_check_enabled());
+        let current = crystalline_core::version::Precedence::parse(crystalline_core::VERSION)?;
+        crystalline_core::update::offer(
+            &facts,
+            &current,
+            crystalline_core::time::now(),
+            config.update_min_age_hours(),
+        )
+        .map(|version| version.render())
     }
 
     /// The process's one-time setup token, if it has one. Read by
