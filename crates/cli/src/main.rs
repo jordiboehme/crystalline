@@ -6479,21 +6479,41 @@ fn run_prompt(
         eprintln!("crystalline prompt system: warning: {w}");
     }
 
+    // The update block (spec S19): an update is ready, once per 24 h per
+    // version, never in a subagent and only on a fresh start. Decided from
+    // the cache and the stamp before anything else is read. Never for a
+    // person who runs the command at a terminal (a hook runner always pipes
+    // stdin), so a hand run does not use up the day's block.
+    let update_block = (!std::io::stdin().is_terminal())
+        .then(|| {
+            update::session_block_here(
+                session_start
+                    .as_ref()
+                    .is_some_and(SessionStartPayload::in_subagent),
+                session_start.as_ref().and_then(|p| p.source.as_deref()),
+            )
+        })
+        .flatten();
+    let update_text = update_block.as_ref().map(|block| block.text.as_str());
+
     // Notices go to stderr in every format, and they go there for the same
     // reason each time: what stdout carries is an agent's context, and a
     // notice telling the reader to ask a human something would either stall an
     // unattended run or be answered by invention. A person reading a session
     // hook's output still sees them, because a hook's stderr is where a
-    // harness shows them.
+    // harness shows them. The one exception is the update block (S19): it
+    // names an action the agent can take or offer, and says to do nothing
+    // when no user is there, so it goes into the payload after the routing
+    // block and the stale lines.
     match format {
-        PromptFormat::Json if stale.is_empty() => {
+        PromptFormat::Json if stale.is_empty() && update_text.is_none() => {
             println!("{}", crystalline_core::render_json(&output))
         }
         PromptFormat::Json => println!(
             "{}",
-            json_with_stale(&crystalline_core::render_json(&output), &stale)?
+            json_with_extras(&crystalline_core::render_json(&output), &stale, update_text)?
         ),
-        PromptFormat::Text => print!("{}", rendered(&output, &stale)),
+        PromptFormat::Text => print!("{}", rendered(&output, &stale, update_text)),
         PromptFormat::Copilot => {
             // Copilot parses stdout as one JSON document, so a bare line
             // printed beside the envelope would corrupt it - which is why the
@@ -6503,7 +6523,7 @@ fn run_prompt(
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "additionalContext": rendered(&output, &stale),
+                    "additionalContext": rendered(&output, &stale, update_text),
                 }))?
             );
         }
@@ -6514,7 +6534,7 @@ fn run_prompt(
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "additional_context": rendered(&output, &stale),
+                    "additional_context": rendered(&output, &stale, update_text),
                 }))?
             );
         }
@@ -6524,11 +6544,14 @@ fn run_prompt(
                 serde_json::to_string(&serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": rendered(&output, &stale),
+                        "additionalContext": rendered(&output, &stale, update_text),
                     },
                 }))?
             );
         }
+    }
+    if let Some(block) = &update_block {
+        block.printed();
     }
     for note in &reconcile_notices {
         eprintln!("{note}");
@@ -6566,10 +6589,15 @@ async fn daemon_routing_config() -> Option<(crystalline_core::config::GlobalConf
     Some((config, env))
 }
 
-/// The text block with each stale source's line after it.
-fn rendered(output: &crystalline_core::PromptOutput, stale: &[String]) -> String {
+/// The text block with each stale source's line after it, then the update
+/// block when there is one.
+fn rendered(
+    output: &crystalline_core::PromptOutput,
+    stale: &[String],
+    update: Option<&str>,
+) -> String {
     let mut text = crystalline_core::render_text(output);
-    for line in stale {
+    for line in stale.iter().map(String::as_str).chain(update) {
         if !text.ends_with('\n') {
             text.push('\n');
         }
@@ -6735,16 +6763,32 @@ fn mounted_part(
     }
 }
 
-/// `render_json`'s document with a `stale` array after its last field. The
-/// fields before it keep `render_json`'s own order and bytes, so the shape
-/// only gains a field.
-fn json_with_stale(rendered: &str, stale: &[String]) -> anyhow::Result<String> {
+/// `render_json`'s document with a `stale` array (when there are stale
+/// lines) and an `update` string (when there is an update block) after its
+/// last field. The fields before them keep `render_json`'s own order and
+/// bytes, so the shape only gains fields.
+fn json_with_extras(
+    rendered: &str,
+    stale: &[String],
+    update: Option<&str>,
+) -> anyhow::Result<String> {
     let body = rendered.trim_end();
     let Some(open) = body.strip_suffix('}') else {
         anyhow::bail!("the routing block is not a JSON object");
     };
-    let lines = serde_json::to_string_pretty(&stale)?.replace('\n', "\n  ");
-    Ok(format!("{},\n  \"stale\": {lines}\n}}", open.trim_end()))
+    let mut text = open.trim_end().to_string();
+    if !stale.is_empty() {
+        let lines = serde_json::to_string_pretty(&stale)?.replace('\n', "\n  ");
+        text.push_str(&format!(",\n  \"stale\": {lines}"));
+    }
+    if let Some(update) = update {
+        text.push_str(&format!(
+            ",\n  \"update\": {}",
+            serde_json::to_string(update)?
+        ));
+    }
+    text.push_str("\n}");
+    Ok(text)
 }
 
 /// Whether this routing hook must stay silent because it was written for
@@ -7122,12 +7166,47 @@ mod tests {
         };
         let plain = crystalline_core::render_json(&output);
         let stale = vec!["Note: a".to_string(), "Note: b".to_string()];
-        let with = json_with_stale(&plain, &stale).unwrap();
+        let with = json_with_extras(&plain, &stale, None).unwrap();
         let head = plain.trim_end().strip_suffix('}').unwrap().trim_end();
         assert!(with.starts_with(head), "{with}");
         let value: Value = serde_json::from_str(&with).unwrap();
         assert_eq!(value["stale"], json!(stale));
         assert_eq!(value["version"], 1);
+        assert!(value.get("update").is_none(), "{with}");
+    }
+
+    /// The update block is an `update` string after the last field, after
+    /// `stale` when both are there; without stale lines no `stale` field.
+    #[test]
+    fn the_json_block_gains_an_update_field_only_with_a_block() {
+        let output = crystalline_core::PromptOutput {
+            workspace: PathBuf::from("/w"),
+            domains: Vec::new(),
+            warnings: Vec::new(),
+            read_only: false,
+            skills_tool: true,
+        };
+        let plain = crystalline_core::render_json(&output);
+        let head = plain.trim_end().strip_suffix('}').unwrap().trim_end();
+        let block = "Crystalline 9.9.9 is available.\nTell the user once.";
+        let only = json_with_extras(&plain, &[], Some(block)).unwrap();
+        assert!(only.starts_with(head), "{only}");
+        let value: Value = serde_json::from_str(&only).unwrap();
+        assert_eq!(value["update"], block);
+        assert!(value.get("stale").is_none(), "{only}");
+        let stale = vec!["Note: a".to_string()];
+        let both = json_with_extras(&plain, &stale, Some(block)).unwrap();
+        let value: Value = serde_json::from_str(&both).unwrap();
+        assert_eq!(value["stale"], json!(stale));
+        assert_eq!(value["update"], block);
+        assert!(both.find("\"stale\"") < both.find("\"update\""), "{both}");
+        // The text shape: the block after the stale lines.
+        let text = rendered(&output, &stale, Some(block));
+        assert!(text.ends_with(&format!("Note: a\n{block}\n")), "{text}");
+        assert_eq!(
+            rendered(&output, &[], None),
+            crystalline_core::render_text(&output)
+        );
     }
 
     /// One domain entry as `origin status` receives it, carrying the detail
