@@ -19,9 +19,9 @@ use crystalline_core::update::{
 use crystalline_core::version::{Precedence, release_tag, release_version};
 use crystalline_service::update::swap::finish_after_swap;
 use crystalline_service::update::{
-    Handover, Spawner, SystemSpawner, UpdateError, download_dir, fetch_verified, hand_over,
-    install_tarball, latest_release, remove_older_tags, root_owned_install_dir, take_lock,
-    under_sudo, writable_install_dir,
+    Handover, Spawner, SystemSpawner, UpdateError, UpdateLock, download_dir, fetch_verified,
+    hand_over, install_tarball, latest_release, remove_older_tags, root_owned_install_dir,
+    take_lock, under_sudo, writable_install_dir,
 };
 use serde::{Serialize, Serializer};
 
@@ -573,7 +573,7 @@ pub(crate) async fn run_now(
     {
         anyhow::bail!(refusal);
     }
-    let _lock = take_lock(&context.cache_dir)?;
+    let mut lock = Some(take_lock(&context.cache_dir)?);
     // A fresh lookup without the cached ETag: a "not modified" carries no
     // digests, and this one release names the tag of every download and
     // of the signature.
@@ -582,16 +582,19 @@ pub(crate) async fn run_now(
         Lookup::NotModified => anyhow::bail!("GitHub's answer could not be read"),
     };
     remove_older_tags(&context.cache_dir, &release.tag);
-    act(context, &release, yes, ignore_age).await
+    act(context, &release, yes, ignore_age, &mut lock).await
 }
 
 /// The plan for `release`, printed, then the action for the install
-/// method. Hands back the exit code.
+/// method. Hands back the exit code. `lock` is the update lock the run
+/// holds; a tar.gz update lets go of it once the swap is done, before
+/// `update finish` runs, which needs no lock.
 pub(crate) async fn act(
     context: &NowContext<'_>,
     release: &LatestRelease,
     yes: bool,
     ignore_age: bool,
+    lock: &mut Option<UpdateLock>,
 ) -> anyhow::Result<u8> {
     // Counted from the publish time, else from when this machine first saw
     // this very release (the check's cache), else from now.
@@ -684,7 +687,7 @@ pub(crate) async fn act(
                 display_path(exe),
                 release.version.render()
             );
-            after_swap(context.spawner, exe, context.sudo)
+            after_swap_unlocked(lock, context.spawner, exe, context.sudo)
         }
         InstallMethod::Docker | InstallMethod::Mcpb | InstallMethod::Unknown => {
             anyhow::bail!(refused_line(&Refusal::Unknown))
@@ -740,6 +743,18 @@ pub(crate) fn brew_upgrade(
 /// finish` (S5).
 pub(crate) const SUDO_LEAVES_THE_DAEMON: &str =
     "Under sudo the daemon is not touched: run `crystalline status` as yourself.";
+
+/// [`after_swap`] once the update lock is let go: the swap is done, so the
+/// next run may start while `update finish` hands the daemon over.
+pub(crate) fn after_swap_unlocked(
+    lock: &mut Option<UpdateLock>,
+    spawner: &dyn Spawner,
+    exe: &Path,
+    sudo: bool,
+) -> anyhow::Result<u8> {
+    drop(lock.take());
+    after_swap(spawner, exe, sudo)
+}
 
 /// After the swap: under `sudo` only [`SUDO_LEAVES_THE_DAEMON`]; else run
 /// `<exe> update finish`, which hands the daemon over (S4). Hands back the
@@ -1319,7 +1334,9 @@ mod tests {
         for method in [InstallMethod::Tarball, InstallMethod::Homebrew] {
             let spawner = Recording::new(0, Vec::new());
             let context = ctx(method, &spawner, false, &never_asked);
-            let code = act(&context, &newer_release(), false, false).await.unwrap();
+            let code = act(&context, &newer_release(), false, false, &mut None)
+                .await
+                .unwrap();
             assert_eq!(code, EXIT_UPDATE_AVAILABLE, "{method:?}");
             assert!(spawner.calls().is_empty(), "{method:?}: nothing ran");
         }
@@ -1339,7 +1356,7 @@ mod tests {
                 cache_dir: file.clone(),
                 ..ctx(method, &spawner, false, &never_asked)
             };
-            let result = act(&context, &newer_release(), false, false).await;
+            let result = act(&context, &newer_release(), false, false, &mut None).await;
             assert!(
                 result.is_err(),
                 "{method:?}: went past the plan: {result:?}"
@@ -1357,7 +1374,9 @@ mod tests {
             false
         };
         let context = ctx(InstallMethod::Homebrew, &spawner, true, &ask);
-        let code = act(&context, &newer_release(), false, false).await.unwrap();
+        let code = act(&context, &newer_release(), false, false, &mut None)
+            .await
+            .unwrap();
         assert_eq!(code, EXIT_UPDATE_AVAILABLE);
         assert_eq!(*asked.lock().unwrap(), ["Update to 0.34.0 now? [y/N] "]);
         assert!(spawner.calls().is_empty());
@@ -1368,7 +1387,9 @@ mod tests {
             ask: &ask,
             ..context
         };
-        let code = act(&context, &newer_release(), false, false).await.unwrap();
+        let code = act(&context, &newer_release(), false, false, &mut None)
+            .await
+            .unwrap();
         assert_eq!(code, 0);
         assert_eq!(spawner.calls(), BREW_CALLS);
     }
@@ -1382,7 +1403,9 @@ mod tests {
             ..ctx(InstallMethod::Homebrew, &spawner, false, &never_asked)
         };
         assert_eq!(
-            act(&context, &newer_release(), true, false).await.unwrap(),
+            act(&context, &newer_release(), true, false, &mut None)
+                .await
+                .unwrap(),
             0
         );
         // Published an hour before now: the 24 h gate is closed, and
@@ -1392,9 +1415,15 @@ mod tests {
             ..newer_release()
         };
         let context = ctx(InstallMethod::Homebrew, &spawner, false, &never_asked);
-        assert_eq!(act(&context, &young, true, false).await.unwrap(), 0);
+        assert_eq!(
+            act(&context, &young, true, false, &mut None).await.unwrap(),
+            0
+        );
         assert!(spawner.calls().is_empty(), "nothing ran");
-        assert_eq!(act(&context, &young, true, true).await.unwrap(), 0);
+        assert_eq!(
+            act(&context, &young, true, true, &mut None).await.unwrap(),
+            0
+        );
         assert_eq!(spawner.calls(), BREW_CALLS, "--ignore-age acted");
     }
 
@@ -1408,7 +1437,12 @@ mod tests {
         };
         // Never seen before: counted from now, so the gate is closed.
         let context = ctx(InstallMethod::Homebrew, &spawner, false, &never_asked);
-        assert_eq!(act(&context, &fallback, true, false).await.unwrap(), 0);
+        assert_eq!(
+            act(&context, &fallback, true, false, &mut None)
+                .await
+                .unwrap(),
+            0
+        );
         assert!(spawner.calls().is_empty());
         // Seen two days ago by the check: open.
         let seen = UpdateCache {
@@ -1426,7 +1460,12 @@ mod tests {
             check_cache: Some(seen),
             ..context
         };
-        assert_eq!(act(&context, &fallback, true, false).await.unwrap(), 0);
+        assert_eq!(
+            act(&context, &fallback, true, false, &mut None)
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(spawner.calls(), BREW_CALLS);
     }
 
@@ -1827,5 +1866,40 @@ mod tests {
         let err = run_now(&context, true, true).await.unwrap_err();
         assert_eq!(err.to_string(), refused_line(&Refusal::Unknown));
         assert!(!cache.path().join("updates").exists(), "no lock, no folder");
+    }
+
+    /// `update finish` runs with the update lock free: the spawner tries to
+    /// take it while it "runs" the new binary.
+    #[test]
+    fn update_finish_runs_after_the_lock_is_let_go() {
+        struct TakesTheLock {
+            cache: PathBuf,
+            took: std::sync::Mutex<Option<bool>>,
+        }
+        impl Spawner for TakesTheLock {
+            fn run(&self, _: &str, _: &[&str]) -> std::io::Result<i32> {
+                *self.took.lock().unwrap() = Some(take_lock(&self.cache).is_ok());
+                Ok(0)
+            }
+            fn output(&self, _: &str, _: &[&str]) -> std::io::Result<String> {
+                unreachable!()
+            }
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let mut lock = Some(take_lock(cache.path()).unwrap());
+        let spawner = TakesTheLock {
+            cache: cache.path().to_path_buf(),
+            took: std::sync::Mutex::default(),
+        };
+        assert!(take_lock(cache.path()).is_err(), "held before the finish");
+        let code = after_swap_unlocked(&mut lock, &spawner, Path::new("/opt/c/crystalline"), false)
+            .unwrap();
+        assert_eq!(code, 0);
+        assert!(lock.is_none());
+        assert_eq!(
+            *spawner.took.lock().unwrap(),
+            Some(true),
+            "the lock was free"
+        );
     }
 }

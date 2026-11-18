@@ -153,8 +153,21 @@ async fn update_now_tarball_end_to_end() {
     let cache = tempfile::tempdir().unwrap();
     let dir = cache.path().join("updates").join(TAG);
     let (install, exe) = install_folder();
-    // A leftover of an interrupted run is cleared.
-    std::fs::write(install.path().join(format!("{NEW_PREFIX}1")), b"old run").unwrap();
+    // A leftover of an interrupted run whose process is gone is cleared;
+    // one of a run still going (pid 1 is always alive) is kept.
+    let mut gone = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let gone_pid = gone.id();
+    gone.wait().unwrap();
+    std::fs::write(
+        install.path().join(format!("{NEW_PREFIX}{gone_pid}")),
+        b"old run",
+    )
+    .unwrap();
+    let running = format!("{NEW_PREFIX}1");
+    std::fs::write(install.path().join(&running), b"a run still going").unwrap();
 
     let spawner = RealButCodesign::new();
     let macos = cfg!(target_os = "macos");
@@ -186,7 +199,11 @@ async fn update_now_tarball_end_to_end() {
         0o755,
         "the old exe's mode"
     );
-    assert_eq!(files_in(install.path()), ["crystalline"], "nothing else");
+    assert_eq!(
+        files_in(install.path()),
+        [running.as_str(), "crystalline"],
+        "nothing else, and the live run's file is kept"
+    );
     let new = format!(
         "{}/{NEW_PREFIX}{}",
         install.path().display(),

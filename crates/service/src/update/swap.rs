@@ -9,17 +9,18 @@
 //! Under `sudo` (S5) only the download, the checks and the swap run; the
 //! caller skips `update finish`, so root never touches the person's daemon.
 //!
-//! Known limits: a sudo run holds its own lock in its own temp folder, so a
-//! sudo run and a normal run at the same moment can remove each other's
-//! `.crystalline-new-*` file; the worse case is a failed run with the old
-//! exe intact. The new binary's `--version` and `update finish` run without
-//! a time limit while the lock is held; the binary is verified first (and
-//! codesigned on macOS), so a hang is not expected, and the lock goes with
-//! the process when it is killed.
+//! Every program the update runs has a time limit: the new binary's
+//! `--version` ([`VERSION_TIME_LIMIT`]) and `update finish`
+//! ([`FINISH_TIME_LIMIT`]), which runs after the caller let go of the
+//! update lock. The extracted file carries the run's process id, and a run
+//! removes only its own leftovers and those of a process that is gone, so
+//! two runs with different locks (a `sudo` run and a normal one) never
+//! remove each other's file.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crystalline_core::update::{Checks, LatestRelease};
 use crystalline_core::version::Precedence;
@@ -194,33 +195,67 @@ fn create_new_executable(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// Remove the files an interrupted run left in `dir` under [`NEW_PREFIX`].
-/// Call it under the update lock.
+/// Remove the files an interrupted run left in `dir` under [`NEW_PREFIX`]:
+/// only `.crystalline-new-<pid>` files whose `<pid>` is this process or a
+/// process that is no longer alive. A file of a run still going (another
+/// update, under `sudo` with a lock of its own) and any other name are
+/// left alone.
 pub fn remove_new_leftovers(dir: &Path) {
+    remove_new_leftovers_with(dir, crate::instance::process_alive);
+}
+
+fn remove_new_leftovers_with(dir: &Path, alive: impl Fn(u32) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let own = std::process::id();
     for entry in entries.flatten() {
-        if entry
-            .file_name()
+        let name = entry.file_name();
+        let Some(pid) = name
             .to_str()
-            .is_some_and(|name| name.starts_with(NEW_PREFIX))
-        {
+            .and_then(|name| name.strip_prefix(NEW_PREFIX))
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own || !alive(pid) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
+/// How long the new binary may take to print its version before it is
+/// killed and the update fails, the old exe untouched.
+pub const VERSION_TIME_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long `update finish` may take: the old daemon gets up to about
+/// twenty seconds to leave (the ask, then two signals) and its successor
+/// fifteen to start, so two minutes is room for a slow machine. Past it
+/// `update finish` is killed; the binary is in place by then.
+pub const FINISH_TIME_LIMIT: Duration = Duration::from_secs(120);
+
 /// Whether `bin --version` names exactly `want`: its first line must be
-/// `crystalline <want>`, as clap prints it before the copyright lines.
+/// `crystalline <want>`, as clap prints it before the copyright lines. A
+/// binary that does not answer within [`VERSION_TIME_LIMIT`] is killed and
+/// fails the check.
 pub fn version_matches(
     spawner: &dyn Spawner,
     bin: &Path,
     want: &Precedence,
 ) -> Result<(), UpdateError> {
+    version_matches_within(spawner, bin, want, VERSION_TIME_LIMIT)
+}
+
+fn version_matches_within(
+    spawner: &dyn Spawner,
+    bin: &Path,
+    want: &Precedence,
+    limit: Duration,
+) -> Result<(), UpdateError> {
     let program = bin.to_str().ok_or(UpdateError::VersionMismatch)?;
     let printed = spawner
-        .output(program, &["--version"])
+        .output_within(program, &["--version"], limit)
         .map_err(|_| UpdateError::VersionMismatch)?;
     let expected = format!("crystalline {}", want.render());
     if printed.lines().next().map(str::trim_end) == Some(expected.as_str()) {
@@ -266,10 +301,16 @@ fn match_owner(new: &Path, canonical_exe: &Path) -> Result<(), UpdateError> {
 pub const FINISH_ARGS: [&str; 2] = ["update", "finish"];
 
 /// Run `<canonical_exe> update finish`, the new binary now in place, with
-/// the terminal's input and output, and hand back its exit code. Never
-/// under `sudo` (S5): the caller skips it there.
+/// the terminal's input and output, and hand back its exit code; past
+/// [`FINISH_TIME_LIMIT`] it is killed and this is an error. Never under
+/// `sudo` (S5): the caller skips it there. Call it after letting go of the
+/// update lock.
 pub fn finish_after_swap(spawner: &dyn Spawner, canonical_exe: &Path) -> std::io::Result<i32> {
-    spawner.run(&canonical_exe.to_string_lossy(), &FINISH_ARGS)
+    spawner.run_within(
+        &canonical_exe.to_string_lossy(),
+        &FINISH_ARGS,
+        FINISH_TIME_LIMIT,
+    )
 }
 
 /// The tar.gz update after the lock and the lookup: download and verify
@@ -644,5 +685,72 @@ mod tests {
         assert!(!under_sudo(0, Some("")));
         assert!(!under_sudo(0, Some("someone")));
         assert!(!under_sudo(501, Some("501")));
+    }
+
+    #[test]
+    fn only_own_or_dead_runs_leftovers_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = format!("{NEW_PREFIX}{}", std::process::id());
+        for name in [
+            own.as_str(),
+            ".crystalline-new-111",
+            ".crystalline-new-222",
+            ".crystalline-new-",
+            ".crystalline-new-12x",
+            "crystalline",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // 222 is a run still going (a sudo run with a lock of its own).
+        remove_new_leftovers_with(dir.path(), |pid| pid == 222);
+        assert_eq!(
+            files_in(dir.path()),
+            vec![
+                ".crystalline-new-",
+                ".crystalline-new-12x",
+                ".crystalline-new-222",
+                "crystalline"
+            ]
+        );
+    }
+
+    /// A live process's file survives the real liveness check: this test
+    /// process's parent is alive.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_runs_file_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = std::os::unix::process::parent_id();
+        let name = format!("{NEW_PREFIX}{parent}");
+        std::fs::write(dir.path().join(&name), b"x").unwrap();
+        remove_new_leftovers(dir.path());
+        assert_eq!(files_in(dir.path()), vec![name]);
+    }
+
+    /// A new binary that never answers `--version` is killed at the limit
+    /// and fails the check, so nothing is swapped.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_new_binary_fails_the_version_check_in_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(format!("{NEW_PREFIX}1"));
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let began = std::time::Instant::now();
+        let err = version_matches_within(
+            &crate::update::SystemSpawner,
+            &bin,
+            &v("0.34.0"),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::VersionMismatch), "{err}");
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(VERSION_TIME_LIMIT, Duration::from_secs(30));
     }
 }
