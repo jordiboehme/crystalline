@@ -2155,6 +2155,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     /// What `brew --prefix` and the linked binary print, the binary at
     /// `version`.
     fn brew_outputs(version: &str) -> Vec<(&'static str, String)> {
@@ -2167,6 +2168,7 @@ mod tests {
         ]
     }
 
+    #[cfg(unix)]
     const BREW_CALLS: [&str; 3] = [
         "brew upgrade jordiboehme/tap/crystalline",
         "brew --prefix",
@@ -2574,6 +2576,7 @@ mod tests {
         assert_eq!(downloads, 3, "the .deb, the tar.gz and the MSI or zip");
     }
 
+    #[cfg(unix)]
     /// A spawner whose unbounded calls fail the test: every program must
     /// be run with a time limit. It records the limit of each call.
     struct BoundedOnly {
@@ -2582,6 +2585,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
     }
 
+    #[cfg(unix)]
     impl Spawner for BoundedOnly {
         fn run(&self, program: &str, _: &[&str]) -> std::io::Result<i32> {
             if program.ends_with("brew") {
@@ -2629,6 +2633,7 @@ mod tests {
 
     /// N2: after `brew upgrade` (which may run as long as it needs) the
     /// prefix and the version are read with a time limit.
+    #[cfg(unix)]
     #[test]
     fn brew_reads_after_the_upgrade_have_a_time_limit() {
         let spawner = BoundedOnly {
@@ -2651,6 +2656,7 @@ mod tests {
 
     /// N3: an `update finish` past its time limit is said as such, not as
     /// a program that could not be started.
+    #[cfg(unix)]
     #[test]
     fn a_timed_out_update_finish_says_it_did_not_finish() {
         let spawner = BoundedOnly {
@@ -2858,6 +2864,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_no_at_the_terminal_does_nothing_and_exits_10() {
         let spawner = Recording::new(0, brew_outputs("0.34.0"));
@@ -2887,6 +2894,7 @@ mod tests {
         assert_eq!(spawner.calls(), BREW_CALLS);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn nothing_is_done_when_up_to_date_or_too_new() {
         let spawner = Recording::new(0, brew_outputs("0.34.0"));
@@ -2920,6 +2928,7 @@ mod tests {
         assert_eq!(spawner.calls(), BREW_CALLS, "--ignore-age acted");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn without_a_publish_time_the_gate_counts_from_first_seen() {
         let spawner = Recording::new(0, brew_outputs("0.34.0"));
@@ -2962,6 +2971,7 @@ mod tests {
         assert_eq!(spawner.calls(), BREW_CALLS);
     }
 
+    #[cfg(unix)]
     #[test]
     fn brew_branch_records_the_command_and_reports_no_move() {
         let spawner = Recording::new(0, brew_outputs("0.33.0"));
@@ -3011,6 +3021,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn brew_is_found_beside_the_cellar_or_on_path() {
         let root = tempfile::tempdir().unwrap();
@@ -3044,6 +3055,7 @@ mod tests {
         assert_eq!(gate_note(None, Gate::Never), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn deb_branch_prints_apt_with_and_without_sudo() {
         let dir = Path::new("/home/ada/.cache/crystalline/updates/v0.34.0");
@@ -3194,6 +3206,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn sudo_skips_finish_and_says_so() {
         let exe = Path::new("/opt/crystalline/crystalline");
@@ -3319,6 +3332,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_sudo_folder_stays_only_for_a_downloaded_deb() {
         let folder = tempfile::tempdir().unwrap();
@@ -3347,6 +3361,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_tarball_without_its_exe_is_refused_before_the_lock() {
         let cache = tempfile::tempdir().unwrap();
@@ -3363,6 +3378,7 @@ mod tests {
 
     /// `update finish` runs with the update lock free: the spawner tries to
     /// take it while it "runs" the new binary.
+    #[cfg(unix)]
     #[test]
     fn update_finish_runs_after_the_lock_is_let_go() {
         struct TakesTheLock {
