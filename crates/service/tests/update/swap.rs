@@ -13,7 +13,9 @@ use axum::http::{Response, StatusCode};
 use crystalline_core::update::{Checks, InstallMethod, LatestRelease, archive_member, asset_name};
 use crystalline_core::version::release_version;
 use crystalline_service::update::swap::{NEW_PREFIX, finish_after_swap};
-use crystalline_service::update::{Spawner, SystemSpawner, UpdateError, install_tarball};
+use crystalline_service::update::{
+    Spawner, SystemSpawner, UpdateError, fetch_verified, install_tarball, install_verified,
+};
 
 use super::now::{files_in, sha256_hex, sign, trust_test_key};
 use super::{ENV, Fake, use_fake};
@@ -295,4 +297,35 @@ async fn an_archive_without_the_binary_is_refused() {
     assert!(spawner.calls().is_empty(), "nothing was run");
     assert_eq!(std::fs::read(&exe).unwrap(), b"the old binary");
     assert_eq!(files_in(install.path()), ["crystalline"]);
+}
+
+/// M12: the binary is taken out of the bytes the checks ran on, never out
+/// of the downloaded file again. Another archive put at the verified
+/// path after the check (a temp folder the person owns under `sudo -E`)
+/// changes nothing: the binary that is checked and installed is the
+/// signed one.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn the_binary_comes_from_the_verified_bytes_not_the_file() {
+    let _env = ENV.lock().await;
+    let version = release_version(TAG).unwrap();
+    let asset = asset_name(InstallMethod::Tarball, &version).unwrap();
+    let member = archive_member(&version).unwrap();
+    let signed = script_printing("0.34.0");
+    let (_fake, digest) = serve(&asset, tarball(&member, &signed)).await;
+    let _key = trust_test_key(true);
+    let cache = tempfile::tempdir().unwrap();
+    let (_install, exe) = install_folder();
+    let release = release(&asset, digest);
+
+    let verified = fetch_verified(&release, &asset, &cache.path().join(TAG))
+        .await
+        .expect("verified");
+    let planted = "#!/bin/sh\necho planted\n";
+    std::fs::write(&verified.path, tarball(&member, planted)).unwrap();
+
+    let spawner = RealButCodesign::new();
+    install_verified(&spawner, &verified, &release, &member, &exe, false)
+        .expect("installed from the verified bytes");
+    assert_eq!(std::fs::read_to_string(&exe).unwrap(), signed);
 }

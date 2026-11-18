@@ -740,11 +740,10 @@ pub(crate) async fn act(
             let asset = asset_name(method, &release.version).ok_or(UpdateError::NoAsset)?;
             let dir = download_dir(&context.cache_dir, &release.tag);
             println!("Downloading {asset}");
-            let (path, checks) =
-                fetch_verified_from(&context.source, release, &asset, &dir).await?;
+            let verified = fetch_verified_from(&context.source, release, &asset, &dir).await?;
             remove_older_tags(&context.cache_dir, &release.tag);
-            println!("{}", checks_line(&checks, &release.tag));
-            println!("Downloaded: {}", display_path(&path));
+            println!("{}", checks_line(&verified.checks, &release.tag));
+            println!("Downloaded: {}", display_path(&verified.path));
             print!("{}", apt_steps(&dir, &asset, context.euid, context.sudo));
             Ok(0)
         }
@@ -809,15 +808,15 @@ pub(crate) async fn windows_steps(
     let leftover = update_windows::remove_old_exe(exe);
     let dir = download_dir(&context.cache_dir, &release.tag);
     println!("Downloading {asset}");
-    let (path, checks) = fetch_verified_from(&context.source, release, asset, &dir).await?;
+    let verified = fetch_verified_from(&context.source, release, asset, &dir).await?;
     // Only now, with this release verified, do older download folders go
     // (a gated, declined or failed run removes nothing), and never this
     // one, which the saved steps point into.
     remove_older_tags(&context.cache_dir, &release.tag);
-    println!("{}", checks_line(&checks, &release.tag));
-    println!("Downloaded: {}", display_path(&path));
+    println!("{}", checks_line(&verified.checks, &release.tag));
+    println!("Downloaded: {}", display_path(&verified.path));
     let steps = if context.detection.method == InstallMethod::Zip {
-        extract_zip_member(&path, member, &dir)?;
+        extract_zip_member(&verified.bytes, member, &dir)?;
         let mut steps = String::new();
         if let Some(old) = &leftover {
             steps.push_str(&format!(

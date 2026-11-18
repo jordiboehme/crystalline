@@ -27,7 +27,7 @@ use crystalline_core::version::Precedence;
 
 use super::client::UpdateError;
 use super::codesign::codesign_ok;
-use super::now::fetch_verified;
+use super::now::{Verified, fetch_verified};
 use super::spawn::Spawner;
 
 /// The name prefix of the file a run extracts the new binary into, followed
@@ -91,14 +91,16 @@ pub fn root_owned_install_dir(canonical_exe: &Path) -> bool {
     }
 }
 
-/// Extract exactly `member` of the gzip-compressed tar `archive` into a new
+/// Extract exactly `member` of the gzip-compressed tar `archive` (the
+/// verified bytes, [`super::now::Verified::bytes`], never a second read of
+/// the file) into a new
 /// file `into/.crystalline-new-<pid>`, mode 0755, and hand back its path.
 /// Nothing else of the archive is ever written: every other entry, a
 /// `../` path among them, is read past. The member must be one plain file
 /// and appear once; a link, a folder, a second copy or no copy at all is
 /// [`UpdateError::NoMember`]. The file is created new (never an existing
 /// one opened) and removed again on any failure.
-pub fn extract_member(archive: &Path, member: &str, into: &Path) -> Result<PathBuf, UpdateError> {
+pub fn extract_member(archive: &[u8], member: &str, into: &Path) -> Result<PathBuf, UpdateError> {
     let target = into.join(format!("{NEW_PREFIX}{}", std::process::id()));
     let mut created = false;
     let result = extract_into(archive, member, &target, &mut created);
@@ -111,13 +113,12 @@ pub fn extract_member(archive: &Path, member: &str, into: &Path) -> Result<PathB
 }
 
 fn extract_into(
-    archive: &Path,
+    archive: &[u8],
     member: &str,
     target: &Path,
     created: &mut bool,
 ) -> Result<(), UpdateError> {
-    let file = File::open(archive).map_err(UpdateError::Extract)?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let mut found = false;
     for entry in tar.entries().map_err(UpdateError::Extract)? {
         let entry = entry.map_err(UpdateError::Extract)?;
@@ -350,8 +351,34 @@ pub async fn install_tarball(
         .parent()
         .ok_or_else(|| UpdateError::Swap(std::io::Error::other("the binary has no folder")))?;
     remove_new_leftovers(exe_dir);
-    let (archive, mut checks) = fetch_verified(release, asset, download_dir).await?;
-    let new = extract_member(&archive, member, exe_dir)?;
+    let verified = fetch_verified(release, asset, download_dir).await?;
+    install_verified(
+        spawner,
+        &verified,
+        release,
+        member,
+        canonical_exe,
+        check_codesign,
+    )
+}
+
+/// The second half of [`install_tarball`]: extract `member` from the bytes
+/// `verified` holds (never from its path), check the new binary and swap
+/// it over `canonical_exe`. On any failure the old exe is untouched and
+/// the extracted file is gone. On success the checks that ran.
+pub fn install_verified(
+    spawner: &dyn Spawner,
+    verified: &Verified,
+    release: &LatestRelease,
+    member: &str,
+    canonical_exe: &Path,
+    check_codesign: bool,
+) -> Result<Checks, UpdateError> {
+    let exe_dir = canonical_exe
+        .parent()
+        .ok_or_else(|| UpdateError::Swap(std::io::Error::other("the binary has no folder")))?;
+    let mut checks = verified.checks;
+    let new = extract_member(&verified.bytes, member, exe_dir)?;
     let mut check_and_swap = || -> Result<(), UpdateError> {
         keep_mode(&new, canonical_exe)?;
         if check_codesign {
@@ -440,7 +467,7 @@ mod tests {
                 ("crystalline", b"a binary at the top", regular),
             ],
         );
-        let new = extract_member(&archive, MEMBER, &into).unwrap();
+        let new = extract_member(&std::fs::read(&archive).unwrap(), MEMBER, &into).unwrap();
         assert_eq!(
             new,
             into.join(format!("{NEW_PREFIX}{}", std::process::id()))
@@ -489,7 +516,7 @@ mod tests {
         );
         let bin = work.join("bin");
         let exe = bin.join("crystalline");
-        let new = extract_member(&archive, MEMBER, &bin).unwrap();
+        let new = extract_member(&std::fs::read(&archive).unwrap(), MEMBER, &bin).unwrap();
         keep_mode(&new, &exe).unwrap();
         swap(&new, &exe).unwrap();
     }
@@ -587,7 +614,7 @@ mod tests {
             std::fs::create_dir_all(&src).unwrap();
             std::fs::create_dir_all(&into).unwrap();
             let archive = archive(&src, entries);
-            let err = extract_member(&archive, MEMBER, &into).unwrap_err();
+            let err = extract_member(&std::fs::read(&archive).unwrap(), MEMBER, &into).unwrap_err();
             assert!(matches!(err, UpdateError::NoMember), "case {at}: {err}");
             assert!(
                 files_in(&into).is_empty(),
@@ -608,7 +635,7 @@ mod tests {
         std::fs::create_dir_all(&into).unwrap();
         let planted = into.join(format!("{NEW_PREFIX}{}", std::process::id()));
         std::fs::write(&planted, b"planted").unwrap();
-        assert!(extract_member(&archive, MEMBER, &into).is_err());
+        assert!(extract_member(&std::fs::read(&archive).unwrap(), MEMBER, &into).is_err());
         assert_eq!(
             std::fs::read(&planted).unwrap(),
             b"planted",
@@ -616,7 +643,7 @@ mod tests {
         );
         remove_new_leftovers(&into);
         assert!(files_in(&into).is_empty());
-        extract_member(&archive, MEMBER, &into).unwrap();
+        extract_member(&std::fs::read(&archive).unwrap(), MEMBER, &into).unwrap();
     }
 
     /// A read-only folder after the extract: the rename fails, and the old
@@ -640,7 +667,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let exe = bin.join("crystalline");
         std::fs::write(&exe, b"the old binary").unwrap();
-        let new = extract_member(&archive, MEMBER, &bin).unwrap();
+        let new = extract_member(&std::fs::read(&archive).unwrap(), MEMBER, &bin).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = swap(&new, &exe).unwrap_err();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();

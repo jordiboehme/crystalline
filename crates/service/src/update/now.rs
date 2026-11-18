@@ -113,13 +113,30 @@ fn staged(dir: &Path, name: &str) -> PathBuf {
 /// at, and never replaces a copy an earlier run verified. Staging files an
 /// earlier run left are removed first; call it under the update lock.
 ///
-/// On success the asset's path and the checks that ran.
+/// On success the asset's path, the bytes that were checked and the checks
+/// that ran ([`Verified`]).
 pub async fn fetch_verified(
     release: &LatestRelease,
     asset: &str,
     dir: &Path,
-) -> Result<(PathBuf, Checks), UpdateError> {
+) -> Result<Verified, UpdateError> {
     fetch_verified_from(&ReleaseSource::here(), release, asset, dir).await
+}
+
+/// A download that passed every check of [`fetch_verified`].
+#[derive(Debug)]
+pub struct Verified {
+    /// Where the asset now lies under its final name, for a command the
+    /// person runs (`apt install`, the MSI steps).
+    pub path: PathBuf,
+    /// The very bytes the checks ran on. Whatever this process takes out
+    /// of the asset, it takes from these, never from `path` again: the
+    /// file can be replaced between the check and a second read (a temp
+    /// folder the person owns under `sudo -E`), the bytes in memory
+    /// cannot.
+    pub bytes: Vec<u8>,
+    /// The checks that ran.
+    pub checks: Checks,
 }
 
 /// Where [`fetch_verified_from`] downloads from and which keys it trusts.
@@ -173,7 +190,7 @@ pub async fn fetch_verified_from(
     release: &LatestRelease,
     asset: &str,
     dir: &Path,
-) -> Result<(PathBuf, Checks), UpdateError> {
+) -> Result<Verified, UpdateError> {
     if release.from_api && !release.digests.contains_key(asset) {
         return Err(UpdateError::NoDigest);
     }
@@ -182,8 +199,8 @@ pub async fn fetch_verified_from(
     let names = [asset, SUMS, SUMS_SIG];
     let staging = names.map(|name| staged(dir, name));
     let verified = fetch_and_verify(source, release, asset, &staging).await;
-    let checks = match verified {
-        Ok(checks) => checks,
+    let (checks, bytes) = match verified {
+        Ok(verified) => verified,
         Err(err) => {
             remove_all(&staging);
             return Err(err);
@@ -197,11 +214,16 @@ pub async fn fetch_verified_from(
             return Err(err.into());
         }
     }
-    Ok((dir.join(asset), checks))
+    Ok(Verified {
+        path: dir.join(asset),
+        bytes,
+        checks,
+    })
 }
 
 /// Extract exactly `member` (`crystalline.exe`) of the verified zip
-/// `archive` into `dir`, under that name, and hand back its path. Nothing
+/// `archive` (its bytes, [`Verified::bytes`]) into `dir`, under that name,
+/// and hand back its path. Nothing
 /// else of the archive is ever written: every other entry is read past, and
 /// the name is matched byte for byte, so a `../` path or a folder prefix
 /// never matches. The member must be one plain file and appear once; a
@@ -212,7 +234,7 @@ pub async fn fetch_verified_from(
 /// the name the printed steps copy from never holds a partial file. Call it
 /// under the update lock.
 pub fn extract_zip_member(
-    archive: &Path,
+    archive: &[u8],
     member: &str,
     dir: &Path,
 ) -> Result<PathBuf, UpdateError> {
@@ -231,9 +253,8 @@ pub fn extract_zip_member(
     Ok(target)
 }
 
-fn extract_zip_into(archive: &Path, member: &str, staging: &Path) -> Result<(), UpdateError> {
-    let file = File::open(archive).map_err(UpdateError::Extract)?;
-    let mut zip = zip::ZipArchive::new(file)
+fn extract_zip_into(archive: &[u8], member: &str, staging: &Path) -> Result<(), UpdateError> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
         .map_err(|err| UpdateError::Extract(std::io::Error::other(err.to_string())))?;
     // The reader keeps one entry per name, so a second copy is seen only
     // here: an archive with any repeated name is refused.
@@ -304,7 +325,7 @@ async fn fetch_and_verify(
     release: &LatestRelease,
     asset: &str,
     [asset_path, sums_path, sig_path]: &[PathBuf; 3],
-) -> Result<Checks, UpdateError> {
+) -> Result<(Checks, Vec<u8>), UpdateError> {
     let tag = release.tag.as_str();
     let base = source.base();
     let bytes = download_from(&base, tag, asset, asset_path).await?;
@@ -325,7 +346,7 @@ async fn fetch_and_verify(
     checks.signature = true;
     signed.line(asset, &digest).map_err(UpdateError::Verify)?;
     checks.sums = true;
-    Ok(checks)
+    Ok((checks, bytes))
 }
 
 #[cfg(test)]
@@ -425,7 +446,12 @@ mod tests {
                 ("LICENSE", b"license"),
             ],
         );
-        let path = extract_zip_member(&archive, "crystalline.exe", dir.path()).unwrap();
+        let path = extract_zip_member(
+            &std::fs::read(&archive).unwrap(),
+            "crystalline.exe",
+            dir.path(),
+        )
+        .unwrap();
         assert_eq!(path, dir.path().join("crystalline.exe"));
         assert_eq!(std::fs::read(&path).unwrap(), b"the new binary");
         assert_eq!(
@@ -459,15 +485,24 @@ mod tests {
             } else {
                 zip_of(&archive, entries);
             }
-            let err =
-                extract_zip_member(&archive, "crystalline.exe", dir.path()).expect_err("refused");
+            let err = extract_zip_member(
+                &std::fs::read(&archive).unwrap(),
+                "crystalline.exe",
+                dir.path(),
+            )
+            .expect_err("refused");
             assert!(matches!(err, UpdateError::NoMember), "{err:?}");
             assert_eq!(names_in(dir.path()), ["a.zip"], "{entries:?}");
         }
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("not.zip");
         std::fs::write(&archive, b"not a zip").unwrap();
-        let err = extract_zip_member(&archive, "crystalline.exe", dir.path()).expect_err("bad");
+        let err = extract_zip_member(
+            &std::fs::read(&archive).unwrap(),
+            "crystalline.exe",
+            dir.path(),
+        )
+        .expect_err("bad");
         assert!(matches!(err, UpdateError::Extract(_)), "{err:?}");
         assert_eq!(names_in(dir.path()), ["not.zip"]);
     }
