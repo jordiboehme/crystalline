@@ -1144,7 +1144,7 @@ jobs:
   # success() check, so without it a failed build would still start every leg.
   fluid-smoke:
     name: fluid-smoke (${{ matrix.run }}, ${{ matrix.shard }}/${{ needs.fluid-smoke-build.outputs.total }})
-    timeout-minutes: 30
+    timeout-minutes: 60
     needs: fluid-smoke-build
     if: ${{ !cancelled() && needs.fluid-smoke-build.result == 'success' }}
     runs-on: ubuntu-latest
@@ -1230,6 +1230,10 @@ jobs:
       # daemon's own UI) for this shard's spec files. The script is the whole
       # sequence, so a local run of the same files is the same run.
       - name: Run the browser smoke
+        # The apt packages Playwright installs sometimes take more than 20
+        # minutes on the hosted runners; the job may wait for them, but the
+        # smoke itself keeps a tight limit so a hung test still fails fast.
+        timeout-minutes: 25
         run: |
           set -euo pipefail
           files=$(cd fluid && node scripts/smoke-shards.ts "$SHARD" "$TOTAL")
