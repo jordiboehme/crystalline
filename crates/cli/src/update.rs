@@ -1873,10 +1873,19 @@ mod tests {
         }
 
         fn record(&self, program: &str, args: &[&str]) {
-            let mut call = vec![program];
+            let program = unix_path(program);
+            let mut call = vec![program.as_str()];
             call.extend_from_slice(args);
             self.calls.lock().unwrap().push(call.join(" "));
         }
+    }
+
+    /// `program` with `/` for every separator. The brew branch joins the
+    /// prefix `brew --prefix` printed with `Path::join`, which on Windows
+    /// adds `\`; Homebrew is never detected there, so the tests compare
+    /// the Unix spelling on every system.
+    fn unix_path(program: &str) -> String {
+        program.replace('\\', "/")
     }
 
     impl Spawner for Recording {
@@ -1889,7 +1898,7 @@ mod tests {
             self.record(program, args);
             self.outputs
                 .iter()
-                .find(|(name, _)| *name == program)
+                .find(|(name, _)| *name == unix_path(program))
                 .map(|(_, out)| out.clone())
                 .ok_or_else(|| std::io::Error::other("no such program"))
         }
@@ -2341,7 +2350,8 @@ mod tests {
             limit: std::time::Duration,
         ) -> std::io::Result<i32> {
             self.calls.lock().unwrap().push(format!(
-                "{program} {} within {} s",
+                "{} {} within {} s",
+                unix_path(program),
                 args.join(" "),
                 limit.as_secs()
             ));
@@ -2355,13 +2365,14 @@ mod tests {
             limit: std::time::Duration,
         ) -> std::io::Result<String> {
             self.calls.lock().unwrap().push(format!(
-                "{program} {} within {} s",
+                "{} {} within {} s",
+                unix_path(program),
                 args.join(" "),
                 limit.as_secs()
             ));
             self.outputs
                 .iter()
-                .find(|(name, _)| *name == program)
+                .find(|(name, _)| *name == unix_path(program))
                 .map(|(_, out)| out.clone())
                 .ok_or_else(|| std::io::Error::other("no such program"))
         }
