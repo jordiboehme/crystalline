@@ -1075,6 +1075,29 @@ mod tests {
         }
     }
 
+    /// Download-only methods go on to the download without a terminal and
+    /// without `--yes`. The cache folder is a file, so the download fails
+    /// before any request (and on a host without that asset, `NoAsset`).
+    #[tokio::test]
+    async fn without_a_terminal_download_only_methods_go_on_to_the_download() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("not-a-folder");
+        std::fs::write(&file, b"").unwrap();
+        for method in [InstallMethod::Deb, InstallMethod::Msi, InstallMethod::Zip] {
+            let spawner = Recording::new(0, Vec::new());
+            let context = NowContext {
+                cache_dir: file.clone(),
+                ..ctx(method, &spawner, false, &never_asked)
+            };
+            let result = act(&context, &newer_release(), false, false).await;
+            assert!(
+                result.is_err(),
+                "{method:?}: went past the plan: {result:?}"
+            );
+            assert!(spawner.calls().is_empty(), "{method:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_no_at_the_terminal_does_nothing_and_exits_10() {
         let spawner = Recording::new(0, brew_outputs("0.34.0"));

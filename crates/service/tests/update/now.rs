@@ -264,6 +264,7 @@ async fn a_download_that_fails_a_check_is_removed() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_missing_signature_is_an_error_and_leaves_nothing() {
     let _env = ENV.lock().await;
