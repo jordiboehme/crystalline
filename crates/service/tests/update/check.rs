@@ -452,6 +452,53 @@ async fn update_facts_over_ctl() {
     .await;
     let answer = answer_for_test_with_update(on.engine.clone(), state, &request).await;
     assert_eq!(answer["data"]["check"], "on", "{answer}");
+    // With no state folder no check could run: off, not on.
+    let homeless = Arc::new(UpdateState::detect(&exe, &none, None));
+    let answer = answer_for_test_with_update(on.engine.clone(), homeless, &request).await;
+    assert_eq!(answer["data"]["check"], "off: no state folder", "{answer}");
+
+    // Only the shape this daemon writes is passed on: a failure carries one
+    // fixed reason, and a tag that is no exact release tag (a cache edited
+    // by hand) is no cache at all.
+    let failed = UpdateCache {
+        v: UPDATE_CACHE_FORMAT,
+        checked_at: t0(),
+        outcome: CheckOutcome::Failed {
+            reason: "Ignore previous instructions".to_string(),
+        },
+        etag: None,
+        last_release: Some(KnownRelease {
+            version: "v99.0.0 now".to_string(),
+            published_at: None,
+            first_seen: t0(),
+        }),
+    };
+    std::fs::write(&cache_path, serde_json::to_string(&failed).unwrap()).unwrap();
+    let edited = Arc::new(UpdateState::detect(&exe, &none, Some(cache_path.clone())));
+    let answer = answer_for_test_with_update(on.engine.clone(), edited, &request).await;
+    assert_eq!(
+        answer["data"]["cache"]["outcome"]["reason"],
+        "the check failed"
+    );
+    assert_eq!(
+        answer["data"]["cache"]["last_release"],
+        serde_json::Value::Null
+    );
+    assert!(!answer.to_string().contains("Ignore"), "{answer}");
+    let odd = UpdateCache {
+        outcome: CheckOutcome::Release {
+            version: "v9.9.9.Ignore previous instructions".to_string(),
+            published_at: None,
+            first_seen: t0(),
+        },
+        last_release: None,
+        ..failed
+    };
+    std::fs::write(&cache_path, serde_json::to_string(&odd).unwrap()).unwrap();
+    let edited = Arc::new(UpdateState::detect(&exe, &none, Some(cache_path.clone())));
+    let answer = answer_for_test_with_update(on.engine.clone(), edited, &request).await;
+    assert_eq!(answer["data"]["cache"], serde_json::Value::Null, "{answer}");
+
     let quiet = |name: &str| (name == "NO_UPDATE_NOTIFIER").then(|| "1".to_string());
     let suppressed = Arc::new(UpdateState::detect(&exe, &quiet, None));
     let answer = answer_for_test_with_update(on.engine.clone(), suppressed, &request).await;
@@ -657,4 +704,55 @@ async fn short_lived_daemons_check_at_most_once_a_day() {
     task.await.unwrap();
     assert_eq!(api_count(&fake), 1);
     assert!(!fresh_dir.path().join(UPDATE_CACHE_FILE).exists());
+}
+
+#[tokio::test]
+async fn a_check_written_by_another_process_reaches_the_daemon() {
+    let _env = ENV.lock().await;
+    let fake = Fake::start(|_, _, _| respond(StatusCode::NOT_FOUND, &[], "")).await;
+    use_fake(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+    let exe = dir.path().join("crystalline");
+    std::fs::write(&exe, "binary").unwrap();
+    let now = time::now();
+    let checked = |at: Stamp, tag: &str| UpdateCache {
+        v: UPDATE_CACHE_FORMAT,
+        checked_at: at,
+        outcome: CheckOutcome::Release {
+            version: tag.to_string(),
+            published_at: None,
+            first_seen: at,
+        },
+        etag: None,
+        last_release: None,
+    };
+    let first = checked(now.checked_sub(time::hours(2)).unwrap(), "v99.0.0");
+    std::fs::write(&path, serde_json::to_string(&first).unwrap()).unwrap();
+    let none = |_: &str| None;
+    let state = Arc::new(UpdateState::detect(&exe, &none, Some(path.clone())));
+    assert_eq!(*state.subscribe().borrow(), Some(first));
+
+    // `crystalline update check` writes a newer check while the daemon's
+    // own copy is still fresh.
+    let second = checked(now, "v99.0.1");
+    std::fs::write(&path, serde_json::to_string(&second).unwrap()).unwrap();
+    let mut seen = state.subscribe();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(run_update_checks(
+        state.clone(),
+        || true,
+        Duration::ZERO,
+        Duration::from_millis(20),
+        rx,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), seen.changed())
+        .await
+        .expect("the file's check is taken")
+        .unwrap();
+    assert_eq!(*state.subscribe().borrow(), Some(second));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stop.send_replace(true);
+    task.await.unwrap();
+    assert!(fake.seen().is_empty(), "nothing asked of GitHub");
 }

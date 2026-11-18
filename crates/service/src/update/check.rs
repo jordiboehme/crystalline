@@ -21,7 +21,7 @@ use crystalline_core::update::{
     CheckOutcome, Detection, InstallMethod, LatestRelease, Lookup, UPDATE_CACHE_FILE,
     UPDATE_CACHE_FORMAT, UpdateCache, detect, official_build,
 };
-use crystalline_core::version::Precedence;
+use crystalline_core::version::{Precedence, release_version};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
@@ -45,6 +45,14 @@ pub const MAX_START_JITTER: Duration = Duration::from_secs(60);
 
 /// The reason the check is off when nothing suppresses it but the setting.
 pub const OFF_BY_SETTING: &str = "not turned on";
+
+/// The reason the check is off when there is no state folder to cache it
+/// in, so no check could ever run.
+pub const OFF_NO_STATE_FOLDER: &str = "no state folder";
+
+/// The one reason a failed check carries in the ctl answer: the cached
+/// sentence stays in the file and the log (S23).
+pub const FAILED_REASON: &str = "the check failed";
 
 /// The file the .deb's package list is read from, as a file and never
 /// through `dpkg`.
@@ -232,13 +240,22 @@ fn write_atomically(
     name.push(path.file_name().unwrap_or_default());
     name.push(format!(".tmp-{}", std::process::id()));
     let temp = path.with_file_name(name);
-    let written = std::fs::write(&temp, bytes)
+    // Synced before the rename, so a power loss leaves the old cache or the
+    // new one, never an empty file.
+    let written = write_synced(&temp, bytes)
         .and_then(|()| before_rename(&temp))
         .and_then(|()| std::fs::rename(&temp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     written
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// What the daemon knows about updating, fixed at its start (S18) but for
@@ -302,18 +319,18 @@ impl UpdateState {
 
     /// The `update_facts` answer: the method's label, whether this is an
     /// official build, `on` or `off: <reason>` given whether `update.check`
-    /// is on, and the last check without its ETag (`null` when there is
-    /// none).
+    /// is on, and the last check (`null` when there is none). The check is
+    /// passed on only in the shape this daemon writes (S23): no ETag, a
+    /// failure as [`FAILED_REASON`], and a release tag that is not exactly
+    /// `v<major>.<minor>.<patch>` (a cache edited by hand) not at all.
     pub fn facts(&self, setting_on: bool) -> Value {
         let check = match (self.suppressed, setting_on) {
             (Some(reason), _) => format!("off: {reason}"),
             (None, false) => format!("off: {OFF_BY_SETTING}"),
+            (None, true) if self.cache_path.is_none() => format!("off: {OFF_NO_STATE_FOLDER}"),
             (None, true) => "on".to_string(),
         };
-        let cache = self.cache.borrow().clone().map(|mut cache| {
-            cache.etag = None;
-            cache
-        });
+        let cache = self.cache.borrow().clone().and_then(answered_cache);
         json!({
             "method": self.detection.method.label(),
             "official": self.official,
@@ -327,6 +344,19 @@ impl UpdateState {
     fn may_check(&self, setting_on: bool) -> bool {
         setting_on && self.suppressed.is_none() && self.cache_path.is_some()
     }
+}
+
+/// A cache as the ctl answer carries it: see [`UpdateState::facts`].
+fn answered_cache(mut cache: UpdateCache) -> Option<UpdateCache> {
+    let exact = |tag: &str| release_version(tag).is_some();
+    match &mut cache.outcome {
+        CheckOutcome::Release { version, .. } if !exact(version) => return None,
+        CheckOutcome::Release { .. } => {}
+        CheckOutcome::Failed { reason } => *reason = FAILED_REASON.to_string(),
+    }
+    cache.etag = None;
+    cache.last_release = cache.last_release.filter(|known| exact(&known.version));
+    Some(cache)
 }
 
 /// The text of the .deb's package list, when this system has one.
@@ -374,7 +404,24 @@ pub async fn run_update_checks(
         if !state.may_check(setting_on()) {
             continue;
         }
+        let Some(path) = state.cache_path.clone() else {
+            continue;
+        };
         let now = time::now();
+        // A fresh file wins over memory: a check another process wrote (a
+        // `crystalline update check`, another daemon) reaches the answer
+        // within one wake.
+        if let Some(file) = read_cache(&path).filter(|c| c.fresh(now, check_interval())) {
+            state.cache.send_if_modified(|held| {
+                let changed = held.as_ref() != Some(&file);
+                *held = Some(file);
+                changed
+            });
+            continue;
+        }
+        // Memory still holds a day's check when the file could not be
+        // written: no second request that day. A state folder that stays
+        // unwritable still costs one request per daemon start.
         if state
             .cache
             .borrow()
@@ -383,9 +430,6 @@ pub async fn run_update_checks(
         {
             continue;
         }
-        let Some(path) = state.cache_path.clone() else {
-            continue;
-        };
         let cache = tokio::select! {
             _ = crate::daemon::wait_true(&mut shutdown) => break,
             cache = run_check(&path, now) => cache,

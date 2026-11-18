@@ -9,12 +9,11 @@
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, domain_register, routing_config, maintenance_stamp, desktop_offer,
-//! forget_domain, forget_credential, sources_reload, mounted_routing, update_facts,
-//! shutdown. This is the
-//! operator channel plus the `tool` command, which
-//! dispatches a daemon-attached CLI data verb to the shared engine and
-//! returns raw engine JSON; an MCP client's data operations still go over the
-//! MCP handshake.
+//! forget_domain, forget_credential, sources_reload, mounted_routing,
+//! update_facts, shutdown. This is the operator channel plus the `tool`
+//! command, which dispatches a daemon-attached CLI data verb to the shared
+//! engine and returns raw engine JSON; an MCP client's data operations still
+//! go over the MCP handshake.
 
 use std::sync::Arc;
 
