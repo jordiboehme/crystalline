@@ -122,9 +122,17 @@ fn the_test_key_seam_is_debug_only() {
             let text = std::fs::read_to_string(&path).unwrap();
             let lines: Vec<&str> = text.lines().collect();
             for (at, line) in lines.iter().enumerate() {
-                // A test that sets or removes the seam does not read it.
-                if !line.contains(name) || line.contains("set_var(") || line.contains("remove_var(")
-                {
+                // A read: `var(` or `var_os(` of the name, not as the tail of
+                // `set_var(` or `remove_var(`: a test that sets or removes the
+                // seam does not read it.
+                let read = [format!("var({name})"), format!("var_os({name})")]
+                    .iter()
+                    .any(|call| {
+                        line.match_indices(call.as_str()).any(|(at, _)| {
+                            !line[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                        })
+                    });
+                if !read {
                     continue;
                 }
                 reads.push(format!("{krate}: {}", path.display()));

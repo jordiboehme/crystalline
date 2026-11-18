@@ -1618,6 +1618,11 @@ mod tests {
                 .strip_prefix("\u{feff}".as_bytes())
                 .expect("a byte order mark");
             let saved = std::str::from_utf8(saved).unwrap();
+            assert!(
+                !saved.replace("\r\n", "").contains('\n'),
+                "CRLF only: {saved:?}"
+            );
+            let saved = saved.replace("\r\n", "\n");
             assert_eq!(
                 printed,
                 format!("{saved}These steps are saved in {}.\n", display_path(&file)),

@@ -12,6 +12,7 @@ use std::path::Path;
 
 use crystalline_core::update::display_path;
 use crystalline_core::version::Precedence;
+use crystalline_service::daemon_task::MACHINE_TASK_NAME;
 use crystalline_service::instance::{LockInfo, StartMode};
 
 /// The name the zip steps give the running exe, and the leftover the next
@@ -20,9 +21,6 @@ pub(crate) const OLD_EXE: &str = "crystalline.old.exe";
 
 /// The file the steps are saved to in the download folder.
 pub(crate) const STEPS_FILE: &str = "steps.txt";
-
-/// The task the MSI registers (`crates/cli/wix/main.wxs`).
-const TASK: &str = r"\Crystalline\Daemon";
 
 /// How the running daemon was started, read from its record, so the MSI
 /// steps can say how to start it again after `ctl shutdown` (S22).
@@ -94,10 +92,14 @@ pub(crate) fn ps_quoted(text: &str) -> String {
 }
 
 /// An argument as PowerShell passes it to a program: as it is when every
-/// character is taken literally, else [`ps_quoted`].
+/// character is taken literally, else [`ps_quoted`]. A word that starts
+/// with `-` stays bare only as a flag (letters and dashes): Windows
+/// PowerShell 5.1 splits a bare `-a.b` into `-a` and `.b`.
 fn ps_word(text: &str) -> String {
+    let flag = text.starts_with('-') && text.chars().all(|c| c.is_ascii_lowercase() || c == '-');
     let plain = !text.is_empty()
         && !text.starts_with('@')
+        && (!text.starts_with('-') || flag)
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || r"-_.:/\=+".contains(c));
@@ -115,16 +117,17 @@ fn folder_text(path: &Path) -> String {
     display_path(path).trim_end_matches('\\').to_string()
 }
 
-/// The `APPLICATIONFOLDER` value: the install root, with a trailing
-/// backslash doubled. Before the closing quote a single one would escape
-/// it (`"D:\"`); `\\"` reads as one backslash and the end of the value,
-/// and Windows Installer takes a doubled separator as one.
+/// The `APPLICATIONFOLDER=` argument for msiexec. A root without a space
+/// goes unquoted (`APPLICATIONFOLDER=D:\`), which msiexec reads to the next
+/// space whichever way it treats backslashes. A root with a space is quoted,
+/// and never ends in a backslash there, which would escape the closing
+/// quote: only a drive root ends in one, and it holds no space.
 fn application_folder(root: &Path) -> String {
     let text = display_path(root);
-    if text.ends_with('\\') {
-        format!(r"{}\\", text.trim_end_matches('\\'))
+    if text.contains(' ') {
+        format!("APPLICATIONFOLDER=\"{}\"", text.trim_end_matches('\\'))
     } else {
-        text
+        format!("APPLICATIONFOLDER={text}")
     }
 }
 
@@ -151,20 +154,24 @@ pub(crate) fn msi_steps(
     let package = format!(r"{}\{msi}", folder_text(download));
     let mut out =
         String::from("Install it with these steps in Windows PowerShell or PowerShell 7:\n");
-    out.push_str(&format!(
-        "1. {CLOSE_SESSIONS} Then stop the daemon, or the installer may ask for a reboot:\n   & {exe} ctl shutdown\n"
-    ));
+    if daemon.is_some() {
+        out.push_str(&format!(
+            "1. {CLOSE_SESSIONS} Then stop the daemon, or the installer may ask for a reboot:\n   & {exe} ctl shutdown\n"
+        ));
+    } else {
+        out.push_str(&format!("1. {CLOSE_SESSIONS}\n"));
+    }
     out.push_str(&format!(
         "2. Run the installer and wait for it. Windows asks for administrator rights; the installer has no Authenticode signature, so the prompt names an unknown publisher.\n   $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', {}, '/passive', '/norestart', {}; $p.ExitCode\n",
         ps_quoted(&format!("\"{package}\"")),
-        ps_quoted(&format!("APPLICATIONFOLDER=\"{}\"", application_folder(install_root))),
+        ps_quoted(&application_folder(install_root)),
     ));
     if default_folder {
         out.push_str(
             "   Crystalline is in the default folder, so a double click on the .msi works too.\n",
         );
     }
-    out.push_str("3. 0 means installed, 3010 installed and active after a reboot. Any other number means it did not install.\n");
+    out.push_str("3. 0 means installed. 3010 means installed and active after a reboot: reboot first, then go on with step 4.\n   1602 means cancelled, for example a no at the administrator prompt: nothing changed.\n   1618 means another installation is running: wait for it and run step 2 again.\n   Any other number means it did not install.\n");
     out.push_str(&format!(
         "4. {}\n   & {exe} status\n",
         start_again(daemon, &exe)
@@ -177,10 +184,12 @@ fn start_again(daemon: Option<&DaemonStart>, exe: &str) -> String {
     let Some(daemon) = daemon else {
         return "No daemon was running. Check the install:".to_string();
     };
+    // The machine task, even for a daemon a per-user task started: every
+    // MSI install registers it again (RegisterDaemonTask in main.wxs).
     if daemon.by_task {
         return format!(
             "Start the daemon again with its task, then check:\n   schtasks.exe /Run /TN {}",
-            ps_quoted(TASK)
+            ps_quoted(MACHINE_TASK_NAME)
         );
     }
     if daemon.serve_args.is_empty() {
@@ -238,12 +247,12 @@ pub(crate) fn is_default_folder(root: &Path, program_files: Option<&str>) -> boo
     folder_text(root).eq_ignore_ascii_case(&default)
 }
 
-/// The text written to `steps.txt`: the printed steps after a UTF-8 byte
-/// order mark, which Windows PowerShell 5.1 needs to read a path that is
-/// not ASCII.
+/// The text written to `steps.txt`: the printed steps with Windows line
+/// endings, after a UTF-8 byte order mark, which Windows PowerShell 5.1
+/// needs to read a path that is not ASCII.
 pub(crate) fn steps_file_bytes(steps: &str) -> Vec<u8> {
     let mut bytes = "\u{feff}".as_bytes().to_vec();
-    bytes.extend_from_slice(steps.as_bytes());
+    bytes.extend_from_slice(steps.replace('\n', "\r\n").as_bytes());
     bytes
 }
 
@@ -292,7 +301,8 @@ mod tests {
 
     #[test]
     fn msi_steps_default_folder() {
-        let text = msi(r"C:\Program Files\Crystalline", None, true);
+        let spawned = by_hand(&[]);
+        let text = msi(r"C:\Program Files\Crystalline", Some(&spawned), true);
         assert_eq!(
             text,
             r#"Install it with these steps in Windows PowerShell or PowerShell 7:
@@ -301,18 +311,30 @@ mod tests {
 2. Run the installer and wait for it. Windows asks for administrator rights; the installer has no Authenticode signature, so the prompt names an unknown publisher.
    $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', '"C:\Users\a\AppData\Local\crystalline\cache\updates\v0.34.0\crystalline-v0.34.0-windows-amd64.msi"', '/passive', '/norestart', 'APPLICATIONFOLDER="C:\Program Files\Crystalline"'; $p.ExitCode
    Crystalline is in the default folder, so a double click on the .msi works too.
-3. 0 means installed, 3010 installed and active after a reboot. Any other number means it did not install.
-4. No daemon was running. Check the install:
+3. 0 means installed. 3010 means installed and active after a reboot: reboot first, then go on with step 4.
+   1602 means cancelled, for example a no at the administrator prompt: nothing changed.
+   1618 means another installation is running: wait for it and run step 2 again.
+   Any other number means it did not install.
+4. The next agent session starts the daemon again. Check the install:
    & 'C:\Program Files\Crystalline\bin\crystalline.exe' status
 "#
+        );
+        // With no daemon running there is nothing to stop.
+        let text = msi(r"C:\Program Files\Crystalline", None, true);
+        assert!(!text.contains("ctl shutdown"), "{text}");
+        assert!(text.contains("open.\n2. Run the installer"), "{text}");
+        assert!(
+            text.contains("4. No daemon was running. Check the install:"),
+            "{text}"
         );
     }
 
     #[test]
     fn msi_steps_custom_folder_keep_applicationfolder() {
-        let text = msi(r"D:\Tools\Crystalline", None, false);
+        let spawned = by_hand(&[]);
+        let text = msi(r"D:\Tools\Crystalline", Some(&spawned), false);
         assert!(
-            text.contains(r#"'APPLICATIONFOLDER="D:\Tools\Crystalline"'; $p.ExitCode"#),
+            text.contains(r"'APPLICATIONFOLDER=D:\Tools\Crystalline'; $p.ExitCode"),
             "{text}"
         );
         assert!(
@@ -324,21 +346,31 @@ mod tests {
 
     #[test]
     fn a_root_ending_in_a_backslash() {
-        for (root, value, exe) in [
-            (r"D:\", r"D:\\", r"D:\bin\crystalline.exe"),
-            (r"D:\Tools\", r"D:\Tools\\", r"D:\Tools\bin\crystalline.exe"),
-        ] {
-            let text = msi(root, None, false);
-            assert!(
-                text.contains(&format!(r#"'APPLICATIONFOLDER="{value}"'"#)),
-                "{text}"
-            );
-            assert!(text.contains(&format!("& '{exe}' status")), "{text}");
-            // No lone backslash before a closing double quote.
-            for (at, _) in text.match_indices("\\\"") {
-                assert_eq!(&text[at - 1..at], "\\", "a lone \\\" in {text}");
-            }
-        }
+        // A drive root (the only root that ends in a backslash) goes
+        // unquoted: no backslash ever stands before a closing quote.
+        let text = msi(r"D:\", None, false);
+        assert!(
+            text.contains(r"'APPLICATIONFOLDER=D:\'; $p.ExitCode"),
+            "{text}"
+        );
+        assert!(
+            text.contains(r"& 'D:\bin\crystalline.exe' status"),
+            "{text}"
+        );
+        assert!(!text.contains("\\\""), "{text}");
+        // Without a space the value is unquoted too; with one it is quoted
+        // and never ends in a backslash.
+        let text = msi(r"D:\Tools\Crystalline", None, false);
+        assert!(
+            text.contains(r"'APPLICATIONFOLDER=D:\Tools\Crystalline'"),
+            "{text}"
+        );
+        let text = msi(r"D:\My Tools\", None, false);
+        assert!(
+            text.contains(r#"'APPLICATIONFOLDER="D:\My Tools"'"#),
+            "{text}"
+        );
+        assert!(!text.contains("\\\""), "{text}");
         // A download folder with a trailing backslash gives one separator.
         let text = msi_steps(
             Path::new(r"C:\cache\"),
@@ -432,6 +464,14 @@ mod tests {
             text.contains("4. The next agent session starts the daemon again. Check the install:"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_value_starting_with_a_dash_is_quoted_and_a_flag_is_not() {
+        assert_eq!(ps_word("--allowed-host"), "--allowed-host");
+        assert_eq!(ps_word("-x.lan"), "'-x.lan'");
+        assert_eq!(ps_word("-1"), "'-1'");
+        assert_eq!(ps_word("0.0.0.0:7411"), "0.0.0.0:7411");
     }
 
     #[test]
@@ -571,8 +611,11 @@ mod tests {
 
     #[test]
     fn the_steps_file_is_the_text_after_a_byte_order_mark() {
-        let bytes = steps_file_bytes("1. Jörg\n");
+        let bytes = steps_file_bytes("1. Jörg\n   & x\n");
         assert_eq!(&bytes[..3], [0xEF, 0xBB, 0xBF]);
-        assert_eq!(std::str::from_utf8(&bytes[3..]).unwrap(), "1. Jörg\n");
+        assert_eq!(
+            std::str::from_utf8(&bytes[3..]).unwrap(),
+            "1. Jörg\r\n   & x\r\n"
+        );
     }
 }
