@@ -5866,6 +5866,62 @@ async fn me_update_available_is_admin_only() {
         serde_json::Value::Null,
         "the anonymous viewer"
     );
+
+    // The role is read on every request: an editor made admin is told on
+    // her next probe, and told nothing again once demoted, on the same
+    // session.
+    for (role, expected) in [
+        ("admin", serde_json::json!("0.35.0")),
+        ("editor", serde_json::Value::Null),
+    ] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::PATCH,
+            "/api/v1/users/eddy",
+            &admin,
+        )
+        .json(&serde_json::json!({ "role": role }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        assert_eq!(
+            update_available(fx.addr, Some(&eddy)).await,
+            expected,
+            "{role}"
+        );
+    }
+
+    // An agent's MCP token opens no identity on this surface, even the
+    // admin's own: the probe answers it as anyone without a session.
+    let issued: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/me/mcp-tokens",
+        &admin,
+    )
+    .json(&serde_json::json!({"label": "agent"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let token = issued["token"].as_str().expect("a token is issued");
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fx.addr))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(!text.contains("0.35.0"), "{status}: {text}");
+    if status == 200 {
+        let me: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(me["user"], serde_json::Value::Null, "{me}");
+        assert_eq!(me["update_available"], serde_json::Value::Null, "{me}");
+    }
 }
 
 /// A router with no daemon behind it names no update, and a daemon's facts

@@ -1157,7 +1157,7 @@ pub async fn run_serve(
         let rx = shared.watch();
         tokio::spawn(crate::update::check::run_update_checks(
             update.clone(),
-            move || e.config().update_check_enabled(),
+            move || e.update_settings().0,
             crate::update::check::start_jitter(),
             crate::update::check::CHECK_WAKE,
             rx,

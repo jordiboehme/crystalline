@@ -5170,6 +5170,14 @@ impl Engine {
         self.config.read().unwrap().github_enabled()
     }
 
+    /// `update.check` and `update.min_age_hours`, read the same cheap way as
+    /// [`Engine::github_enabled`]: the instance probe asks them for every
+    /// admin, so it must not clone the whole config to get at two keys.
+    pub fn update_settings(&self) -> (bool, u32) {
+        let config = self.config.read().unwrap();
+        (config.update_check_enabled(), config.update_min_age_hours())
+    }
+
     /// Whether the MCP endpoint authenticates (`auth.mcp`), read the same cheap
     /// way as [`Engine::github_enabled`]. This is the setting that creates the
     /// legacy open tier, and a write gate reads it once per write, so it must

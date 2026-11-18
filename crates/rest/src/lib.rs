@@ -617,14 +617,14 @@ impl RestState {
     /// and this server's own version.
     pub(crate) fn update_available(&self) -> Option<String> {
         let source = self.update.as_ref()?;
-        let config = self.engine.config();
-        let facts = source(config.update_check_enabled());
+        let (check, min_age_hours) = self.engine.update_settings();
+        let facts = source(check);
         let current = crystalline_core::version::Precedence::parse(crystalline_core::VERSION)?;
         crystalline_core::update::offer(
             &facts,
             &current,
             crystalline_core::time::now(),
-            config.update_min_age_hours(),
+            min_age_hours,
         )
         .map(|version| version.render())
     }
