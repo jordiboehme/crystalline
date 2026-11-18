@@ -3003,6 +3003,54 @@ fn config_writes_unchanged_on_turso() {
     assert!(cfg.domains.contains_key("notes"), "{:?}", cfg.domains);
 }
 
+/// An index that does not open is described for its backend. On Postgres
+/// (here nothing listens on the database's port) `reindex` names the
+/// database and the checks that fit it: the server, the sign-in and the
+/// connection limit, never the file advice or the `--wipe` hint. On Turso
+/// (here the index path is a folder) the file advice and the hint stay.
+/// Needs no Postgres server.
+#[test]
+fn an_index_that_does_not_open_gets_the_advice_of_its_backend() {
+    let env = Env::new("pgdown");
+    let url = format!("postgres://u:p@127.0.0.1:{}/nodb", free_port());
+    let vars = [
+        ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
+        ("CRYSTALLINE_DATABASE_URL", url.as_str()),
+        ("CRYSTALLINE_DATABASE_SCHEMA", "down"),
+        ("CRYSTALLINE_SECRET_KEY", crate::service::TEST_SECRET_KEY),
+    ];
+    let (ok, out, err) = run_vars(&env, &["reindex"], &vars);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("schema down could not be opened"), "{err}");
+    assert!(err.contains("Postgres server is running"), "{err}");
+    assert!(err.contains("max_connections"), "{err}");
+    assert!(!err.contains("file is readable"), "{err}");
+    assert!(!err.contains("reindex --wipe"), "{err}");
+
+    // A password with a raw `?` makes a URL that cannot be read safely: the
+    // words name the schema but no part of the URL.
+    let url = format!("postgres://u:pq?zw@127.0.0.1:{}/nodb", free_port());
+    let mut odd = vars;
+    odd[1] = ("CRYSTALLINE_DATABASE_URL", url.as_str());
+    let (ok, out, err) = run_vars(&env, &["reindex"], &odd);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains(
+            "the index in the database (address not shown), schema down could not be opened"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("pq") && !err.contains("zw"), "{err}");
+
+    let turso = Env::new("filedown");
+    std::fs::create_dir_all(turso.state_dir().join("index.db/not-a-file")).unwrap();
+    let (ok, out, err) = turso.run_full(&["reindex"]);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("Check that the file is readable"), "{err}");
+    assert!(err.contains("crystalline reindex --wipe"), "{err}");
+    assert!(!err.contains("Postgres server"), "{err}");
+}
+
 // --- the CLI credential writers on Postgres (spec section D) -----------------
 
 /// Run `crystalline <args>` in `env` with `extra` variables on top of its

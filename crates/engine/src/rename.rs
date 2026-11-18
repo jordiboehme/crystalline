@@ -178,12 +178,24 @@ pub(crate) struct RenameJournal {
 /// What a rename journal belongs to: the index, the configuration file and
 /// the state directory of the engine that started it, each path in its
 /// canonical form so two spellings of one file compare equal.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Two owners are equal when their configuration and state directory are,
+/// and their index is the same one: by `index_key` when both carry one, else
+/// by `index` (a journal an older binary wrote has no key).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameOwner {
-    /// The index as its store names it: the database file, or the Postgres
-    /// host and database without credentials. `None` for an in-memory store.
+    /// The index as its store names it, for display: the database file, or
+    /// the Postgres host and database without credentials. `None` for an
+    /// in-memory store, and on Postgres for a URL that is not clean enough to
+    /// show any part of it; `index_key` still tells those apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
+    /// What tells the index apart from another when `index` cannot, never
+    /// shown: on Postgres a hash of the host, port, database and schema
+    /// ([`crystalline_index::StoreInfo::db_key`]); `None` on Turso, where the
+    /// path in `index` is the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_key: Option<String>,
     /// The configuration file the engine persists to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
@@ -197,8 +209,24 @@ impl RenameOwner {
     pub fn new(index: Option<&str>, config: Option<&Path>, state_dir: &Path) -> RenameOwner {
         RenameOwner {
             index: index.map(|i| canonical_text(Path::new(i))),
+            index_key: None,
             config: config.map(canonical_text),
             state_dir: canonical_text(state_dir),
+        }
+    }
+
+    /// This owner with `key` as its [`RenameOwner::index_key`].
+    pub fn with_index_key(mut self, key: Option<String>) -> RenameOwner {
+        self.index_key = key;
+        self
+    }
+
+    /// Whether `self` and `other` name the same index: by the key when both
+    /// carry one, else by the name.
+    pub fn same_index(&self, other: &RenameOwner) -> bool {
+        match (&self.index_key, &other.index_key) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.index == other.index,
         }
     }
 
@@ -211,12 +239,13 @@ impl RenameOwner {
         db_path: &Path,
         state_dir: &Path,
     ) -> RenameOwner {
+        let database = loaded.effective.database();
         RenameOwner::new(
-            crystalline_index::store_location(&loaded.effective.database(), Some(db_path))
-                .as_deref(),
+            crystalline_index::store_location(&database, Some(db_path)).as_deref(),
             Some(&loaded.path),
             state_dir,
         )
+        .with_index_key(crystalline_index::store_key(&database))
     }
 
     /// The same owner with every path spelled canonically as of now: a
@@ -225,6 +254,7 @@ impl RenameOwner {
     pub fn normalized(&self) -> RenameOwner {
         RenameOwner {
             index: self.index.as_deref().map(|i| canonical_text(Path::new(i))),
+            index_key: self.index_key.clone(),
             config: self.config.as_deref().map(|c| canonical_text(Path::new(c))),
             state_dir: canonical_text(Path::new(&self.state_dir)),
         }
@@ -255,7 +285,7 @@ impl RenameOwner {
         let side =
             |value: &Option<String>, none: &str| value.clone().unwrap_or_else(|| none.to_string());
         let mut parts = Vec::new();
-        if this.index != other.index {
+        if !this.same_index(other) {
             parts.push(format!(
                 "the index {} is not this machine's own index {}",
                 side(&this.index, "in memory"),
@@ -278,6 +308,14 @@ impl RenameOwner {
         parts
     }
 }
+
+impl PartialEq for RenameOwner {
+    fn eq(&self, other: &RenameOwner) -> bool {
+        self.same_index(other) && self.config == other.config && self.state_dir == other.state_dir
+    }
+}
+
+impl Eq for RenameOwner {}
 
 /// This machine's own index, configuration and state directory, as a rename
 /// journal records them: what a plain command, with no `--db` and no
@@ -789,6 +827,59 @@ fn entry_names(parent: &Path) -> io::Result<HashSet<String>> {
 mod tests {
     use super::*;
 
+    /// Two Postgres indexes whose URLs are not clean enough to show (here an
+    /// `@` in the query) have no name, and are still told apart by their
+    /// key; the same database reached through another spelling of the URL
+    /// compares equal. A journal without a key (an older binary) still
+    /// compares by name.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_owners_without_a_shown_name_are_told_apart_by_their_key() {
+        use crystalline_core::config::{DatabaseBackend, DatabaseConfig};
+        let pg = |url: &str| DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some(url.to_string()),
+            schema: Some("team_a".to_string()),
+        };
+        let owner = |url: &str| {
+            let cfg = pg(url);
+            RenameOwner::new(
+                crystalline_index::store_location(&cfg, None).as_deref(),
+                Some(Path::new("/c/config.yaml")),
+                Path::new("/state"),
+            )
+            .with_index_key(crystalline_index::store_key(&cfg))
+        };
+        let a = owner("postgres://db-a.internal:5432/kb?user=ada@corp&password=x");
+        let b = owner("postgres://db-b.internal:5432/kb?user=ada@corp&password=x");
+        assert_eq!((a.index.as_deref(), b.index.as_deref()), (None, None));
+        assert!(a.index_key.is_some() && b.index_key.is_some());
+        assert_ne!(a, b, "different hosts are different indexes");
+        assert!(!a.same_as(&b));
+        assert_eq!(
+            a.differences_from(&b).len(),
+            1,
+            "{:?}",
+            a.differences_from(&b)
+        );
+        // The same host, port, database and schema, the credentials moved.
+        let a_again = owner("postgres://ada:x@db-a.internal:5432/kb");
+        assert_eq!(a, a_again);
+        // Another schema on the same database is another index.
+        let mut other_schema = pg("postgres://db-a.internal:5432/kb");
+        other_schema.schema = Some("team_b".to_string());
+        assert_ne!(a.index_key, crystalline_index::store_key(&other_schema));
+        // A keyless journal (an older binary) compares by its name.
+        let named = owner("postgres://db-a.internal:5432/kb");
+        let old = RenameOwner {
+            index_key: None,
+            ..named.clone()
+        };
+        assert_eq!(old, named);
+        // The key is never shown.
+        assert!(!a.describe().contains("postgres:"), "{}", a.describe());
+    }
+
     /// A configuration not written yet, below a folder reached through a
     /// symlink (`/tmp` on macOS), is spelled the way it will be once it
     /// exists, so an owner recorded before the first `domain add` compares
@@ -817,6 +908,7 @@ mod tests {
 
         let owner = |config: &str| RenameOwner {
             index: None,
+            index_key: None,
             config: Some(config.to_string()),
             state_dir: "/state".to_string(),
         };

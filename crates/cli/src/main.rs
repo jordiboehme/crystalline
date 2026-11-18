@@ -3639,11 +3639,15 @@ async fn reindex_dispatch(
         // sentence a person gets points at `doctor --fix`, which clears a stale
         // lock and does not repair a database. `--wipe` is what repairs one,
         // and nothing else in the program will ever name it to them. Said only
-        // here, where the remedy is a flag on the command they just ran.
-        cmd::IndexRoute::Unreachable(why) if !wipe => Err(anyhow::anyhow!(
-            "{} If the database file itself is damaged, set it aside and rebuild from your files with: crystalline reindex --wipe - that renames the unreadable file rather than deleting it, so its bytes are still there afterwards.",
-            cmd::index_unreachable("reindex", &why)
-        )),
+        // here, where the remedy is a flag on the command they just ran. Only
+        // for the Turso file: on Postgres there is no file to set aside, and
+        // the shared wording already names the database checks.
+        cmd::IndexRoute::Unreachable(why) if !wipe && cmd::backend_is_turso(&cfg) => {
+            Err(anyhow::anyhow!(
+                "{} If the database file itself is damaged, set it aside and rebuild from your files with: crystalline reindex --wipe - that renames the unreadable file rather than deleting it, so its bytes are still there afterwards.",
+                cmd::index_unreachable("reindex", &why)
+            ))
+        }
         other => {
             cmd::reindex(
                 cmd::local_store(other, "reindex")?,

@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use fs4::FileExt;
 use serde_json::{Value, json};
@@ -34,13 +34,10 @@ struct Env {
 impl Env {
     /// Create the isolated dirs, then take and hold the exclusive index lock.
     fn locked(tag: &str) -> Env {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::common::unique_suffix();
         // A short base keeps any derived path well under the macOS limits and
         // matches the daemon integration tests' `Env`.
-        let dir = PathBuf::from("/tmp").join(format!("cq-{tag}-{nanos}"));
+        let dir = PathBuf::from("/tmp").join(format!("cq-{tag}-{unique}"));
         std::fs::create_dir_all(dir.join("config")).unwrap();
         std::fs::create_dir_all(dir.join("cache")).unwrap();
         let state = dir.join("state/crystalline");

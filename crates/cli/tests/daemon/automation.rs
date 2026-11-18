@@ -982,8 +982,16 @@ fn run_logs_are_private_and_only_the_newest_fifty_are_kept() {
         ours[0], "evolve-busy-20200101T000006.000Z.jsonl",
         "{ours:?}"
     );
-    let newest = logs.join(ours.last().unwrap());
-    assert!(!newest.to_string_lossy().contains("2020"), "{ours:?}");
+    // The newest is this run's own log, none of the seeded ones. Asked of
+    // the file name and by the seeded date: the folder's path carries the
+    // clock and a process id, and a run at 20:20 UTC has `2020` in its own
+    // name, so a bare search for `2020` in the path failed now and then.
+    let newest_name = ours.last().unwrap();
+    assert!(
+        !newest_name.starts_with("evolve-busy-20200101T"),
+        "{ours:?}"
+    );
+    let newest = logs.join(newest_name);
     let mode = std::fs::metadata(&newest).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
     assert!(

@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -22,11 +22,8 @@ pub struct DaemonEnv {
 
 impl DaemonEnv {
     pub fn new(tag: &str) -> DaemonEnv {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = PathBuf::from("/tmp").join(format!("cqp-{tag}-{nanos}"));
+        let unique = crate::common::unique_suffix();
+        let dir = PathBuf::from("/tmp").join(format!("cqp-{tag}-{unique}"));
         std::fs::create_dir_all(dir.join("config")).unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();
         std::fs::create_dir_all(dir.join("cache")).unwrap();

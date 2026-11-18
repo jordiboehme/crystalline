@@ -662,13 +662,10 @@ impl PgDocument {
             eprintln!("note: skipping the postgres leg (CRYSTALLINE_TEST_POSTGRES_URL is unset)");
             return None;
         };
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::common::unique_suffix();
         let doc = PgDocument {
             url,
-            schema: format!("updcheck_{nanos}"),
+            schema: format!("updcheck_{unique}"),
         };
         // The table as the migrations make it (crates/index postgres
         // migrations, `instance_config`).

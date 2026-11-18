@@ -3184,6 +3184,7 @@ impl ReadStore for TursoStore {
             fts_mode: FtsMode::CandidateScan,
             schema_version: self.schema_version,
             db_path: self.db_path.clone(),
+            db_key: None,
             db_size,
         })
     }

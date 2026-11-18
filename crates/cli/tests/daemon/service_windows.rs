@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -34,11 +34,8 @@ struct Env {
 
 impl Env {
     fn new(tag: &str) -> Env {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("cq-{tag}-{nanos}"));
+        let unique = crate::common::unique_suffix();
+        let dir = std::env::temp_dir().join(format!("cq-{tag}-{unique}"));
         std::fs::create_dir_all(dir.join("roaming")).unwrap();
         std::fs::create_dir_all(dir.join("local")).unwrap();
         // An unresolvable embeddings provider keeps the daemon text-only so a

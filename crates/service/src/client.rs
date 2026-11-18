@@ -1224,14 +1224,9 @@ async fn open_standalone_noting(
     note: bool,
 ) -> anyhow::Result<(Engine, Option<Value>)> {
     // Postgres has no local file, so naming one in a failure would point at a
-    // path nothing lives at.
-    let location = if loaded.effective.database().backend
-        == crystalline_core::config::DatabaseBackend::Turso
-    {
-        db_path.display().to_string()
-    } else {
-        "the configured database".to_string()
-    };
+    // path nothing lives at, and its advice would send a person to the wrong
+    // place.
+    let location = crate::instance::IndexLocation::of(&loaded.effective, db_path);
     // Inside an app package no local engine is opened, not even for a read
     // or with an override outside AppData: see `ctl_routed`.
     if crate::runs_in::PackageContext::here().is_packaged() {

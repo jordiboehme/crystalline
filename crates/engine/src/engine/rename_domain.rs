@@ -668,7 +668,8 @@ impl Engine {
             info.db_path.as_deref(),
             self.config_path.as_deref(),
             state_dir,
-        ))
+        )
+        .with_index_key(info.db_key))
     }
 
     /// Why the index, configuration or state directory this engine opened
