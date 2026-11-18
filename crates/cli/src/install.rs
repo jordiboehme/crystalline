@@ -2800,7 +2800,7 @@ pub(crate) enum AskOutcome {
 /// set `update.check` (the config or `CRYSTALLINE_UPDATE_CHECK`), when this
 /// machine was asked before, or when an update may not be offered for this
 /// binary (`suppressed`: `CI`, `NO_UPDATE_NOTIFIER`, Docker, mcpb, an app
-/// package, an unofficial build). Otherwise it asks when stdin and stdout
+/// package, an unofficial build). Otherwise it asks when stdin and stderr
 /// are terminals (`tty`) and prints the hint when they are not. Pure.
 pub(crate) fn should_ask(
     tty: bool,
@@ -2822,10 +2822,10 @@ pub(crate) fn should_ask(
 /// Everything [`ask_with`] reads, writes and asks through, so the flow runs
 /// in tests without a terminal, a daemon or this machine's receipt.
 pub(crate) struct AskSeams<'a> {
-    /// stdin and stdout are terminals.
+    /// stdin and stderr are terminals ([`interactive`]).
     pub(crate) tty: bool,
     pub(crate) json: bool,
-    /// `CRYSTALLINE_UPDATE_CHECK` is set.
+    /// `CRYSTALLINE_UPDATE_CHECK` is set ([`env_decided`]).
     pub(crate) env_set: bool,
     /// See [`should_ask`].
     pub(crate) suppressed: bool,
@@ -2921,9 +2921,12 @@ pub(crate) fn ask_update_check(json: bool) -> AskOutcome {
     // The install summary on stdout comes before the question.
     let _ = std::io::stdout().flush();
     ask_with(AskSeams {
-        tty: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        tty: interactive(
+            std::io::stdin().is_terminal(),
+            std::io::stderr().is_terminal(),
+        ),
         json,
-        env_set: std::env::var_os(UPDATE_CHECK_ENV).is_some(),
+        env_set: env_decided(std::env::var_os(UPDATE_CHECK_ENV)),
         suppressed: !update::may_offer(&env, &detection),
         receipt: &receipt_path,
         now: time::now(),
@@ -2939,6 +2942,19 @@ pub(crate) fn ask_update_check(json: bool) -> AskOutcome {
 
 /// The variable that sets `update.check` from the environment.
 const UPDATE_CHECK_ENV: &str = "CRYSTALLINE_UPDATE_CHECK";
+
+/// Whether the question can be asked: the answer comes from stdin and the
+/// question goes to stderr, so both must be terminals (an install run with
+/// `2>log` must not wait on a question nobody sees). Pure.
+pub(crate) fn interactive(stdin_tty: bool, stderr_tty: bool) -> bool {
+    stdin_tty && stderr_tty
+}
+
+/// Whether `CRYSTALLINE_UPDATE_CHECK` decides the setting: set to anything
+/// but an empty value, which the settings overlay reads as unset. Pure.
+pub(crate) fn env_decided(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
 
 /// Whether the stored configuration sets `update.check`, true or false:
 /// config.yaml, or the configuration document on Postgres together with the
@@ -3085,6 +3101,25 @@ mod update_question_tests {
                 Ask::Silent
             );
         }
+    }
+
+    #[test]
+    fn asks_only_when_stdin_and_stderr_are_terminals() {
+        assert!(interactive(true, true));
+        assert!(
+            !interactive(true, false),
+            "stderr to a file: no hidden question"
+        );
+        assert!(!interactive(false, true));
+        assert!(!interactive(false, false));
+    }
+
+    #[test]
+    fn an_empty_update_check_variable_counts_as_unset() {
+        assert!(!env_decided(None));
+        assert!(!env_decided(Some("".into())));
+        assert!(env_decided(Some("false".into())));
+        assert!(env_decided(Some("true".into())));
     }
 
     #[test]
