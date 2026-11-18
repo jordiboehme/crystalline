@@ -16,6 +16,11 @@
 //! file needs (everything else that does not parse stays `E001`), and
 //! `crystalline doctor --fix` removes the extra copies when they all agree.
 //! `E011` warns about a key or value too large for the metadata index.
+//! `E012` warns about a body that opens with a second frontmatter block,
+//! which 0.33.0 stored when a capture's content opened with one;
+//! `crystalline doctor --fix` merges it (and any blocks stacked under it) by
+//! the rules a write lifts such a block by, writing the frontmatter anew as
+//! an overwrite does, so YAML comments and the key order are not kept.
 //!
 //! `E009` is the odd one out twice over: it is about paths rather than
 //! frontmatter, and it is domain-scoped rather than per-file, so it runs from
@@ -30,7 +35,9 @@ use crate::address::slugify;
 use crate::engram::{
     Frontmatter, META_KEY_MAX_BYTES, META_VALUE_MAX_BYTES, RECOMMENDED_TYPES, meta_value_text,
 };
-use crate::frontmatter::{DuplicateKey, duplicate_keys, keep_first_copies, line_list};
+use crate::frontmatter::{
+    DuplicateKey, duplicate_keys, keep_first_copies, line_list, second_block,
+};
 use crate::parse::{ParseError, parse_engram};
 
 use super::scanner::{Domain, ScannedFile};
@@ -114,6 +121,10 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
     };
 
     let fm = &engram.frontmatter;
+
+    if let Some(block) = second_block(&file.source) {
+        emit_second_block(&file.path, Some(block.line), &block.keys, sink);
+    }
 
     if fm.title.trim().is_empty() {
         sink.emit(
@@ -276,6 +287,38 @@ pub(crate) fn check_index_limits(path: &Path, fm: &Frontmatter, sink: &mut Sink)
             _ => {}
         }
     }
+}
+
+/// `E012`: the body opens with a second frontmatter block, whose `keys`
+/// every reader takes for body text. 0.33.0 stored such a block when a
+/// capture's content opened with one.
+pub(crate) fn emit_second_block(
+    path: &Path,
+    line: Option<usize>,
+    keys: &[String],
+    sink: &mut Sink,
+) {
+    let named = if keys.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", keys.join(", "))
+    };
+    sink.emit(
+        path,
+        line,
+        "E012",
+        Severity::Warning,
+        format!(
+            "the body opens with a second frontmatter block{named}, which every reader takes for body text"
+        ),
+        Some(
+            "merge it into the engram's own frontmatter with `crystalline doctor --fix` (a file \
+             domain; the frontmatter is written anew, without YAML comments or the key order), \
+             or rewrite the engram with write_engram, overwrite: true and its whole text \
+             as content, which merges the block"
+                .into(),
+        ),
+    );
 }
 
 /// `E010`: one frontmatter key held more than once, pointing at the second

@@ -1,29 +1,21 @@
 //! Only `crystalline_core::time` may name a date library: everything else
-//! goes through it.
+//! goes through it, and chrono has left the build.
 //!
 //! The test scans every crate (`Cargo.toml`, `build.rs` and the `.rs` files
 //! under `src`, `tests`, `benches` and `examples`) for `chrono` and `jiff`
-//! as a whole word and for the chrono bridge (`from_chrono`, `into_chrono`).
-//! Exempt are the module itself and what builds and checks it:
-//! `crates/core/Cargo.toml`, `crates/core/src/time.rs`, everything under
-//! `crates/core/src/time/` and `crates/core/tests/it/time_*.rs`.
+//! as a whole word and for the old chrono bridge (`from_chrono`,
+//! `into_chrono`). Exempt are the module itself and what builds and checks
+//! it: `crates/core/Cargo.toml`, `crates/core/src/time.rs`, everything
+//! under `crates/core/src/time/` and `crates/core/tests/it/time_*.rs`. The
+//! module's own prose still says what chrono did, so it may name chrono.
 //!
-//! A file that names jiff fails. A file that names chrono or uses the bridge
-//! fails unless it is on `crates/core/tests/time_boundary_allow.txt`, the
-//! files that still used chrono when the module arrived; a listed file that
-//! no longer does fails too, so the list shrinks as each crate moves over.
-//!
-//! The test matches names, not uses: a file can call chrono methods on a
-//! value without naming the crate. So an empty list does not prove a crate
-//! is off chrono; removing `chrono` from the crate's `Cargo.toml` (and, in
-//! the end, the compiler once chrono is gone) does.
+//! A file outside those that names jiff or chrono, or uses the bridge,
+//! fails. No manifest may name chrono, the workspace's own and core's
+//! included: chrono is no dependency of any crate here.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
-
-const ALLOW_LIST: &str = include_str!("../time_boundary_allow.txt");
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -99,57 +91,65 @@ fn scanned_files(root: &Path) -> Vec<String> {
 #[test]
 fn nothing_but_the_time_module_names_chrono_or_jiff() {
     let root = workspace_root();
-    let allowed: BTreeSet<&str> = ALLOW_LIST
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
-
     let mut names_jiff = Vec::new();
-    let mut unlisted_chrono = Vec::new();
-    let mut still_listed = Vec::new();
-    let mut seen_chrono = BTreeSet::new();
+    let mut uses_chrono_files = Vec::new();
     for rel in scanned_files(&root) {
         let text = std::fs::read_to_string(root.join(&rel)).expect("readable source");
         if names(&text, "jiff") {
             names_jiff.push(rel.clone());
         }
         if uses_chrono(&text) {
-            seen_chrono.insert(rel.clone());
-            if !allowed.contains(rel.as_str()) {
-                unlisted_chrono.push(rel);
-            }
+            uses_chrono_files.push(rel);
         }
     }
-    for listed in &allowed {
-        if !seen_chrono.contains(*listed) {
-            still_listed.push(*listed);
+    let mut chrono_manifests = Vec::new();
+    for rel in manifests(&root) {
+        let text = std::fs::read_to_string(root.join(&rel)).expect("readable manifest");
+        if names(&text, "chrono") {
+            chrono_manifests.push(rel);
         }
     }
 
     let mut problems = String::new();
-    if !names_jiff.is_empty() {
-        problems.push_str("these files name jiff; only crystalline-core may:\n");
-        problems.push_str(&names_jiff.join("\n"));
-        problems.push('\n');
-    }
-    if !unlisted_chrono.is_empty() {
-        problems.push_str(
+    for (files, what) in [
+        (
+            &names_jiff,
+            "these files name jiff; only crystalline-core's time module may",
+        ),
+        (
+            &uses_chrono_files,
             "these files name chrono or use from_chrono/into_chrono; use \
-             crystalline_core::time instead (the allow-list only shrinks):\n",
-        );
-        problems.push_str(&unlisted_chrono.join("\n"));
-        problems.push('\n');
-    }
-    if !still_listed.is_empty() {
-        problems.push_str(
-            "these allow-list entries no longer use chrono; remove them from \
-             crates/core/tests/time_boundary_allow.txt:\n",
-        );
-        problems.push_str(&still_listed.join("\n"));
-        problems.push('\n');
+             crystalline_core::time instead",
+        ),
+        (
+            &chrono_manifests,
+            "these manifests name chrono; chrono has left the build",
+        ),
+    ] {
+        if !files.is_empty() {
+            problems.push_str(what);
+            problems.push_str(":\n");
+            problems.push_str(&files.join("\n"));
+            problems.push('\n');
+        }
     }
     assert!(problems.is_empty(), "{problems}");
+}
+
+/// Every manifest: the workspace's own and each crate's, as a
+/// workspace-relative path with forward slashes.
+fn manifests(root: &Path) -> Vec<String> {
+    let mut out = vec!["Cargo.toml".to_string()];
+    let crates = std::fs::read_dir(root.join("crates")).expect("crates folder");
+    for entry in crates {
+        let dir = entry.expect("crate entry").path();
+        if dir.join("Cargo.toml").is_file() {
+            let name = dir.file_name().expect("a folder name").to_string_lossy();
+            out.push(format!("crates/{name}/Cargo.toml"));
+        }
+    }
+    out.sort();
+    out
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn the_time_module_and_its_checks_are_exempt() {
         "crates/core/Cargo.toml",
         "crates/core/src/time.rs",
         "crates/core/src/time/parse.rs",
-        "crates/core/tests/it/time_differential.rs",
+        "crates/core/tests/it/time_boundary.rs",
     ] {
         assert!(exempt(rel), "{rel}");
     }

@@ -3639,11 +3639,15 @@ async fn reindex_dispatch(
         // sentence a person gets points at `doctor --fix`, which clears a stale
         // lock and does not repair a database. `--wipe` is what repairs one,
         // and nothing else in the program will ever name it to them. Said only
-        // here, where the remedy is a flag on the command they just ran.
-        cmd::IndexRoute::Unreachable(why) if !wipe => Err(anyhow::anyhow!(
-            "{} If the database file itself is damaged, set it aside and rebuild from your files with: crystalline reindex --wipe - that renames the unreadable file rather than deleting it, so its bytes are still there afterwards.",
-            cmd::index_unreachable("reindex", &why)
-        )),
+        // here, where the remedy is a flag on the command they just ran. Only
+        // for the Turso file: on Postgres there is no file to set aside, and
+        // the shared wording already names the database checks.
+        cmd::IndexRoute::Unreachable(why) if !wipe && cmd::backend_is_turso(&cfg) => {
+            Err(anyhow::anyhow!(
+                "{} If the database file itself is damaged, set it aside and rebuild from your files with: crystalline reindex --wipe - that renames the unreadable file rather than deleting it, so its bytes are still there afterwards.",
+                cmd::index_unreachable("reindex", &why)
+            ))
+        }
         other => {
             cmd::reindex(
                 cmd::local_store(other, "reindex")?,
@@ -6312,13 +6316,13 @@ fn run_prompt(
     if matches!(
         format,
         PromptFormat::Copilot | PromptFormat::Cursor | PromptFormat::HookSpecific
-    ) && session_start.as_ref().and_then(|p| p.source.as_deref()) == Some("resume")
+    ) && session_start.as_ref().and_then(SessionStartPayload::source) == Some("resume")
     {
         return Ok(());
     }
     if let Some(payload) = &session_start
-        && matches!(payload.source.as_deref(), Some("clear" | "compact"))
-        && let Some(id) = payload.session_id.as_deref()
+        && matches!(payload.source(), Some("clear" | "compact"))
+        && let Some(id) = payload.session_id()
     {
         hook::reset_recalled(id);
     }
@@ -6490,7 +6494,7 @@ fn run_prompt(
                 session_start
                     .as_ref()
                     .is_some_and(SessionStartPayload::in_subagent),
-                session_start.as_ref().and_then(|p| p.source.as_deref()),
+                session_start.as_ref().and_then(SessionStartPayload::source),
             )
         })
         .flatten();
@@ -6820,7 +6824,7 @@ fn silenced_by_importing_harness(
             None => return false,
         },
     };
-    let payload_fields: &[&str] = if payload.is_some_and(|p| p.cursor_version.is_some()) {
+    let payload_fields: &[&str] = if payload.is_some_and(SessionStartPayload::has_cursor_version) {
         &["cursor_version"]
     } else {
         &[]
@@ -6839,21 +6843,26 @@ fn silenced_by_importing_harness(
 
 /// The fields this command reads off a SessionStart payload. Each carries
 /// a serde default, so a harness that omits one, sends `null` or adds fields
-/// nobody here knows about still parses.
+/// nobody here knows about still parses. Each is read as a raw JSON value,
+/// like the Stop hook's (R8): one field of an unexpected type must not fail
+/// the whole parse, or the payload would read as a fresh start outside a
+/// subagent and lose the subagent and resume silence.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct SessionStartPayload {
-    /// What started the session: `startup`, `resume`, `clear` or `compact`.
+    /// What started the session: `startup`, `resume`, `clear` or `compact`
+    /// (Copilot also sends `new`). Read through [`Self::source`].
     #[serde(default)]
-    source: Option<String>,
+    source: Option<serde_json::Value>,
     /// The session this start belongs to, which is the key to the per-session
-    /// hook state file.
+    /// hook state file. Read through [`Self::session_id`].
     #[serde(default)]
-    session_id: Option<String>,
+    session_id: Option<serde_json::Value>,
     /// Cursor's version, which Cursor puts in the payload of the hooks it
-    /// runs: the signal that this hook runs inside Cursor. That an imported
-    /// Claude Code hook gets it too is documented but not yet observed.
+    /// runs: the signal that this hook runs inside Cursor, whatever its type
+    /// (a number counts, as in the Stop hook). That an imported Claude Code
+    /// hook gets it too is documented but not yet observed.
     #[serde(default)]
-    cursor_version: Option<String>,
+    cursor_version: Option<serde_json::Value>,
     /// The subagent id a harness puts on a payload sent from inside a
     /// subagent, read as a raw JSON value like the Stop hook's.
     #[serde(default)]
@@ -6868,6 +6877,25 @@ impl SessionStartPayload {
     /// [`hook::marks_subagent`]'s rule.
     fn in_subagent(&self) -> bool {
         hook::marks_subagent(self.agent_id.as_ref(), self.agent_id_camel.as_ref())
+    }
+
+    /// The `source` text. A `source` of another type is a start of an
+    /// unknown kind, `""`: never a fresh start (no update block), never a
+    /// resume.
+    fn source(&self) -> Option<&str> {
+        self.source
+            .as_ref()
+            .map(|value| value.as_str().unwrap_or(""))
+    }
+
+    /// The `session_id` text, `None` when it is missing or not a string.
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_ref().and_then(serde_json::Value::as_str)
+    }
+
+    /// Whether the payload carries `cursor_version` (not `null`).
+    fn has_cursor_version(&self) -> bool {
+        self.cursor_version.is_some()
     }
 }
 
@@ -6912,6 +6940,31 @@ fn to_core_format(f: OutputFormat) -> verify::Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M3: one field of an unexpected type keeps the rest of the payload.
+    /// The subagent id still silences the start, a `cursor_version` number
+    /// still marks Cursor, and a `source` that is no string is no fresh
+    /// start.
+    #[test]
+    fn a_payload_field_of_another_type_keeps_the_rest() {
+        let parse =
+            |text: &str| serde_json::from_str::<SessionStartPayload>(text).expect("it parses");
+        let subagent = parse(r#"{"agent_id":"a1","source":"startup","cursor_version":3}"#);
+        assert!(subagent.in_subagent());
+        assert_eq!(subagent.source(), Some("startup"));
+        assert!(subagent.has_cursor_version());
+        let odd = parse(r#"{"source":7,"session_id":5,"cursor_version":null}"#);
+        assert!(!odd.in_subagent());
+        assert_eq!(odd.source(), Some(""), "a start of an unknown kind");
+        assert_eq!(odd.session_id(), None);
+        assert!(!odd.has_cursor_version());
+        let plain = parse(r#"{"source":"clear","session_id":"s1"}"#);
+        assert_eq!(plain.source(), Some("clear"));
+        assert_eq!(plain.session_id(), Some("s1"));
+        let empty = parse("{}");
+        assert_eq!(empty.source(), None);
+        assert_eq!(empty.session_id(), None);
+    }
 
     #[test]
     fn a_dropped_owner_is_named_with_the_reason() {

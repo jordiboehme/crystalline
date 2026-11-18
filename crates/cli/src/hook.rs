@@ -81,10 +81,9 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
-use crystalline_core::{HarnessKind, config};
+use crystalline_core::{HarnessKind, config, time};
 use crystalline_service::maintenance::{self, MAINTENANCE_FILE, MaintenanceState};
 
 /// The reminder printed on the one Stop call per session that earns it. Exact
@@ -345,7 +344,8 @@ pub struct SessionState {
     /// Stop for the same session stays silent regardless of transcript size.
     pub nudged: bool,
     /// When this file was last written.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub updated_at: time::Stamp,
     /// Addresses this session has already been shown by the prompt hook,
     /// oldest first. Capped at `RECALLED_MAX` (200); the oldest fall off.
     /// Absent from every file written before 0.19.0, which is why it carries
@@ -365,7 +365,7 @@ impl SessionState {
             v: STATE_VERSION,
             stops: 0,
             nudged: false,
-            updated_at: chrono::Utc::now(),
+            updated_at: time::now(),
             recalled: Vec::new(),
         }
     }
@@ -501,21 +501,19 @@ pub fn decide(
 /// function stays a plain comparison, and a throttle record that reads as
 /// nonsense costs delayed asks rather than a decision made on a stamp nobody
 /// wrote.
-pub fn evolve_ask(m: &MaintenanceState, now: DateTime<Utc>) -> Option<Vec<String>> {
+pub fn evolve_ask(m: &MaintenanceState, now: time::Stamp) -> Option<Vec<String>> {
     if let Some(nudged) = m.last_nudge_at
-        && now.signed_duration_since(nudged) < TimeDelta::hours(EVOLVE_NUDGE_COOLDOWN_HOURS)
+        && now.since(nudged) < time::hours(EVOLVE_NUDGE_COOLDOWN_HOURS)
     {
         return None;
     }
-    let interval = TimeDelta::days(EVOLVE_RUN_INTERVAL_DAYS);
+    let interval = time::days(EVOLVE_RUN_INTERVAL_DAYS);
     let weekly_due = match m.last_run_at {
-        Some(ran) => now.signed_duration_since(ran) >= interval,
+        Some(ran) => now.since(ran) >= interval,
         // No sweep ever recorded: the clock runs from the first time this
         // hook saw the machine. Absent (the very first call, which seeds it)
         // nothing is due yet.
-        None => m
-            .first_seen
-            .is_some_and(|seen| now.signed_duration_since(seen) >= interval),
+        None => m.first_seen.is_some_and(|seen| now.since(seen) >= interval),
     };
     if weekly_due || !m.pending_domains.is_empty() {
         Some(m.pending_domains.clone())
@@ -658,10 +656,9 @@ fn remote_backlogs(set: &crystalline_remote::SourceSet) -> RemoteBacklogs {
 
 /// Whether the reflect ask's cooldown is clear: never asked, or asked at
 /// least [`REFLECT_NUDGE_COOLDOWN_HOURS`] ago.
-pub fn reflect_ask(m: &MaintenanceState, now: DateTime<Utc>) -> bool {
-    m.last_reflect_nudge_at.is_none_or(|at| {
-        now.signed_duration_since(at) >= TimeDelta::hours(REFLECT_NUDGE_COOLDOWN_HOURS)
-    })
+pub fn reflect_ask(m: &MaintenanceState, now: time::Stamp) -> bool {
+    m.last_reflect_nudge_at
+        .is_none_or(|at| now.since(at) >= time::hours(REFLECT_NUDGE_COOLDOWN_HOURS))
 }
 
 /// The domains this session recalled from, in first-seen order: what the
@@ -899,7 +896,7 @@ pub fn run_stop(harness: Option<&str>) {
     // `record_pending` from the daemon landing inside that gap has to survive.
     // Nothing else here writes the file, so the whole-file save is gone and
     // with it the window it opened.
-    let now = chrono::Utc::now();
+    let now = time::now();
     let mut maintenance_state = maintenance::load();
     if maintenance_state.first_seen.is_none() {
         stamp_maintenance(Stamp::FirstSeen, now);
@@ -1135,7 +1132,7 @@ enum Stamp {
 /// goes to a daemon that already runs (a passive attach, the hook's budget
 /// allows no start) and is dropped when none answers. Best effort either
 /// way, like every recorder.
-fn stamp_maintenance(stamp: Stamp, now: chrono::DateTime<chrono::Utc>) {
+fn stamp_maintenance(stamp: Stamp, now: time::Stamp) {
     if crystalline_service::runs_in::PackageContext::here().is_packaged() {
         let name = match stamp {
             Stamp::FirstSeen => "first_seen",
@@ -1146,7 +1143,7 @@ fn stamp_maintenance(stamp: Stamp, now: chrono::DateTime<chrono::Utc>) {
             "v": 1,
             "cmd": "maintenance_stamp",
             "stamp": name,
-            "at": now.to_rfc3339(),
+            "at": now.rfc3339(),
         });
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1203,7 +1200,7 @@ fn stopped(state: &SessionState, nudge: bool) -> SessionState {
         v: STATE_VERSION,
         stops: state.stops.saturating_add(1),
         nudged: state.nudged || nudge,
-        updated_at: chrono::Utc::now(),
+        updated_at: time::now(),
         recalled: state.recalled.clone(),
     }
 }
@@ -1235,7 +1232,7 @@ fn reset_recalled_at(path: &Path) {
         return;
     }
     state.recalled.clear();
-    state.updated_at = chrono::Utc::now();
+    state.updated_at = time::now();
     let _ = write_state(path, &state);
 }
 
@@ -1746,7 +1743,7 @@ mod tests {
             v: STATE_VERSION,
             stops: 1,
             nudged: false,
-            updated_at: chrono::Utc::now(),
+            updated_at: time::now(),
             recalled: vec![
                 "crystalline://ship-ops/docking-gear".to_string(),
                 "crystalline://ship-ops/coolant/vent-driver-retries".to_string(),
@@ -1773,7 +1770,7 @@ mod tests {
             v: STATE_VERSION,
             stops: 3,
             nudged: true,
-            updated_at: chrono::Utc::now(),
+            updated_at: time::now(),
             recalled: vec![
                 "crystalline://a/b".to_string(),
                 "crystalline://c/d".to_string(),
@@ -1809,9 +1806,7 @@ mod tests {
     fn reset_recalled_does_not_rewrite_an_already_empty_list() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.json");
-        let stamp = chrono::DateTime::parse_from_rfc3339("2026-09-01T08:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let stamp = time::parse_lenient_stamp("2026-09-01T08:00:00Z").unwrap();
         let before = SessionState {
             v: STATE_VERSION,
             stops: 1,
@@ -1825,6 +1820,29 @@ mod tests {
 
         let after = read_state(&path).expect("the file is still there");
         assert_eq!(after.updated_at, stamp);
+    }
+
+    /// A state file written by 0.33.0 loads, and writing it back gives the
+    /// same bytes: the stamp keeps its `Z` and its fraction.
+    #[test]
+    fn a_state_file_from_0_33_0_round_trips_byte_for_byte() {
+        for written in [
+            r#"{"v":1,"stops":2,"nudged":true,"updated_at":"2026-09-01T08:00:00Z","recalled":["crystalline://a/b"]}"#,
+            r#"{"v":1,"stops":0,"nudged":false,"updated_at":"2026-09-01T08:00:00.120Z","recalled":[]}"#,
+            r#"{"v":1,"stops":5,"nudged":false,"updated_at":"2026-09-01T08:00:00.123456789Z","recalled":[]}"#,
+            r#"{"v":1,"stops":3,"nudged":false,"updated_at":"2026-09-01T08:00:00.123456Z","recalled":[]}"#,
+        ] {
+            let state: SessionState = serde_json::from_str(written).expect("0.33.0 state loads");
+            assert_eq!(serde_json::to_string(&state).unwrap(), written);
+        }
+        // A stamp written with an offset loads as the same instant and is
+        // written back in UTC with `Z`, as 0.33.0 did.
+        let offset = r#"{"v":1,"stops":1,"nudged":false,"updated_at":"2026-09-01T10:00:00.120+02:00","recalled":[]}"#;
+        let state: SessionState = serde_json::from_str(offset).expect("an offset stamp loads");
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            r#"{"v":1,"stops":1,"nudged":false,"updated_at":"2026-09-01T08:00:00.120Z","recalled":[]}"#
+        );
     }
 
     // --- decide ----------------------------------------------------------------
@@ -1950,16 +1968,16 @@ mod tests {
 
     /// The fixed instant every throttle case below measures against, so no
     /// test depends on the wall clock.
-    fn now() -> chrono::DateTime<chrono::Utc> {
-        "2026-08-17T12:00:00Z".parse().unwrap()
+    fn now() -> time::Stamp {
+        time::parse_lenient_stamp("2026-08-17T12:00:00Z").unwrap()
     }
 
-    fn days_ago(days: i64) -> chrono::DateTime<chrono::Utc> {
-        now() - chrono::TimeDelta::days(days)
+    fn days_ago(days: i64) -> time::Stamp {
+        now() - time::days(days)
     }
 
-    fn hours_ago(hours: i64) -> chrono::DateTime<chrono::Utc> {
-        now() - chrono::TimeDelta::hours(hours)
+    fn hours_ago(hours: i64) -> time::Stamp {
+        now() - time::hours(hours)
     }
 
     #[test]
@@ -2065,7 +2083,7 @@ mod tests {
         let short = MaintenanceState {
             // One minute later than the sweep above, so one minute short of the
             // interval.
-            last_run_at: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + TimeDelta::minutes(1)),
+            last_run_at: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + time::minutes(1)),
             ..due.clone()
         };
         assert_eq!(
@@ -2090,7 +2108,7 @@ mod tests {
         );
 
         let short = MaintenanceState {
-            first_seen: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + TimeDelta::minutes(1)),
+            first_seen: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + time::minutes(1)),
             ..MaintenanceState::default()
         };
         assert_eq!(
@@ -2107,7 +2125,7 @@ mod tests {
         let state = MaintenanceState {
             pending_domains: vec!["a".to_string()],
             pending_since: Some(days_ago(2)),
-            last_nudge_at: Some(hours_ago(EVOLVE_NUDGE_COOLDOWN_HOURS) + TimeDelta::minutes(1)),
+            last_nudge_at: Some(hours_ago(EVOLVE_NUDGE_COOLDOWN_HOURS) + time::minutes(1)),
             first_seen: Some(days_ago(30)),
             ..MaintenanceState::default()
         };
@@ -2437,7 +2455,7 @@ mod tests {
             kind: crystalline_remote::CredentialKind::Token,
             token_endpoint: None,
             revocation_endpoint: None,
-            connected_at: crystalline_core::time::now(),
+            connected_at: time::now(),
             mounts: vec![crystalline_remote::MountRecord {
                 remote: "jordi".into(),
                 local: "jordi-acme".into(),
@@ -2470,7 +2488,7 @@ mod tests {
                 &crystalline_remote::Cached {
                     account: "ada".into(),
                     etag: "e".into(),
-                    fetched_at: crystalline_core::time::now(),
+                    fetched_at: time::now(),
                     data,
                     last_failure: None,
                 },

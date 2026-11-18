@@ -250,7 +250,7 @@ impl Shared {
             SessionInfo {
                 id,
                 kind: kind.to_string(),
-                since: chrono::Utc::now().to_rfc3339(),
+                since: crystalline_core::time::now().rfc3339(),
             },
         );
         // Nobody listens unless the idle exit runs; a send with no receiver
@@ -1364,7 +1364,7 @@ async fn read_document_at_takeover(
     };
     let doc = side.load_config().await.map_err(|e| fatal(e.to_string()))?;
     let state = match &doc {
-        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at.into_chrono()),
+        Some(doc) => crate::durable::DocumentState::Saved(doc.updated_at),
         None => crate::durable::DocumentState::NotSaved,
     };
     loaded
@@ -3726,7 +3726,7 @@ async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bo
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
-                engine.origin_poll_tick(Instant::now(), chrono::Utc::now()).await;
+                engine.origin_poll_tick(Instant::now(), crystalline_core::time::now()).await;
             }
         }
     }
@@ -3931,7 +3931,7 @@ pub async fn run_orphan_sweep(
             _ = ticker.tick() => {
                 match engine
                     .collect_orphaned_domains(
-                        Some(chrono::Duration::days(ORPHAN_GRACE_DAYS)),
+                        Some(crystalline_core::time::days(ORPHAN_GRACE_DAYS)),
                         false,
                     )
                     .await

@@ -131,7 +131,7 @@ fn read_maintenance(home: &Path) -> serde_json::Value {
 /// the same thing whenever the suite runs: a literal date would drift past the
 /// weekly interval and silently change which arm a test exercises.
 fn stamp(days: i64) -> String {
-    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
+    (crystalline_core::time::now() - crystalline_core::time::days(days)).rfc3339()
 }
 
 /// Backdate a file's modification time past the sweep's one-week cutoff.

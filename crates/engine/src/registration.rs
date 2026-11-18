@@ -288,10 +288,7 @@ pub fn register_virtual_domain_saving(
         );
         save(cfg, name)?;
     }
-    let today = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
+    let today = crystalline_core::time::today_utc().ymd();
     Ok(Registered {
         name: name.to_string(),
         root: None,

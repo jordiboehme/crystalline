@@ -1717,7 +1717,7 @@ async fn a_grantee_whose_link_runs_out_is_closed_out_of_its_room() {
     let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
     // Long enough to be live through the join and the upgrade, short enough
     // that the saver's four-times-a-second pass reaches it inside the test.
-    let until = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+    let until = (crystalline_core::time::now() + crystalline_core::time::seconds(2)).rfc3339();
     let minted = fx.mint_until(&alice, &path, &until).await;
     let token = minted["token"].as_str().unwrap().to_string();
     fx.accept_and_join(&bob, &token).await;

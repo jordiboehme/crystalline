@@ -290,10 +290,7 @@ mod pg {
     }
 
     fn since(owner: &OwnerRow) -> String {
-        owner
-            .since
-            .into_chrono()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        owner.since.rfc3339_secs_z()
     }
 
     /// Who owns the database, for the log and the control socket.
@@ -398,7 +395,8 @@ mod pg {
                     "since": since(o),
                 })
             });
-            let waited = (chrono::Utc::now() - status.waiting_since.into_chrono())
+            let waited = crystalline_core::time::now()
+                .since(status.waiting_since)
                 .num_seconds()
                 .max(0);
             let intent = crate::instance::serve_intent();
@@ -1062,7 +1060,6 @@ mod pg {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use chrono::{TimeZone, Utc};
 
         fn row(released: bool) -> OwnerRow {
             OwnerRow {
@@ -1072,13 +1069,9 @@ mod pg {
                 pid: 42,
                 backend_pid: 4242,
                 version: "0.33.0".to_string(),
-                since: crystalline_core::time::Stamp::from_chrono(
-                    Utc.with_ymd_and_hms(2026, 11, 16, 9, 30, 0).unwrap(),
-                ),
+                since: crystalline_core::time::Stamp::from_ymd_hms(2026, 11, 16, 9, 30, 0).unwrap(),
                 released_at: released.then(|| {
-                    crystalline_core::time::Stamp::from_chrono(
-                        Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap(),
-                    )
+                    crystalline_core::time::Stamp::from_ymd_hms(2026, 11, 16, 10, 0, 0).unwrap()
                 }),
             }
         }

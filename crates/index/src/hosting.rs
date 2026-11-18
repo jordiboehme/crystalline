@@ -127,17 +127,25 @@ pub async fn instance_label(store: &dyn Store, name: &str, instance_id: &str) ->
 /// instance.
 const DEFAULT_STALE_SECS: i64 = 90;
 
+/// The longest span a seconds setting from the environment holds (the
+/// stale threshold, the heartbeat): 100 years. A larger value is held here,
+/// so no instant computed from it leaves the range a date can hold.
+pub const MAX_ENV_SECS: i64 = 100 * 36_525 * 864;
+
 /// The host-lock stale threshold in seconds, from `CRYSTALLINE_STALE_SECS`
 /// (a short one makes multi-instance verification fast), else 90. An unset,
-/// empty, unparsable or non-positive value is the default. The daemon and a
-/// sync without a daemon both read it here, so they agree on when a lock is
-/// stale.
+/// empty, unparsable or non-positive value is the default, and a value over
+/// [`MAX_ENV_SECS`] is held there. The daemon and a sync without a daemon
+/// both read it here, so they agree on when a lock is stale.
 pub fn stale_secs() -> i64 {
-    std::env::var("CRYSTALLINE_STALE_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
+    stale_secs_from(std::env::var("CRYSTALLINE_STALE_SECS").ok().as_deref())
+}
+
+/// [`stale_secs`] for the variable's value `raw`.
+fn stale_secs_from(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_STALE_SECS)
+        .map_or(DEFAULT_STALE_SECS, |n| n.min(MAX_ENV_SECS))
 }
 
 /// The `(now, stale_before)` pair a claim compares heartbeats with, both
@@ -145,7 +153,7 @@ pub fn stale_secs() -> i64 {
 /// comparison stays a lexical one.
 pub fn claim_window(stale_secs: i64) -> (String, String) {
     let now = time::now();
-    let stale_before = now - time::seconds(stale_secs);
+    let stale_before = now.saturating_sub(time::saturating_seconds(stale_secs));
     (now.rfc3339(), stale_before.rfc3339())
 }
 
@@ -383,6 +391,23 @@ mod tests {
     use super::*;
     #[cfg(feature = "postgres")]
     use crate::store::ReadStore;
+
+    /// A stale threshold from the environment never panics a claim: a huge
+    /// one is held at 100 years, and a window over any span stays a window.
+    #[test]
+    fn a_huge_stale_threshold_is_held_and_never_panics() {
+        assert_eq!(stale_secs_from(None), DEFAULT_STALE_SECS);
+        assert_eq!(stale_secs_from(Some("0")), DEFAULT_STALE_SECS);
+        assert_eq!(stale_secs_from(Some("-5")), DEFAULT_STALE_SECS);
+        assert_eq!(stale_secs_from(Some(" 120 ")), 120);
+        assert_eq!(stale_secs_from(Some("3155760000")), MAX_ENV_SECS);
+        assert_eq!(stale_secs_from(Some("3155760001")), MAX_ENV_SECS);
+        assert_eq!(stale_secs_from(Some("9223372036854775807")), MAX_ENV_SECS);
+        for secs in [MAX_ENV_SECS, 300_000_000_000, i64::MAX] {
+            let (now, stale_before) = claim_window(secs);
+            assert!(stale_before < now, "{secs}: {stale_before} {now}");
+        }
+    }
 
     #[test]
     fn the_line_names_the_counts_the_host_and_both_ways_out() {

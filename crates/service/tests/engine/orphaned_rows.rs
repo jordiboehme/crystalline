@@ -865,8 +865,12 @@ async fn a_domain_the_config_file_gains_is_registered_and_served() {
 
 /// Stamp `name` as last seen registered `ago` before now, the way a daemon
 /// sweep that ran then would have left it. Returns the instant written.
-async fn plant_stamp(store: &Arc<Mutex<dyn Store>>, name: &str, ago: chrono::Duration) -> String {
-    let when = (chrono::Utc::now() - ago).to_rfc3339();
+async fn plant_stamp(
+    store: &Arc<Mutex<dyn Store>>,
+    name: &str,
+    ago: crystalline_core::time::Delta,
+) -> String {
+    let when = (crystalline_core::time::now() - ago).rfc3339();
     store
         .lock()
         .await
@@ -934,12 +938,12 @@ fn considered<'a>(report: &'a serde_json::Value, name: &str) -> Option<&'a serde
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_domain_unregistered_past_the_grace_period_is_collected() {
     let (_tmp, engine, store) = fixture().await;
-    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(13)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
     assert!(before >= 2, "the orphan starts with its rows: {before}");
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -975,11 +979,11 @@ async fn a_domain_unregistered_past_the_grace_period_is_collected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_domain_unregistered_for_an_hour_is_not_collected() {
     let (_tmp, engine, store) = fixture().await;
-    plant_stamp(&store, "gone", chrono::Duration::hours(1)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::hours(1)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -1002,11 +1006,11 @@ async fn a_domain_unregistered_for_an_hour_is_not_collected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registered_domain_is_never_collected_whatever_its_stamp() {
     let (_tmp, engine, store) = fixture().await;
-    let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
+    let ancient = plant_stamp(&store, "keep", crystalline_core::time::days(400)).await;
     let before = engrams_of(&store, "keep").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -1044,7 +1048,7 @@ async fn a_never_stamped_domain_is_stamped_now_and_not_collected() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -1068,11 +1072,11 @@ async fn a_never_stamped_domain_is_stamped_now_and_not_collected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
     let (_tmp, engine, store) = fixture().await;
-    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(13)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let dry = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), true)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), true)
         .await
         .unwrap();
     assert_eq!(dry["dry_run"], true, "the report says which it was: {dry}");
@@ -1097,7 +1101,7 @@ async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
     );
 
     let wet = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
     assert_eq!(
@@ -1124,12 +1128,12 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
     let read_only = Engine::new(store.clone(), cfg, None, Some(config_path))
         .with_read_only(true)
         .with_state_dir(tmp.path().join("state"));
-    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
-    let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(13)).await;
+    let ancient = plant_stamp(&store, "keep", crystalline_core::time::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -1172,11 +1176,11 @@ async fn a_read_only_preview_says_nothing_was_changed() {
     let read_only = Engine::new(store.clone(), cfg, None, Some(config_path))
         .with_read_only(true)
         .with_state_dir(tmp.path().join("state"));
-    let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
+    let ancient = plant_stamp(&store, "keep", crystalline_core::time::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), true)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), true)
         .await
         .unwrap();
 
@@ -1216,7 +1220,7 @@ async fn a_read_only_preview_says_nothing_was_changed() {
 async fn an_unreadable_configuration_collects_nothing() {
     let (tmp, engine, store) = fixture().await;
     let config_path = tmp.path().join("config.yaml");
-    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(13)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     for (case, prepare) in [
@@ -1232,7 +1236,7 @@ async fn an_unreadable_configuration_collects_nothing() {
         }
 
         let report = engine
-            .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+            .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
             .await
             .unwrap();
 
@@ -1291,12 +1295,12 @@ async fn a_virtual_domains_rows_are_never_collected() {
         .upsert_domain("gone", None, crystalline_core::config::DomainKind::Virtual)
         .await
         .unwrap();
-    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
     assert!(before >= 2, "it has rows to lose: {before}");
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -1362,11 +1366,11 @@ async fn a_virtual_orphan_is_virtual_even_on_a_read_only_instance() {
         .upsert_domain("gone", None, crystalline_core::config::DomainKind::Virtual)
         .await
         .unwrap();
-    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -1408,7 +1412,7 @@ async fn a_person_asking_collects_a_never_stamped_orphan_and_a_sweep_does_not() 
     // The sweep first, with no grace period at all: an unstamped domain is not
     // old, it is unmeasured, so even a zero grace keeps it.
     let swept = engine
-        .collect_orphaned_domains(Some(chrono::Duration::zero()), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::Delta::ZERO), false)
         .await
         .unwrap();
     assert!(
@@ -1504,7 +1508,7 @@ async fn plant_host_lock(
     store: &Arc<Mutex<dyn Store>>,
     name: &str,
     root: &std::path::Path,
-    ago: chrono::Duration,
+    ago: crystalline_core::time::Delta,
 ) {
     let store = store.lock().await;
     let id = store
@@ -1515,8 +1519,9 @@ async fn plant_host_lock(
         )
         .await
         .unwrap();
-    let beat = (chrono::Utc::now() - ago).to_rfc3339();
-    let stale_before = (chrono::Utc::now() - chrono::Duration::seconds(90)).to_rfc3339();
+    let beat = (crystalline_core::time::now() - ago).rfc3339();
+    let stale_before =
+        (crystalline_core::time::now() - crystalline_core::time::seconds(90)).rfc3339();
     store
         .claim_domain_host(id, "peer-instance", "a peer", &beat, &stale_before, false)
         .await
@@ -1565,12 +1570,12 @@ async fn a_domain_registered_only_in_the_config_file_is_stamped_and_never_collec
     crystalline_core::config::save_yaml(&config_path, &with_later).unwrap();
 
     // As stale as a stamp gets. Only the registration saves it.
-    let ancient = plant_stamp(&store, "later", chrono::Duration::days(400)).await;
+    let ancient = plant_stamp(&store, "later", crystalline_core::time::days(400)).await;
     let before = engrams_of(&store, "later").await.unwrap();
     assert!(before >= 2, "it has rows to lose: {before}");
 
     for (label, grace) in [
-        ("the sweep", Some(chrono::Duration::days(7))),
+        ("the sweep", Some(crystalline_core::time::days(7))),
         ("the person", None),
     ] {
         let report = engine.collect_orphaned_domains(grace, false).await.unwrap();
@@ -1607,14 +1612,14 @@ async fn a_domain_a_live_peer_hosts_is_kept_on_both_paths() {
         &store,
         "gone",
         &tmp.path().join("gone"),
-        chrono::Duration::seconds(5),
+        crystalline_core::time::seconds(5),
     )
     .await;
-    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     for (label, grace) in [
-        ("the sweep", Some(chrono::Duration::days(7))),
+        ("the sweep", Some(crystalline_core::time::days(7))),
         ("the person", None),
     ] {
         let report = engine.collect_orphaned_domains(grace, false).await.unwrap();
@@ -1646,14 +1651,14 @@ async fn a_domain_whose_host_lock_went_stale_is_collected() {
         &store,
         "gone",
         &tmp.path().join("gone"),
-        chrono::Duration::days(1),
+        crystalline_core::time::days(1),
     )
     .await;
-    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(400)).await;
     assert!(engrams_of(&store, "gone").await.unwrap() >= 2);
 
     let report = engine
-        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .collect_orphaned_domains(Some(crystalline_core::time::days(7)), false)
         .await
         .unwrap();
 
@@ -1698,7 +1703,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_daemon_sweep_collects_a_stale_orphan() {
     let (_tmp, engine, store) = fixture().await;
-    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::days(13)).await;
     assert!(
         engrams_of(&store, "gone").await.unwrap() >= 2,
         "the orphan starts with its rows"
@@ -1735,7 +1740,7 @@ async fn the_daemon_sweep_collects_a_stale_orphan() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_daemon_sweep_keeps_an_orphan_inside_the_grace_period() {
     let (_tmp, engine, store) = fixture().await;
-    plant_stamp(&store, "gone", chrono::Duration::hours(1)).await;
+    plant_stamp(&store, "gone", crystalline_core::time::hours(1)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

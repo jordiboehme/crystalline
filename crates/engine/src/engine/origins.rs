@@ -1239,7 +1239,7 @@ impl Engine {
                     domains.push(json!({
                         "domain": name,
                         "pulled": false,
-                        "last_checked": checked.map(crystalline_core::time::serde::stamp_json),
+                        "last_checked": checked.map(time::serde::stamp_json),
                         "open_proposals": open_proposals,
                         "note": note,
                     }));
@@ -2026,7 +2026,7 @@ impl Engine {
     /// `status_report`'s offline `origins` block can show `next_due` without
     /// ever touching an `Instant` (which carries no epoch and cannot be
     /// serialized). Passing both in, rather than reading `Instant::now()`
-    /// and `Utc::now()` here, is what lets a test drive several ticks
+    /// and `time::now()` here, is what lets a test drive several ticks
     /// deterministically with no real waiting.
     ///
     /// A tick does nothing when collaboration is off (so enabling it later
@@ -2042,7 +2042,7 @@ impl Engine {
     /// never stops the tick from moving on to the next due domain. A tick
     /// whose pulls landed anything ends with [`Engine::adopt_domain_names`],
     /// since a pulled MANIFEST may declare a new name.
-    pub async fn origin_poll_tick(&self, now: Instant, wall_now: DateTime<Utc>) {
+    pub async fn origin_poll_tick(&self, now: Instant, wall_now: Stamp) {
         if !self.config.read().unwrap().github_enabled() {
             return;
         }
@@ -2094,10 +2094,10 @@ impl Engine {
             let interval_secs = poller::effective_interval_secs(domain_poll_secs, github_poll_secs);
             let tick = self.origin_poller.next_tick();
             let jitter = poller::jittered_interval(interval_secs, &name, tick);
-            let jitter_chrono =
-                Duration::from_std(jitter).unwrap_or(Duration::seconds(interval_secs as i64));
+            let jitter_wall =
+                time::Delta::from_std(jitter).unwrap_or(time::seconds(interval_secs as i64));
             self.origin_poller
-                .schedule(&name, now + jitter, wall_now + jitter_chrono);
+                .schedule(&name, now + jitter, wall_now + jitter_wall);
 
             // A domain another live instance hosts is that instance's to
             // pull: skipped quietly, never claimed from a live host.
@@ -2167,11 +2167,10 @@ impl Engine {
                     self.origin_poller.record_result(&name, outcome);
                 }
                 Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
-                    let until = reset
-                        .map(crystalline_core::time::Stamp::into_chrono)
-                        .unwrap_or_else(|| wall_now + Duration::hours(1));
+                    let until = reset.unwrap_or_else(|| wall_now + time::hours(1));
                     tracing::warn!(
-                        "origin poll: GitHub is rate limiting this machine; pausing every domain until {until}"
+                        "origin poll: GitHub is rate limiting this machine; pausing every domain until {}",
+                        until.display_utc()
                     );
                     self.origin_poller.set_rate_limited_until(Some(until));
                     break;
@@ -2258,7 +2257,7 @@ impl Engine {
             "enabled": true,
             "connected": connected,
             "token_store": token_store,
-            "rate_limit_wait_until": rate_limit_wait_until,
+            "rate_limit_wait_until": rate_limit_wait_until.map(time::serde::stamp_json),
             "domains": domains,
         })
     }
@@ -4434,7 +4433,7 @@ impl Engine {
             "id": conflict.id,
             "path": conflict.path,
             "kind": conflict.kind,
-            "detected_at": crystalline_core::time::serde::stamp_json(conflict.detected_at),
+            "detected_at": time::serde::stamp_json(conflict.detected_at),
             "base": base_v,
             "local": local_v,
             "upstream": upstream_v,

@@ -42,9 +42,9 @@ pub(crate) struct ContradictionFact {
     /// reads a hand-written `Stable` as current and `Draft` as speculative.
     pub(crate) status: String,
     /// Start of the validity window; absent is unbounded.
-    pub(crate) valid_from: Option<NaiveDate>,
+    pub(crate) valid_from: Option<Day>,
     /// End of the validity window; absent is unbounded.
-    pub(crate) valid_to: Option<NaiveDate>,
+    pub(crate) valid_to: Option<Day>,
     /// The scoring checksum ([`scoring_checksum`]): what the model reads of
     /// the engram under the line rules, which is what a scored pair and a
     /// parked failure are keyed by. A changed line, floor, limit or
@@ -64,8 +64,8 @@ impl ContradictionFact {
         CandidateFacts {
             id: self.id,
             status: &self.status,
-            valid_from: self.valid_from.map(time_day),
-            valid_to: self.valid_to.map(time_day),
+            valid_from: self.valid_from,
+            valid_to: self.valid_to,
             checksum: &self.checksum,
             lead_vector: self.lead_vector.as_deref(),
             observations: &self.observations,
@@ -94,8 +94,8 @@ struct ParsedFact {
     /// The frontmatter status as written, untrimmed; absent falls back to
     /// the listing's status, which is read afresh.
     status: Option<String>,
-    valid_from: Option<NaiveDate>,
-    valid_to: Option<NaiveDate>,
+    valid_from: Option<Day>,
+    valid_to: Option<Day>,
     observations: Vec<FactObservation>,
 }
 
@@ -104,8 +104,8 @@ impl ParsedFact {
         let fm = &engram.frontmatter;
         ParsedFact {
             status: fm.status.clone(),
-            valid_from: fm.valid_from.map(chrono_day),
-            valid_to: fm.valid_to.map(chrono_day),
+            valid_from: fm.valid_from,
+            valid_to: fm.valid_to,
             observations: engram
                 .observations
                 .iter()
@@ -590,18 +590,18 @@ impl Engine {
     /// near midnight. An engram whose `valid_to` is before it takes no part
     /// in `V302`, and the walk digest carries it, so every domain is walked
     /// again once a day. The sweep's pending-count digest reads it here too.
-    pub(crate) fn contradiction_today(&self) -> NaiveDate {
+    pub(crate) fn contradiction_today(&self) -> Day {
         #[cfg(any(test, feature = "testing"))]
         if let Some(today) = *self.contradiction_today_override.lock().unwrap() {
             return today;
         }
-        Utc::now().date_naive()
+        time::today_utc()
     }
 
     /// Move the contradiction check's date to `today`, so a test can step a
     /// day on. Test-only.
     #[cfg(any(test, feature = "testing"))]
-    pub fn set_contradiction_today(&self, today: NaiveDate) {
+    pub fn set_contradiction_today(&self, today: Day) {
         *self.contradiction_today_override.lock().unwrap() = Some(today);
     }
 
@@ -802,12 +802,12 @@ impl Engine {
         &self,
         model: &'static NliModel,
         facts: &[ContradictionFact],
-        today: NaiveDate,
+        today: Day,
     ) -> Result<LineCoverage> {
         let lines = {
             let views: Vec<CandidateFacts<'_>> =
                 facts.iter().map(ContradictionFact::view).collect();
-            eligible_lines(&views, time_day(today))
+            eligible_lines(&views, today)
         };
         let hashes: Vec<String> = lines.keys().cloned().collect();
         let present = if hashes.is_empty() {
@@ -1480,7 +1480,7 @@ impl Engine {
                 &scored,
                 cosine,
                 model.repo,
-                &Utc::now().to_rfc3339(),
+                &time::now().rfc3339(),
                 rows,
             )
             .await?;
@@ -1517,7 +1517,7 @@ impl Engine {
         &self,
         model: &'static NliModel,
         generation: u64,
-        today: NaiveDate,
+        today: Day,
         work: &[DomainWork],
         pending: BTreeMap<String, usize>,
         mut failures: HashMap<String, HashSet<FailedPair>>,
@@ -1575,7 +1575,7 @@ impl Engine {
         &self,
         model: &'static NliModel,
         retry: bool,
-        today: NaiveDate,
+        today: Day,
     ) -> Result<(Vec<DomainWork>, bool)> {
         let (scope, coverage, shared) = {
             let store = self.store.lock().await;
@@ -1678,7 +1678,7 @@ impl Engine {
                 .iter()
                 .filter(|f| {
                     f.lead_vector.is_none()
-                        && eligible(&f.status, f.valid_to.map(time_day), time_day(today))
+                        && eligible(&f.status, f.valid_to, today)
                         && !f.observations.is_empty()
                 })
                 .count();
@@ -1714,8 +1714,7 @@ impl Engine {
                 let (full, vectors_capped, all) = {
                     let views: Vec<CandidateFacts<'_>> =
                         facts.iter().map(ContradictionFact::view).collect();
-                    let found =
-                        contradiction_candidates(&views, threshold, max_pairs, time_day(today));
+                    let found = contradiction_candidates(&views, threshold, max_pairs, today);
                     let all = pending_pairs(&views, &found.pairs, &scored);
                     (found.full, found.capped.then_some(found.compared), all)
                 };
@@ -1778,11 +1777,11 @@ impl Engine {
         model: &'static NliModel,
         facts: &[ContradictionFact],
         scored: &[ScoredPair],
-        today: NaiveDate,
+        today: Day,
     ) {
         let expired: HashSet<i64> = facts
             .iter()
-            .filter(|f| expired(f.valid_to.map(time_day), time_day(today)))
+            .filter(|f| expired(f.valid_to, today))
             .map(|f| f.id.0)
             .collect();
         if expired.is_empty() {
@@ -2331,7 +2330,7 @@ fn walk_digest(
     model: &NliModel,
     threshold: f64,
     rules: &LineRules<'_>,
-    today: NaiveDate,
+    today: Day,
     domain: DomainId,
     stamps: &HashMap<String, FileStamp>,
 ) -> String {
@@ -2341,7 +2340,7 @@ fn walk_digest(
     h.update(threshold.to_bits().to_le_bytes());
     h.update(rules.key().as_bytes());
     h.update([0]);
-    h.update(today.to_string().as_bytes());
+    h.update(today.ymd().as_bytes());
     h.update([0]);
     h.update(domain.0.to_le_bytes());
     let mut paths: Vec<(&String, &FileStamp)> = stamps.iter().collect();
@@ -2407,7 +2406,7 @@ mod tests {
             floor: 0.86,
             max_line_pairs: 4,
         };
-        let t: NaiveDate = "2026-10-01".parse().unwrap();
+        let t = time::parse_lenient_date("2026-10-01").unwrap();
         let base = walk_digest(full, 0.8, &rules, t, d, &stamps);
         assert_eq!(base, walk_digest(full, 0.8, &rules, t, d, &stamps.clone()));
         let mut edited = stamps.clone();
@@ -2444,7 +2443,7 @@ mod tests {
         );
         // Task 5b: another day is another walk, since an engram can expire
         // overnight; the same day is the same digest.
-        let next = t.succ_opt().unwrap();
+        let next = t.checked_add_days(1).unwrap();
         assert_ne!(base, walk_digest(full, 0.8, &rules, next, d, &stamps));
         assert_eq!(
             walk_digest(full, 0.8, &rules, next, d, &stamps),

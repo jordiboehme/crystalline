@@ -1166,8 +1166,17 @@ fn prompt_for_update(home: &std::path::Path, extra: &[&str], stdin: &str, on: bo
 /// The block as the routing payload carries it, for a tar.gz install of
 /// this binary and 99.0.0 in the cache.
 fn expected_block() -> String {
+    // The test binary's folder is writable, so on Unix the block offers the
+    // in-place update. Outside Unix no tar.gz folder counts as writable
+    // (`update now` swaps a binary only on macOS and Linux), so the block
+    // sends the person to the by-hand replacement there.
+    let action = if cfg!(unix) {
+        "run crystalline update now --yes."
+    } else {
+        "tell them update now cannot write to this install's folder, so they replace the binary by hand with the one from the release's tar.gz."
+    };
     format!(
-        "Crystalline 99.0.0 is available (this is {}, tar.gz). Notes: https://github.com/jordiboehme/crystalline/releases/tag/v99.0.0\nTell the user once. If they want it: run crystalline update now --yes. No user here: do nothing.",
+        "Crystalline 99.0.0 is available (this is {}, tar.gz). Notes: https://github.com/jordiboehme/crystalline/releases/tag/v99.0.0\nTell the user once. If they want it: {action} No user here: do nothing.",
         env!("CARGO_PKG_VERSION")
     )
 }

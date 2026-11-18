@@ -41,9 +41,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{SecondsFormat, Utc};
 use crystalline_core::Trigger;
 use crystalline_core::automation::{BACKOFF_REASON_PREFIX, Loop, webhook_signature};
+use crystalline_core::time::{self, Stamp};
 use crystalline_engine::changes::Change;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
@@ -574,15 +574,15 @@ pub fn webhook_request(
     domain: &str,
     instance: &str,
     counts: &Value,
-    now: chrono::DateTime<Utc>,
+    now: Stamp,
 ) -> WebhookRequest {
-    let timestamp = now.timestamp().to_string();
+    let timestamp = now.unix_seconds().to_string();
     let body = serde_json::to_vec(&json!({
         "event": lp.as_str(),
         "domain": domain,
         "instance": instance,
         "counts": counts,
-        "sent_at": now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "sent_at": now.rfc3339_secs_z(),
     }))
     .expect("a JSON value serializes");
     let signature = webhook_signature(secret.as_bytes(), &timestamp, &body);
@@ -720,7 +720,7 @@ impl Delivering {
                     return Outcome::LeaseHeld;
                 }
             }
-            let now = Utc::now();
+            let now = time::now();
             let request = webhook_request(
                 &self.url,
                 &self.secret,
@@ -735,7 +735,7 @@ impl Delivering {
                     tracing::info!(
                         "{lp} trigger for '{domain}' sent to {host} (attempt {attempt} of {attempts})"
                     );
-                    let sent_at = now.to_rfc3339_opts(SecondsFormat::Secs, true);
+                    let sent_at = now.rfc3339_secs_z();
                     self.engine.record_delivery(&domain, lp, Ok(sent_at));
                     return Outcome::Sent;
                 }

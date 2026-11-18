@@ -1222,7 +1222,7 @@ mod chain {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::mpsc::{Receiver, channel};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use serde_json::{Value, json};
 
@@ -1263,11 +1263,8 @@ mod chain {
         /// with this process as the daemon, at this binary's version, on its
         /// own connection; it takes no envelope and is not recorded.
         fn serving_sequence(tag: &str, envelopes: Vec<Value>) -> Daemon {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = PathBuf::from("/tmp").join(format!("cq-chain-{tag}-{nanos}"));
+            let unique = crate::common::unique_suffix();
+            let dir = PathBuf::from("/tmp").join(format!("cq-chain-{tag}-{unique}"));
             let state = dir.join("state/crystalline");
             std::fs::create_dir_all(&state).unwrap();
             std::fs::create_dir_all(dir.join("config")).unwrap();

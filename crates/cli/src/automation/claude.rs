@@ -23,18 +23,33 @@ impl PrivateConfig {
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
         }
         let path = dir.path().join("mcp.json");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(serde_json::to_string(config)?.as_bytes())?;
-        file.sync_all()?;
+        private_file(&path, serde_json::to_string(config)?.as_bytes())?;
         Ok(PrivateConfig { _dir: dir, path })
     }
+
+    /// Write `text` as the skills file beside the config, readable only by
+    /// this user and removed with it. Its path is what the agent is started
+    /// with (`--append-system-prompt-file`).
+    pub(super) fn write_skills(&self, text: &str) -> anyhow::Result<PathBuf> {
+        let path = self._dir.path().join("skills.md");
+        private_file(&path, text.as_bytes())?;
+        Ok(path)
+    }
+}
+
+/// A new file at `path` with `bytes`, mode 0600 on unix.
+fn private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// What one headless agent session is started with.
@@ -45,17 +60,24 @@ pub struct ClaudeRun {
     pub mcp_config: PathBuf,
     /// The filled-in shipped prompt.
     pub prompt: String,
+    /// The bare MCP tool names the agent may never call, as the server
+    /// answered them (`automation_prompt`).
+    pub disallowed_tools: Vec<String>,
+    /// The file of skill text appended to the agent's system prompt
+    /// (`--append-system-prompt-file`), when the prompt says the skills are
+    /// loaded: the runner then hands them over itself.
+    pub skills_file: Option<PathBuf>,
     /// `--max-turns`.
     pub max_turns: u32,
     /// `--model`, when one is named.
     pub model: Option<String>,
 }
 
-/// The tools a headless agent may never call, in Claude Code's names.
-pub(super) fn disallowed_tools() -> String {
-    HEADLESS_DISALLOWED_TOOLS
+/// The tools `names` in Claude Code's names, joined for `--disallowedTools`.
+pub(super) fn disallowed_tools<S: AsRef<str>>(names: &[S]) -> String {
+    names
         .iter()
-        .map(|name| format!("{MCP_TOOL_PREFIX}__{name}"))
+        .map(|name| format!("{MCP_TOOL_PREFIX}__{}", name.as_ref()))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -75,7 +97,7 @@ pub(super) fn claude_args(cfg: &ClaudeRun) -> Vec<String> {
         "--allowedTools".into(),
         MCP_TOOL_PREFIX.into(),
         "--disallowedTools".into(),
-        disallowed_tools(),
+        disallowed_tools(&cfg.disallowed_tools),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
@@ -85,6 +107,10 @@ pub(super) fn claude_args(cfg: &ClaudeRun) -> Vec<String> {
     if let Some(model) = &cfg.model {
         args.push("--model".into());
         args.push(model.clone());
+    }
+    if let Some(skills) = &cfg.skills_file {
+        args.push("--append-system-prompt-file".into());
+        args.push(skills.to_string_lossy().into_owned());
     }
     args.push("-p".into());
     args.push(cfg.prompt.clone());
@@ -148,9 +174,48 @@ mod tests {
             program: PathBuf::from("/usr/local/bin/claude"),
             mcp_config: PathBuf::from("/tmp/run/mcp.json"),
             prompt: "the prompt".to_string(),
+            disallowed_tools: HEADLESS_DISALLOWED_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+            skills_file: None,
             max_turns: 60,
             model: model.map(str::to_string),
         }
+    }
+
+    /// With skills to hand over, the file follows the other flags and stays
+    /// before `-p`, so no list-taking flag can take it.
+    #[test]
+    fn the_skills_file_goes_before_the_prompt() {
+        let mut run = pinned_run(None);
+        run.skills_file = Some(PathBuf::from("/tmp/run/skills.md"));
+        let args = claude_args(&run);
+        assert_eq!(
+            args[args.len() - 4..],
+            [
+                "--append-system-prompt-file",
+                "/tmp/run/skills.md",
+                "-p",
+                "the prompt"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_skills_file_is_private_and_goes_away_with_the_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let config = PrivateConfig::write(&remote_mcp_config("https://x", "cmt_t", "eng")).unwrap();
+        let skills = config.write_skills("skill text").unwrap();
+        assert_eq!(skills.parent(), config.path.parent());
+        assert_eq!(std::fs::read_to_string(&skills).unwrap(), "skill text");
+        assert_eq!(
+            std::fs::metadata(&skills).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(config);
+        assert!(!skills.exists());
     }
 
     #[test]
@@ -175,11 +240,11 @@ mod tests {
                 "mcp__crystalline",
                 "--disallowedTools",
                 "mcp__crystalline__delete_engram,mcp__crystalline__move_engram,\
-                 mcp__crystalline__split_engram,mcp__crystalline__remove_domain,\
-                 mcp__crystalline__add_domain,mcp__crystalline__configure,\
-                 mcp__crystalline__provision,mcp__crystalline__share_changes,\
-                 mcp__crystalline__update_domain,mcp__crystalline__resolve_conflict,\
-                 mcp__crystalline__withdraw_proposal,mcp__crystalline__discard_changes",
+                 mcp__crystalline__remove_domain,mcp__crystalline__add_domain,\
+                 mcp__crystalline__configure,mcp__crystalline__provision,\
+                 mcp__crystalline__share_changes,mcp__crystalline__update_domain,\
+                 mcp__crystalline__resolve_conflict,mcp__crystalline__withdraw_proposal,\
+                 mcp__crystalline__discard_changes",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -201,7 +266,7 @@ mod tests {
 
     #[test]
     fn the_disallowed_tools_are_every_headless_tool_by_its_mcp_name() {
-        let list = disallowed_tools();
+        let list = disallowed_tools(HEADLESS_DISALLOWED_TOOLS);
         let names: Vec<&str> = list.split(',').collect();
         assert_eq!(names.len(), HEADLESS_DISALLOWED_TOOLS.len());
         for (full, bare) in names.iter().zip(HEADLESS_DISALLOWED_TOOLS) {

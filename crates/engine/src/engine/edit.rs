@@ -1099,6 +1099,7 @@ impl Engine {
             let content = self.require_content(p)?;
             let section = self.require_section(p)?;
             let edit = apply_section_op(source, op, section, content).map_err(section_err)?;
+            refuse_new_second_block(source, &edit.text)?;
             return Ok((edit.text, edit.heading_stripped, edit.placed_after_section));
         }
         let text = match p.operation.as_str() {
@@ -1144,6 +1145,7 @@ impl Engine {
                 )));
             }
         };
+        refuse_new_second_block(source, &text)?;
         Ok((text, None, false))
     }
 
@@ -1497,6 +1499,22 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+/// Refuses an edit whose result opens the body with a block that looks like
+/// engram frontmatter when the body did not open with one before: whatever
+/// the operation (an append to an empty body, an insert before the first
+/// heading, a find and replace), that block would sit under the engram's own
+/// as a second one that every reader takes for body text. An engram that
+/// already carried such a block keeps taking edits, so it can be repaired.
+fn refuse_new_second_block(before: &str, after: &str) -> Result<()> {
+    use crystalline_core::frontmatter::body_opens_with_frontmatter;
+    if body_opens_with_frontmatter(after) && !body_opens_with_frontmatter(before) {
+        return Err(EngineError::Invalid(
+            super::content_frontmatter::SECOND_BLOCK_REFUSAL.into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

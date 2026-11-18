@@ -193,6 +193,7 @@ fn the_remote_allow_lists_are_pinned() {
             "origin_changes",
             "file",
             "automation_status",
+            "automation_prompt",
             "automation_lease_take",
             "automation_lease_renew",
             "automation_lease_release",
@@ -391,6 +392,74 @@ async fn a_token_runs_a_full_cycle_over_the_ctl_route() {
     .await;
     assert_eq!(bad["ok"], false, "{bad}");
     assert_eq!(bad["kind"], "invalid", "{bad}");
+}
+
+/// `automation_prompt` over the route with a `cmt_` token: the prompt as
+/// the server builds it for that domain and cap, with the forbidden tools,
+/// the version and the checksum. A token that may not run the loop is
+/// refused as `automation_status` refuses it, and a hidden domain like an
+/// unknown one.
+#[tokio::test]
+async fn a_token_fetches_the_prompt_over_the_ctl_route() {
+    use crystalline_core::automation::{Loop, runner_setup};
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let keeper = server.token_for("keeper").await;
+    let (_, answer) = server
+        .ctl(
+            Some(&keeper),
+            verb(
+                "automation_prompt",
+                json!({ "loop": "evolve", "domain": "open", "max_items": 5 }),
+            ),
+        )
+        .await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(
+        answer["data"],
+        serde_json::to_value(runner_setup(Loop::Evolve, "open", 5, false)).unwrap(),
+        "{answer}"
+    );
+
+    let looker = server.token_for("looker").await;
+    let (_, status) = server
+        .ctl(
+            Some(&looker),
+            verb(
+                "automation_status",
+                json!({ "loop": "evolve", "domains": ["open"] }),
+            ),
+        )
+        .await;
+    let (_, refused) = server
+        .ctl(
+            Some(&looker),
+            verb(
+                "automation_prompt",
+                json!({ "loop": "evolve", "domain": "open" }),
+            ),
+        )
+        .await;
+    assert_eq!(status["ok"], false, "{status}");
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"], status["error"], "{refused} {status}");
+    assert!(refused.get("data").is_none(), "{refused}");
+
+    let out = server.token_for("out").await;
+    let mut texts = Vec::new();
+    for domain in ["lab", "nosuch"] {
+        let (_, reply) = server
+            .ctl(
+                Some(&out),
+                verb(
+                    "automation_prompt",
+                    json!({ "loop": "evolve", "domain": domain }),
+                ),
+            )
+            .await;
+        assert_eq!(reply["ok"], false, "{reply}");
+        texts.push(reply["error"].as_str().unwrap().replace(domain, "X"));
+    }
+    assert_eq!(texts[0], texts[1], "{texts:?}");
 }
 
 /// A viewer may read `open` but not write it, so it may not run its evolve

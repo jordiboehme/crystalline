@@ -120,7 +120,7 @@ async fn hook_status_answers_the_backlog_the_account_may_see() {
     let _guard = crate::support::maintenance_guard().await;
     crystalline_service::maintenance::save(&crystalline_service::maintenance::MaintenanceState {
         pending_domains: vec!["open".to_string(), "lab".to_string()],
-        last_run_at: chrono::DateTime::from_timestamp(1_800_000_000, 0),
+        last_run_at: crystalline_core::time::Stamp::from_unix(1_800_000_000, 0),
         ..Default::default()
     })
     .unwrap();
@@ -162,7 +162,7 @@ async fn a_write_to_a_hidden_domain_does_not_move_the_hook_status() {
 
     crystalline_service::maintenance::save(&crystalline_service::maintenance::MaintenanceState {
         pending_domains: vec!["lab".to_string()],
-        pending_since: chrono::DateTime::from_timestamp(1_800_000_000, 0),
+        pending_since: crystalline_core::time::Stamp::from_unix(1_800_000_000, 0),
         ..Default::default()
     })
     .unwrap();
@@ -248,7 +248,7 @@ async fn hook_status_leaves_a_read_only_domain_out() {
     let _guard = crate::support::maintenance_guard().await;
     crystalline_service::maintenance::save(&crystalline_service::maintenance::MaintenanceState {
         pending_domains: vec!["open".to_string(), "lab".to_string()],
-        last_run_at: chrono::DateTime::from_timestamp(1_800_000_000, 0),
+        last_run_at: crystalline_core::time::Stamp::from_unix(1_800_000_000, 0),
         ..Default::default()
     })
     .unwrap();

@@ -34,7 +34,7 @@ Crystalline cannot see what Claude Desktop has installed. It only remembers what
 
 ## Updating
 
-When you update Crystalline (`brew upgrade crystalline` on macOS, the newest MSI on Windows), the extension uses the new version at once. Crystalline also builds the extension again for the new version. The next time Claude Desktop starts the extension, Claude Desktop shows a dialog to update it. Confirm it there. On Windows the daemon opens the dialog, because Claude Desktop's own package may not write the file.
+When you update Crystalline (`crystalline update now`, or `brew upgrade jordiboehme/tap/crystalline` on macOS and the newest MSI on Windows; see [Updating](../deployment.md#updating)), the extension uses the new version at once. Crystalline also builds the extension again for the new version. The next time Claude Desktop starts the extension, Claude Desktop shows a dialog to update it. Confirm it there. On Windows the daemon opens the dialog, because Claude Desktop's own package may not write the file.
 
 Crystalline asks once per version. If you said no, or no dialog came, run `crystalline install claude-desktop` in a terminal. `crystalline doctor` says when an update for this version was not offered yet. Without a record from `crystalline install claude-desktop` (an extension you downloaded, for example), nothing is offered: run the command once.
 

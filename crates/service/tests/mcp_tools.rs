@@ -3560,10 +3560,7 @@ fn context_fixture(h: &Harness, slug: &str, recorded_at: Option<&str>, body: &st
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_context_timeframe_keeps_recent_related_engrams() {
     let h = Harness::new(&["eng"]).await;
-    let today = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
+    let today = crystalline_core::time::today_utc().ymd();
     context_fixture(
         &h,
         "seed",
@@ -7156,9 +7153,7 @@ async fn edit_engram_migrates_a_legacy_timestamp_to_generated() {
     );
     let engram = crystalline_core::parse_engram(&text).unwrap();
     let generated = engram.frontmatter.generated.unwrap();
-    assert!(
-        generated.at.unwrap().into_chrono().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00"
-    );
+    assert!(generated.at.unwrap().rfc3339().as_str() > "2026-01-01T00:00:00+00:00");
 }
 
 /// The agent reports the model that produced the words, and it lands beside the

@@ -9,6 +9,12 @@
 //! [`parse_lenient_stamp`], [`parse_lenient_offset`] and
 //! [`parse_lenient_date`].
 //!
+//! One edge of the year range (J4) does not survive a round trip: a year
+//! is judged as written, so `0000-01-01T00:30:00+01:00` is read, but its
+//! instant lies in the year -0001, which [`stamp`] writes and the next
+//! load refuses. The same holds for any [`Stamp`] before the year 0000.
+//! No stored date is that early.
+//!
 //! Every adapter has an `_option` twin for an `Option` field. It writes
 //! `None` as `null`, and the field must also carry `#[serde(default)]`:
 //! `with` alone makes a missing key an error, where chrono's own `Option`
@@ -213,7 +219,7 @@ pub mod stamp_map {
 mod tests {
     use super::*;
     use ::serde::{Deserialize, Serialize};
-    use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+    use std::collections::BTreeMap;
 
     #[derive(Serialize, Deserialize)]
     struct Ours {
@@ -231,60 +237,136 @@ mod tests {
         maybe_on: Option<Day>,
     }
 
-    #[derive(Serialize, Deserialize)]
-    struct Theirs {
-        at: DateTime<Utc>,
-        written: DateTime<FixedOffset>,
-        on: NaiveDate,
-        maybe_at: Option<DateTime<Utc>>,
-        maybe_written: Option<DateTime<FixedOffset>>,
-        maybe_on: Option<NaiveDate>,
+    /// The same fields as plain strings: what [`Ours`] must serialize as.
+    #[derive(Serialize)]
+    struct Texts {
+        at: String,
+        written: String,
+        on: String,
+        maybe_at: Option<String>,
+        maybe_written: Option<String>,
+        maybe_on: Option<String>,
     }
 
-    const SECS: [i64; 6] = [
-        1_767_608_239,
-        0,
-        -1,
-        253_402_300_799,
-        -62_167_219_200,
+    /// (seconds, UTC date and time, then each offset of the row with its
+    /// local form there), the bytes chrono's serde wrote, without the
+    /// fraction. Every row names its own offsets, so no row depends on the
+    /// order of another list.
+    /// One offset of a row: its seconds, how it is written and the local
+    /// date and time there.
+    type AtOffset = (i32, &'static str, &'static str);
+
+    const SECS: [(i64, &str, [AtOffset; 5]); 6] = [
+        (
+            1_767_608_239,
+            "2026-01-05T10:17:19",
+            [
+                (0, "Z", "2026-01-05T10:17:19"),
+                (7200, "+02:00", "2026-01-05T12:17:19"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "2026-01-05T05:47:19"),
+                (5 * 3600 + 45 * 60, "+05:45", "2026-01-05T16:02:19"),
+                (-23 * 3600, "-23:00", "2026-01-04T11:17:19"),
+            ],
+        ),
+        (
+            0,
+            "1970-01-01T00:00:00",
+            [
+                (0, "Z", "1970-01-01T00:00:00"),
+                (7200, "+02:00", "1970-01-01T02:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "1969-12-31T19:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "1970-01-01T05:45:00"),
+                (-23 * 3600, "-23:00", "1969-12-31T01:00:00"),
+            ],
+        ),
+        (
+            -1,
+            "1969-12-31T23:59:59",
+            [
+                (0, "Z", "1969-12-31T23:59:59"),
+                (7200, "+02:00", "1970-01-01T01:59:59"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "1969-12-31T19:29:59"),
+                (5 * 3600 + 45 * 60, "+05:45", "1970-01-01T05:44:59"),
+                (-23 * 3600, "-23:00", "1969-12-31T00:59:59"),
+            ],
+        ),
+        // jiff's latest whole second (J4: 9999-12-31T23:59:59Z is past it).
+        (
+            253_402_207_200,
+            "9999-12-30T22:00:00",
+            [
+                (0, "Z", "9999-12-30T22:00:00"),
+                (7200, "+02:00", "9999-12-31T00:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "9999-12-30T17:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "9999-12-31T03:45:00"),
+                (-23 * 3600, "-23:00", "9999-12-29T23:00:00"),
+            ],
+        ),
+        // 0000-01-02: a day later than the year's first, so every offset
+        // still writes the year 0000 (J4 refuses to read a year before it).
+        (
+            -62_167_132_800,
+            "0000-01-02T00:00:00",
+            [
+                (0, "Z", "0000-01-02T00:00:00"),
+                (7200, "+02:00", "0000-01-02T02:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "0000-01-01T19:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "0000-01-02T05:45:00"),
+                (-23 * 3600, "-23:00", "0000-01-01T01:00:00"),
+            ],
+        ),
         // Leap year day at noon.
-        1_709_208_000,
-    ];
-    const NANOS: [u32; 6] = [0, 500_000_000, 120_000_000, 123_450_000, 123_456_789, 1];
-    const OFFSETS: [i32; 5] = [
-        0,
-        7200,
-        -(4 * 3600 + 30 * 60),
-        5 * 3600 + 45 * 60,
-        -23 * 3600,
+        (
+            1_709_208_000,
+            "2024-02-29T12:00:00",
+            [
+                (0, "Z", "2024-02-29T12:00:00"),
+                (7200, "+02:00", "2024-02-29T14:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "2024-02-29T07:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "2024-02-29T17:45:00"),
+                (-23 * 3600, "-23:00", "2024-02-28T13:00:00"),
+            ],
+        ),
     ];
 
-    fn pairs() -> Vec<(Ours, Theirs)> {
+    /// (nanoseconds, the fraction written for them: none, 3, 6 or 9 digits).
+    const NANOS: [(u32, &str); 6] = [
+        (0, ""),
+        (500_000_000, ".500"),
+        (120_000_000, ".120"),
+        (123_450_000, ".123450"),
+        (123_456_789, ".123456789"),
+        (1, ".000000001"),
+    ];
+
+    /// Every value of the matrix with the strings it must be written as.
+    fn cases() -> Vec<(Ours, Texts)> {
         let mut out = Vec::new();
-        for secs in SECS {
-            for nanos in NANOS {
-                for offset in OFFSETS {
-                    let utc = DateTime::from_timestamp(secs, nanos).unwrap();
-                    let zone = FixedOffset::east_opt(offset).unwrap();
-                    let written = utc.with_timezone(&zone);
-                    let on = utc.date_naive();
+        for (secs, utc, locals) in SECS {
+            for (nanos, fraction) in NANOS {
+                for (offset, offset_text, local) in locals {
+                    let at = Stamp::from_unix(secs, nanos).unwrap();
+                    let written = OffsetStamp::at_offset(at, offset).unwrap();
                     let present = nanos != 1;
+                    let at_text = format!("{utc}{fraction}Z");
+                    let written_text = format!("{local}{fraction}{offset_text}");
+                    let on_text = utc[..10].to_string();
                     out.push((
                         Ours {
-                            at: Stamp::from_chrono(utc),
-                            written: OffsetStamp::from_chrono(written),
-                            on: Day::from_chrono(on),
-                            maybe_at: present.then(|| Stamp::from_chrono(utc)),
-                            maybe_written: present.then(|| OffsetStamp::from_chrono(written)),
-                            maybe_on: present.then(|| Day::from_chrono(on)),
-                        },
-                        Theirs {
-                            at: utc,
+                            at,
                             written,
-                            on,
-                            maybe_at: present.then_some(utc),
+                            on: at.day_utc(),
+                            maybe_at: present.then_some(at),
                             maybe_written: present.then_some(written),
-                            maybe_on: present.then_some(on),
+                            maybe_on: present.then(|| at.day_utc()),
+                        },
+                        Texts {
+                            maybe_at: present.then(|| at_text.clone()),
+                            maybe_written: present.then(|| written_text.clone()),
+                            maybe_on: present.then(|| on_text.clone()),
+                            at: at_text,
+                            written: written_text,
+                            on: on_text,
                         },
                     ));
                 }
@@ -294,12 +376,18 @@ mod tests {
     }
 
     #[test]
-    fn adapters_round_trip_like_chrono() {
-        for (ours, theirs) in pairs() {
-            let json = serde_json::to_string(&theirs).unwrap();
+    fn adapters_write_the_frozen_bytes_and_read_them_back() {
+        for (ours, texts) in cases() {
+            let json = serde_json::to_string(&texts).unwrap();
             assert_eq!(serde_json::to_string(&ours).unwrap(), json);
-            let yaml = serde_yaml_ng::to_string(&theirs).unwrap();
+            let yaml = serde_yaml_ng::to_string(&texts).unwrap();
             assert_eq!(serde_yaml_ng::to_string(&ours).unwrap(), yaml);
+            assert_eq!(stamp_json(ours.at), Value::from(texts.at.as_str()));
+            assert_eq!(
+                offset_stamp_json(ours.written),
+                Value::from(texts.written.as_str())
+            );
+            assert_eq!(day_json(ours.on), Value::from(texts.on.as_str()));
 
             let back: Ours = serde_json::from_str(&json).unwrap();
             assert_eq!(back.at, ours.at);
@@ -320,8 +408,7 @@ mod tests {
     fn written_bytes_are_the_documented_ones() {
         let at = Stamp::from_unix(1_767_608_239, 120_000_000).unwrap();
         assert_eq!(stamp_json(at), Value::from("2026-01-05T10:17:19.120Z"));
-        let zone = chrono::FixedOffset::east_opt(7200).unwrap();
-        let plus_two = OffsetStamp::from_chrono(at.into_chrono().with_timezone(&zone));
+        let plus_two = OffsetStamp::at_offset(at, 7200).unwrap();
         assert_eq!(
             offset_stamp_json(plus_two),
             Value::from("2026-01-05T12:17:19.120+02:00")
@@ -333,69 +420,141 @@ mod tests {
         assert_eq!(day_json(at.day_utc()), Value::from("2026-01-05"));
     }
 
+    /// A written year 0000 just after midnight at a positive offset is read
+    /// (J4 judges the year as written), but its UTC instant lies in the
+    /// year -0001, so the `stamp` adapter writes a year the next load
+    /// refuses. The offset adapter keeps the written offset and reads back.
     #[test]
-    fn json_helpers_match_chrono_serde() {
-        for (ours, theirs) in pairs() {
-            assert_eq!(
-                stamp_json(ours.at),
-                serde_json::to_value(theirs.at).unwrap()
-            );
-            assert_eq!(
-                offset_stamp_json(ours.written),
-                serde_json::to_value(theirs.written).unwrap()
-            );
-            assert_eq!(day_json(ours.on), serde_json::to_value(theirs.on).unwrap());
-        }
+    fn a_stamp_early_in_year_0000_is_read_but_its_written_form_is_refused() {
+        let input = "0000-01-01T00:30:00+01:00";
+        let at = parse_lenient_stamp(input).expect("a written year 0000 is read");
+        assert_eq!(stamp_json(at), Value::from("-0001-12-31T23:30:00Z"));
+        let reload = serde_json::from_str::<UtcField>(r#"{"at":"-0001-12-31T23:30:00Z"}"#);
+        assert!(reload.is_err());
+
+        let written = parse_lenient_offset(input).unwrap();
+        let text = offset_stamp_json(written);
+        assert_eq!(text, Value::from(input));
+        let reload: OffsetField =
+            serde_json::from_value(serde_json::json!({ "at": text })).unwrap();
+        assert_eq!(reload.at, written);
+    }
+
+    #[derive(Deserialize)]
+    struct UtcField {
+        #[serde(with = "stamp")]
+        #[allow(dead_code)]
+        at: Stamp,
+    }
+
+    #[derive(Deserialize)]
+    struct OffsetField {
+        #[serde(with = "offset_stamp")]
+        at: OffsetStamp,
     }
 
     #[test]
-    fn j3_inputs_are_accepted_and_refused_like_chrono() {
+    fn j3_inputs_are_accepted_and_refused_as_chrono_did() {
+        // (input, `at` read, `written` read, `on` read), each in RFC 3339
+        // (`%Y-%m-%d` for `on`); `None` is a refusal.
         let inputs = [
-            "2026-01-05T10:17:19Z",
-            "2026-1-5T1:7:9Z",
-            " 2026-01-05T10:17:19Z ",
-            "2026-01-05T10:17:19 +0200",
-            "2026-01-05T10:17:19+02:00",
-            "2026-01-05T10:17:19 UTC",
-            "2026-01-05T10:17:19.1234567891Z",
-            "2026-01-05T10:17:60Z",
-            "2026-01-05T25:17:19Z",
-            "+2026-01-05T10:17:19Z",
-            "2026 - 01 - 05",
-            "2026-01-05",
-            "2026-02-30",
-            "",
-            "not a date",
+            (
+                "2026-01-05T10:17:19Z",
+                Some("2026-01-05T10:17:19+00:00"),
+                Some("2026-01-05T10:17:19+00:00"),
+                None,
+            ),
+            (
+                "2026-1-5T1:7:9Z",
+                Some("2026-01-05T01:07:09+00:00"),
+                Some("2026-01-05T01:07:09+00:00"),
+                None,
+            ),
+            (
+                " 2026-01-05T10:17:19Z ",
+                Some("2026-01-05T10:17:19+00:00"),
+                Some("2026-01-05T10:17:19+00:00"),
+                None,
+            ),
+            (
+                "2026-01-05T10:17:19 +0200",
+                Some("2026-01-05T08:17:19+00:00"),
+                Some("2026-01-05T10:17:19+02:00"),
+                None,
+            ),
+            (
+                "2026-01-05T10:17:19+02:00",
+                Some("2026-01-05T08:17:19+00:00"),
+                Some("2026-01-05T10:17:19+02:00"),
+                None,
+            ),
+            (
+                "2026-01-05T10:17:19 UTC",
+                Some("2026-01-05T10:17:19+00:00"),
+                Some("2026-01-05T10:17:19+00:00"),
+                None,
+            ),
+            (
+                "2026-01-05T10:17:19.1234567891Z",
+                Some("2026-01-05T10:17:19.123456789+00:00"),
+                Some("2026-01-05T10:17:19.123456789+00:00"),
+                None,
+            ),
+            // J4: chrono kept a leap second, jiff reads it as `:59`.
+            (
+                "2026-01-05T10:17:60Z",
+                Some("2026-01-05T10:17:59+00:00"),
+                Some("2026-01-05T10:17:59+00:00"),
+                None,
+            ),
+            ("2026-01-05T25:17:19Z", None, None, None),
+            (
+                "+2026-01-05T10:17:19Z",
+                Some("2026-01-05T10:17:19+00:00"),
+                Some("2026-01-05T10:17:19+00:00"),
+                None,
+            ),
+            ("2026 - 01 - 05", None, None, Some("2026-01-05")),
+            ("2026-01-05", None, None, Some("2026-01-05")),
+            ("2026-02-30", None, None, None),
+            ("", None, None, None),
+            ("not a date", None, None, None),
         ];
-        for input in inputs {
+        for (input, at, written, on) in inputs {
             let json = serde_json::to_string(input).unwrap();
-            let ours: Result<Ours, _> =
-                serde_json::from_str(&format!(r#"{{"at":{json},"written":{json},"on":{json}}}"#));
-            let theirs: Result<Theirs, _> =
+            let whole: Result<Ours, _> =
                 serde_json::from_str(&format!(r#"{{"at":{json},"written":{json},"on":{json}}}"#));
             // The struct needs all three fields to parse, so compare each
             // field on its own as well.
-            assert_eq!(ours.is_ok(), theirs.is_ok(), "{input:?}");
-            let one = |field: &str| {
+            assert_eq!(
+                whole.is_ok(),
+                at.is_some() && written.is_some() && on.is_some(),
+                "{input:?}"
+            );
+            for (field, expected) in [("at", at), ("written", written), ("on", on)] {
+                // The other two fields hold valid values; a key given twice
+                // would be refused as a duplicate whatever its value.
+                let value = |name: &str, valid: &str| {
+                    if name == field {
+                        json.clone()
+                    } else {
+                        format!("{valid:?}")
+                    }
+                };
                 let body = format!(
-                    r#"{{"at":"2026-01-05T10:17:19Z","written":"2026-01-05T10:17:19Z","on":"2026-01-05","{field}":{json}}}"#
+                    r#"{{"at":{},"written":{},"on":{}}}"#,
+                    value("at", "2026-01-05T10:17:19Z"),
+                    value("written", "2026-01-05T10:17:19Z"),
+                    value("on", "2026-01-05"),
                 );
-                (
-                    serde_json::from_str::<Ours>(&body).map(|o| match field {
+                let read = serde_json::from_str::<Ours>(&body)
+                    .ok()
+                    .map(|o| match field {
                         "at" => o.at.rfc3339(),
                         "written" => o.written.rfc3339(),
                         _ => o.on.ymd(),
-                    }),
-                    serde_json::from_str::<Theirs>(&body).map(|t| match field {
-                        "at" => t.at.to_rfc3339(),
-                        "written" => t.written.to_rfc3339(),
-                        _ => t.on.format("%Y-%m-%d").to_string(),
-                    }),
-                )
-            };
-            for field in ["at", "written", "on"] {
-                let (ours, theirs) = one(field);
-                assert_eq!(ours.ok(), theirs.ok(), "{field} {input:?}");
+                    });
+                assert_eq!(read.as_deref(), expected, "{field} {input:?}");
             }
         }
     }
@@ -408,7 +567,6 @@ mod tests {
             r#"{"at":"2026-01-05T10:17:19Z","written":[],"on":"2026-01-05"}"#,
         ] {
             assert!(serde_json::from_str::<Ours>(body).is_err(), "{body}");
-            assert!(serde_json::from_str::<Theirs>(body).is_err(), "{body}");
         }
         let head =
             r#""at":"2026-01-05T10:17:19Z","written":"2026-01-05T10:17:19Z","on":"2026-01-05""#;
@@ -421,9 +579,15 @@ mod tests {
                 r#""2026-01-05""#,
             ] {
                 let body = format!("{{{head},\"{field}\":{value}}}");
+                // Only a string of the field's own kind is read, as chrono
+                // read it.
+                let accepted = match field {
+                    "maybe_on" => value == r#""2026-01-05""#,
+                    _ => value == r#""2026-01-05T10:17:19Z""#,
+                };
                 assert_eq!(
                     serde_json::from_str::<Ours>(&body).is_ok(),
-                    serde_json::from_str::<Theirs>(&body).is_ok(),
+                    accepted,
                     "{body}"
                 );
             }
@@ -439,9 +603,11 @@ mod tests {
         ] {
             for value in ["5", "[1]", "bad", "{a: 1}", "~"] {
                 let body = format!("{yaml_head}{field}: {value}\n");
+                // Only `~` (null) in an `_option` field is read.
+                let accepted = value == "~" && field.starts_with("maybe_");
                 assert_eq!(
                     serde_yaml_ng::from_str::<Ours>(&body).is_ok(),
-                    serde_yaml_ng::from_str::<Theirs>(&body).is_ok(),
+                    accepted,
                     "{body}"
                 );
             }
@@ -492,58 +658,51 @@ mod tests {
     #[derive(Serialize, Deserialize)]
     struct OursMap {
         #[serde(default, with = "stamp_map")]
-        nudges: std::collections::BTreeMap<String, Stamp>,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct TheirsMap {
-        #[serde(default)]
-        nudges: std::collections::BTreeMap<String, DateTime<Utc>>,
+        nudges: BTreeMap<String, Stamp>,
     }
 
     #[test]
-    fn stamp_map_matches_chrono() {
+    fn stamp_map_writes_the_frozen_bytes() {
         let instants = [
-            DateTime::from_timestamp(1_767_608_239, 120_000_000).unwrap(),
-            DateTime::from_timestamp(-1, 999_999_999).unwrap(),
-            DateTime::from_timestamp(0, 0).unwrap(),
+            Stamp::from_unix(1_767_608_239, 120_000_000).unwrap(),
+            Stamp::from_unix(-1, 999_999_999).unwrap(),
+            Stamp::UNIX_EPOCH,
         ];
-        let maps: Vec<Vec<(String, DateTime<Utc>)>> = vec![
-            Vec::new(),
-            vec![("search".into(), instants[0])],
-            instants
-                .iter()
-                .enumerate()
-                .map(|(i, t)| (format!("tool-{i}"), *t))
-                .collect(),
+        // (entries, JSON, YAML) as chrono's serde wrote them.
+        let maps = [
+            (Vec::new(), r#"{"nudges":{}}"#, "nudges: {}\n"),
+            (
+                vec![("search", instants[0])],
+                r#"{"nudges":{"search":"2026-01-05T10:17:19.120Z"}}"#,
+                "nudges:\n  search: 2026-01-05T10:17:19.120Z\n",
+            ),
+            (
+                vec![
+                    ("tool-0", instants[0]),
+                    ("tool-1", instants[1]),
+                    ("tool-2", instants[2]),
+                ],
+                r#"{"nudges":{"tool-0":"2026-01-05T10:17:19.120Z","tool-1":"1969-12-31T23:59:59.999999999Z","tool-2":"1970-01-01T00:00:00Z"}}"#,
+                "nudges:\n  tool-0: 2026-01-05T10:17:19.120Z\n  tool-1: 1969-12-31T23:59:59.999999999Z\n  tool-2: 1970-01-01T00:00:00Z\n",
+            ),
         ];
-        for entries in maps {
-            let theirs = TheirsMap {
-                nudges: entries.iter().cloned().collect(),
-            };
+        for (entries, json, yaml) in maps {
             let ours = OursMap {
-                nudges: entries
-                    .iter()
-                    .map(|(k, t)| (k.clone(), Stamp::from_chrono(*t)))
-                    .collect(),
+                nudges: entries.iter().map(|(k, t)| (k.to_string(), *t)).collect(),
             };
-            let json = serde_json::to_string(&theirs).unwrap();
             assert_eq!(serde_json::to_string(&ours).unwrap(), json);
-            let yaml = serde_yaml_ng::to_string(&theirs).unwrap();
             assert_eq!(serde_yaml_ng::to_string(&ours).unwrap(), yaml);
-            let back: OursMap = serde_json::from_str(&json).unwrap();
+            let back: OursMap = serde_json::from_str(json).unwrap();
             assert_eq!(back.nudges, ours.nudges);
-            let back: OursMap = serde_yaml_ng::from_str(&yaml).unwrap();
+            let back: OursMap = serde_yaml_ng::from_str(yaml).unwrap();
             assert_eq!(back.nudges, ours.nudges);
         }
         let lenient = r#"{"nudges":{"a":" 2026-1-5T1:7:9 +0200 "}}"#;
         let ours: OursMap = serde_json::from_str(lenient).unwrap();
-        let theirs: TheirsMap = serde_json::from_str(lenient).unwrap();
-        assert_eq!(ours.nudges["a"].into_chrono(), theirs.nudges["a"]);
+        assert_eq!(ours.nudges["a"].rfc3339(), "2026-01-04T23:07:09+00:00");
         let missing: OursMap = serde_json::from_str("{}").unwrap();
         assert!(missing.nudges.is_empty());
         let bad = r#"{"nudges":{"a":"2026-02-30T00:00:00Z"}}"#;
         assert!(serde_json::from_str::<OursMap>(bad).is_err());
-        assert!(serde_json::from_str::<TheirsMap>(bad).is_err());
     }
 }

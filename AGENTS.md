@@ -27,6 +27,8 @@ Cargo workspace, Rust edition 2024, pinned toolchain in rust-toolchain.toml.
 - `crates/service` (crystalline-service) - single-instance daemon, MCP server, control protocol; the facade the CLI and the integration tests reach everything through
 - `crates/cli` (crystalline) - the single user-facing binary
 
+Dates go through `crystalline_core::time` (jiff behind it since 0.34.0): no crate other than crystalline-core names jiff, and none names chrono; `crates/core/tests/it/time_boundary.rs` enforces both.
+
 Dependency direction: core <- index <- identity <- engine <- rest <- service <- cli, with remote beside index (it depends on core and is used by engine, rest, service and cli).
 
 ## Commands

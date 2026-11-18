@@ -6,12 +6,15 @@
 //! displaced daemon's own start options (database, config file, read-only
 //! mode, HTTP address, allowed hosts, environment names). The old binary
 //! never stops the daemon itself: a stopped daemon loses how it was
-//! started.
+//! started. A handover marker in the state folder
+//! (`handover.json`, see `instance::HANDOVER_FILE`) holds while it runs, so a connected
+//! bridge waits for this successor instead of starting its own (S24: the
+//! session survives the handover).
 
 use crystalline_core::config;
 
 use crate::instance::{
-    SuccessorPlan, ask_holder_at, attach_after_displacement, displace, displaces,
+    SuccessorPlan, ask_holder_at, attach_after_displacement, displace_for_handover, displaces,
     successor_plan_here,
 };
 use crate::runs_in::PackageContext;
@@ -60,7 +63,12 @@ pub async fn hand_over() -> Handover {
     if let SuccessorPlan::Wait { why, .. } = successor_plan_here(facts.start.as_ref()) {
         return Handover::Kept { version, why };
     }
-    if !displace(&sock, facts.pid).await {
+    // Marked before the old daemon is asked to stop, and removed when this
+    // call returns: a connected bridge reconnects the moment its socket
+    // closes, and while the marker holds it waits for the successor started
+    // below instead of starting one with its own flags.
+    let (gone, _marker) = displace_for_handover(&sock, facts.pid).await;
+    if !gone {
         return Handover::StillRunning { version };
     }
     match attach_after_displacement(facts.start).await {

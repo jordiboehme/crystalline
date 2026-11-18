@@ -32,8 +32,8 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, TimeDelta, Utc};
 use crystalline_core::config::GlobalConfig;
+use crystalline_core::time::{self, Stamp};
 
 use crate::engine::Engine;
 use crate::maintenance::{self, MaintenanceState, NudgeKind, mcp_nudge_due};
@@ -267,7 +267,7 @@ pub async fn write_verb_trailer(
 ) -> Option<String> {
     let state_dir = engine.journal_state_dir().ok()?;
     let key = identity_key(identity);
-    let now = Utc::now();
+    let now = time::now();
     let state = maintenance::load_under(&state_dir);
 
     let share_open = mcp_nudge_due(&state, NudgeKind::Share, key, now);
@@ -340,7 +340,7 @@ pub async fn write_verb_trailer(
 
 /// Stamp an emitted nudge against the state directory this daemon reads, which
 /// is the machine's own in production and a test's temporary one under test.
-fn record(state_dir: &std::path::Path, kind: NudgeKind, identity: &str, now: DateTime<Utc>) {
+fn record(state_dir: &std::path::Path, kind: NudgeKind, identity: &str, now: Stamp) {
     if let Err(e) =
         maintenance::record_mcp_nudge_at(&maintenance::path_under(state_dir), kind, identity, now)
     {
@@ -467,7 +467,7 @@ async fn walked_unshared(engine: &Engine, name: &str, root: &Path) -> u64 {
 fn evolve_due(
     config: &GlobalConfig,
     state: &MaintenanceState,
-    now: DateTime<Utc>,
+    now: Stamp,
     read_only: &HashSet<String>,
 ) -> bool {
     // Only a domain somebody could sweep counts: a read-only one takes no
@@ -480,12 +480,12 @@ fn evolve_due(
         .pending_domains
         .iter()
         .any(|domain| config.domains.contains_key(domain) && !read_only.contains(domain));
-    let interval = TimeDelta::days(EVOLVE_RUN_INTERVAL_DAYS);
+    let interval = time::days(EVOLVE_RUN_INTERVAL_DAYS);
     let weekly = match state.last_run_at {
-        Some(ran) => now.signed_duration_since(ran) >= interval,
+        Some(ran) => now.since(ran) >= interval,
         None => state
             .first_seen
-            .is_some_and(|seen| now.signed_duration_since(seen) >= interval),
+            .is_some_and(|seen| now.since(seen) >= interval),
     };
     weekly || pending
 }
@@ -500,7 +500,7 @@ mod tests {
     /// and a named account's quiet hours are not spent by it.
     #[test]
     fn an_anonymous_nudge_uses_the_instance_key() {
-        let now: DateTime<Utc> = "2026-09-16T09:00:00Z".parse().unwrap();
+        let now = time::parse_lenient_stamp("2026-09-16T09:00:00Z").unwrap();
         assert_eq!(identity_key(None), INSTANCE_KEY);
         assert_eq!(identity_key(Some("ada")), "ada");
 
@@ -682,7 +682,7 @@ mod tests {
     /// stays quiet when every registered domain is read-only.
     #[test]
     fn a_read_only_domain_never_arms_the_maintenance_ask() {
-        let now: DateTime<Utc> = "2026-10-05T09:00:00Z".parse().unwrap();
+        let now = time::parse_lenient_stamp("2026-10-05T09:00:00Z").unwrap();
         let mut config = GlobalConfig::default();
         config.domains.insert(
             "archive".into(),
@@ -690,7 +690,7 @@ mod tests {
         );
         let state = MaintenanceState {
             pending_domains: vec!["archive".into()],
-            last_run_at: Some(now - TimeDelta::days(30)),
+            last_run_at: Some(now - time::days(30)),
             ..MaintenanceState::default()
         };
         let locked: HashSet<String> = ["archive".to_string()].into();
@@ -704,7 +704,7 @@ mod tests {
             crystalline_core::config::DomainEntry::virtual_domain(),
         );
         let fresh = MaintenanceState {
-            last_run_at: Some(now - TimeDelta::days(1)),
+            last_run_at: Some(now - time::days(1)),
             ..state.clone()
         };
         assert!(!evolve_due(&config, &fresh, now, &locked));

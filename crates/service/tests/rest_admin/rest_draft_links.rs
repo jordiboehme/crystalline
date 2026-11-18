@@ -3199,7 +3199,7 @@ async fn a_save_on_a_link_that_ran_out_is_refused_in_the_links_own_words() {
         .unwrap();
     assert_eq!(drafted.status(), 200, "{:?}", drafted.text().await);
 
-    let until = (chrono::Utc::now() + chrono::Duration::milliseconds(900)).to_rfc3339();
+    let until = (crystalline_core::time::now() + crystalline_core::time::millis(900)).rfc3339();
     let token = f.mint_until(&alice, "plan.md", &until).await["token"]
         .as_str()
         .unwrap()

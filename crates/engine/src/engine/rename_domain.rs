@@ -668,7 +668,8 @@ impl Engine {
             info.db_path.as_deref(),
             self.config_path.as_deref(),
             state_dir,
-        ))
+        )
+        .with_index_key(info.db_key))
     }
 
     /// Why the index, configuration or state directory this engine opened
@@ -1919,7 +1920,7 @@ impl Engine {
     /// is shared, so a rename on this machine alone would rename the domain
     /// under that instance too.
     async fn refuse_shared_index(&self, old: &str) -> Result<()> {
-        let now = Utc::now();
+        let now = time::now();
         let stats = {
             let store = self.store.lock().await;
             store.domain_stats().await?

@@ -207,10 +207,16 @@ pub const RESERVED_VARS: &[&str] = &[
     // block): the release API root, the download root, an extra trusted key
     // and the install method a test binary acts as. Read straight from the
     // environment, and only by a debug build, so reserved here or every test
-    // run that sets them logs a warning.
+    // run that sets them logs a warning. Gated like the seams themselves:
+    // a release binary must not carry their names at all, and the release
+    // workflow's `check-signature` job greps for them.
+    #[cfg(debug_assertions)]
     "CRYSTALLINE_TEST_UPDATE_API",
+    #[cfg(debug_assertions)]
     "CRYSTALLINE_TEST_UPDATE_DOWNLOAD",
+    #[cfg(debug_assertions)]
     "CRYSTALLINE_TEST_UPDATE_KEY",
+    #[cfg(debug_assertions)]
     "CRYSTALLINE_TEST_UPDATE_METHOD",
     // `crystalline_remote::token`'s boolean kill switch
     // (`refuse_real_keychain`): set, it refuses the real OS keychain
@@ -1645,6 +1651,13 @@ mod tests {
             "CRYSTALLINE_LOG_FORMAT",
             "CRYSTALLINE_EMBED_THREADS",
             "CRYSTALLINE_EMBED_THREADS_FROM",
+        ] {
+            assert!(is_reserved(name), "{name}");
+        }
+        // The updater's seams exist in debug builds only, and so do their
+        // reservations (a release binary must not carry the names).
+        #[cfg(debug_assertions)]
+        for name in [
             "CRYSTALLINE_TEST_UPDATE_API",
             "CRYSTALLINE_TEST_UPDATE_DOWNLOAD",
             "CRYSTALLINE_TEST_UPDATE_KEY",

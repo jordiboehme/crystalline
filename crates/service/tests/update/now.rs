@@ -147,12 +147,14 @@ async fn a_signed_release_verifies_with_every_check() {
     let cache = tempfile::tempdir().unwrap();
     let dir = cache.path().join("updates").join(TAG);
 
-    let (path, checks) = fetch_verified(&release(good_digest(), true), ASSET, &dir)
+    let verified = fetch_verified(&release(good_digest(), true), ASSET, &dir)
         .await
         .expect("verified");
+    let checks = verified.checks;
 
-    assert_eq!(path, dir.join(ASSET));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), BYTES);
+    assert_eq!(verified.path, dir.join(ASSET));
+    assert_eq!(std::fs::read_to_string(&verified.path).unwrap(), BYTES);
+    assert_eq!(verified.bytes, BYTES.as_bytes(), "the checked bytes");
     assert_eq!(
         checks,
         Checks {
@@ -184,9 +186,10 @@ async fn the_fallback_has_no_digest_to_check() {
     let _fake = serve(Served::good()).await;
     let _key = trust_test_key(true);
     let dir = tempfile::tempdir().unwrap();
-    let (_, checks) = fetch_verified(&release(None, false), ASSET, dir.path())
+    let checks = fetch_verified(&release(None, false), ASSET, dir.path())
         .await
-        .expect("verified without a digest");
+        .expect("verified without a digest")
+        .checks;
     assert!(!checks.digest, "only the API carries a digest");
     assert!(checks.sums && checks.signature);
 }

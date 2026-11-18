@@ -68,6 +68,11 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
         "A frontmatter key and each of its values are small enough for the metadata index.",
     ),
     rule(
+        "E012",
+        "warning",
+        "The body does not open with a second frontmatter block.",
+    ),
+    rule(
         "L001",
         "warning",
         "Every wikilink and relative note link resolves.",
@@ -314,7 +319,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids, sorted, "id order, each id once");
-        assert_eq!(ids.len(), 69);
+        assert_eq!(ids.len(), 70);
         for rule in VERIFY_RULES {
             assert!(
                 ["error", "warning", "info"].contains(&rule.default),

@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use crystalline_remote::UserTokenGrant;
 use crystalline_remote::reflections_backup::BACKUP_BRANCH;
 use crystalline_service::params::WriteReflectionParams;
@@ -427,7 +426,7 @@ async fn a_replayed_delivery_is_ignored() {
 async fn a_delivery_is_forgotten_after_a_day() {
     let fx = setup(Some(SECRET)).await;
     ask(&fx).await;
-    let now = Utc::now().timestamp();
+    let now = crystalline_core::time::now().unix_seconds();
     // Seen an hour ago: still a replay.
     assert!(
         fx.auth

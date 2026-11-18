@@ -434,7 +434,7 @@ pub async fn run_prompt(harness: Option<String>) {
         .recalled
         .extend(hits.iter().map(|h| h.address.clone()));
     trim_recalled(&mut new_state.recalled);
-    new_state.updated_at = chrono::Utc::now();
+    new_state.updated_at = crystalline_core::time::now();
     // Persisted before the print, the Stop hook's order: a crash between the
     // two costs one engram never shown again this session, never a repeat.
     let _ = hook::write_state(&path, &new_state);

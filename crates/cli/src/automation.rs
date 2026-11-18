@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use crystalline_core::automation::{
-    HEADLESS_DISALLOWED_TOOLS, LEASE_RENEW_SECS, Loop, RunOutcome, RunSummary, headless_prompt,
-    parse_run_summary,
+    DEFAULT_MAX_ITEMS, HEADLESS_DISALLOWED_TOOLS, LEASE_RENEW_SECS, Loop, RunOutcome, RunSummary,
+    SKILLS_LOADED_LINE, headless_prompt, loaded_skills_text, parse_run_summary, runner_setup,
 };
 use crystalline_remote::{Connection, RemoteFailure};
 use serde_json::{Value, json};
@@ -71,7 +71,7 @@ const EXIT_NOTHING: u8 = 1;
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
     /// The most items the agent works in one run.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = DEFAULT_MAX_ITEMS)]
     pub max_items: u32,
     /// The most agent turns in one run.
     #[arg(long, default_value_t = 60)]
@@ -106,10 +106,10 @@ pub enum LoopCommand {
         domain: Vec<String>,
     },
     /// Work what is due with a headless Claude Code agent: take the lease,
-    /// run the agent with the shipped prompt, share its changes as a pull
-    /// request, record the run and release the lease. Exit 0 when the run is
-    /// done or stopped at its item cap, 1 when nothing is due or a run is
-    /// already going, 2 when the run failed or on an error.
+    /// run the agent with the prompt the server answers, share its changes
+    /// as a pull request, record the run and release the lease. Exit 0 when
+    /// the run is done or stopped at its item cap, 1 when nothing is due or a
+    /// run is already going, 2 when the run failed or on an error.
     Run {
         /// The domain to work. Omit to work every due domain in turn.
         #[arg(long)]
@@ -139,21 +139,83 @@ pub enum LoopCommand {
         args: RunArgs,
     },
     /// Print the shipped prompt a headless run starts its agent with, for a
-    /// runner outside the CLI.
+    /// runner outside the CLI. With --json: the prompt, the tools the agent
+    /// may not call, this version and their checksum, the answer the
+    /// automation_prompt ctl verb gives.
     Prompt {
         /// The domain the prompt names.
         #[arg(long)]
         domain: String,
         /// The item cap the prompt names.
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = DEFAULT_MAX_ITEMS)]
         max_items: u32,
+        /// Say the agent's skills are already loaded instead of calling the
+        /// skills tool, for a runner that hands them to its agent itself.
+        /// `--skills-loaded false` asks for the call to the skills tool.
+        /// Without it the answer follows this machine's skills.serve, as
+        /// the automation_prompt verb of a daemon started here does.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+        skills_loaded: Option<bool>,
+        /// The config file to read skills.serve and the domain names from,
+        /// for a daemon started with --config. Defaults to
+        /// CRYSTALLINE_CONFIG, then the default config path.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
+}
+
+/// The domain and the skills line `<loop> prompt` fills in, read from this
+/// machine's configuration as a daemon started here reads them: the local
+/// name `domain` resolves to (an alias, a canonical name), and whether the
+/// skills are loaded (`skills_loaded` when given, else `skills.serve`
+/// through the environment overlay). A spelling the configuration does not
+/// know stays as typed.
+fn local_prompt_inputs(
+    domain: &str,
+    skills_loaded: Option<bool>,
+    config: Option<&Path>,
+) -> anyhow::Result<(String, bool)> {
+    let loaded = match crate::cmd::load(config) {
+        Ok(loaded) => loaded,
+        // Nothing to read is needed when the flag says it: the domain then
+        // stays as typed.
+        Err(_) if skills_loaded.is_some() => {
+            return Ok((domain.to_string(), skills_loaded.unwrap_or_default()));
+        }
+        Err(e) => {
+            return Err(e.context(
+                "could not read the configuration for skills.serve; pass --skills-loaded true or false",
+            ));
+        }
+    };
+    let local = loaded
+        .name_table()
+        .resolve(domain)
+        .unwrap_or(domain)
+        .to_string();
+    let serve = loaded.effective.skills_serve();
+    Ok((
+        local,
+        crystalline_core::automation::skills_loaded(serve, skills_loaded),
+    ))
 }
 
 /// Run `command` for loop `lp`.
 pub async fn run(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<()> {
-    if let LoopCommand::Prompt { domain, max_items } = &command {
-        print!("{}", headless_prompt(lp, domain, *max_items));
+    if let LoopCommand::Prompt {
+        domain,
+        max_items,
+        skills_loaded,
+        config,
+    } = &command
+    {
+        let (domain, loaded) = local_prompt_inputs(domain, *skills_loaded, config.as_deref())?;
+        if json {
+            let setup = runner_setup(lp, &domain, *max_items, loaded);
+            println!("{}", serde_json::to_string(&setup)?);
+        } else {
+            print!("{}", headless_prompt(lp, &domain, *max_items, loaded));
+        }
         return Ok(());
     }
     let code = match dispatch(lp, command, json).await {

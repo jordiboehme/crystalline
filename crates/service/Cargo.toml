@@ -81,7 +81,6 @@ axum = { workspace = true }
 tower-service = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 sha2 = { workspace = true }
 # The tar.gz update unpacks the one member that holds the binary.
 tar = { workspace = true }

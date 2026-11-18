@@ -1159,10 +1159,7 @@ pub(crate) mod pg {
     }
 
     fn since(owner: &OwnerRow) -> String {
-        owner
-            .since
-            .into_chrono()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        owner.since.rfc3339_secs_z()
     }
 
     /// `running `<command>`, ` when the holder is a command, else nothing.
@@ -1302,7 +1299,6 @@ pub(crate) mod pg {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use chrono::{TimeZone, Utc};
 
         fn row(command: Option<&str>, released: bool) -> OwnerRow {
             OwnerRow {
@@ -1312,13 +1308,9 @@ pub(crate) mod pg {
                 pid: 42,
                 backend_pid: 4242,
                 version: "0.33.0".to_string(),
-                since: crystalline_core::time::Stamp::from_chrono(
-                    Utc.with_ymd_and_hms(2026, 11, 16, 9, 30, 0).unwrap(),
-                ),
+                since: crystalline_core::time::Stamp::from_ymd_hms(2026, 11, 16, 9, 30, 0).unwrap(),
                 released_at: released.then(|| {
-                    crystalline_core::time::Stamp::from_chrono(
-                        Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap(),
-                    )
+                    crystalline_core::time::Stamp::from_ymd_hms(2026, 11, 16, 10, 0, 0).unwrap()
                 }),
             }
         }

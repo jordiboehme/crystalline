@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, FixedOffset};
 use crystalline_core::automation::{Loop, RunOutcome, RunReport};
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
+use crystalline_core::time::{self, OffsetStamp};
 use crystalline_index::TursoStore;
 use crystalline_service::engine::ShareActor;
 use crystalline_service::params::{DiscussParams, ReflectParams, WriteReflectionParams};
@@ -22,11 +22,11 @@ use crate::support::MockProvider;
 /// When every test starts.
 const START: &str = "2026-10-21T10:00:00+00:00";
 
-fn at(rfc3339: &str) -> DateTime<FixedOffset> {
-    DateTime::parse_from_rfc3339(rfc3339).unwrap()
+fn at(rfc3339: &str) -> OffsetStamp {
+    time::parse_rfc3339(rfc3339).unwrap()
 }
 
-fn start() -> DateTime<FixedOffset> {
+fn start() -> OffsetStamp {
     at(START)
 }
 
@@ -241,7 +241,7 @@ async fn a_crashed_runner_expires_after_five_minutes() {
     open_thread(&fx, "aaaa1111", "Still true?").await;
     let token = take(&fx.engine, Loop::Reflect, "eng", "k8s").await;
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(120)));
+        .set_automation_now(Some(start() + time::seconds(120)));
     fx.engine
         .automation_lease_renew(Loop::Reflect, "eng", &token, &Scope::Unrestricted)
         .await
@@ -249,13 +249,13 @@ async fn a_crashed_runner_expires_after_five_minutes() {
 
     // Then the runner dies. Five minutes after the last renewal it still runs.
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(120 + 299)));
+        .set_automation_now(Some(start() + time::seconds(120 + 299)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["running"]["runner"], "k8s", "{s}");
     assert_eq!(s["due"], false, "{s}");
 
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(120 + 301)));
+        .set_automation_now(Some(start() + time::seconds(120 + 301)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["running"], Value::Null, "{s}");
     assert_eq!(s["due"], true, "{s}");
@@ -353,7 +353,7 @@ async fn a_failed_run_parks_nothing() {
     // The loop backs off for 5 minutes after the failure; then the item
     // that run did not settle is due again.
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(301)));
+        .set_automation_now(Some(start() + time::seconds(301)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
     assert_eq!(s["left_for_person"], 0, "{s}");
@@ -366,7 +366,7 @@ async fn a_failed_run_parks_nothing() {
 }
 
 /// Record one run of `outcome` on `eng` at `now`.
-async fn run_at(fx: &Fx, now: DateTime<FixedOffset>, outcome: RunOutcome) {
+async fn run_at(fx: &Fx, now: OffsetStamp, outcome: RunOutcome) {
     fx.engine.set_automation_now(Some(now));
     let token = take(&fx.engine, Loop::Reflect, "eng", "cli").await;
     record(
@@ -411,28 +411,28 @@ async fn failed_runs_back_off_until_a_run_does_not_fail() {
     assert_eq!(forced["domains"][0]["due"], true, "{forced}");
 
     // A second failure 6 minutes in: the wait doubles to 10 minutes from it.
-    let second = start() + Duration::seconds(360);
+    let second = start() + time::seconds(360);
     run_at(&fx, second, RunOutcome::Failed).await;
     fx.engine
-        .set_automation_now(Some(second + Duration::seconds(599)));
+        .set_automation_now(Some(second + time::seconds(599)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], "backing off after 2 failed runs", "{s}");
     assert_eq!(s["due"], false, "{s}");
     fx.engine
-        .set_automation_now(Some(second + Duration::seconds(601)));
+        .set_automation_now(Some(second + time::seconds(601)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
     assert_eq!(s["reason"], Value::Null, "{s}");
 
     // A run that stops at its cap ends the row; the next failure waits 5
     // minutes again.
-    let capped = second + Duration::seconds(700);
+    let capped = second + time::seconds(700);
     run_at(&fx, capped, RunOutcome::StoppedAtCap).await;
-    run_at(&fx, capped + Duration::seconds(10), RunOutcome::Failed).await;
+    run_at(&fx, capped + time::seconds(10), RunOutcome::Failed).await;
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], "backing off after 1 failed run", "{s}");
     fx.engine
-        .set_automation_now(Some(capped + Duration::seconds(311)));
+        .set_automation_now(Some(capped + time::seconds(311)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
 }
@@ -444,8 +444,7 @@ async fn a_failure_from_the_future_backs_nothing_off() {
     let fx = reflecting().await;
     open_thread(&fx, "aaaa1111", "Still true?").await;
     run_at(&fx, start(), RunOutcome::Failed).await;
-    fx.engine
-        .set_automation_now(Some(start() - Duration::hours(2)));
+    fx.engine.set_automation_now(Some(start() - time::hours(2)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], Value::Null, "{s}");
     assert_eq!(s["due"], true, "{s}");
@@ -459,15 +458,15 @@ async fn the_backoff_stops_at_six_hours() {
     let mut now = start();
     for _ in 0..12 {
         run_at(&fx, now, RunOutcome::Failed).await;
-        now += Duration::seconds(1);
+        now = now + time::seconds(1);
     }
-    let last = now - Duration::seconds(1);
+    let last = now - time::seconds(1);
     fx.engine
-        .set_automation_now(Some(last + Duration::seconds(6 * 3600 - 1)));
+        .set_automation_now(Some(last + time::seconds(6 * 3600 - 1)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["reason"], "backing off after 12 failed runs", "{s}");
     fx.engine
-        .set_automation_now(Some(last + Duration::seconds(6 * 3600 + 1)));
+        .set_automation_now(Some(last + time::seconds(6 * 3600 + 1)));
     let s = status(&fx.engine, Loop::Reflect).await;
     assert_eq!(s["due"], true, "{s}");
 }
@@ -584,8 +583,7 @@ async fn an_unchanged_item_keeps_its_version_a_day_later() {
     assert!(before >= 86_000, "a day old: {before}");
 
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    fx.engine
-        .set_automation_now(Some(start() + Duration::days(1)));
+    fx.engine.set_automation_now(Some(start() + time::days(1)));
     let after = source_change_age(&fx).await;
     assert!(after > before, "the age moved: {before} then {after}");
     let s = status(&fx.engine, Loop::Reflect).await;
@@ -1079,7 +1077,7 @@ async fn a_record_after_a_takeover_is_refused() {
     open_thread(&fx, "aaaa1111", "Still true?").await;
     let old = take(&fx.engine, Loop::Reflect, "eng", "k8s").await;
     fx.engine
-        .set_automation_now(Some(start() + Duration::seconds(301)));
+        .set_automation_now(Some(start() + time::seconds(301)));
     take(&fx.engine, Loop::Reflect, "eng", "cli").await;
     let err = fx
         .engine
@@ -1204,7 +1202,7 @@ async fn on_postgres_evolve_runs_on_the_host_and_a_stale_lease_expires_once() {
 
     let old = take(&a.engine, Loop::Evolve, "eng", "k8s").await;
     a.engine
-        .set_automation_now(Some(start() + Duration::seconds(301)));
+        .set_automation_now(Some(start() + time::seconds(301)));
     take(&a.engine, Loop::Evolve, "eng", "cli").await;
     let err = a
         .engine
@@ -1239,7 +1237,7 @@ async fn a_write_while_the_lease_lapsed_is_still_shared() {
         .await
         .unwrap();
     let token = taken["token"].as_str().unwrap().to_string();
-    eng.set_automation_now(Some(start() + Duration::seconds(400)));
+    eng.set_automation_now(Some(start() + time::seconds(400)));
     write_note(&root, "notes/late.md", "written while the lease lapsed");
     eng.note_written("brand", "runner", &["notes/late.md".to_string()])
         .await

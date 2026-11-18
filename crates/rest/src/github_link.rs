@@ -153,7 +153,7 @@ fn view(v: GithubLinkView) -> GithubLinkResponse {
         login: v.login,
         github_id: v.github_id,
         host: v.host,
-        linked_at: v.linked_at.map(|at| at.to_rfc3339()),
+        linked_at: v.linked_at.map(|at| at.rfc3339()),
         token_live: v.token_live,
         pending: v.pending.map(|p| GithubPendingView {
             user_code: p.user_code,

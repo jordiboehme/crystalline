@@ -113,7 +113,14 @@ The MSI also registers a Windows task that starts the Crystalline daemon when yo
 
 </details>
 
-Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file, or build from a clone with `cargo build --release`. The macOS binaries are code signed and notarized, so Gatekeeper runs them without a prompt.
+Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file and its minisign signature, or build from a clone with `cargo build --release`. The macOS binaries are code signed and notarized, so Gatekeeper runs them without a prompt.
+
+To update:
+
+- `crystalline update check` says if a newer stable release is out and what `update now` would do on your install.
+- `crystalline update now` updates the install, or downloads and verifies the package and prints the command or steps that install it.
+
+See [Updating](docs/deployment.md#updating) for each install method and the opt-in daily check.
 
 ## Why not a memory feature
 
@@ -141,6 +148,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | Scenario | In one line |
 |---|---|
 | [Personal workstation](docs/deployment.md#personal-workstation) | The default: local folders, agents over stdio, one shared background daemon |
+| [Updating](docs/deployment.md#updating) | `crystalline update check` and `update now` per install method, signed release checksums and an opt-in daily check |
 | [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | `crystalline install claude-desktop` builds a small extension that connects Claude Desktop to the Crystalline you installed; a Desktop-only bundle with Crystalline inside exists for Mac users of Claude Desktop alone |
 | [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP with its own token |
 | [Web UI from the daemon](docs/deployment.md#web-ui-from-the-daemon) | The browser UI ships built into the binary, on by default at localhost - browse what your agents know with zero extra moving parts, and follow the links they hand you into it |

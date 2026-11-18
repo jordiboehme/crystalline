@@ -842,9 +842,338 @@ fn without_generated(blocks: &KeyBlocks) -> String {
     text
 }
 
+/// The keys a write owns outright: a frontmatter block in a write's content
+/// cannot set them, and the repair of a second block leaves them out too.
+pub const ENGINE_OWNED_KEYS: [&str; 4] = ["permalink", "recorded_at", "timestamp", "generated"];
+
+/// The block between two rules as frontmatter, when it looks like engram
+/// frontmatter: a YAML mapping, with no `#` comment line (between two rules
+/// that is a markdown heading, which YAML would read as a comment and drop),
+/// that names at least one key the engram schema knows
+/// ([`RECOGNIZED_FRONTMATTER_KEYS`]). Anything else, `Note: remember this`
+/// among them, is markdown that stays body text. The one rule a write's
+/// content, an edit's result and verify's `E012` find a block by.
+pub fn frontmatter_block(yaml: &str) -> Option<serde_yaml_ng::Mapping> {
+    if yaml.lines().any(|line| line.trim_start().starts_with('#')) {
+        return None;
+    }
+    let Ok(Value::Mapping(mapping)) = serde_yaml_ng::from_str::<Value>(yaml) else {
+        return None;
+    };
+    mapping
+        .keys()
+        .any(|key| RECOGNIZED_FRONTMATTER_KEYS.contains(&key_text(key).as_str()))
+        .then_some(mapping)
+}
+
+/// Whether `text` opens, after blank lines, with a block that looks like
+/// engram frontmatter ([`frontmatter_block`]).
+pub fn opens_with_frontmatter(text: &str) -> bool {
+    let text = to_lf(text);
+    split_frontmatter(text.trim_start_matches('\n'))
+        .is_some_and(|parts| frontmatter_block(parts.yaml).is_some())
+}
+
+/// Whether the body of the engram `source` opens with a second block that
+/// looks like engram frontmatter, under the engram's own: what a capture
+/// whose content opened with a block stored before 0.34.0. Every reader takes
+/// the first block only, so the keys of the second are lost to them.
+pub fn body_opens_with_frontmatter(source: &str) -> bool {
+    let source = to_lf(source);
+    split_frontmatter(&source).is_some_and(|parts| opens_with_frontmatter(parts.body))
+}
+
+/// A second frontmatter block at the top of an engram's body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondBlock {
+    /// One-based file line of the block's opening rule.
+    pub line: usize,
+    /// The block's keys, in its order.
+    pub keys: Vec<String>,
+}
+
+/// The second block the body of `source` opens with, or `None` when it opens
+/// with none ([`body_opens_with_frontmatter`]).
+pub fn second_block(source: &str) -> Option<SecondBlock> {
+    // CRLF reads as LF, which keeps the line numbers.
+    let source = to_lf(source);
+    let source = source.as_ref();
+    let parts = split_frontmatter(source)?;
+    let lead = parts.body.len() - parts.body.trim_start_matches('\n').len();
+    let inner = split_frontmatter(&parts.body[lead..])?;
+    let mapping = frontmatter_block(inner.yaml)?;
+    let before = parts.open.len() + parts.yaml.len() + parts.close.len() + lead;
+    Some(SecondBlock {
+        line: source[..before].matches('\n').count() + 1,
+        keys: mapping.keys().map(key_text).collect(),
+    })
+}
+
+/// What [`merge_second_block`] made of an engram with a second block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockMerge {
+    /// The engram with the second block's keys in its own frontmatter and the
+    /// block gone from the body.
+    Merged(String),
+    /// Why the block cannot be merged by these rules.
+    NotRepairable(String),
+}
+
+/// Merge the second block the body of `source` opens with into the engram's
+/// own frontmatter, by the rules a write lifts a block in its content by
+/// (`write_engram`): the engram's own keys stand for the write's parameters
+/// and win over the same key in the block; `permalink`, `recorded_at`,
+/// `timestamp` and `generated` in the block are dropped; a `title`, `type`,
+/// `status` or `tags` with no value is left out, and one that is a list or a
+/// mapping (tags: a mapping) cannot be merged. A `type: engram`, a `status:
+/// stable`, an empty title and no tags are what a write fills in when its
+/// parameter is left out, so the block's value takes their place. The body
+/// is the text under the block, as a write stores its content.
+///
+/// `None` when the body opens with no such block. A CRLF source is read as
+/// LF, and the merge is LF, as every stored engram is. The frontmatter is
+/// written anew, as an overwrite writes it: YAML comments and the key order
+/// of the engram's own block are not kept. Only the first stacked block is
+/// merged; [`merge_second_blocks`] merges them all.
+pub fn merge_second_block(source: &str) -> Option<BlockMerge> {
+    let source = to_lf(source);
+    let source = source.as_ref();
+    let parts = split_frontmatter(source)?;
+    let inner = split_frontmatter(parts.body.trim_start_matches('\n'))?;
+    let block = frontmatter_block(inner.yaml)?;
+    let mut engram = match parse_engram(source) {
+        Ok(engram) => engram,
+        Err(e) => {
+            return Some(BlockMerge::NotRepairable(format!(
+                "the engram's own frontmatter does not parse: {e}"
+            )));
+        }
+    };
+    let own = match serde_yaml_ng::from_str::<Value>(parts.yaml) {
+        Ok(Value::Mapping(own)) => own,
+        _ => serde_yaml_ng::Mapping::new(),
+    };
+    let has_own = |key: &str| own.keys().any(|k| key_text(k) == key);
+    let fm = &mut engram.frontmatter;
+    for (key, value) in block {
+        let key = key_text(&key);
+        if ENGINE_OWNED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let typed = matches!(key.as_str(), "title" | "type" | "status" | "tags");
+        if typed && value.is_null() {
+            continue;
+        }
+        match key.as_str() {
+            "title" if fm.title.trim().is_empty() => match block_scalar(&value) {
+                Some(title) => fm.title = title,
+                None => return Some(not_plain_text(&key)),
+            },
+            "type" if fm.engram_type.is_empty() || fm.engram_type == "engram" => {
+                match block_scalar(&value) {
+                    Some(kind) => fm.engram_type = kind,
+                    None => return Some(not_plain_text(&key)),
+                }
+            }
+            "status" if matches!(fm.status.as_deref(), None | Some("stable")) => {
+                match block_scalar(&value) {
+                    Some(status) => fm.status = Some(status),
+                    None => return Some(not_plain_text(&key)),
+                }
+            }
+            "tags" if fm.tags.is_empty() => match block_tags(&value) {
+                Some(tags) => fm.tags = tags,
+                None => return Some(not_plain_text(&key)),
+            },
+            _ if typed || has_own(&key) => {}
+            _ => {
+                fm.extra.insert(key, crate::YamlValue::from_backend(value));
+            }
+        }
+    }
+    if let Err(e) = crate::temporal::normalize_temporal_fields(fm) {
+        return Some(BlockMerge::NotRepairable(e.to_string()));
+    }
+    if let Err(e) = crate::temporal::normalize_verified(fm) {
+        return Some(BlockMerge::NotRepairable(e.to_string()));
+    }
+    engram.body = format!("\n{}\n", inner.body.trim_matches('\n'));
+    let merged = crate::emit::emit_engram(&engram);
+    if parse_engram(&merged).is_err() {
+        return Some(BlockMerge::NotRepairable(
+            "the merged frontmatter does not parse".to_string(),
+        ));
+    }
+    Some(BlockMerge::Merged(merged))
+}
+
+/// [`merge_second_block`] until the body opens with no block, for an engram
+/// that holds several stacked ones. At most 64 rounds, then the text as far
+/// as it got is not repairable. `None` when there is no block to merge.
+pub fn merge_second_blocks(source: &str) -> Option<BlockMerge> {
+    let mut text = match merge_second_block(source)? {
+        BlockMerge::Merged(text) => text,
+        refused => return Some(refused),
+    };
+    for _ in 0..64 {
+        match merge_second_block(&text) {
+            None => return Some(BlockMerge::Merged(text)),
+            Some(BlockMerge::Merged(next)) => text = next,
+            Some(refused) => return Some(refused),
+        }
+    }
+    Some(BlockMerge::NotRepairable(
+        "the body opens with more stacked blocks than one repair merges".to_string(),
+    ))
+}
+
+fn not_plain_text(key: &str) -> BlockMerge {
+    BlockMerge::NotRepairable(format!(
+        "the second block gives {key} a value that is not plain text"
+    ))
+}
+
+/// A one-value key (title, type, status) of a block as text, as a write
+/// lifts it.
+fn block_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// `tags` of a block as a list, from a YAML list or a comma-separated line,
+/// as a write lifts it.
+fn block_tags(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Null => Some(Vec::new()),
+        Value::String(s) => Some(
+            s.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        Value::Sequence(items) => items.iter().map(block_scalar).collect(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What 0.33.0 stored for a capture whose content opened with a block:
+    /// its own generated block (the parameters and the defaults of the ones
+    /// left out), then the content's block as body text.
+    const DOUBLED: &str = "---\ntype: engram\ntitle: Cache Policy\npermalink: cache-policy\ntags: []\nstatus: stable\nrecorded_at: 2026-11-01\ngenerated: { by: agent, at: 2026-11-01T10:00:00Z }\nowner: kept\n---\n\n---\ntitle: Ignored Title\ntype: decision\nstatus: draft\ntags:\n  - from-block\nsalience: 7\nvalid_from: 2026-01-01\nowner: block\nteam: core\npermalink: somewhere/else\nrecorded_at: 2020-01-01\n---\n\n# Cache Policy\n\nWe cache for five minutes.\n";
+
+    #[test]
+    fn a_second_block_is_found_with_its_line_and_keys() {
+        let block = second_block(DOUBLED).expect("found");
+        assert_eq!(block.line, 12);
+        assert_eq!(block.keys[..3], ["title", "type", "status"]);
+        assert!(body_opens_with_frontmatter(DOUBLED));
+        let single = "---\ntitle: T\n---\n\n# T\n\n---\nstatus: draft\n---\n";
+        assert_eq!(second_block(single), None);
+        assert!(!body_opens_with_frontmatter(single));
+        // Markdown between two rules is no block.
+        let rules = "---\ntitle: T\n---\n---\nNote: remember this\n---\n";
+        assert_eq!(second_block(rules), None);
+        assert_eq!(merge_second_block(rules), None);
+    }
+
+    #[test]
+    fn a_second_block_merges_by_the_rules_a_write_lifts_it_by() {
+        let Some(BlockMerge::Merged(text)) = merge_second_block(DOUBLED) else {
+            panic!("not merged");
+        };
+        let engram = parse_engram(&text).unwrap();
+        let fm = &engram.frontmatter;
+        // The engram's own keys win, unless they are what a write fills in.
+        assert_eq!(fm.title, "Cache Policy");
+        assert_eq!(fm.engram_type, "decision");
+        assert_eq!(fm.status.as_deref(), Some("draft"));
+        assert_eq!(fm.tags, ["from-block"]);
+        assert_eq!(fm.extra.get("owner").and_then(|v| v.as_str()), Some("kept"));
+        assert_eq!(fm.extra.get("team").and_then(|v| v.as_str()), Some("core"));
+        assert_eq!(fm.extra.get("salience"), Some(&crate::YamlValue::Int(7)));
+        assert_eq!(
+            fm.valid_from.map(|d| d.ymd()).as_deref(),
+            Some("2026-01-01")
+        );
+        // The keys a write owns stay the engram's.
+        assert_eq!(fm.permalink.as_deref(), Some("cache-policy"));
+        assert_eq!(
+            fm.recorded_at.map(|d| d.ymd()).as_deref(),
+            Some("2026-11-01")
+        );
+        assert_eq!(fm.generated.as_ref().map(|g| g.by.as_str()), Some("agent"));
+        // One block, and the body is the text under the second one.
+        assert_eq!(second_block(&text), None);
+        assert_eq!(
+            engram.body,
+            "\n# Cache Policy\n\nWe cache for five minutes.\n"
+        );
+        // A merge of a merged engram has nothing left to do.
+        assert_eq!(merge_second_block(&text), None);
+    }
+
+    #[test]
+    fn a_crlf_engram_s_second_block_is_found_and_merged() {
+        let crlf = DOUBLED.replace('\n', "\r\n");
+        assert!(body_opens_with_frontmatter(&crlf));
+        assert!(opens_with_frontmatter(
+            "\r\n---\r\nstatus: draft\r\n---\r\nIntro"
+        ));
+        assert_eq!(second_block(&crlf), second_block(DOUBLED));
+        assert_eq!(merge_second_block(&crlf), merge_second_block(DOUBLED));
+    }
+
+    #[test]
+    fn stacked_blocks_are_merged_until_none_is_left() {
+        let stacked = DOUBLED.replacen(
+            "---\n\n# Cache Policy",
+            "---\n---\nresource: https://example.com/a\n---\n---\nreview_after: 2027-01-01\n---\n\n# Cache Policy",
+            1,
+        );
+        let Some(BlockMerge::Merged(one)) = merge_second_block(&stacked) else {
+            panic!("not merged");
+        };
+        assert!(
+            second_block(&one).is_some(),
+            "one round leaves the next block"
+        );
+        let Some(BlockMerge::Merged(all)) = merge_second_blocks(&stacked) else {
+            panic!("not merged");
+        };
+        assert_eq!(second_block(&all), None);
+        let engram = parse_engram(&all).unwrap();
+        assert_eq!(engram.frontmatter.engram_type, "decision");
+        assert_eq!(
+            engram.frontmatter.resource.as_deref(),
+            Some("https://example.com/a")
+        );
+        assert!(
+            engram.frontmatter.stale_after.is_some() || engram.frontmatter.review_after.is_some()
+        );
+        assert_eq!(
+            engram.body,
+            "\n# Cache Policy\n\nWe cache for five minutes.\n"
+        );
+        assert_eq!(merge_second_blocks(&all), None);
+    }
+
+    #[test]
+    fn a_second_block_a_write_would_refuse_is_not_merged() {
+        let doubled = "---\ntype: engram\ntitle: T\npermalink: t\ntags: []\nstatus: stable\n---\n---\ntype: [a, b]\n---\nBody\n";
+        assert!(matches!(
+            merge_second_block(doubled),
+            Some(BlockMerge::NotRepairable(why)) if why.contains("type")
+        ));
+    }
 
     // Review Focus 3 of the time-module move: two `generated` blocks naming
     // the same instant in different offsets rank equal on the instant, so the

@@ -69,6 +69,7 @@ use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DatabaseBackend, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::text::plural;
+use crystalline_core::time;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{DomainLayout, HarnessKind, PathClass, harness_paths, slash_rel};
 use crystalline_index::{
@@ -167,6 +168,10 @@ pub struct DomainDoctor {
     /// Files whose frontmatter holds a key more than once (`verify` rule
     /// `E010`). Kept apart from `unsyncable`, since `--fix` can repair them.
     pub duplicate_keys: Vec<DuplicateKeyFile>,
+    /// Engrams whose body opens with a second frontmatter block (`verify`
+    /// rule `E012`), which 0.33.0 stored when a capture's content opened
+    /// with one. `--fix` merges the block into the engram's own.
+    pub second_blocks: Vec<SecondBlockFile>,
     /// Second copies 0.20.0's overwrite left beside an engram. Both files
     /// leave `unindexed`, since neither is merely unsynced.
     pub stray_copies: Vec<StrayCopy>,
@@ -231,6 +236,26 @@ pub struct DuplicateKeyFile {
     /// sends a person to `--fix` when it would work.
     pub fixable: bool,
     /// Whether `--fix` removed the extra copies in this run.
+    pub fixed: bool,
+    /// Why `--fix` leaves (or left) the file as it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_fixed: Option<String>,
+}
+
+/// An engram whose body opens with a second frontmatter block.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SecondBlockFile {
+    /// The file path, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// The line of the second block's opening rule.
+    pub line: usize,
+    /// The second block's keys.
+    pub keys: Vec<String>,
+    /// Whether `--fix` would merge the block (it merges by the rules a write
+    /// lifts a block by, the result parses, the instance and the domain take
+    /// writes and the domain does not review changes).
+    pub fixable: bool,
+    /// Whether `--fix` merged the block in this run.
     pub fixed: bool,
     /// Why `--fix` leaves (or left) the file as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1978,14 +2003,13 @@ pub struct KeptDoctor {
 fn check_kept(
     found: Vec<crystalline_core::kept::KeptText>,
     domain_filter: Option<&str>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: time::Stamp,
 ) -> Vec<KeptDoctor> {
     found
         .into_iter()
         .filter(|k| domain_filter.is_none_or(|d| k.domain == d))
         .map(|k| {
-            let stale =
-                now - k.kept_at.into_chrono() > chrono::Duration::days(crate::kept::STALE_DAYS);
+            let stale = now.since(k.kept_at) > time::days(crate::kept::STALE_DAYS);
             KeptDoctor {
                 line: format!(
                     "{} {}, kept {}, {}",
@@ -2001,10 +2025,7 @@ fn check_kept(
                 unfinished: k.unfinished,
                 kind: k.kind,
                 path: k.path.clone(),
-                kept_at: k
-                    .kept_at
-                    .into_chrono()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                kept_at: k.kept_at.rfc3339_secs_z(),
                 bytes: k.bytes,
                 file: k.file.display().to_string(),
                 stale,
@@ -2119,6 +2140,7 @@ impl DoctorReport {
             n += d.unsyncable.len();
             n += d.encoding_issues.len();
             n += d.duplicate_keys.iter().filter(|f| !f.fixed).count();
+            n += d.second_blocks.iter().filter(|f| !f.fixed).count();
             n += d.stray_copies.iter().filter(|s| !s.fixed).count();
         }
         if self.service.lock_stale && !self.service.lock_removed {
@@ -2318,7 +2340,7 @@ pub async fn run(
     let mut merge = None;
     let mut merge_error = None;
     if merge_desktop_state {
-        let today = chrono::Local::now().date_naive();
+        let today = time::today_utc();
         let mut merged = crate::desktop_state::MergeReport::default();
         for state in &desktop_states {
             if let Err(e) =
@@ -2409,7 +2431,12 @@ pub async fn run(
             // runs below, and the reason travels in the report as guidance.
             Err(e) => {
                 index = IndexAccess::Unavailable {
-                    reason: index_unavailable_reason(&db, &e.to_string(), &service, bypassed),
+                    reason: index_unavailable_reason(
+                        &crystalline_service::instance::IndexLocation::of(cfg, &db),
+                        &e.to_string(),
+                        &service,
+                        bypassed,
+                    ),
                 };
             }
         }
@@ -2551,7 +2578,7 @@ pub async fn run(
 
     let daemon_task = check_task(fix);
 
-    let kept = check_kept(crate::kept::scan_here(), domain_filter, chrono::Utc::now());
+    let kept = check_kept(crate::kept::scan_here(), domain_filter, time::now());
     let case_twins = check_case_twins(cfg);
 
     // Only an active daemon answers the file-stamp request (a standby
@@ -2679,7 +2706,7 @@ fn rename_doctor(
                         None => restorable = false,
                     }
                 }
-                if owner.index != here.index {
+                if !owner.same_index(here) {
                     match owner.index.as_deref() {
                         // A Postgres index is named by its host and database,
                         // which the configuration's url chooses.
@@ -2982,12 +3009,12 @@ async fn daemon_file_stamps(
 /// `doctor` while a daemon is up used to see nothing but the raw locking
 /// error, which named neither.
 fn index_unavailable_reason(
-    db: &Path,
+    location: &crystalline_service::instance::IndexLocation,
     error: &str,
     service: &ServiceDoctor,
     bypassed: bool,
 ) -> String {
-    let db = db.display();
+    let at = location.at();
     let pid = service
         .lock_pid
         .map(|p| p.to_string())
@@ -2995,28 +3022,35 @@ fn index_unavailable_reason(
     let skipped = "so the orphan, unindexed, embedding and tag checks did not run";
     // Not a holder problem: see `instance::words_for_holder`.
     if crystalline_index::is_schema_too_new_text(error) {
-        return format!("the index at {db} cannot be used by this binary, {skipped}. {error}");
+        return format!("the index {at} cannot be used by this binary, {skipped}. {error}");
     }
     // The wedge first: it is the one holder `--fix` can do something about.
     if service.daemon_unresponsive && !service.daemon_dislodged {
         return format!(
-            "an unresponsive daemon (pid {pid}) holds the index at {db} and answers nothing on its socket, {skipped}. Rerun `crystalline doctor --fix` to replace it. The index reported: {error}"
+            "an unresponsive daemon (pid {pid}) holds the index {at} and answers nothing on its socket, {skipped}. Rerun `crystalline doctor --fix` to replace it. The index reported: {error}"
         );
     }
     let live_daemon = instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
     if live_daemon && bypassed {
         return format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {db}, and --db or --config told doctor to read that file directly instead of asking the daemon, {skipped}. Run `crystalline doctor` without --db and --config to have the daemon answer them, or stop it first with `crystalline ctl shutdown`. The index reported: {error}"
+            "the running Crystalline daemon (pid {pid}) owns the index {at}, and --db or --config told doctor to read {} directly instead of asking the daemon, {skipped}. Run `crystalline doctor` without --db and --config to have the daemon answer them, or stop it first with `crystalline ctl shutdown`. The index reported: {error}",
+            location.direct_target()
         );
     }
     if live_daemon {
         return format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {db} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
+            "the running Crystalline daemon (pid {pid}) owns the index {at} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
         );
     }
-    format!(
-        "the index at {db} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
-    )
+    match location {
+        crystalline_service::instance::IndexLocation::File(_) => format!(
+            "the index {at} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+        ),
+        crystalline_service::instance::IndexLocation::Database(_) => format!(
+            "the index {at} could not be opened, {skipped}. {} The database reported: {error}",
+            crystalline_service::instance::database_open_advice()
+        ),
+    }
 }
 
 fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
@@ -3223,6 +3257,7 @@ async fn check_domain_checks(
     // shape before comparing.
     let mut unsyncable_by_path: BTreeMap<String, String> = BTreeMap::new();
     let mut duplicate_paths: BTreeSet<String> = BTreeSet::new();
+    let mut second_block_paths: BTreeSet<String> = BTreeSet::new();
     if let Ok(report) = verify::verify_paths([&path], &VerifyOptions::default()) {
         for issue in report.issues {
             match issue.rule {
@@ -3239,6 +3274,9 @@ async fn check_domain_checks(
                 }
                 "E010" => {
                     duplicate_paths.insert(relative_slash_path(&path, &issue.path));
+                }
+                "E012" => {
+                    second_block_paths.insert(relative_slash_path(&path, &issue.path));
                 }
                 _ => {}
             }
@@ -3288,6 +3326,50 @@ async fn check_domain_checks(
             }
         }
         d.duplicate_keys.push(report);
+    }
+
+    // (n) 0.33.0's second frontmatter blocks (E012): with --fix the block
+    // is merged into the engram's own, by the rules a write lifts a block in
+    // its content by. A reviewing domain's folder only moves through a
+    // merge, so there the file is left for a rewrite through a write.
+    for rel in second_block_paths {
+        let file = path.join(&rel);
+        let Ok(source) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Some(block) = crystalline_core::frontmatter::second_block(&source) else {
+            continue;
+        };
+        let mut plan = match crystalline_core::frontmatter::merge_second_blocks(&source) {
+            Some(crystalline_core::frontmatter::BlockMerge::Merged(text)) => Ok(text),
+            Some(crystalline_core::frontmatter::BlockMerge::NotRepairable(why)) => Err(format!(
+                "--fix leaves it: {why}. Rewrite the engram with write_engram and overwrite: true"
+            )),
+            None => continue,
+        };
+        if let Some(note) = &refusal
+            && plan.is_ok()
+        {
+            plan = Err(note.clone());
+        }
+        if entry.is_overlay() && plan.is_ok() {
+            plan = Err(REVIEWED_NOTE.to_string());
+        }
+        let mut report = SecondBlockFile {
+            path: rel,
+            line: block.line,
+            keys: block.keys,
+            fixable: plan.is_ok(),
+            fixed: false,
+            not_fixed: plan.as_ref().err().cloned(),
+        };
+        if fix && let Ok(text) = plan {
+            match write_fix(&file, &source, &text) {
+                Ok(()) => report.fixed = true,
+                Err(note) => report.not_fixed = Some(note),
+            }
+        }
+        d.second_blocks.push(report);
     }
 
     // (m) 0.20.0's stray second copies. In every domain, team domains
@@ -3602,19 +3684,19 @@ fn same_apart_from_generated(a: &str, b: &str) -> bool {
 
 /// When a file was written: its `generated.at`, else its `recorded_at`, else
 /// the file's modification time.
-fn written_at(file: &StrayFile) -> Option<chrono::DateTime<chrono::Utc>> {
+fn written_at(file: &StrayFile) -> Option<time::Stamp> {
     let engram = crystalline_core::parse_engram(&file.source).ok();
     let frontmatter = engram.as_ref().map(|e| &e.frontmatter);
     if let Some(at) = frontmatter
         .and_then(|f| f.generated.as_ref())
         .and_then(|g| g.at)
     {
-        return Some(at.into_chrono().with_timezone(&chrono::Utc));
+        return Some(at.stamp());
     }
     if let Some(day) = frontmatter.and_then(|f| f.recorded_at) {
-        return day.into_chrono().and_hms_opt(0, 0, 0).map(|t| t.and_utc());
+        return day.start_utc();
     }
-    file.modified.map(chrono::DateTime::<chrono::Utc>::from)
+    file.modified.and_then(time::Stamp::from_system_time)
 }
 
 /// What doctor reports about one stray pair, and what `--fix` did about it,
@@ -4766,7 +4848,7 @@ async fn check_github_app(
             let probe = app.probe().await;
             doctor.clock_skew_secs = probe
                 .server_date
-                .map(|date| date.since(crystalline_core::time::now()).num_seconds());
+                .map(|date| date.since(time::now()).num_seconds());
             match &probe.info {
                 Ok(info) => {
                     doctor.jwt_accepted = Some(true);
@@ -5535,6 +5617,28 @@ pub fn render_human(report: &DoctorReport) -> String {
                 };
             }
         }
+        for f in &d.second_blocks {
+            let keys = f.keys.join(", ");
+            let _ = if f.fixed {
+                writeln!(
+                    out,
+                    "  fixed {}: merged the second frontmatter block ({keys}) into the engram's own, written anew as an overwrite writes it (YAML comments and the key order are not kept)",
+                    f.path
+                )
+            } else if let Some(note) = &f.not_fixed {
+                writeln!(
+                    out,
+                    "  [problem] {} opens its body with a second frontmatter block on line {} ({keys}), which readers take for text (verify rule E012). {note}",
+                    f.path, f.line
+                )
+            } else {
+                writeln!(
+                    out,
+                    "  [problem] {} opens its body with a second frontmatter block on line {} ({keys}), which readers take for text (verify rule E012), rerun with --fix to merge it into the engram's own (the frontmatter is written anew, without YAML comments or the key order)",
+                    f.path, f.line
+                )
+            };
+        }
         for s in &d.stray_copies {
             let head = format!(
                 "{} is a second copy of {}, left by an overwrite in 0.20.0.",
@@ -5588,6 +5692,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
             && d.duplicate_keys.iter().all(|f| f.fixed)
+            && d.second_blocks.iter().all(|f| f.fixed)
             && d.stray_copies.iter().all(|s| s.fixed)
             && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {
@@ -6851,6 +6956,7 @@ mod tests {
     fn owner(index: &str, config: &str, state_dir: &str) -> crystalline_service::RenameOwner {
         crystalline_service::RenameOwner {
             index: Some(index.to_string()),
+            index_key: None,
             config: Some(config.to_string()),
             state_dir: state_dir.to_string(),
         }
@@ -7280,14 +7386,14 @@ mod tests {
     fn kept_texts_follow_the_domain_filter_and_old_ones_warn() {
         use crystalline_core::kept::{self, KeptKind};
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = time::now();
         kept::write(
             dir.path(),
             "eng",
             None,
             KeptKind::Reflection,
             "a.md",
-            crystalline_core::time::Stamp::from_chrono(now),
+            now,
             "x",
         )
         .unwrap();
@@ -7297,7 +7403,7 @@ mod tests {
             None,
             KeptKind::Engram,
             "b.md",
-            crystalline_core::time::Stamp::from_chrono(now - chrono::Duration::days(31)),
+            now - time::days(31),
             "y",
         )
         .unwrap();
@@ -7502,8 +7608,7 @@ mod tests {
             cache: None,
         };
         let current = crystalline_core::version::Precedence::parse("0.34.0").unwrap();
-        let lines =
-            crate::update::report_lines(&facts, &current, crystalline_core::time::now(), 24, None);
+        let lines = crate::update::report_lines(&facts, &current, time::now(), 24, None);
         let report = DoctorReport {
             update: Some(UpdateDoctor { facts, lines }),
             ..DoctorReport::default()

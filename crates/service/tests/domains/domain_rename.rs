@@ -552,6 +552,10 @@ async fn a_journal_for_another_index_is_left_alone_body(store: Arc<Mutex<dyn Sto
     );
     let mut foreign = own.clone();
     foreign["owner"]["index"] = serde_json::json!("/elsewhere/other-index.db");
+    // On Postgres the key, not the shown name, says which index it is.
+    if foreign["owner"].get("index_key").is_some() {
+        foreign["owner"]["index_key"] = serde_json::json!("postgres:another-database");
+    }
     std::fs::write(m.journal(), serde_json::to_vec(&foreign).unwrap()).unwrap();
 
     let other = m.engine(false).await;
@@ -2817,7 +2821,7 @@ async fn a_case_only_rename_moves_the_state_folders_body(store: Arc<Mutex<dyn St
         None,
         crystalline_core::kept::KeptKind::Engram,
         "alpha.md",
-        crystalline_core::time::Stamp::from_chrono(chrono::Utc::now()),
+        crystalline_core::time::now(),
         "typed",
     )
     .unwrap();
@@ -2874,7 +2878,7 @@ async fn a_finished_rename_keeps_its_kept_texts_under_the_new_name_body(
             None,
             crystalline_core::kept::KeptKind::Engram,
             "alpha.md",
-            crystalline_core::time::Stamp::from_chrono(chrono::Utc::now()),
+            crystalline_core::time::now(),
             "typed",
         )
         .unwrap();

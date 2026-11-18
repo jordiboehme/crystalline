@@ -1233,9 +1233,9 @@ impl From<super::OauthClient> for RegisteredClient {
 /// millisecond of the truth for the row that was just inserted and is the only
 /// way this is ever reached.
 fn issued_at(created_at: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(created_at)
-        .map(|at| at.timestamp())
-        .unwrap_or_else(|_| chrono::Utc::now().timestamp())
+    crystalline_core::time::parse_rfc3339(created_at)
+        .map(|at| at.stamp().unix_seconds())
+        .unwrap_or_else(|| crystalline_core::time::now().unix_seconds())
 }
 
 /// Why `uri` may not be stored as a redirect target, or `None` when it may.

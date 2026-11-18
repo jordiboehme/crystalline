@@ -127,14 +127,14 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "github_access_degraded_since": shared
                     .engine
                     .github_access_degraded()
-                    .map(|since| since.to_rfc3339()),
+                    .map(|since| since.rfc3339()),
                 // The part of that outage where the last answers still
                 // serve, and the repositories GitHub does not show to the
                 // App at all (their domains are closed).
                 "github_access_stale_since": shared
                     .engine
                     .github_access_stale_since()
-                    .map(|since| since.to_rfc3339()),
+                    .map(|since| since.rfc3339()),
                 "github_access_closed": shared.engine.github_access_closed(),
                 "github_agent_identity_admin": shared.engine.github_agent_identity_is_admin().await,
             });
@@ -970,9 +970,9 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let at = req
                 .get("at")
                 .and_then(Value::as_str)
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| t.with_timezone(&chrono::Utc))
-                .unwrap_or_else(chrono::Utc::now);
+                .and_then(crystalline_core::time::parse_rfc3339)
+                .map(|t| t.stamp())
+                .unwrap_or_else(crystalline_core::time::now);
             match req.get("stamp").and_then(Value::as_str).unwrap_or("") {
                 "first_seen" => crate::maintenance::record_first_seen(at),
                 "nudge" => crate::maintenance::record_nudge(at),
@@ -1342,7 +1342,7 @@ fn folds_on_the_way_in(req: &Value) -> bool {
 /// domain collide with the one an alias already points at. Nor is
 /// `forget_domain`: it names a domain that was just removed, and mapping that
 /// name could only land on a different, live domain.
-const DOMAIN_REFERENCE_COMMANDS: [&str; 22] = [
+const DOMAIN_REFERENCE_COMMANDS: [&str; 23] = [
     "sync",
     "file_stamps",
     "scaffold_manifest",
@@ -1359,6 +1359,7 @@ const DOMAIN_REFERENCE_COMMANDS: [&str; 22] = [
     "origin_discard",
     "origin_resolve",
     "provision",
+    "automation_prompt",
     "automation_lease_take",
     "automation_lease_renew",
     "automation_lease_release",

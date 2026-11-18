@@ -119,12 +119,14 @@ impl ServerCredential {
         account: String,
         now: Stamp,
     ) -> ServerCredential {
-        let lifetime = i64::try_from(expires_in).unwrap_or(i64::MAX / 2);
+        // A lifetime from the server too large for a date is held at the
+        // latest instant: the token then reads as one that never expires.
+        let lifetime = i64::try_from(expires_in).unwrap_or(i64::MAX);
         ServerCredential {
             kind: CredentialKind::Oauth,
             access_token,
             refresh_token: Some(refresh_token),
-            expires_at: Some(now + time::seconds(lifetime)),
+            expires_at: Some(now.saturating_add(time::saturating_seconds(lifetime))),
             client_id: Some(client_id),
             resource,
             account,
@@ -532,6 +534,57 @@ mod tests {
             "ada".to_string(),
             now(),
         )
+    }
+
+    /// Server credentials written by 0.33.0, frozen: each
+    /// loads, and saving it again gives the same bytes.
+    #[test]
+    fn a_credential_from_0_33_0_round_trips_byte_for_byte() {
+        for written in [
+            r#"{"kind":"oauth","access_token":"coa_access","refresh_token":"cor_refresh","expires_at":"2027-01-15T09:00:00Z","client_id":"coc_client","resource":"https://kb.example","account":"ada","created_at":"2027-01-15T08:00:00.123Z"}"#,
+            r#"{"kind":"token","access_token":"cmt_token","refresh_token":null,"expires_at":null,"client_id":null,"resource":"https://kb.example","account":"ada","created_at":"2027-01-15T08:00:00.000000001Z"}"#,
+        ] {
+            let credential = from_json(written).expect("a 0.33.0 credential loads");
+            assert_eq!(to_json(&credential).unwrap(), written);
+        }
+        let oauth = from_json(
+            r#"{"kind":"oauth","access_token":"a","refresh_token":"r","expires_at":"2027-01-15T09:00:00Z","client_id":"c","resource":"https://kb.example","account":"ada","created_at":"2027-01-15T08:00:00.123Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(oauth.expires_at, Stamp::from_unix(1_800_003_600, 0));
+        assert_eq!(
+            oauth.created_at,
+            Stamp::from_unix(1_800_000_000, 123_000_000).unwrap()
+        );
+    }
+
+    /// A lifetime from the server too large for a date is held at the
+    /// latest instant instead of panicking the sign-in or the refresh.
+    #[test]
+    fn a_huge_lifetime_is_held_at_the_latest_instant() {
+        for expires_in in [300_000_000_000_u64, i64::MAX as u64, u64::MAX] {
+            let credential = ServerCredential::oauth(
+                "coa_access".to_string(),
+                "cor_refresh".to_string(),
+                expires_in,
+                "coc_client".to_string(),
+                "https://kb.example".to_string(),
+                "ada".to_string(),
+                now(),
+            );
+            assert_eq!(credential.expires_at, Some(Stamp::LATEST), "{expires_in}");
+        }
+        let left = Stamp::LATEST.since(now()).num_seconds() as u64;
+        let credential = ServerCredential::oauth(
+            "coa_access".to_string(),
+            "cor_refresh".to_string(),
+            left,
+            "coc_client".to_string(),
+            "https://kb.example".to_string(),
+            "ada".to_string(),
+            now(),
+        );
+        assert_eq!(credential.expires_at, Some(Stamp::LATEST));
     }
 
     #[test]

@@ -425,7 +425,7 @@ impl Engine {
                 }
             }
             (AssetHome::Engram, ContentSource::Virtual) => {
-                let row = attachment_row(path, &bytes, Utc::now().to_rfc3339())?;
+                let row = attachment_row(path, &bytes, time::now().rfc3339())?;
                 let store = self.store.lock().await;
                 // What was there before this write, so a failure can put it
                 // back rather than approximate it.

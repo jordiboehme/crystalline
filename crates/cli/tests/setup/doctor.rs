@@ -668,6 +668,165 @@ fn reports_and_fixes_a_frontmatter_key_held_twice_with_one_value() {
     );
 }
 
+/// What 0.33.0 stored for a capture whose content opened with a block.
+const SECOND_BLOCK: &str = "---\ntype: engram\ntitle: Cache Policy\npermalink: cache-policy\ntags: []\nstatus: stable\nrecorded_at: 2026-11-01\n---\n\n---\ntype: decision\nstatus: draft\ntags:\n  - from-block\nowner: platform\n---\n\n# Cache Policy\n\nWe cache for five minutes.\n";
+
+/// An engram whose body opens with a second frontmatter block (verify rule
+/// E012) is reported with its line and keys, and `--fix` merges the block
+/// into the engram's own by the rules a write lifts it by.
+#[test]
+fn reports_and_merges_a_second_frontmatter_block() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(&domain_dir, "cache-policy.md", SECOND_BLOCK);
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["domains"][0]["second_blocks"],
+        serde_json::json!([{
+            "path": "cache-policy.md",
+            "line": 10,
+            "keys": ["type", "status", "tags", "owner"],
+            "fixable": true,
+            "fixed": false
+        }]),
+        "{report}"
+    );
+
+    let mut human = bin();
+    let _home = shield_ambient_home(&mut human);
+    let stdout = String::from_utf8(
+        human
+            .args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("[problem] cache-policy.md opens its body with a second frontmatter block on line 10 (type, status, tags, owner), which readers take for text (verify rule E012), rerun with --fix to merge it into the engram's own (the frontmatter is written anew, without YAML comments or the key order)"),
+        "{stdout}"
+    );
+
+    let mut fix = bin();
+    let _home = shield_ambient_home(&mut fix);
+    let fixed_out = String::from_utf8(
+        fix.args(["doctor", "--fix", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        fixed_out.contains(
+            "fixed cache-policy.md: merged the second frontmatter block (type, status, tags, owner) into the engram's own, written anew as an overwrite writes it (YAML comments and the key order are not kept)"
+        ),
+        "{fixed_out}"
+    );
+    let healed = std::fs::read_to_string(domain_dir.join("cache-policy.md")).unwrap();
+    let engram = crystalline_core::parse_engram(&healed).unwrap();
+    assert_eq!(engram.frontmatter.engram_type, "decision", "{healed}");
+    assert_eq!(engram.frontmatter.status.as_deref(), Some("draft"));
+    assert_eq!(engram.frontmatter.tags, ["from-block"]);
+    assert_eq!(
+        engram.frontmatter.permalink.as_deref(),
+        Some("cache-policy")
+    );
+    assert_eq!(
+        engram
+            .frontmatter
+            .extra
+            .get("owner")
+            .and_then(|v| v.as_str()),
+        Some("platform")
+    );
+    assert_eq!(
+        engram.body,
+        "\n# Cache Policy\n\nWe cache for five minutes.\n"
+    );
+    assert!(!crystalline_core::frontmatter::body_opens_with_frontmatter(
+        &healed
+    ));
+}
+
+/// Three stacked blocks in a CRLF file are found, and one `--fix` merges
+/// them all.
+#[test]
+fn merges_every_stacked_block_of_a_crlf_engram_in_one_run() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    let stacked = SECOND_BLOCK
+        .replacen(
+            "owner: platform\n---\n",
+            "owner: platform\n---\n---\nresource: https://example.com/a\n---\n---\nsource_date: 2026-05-01\n---\n",
+            1,
+        )
+        .replace('\n', "\r\n");
+    write(&domain_dir, "cache-policy.md", &stacked);
+
+    let mut fix = bin();
+    let _home = shield_ambient_home(&mut fix);
+    let fixed_out = String::from_utf8(
+        fix.args(["doctor", "--fix", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        fixed_out.contains("fixed cache-policy.md: merged"),
+        "{fixed_out}"
+    );
+    let healed = std::fs::read_to_string(domain_dir.join("cache-policy.md")).unwrap();
+    assert!(!healed.contains('\r'), "{healed:?}");
+    assert!(!crystalline_core::frontmatter::body_opens_with_frontmatter(
+        &healed
+    ));
+    let engram = crystalline_core::parse_engram(&healed).unwrap();
+    assert_eq!(engram.frontmatter.engram_type, "decision");
+    assert_eq!(
+        engram.frontmatter.resource.as_deref(),
+        Some("https://example.com/a")
+    );
+    assert_eq!(
+        engram.frontmatter.source_date.map(|d| d.ymd()).as_deref(),
+        Some("2026-05-01")
+    );
+    assert_eq!(
+        engram.body,
+        "\n# Cache Policy\n\nWe cache for five minutes.\n"
+    );
+}
+
 /// Copies with different values are a person's call: reported, never written.
 #[test]
 fn leaves_a_key_held_twice_with_different_values_to_a_person() {
@@ -1254,11 +1413,8 @@ fn domain_filter_restricts_checks_to_one_domain() {
 #[test]
 #[cfg(unix)]
 fn detects_and_fixes_a_stale_lock_and_orphaned_socket() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{nanos}"));
+    let unique = crate::common::unique_suffix();
+    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{unique}"));
     std::fs::create_dir_all(home.join("config")).unwrap();
     std::fs::create_dir_all(home.join("state")).unwrap();
     std::fs::create_dir_all(home.join("cache")).unwrap();
@@ -1457,11 +1613,8 @@ fn a_free_lock_with_no_record_is_reported_by_name_and_fixed() {
 /// every test that calls it: the isolation runs through `/tmp` and `HOME`.
 #[cfg(unix)]
 fn isolated_home(tag: &str) -> (PathBuf, PathBuf) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{tag}-{nanos}"));
+    let unique = crate::common::unique_suffix();
+    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{tag}-{unique}"));
     std::fs::create_dir_all(home.join("config")).unwrap();
     std::fs::create_dir_all(home.join("state")).unwrap();
     std::fs::create_dir_all(home.join("cache")).unwrap();

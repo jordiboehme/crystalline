@@ -333,7 +333,7 @@ fn save_skill(
         name: SKILL_NAME.to_string(),
         sha256,
         file: file.display().to_string(),
-        saved_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        saved_at: crystalline_core::time::now().rfc3339_secs_z(),
     });
     let shown = opener.map(|opener| opener.reveal(&file));
     Ok(SavedSkill {

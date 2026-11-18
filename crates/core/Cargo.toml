@@ -19,7 +19,7 @@ jsonc-parser = { workspace = true }
 serde_yaml_ng = { workspace = true }
 toml = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true }
 thiserror = { workspace = true }
 etcetera = { workspace = true }
 walkdir = { workspace = true }

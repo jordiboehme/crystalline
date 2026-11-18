@@ -252,16 +252,181 @@ async fn a_note_with_a_colon_between_rules_stays_body_text() {
     assert!(receipt.get("notices").is_none(), "{receipt}");
 }
 
-/// An empty block carries nothing: it is dropped, and the engram keeps one.
+/// An empty block carries nothing: it is dropped, the engram keeps one, and
+/// the receipt says so.
 #[tokio::test]
 async fn an_empty_block_is_dropped() {
     let (_tmp, engine) = fixture().await;
-    engine
+    let receipt = engine
         .write_engram(&capture("eng", "Empty", "---\n---\n\nBody.\n"))
         .await
         .unwrap();
     let text = stored(&engine, "eng", "empty").await;
     assert_eq!(delimiter_lines(&text), 2, "{text}");
+    let said = notices(&receipt);
+    assert!(said.contains("empty frontmatter block"), "{receipt}");
+}
+
+fn edit(identifier: &str, operation: &str, content: &str) -> EditParams {
+    EditParams {
+        identifier: identifier.to_string(),
+        domain: "eng".to_string(),
+        operation: operation.to_string(),
+        content: Some(content.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Every edit, not only a prepend, is refused when its result would open
+/// the body with a frontmatter block: an insert before the first heading, an
+/// append to an empty body and a find and replace at the top alike.
+#[tokio::test]
+async fn no_edit_puts_a_second_block_under_the_engram_s_own() {
+    let (_tmp, engine) = fixture().await;
+    engine
+        .write_engram(&capture("eng", "Headed", "# Top\n\nBody."))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&capture("eng", "Blank", ""))
+        .await
+        .unwrap();
+    let block = "---\nstatus: draft\n---\nBefore";
+    let mut insert = edit("headed", "insert_before_section", block);
+    insert.section = Some("Top".to_string());
+    let mut replace = edit("headed", "find_replace", "---\nstatus: draft\n---\n# Top");
+    replace.find_text = Some("# Top".to_string());
+    for (permalink, params) in [
+        ("headed", insert),
+        ("blank", edit("blank", "append", block)),
+        ("headed", replace),
+    ] {
+        let before = stored(&engine, "eng", permalink).await;
+        let err = engine.edit_engram(&params).await.unwrap_err();
+        assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("set_frontmatter"), "{err}");
+        assert_eq!(stored(&engine, "eng", permalink).await, before);
+    }
+    // A CRLF block is the same block: it is stored as LF, so it is refused
+    // just the same.
+    for (permalink, params) in [
+        (
+            "headed",
+            edit("headed", "prepend", "\r\n---\r\nstatus: draft\r\n---\r\n"),
+        ),
+        (
+            "blank",
+            edit("blank", "append", "---\r\nstatus: draft\r\n---\r\nBefore"),
+        ),
+    ] {
+        let before = stored(&engine, "eng", permalink).await;
+        let err = engine.edit_engram(&params).await.unwrap_err();
+        assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+        assert_eq!(stored(&engine, "eng", permalink).await, before);
+    }
+    // A rule further down is markdown, and an append lands.
+    engine
+        .edit_engram(&edit("headed", "append", "---\nstatus: draft\n---\nAfter"))
+        .await
+        .unwrap();
+}
+
+/// What 0.33.0 stored for a capture of [`WHOLE_FILE`] titled "Cache Policy"
+/// with no other parameter: its own block with the defaults, then the
+/// content's block as body text.
+const DOUBLED: &str = "---\ntype: engram\ntitle: Cache Policy\npermalink: cache-policy\ntags: []\nstatus: stable\nrecorded_at: 2026-11-01\ngenerated: { by: agent, at: 2026-11-01T10:00:00Z }\n---\n\n---\ntitle: Ignored Title\ntype: decision\nstatus: draft\ntags:\n  - from-block\nsalience: 7\nvalid_from: 2026-01-01\nowner: platform\npermalink: somewhere/else\nrecorded_at: 2020-01-01\ngenerated:\n  by: someone\n---\n\n# Cache Policy\n\nWe cache for five minutes.\n";
+
+/// An engram 0.33.0 stored with two blocks is found by validate (E012),
+/// still takes edits, and doctor's merge gives the frontmatter and the body
+/// a rewrite of the same content through `write_engram` gives.
+#[tokio::test]
+async fn a_0_33_0_second_block_is_found_and_merges_as_a_rewrite_would() {
+    let (tmp, engine) = fixture().await;
+    std::fs::write(tmp.path().join("eng/cache-policy.md"), DOUBLED).unwrap();
+    // The same engram saved with CRLF line endings is found too.
+    std::fs::write(
+        tmp.path().join("eng/cache-policy-crlf.md"),
+        DOUBLED
+            .replace("permalink: cache-policy", "permalink: cache-policy-crlf")
+            .replace('\n', "\r\n"),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let crlf = engine
+        .validate_engrams(
+            &crystalline_service::params::ValidateParams {
+                domain: "eng".to_string(),
+                identifier: Some("cache-policy-crlf".to_string()),
+                engram_type: None,
+                drift: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        crlf["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["kind"] == "E012"),
+        "{crlf}"
+    );
+
+    let report = engine
+        .validate_engrams(
+            &crystalline_service::params::ValidateParams {
+                domain: "eng".to_string(),
+                identifier: Some("cache-policy".to_string()),
+                engram_type: None,
+                drift: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["kind"] == "E012"),
+        "{report}"
+    );
+
+    // Still editable, so it can be repaired.
+    engine
+        .edit_engram(&edit("cache-policy", "append", "One more line."))
+        .await
+        .unwrap();
+    let current = stored(&engine, "eng", "cache-policy").await;
+    let crystalline_core::frontmatter::BlockMerge::Merged(merged) =
+        crystalline_core::frontmatter::merge_second_block(&current).expect("a second block")
+    else {
+        panic!("not merged");
+    };
+
+    // The rewrite an agent does today with the same content.
+    let content = current.splitn(3, "---\n").nth(2).unwrap().to_string();
+    let mut rewrite = capture("eng", "Cache Policy", &content);
+    rewrite.overwrite = true;
+    engine.write_engram(&rewrite).await.unwrap();
+    let rewritten = parse_engram(&stored(&engine, "eng", "cache-policy").await).unwrap();
+    let merged = parse_engram(&merged).unwrap();
+    let (a, b) = (&merged.frontmatter, &rewritten.frontmatter);
+    assert_eq!(a.title, b.title);
+    assert_eq!(a.engram_type, b.engram_type);
+    assert_eq!(a.status, b.status);
+    assert_eq!(a.tags, b.tags);
+    assert_eq!(a.valid_from, b.valid_from);
+    assert_eq!(a.permalink, b.permalink);
+    assert_eq!(a.extra, b.extra);
+    assert_eq!(merged.body, rewritten.body);
+    assert_eq!(a.engram_type, "decision");
+    assert_eq!(
+        a.extra.get("owner").and_then(|v| v.as_str()),
+        Some("platform")
+    );
 }
 
 /// A prepend lands right under the frontmatter, so a block at its top would

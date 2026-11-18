@@ -157,7 +157,7 @@ fn the_record_says_what_was_built() {
         .collect();
     assert_eq!(ext["shim_sha256"], hash);
     assert_eq!(ext["file"], s.bundle().display().to_string());
-    chrono::DateTime::parse_from_rfc3339(ext["built_at"].as_str().unwrap())
+    crystalline_core::time::parse_rfc3339(ext["built_at"].as_str().unwrap())
         .expect("built_at is RFC 3339");
     assert_eq!(ext["opened"], false);
     assert!(record.get("skill").is_none_or(|v| v.is_null()), "{record}");
@@ -238,9 +238,9 @@ fn a_second_run_replaces_the_file_and_leaves_no_partial() {
         !state_names.iter().any(|n| n.ends_with(".partial")),
         "{state_names:?}"
     );
-    let first = chrono::DateTime::parse_from_rfc3339(&first).unwrap();
-    let second = chrono::DateTime::parse_from_rfc3339(&second).unwrap();
-    assert!(second >= first, "{first} then {second}");
+    let first = crystalline_core::time::parse_rfc3339(&first).unwrap();
+    let second = crystalline_core::time::parse_rfc3339(&second).unwrap();
+    assert!(second >= first, "{first:?} then {second:?}");
 }
 
 #[test]
@@ -631,7 +631,7 @@ fn the_skill_is_saved_to_downloads_and_revealed() {
     assert_eq!(skill["name"], "crystalline-intelligence");
     assert_eq!(skill["sha256"], sha256(skill_text().as_bytes()));
     assert_eq!(skill["file"], zip.display().to_string());
-    chrono::DateTime::parse_from_rfc3339(skill["saved_at"].as_str().unwrap())
+    crystalline_core::time::parse_rfc3339(skill["saved_at"].as_str().unwrap())
         .expect("saved_at is RFC 3339");
 
     let out = stdout(&assert);

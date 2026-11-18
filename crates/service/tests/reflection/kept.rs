@@ -3,8 +3,8 @@
 //! needs; an engram text: write access to the engrams), and a reader is
 //! refused.
 
-use chrono::TimeZone;
 use crystalline_core::kept::{self, KeptKind};
+use crystalline_core::time::{self, Stamp};
 use crystalline_service::rest::{MemberLevel, Role};
 use reqwest::Method;
 use serde_json::Value;
@@ -19,25 +19,25 @@ const ENGRAM: &str = "runbooks/deploy.md";
 /// `eng` texts, page first.
 fn keep(s: &Served) -> (String, String) {
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 8, 0, 0).unwrap();
     kept::write(
         &root,
         "eng",
         None,
         KeptKind::Reflection,
         PAGE,
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         "Typed on the page.\n",
     )
     .unwrap();
-    let later = at + chrono::Duration::minutes(1);
+    let later = at + time::minutes(1);
     kept::write(
         &root,
         "eng",
         None,
         KeptKind::Engram,
         ENGRAM,
-        crystalline_core::time::Stamp::from_chrono(later),
+        later,
         "Typed on the engram.\n",
     )
     .unwrap();
@@ -47,7 +47,7 @@ fn keep(s: &Served) -> (String, String) {
         None,
         KeptKind::Reflection,
         PAGE,
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         "Another domain.\n",
     )
     .unwrap();
@@ -245,14 +245,14 @@ async fn a_contributor_gets_a_pages_text_and_not_the_pacts() {
     let s = serve().await;
     let (page_id, engram_id) = keep(&s);
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 9, 0, 0).unwrap();
     kept::write(
         &root,
         "eng",
         None,
         KeptKind::Reflection,
         "PACT.md",
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         "Typed on the pact.\n",
     )
     .unwrap();
@@ -366,14 +366,14 @@ async fn a_switched_off_reflection_still_lists_its_kept_texts() {
 async fn a_drafts_kept_text_goes_to_its_owner_only() {
     let s = serve().await;
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 9, 0, 0).unwrap();
     kept::write(
         &root,
         "eng",
         Some("ed"),
         KeptKind::Engram,
         ENGRAM,
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         "Typed in ed's draft.\n",
     )
     .unwrap();
@@ -419,7 +419,7 @@ async fn a_drafts_kept_text_goes_to_its_owner_only() {
 async fn a_kept_file_is_listed_as_a_file_and_downloads_as_its_bytes() {
     let s = serve().await;
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 9, 0, 0).unwrap();
     let bytes = b"%PDF-1.7\n\xff\xfe her deck".to_vec();
     kept::write_bytes(
         &root,
@@ -427,7 +427,7 @@ async fn a_kept_file_is_listed_as_a_file_and_downloads_as_its_bytes() {
         Some("ed"),
         KeptKind::Engram,
         "assets/deck.pdf",
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         &bytes,
     )
     .unwrap();
@@ -526,14 +526,14 @@ async fn a_kept_copy_that_cannot_be_read_names_no_server_path() {
 
     let s = serve().await;
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 9, 0, 0).unwrap();
     let file = kept::write_bytes(
         &root,
         "eng",
         Some("ed"),
         KeptKind::Engram,
         "assets/deck.pdf",
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         b"her deck",
     )
     .unwrap();
@@ -652,7 +652,7 @@ async fn a_name_taken_later_never_reaches_texts_left_under_it() {
     })
     .await;
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 8, 0, 0).unwrap();
     for name in ["fresh", "platform"] {
         kept::write(
             &root,
@@ -660,7 +660,7 @@ async fn a_name_taken_later_never_reaches_texts_left_under_it() {
             None,
             KeptKind::Engram,
             "old.md",
-            crystalline_core::time::Stamp::from_chrono(at),
+            at,
             "left over\n",
         )
         .unwrap();
@@ -712,18 +712,9 @@ async fn start_and_a_hand_added_domain_set_left_over_texts_aside() {
     })
     .await;
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 8, 0, 0).unwrap();
     for name in ["gone", "eng"] {
-        kept::write(
-            &root,
-            name,
-            None,
-            KeptKind::Engram,
-            "a.md",
-            crystalline_core::time::Stamp::from_chrono(at),
-            "text\\n",
-        )
-        .unwrap();
+        kept::write(&root, name, None, KeptKind::Engram, "a.md", at, "text\\n").unwrap();
     }
     s.fx.engine.finish_leftover_rename().await;
     let state: Vec<(String, bool)> = kept::scan(&root)
@@ -735,16 +726,7 @@ async fn start_and_a_hand_added_domain_set_left_over_texts_aside() {
         vec![("eng".to_string(), false), ("gone".to_string(), true)]
     );
 
-    kept::write(
-        &root,
-        "fresh",
-        None,
-        KeptKind::Engram,
-        "a.md",
-        crystalline_core::time::Stamp::from_chrono(at),
-        "old\\n",
-    )
-    .unwrap();
+    kept::write(&root, "fresh", None, KeptKind::Engram, "a.md", at, "old\\n").unwrap();
     let config = s.fx.tmp.path().join("config.yaml");
     let mut cfg: crystalline_core::config::GlobalConfig =
         crystalline_core::config::load_yaml(&config).unwrap();
@@ -778,17 +760,8 @@ async fn a_hand_added_case_twin_leaves_the_registered_domains_texts() {
     })
     .await;
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap();
-    kept::write(
-        &root,
-        "eng",
-        None,
-        KeptKind::Engram,
-        "a.md",
-        crystalline_core::time::Stamp::from_chrono(at),
-        "eng's\\n",
-    )
-    .unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 8, 0, 0).unwrap();
+    kept::write(&root, "eng", None, KeptKind::Engram, "a.md", at, "eng's\\n").unwrap();
     // The twin's own folder name, so the check runs on a disk that tells
     // case apart too.
     kept::write(
@@ -797,7 +770,7 @@ async fn a_hand_added_case_twin_leaves_the_registered_domains_texts() {
         None,
         KeptKind::Engram,
         "b.md",
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         "eng's too\\n",
     )
     .unwrap();
@@ -835,14 +808,14 @@ async fn a_kept_comment_goes_to_its_sender_and_to_editors() {
         .await
         .unwrap();
     let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
-    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap();
+    let at = Stamp::from_ymd_hms(2026, 10, 15, 8, 0, 0).unwrap();
     let hers = kept::write(
         &root,
         "eng",
         None,
         KeptKind::Comment,
         PAGE,
-        crystalline_core::time::Stamp::from_chrono(at),
+        at,
         "Vera asks.\n",
     )
     .unwrap();
@@ -855,14 +828,14 @@ async fn a_kept_comment_goes_to_its_sender_and_to_editors() {
         },
     )
     .unwrap();
-    let later = at + chrono::Duration::minutes(1);
+    let later = at + time::minutes(1);
     kept::write(
         &root,
         "eng",
         None,
         KeptKind::Comment,
         PAGE,
-        crystalline_core::time::Stamp::from_chrono(later),
+        later,
         "Nobody's.\n",
     )
     .unwrap();

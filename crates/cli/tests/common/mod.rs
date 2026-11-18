@@ -10,6 +10,25 @@ pub fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
+/// A name part no other test run on this machine makes at the same time:
+/// the clock in nanoseconds, this process's id and a counter of this
+/// process. The clock alone is not enough. On macOS it counts in whole
+/// microseconds, so two test processes that start the same test at the same
+/// moment (two suites run side by side) read the same value and shared one
+/// folder and one Postgres schema: one test's `Env` drop stopped the other
+/// test's daemon, and a second `serve` found the first one's record. Only
+/// lowercase letters, digits and `_`, so it also fits a schema name.
+pub fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}_{}_{n}", std::process::id())
+}
+
 /// A hook payload recorded from a real harness run, from this crate's
 /// `tests/fixtures/hooks`, parsed so a test can patch the fields it needs
 /// (a real transcript path, a session id, an `agent_id`).

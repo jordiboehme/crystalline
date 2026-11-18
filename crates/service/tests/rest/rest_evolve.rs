@@ -46,8 +46,8 @@ struct Fixture {
 /// `V006`: the rule leaves an engram recorded today alone, because it is still
 /// being worked on. The route never takes a `today` parameter, so the fixture
 /// dates itself against the real clock rather than pinning one.
-fn yesterday() -> chrono::NaiveDate {
-    chrono::Utc::now().date_naive() - chrono::Duration::days(1)
+fn yesterday() -> String {
+    (crystalline_core::time::today_utc() - crystalline_core::time::days(1)).ymd()
 }
 
 /// One engram file's markdown. `generated_by` writes the provenance block a
@@ -515,7 +515,7 @@ async fn viewing_the_queue_never_counts_as_a_run() {
     // appearing.
     crystalline_service::maintenance::save(&crystalline_service::maintenance::MaintenanceState {
         pending_domains: vec!["eng".to_string()],
-        pending_since: Some("2026-08-01T10:00:00Z".parse().unwrap()),
+        pending_since: crystalline_core::time::parse_lenient_stamp("2026-08-01T10:00:00Z"),
         ..Default::default()
     })
     .unwrap();

@@ -83,7 +83,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 similar = { workspace = true }
-chrono = { workspace = true }
 walkdir = { workspace = true }
 dunce = { workspace = true }
 # `doctor --merge-desktop-state` exports a private index from a copy in a

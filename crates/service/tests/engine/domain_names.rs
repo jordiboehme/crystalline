@@ -1343,7 +1343,7 @@ async fn a_hand_edited_explicit_name_records_a_question() {
     assert_eq!(question.to, "platform");
     assert_eq!(question.answered, None);
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&question.seen_at).is_ok(),
+        crystalline_core::time::parse_rfc3339(&question.seen_at).is_some(),
         "{}",
         question.seen_at
     );

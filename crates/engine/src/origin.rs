@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Day, Stamp};
 use crystalline_remote::RemoteError;
 use crystalline_remote::changes::LocalChange;
 use crystalline_remote::ops::{self, OriginStatusReport, ProposeOutcome, PullReport};
@@ -251,7 +251,7 @@ pub(crate) fn status_report_json(
         "declined_proposals": report.declined_proposals,
         "merged_unconsumed": report.merged_unconsumed,
         "conflicts": report.conflicts,
-        "last_checked": report.last_checked.map(crystalline_core::time::serde::stamp_json),
+        "last_checked": report.last_checked.map(time::serde::stamp_json),
         "probe_error": probe_error,
         "stack_number": report.stack_number,
         "stack_wedged": report.stack_wedged,
@@ -262,13 +262,13 @@ pub(crate) fn status_report_json(
             "sha": share.sha,
             "url": share.url,
             "title": share.title,
-            "shared_at": crystalline_core::time::serde::stamp_json(share.shared_at),
+            "shared_at": time::serde::stamp_json(share.shared_at),
             "author_login": share.author_login,
         })).collect::<Vec<Value>>(),
         "direct_refused": refusal.map(|refusal| json!({
             "branch": refusal.branch,
             "message": refusal.message,
-            "refused_at": crystalline_core::time::serde::stamp_json(refusal.refused_at),
+            "refused_at": time::serde::stamp_json(refusal.refused_at),
             "line": crystalline_remote::error::direct_refused_line(&refusal.branch),
         })),
     });
@@ -496,16 +496,16 @@ pub(crate) fn is_probe_transport_error(err: &RemoteError) -> bool {
 pub(crate) fn origin_poll_status_json(
     domain: &str,
     report: &OriginStatusReport,
-    next_due: Option<DateTime<Utc>>,
+    next_due: Option<Stamp>,
     last_result: Option<&DomainPollOutcome>,
 ) -> Value {
     json!({
         "domain": domain,
         "repo": report.repo,
         "branch": report.branch,
-        "last_checked": report.last_checked.map(crystalline_core::time::serde::stamp_json),
+        "last_checked": report.last_checked.map(time::serde::stamp_json),
         "last_result": last_result.map(poll_outcome_json),
-        "next_due": next_due,
+        "next_due": next_due.map(time::serde::stamp_json),
         "open_proposals": report.open_proposals.len(),
         "declined_proposals": report.declined_proposals.len(),
         "merged_unconsumed": report.merged_unconsumed,
@@ -759,7 +759,7 @@ pub struct UnsharedWork {
     /// mtime. `None` when nothing changed, when every change is a deletion (a
     /// path with no file left to stat) or when the tree could not be stat'ed
     /// at all - all three read as "no age to assert".
-    pub oldest_change: Option<DateTime<Utc>>,
+    pub oldest_change: Option<Stamp>,
     /// Where the paths above actually are on this machine, for the few whose
     /// spelling on disk differs from the one they are reported at. Carried
     /// straight from
@@ -787,8 +787,8 @@ impl UnsharedWork {
 
     /// [`UnsharedWork::oldest_change`] as a plain date, which is what the
     /// consolidation sweep compares against its `today`.
-    pub fn oldest_change_date(&self) -> Option<chrono::NaiveDate> {
-        self.oldest_change.map(|at| at.date_naive())
+    pub fn oldest_change_date(&self) -> Option<Day> {
+        self.oldest_change.map(|at| at.day_utc())
     }
 
     /// How many of the changes `actor` last wrote, by the changed file's own
@@ -857,7 +857,7 @@ pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWor
                 .ok()
         })
         .min()
-        .map(DateTime::<Utc>::from);
+        .and_then(Stamp::from_system_time);
     Some(UnsharedWork {
         paths,
         oldest_change,
@@ -2077,7 +2077,7 @@ mod tests {
     #[test]
     fn origin_poll_status_json_carries_the_domain_and_every_field() {
         let report = poll_status_fixture();
-        let next_due = Utc::now();
+        let next_due = time::now();
         let outcome = DomainPollOutcome::Applied {
             applied: 2,
             conflicts: 0,
@@ -2090,7 +2090,7 @@ mod tests {
         assert_eq!(v["declined_proposals"], 0);
         assert_eq!(v["conflicts"], 0);
         assert_eq!(v["local_changes"], 3);
-        assert_eq!(v["next_due"], serde_json::to_value(next_due).unwrap());
+        assert_eq!(v["next_due"], time::serde::stamp_json(next_due));
         assert_eq!(v["last_result"]["outcome"], "applied");
         assert_eq!(v["last_result"]["applied"], 2);
     }

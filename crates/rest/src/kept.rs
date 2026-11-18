@@ -9,8 +9,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
 use crystalline_core::kept::{self, KeptText};
+use crystalline_core::time::{self, Stamp};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -63,7 +63,8 @@ pub struct KeptTextEntry {
     pub file: bool,
     /// When it was kept.
     #[schema(value_type = String, format = DateTime, example = "2026-10-15T08:00:00Z")]
-    pub kept_at: DateTime<Utc>,
+    #[serde(with = "time::serde::stamp")]
+    pub kept_at: Stamp,
     /// Its size in bytes.
     #[schema(example = 1204)]
     pub bytes: u64,
@@ -111,7 +112,7 @@ fn entry(kept: KeptText) -> KeptTextEntry {
         draft: kept.owner.is_some(),
         kind: kept.kind.as_str().to_string(),
         path: kept.path,
-        kept_at: kept.kept_at.into_chrono(),
+        kept_at: kept.kept_at,
         bytes: kept.bytes,
         sender_account: kept.sender.as_ref().map(|s| s.account.clone()),
         sender: kept.sender.map(|s| s.name),
@@ -403,7 +404,6 @@ pub async fn remove(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use crystalline_core::kept::{KeptKind, Sender};
 
     fn comment(sender: Option<Sender>) -> KeptText {
@@ -415,9 +415,7 @@ mod tests {
             owner: None,
             kind: KeptKind::Comment,
             path: "guides/a.md".to_string(),
-            kept_at: crystalline_core::time::Stamp::from_chrono(
-                Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap(),
-            ),
+            kept_at: Stamp::from_ymd_hms(2026, 10, 15, 8, 0, 0).unwrap(),
             bytes: 12,
             file: std::path::PathBuf::from("kept/eng/comment/guides/a.md.20261015T080000Z.md"),
             sender,

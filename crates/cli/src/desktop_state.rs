@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crystalline_core::config::registration::canonical_root;
 use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig};
+use crystalline_core::time::Day;
 use serde::Serialize;
 
 pub use crystalline_service::desktop_state::{DesktopState, scan_here};
@@ -335,8 +336,8 @@ async fn sync_registered(
 
 /// `crystalline.merged-<day>` beside `folder`, with `-2`, `-3` and so on when
 /// that name is taken.
-pub(crate) fn merged_name(folder: &Path, today: chrono::NaiveDate) -> PathBuf {
-    let base = format!("crystalline.merged-{}", today.format("%Y-%m-%d"));
+pub(crate) fn merged_name(folder: &Path, today: Day) -> PathBuf {
+    let base = format!("crystalline.merged-{}", today.ymd());
     let parent = folder.parent().unwrap_or(folder);
     let mut candidate = parent.join(&base);
     let mut n = 2;
@@ -449,7 +450,7 @@ fn copy_private_state(folder: &Path, scratch: &Path) -> anyhow::Result<(PathBuf,
 pub async fn merge_into(
     state: &DesktopState,
     real_config: Option<&Path>,
-    today: chrono::NaiveDate,
+    today: Day,
     report: &mut MergeReport,
 ) -> anyhow::Result<()> {
     if let Some(pid) = state.daemon_alive {
@@ -802,7 +803,7 @@ mod tests {
     fn the_merged_folder_is_named_by_the_day_and_never_reused() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("crystalline");
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let day = Day::from_ymd(2026, 10, 7).unwrap();
         assert_eq!(
             merged_name(&folder, day),
             tmp.path().join("crystalline.merged-2026-10-07")

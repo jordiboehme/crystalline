@@ -177,12 +177,12 @@ pub fn webhook_signature(secret: &[u8], timestamp: &str, body: &[u8]) -> String 
     out
 }
 
-/// The reflect loop's shipped prompt, with `{domain}` and `{max_items}` to
-/// fill in.
+/// The reflect loop's shipped prompt, with `{skills}`, `{domain}` and
+/// `{max_items}` to fill in.
 const REFLECT_PROMPT: &str = include_str!("automation/reflect-prompt.md");
 
-/// The evolve loop's shipped prompt, with `{domain}` and `{max_items}` to
-/// fill in.
+/// The evolve loop's shipped prompt, with `{skills}`, `{domain}` and
+/// `{max_items}` to fill in.
 const EVOLVE_PROMPT: &str = include_str!("automation/evolve-prompt.md");
 
 /// The MCP tools a headless run may never call, by name: each needs a yes,
@@ -195,7 +195,6 @@ const EVOLVE_PROMPT: &str = include_str!("automation/evolve-prompt.md");
 pub const HEADLESS_DISALLOWED_TOOLS: &[&str] = &[
     "delete_engram",
     "move_engram",
-    "split_engram",
     "remove_domain",
     "add_domain",
     "configure",
@@ -207,17 +206,139 @@ pub const HEADLESS_DISALLOWED_TOOLS: &[&str] = &[
     "discard_changes",
 ];
 
+/// The item cap of a headless run when nobody names one: the CLI's
+/// `--max-items` default and the `automation_prompt` verb's.
+pub const DEFAULT_MAX_ITEMS: u32 = 20;
+
+/// The words a prompt opens its start with when the agent's skills are
+/// already loaded, in place of the call to the `skills` tool.
+pub const SKILLS_LOADED_LINE: &str = "Your skills are already loaded";
+
+/// The shipped skills a headless run of `lp` works with, in the order its
+/// prompt names them: the ones the prompt has the agent read through the
+/// `skills` tool, or says are loaded, and the ones `crystalline <loop> run`
+/// hands its agent itself when the prompt says so ([`loaded_skills_text`]).
+pub fn loop_skills(lp: Loop) -> &'static [&'static str] {
+    match lp {
+        Loop::Reflect => &["crystalline-intelligence", "crystalline-presentation"],
+        Loop::Evolve => &["crystalline-intelligence"],
+    }
+}
+
+/// The text of [`loop_skills`] as this binary ships them, for a runner that
+/// hands the skills to its agent itself when the prompt says they are
+/// loaded (`crystalline <loop> run` appends it to Claude Code's system
+/// prompt). Each skill opens with a line that names it.
+pub fn loaded_skills_text(lp: Loop) -> String {
+    let mut out = String::from(
+        "The Crystalline skills below are loaded for this run. Where the run's prompt says something else, the prompt wins.\n",
+    );
+    for name in loop_skills(lp) {
+        let skill = crate::skills::skill(name).expect("every loop skill ships");
+        out.push_str(&format!(
+            "\n# Skill `{name}`\n\n{}\n",
+            skill.content.trim_end()
+        ));
+    }
+    out
+}
+
+/// The sentence the start of `lp`'s prompt opens with: the call to the
+/// `skills` tool, or with `skills_loaded` the words that say they are there.
+/// The rest of that paragraph (what the skills teach and that this prompt
+/// wins over them) stays the same either way.
+fn skills_sentence(lp: Loop, skills_loaded: bool) -> String {
+    let skills = loop_skills(lp)
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    match (lp, skills_loaded) {
+        (_, true) => format!("{SKILLS_LOADED_LINE}: {skills}."),
+        (Loop::Reflect, false) => "Start: call the `skills` tool with name `crystalline-intelligence` and read it, then with name `crystalline-presentation`.".to_string(),
+        (Loop::Evolve, false) => "Start: call the `skills` tool with name `crystalline-intelligence` and read it.".to_string(),
+    }
+}
+
+/// Whether a headless prompt says the skills are already loaded instead of
+/// calling the `skills` tool: what the request names when it names it,
+/// else whether the server hides the `skills` tool from a headless run.
+/// Only `skills.serve: false` hides it there: under `auto` an unattended
+/// session and an HTTP session are both served the full surface.
+pub fn skills_loaded(serve: crate::config::SkillsServe, requested: Option<bool>) -> bool {
+    requested.unwrap_or(serve == crate::config::SkillsServe::Never)
+}
+
 /// The shipped prompt a headless run of `lp` starts its agent with, for
-/// `domain` and at most `max_items` items. It ends with the block
-/// [`parse_run_summary`] reads.
-pub fn headless_prompt(lp: Loop, domain: &str, max_items: u32) -> String {
+/// `domain` and at most `max_items` items. With `skills_loaded` its start
+/// says the skills are already loaded instead of calling the `skills` tool
+/// (see [`skills_loaded`]). It ends with the block [`parse_run_summary`]
+/// reads.
+pub fn headless_prompt(lp: Loop, domain: &str, max_items: u32, skills_loaded: bool) -> String {
     let template = match lp {
         Loop::Reflect => REFLECT_PROMPT,
         Loop::Evolve => EVOLVE_PROMPT,
     };
     template
+        .replace("{skills}", &skills_sentence(lp, skills_loaded))
         .replace("{max_items}", &max_items.to_string())
         .replace("{domain}", domain)
+}
+
+/// What a runner that starts its own agent sets it up with: the answer of
+/// the `automation_prompt` verb and of `<loop> prompt --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunnerSetup {
+    /// The filled-in prompt, as [`headless_prompt`] gives it.
+    pub prompt: String,
+    /// [`HEADLESS_DISALLOWED_TOOLS`], in order: the bare MCP tool names the
+    /// agent's harness must refuse.
+    pub disallowed_tools: Vec<String>,
+    /// The Crystalline version that built this answer.
+    pub version: String,
+    /// [`setup_checksum`] of the prompt and the tools, so a runner notices
+    /// when either changed.
+    pub checksum: String,
+}
+
+/// The [`RunnerSetup`] of a headless run of `lp` on `domain` with at most
+/// `max_items` items.
+pub fn runner_setup(lp: Loop, domain: &str, max_items: u32, skills_loaded: bool) -> RunnerSetup {
+    let prompt = headless_prompt(lp, domain, max_items, skills_loaded);
+    let checksum = setup_checksum(&prompt, HEADLESS_DISALLOWED_TOOLS);
+    RunnerSetup {
+        prompt,
+        disallowed_tools: HEADLESS_DISALLOWED_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        checksum,
+    }
+}
+
+/// `sha256:<hex>`: the lowercase hex SHA-256 of the prompt's UTF-8 bytes,
+/// one NUL byte, then the tool names joined by a line feed (`\n`), with
+/// nothing after the last one. Neither a prompt nor a tool name holds a
+/// NUL, so a change to either part, or to the order of the tools, changes
+/// the sum. The version is not part of it: an upgrade that changes neither
+/// keeps the sum.
+pub fn setup_checksum<S: AsRef<str>>(prompt: &str, tools: &[S]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(prompt.as_bytes());
+    hasher.update([0u8]);
+    for (i, tool) in tools.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(tool.as_ref().as_bytes());
+    }
+    let mut out = String::from("sha256:");
+    for byte in hasher.finalize() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// The fixed block a headless run's agent ends with, read into numbers.
@@ -292,6 +413,92 @@ fn next_count(lines: &[&str], from: usize, key: &str) -> Option<(usize, u64)> {
 mod tests {
     use super::*;
 
+    /// The n8n loop workflows exclude exactly the tools a headless run may
+    /// not call, and their guard stops a run when the server forbids another
+    /// list: a new forbidden tool fails this test instead of drifting.
+    #[test]
+    fn the_n8n_workflows_exclude_and_guard_exactly_the_headless_tools() {
+        let joined = HEADLESS_DISALLOWED_TOOLS.join(",");
+        for (name, text) in [
+            (
+                "reflect",
+                include_str!("../../../examples/n8n/reflect-loop.json"),
+            ),
+            (
+                "evolve",
+                include_str!("../../../examples/n8n/evolve-loop.json"),
+            ),
+        ] {
+            let workflow: serde_json::Value = serde_json::from_str(text).unwrap();
+            let node = |wanted: &str| {
+                workflow["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|n| n["name"] == wanted)
+                    .unwrap_or_else(|| panic!("{name}: no node {wanted}"))
+                    .clone()
+            };
+            let mcp = node("Crystalline MCP");
+            let excluded: Vec<&str> = mcp["parameters"]["excludeTools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap())
+                .collect();
+            assert_eq!(excluded, HEADLESS_DISALLOWED_TOOLS, "{name}");
+            let guard = node("Same forbidden tools?");
+            let condition = guard["parameters"]["conditions"]["conditions"][0]["leftValue"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                condition.contains(&format!("=== '{joined}'")),
+                "{name}: {condition}"
+            );
+            let connections = &workflow["connections"];
+            assert_eq!(
+                connections["Prompt fetched?"]["main"][0][0]["node"], "Same forbidden tools?",
+                "{name}"
+            );
+            assert_eq!(
+                connections["Same forbidden tools?"]["main"][0][0]["node"], "Status",
+                "{name}"
+            );
+            assert_eq!(
+                connections["Same forbidden tools?"]["main"][1][0]["node"],
+                "Forbidden tools changed",
+                "{name}"
+            );
+        }
+    }
+
+    /// The skills a loop's prompt names are the ones a run hands over, and
+    /// the handed text carries each shipped skill whole.
+    #[test]
+    fn the_handed_skills_are_the_ones_the_prompt_names() {
+        for lp in [Loop::Reflect, Loop::Evolve] {
+            let prompt = headless_prompt(lp, "eng", 5, true);
+            let text = loaded_skills_text(lp);
+            for name in loop_skills(lp) {
+                assert!(prompt.contains(&format!("`{name}`")), "{name}");
+                let skill = crate::skills::skill(name).unwrap();
+                assert!(text.contains(skill.content.trim_end()), "{name}");
+                assert!(text.contains(&format!("# Skill `{name}`")), "{name}");
+            }
+        }
+        assert_eq!(
+            headless_prompt(Loop::Reflect, "eng", 5, true)
+                .lines()
+                .find(|l| l.starts_with(SKILLS_LOADED_LINE))
+                .unwrap()
+                .split(" They teach")
+                .next()
+                .unwrap(),
+            "Your skills are already loaded: `crystalline-intelligence` and `crystalline-presentation`."
+        );
+    }
+
     #[test]
     fn the_backoff_doubles_from_five_minutes_up_to_six_hours() {
         assert_eq!(backoff_secs(0), 0);
@@ -343,8 +550,14 @@ mod tests {
 
     fn both() -> [(Loop, String); 2] {
         [
-            (Loop::Reflect, headless_prompt(Loop::Reflect, "work", 7)),
-            (Loop::Evolve, headless_prompt(Loop::Evolve, "work", 7)),
+            (
+                Loop::Reflect,
+                headless_prompt(Loop::Reflect, "work", 7, false),
+            ),
+            (
+                Loop::Evolve,
+                headless_prompt(Loop::Evolve, "work", 7, false),
+            ),
         ]
     }
 
@@ -389,11 +602,11 @@ mod tests {
 
     #[test]
     fn reflect_asks_in_threads_and_evolve_in_the_summary() {
-        let reflect = headless_prompt(Loop::Reflect, "work", 7);
+        let reflect = headless_prompt(Loop::Reflect, "work", 7, false);
         assert!(
             reflect.contains("Questions for people go into a Reflection thread with `discuss`")
         );
-        let evolve = headless_prompt(Loop::Evolve, "work", 7);
+        let evolve = headless_prompt(Loop::Evolve, "work", 7, false);
         assert!(evolve.contains("Name every question for people in the summary"));
         assert!(evolve.contains("never in a Reflection thread"));
         assert!(!evolve.contains("`discuss`"));
@@ -484,7 +697,7 @@ mod tests {
 
     #[test]
     fn the_reflect_prompt_reads_the_pages_and_names_sources() {
-        let prompt = headless_prompt(Loop::Reflect, "work", 7);
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
         for needle in [
             "`## Pages`",
             "`sources`",
@@ -505,7 +718,7 @@ mod tests {
 
     #[test]
     fn the_evolve_prompt_asks_for_mechanical_findings_only() {
-        let prompt = headless_prompt(Loop::Evolve, "work", 7);
+        let prompt = headless_prompt(Loop::Evolve, "work", 7, false);
         for needle in [
             "class: \"mechanical\"",
             "`judgment`",
@@ -514,6 +727,98 @@ mod tests {
         ] {
             assert!(prompt.contains(needle), "evolve prompt lacks {needle}");
         }
+    }
+
+    #[test]
+    fn the_shipped_prompt_calls_the_skills_tool_and_a_loaded_one_does_not() {
+        for lp in [Loop::Reflect, Loop::Evolve] {
+            let shipped = headless_prompt(lp, "work", 7, false);
+            assert!(!shipped.contains("{skills}"), "{lp} keeps {{skills}}");
+            assert!(
+                shipped.contains(
+                    "\n\nStart: call the `skills` tool with name `crystalline-intelligence`"
+                ),
+                "{lp}"
+            );
+            let loaded = headless_prompt(lp, "work", 7, true);
+            assert!(!loaded.contains("{skills}"), "{lp} keeps {{skills}}");
+            assert!(!loaded.contains("call the `skills` tool"), "{lp}");
+            assert!(
+                loaded.contains("\n\nYour skills are already loaded"),
+                "{lp} lacks the loaded line"
+            );
+            // The rule that the prompt wins over a skill stays either way.
+            assert!(loaded.contains("this prompt wins"), "{lp}");
+            assert_eq!(
+                shipped.lines().count(),
+                loaded.lines().count(),
+                "{lp} changes more than the one line"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skills_line_follows_the_setting_unless_the_request_names_it() {
+        use crate::config::SkillsServe;
+        for serve in [SkillsServe::Auto, SkillsServe::Always] {
+            assert!(!skills_loaded(serve, None), "{serve:?}");
+        }
+        assert!(skills_loaded(SkillsServe::Never, None));
+        for serve in [SkillsServe::Auto, SkillsServe::Always, SkillsServe::Never] {
+            assert!(skills_loaded(serve, Some(true)), "{serve:?}");
+            assert!(!skills_loaded(serve, Some(false)), "{serve:?}");
+        }
+    }
+
+    #[test]
+    fn a_runner_setup_carries_the_prompt_the_tools_the_version_and_the_checksum() {
+        let setup = runner_setup(Loop::Evolve, "work", 7, false);
+        assert_eq!(
+            setup.prompt,
+            headless_prompt(Loop::Evolve, "work", 7, false)
+        );
+        assert_eq!(setup.disallowed_tools, HEADLESS_DISALLOWED_TOOLS);
+        assert_eq!(setup.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            setup.checksum,
+            setup_checksum(&setup.prompt, HEADLESS_DISALLOWED_TOOLS)
+        );
+        let value = serde_json::to_value(&setup).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["checksum", "disallowed_tools", "prompt", "version"]);
+    }
+
+    #[test]
+    fn the_checksum_is_sha256_of_the_prompt_a_nul_and_the_tools_one_per_line() {
+        use sha2::Digest as _;
+        let tools = ["a_tool", "b_tool"];
+        let digest = sha2::Sha256::digest(b"the prompt\0a_tool\nb_tool");
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            setup_checksum("the prompt", &tools),
+            format!("sha256:{hex}")
+        );
+        // The same input hashes the same; a change to either part changes it.
+        let base = setup_checksum("the prompt", &tools);
+        assert_eq!(base, setup_checksum("the prompt", &tools));
+        assert_ne!(base, setup_checksum("the prompt.", &tools));
+        assert_ne!(base, setup_checksum("the prompt", &["a_tool"]));
+        assert_ne!(
+            base,
+            setup_checksum("the prompt", &["a_tool", "b_tool", "c_tool"])
+        );
+        assert_ne!(base, setup_checksum("the prompt", &["b_tool", "a_tool"]));
+        // The skills line is part of the prompt, so it is part of the sum.
+        assert_ne!(
+            runner_setup(Loop::Reflect, "work", 7, false).checksum,
+            runner_setup(Loop::Reflect, "work", 7, true).checksum
+        );
     }
 
     #[test]

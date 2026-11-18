@@ -565,7 +565,9 @@ impl OverlayGrant {
     /// The window is compared by parsing rather than by string order, because
     /// an RFC 3339 instant carries its offset and two spellings of one moment
     /// do not sort. An `expires_at` that cannot be parsed is treated as past:
-    /// a grant nobody can date is one nobody should be able to redeem.
+    /// a grant nobody can date is one nobody should be able to redeem. One
+    /// past the latest instant a date holds (`9999-12-31T23:59:59Z`, which
+    /// 0.33.0 read and stored) is far in the future, so it stays live.
     pub(crate) fn is_live(&self) -> bool {
         if self.revoked_at.is_some() {
             return false;
@@ -574,7 +576,7 @@ impl OverlayGrant {
             None => true,
             Some(at) => match time::parse_rfc3339(at) {
                 Some(at) => at.stamp() > time::now(),
-                None => false,
+                None => time::rfc3339_past_latest(at),
             },
         }
     }

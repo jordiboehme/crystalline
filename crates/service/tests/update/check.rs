@@ -403,7 +403,7 @@ fn suppressed_by_no_update_notifier_ci_docker_mcpb() {
     };
     assert_eq!(
         check_suppressed(&env_of(&[]), &mcpb),
-        Some("Claude Desktop extension")
+        Some("Claude Desktop-only bundle")
     );
     let state = UpdateState::detect(
         Path::new("/nowhere/crystalline"),
@@ -416,7 +416,7 @@ fn suppressed_by_no_update_notifier_ci_docker_mcpb() {
     );
     assert_eq!(
         state.facts(true).check.text(),
-        "off: Claude Desktop extension"
+        "off: Claude Desktop-only bundle"
     );
 }
 

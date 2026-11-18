@@ -205,6 +205,30 @@ pub fn check_index_limits(path: &Path, engram: &Engram) -> Vec<Issue> {
     issues
 }
 
+/// Run `E012` against a single already-parsed engram: warn when its body
+/// opens with a second frontmatter block. Backs the `validate_engrams` tool
+/// beside [`check_index_limits`], with the same rules about overrides. The
+/// parsed engram does not say where its body starts, so the issue names no
+/// line.
+pub fn check_second_block(path: &Path, engram: &Engram) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    let mut summary = Summary::default();
+    let mut sink = Sink::new(&mut issues, &mut summary, None, false);
+    if crate::frontmatter::opens_with_frontmatter(&engram.body) {
+        let keys = crate::frontmatter::split_frontmatter(engram.body.trim_start_matches('\n'))
+            .and_then(|parts| crate::frontmatter::frontmatter_block(parts.yaml))
+            .map(|mapping| {
+                mapping
+                    .keys()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        format::emit_second_block(path, None, &keys, &mut sink);
+    }
+    issues
+}
+
 /// One finding as a domain's settings and the `--strict` switch leave it: a
 /// rule the domain's `.crystalline.yaml` sets `off` is dropped (`None`), a
 /// severity word re-ranks it, a word verify does not know leaves its default,

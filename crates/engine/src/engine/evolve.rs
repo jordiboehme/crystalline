@@ -18,7 +18,7 @@ pub(super) const FOLDER_PAIR_RULE: &str = "V112";
 
 /// What [`Engine::evolve_findings`] swept, before the queue is shaped.
 pub(super) struct SweptFindings {
-    pub(super) today: NaiveDate,
+    pub(super) today: Day,
     pub(super) families: Vec<Family>,
     pub(super) rules: Vec<&'static str>,
     pub(super) class: Option<Class>,
@@ -168,10 +168,10 @@ impl Engine {
         let hidden = self.hidden_for(scope).await?;
         let p = &self.localized(p, &hidden).await;
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
+            Some(s) => time::parse_date(s).ok_or_else(|| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
             })?,
-            None => Utc::now().date_naive(),
+            None => time::today_utc(),
         };
         let families = parse_families(&p.families)?;
         let rules = parse_rules(&p.rules)?;
@@ -484,7 +484,7 @@ impl Engine {
                 "rules": rules,
                 "min_priority": p.min_priority,
                 "class": class.map(|c| c.as_str()),
-                "today": today.to_string(),
+                "today": today.ymd(),
             },
             "engrams_scanned": engrams_scanned,
             "unparsed": unparsed,
@@ -761,7 +761,7 @@ impl Engine {
     ) -> Result<Vec<Finding>> {
         let hidden = self.hidden_for(scope).await?;
         let names = self.sweep_domain_names(&hidden).await;
-        let today = Utc::now().date_naive();
+        let today = time::today_utc();
         let Some(swept) = self
             .sweep_domain(domain, today, &names, true, false, scope, &hidden)
             .await?
@@ -1239,7 +1239,7 @@ impl Engine {
     async fn sweep_domain(
         &self,
         name: &str,
-        today: NaiveDate,
+        today: Day,
         names: &SweepNames,
         include_acknowledged: bool,
         count_pending: bool,
@@ -1492,7 +1492,7 @@ impl Engine {
 
         let input = SweepInput {
             domain: name.to_string(),
-            today: time_day(today),
+            today,
             engrams: facts,
             graph,
             unresolved,
@@ -1559,7 +1559,7 @@ impl Engine {
         let work = origin::unshared_work(&root, &state_dir)?;
         Some(ShareFacts {
             unshared: work.count(),
-            oldest_change: work.oldest_change_date().map(time_day),
+            oldest_change: work.oldest_change_date(),
         })
     }
 

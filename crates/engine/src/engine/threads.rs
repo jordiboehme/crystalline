@@ -49,7 +49,7 @@ fn refuse_anonymous_comment(
 /// One entry by `caller`, now.
 fn entry(kind: EntryKind, caller: &ReflectionCaller, text: &str) -> Entry {
     Entry {
-        at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        at: time::now().rfc3339_secs_z(),
         kind,
         author: caller.author.clone(),
         text: text.to_string(),

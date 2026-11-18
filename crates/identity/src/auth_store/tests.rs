@@ -1,6 +1,33 @@
 use super::*;
 use crate::auth_store::db::test_store;
 
+/// A link 0.33.0 stored with an expiry past the latest instant a date holds
+/// (a caller's "never") stays live after the upgrade; one nobody can read is
+/// still over, and a past one is over.
+#[test]
+fn a_far_future_link_expiry_stays_live() {
+    let grant = |expires_at: Option<&str>| OverlayGrant {
+        id: 1,
+        domain: "team".to_string(),
+        path: "plan.md".to_string(),
+        owner: "alice".to_string(),
+        grantee: None,
+        created_at: "2026-11-18T10:00:00+00:00".to_string(),
+        expires_at: expires_at.map(str::to_string),
+        revoked_at: None,
+    };
+    assert!(grant(None).is_live());
+    assert!(grant(Some("9999-12-31T23:59:59Z")).is_live());
+    assert!(grant(Some("9999-12-31T00:00:00+00:00")).is_live());
+    assert!(grant(Some("9999-12-30T22:00:00Z")).is_live());
+    assert!(!grant(Some("2001-01-01T00:00:00Z")).is_live());
+    assert!(!grant(Some("never")).is_live());
+    assert!(!grant(Some("9999-12-32T00:00:00Z")).is_live());
+    let mut revoked = grant(Some("9999-12-31T23:59:59Z"));
+    revoked.revoked_at = Some("2026-11-18T10:00:00+00:00".to_string());
+    assert!(!revoked.is_live());
+}
+
 /// Whether [`open_database`] is expected to reach multiprocess WAL on the
 /// platform these tests are running on, rather than falling back to a
 /// legacy open. Observable as the `web-auth.db-tshm` coordination file

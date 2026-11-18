@@ -47,7 +47,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crystalline_core::time::{self, Stamp};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::sha256_hex;
@@ -91,7 +91,8 @@ pub struct DraftStart {
     /// What the open proposal holds.
     pub shared: Option<SharedText>,
     /// Set when a merge changed the row. Drives the notice.
-    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "time::serde::stamp_option")]
+    pub merged_at: Option<Stamp>,
     /// Stands while a merge is being written: set before the row is written
     /// and cleared when the start moves after it. A crash between the two
     /// leaves the merged row over the old start, and this says so, so the next
@@ -457,6 +458,39 @@ pub fn all(state_dir: &Path, domain: &str, actor: &str) -> io::Result<Vec<DraftS
 mod tests {
     use super::*;
 
+    /// Draft start records written by 0.33.0 (pretty JSON), frozen:
+    /// each loads, and saving it again gives the same bytes.
+    #[test]
+    fn a_record_from_0_33_0_round_trips_byte_for_byte() {
+        let state = tempfile::tempdir().unwrap();
+        for (path, written) in [
+            (
+                "plan.md",
+                "{\n  \"path\": \"plan.md\",\n  \"from\": \"plan.md\",\n  \"start\": \"# Plan\\n\",\n  \"shared\": {\n    \"proposal\": 7,\n    \"text\": \"# Plan\\nmore\\n\"\n  },\n  \"merged_at\": \"2027-01-15T08:00:00.123456789Z\",\n  \"merging\": true,\n  \"settling\": {\n    \"text_sha256\": \"ab\",\n    \"from\": \"plan.md\",\n    \"start\": null,\n    \"start_sha256\": \"cd\"\n  }\n}",
+            ),
+            (
+                "new.md",
+                "{\n  \"path\": \"new.md\",\n  \"from\": null,\n  \"start\": null,\n  \"start_sha256\": \"ef\",\n  \"shared\": null,\n  \"merged_at\": null\n}",
+            ),
+        ] {
+            let file = record_file(state.path(), "team", "ada", path).unwrap();
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, written).unwrap();
+            let record = load(state.path(), "team", "ada", path)
+                .unwrap()
+                .expect("a 0.33.0 record loads");
+            save(state.path(), "team", "ada", &record).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), written, "{path}");
+        }
+        let record = load(state.path(), "team", "ada", "plan.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.merged_at,
+            Stamp::from_unix(1_800_000_000, 123_456_789)
+        );
+    }
+
     /// A retry's wait does not hold up the worker it runs on: with the one
     /// worker waiting, another task still runs before the wait is over.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -528,7 +562,7 @@ mod tests {
                 proposal: 42,
                 text: Some("what the proposal holds\n".to_string()),
             }),
-            merged_at: Some("2026-11-06T10:00:00Z".parse().unwrap()),
+            merged_at: time::parse_lenient_stamp("2026-11-06T10:00:00Z"),
             merging: None,
             settling: None,
         };

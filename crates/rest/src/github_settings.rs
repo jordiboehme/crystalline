@@ -312,7 +312,7 @@ pub async fn access(
         stale_since: state
             .engine
             .github_access_stale_since()
-            .map(|since| since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            .map(|since| since.rfc3339_secs_z()),
         closed: state.engine.github_access_closed(),
     }))
 }

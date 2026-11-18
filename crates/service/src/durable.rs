@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use crystalline_core::config::{AccountsLocation, GlobalConfig};
+use crystalline_core::time::Stamp;
 use crystalline_index::postgres::OwnerRow;
 use serde_json::{Value, json};
 
@@ -48,7 +48,7 @@ pub enum OwnerState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentState {
     /// The document was saved, last at this time.
-    Saved(DateTime<Utc>),
+    Saved(Stamp),
     /// No document is stored yet: the database runs on config.yaml and the
     /// defaults.
     NotSaved,
@@ -298,8 +298,8 @@ pub struct DurableStateReport {
     pub warnings: Vec<String>,
 }
 
-fn stamp(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(SecondsFormat::Secs, true)
+fn stamp(at: Stamp) -> String {
+    at.rfc3339_secs_z()
 }
 
 /// The sentence for an accounts file left in the state directory, `None`
@@ -366,7 +366,7 @@ impl DurableStateReport {
             Some(o) => format!(
                 "owner of postgres {} since {}",
                 self.database,
-                stamp(o.since.into_chrono())
+                stamp(o.since)
             ),
             None => format!("owner of postgres {}", self.database),
         };
@@ -396,7 +396,7 @@ impl DurableStateReport {
                     .unwrap_or_default(),
                 o.pid,
                 o.version,
-                stamp(o.since.into_chrono())
+                stamp(o.since)
             ),
             (OwnerState::Owned | OwnerState::Unannounced, _) => {
                 "Owner: an instance that has not announced itself yet".to_string()
@@ -436,7 +436,7 @@ impl DurableStateReport {
                 "command": o.command,
                 "pid": o.pid,
                 "version": o.version,
-                "since": stamp(o.since.into_chrono()),
+                "since": stamp(o.since),
             })
         });
         let (state, error) = match &self.owner_state {
@@ -576,7 +576,7 @@ async fn read_document_state(cfg: &GlobalConfig) -> DocumentState {
         Err(e) => return DocumentState::Unreadable(e.to_string()),
     };
     match crystalline_index::postgres::read_config_document(&target).await {
-        Ok(Some(doc)) => DocumentState::Saved(doc.updated_at.into_chrono()),
+        Ok(Some(doc)) => DocumentState::Saved(doc.updated_at),
         Ok(None) => DocumentState::NotSaved,
         Err(e) => DocumentState::Unreadable(e.to_string()),
     }
@@ -675,7 +675,6 @@ fn report_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn owned() -> DurableStateReport {
         DurableStateReport {
@@ -689,16 +688,12 @@ mod tests {
                 pid: 42,
                 backend_pid: 7,
                 version: "0.33.0".to_string(),
-                since: crystalline_core::time::Stamp::from_chrono(
-                    Utc.with_ymd_and_hms(2026, 11, 16, 9, 30, 0).unwrap(),
-                ),
+                since: Stamp::from_ymd_hms(2026, 11, 16, 9, 30, 0).unwrap(),
                 released_at: None,
             }),
             accounts: AccountsLocationKind::Postgres,
             config: ConfigState {
-                document: DocumentState::Saved(
-                    Utc.with_ymd_and_hms(2026, 11, 17, 8, 0, 0).unwrap(),
-                ),
+                document: DocumentState::Saved(Stamp::from_ymd_hms(2026, 11, 17, 8, 0, 0).unwrap()),
                 base_path: Some(PathBuf::from("/etc/crystalline/config.yaml")),
                 base_domains: vec!["team".to_string(), "docs".to_string()],
             },

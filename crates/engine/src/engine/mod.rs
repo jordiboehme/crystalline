@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use crystalline_core::attachment::suffixed_asset_path;
 use crystalline_core::config::registration::{
     Registration, RegistrationRequest, case_twin, case_twin_refusal, choose_domain_name,
@@ -36,6 +35,7 @@ use crystalline_core::emit::{
 };
 use crystalline_core::relink::Relink;
 use crystalline_core::schema::{self, Schema};
+use crystalline_core::time::{self, Day, OffsetStamp, Stamp};
 use crystalline_core::{
     CrystallineUrl, DomainLayout, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind,
     LinkForm, LinkTarget, Manifest, PathClass, ReflectionMode, YamlValue, domain_name_at,
@@ -328,13 +328,18 @@ const CONTEXT_MAX_ITERATIONS: usize = 50;
 const CONTEXT_TOLERANCE: f64 = 1e-10;
 
 /// Read a positive-integer seconds value from an environment variable, falling
-/// back to `default` when unset, empty, unparseable or non-positive.
+/// back to `default` when unset, empty, unparseable or non-positive, and held
+/// at [`crystalline_index::MAX_ENV_SECS`] above it, so no instant computed
+/// from it leaves the range a date can hold.
 fn env_secs(key: &str, default: i64) -> i64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
+    env_secs_from(std::env::var(key).ok().as_deref(), default)
+}
+
+/// [`env_secs`] for the variable's value `raw`.
+fn env_secs_from(raw: Option<&str>, default: i64) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(default)
+        .map_or(default, |n| n.min(crystalline_index::MAX_ENV_SECS))
 }
 
 /// An error from an engine operation, mapped to actionable tool errors.
@@ -1050,7 +1055,7 @@ pub struct Engine {
     // test to move a day on without waiting for one. See
     // `Engine::set_contradiction_today`.
     #[cfg(any(test, feature = "testing"))]
-    contradiction_today_override: std::sync::Mutex<Option<NaiveDate>>,
+    contradiction_today_override: std::sync::Mutex<Option<Day>>,
     // What the last successful embedding-model load pruned from the model
     // cache, so `ctl status` after a start says what that start freed. Empty on
     // every install that had nothing to prune, which is every install that
@@ -1146,7 +1151,7 @@ pub struct Engine {
     // time as now, so a test moves a lease past its stale time or a status
     // read to the next day. See `Engine::set_automation_now`.
     #[cfg(any(test, feature = "testing"))]
-    automation_now: std::sync::Mutex<Option<DateTime<FixedOffset>>>,
+    automation_now: std::sync::Mutex<Option<OffsetStamp>>,
     // What each loop's trigger webhook last did on each domain, as the
     // daemon's trigger task records it. Kept in memory: a restart forgets
     // it, and the next send writes it again. See `Engine::record_delivery`.
@@ -2100,14 +2105,14 @@ fn share_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> RemoteE
 pub(crate) struct ActivityState {
     next_token: u64,
     current: Vec<(u64, ActivityEntry)>,
-    last_done: Option<(ActivityEntry, chrono::DateTime<chrono::Utc>)>,
+    last_done: Option<(ActivityEntry, Stamp)>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ActivityEntry {
     kind: &'static str,
     domain: Option<String>,
-    started_at: chrono::DateTime<chrono::Utc>,
+    started_at: Stamp,
 }
 
 impl ActivityState {
@@ -2125,7 +2130,7 @@ impl ActivityState {
             ActivityEntry {
                 kind,
                 domain: domain.map(str::to_string),
-                started_at: chrono::Utc::now(),
+                started_at: time::now(),
             },
         ));
         ActivityGuard {
@@ -2137,7 +2142,7 @@ impl ActivityState {
     /// The status-report shape: `now` lists running operations with their
     /// elapsed seconds, `last` the most recently finished one.
     pub(crate) fn snapshot_json(&self) -> Value {
-        let now = chrono::Utc::now();
+        let now = time::now();
         let current: Vec<Value> = self
             .current
             .iter()
@@ -2153,7 +2158,7 @@ impl ActivityState {
             json!({
                 "kind": e.kind,
                 "domain": e.domain,
-                "finished_at": at.to_rfc3339(),
+                "finished_at": at.rfc3339(),
             })
         });
         json!({ "now": current, "last": last })
@@ -2172,7 +2177,7 @@ impl Drop for ActivityGuard {
         let mut state = self.state.lock().unwrap();
         if let Some(pos) = state.current.iter().position(|(t, _)| *t == self.token) {
             let (_, entry) = state.current.remove(pos);
-            state.last_done = Some((entry, chrono::Utc::now()));
+            state.last_done = Some((entry, time::now()));
         }
     }
 }
@@ -2457,7 +2462,7 @@ pub(crate) struct ContradictionState {
     /// The date the last published walk read validity against. A new day
     /// asks for a walk with nothing written, since an engram can expire
     /// overnight.
-    pub(crate) walked_on: Option<NaiveDate>,
+    pub(crate) walked_on: Option<Day>,
     /// Per domain, the pairs the scorer or the store failed on. Skipped by
     /// every walk but a retry walk, which the tick asks for at most once per
     /// tick and only while the model is loaded anyway.
@@ -4065,7 +4070,7 @@ impl Engine {
         self.last_synced
             .lock()
             .unwrap()
-            .insert(domain.to_string(), chrono::Utc::now().to_rfc3339());
+            .insert(domain.to_string(), time::now().rfc3339());
         if !report.changes.is_empty() {
             self.bump_reflection_generation(domain);
         }
@@ -4800,7 +4805,7 @@ impl Engine {
         if !self.config.read().unwrap().github_enabled() {
             return out;
         }
-        let wall_now = chrono::Utc::now();
+        let wall_now = time::now();
         if self
             .origin_poller
             .rate_limited_until()
@@ -4913,11 +4918,10 @@ impl Engine {
                 Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
                     // GitHub limits the token, not the repository: every
                     // domain waits, the origin poller's pulls included.
-                    let until = reset
-                        .map(crystalline_core::time::Stamp::into_chrono)
-                        .unwrap_or_else(|| wall_now + chrono::Duration::hours(1));
+                    let until = reset.unwrap_or_else(|| wall_now + time::hours(1));
                     tracing::warn!(
-                        "reflection backup: GitHub is rate limiting this machine; pausing until {until}"
+                        "reflection backup: GitHub is rate limiting this machine; pausing until {}",
+                        until.display_utc()
                     );
                     self.origin_poller.set_rate_limited_until(Some(until));
                     self.backup_marks.failed(&domain, now);
@@ -5667,8 +5671,8 @@ impl Engine {
                     .await?
             }
         };
-        let now = now_offset().to_rfc3339();
-        let stale_before = (now_offset() - Duration::seconds(self.stale_secs)).to_rfc3339();
+        let now = now_offset().rfc3339();
+        let stale_before = (time::now() - time::seconds(self.stale_secs)).rfc3339();
         // A long-running engine re-claims each domain it syncs, and a domain
         // it already holds under the lease it keeps, with a heartbeat the
         // timer keeps fresh, is answered from the lock row with nothing
@@ -5685,7 +5689,7 @@ impl Engine {
         let reclaimed = match &held {
             Some(lease) => {
                 let fresh = (2 * self.heartbeat_secs).min(self.stale_secs / 2);
-                let fresh_since = (now_offset() - Duration::seconds(fresh)).to_rfc3339();
+                let fresh_since = (time::now() - time::seconds(fresh)).rfc3339();
                 crystalline_index::held_claim(
                     store,
                     id,
@@ -5839,7 +5843,7 @@ impl Engine {
     /// several instances register different domains against one index, so a
     /// domain this instance has no registration for may be another's current
     /// work, and another instance's live registration is a registration.
-    fn hosted_elsewhere(&self, row: &DomainStats, now: DateTime<Utc>) -> bool {
+    fn hosted_elsewhere(&self, row: &DomainStats, now: Stamp) -> bool {
         self.held_elsewhere(
             row.host_instance_id.as_deref(),
             row.host_heartbeat_at.as_deref(),
@@ -5854,7 +5858,7 @@ impl Engine {
         &self,
         holder: Option<&str>,
         beat: Option<&str>,
-        now: DateTime<Utc>,
+        now: Stamp,
     ) -> bool {
         let Some(holder) = holder.filter(|h| !h.is_empty()) else {
             return false;
@@ -5865,12 +5869,9 @@ impl Engine {
         let Some(beat) = beat else {
             return false;
         };
-        match DateTime::parse_from_rfc3339(beat) {
-            Ok(beat) => {
-                now.signed_duration_since(beat.with_timezone(&Utc))
-                    <= Duration::seconds(self.stale_secs)
-            }
-            Err(_) => true,
+        match time::parse_rfc3339(beat) {
+            Some(beat) => now.since(beat.stamp()) <= time::seconds(self.stale_secs),
+            None => true,
         }
     }
 
@@ -5914,7 +5915,7 @@ impl Engine {
         if hosted.is_empty() {
             return;
         }
-        let now = now_offset().to_rfc3339();
+        let now = now_offset().rfc3339();
         let store = self.store.lock().await;
         // The label is resolved again on each beat, so an instance that
         // raced a twin to the same bare name takes its short id here
@@ -6301,10 +6302,8 @@ impl Engine {
     /// Whether a heartbeat is older than the stale threshold; one that does
     /// not parse counts as live, the direction that refuses.
     fn lock_is_stale(&self, beat: &str) -> bool {
-        DateTime::parse_from_rfc3339(beat).is_ok_and(|beat| {
-            Utc::now().signed_duration_since(beat.with_timezone(&Utc))
-                > Duration::seconds(self.stale_secs)
-        })
+        time::parse_rfc3339(beat)
+            .is_some_and(|beat| time::now().since(beat.stamp()) > time::seconds(self.stale_secs))
     }
 
     /// The host's label as `scope` may read it: a caller who is not signed
@@ -8068,7 +8067,7 @@ impl Engine {
                 start: Some(start.clone()),
                 start_sha256: None,
                 merged_at: if edited {
-                    Some(chrono::Utc::now())
+                    Some(time::now())
                 } else {
                     record.merged_at
                 },
@@ -9772,7 +9771,8 @@ pub struct GithubIdentity {
     /// The GitHub login it authenticated as, when connected.
     pub login: Option<String>,
     /// When the credential was stored, for the card's "connected since".
-    pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(with = "time::serde::stamp_option")]
+    pub connected_at: Option<Stamp>,
     /// "keyring" | "file", when connected. Never "environment": the
     /// environment supplies the machine's credential and never a personal one.
     pub token_store: Option<String>,
@@ -9803,7 +9803,8 @@ pub struct GithubLinkView {
     /// host.
     pub host: Option<String>,
     /// When the link was made.
-    pub linked_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(with = "time::serde::stamp_option")]
+    pub linked_at: Option<Stamp>,
     /// False once the user token is known to be gone (revoked, or its
     /// refresh token expired): the link stays and the person links again to
     /// share personally.
@@ -11977,10 +11978,10 @@ mod asset_ref_tests {
 pub(crate) fn asset_modified(abs: &Path) -> String {
     let mtime = std::fs::metadata(abs)
         .map(|meta| mtime_secs(&meta))
-        .unwrap_or_else(|_| Utc::now().timestamp());
-    chrono::DateTime::from_timestamp(mtime, 0)
-        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
-        .to_rfc3339()
+        .unwrap_or_else(|_| time::now().unix_seconds());
+    Stamp::from_unix(mtime, 0)
+        .unwrap_or(Stamp::UNIX_EPOCH)
+        .rfc3339()
 }
 
 /// The miss message every attachment verb reports, one spelling.
@@ -12608,7 +12609,7 @@ fn pulled_addresses(state_dir: &Path, touched: &HashSet<&str>) -> Result<HashMap
 /// without ever touching a filesystem.
 pub(crate) fn virtual_stamp(content: &str) -> FileStamp {
     FileStamp {
-        mtime: chrono::Utc::now().timestamp(),
+        mtime: time::now().unix_seconds(),
         size: content.len() as u64,
         sha256: sha256_hex(content.as_bytes()),
     }
@@ -12640,40 +12641,28 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn now_offset() -> DateTime<FixedOffset> {
-    chrono::Utc::now().fixed_offset()
-}
-
-/// A frontmatter date as the chrono date the engine's own types still hold.
-/// A stage 2 bridge: it goes when the engine moves onto
-/// `crystalline_core::time`.
-fn chrono_day(day: crystalline_core::time::Day) -> NaiveDate {
-    day.into_chrono()
-}
-
-/// A chrono date the engine still holds as the time module's date the index
-/// takes. A stage 2 bridge: it goes when the engine moves onto
-/// `crystalline_core::time`.
-fn time_day(day: NaiveDate) -> crystalline_core::time::Day {
-    crystalline_core::time::Day::from_chrono(day)
+fn now_offset() -> OffsetStamp {
+    time::now().to_offset_utc()
 }
 
 /// The ISO date `spec` before today, for `timeframe` windows like `7d`, `24h`,
-/// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure.
+/// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure. A window
+/// reaching past the earliest date the calendar holds stops there instead of
+/// failing, so an agent's `20000y` still lists everything.
 fn timeframe_cutoff(spec: &str) -> Option<String> {
     let spec = spec.trim();
     let (num, unit) = spec.split_at(spec.find(|c: char| c.is_alphabetic()).unwrap_or(spec.len()));
     let n: i64 = num.trim().parse().unwrap_or(7);
     let days = match unit.trim() {
-        "h" => (n + 23) / 24,
+        "h" => n.saturating_add(23) / 24,
         "d" | "" => n,
-        "w" => n * 7,
-        "m" => n * 30,
-        "y" => n * 365,
+        "w" => n.saturating_mul(7),
+        "m" => n.saturating_mul(30),
+        "y" => n.saturating_mul(365),
         _ => 7,
     };
-    let cutoff = chrono::Utc::now().date_naive() - Duration::days(days.max(0));
-    Some(cutoff.format("%Y-%m-%d").to_string())
+    let cutoff = time::today_utc().saturating_sub_days(days.max(0));
+    Some(cutoff.ymd())
 }
 
 /// Build engram markdown with auto-filled frontmatter via the core emitter.
@@ -12692,7 +12681,7 @@ fn build_markdown(
     recorded_at: &str,
     actor: &str,
     model: Option<&str>,
-    now: DateTime<FixedOffset>,
+    now: OffsetStamp,
     metadata: Option<&Value>,
     body: &str,
 ) -> Result<String> {
@@ -12708,7 +12697,7 @@ fn build_markdown(
     fm.generated = Some(crystalline_core::Generated {
         by: actor.to_string(),
         model: model.map(str::to_string),
-        at: Some(crystalline_core::time::OffsetStamp::from_chrono(now)),
+        at: Some(now),
     });
     // Models routinely double-encode nested tool arguments, so an object
     // arriving as a JSON string is accepted by parsing it first.
@@ -12895,6 +12884,29 @@ impl ReindexHooks for DaemonReindexHooks<'_> {
     /// domain's lock.
     fn walker(&self) -> Option<String> {
         self.collab.then(|| self.engine.instance_id.clone())
+    }
+}
+
+#[cfg(test)]
+mod env_secs_tests {
+    use super::*;
+
+    /// A seconds setting from the environment is held at 100 years, so the
+    /// stale and heartbeat windows built from it never panic.
+    #[test]
+    fn a_huge_seconds_setting_is_held_and_its_window_never_panics() {
+        assert_eq!(env_secs_from(None, 30), 30);
+        assert_eq!(env_secs_from(Some("x"), 30), 30);
+        assert_eq!(env_secs_from(Some("0"), 30), 30);
+        assert_eq!(env_secs_from(Some("45"), 30), 45);
+        for raw in ["300000000000", "9223372036854775807"] {
+            let secs = env_secs_from(Some(raw), 30);
+            assert_eq!(secs, crystalline_index::MAX_ENV_SECS, "{raw}");
+            let stale_before = (time::now() - time::seconds(secs)).rfc3339();
+            assert!(stale_before < time::now().rfc3339(), "{raw}");
+            let fresh = (2 * secs).min(secs / 2);
+            assert!(time::now().checked_sub(time::seconds(fresh)).is_some());
+        }
     }
 }
 
@@ -13418,6 +13430,51 @@ mod lock_tests {
         format!(
             "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
         )
+    }
+
+    /// An agent's `timeframe` far beyond any engram's age lists everything
+    /// instead of failing: the window stops at the earliest date the calendar
+    /// holds, and a number of years too large to count in days stops there
+    /// too.
+    #[tokio::test]
+    async fn huge_timeframe_saturates() {
+        let earliest = time::today_utc().saturating_sub_days(i64::MAX).ymd();
+        let cutoff = timeframe_cutoff("20000y").expect("a cutoff");
+        let year: i64 = cutoff.rsplitn(3, '-').nth(2).unwrap().parse().unwrap();
+        assert!(
+            year <= -9999,
+            "20000 years back, or the earliest date: {cutoff}"
+        );
+        assert_eq!(
+            timeframe_cutoff("30000000000000000y").as_deref(),
+            Some(earliest.as_str()),
+            "a window too long to count in days holds at the earliest date"
+        );
+        assert_eq!(
+            timeframe_cutoff(&format!("{}h", i64::MAX)).as_deref(),
+            Some(earliest.as_str())
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.md"), engram("Alpha", "alpha", "The body.")).unwrap();
+        let engine = file_engine(&root).await;
+        for timeframe in ["20000y", "30000000000000000y"] {
+            let recent = engine
+                .recent_activity(
+                    &RecentParams {
+                        domains: Vec::new(),
+                        timeframe: Some(timeframe.to_string()),
+                        types: Vec::new(),
+                    },
+                    &crate::scope::Scope::Unrestricted,
+                )
+                .await
+                .unwrap();
+            assert_eq!(recent["count"], 1, "{timeframe}: {recent}");
+            assert_eq!(recent["timeframe"], timeframe);
+        }
     }
 
     /// A create checks that the permalink is free *inside* the file's lock, so

@@ -3442,8 +3442,8 @@ async fn both_reading_orders_land_on_their_own_pair_in_a_shared_group() {
 
 // --- an engram past its valid_to takes no part (Task 5b) --------------------
 
-fn day(s: &str) -> chrono::NaiveDate {
-    s.parse().unwrap()
+fn day(s: &str) -> crystalline_core::time::Day {
+    crystalline_core::time::parse_lenient_date(s).unwrap()
 }
 
 /// Close `permalink`'s validity window at `date`.
@@ -3586,7 +3586,7 @@ async fn the_walk_and_a_default_sweep_read_the_same_utc_date() {
     let (_tmp, engine) = engine_with(loader(s, loads)).await;
     set(&engine, "evolve.contradictions", "full").await;
     three(&engine).await;
-    let today = chrono::Utc::now().date_naive().to_string();
+    let today = crystalline_core::time::today_utc().ymd();
     valid_to(&engine, "eighteen", &today).await;
     engine.embed_pending().await.unwrap();
     assert_eq!(
@@ -3967,7 +3967,11 @@ async fn a_prose_edit_reads_one_engram_and_midnight_reads_none() {
     assert_eq!(engine.contradiction_fact_loads(), loads + 1);
     assert_eq!(s.forwards(), forwards, "nothing is scored again");
 
-    engine.set_contradiction_today(chrono::Utc::now().date_naive() + chrono::Days::new(1));
+    engine.set_contradiction_today(
+        crystalline_core::time::today_utc()
+            .checked_add_days(1)
+            .unwrap(),
+    );
     let (walks, loads) = (
         engine.contradiction_fact_walks(),
         engine.contradiction_fact_loads(),

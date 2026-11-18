@@ -86,7 +86,10 @@ impl Engine {
     /// One function because two verbs create engrams - [`Engine::write_engram`]
     /// and [`Engine::split_engram`] - and a second copy of these screens is a
     /// second chance to leave one of them out.
-    fn engram_destination(folder: Option<&str>, title: &str) -> Result<(String, String)> {
+    pub(super) fn engram_destination(
+        folder: Option<&str>,
+        title: &str,
+    ) -> Result<(String, String)> {
         let folder = folder.map(str::to_string).unwrap_or_default();
         let title_slug = slugify(title);
         if title_slug.is_empty() {
@@ -487,7 +490,7 @@ impl Engine {
         // taken because nothing about it needs one: it is the caller's own
         // arguments plus this instant, and a call that cannot produce a
         // well-formed engram is better refused with no lock in hand.
-        let today = chrono::Utc::now().date_naive();
+        let today = time::today_utc();
         let now = now_offset();
         // The model the agent reported, held against the actor this write
         // records: a person's write never carries one (`stamped_model`).
@@ -501,7 +504,7 @@ impl Engine {
             &permalink,
             &tags,
             &status,
-            &today.format("%Y-%m-%d").to_string(),
+            &today.ymd(),
             &actor,
             model.as_deref(),
             now,

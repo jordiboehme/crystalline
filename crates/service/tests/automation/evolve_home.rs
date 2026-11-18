@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, FixedOffset};
 use crystalline_core::automation::Loop;
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ServiceConfig};
+use crystalline_core::time::{self, OffsetStamp};
 use crystalline_index::TursoStore;
 use crystalline_remote::provider::ProposalState;
 use crystalline_service::engine::{PolicyEdit, ShareActor};
@@ -27,8 +27,8 @@ const HERE: &str = "https://kb.example.com";
 /// Another instance.
 const THERE: &str = "https://home.example";
 
-fn start() -> DateTime<FixedOffset> {
-    DateTime::parse_from_rfc3339("2026-10-21T10:00:00+00:00").unwrap()
+fn start() -> OffsetStamp {
+    time::parse_rfc3339("2026-10-21T10:00:00+00:00").unwrap()
 }
 
 /// A team MANIFEST that shares directly and carries the team marker, with
