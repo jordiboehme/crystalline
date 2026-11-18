@@ -285,3 +285,37 @@ fn the_release_checks_every_updater_seam() {
         );
     }
 }
+
+/// The macOS signing step in build.yml reads the Team ID from the
+/// `APPLE_TEAM_ID` line of `crates/core/src/update/mod.rs` with `sed`.
+/// A reformatted constant would make that read come out empty and fail
+/// the release at its first signing leg, so the line keeps the shape the
+/// `sed` matches and holds the constant's value.
+#[test]
+fn build_yml_reads_the_compiled_in_team_id() {
+    let build = repo_file(".github/workflows/build.yml");
+    assert!(
+        build.contains(
+            r#"sed -n 's/^pub const APPLE_TEAM_ID: &str = "\([A-Z0-9]*\)";$/\1/p' "$GITHUB_WORKSPACE/crates/core/src/update/mod.rs""#
+        ),
+        "build.yml reads the Team ID from the source"
+    );
+    assert!(
+        !build.contains("TeamIdentifier=${APPLE_TEAM_ID}"),
+        "the Team ID is not taken from the secret"
+    );
+    let source = repo_file("crates/core/src/update/mod.rs");
+    let line = format!(
+        "pub const APPLE_TEAM_ID: &str = \"{}\";",
+        crystalline_core::update::APPLE_TEAM_ID
+    );
+    assert!(
+        source.lines().any(|l| l == line),
+        "mod.rs holds `{line}` on a line of its own"
+    );
+    assert!(
+        crystalline_core::update::APPLE_TEAM_ID
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    );
+}
