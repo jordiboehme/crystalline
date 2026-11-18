@@ -166,7 +166,10 @@ pub(crate) fn refusal_text(refusal: &Refusal) -> String {
             path.label()
         ),
         Refusal::Docker => "a Docker install; pull the new image".to_string(),
-        Refusal::Mcpb => "the Claude Desktop extension; Claude Desktop updates it".to_string(),
+        Refusal::Mcpb => {
+            "the Claude Desktop-only bundle; open the newer .mcpb from the releases page"
+                .to_string()
+        }
         Refusal::Unknown => "the install method could not be told".to_string(),
     }
 }
@@ -3144,7 +3147,7 @@ mod tests {
             (
                 InstallMethod::Mcpb,
                 Some(Refusal::Mcpb),
-                "update now does nothing: the Claude Desktop extension; Claude Desktop updates it",
+                "update now does nothing: the Claude Desktop-only bundle; open the newer .mcpb from the releases page",
             ),
             (
                 InstallMethod::Unknown,

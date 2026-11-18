@@ -224,7 +224,7 @@ Crystalline is licensed under the Mozilla Public License 2.0 (see [LICENSE](../L
 - The generated `index.md` files are rewritten and removed on their own while `index.files` is on.
 - `provision` can register MCP servers, skills and agents that a domain's MANIFEST ships into your harnesses, and the server asks for no confirmation.
 - `add_domain` accepts any folder the daemon's user can read.
-- An agent that may change settings can change every key in the settings registry, including `auth.mcp`, `service.http` and the database connection. There is no confirmation step.
+- An agent that may change settings can change every key in the settings registry that is not an operator setting, for example `github.enabled`, `evolve.contradictions` or `recall.enabled`. There is no confirmation step. The operator settings (the network, the database, sign-in, the GitHub server address and OAuth client, the automation settings and the update check) change only with the CLI, `config.yaml` or their `CRYSTALLINE_*` variables.
 - There is no server-side allowlist of tools and no read-only flag per local domain. Read-only is daemon-wide.
 - There is no encryption at rest and no built-in TLS.
 - The builds are not reproducible.
