@@ -2406,7 +2406,12 @@ pub async fn run(
             // runs below, and the reason travels in the report as guidance.
             Err(e) => {
                 index = IndexAccess::Unavailable {
-                    reason: index_unavailable_reason(&db, &e.to_string(), &service, bypassed),
+                    reason: index_unavailable_reason(
+                        &crystalline_service::instance::IndexLocation::of(cfg, &db),
+                        &e.to_string(),
+                        &service,
+                        bypassed,
+                    ),
                 };
             }
         }
@@ -2979,12 +2984,12 @@ async fn daemon_file_stamps(
 /// `doctor` while a daemon is up used to see nothing but the raw locking
 /// error, which named neither.
 fn index_unavailable_reason(
-    db: &Path,
+    location: &crystalline_service::instance::IndexLocation,
     error: &str,
     service: &ServiceDoctor,
     bypassed: bool,
 ) -> String {
-    let db = db.display();
+    let db = location.place();
     let pid = service
         .lock_pid
         .map(|p| p.to_string())
@@ -3011,9 +3016,15 @@ fn index_unavailable_reason(
             "the running Crystalline daemon (pid {pid}) owns the index at {db} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
         );
     }
-    format!(
-        "the index at {db} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
-    )
+    match location {
+        crystalline_service::instance::IndexLocation::File(_) => format!(
+            "the index at {db} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+        ),
+        crystalline_service::instance::IndexLocation::Database(_) => format!(
+            "the index in {db} could not be opened, {skipped}. {} The database reported: {error}",
+            crystalline_service::instance::database_open_advice()
+        ),
+    }
 }
 
 fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {

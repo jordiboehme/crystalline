@@ -2944,6 +2944,52 @@ pub fn lock_held_message(intent: Option<&ServeIntent>, holder: Option<&LockInfo>
 /// way.
 pub const BYPASS_NOTE: &str = "bypassed (--db/--config override); reading the index directly";
 
+/// Where the index a command could not open lives. The advice for a failed
+/// open depends on it: a local file is unreadable or locked, a Postgres
+/// database is down, unreachable, refuses the sign-in or has no free
+/// connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexLocation {
+    /// The local Turso file at this path.
+    File(String),
+    /// A Postgres database, described without credentials
+    /// (`host:port/db, schema s`).
+    Database(String),
+}
+
+impl IndexLocation {
+    /// The index of `cfg`: the file at `db` on Turso, the database `cfg`
+    /// names on Postgres.
+    pub fn of(cfg: &config::GlobalConfig, db: &Path) -> IndexLocation {
+        let database = cfg.database();
+        if database.backend == config::DatabaseBackend::Turso {
+            return IndexLocation::File(db.display().to_string());
+        }
+        #[cfg(feature = "postgres")]
+        if let Ok(target) = crystalline_index::postgres::PgTarget::from_config(&database) {
+            return IndexLocation::Database(target.describe());
+        }
+        IndexLocation::Database("(the configured database)".to_string())
+    }
+
+    /// The location in a sentence: the path, or `the database <place>`.
+    pub fn place(&self) -> String {
+        match self {
+            IndexLocation::File(path) => path.clone(),
+            IndexLocation::Database(place) => format!("the database {place}"),
+        }
+    }
+
+    /// What `--db` or `--config` reached past the daemon to: the file, or
+    /// the database.
+    fn direct_target(&self) -> &'static str {
+        match self {
+            IndexLocation::File(_) => "that file",
+            IndexLocation::Database(_) => "that database",
+        }
+    }
+}
+
 /// Why the index could not be reached, in words a person can act on, with the
 /// holder looked up here.
 ///
@@ -2954,7 +3000,7 @@ pub const BYPASS_NOTE: &str = "bypassed (--db/--config override); reading the in
 /// the same sentence wherever they meet the same state. It lives beside
 /// [`lock_held_message`] because both answer "somebody else has the index" and
 /// both must keep saying it the same way.
-pub fn index_unreachable_words(location: &str, error: &str, bypassed: bool) -> String {
+pub fn index_unreachable_words(location: &IndexLocation, error: &str, bypassed: bool) -> String {
     let info = read_lock_info().filter(|info| process_alive(info.pid));
     // A one-shot command is no daemon to ask or to stop: it lets go when it
     // finishes.
@@ -2963,8 +3009,9 @@ pub fn index_unreachable_words(location: &str, error: &str, bypassed: bool) -> S
         && !crystalline_index::is_schema_too_new_text(error)
     {
         return format!(
-            "the standalone command `{command}` (pid {}) holds the index at {location} right now; run this again once it has finished. The index reported: {error}",
-            info.pid
+            "the standalone command `{command}` (pid {}) holds the index at {} right now; run this again once it has finished. The index reported: {error}",
+            info.pid,
+            location.place()
         );
     }
     words_for_holder(info.map(|info| info.pid), location, error, bypassed)
@@ -2978,27 +3025,42 @@ pub fn index_unreachable_words(location: &str, error: &str, bypassed: bool) -> S
 /// cheapest fix there is to stop reaching past the holder.
 pub fn words_for_holder(
     holder: Option<u32>,
-    location: &str,
+    location: &IndexLocation,
     error: &str,
     bypassed: bool,
 ) -> String {
+    let place = location.place();
     // An index newer than this binary is not a holder problem, and the lock
     // advice below would send a person looking for a process that is not
     // there. Its own message names the remedy, so it stands alone.
     if crystalline_index::is_schema_too_new_text(error) {
-        return format!("the index at {location} cannot be used by this binary: {error}");
+        return format!("the index at {place} cannot be used by this binary: {error}");
     }
     match (holder, bypassed) {
         (Some(pid), true) => format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {location}, and --db or --config told this command to read that file directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}"
+            "the running Crystalline daemon (pid {pid}) owns the index at {place}, and --db or --config told this command to read {} directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}",
+            location.direct_target()
         ),
         (Some(pid), false) => format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {location} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}"
+            "the running Crystalline daemon (pid {pid}) owns the index at {place} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}"
         ),
-        (None, _) => format!(
-            "the index at {location} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
-        ),
+        (None, _) => match location {
+            IndexLocation::File(_) => format!(
+                "the index at {place} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+            ),
+            IndexLocation::Database(_) => format!(
+                "the index in {place} could not be opened, and no Crystalline daemon is running to ask instead. {} The database reported: {error}",
+                database_open_advice()
+            ),
+        },
     }
+}
+
+/// What to check when a Postgres database did not open: the server, the
+/// sign-in and the connection limit. Shared by every sentence about a failed
+/// open of a database, so `doctor` says the same as the other commands.
+pub fn database_open_advice() -> &'static str {
+    "Check that the Postgres server is running and this machine can reach it, that the user and password in the database URL are right, and that the server has a free connection (its max_connections); run this again once it answers."
 }
 
 /// Acquire ownership of the index by taking the advisory lock, with stale
@@ -3759,7 +3821,7 @@ mod tests {
     #[test]
     fn a_silent_holder_is_named_with_its_pid_and_a_remedy() {
         let raw = "Locking error: File is locked by another process";
-        let words = words_for_holder(Some(4242), "/tmp/index.db", raw, false);
+        let words = words_for_holder(Some(4242), &file_at_tmp(), raw, false);
         assert!(words.contains("(pid 4242)"), "{words}");
         assert!(words.contains("/tmp/index.db"), "{words}");
         assert!(words.contains("crystalline doctor --fix"), "{words}");
@@ -3772,7 +3834,7 @@ mod tests {
     #[test]
     fn a_bypassed_holder_is_told_to_drop_the_override() {
         let raw = "Locking error: File is locked by another process";
-        let words = words_for_holder(Some(77), "/tmp/index.db", raw, true);
+        let words = words_for_holder(Some(77), &file_at_tmp(), raw, true);
         assert!(words.contains("(pid 77)"), "{words}");
         assert!(words.contains("--db or --config"), "{words}");
         assert!(
@@ -3788,7 +3850,7 @@ mod tests {
     #[test]
     fn with_no_daemon_the_absence_is_stated() {
         let raw = "unable to open database file";
-        let words = words_for_holder(None, "/tmp/index.db", raw, false);
+        let words = words_for_holder(None, &file_at_tmp(), raw, false);
         assert!(!words.contains("pid"), "{words}");
         assert!(
             words.contains("no Crystalline daemon is running"),
@@ -3796,6 +3858,48 @@ mod tests {
         );
         assert!(words.contains("crystalline doctor --fix"), "{words}");
         assert_error_is_only_the_tail(&words, raw);
+    }
+
+    /// The file location the sentences in these tests name.
+    fn file_at_tmp() -> IndexLocation {
+        IndexLocation::File("/tmp/index.db".to_string())
+    }
+
+    /// A Postgres database that did not open (here: out of connections) is
+    /// no file: the words name the database and the checks that fit it, the
+    /// server, the sign-in and the connection limit, and none of the file
+    /// advice. The raw error stays the tail.
+    #[test]
+    fn a_database_that_did_not_open_gets_database_advice() {
+        let raw = "error returned from database: sorry, too many clients already";
+        let place =
+            IndexLocation::Database("db.internal:5432/crystalline, schema team_a".to_string());
+        let words = words_for_holder(None, &place, raw, false);
+        assert!(
+            words.contains("the database db.internal:5432/crystalline, schema team_a"),
+            "{words}"
+        );
+        assert!(words.contains("Postgres server is running"), "{words}");
+        assert!(words.contains("user and password"), "{words}");
+        assert!(words.contains("max_connections"), "{words}");
+        assert!(!words.contains("file is readable"), "{words}");
+        assert!(!words.contains("doctor --fix"), "{words}");
+        assert!(words.ends_with(raw), "{words}");
+        let bypassed = words_for_holder(Some(9), &place, raw, true);
+        assert!(
+            bypassed.contains("read that database directly"),
+            "{bypassed}"
+        );
+    }
+
+    /// The file wording is the one it was, word for word.
+    #[test]
+    fn a_file_that_did_not_open_keeps_the_file_advice() {
+        let raw = "unable to open database file";
+        assert_eq!(
+            words_for_holder(None, &file_at_tmp(), raw, false),
+            "the index at /tmp/index.db could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: unable to open database file"
+        );
     }
 
     /// A newer schema is not a holder problem: whoever holds the lock, the
@@ -3806,7 +3910,7 @@ mod tests {
         let raw = "this index was upgraded by a newer Crystalline (schema v16, this binary knows v15). \
                    This copy is out of date.";
         for holder in [None, Some(4242)] {
-            let words = words_for_holder(holder, "/tmp/index.db", raw, false);
+            let words = words_for_holder(holder, &file_at_tmp(), raw, false);
             assert!(words.ends_with(raw), "{words}");
             assert!(!words.contains("doctor --fix"), "{words}");
             assert!(!words.contains("ctl shutdown"), "{words}");

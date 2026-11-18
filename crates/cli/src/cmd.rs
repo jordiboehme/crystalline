@@ -168,12 +168,9 @@ pub(crate) async fn reach_index(
         return Ok(IndexRoute::Absent(db));
     }
     // Postgres has no local file, so naming one in a failure would point at a
-    // path nothing lives at.
-    let location = if turso {
-        db.display().to_string()
-    } else {
-        "the configured database".to_string()
-    };
+    // path nothing lives at, and its advice would send a person to the wrong
+    // place.
+    let location = crystalline_service::instance::IndexLocation::of(cfg, &db);
     // On Postgres the database is claimed for this command first, or refused
     // with the owner's name when another instance has it (spec section L); a
     // read-only report never opens it there. A read hands the refusal on as
