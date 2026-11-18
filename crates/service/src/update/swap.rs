@@ -1,0 +1,499 @@
+//! The tar.gz update on Unix (S12): the one member that holds the binary is
+//! extracted into a file the updater creates in the exe's own folder, the
+//! new binary is checked (its macOS code signature, then its `--version`),
+//! and a plain `rename` puts it over the canonical exe. The old binary is
+//! never written in place, which on macOS would break its code signature
+//! for every process that still runs it; a failed rename leaves it as it
+//! was, byte for byte.
+//!
+//! Under `sudo` (S5) only the download, the checks and the swap run; the
+//! caller skips `update finish`, so root never touches the person's daemon.
+
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use crystalline_core::update::{Checks, LatestRelease};
+use crystalline_core::version::Precedence;
+
+use super::client::UpdateError;
+use super::codesign::codesign_ok;
+use super::now::fetch_verified;
+use super::spawn::Spawner;
+
+/// The name prefix of the file a run extracts the new binary into, followed
+/// by the run's process id. Hidden, and never a name anything runs.
+pub const NEW_PREFIX: &str = ".crystalline-new-";
+
+/// The largest binary an archive member may unpack to.
+const MAX_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Whether this process runs under `sudo`: effective user id 0 with
+/// `SUDO_UID` naming the person who ran it (S5). Root itself running `sudo`
+/// (`SUDO_UID` 0) is no person to hand anything back to.
+pub fn under_sudo(euid: u32, sudo_uid: Option<&str>) -> bool {
+    euid == 0
+        && sudo_uid
+            .and_then(|uid| uid.trim().parse::<u32>().ok())
+            .is_some_and(|uid| uid != 0)
+}
+
+/// Whether this process may create and rename files in the folder of
+/// `canonical_exe`, checked with the effective user id. The swap needs the
+/// folder, not the exe, to be writable.
+pub fn writable_install_dir(canonical_exe: &Path) -> bool {
+    let Some(dir) = canonical_exe.parent() else {
+        return false;
+    };
+    writable(dir)
+}
+
+#[cfg(unix)]
+fn writable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string that outlives the
+    // call; faccessat only reads it.
+    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0 }
+}
+
+#[cfg(not(unix))]
+fn writable(_dir: &Path) -> bool {
+    false
+}
+
+/// Whether the folder of `canonical_exe` belongs to root, so `sudo
+/// crystalline update now` is the way to update it.
+pub fn root_owned_install_dir(canonical_exe: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        canonical_exe
+            .parent()
+            .and_then(|dir| std::fs::metadata(dir).ok())
+            .is_some_and(|meta| meta.uid() == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = canonical_exe;
+        false
+    }
+}
+
+/// Extract exactly `member` of the gzip-compressed tar `archive` into a new
+/// file `into/.crystalline-new-<pid>`, mode 0755, and hand back its path.
+/// Nothing else of the archive is ever written: every other entry, a
+/// `../` path among them, is read past. The member must be one plain file
+/// and appear once; a link, a folder, a second copy or no copy at all is
+/// [`UpdateError::NoMember`]. The file is created new (never an existing
+/// one opened) and removed again on any failure.
+pub fn extract_member(archive: &Path, member: &str, into: &Path) -> Result<PathBuf, UpdateError> {
+    let target = into.join(format!("{NEW_PREFIX}{}", std::process::id()));
+    let result = extract_into(archive, member, &target);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&target);
+    }
+    result.map(|()| target)
+}
+
+fn extract_into(archive: &Path, member: &str, target: &Path) -> Result<(), UpdateError> {
+    let file = File::open(archive).map_err(UpdateError::Extract)?;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut found = false;
+    for entry in tar.entries().map_err(UpdateError::Extract)? {
+        let entry = entry.map_err(UpdateError::Extract)?;
+        if entry.path_bytes().as_ref() != member.as_bytes() {
+            continue;
+        }
+        if found || !entry.header().entry_type().is_file() {
+            return Err(UpdateError::NoMember);
+        }
+        found = true;
+        let mut out = create_new_executable(target).map_err(UpdateError::Extract)?;
+        let copied = std::io::copy(&mut entry.take(MAX_BINARY_BYTES + 1), &mut out)
+            .map_err(UpdateError::Extract)?;
+        if copied > MAX_BINARY_BYTES {
+            return Err(UpdateError::TooLarge);
+        }
+        out.sync_all().map_err(UpdateError::Extract)?;
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(UpdateError::NoMember)
+    }
+}
+
+/// A new file at `path`, mode 0755 on Unix; an existing file is an error.
+fn create_new_executable(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o755);
+    }
+    options.open(path)
+}
+
+/// Remove the files an interrupted run left in `dir` under [`NEW_PREFIX`].
+/// Call it under the update lock.
+pub fn remove_new_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(NEW_PREFIX))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether `bin --version` names exactly `want`: its first line must be
+/// `crystalline <want>`, as clap prints it before the copyright lines.
+pub fn version_matches(
+    spawner: &dyn Spawner,
+    bin: &Path,
+    want: &Precedence,
+) -> Result<(), UpdateError> {
+    let program = bin.to_str().ok_or(UpdateError::VersionMismatch)?;
+    let printed = spawner
+        .output(program, &["--version"])
+        .map_err(|_| UpdateError::VersionMismatch)?;
+    let expected = format!("crystalline {}", want.render());
+    if printed.lines().next().map(str::trim_end) == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err(UpdateError::VersionMismatch)
+    }
+}
+
+/// Put `new` over `canonical_exe` with one plain `rename`. On an error the
+/// new file is removed and the old exe is untouched.
+pub fn swap(new: &Path, canonical_exe: &Path) -> Result<(), UpdateError> {
+    std::fs::rename(new, canonical_exe).map_err(|err| {
+        let _ = std::fs::remove_file(new);
+        UpdateError::Swap(err)
+    })
+}
+
+/// Give `new` the owner of `canonical_exe` when this process runs as root,
+/// so a `sudo` update never leaves a root-owned binary in a folder that
+/// belongs to someone else.
+fn match_owner(new: &Path, canonical_exe: &Path) -> Result<(), UpdateError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid takes no arguments, cannot fail and touches no
+        // memory.
+        if unsafe { libc::geteuid() } == 0 {
+            let old = std::fs::metadata(canonical_exe).map_err(UpdateError::Swap)?;
+            std::os::unix::fs::chown(new, Some(old.uid()), Some(old.gid()))
+                .map_err(UpdateError::Swap)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (new, canonical_exe);
+    }
+    Ok(())
+}
+
+/// The arguments the old binary runs the new one with once it is in place
+/// (S4).
+pub const FINISH_ARGS: [&str; 2] = ["update", "finish"];
+
+/// Run `<canonical_exe> update finish`, the new binary now in place, with
+/// the terminal's input and output, and hand back its exit code. Never
+/// under `sudo` (S5): the caller skips it there.
+pub fn finish_after_swap(spawner: &dyn Spawner, canonical_exe: &Path) -> std::io::Result<i32> {
+    spawner.run(&canonical_exe.to_string_lossy(), &FINISH_ARGS)
+}
+
+/// The tar.gz update after the lock and the lookup: download and verify
+/// `asset` of `release` into `download_dir` ([`fetch_verified`]), extract
+/// `member` beside `canonical_exe`, check its code signature when
+/// `check_codesign` (macOS), check its `--version` against the release,
+/// then [`swap`]. Leftovers of an interrupted run in the exe's folder are
+/// removed first; call it under the update lock. On any failure the old
+/// exe is untouched and the extracted file is gone.
+///
+/// On success the checks that ran.
+pub async fn install_tarball(
+    spawner: &dyn Spawner,
+    release: &LatestRelease,
+    asset: &str,
+    member: &str,
+    download_dir: &Path,
+    canonical_exe: &Path,
+    check_codesign: bool,
+) -> Result<Checks, UpdateError> {
+    let exe_dir = canonical_exe
+        .parent()
+        .ok_or_else(|| UpdateError::Swap(std::io::Error::other("the binary has no folder")))?;
+    remove_new_leftovers(exe_dir);
+    let (archive, mut checks) = fetch_verified(release, asset, download_dir).await?;
+    let new = extract_member(&archive, member, exe_dir)?;
+    let mut check_and_swap = || -> Result<(), UpdateError> {
+        if check_codesign {
+            codesign_ok(spawner, &new)?;
+            checks.codesign = true;
+        }
+        version_matches(spawner, &new, &release.version)?;
+        checks.version = true;
+        match_owner(&new, canonical_exe)?;
+        swap(&new, canonical_exe)
+    };
+    if let Err(err) = check_and_swap() {
+        let _ = std::fs::remove_file(&new);
+        return Err(err);
+    }
+    Ok(checks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::update::spawn::Scripted;
+
+    /// A gzip-compressed tar of `entries`: (path, body, kind).
+    fn archive(dir: &Path, entries: &[(&str, &[u8], tar::EntryType)]) -> PathBuf {
+        let path = dir.join("release.tar.gz");
+        let gz = flate2::write::GzEncoder::new(
+            File::create(&path).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(gz);
+        for (name, body, kind) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*kind);
+            header.set_size(if kind.is_file() { body.len() as u64 } else { 0 });
+            header.set_mode(0o644);
+            if kind.is_symlink() {
+                header.set_link_name("/bin/sh").unwrap();
+            }
+            // `append_data` refuses `..`, so the name goes in by hand, as a
+            // hostile archive would carry it.
+            let bytes = name.as_bytes();
+            header.as_old_mut().name[..bytes.len()].copy_from_slice(bytes);
+            header.set_cksum();
+            let body: &[u8] = if kind.is_file() { body } else { &[] };
+            builder.append(&header, body).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    const MEMBER: &str = "crystalline-v0.34.0-linux-amd64/crystalline";
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn extracts_only_the_named_member() {
+        let work = tempfile::tempdir().unwrap();
+        let src = work.path().join("src");
+        let into = work.path().join("bin");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&into).unwrap();
+        let regular = tar::EntryType::Regular;
+        let archive = archive(
+            &src,
+            &[
+                ("../evil", b"escaped", regular),
+                (
+                    "crystalline-v0.34.0-linux-amd64/",
+                    b"",
+                    tar::EntryType::Directory,
+                ),
+                (
+                    "crystalline-v0.34.0-linux-amd64/README",
+                    b"read me",
+                    regular,
+                ),
+                (MEMBER, b"the new binary", regular),
+                ("crystalline", b"a binary at the top", regular),
+            ],
+        );
+        let new = extract_member(&archive, MEMBER, &into).unwrap();
+        assert_eq!(
+            new,
+            into.join(format!("{NEW_PREFIX}{}", std::process::id()))
+        );
+        assert_eq!(std::fs::read(&new).unwrap(), b"the new binary");
+        assert_eq!(
+            files_in(&into),
+            vec![format!("{NEW_PREFIX}{}", std::process::id())],
+            "only the one file appears in the target folder"
+        );
+        assert_eq!(files_in(&src), vec!["release.tar.gz"]);
+        assert_eq!(files_in(work.path()), vec!["bin", "src"], "nothing escaped");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&new).unwrap().permissions().mode() & 0o777;
+            // The umask can only take bits away.
+            assert_eq!(mode & !0o755, 0, "{mode:o}");
+            assert_eq!(mode & 0o700, 0o700, "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_missing_twice_or_linked_member_is_refused_and_leaves_nothing() {
+        let work = tempfile::tempdir().unwrap();
+        let regular = tar::EntryType::Regular;
+        let cases: [&[(&str, &[u8], tar::EntryType)]; 3] = [
+            &[("crystalline", b"not the member", regular)],
+            &[(MEMBER, b"one", regular), (MEMBER, b"two", regular)],
+            &[(MEMBER, b"", tar::EntryType::Symlink)],
+        ];
+        for (at, entries) in cases.iter().enumerate() {
+            let src = work.path().join(format!("src{at}"));
+            let into = work.path().join(format!("bin{at}"));
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::create_dir_all(&into).unwrap();
+            let archive = archive(&src, entries);
+            let err = extract_member(&archive, MEMBER, &into).unwrap_err();
+            assert!(matches!(err, UpdateError::NoMember), "case {at}: {err}");
+            assert!(
+                files_in(&into).is_empty(),
+                "case {at}: {:?}",
+                files_in(&into)
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_target_file_is_never_opened() {
+        let work = tempfile::tempdir().unwrap();
+        let archive = archive(
+            work.path(),
+            &[(MEMBER, b"the new binary", tar::EntryType::Regular)],
+        );
+        let into = work.path().join("bin");
+        std::fs::create_dir_all(&into).unwrap();
+        let planted = into.join(format!("{NEW_PREFIX}{}", std::process::id()));
+        std::fs::write(&planted, b"planted").unwrap();
+        assert!(extract_member(&archive, MEMBER, &into).is_err());
+        remove_new_leftovers(&into);
+        assert!(files_in(&into).is_empty());
+        extract_member(&archive, MEMBER, &into).unwrap();
+    }
+
+    /// A read-only folder after the extract: the rename fails, and the old
+    /// exe keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rename_keeps_the_old_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root writes into a read-only folder, so there is no failure
+            // to see.
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let archive = archive(
+            work.path(),
+            &[(MEMBER, b"the new binary", tar::EntryType::Regular)],
+        );
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("crystalline");
+        std::fs::write(&exe, b"the old binary").unwrap();
+        let new = extract_member(&archive, MEMBER, &bin).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = swap(&new, &exe).unwrap_err();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, UpdateError::Swap(_)), "{err}");
+        assert!(
+            err.to_string().starts_with("cannot replace the binary: "),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&exe).unwrap(), b"the old binary");
+    }
+
+    #[test]
+    fn a_rename_puts_the_new_binary_in_place() {
+        let work = tempfile::tempdir().unwrap();
+        let exe = work.path().join("crystalline");
+        std::fs::write(&exe, b"the old binary").unwrap();
+        let new = work.path().join(format!("{NEW_PREFIX}1"));
+        std::fs::write(&new, b"the new binary").unwrap();
+        swap(&new, &exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"the new binary");
+        assert!(!new.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_folder_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let exe = work.path().join("crystalline");
+        std::fs::write(&exe, b"bin").unwrap();
+        assert!(writable_install_dir(&exe));
+        assert!(!root_owned_install_dir(&exe));
+        std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = writable_install_dir(&exe);
+        std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!writable);
+        assert!(root_owned_install_dir(Path::new("/usr/bin/true")));
+    }
+
+    fn v(text: &str) -> Precedence {
+        Precedence::parse(text).unwrap()
+    }
+
+    #[test]
+    fn version_mismatch_refuses_the_swap() {
+        let bin = Path::new("/install/.crystalline-new-7");
+        for printed in [
+            "crystalline 0.33.0\nCopyright\n",
+            "crystalline 0.34.0-rc.1\n",
+            "crystalline 0.34.00\n",
+            "Crystalline 0.34.0\n",
+            "",
+        ] {
+            let spawner = Scripted::new(|_, _| Ok(printed.to_string()));
+            let err = version_matches(&spawner, bin, &v("0.34.0")).unwrap_err();
+            assert!(matches!(err, UpdateError::VersionMismatch), "{printed:?}");
+            assert_eq!(
+                spawner.calls(),
+                vec!["/install/.crystalline-new-7 --version"],
+                "{printed:?}"
+            );
+        }
+        let failing = Scripted::new(|_, _| Err(std::io::Error::other("exit 1")));
+        assert!(version_matches(&failing, bin, &v("0.34.0")).is_err());
+        let good =
+            Scripted::new(|_, _| Ok("crystalline 0.34.0\nCopyright (c) Jordi\n".to_string()));
+        version_matches(&good, bin, &v("0.34.0")).unwrap();
+    }
+
+    #[test]
+    fn the_sudo_rule_needs_root_and_a_person() {
+        assert!(under_sudo(0, Some("501")));
+        assert!(!under_sudo(0, None));
+        assert!(!under_sudo(0, Some("0")));
+        assert!(!under_sudo(0, Some("")));
+        assert!(!under_sudo(0, Some("someone")));
+        assert!(!under_sudo(501, Some("501")));
+    }
+}

@@ -777,7 +777,7 @@ pub(crate) async fn try_attach_displacing_in(
 /// an older one costs nothing, and the newer one spawned in its place would
 /// only wait as a standby itself, or refuse when autostarted. The client
 /// gets the standby's refusal instead.
-fn displaces(
+pub(crate) fn displaces(
     facts: &HolderFacts,
     own_version: &str,
     here: &crate::runs_in::PackageContext,
@@ -1110,7 +1110,7 @@ const DISPLACE_WAITS: DisplaceWaits = DisplaceWaits {
 /// shutdown can no longer linger (see [`crate::daemon::Departure`]), but a
 /// daemon being displaced is by definition an older one, and nothing but a
 /// signal reaches it once it stops listening.
-async fn displace(sock: &Path, pid: u32) -> bool {
+pub(crate) async fn displace(sock: &Path, pid: u32) -> bool {
     displace_within(sock, pid, &DISPLACE_WAITS).await
 }
 
@@ -1969,15 +1969,7 @@ pub async fn dislodge_unresponsive() -> anyhow::Result<DislodgeOutcome> {
 /// another client already spawned wins the ownership race and this call's
 /// own spawn exits at once (the 2026-07-28 wedge logic there covers that).
 pub async fn attach_after_displacement(displaced: Option<StartOptions>) -> Option<Connection> {
-    let current = crate::overlay::EnvOverlay::from_process_env()
-        .map(|overlay| overlay_variable_names(&overlay));
-    let plan = successor_plan(
-        displaced.as_ref(),
-        current.as_ref().map(Vec::as_slice),
-        |name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
-        std::env::current_exe().is_ok_and(|exe| in_desktop_extension_folder(&exe)),
-    );
-    let options = match plan {
+    let options = match successor_plan_here(displaced.as_ref()) {
         SuccessorPlan::Spawn(options) => options,
         SuccessorPlan::Wait { why, budget } => {
             tracing::warn!(
@@ -1993,6 +1985,19 @@ pub async fn attach_after_displacement(displaced: Option<StartOptions>) -> Optio
             None
         }
     }
+}
+
+/// [`successor_plan`] for this process: its environment, its overlay
+/// variables and where its binary lies.
+pub(crate) fn successor_plan_here(displaced: Option<&StartOptions>) -> SuccessorPlan {
+    let current = crate::overlay::EnvOverlay::from_process_env()
+        .map(|overlay| overlay_variable_names(&overlay));
+    successor_plan(
+        displaced,
+        current.as_ref().map(Vec::as_slice),
+        |name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+        std::env::current_exe().is_ok_and(|exe| in_desktop_extension_folder(&exe)),
+    )
 }
 
 /// What a displacing client does about the successor.

@@ -14,12 +14,14 @@ use anyhow::Context;
 use crystalline_core::time::{self, Stamp};
 use crystalline_core::update::{
     CheckOutcome, Checks, Detection, FAILED_REASON, Gate, InstallMethod, LatestRelease, Lookup,
-    Refusal, UPDATE_CACHE_FILE, UpdateCache, age_gate, asset_name, display_path,
+    Refusal, UPDATE_CACHE_FILE, UpdateCache, age_gate, archive_member, asset_name, display_path,
 };
 use crystalline_core::version::{Precedence, release_tag, release_version};
+use crystalline_service::update::swap::finish_after_swap;
 use crystalline_service::update::{
-    Spawner, SystemSpawner, UpdateError, download_dir, fetch_verified, latest_release,
-    remove_older_tags, take_lock,
+    Handover, Spawner, SystemSpawner, UpdateError, download_dir, fetch_verified, hand_over,
+    install_tarball, latest_release, remove_older_tags, root_owned_install_dir, take_lock,
+    under_sudo, writable_install_dir,
 };
 use serde::{Serialize, Serializer};
 
@@ -435,6 +437,12 @@ pub(crate) struct NowContext<'a> {
     pub(crate) ask: &'a (dyn Fn(&str) -> bool + Sync),
     /// The effective user id on Unix, `None` elsewhere.
     pub(crate) euid: Option<u32>,
+    /// Whether this run is under `sudo` ([`under_sudo`]): then `cache_dir`
+    /// is a fresh folder of root's, and the daemon is never touched (S5).
+    pub(crate) sudo: bool,
+    /// The canonical exe the detection spoke for: the one file a tar.gz
+    /// update replaces.
+    pub(crate) exe: Option<PathBuf>,
     /// When the run started.
     pub(crate) now: Stamp,
 }
@@ -454,12 +462,23 @@ pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
     if let Some(refusal) = refusal_of(&detection) {
         anyhow::bail!(refused_line(&refusal));
     }
+    let euid = effective_uid();
+    let sudo = euid.is_some_and(|euid| under_sudo(euid, std::env::var("SUDO_UID").ok().as_deref()));
     let min_age_hours = crystalline_service::config_for_report(None)
         .await?
         .effective
         .update_min_age_hours();
-    let cache_dir =
-        crystalline_core::config::cache_dir().context("no cache folder to download into")?;
+    // Under sudo the person's cache folder is never written: the lock and
+    // the download go to a fresh folder of root's (S5).
+    let cache_dir = if sudo {
+        tempfile::Builder::new()
+            .prefix("crystalline-update-")
+            .tempdir()
+            .context("no temporary folder to download into")?
+            .keep()
+    } else {
+        crystalline_core::config::cache_dir().context("no cache folder to download into")?
+    };
     let check_cache = crystalline_core::config::state_dir()
         .ok()
         .and_then(|dir| crystalline_service::update::read_cache(&dir.join(UPDATE_CACHE_FILE)));
@@ -474,13 +493,46 @@ pub(crate) async fn now(yes: bool, ignore_age: bool) -> anyhow::Result<()> {
         brew: brew_program(detected.exe.as_deref()),
         terminal,
         ask: &ask_at_terminal,
-        euid: effective_uid(),
+        euid,
+        sudo,
+        exe: detected.exe,
         now: time::now(),
     };
-    match run_now(&context, yes, ignore_age).await? {
+    let result = run_now(&context, yes, ignore_age).await;
+    // The folder of a sudo run goes, but for a .deb: the printed apt
+    // command points into it.
+    if sudo && detection.method != InstallMethod::Deb {
+        let _ = std::fs::remove_dir_all(&context.cache_dir);
+    }
+    match result? {
         0 => Ok(()),
         code => Err(ExitWith(code).into()),
     }
+}
+
+/// Why a tar.gz install cannot be updated in place, before anything is
+/// downloaded: its folder is not writable for this process. The text names
+/// the folder and the manual steps, and, for a folder of root's, `sudo
+/// crystalline update now`. `None` when the swap can go ahead.
+pub(crate) fn tarball_refusal(exe: Option<&Path>, euid: Option<u32>) -> Option<String> {
+    let exe = exe?;
+    if writable_install_dir(exe) {
+        return None;
+    }
+    let dir = exe.parent().unwrap_or(exe);
+    let by_hand = format!(
+        "take crystalline from the tar.gz of the newest release ({RELEASES_URL}/latest) and move it over {}.",
+        display_path(exe)
+    );
+    let next = if root_owned_install_dir(exe) && euid != Some(0) {
+        format!("Run sudo crystalline update now, or update by hand: {by_hand}")
+    } else {
+        format!("Update by hand: {by_hand}")
+    };
+    Some(format!(
+        "update now does nothing: you cannot write to {}. {next}",
+        display_path(dir)
+    ))
 }
 
 /// [`now`] once its parts are known: the lock, the lookup and the action.
@@ -492,6 +544,13 @@ pub(crate) async fn run_now(
 ) -> anyhow::Result<u8> {
     if let Some(refusal) = refusal_of(&context.detection) {
         anyhow::bail!(refused_line(&refusal));
+    }
+    // On Unix a tar.gz folder that is not writable is refused before any
+    // request or file too.
+    if context.detection.method == InstallMethod::Tarball
+        && let Some(refusal) = tarball_refusal(context.exe.as_deref(), context.euid)
+    {
+        anyhow::bail!(refusal);
     }
     let _lock = take_lock(&context.cache_dir)?;
     // A fresh lookup without the cached ETag: a "not modified" carries no
@@ -576,11 +635,36 @@ pub(crate) async fn act(
             println!("{}", checks_line(&checks, &release.tag));
             println!("Downloaded: {}", display_path(&path));
             if method == InstallMethod::Deb {
-                print!("{}", apt_steps(&dir, &asset, context.euid));
+                print!("{}", apt_steps(&dir, &asset, context.euid, context.sudo));
             }
             Ok(0)
         }
-        InstallMethod::Tarball => anyhow::bail!("the tar.gz update is not available yet"),
+        InstallMethod::Tarball => {
+            let exe = context
+                .exe
+                .as_deref()
+                .with_context(|| refused_line(&Refusal::Unknown))?;
+            let asset = asset_name(method, &release.version).ok_or(UpdateError::NoAsset)?;
+            let member = archive_member(&release.version).ok_or(UpdateError::NoAsset)?;
+            let dir = download_dir(&context.cache_dir, &release.tag);
+            let checks = install_tarball(
+                context.spawner,
+                release,
+                &asset,
+                &member,
+                &dir,
+                exe,
+                cfg!(target_os = "macos"),
+            )
+            .await?;
+            println!("{}", checks_line(&checks, &release.tag));
+            println!(
+                "Replaced {} with {}.",
+                display_path(exe),
+                release.version.render()
+            );
+            after_swap(context.spawner, exe, context.sudo)
+        }
         InstallMethod::Docker | InstallMethod::Mcpb | InstallMethod::Unknown => {
             anyhow::bail!(refused_line(&Refusal::Unknown))
         }
@@ -631,6 +715,88 @@ pub(crate) fn brew_upgrade(
     }
 }
 
+/// What a tar.gz update says under `sudo` instead of running `update
+/// finish` (S5).
+pub(crate) const SUDO_LEAVES_THE_DAEMON: &str =
+    "Under sudo the daemon is not touched: run `crystalline status` as yourself.";
+
+/// After the swap: under `sudo` only [`SUDO_LEAVES_THE_DAEMON`]; else run
+/// `<exe> update finish`, which hands the daemon over (S4). Hands back the
+/// exit code; a failed `update finish` is an error that says the binary is
+/// in place.
+pub(crate) fn after_swap(spawner: &dyn Spawner, exe: &Path, sudo: bool) -> anyhow::Result<u8> {
+    if sudo {
+        println!("{SUDO_LEAVES_THE_DAEMON}");
+        return Ok(0);
+    }
+    println!("Running: {} update finish", display_path(exe));
+    let code = finish_after_swap(spawner, exe)
+        .context("the binary is updated, but update finish could not be started")?;
+    if code != 0 {
+        anyhow::bail!(
+            "the binary is updated, but update finish failed (exit code {code}): run crystalline status to hand the daemon over"
+        );
+    }
+    Ok(0)
+}
+
+/// `crystalline update finish`, run by the old binary as `<new> update
+/// finish` right after a tar.gz swap (S4): hand the daemon over to this
+/// binary through the existing displacement path, then refresh the
+/// installed hooks and skills ([`crate::install::auto_reconcile`]). Under
+/// `sudo` it does nothing but say so.
+pub(crate) async fn finish() -> anyhow::Result<()> {
+    let sudo = effective_uid()
+        .is_some_and(|euid| under_sudo(euid, std::env::var("SUDO_UID").ok().as_deref()));
+    if sudo {
+        println!("{SUDO_LEAVES_THE_DAEMON}");
+        return Ok(());
+    }
+    let handover = hand_over().await;
+    let own = env!("CARGO_PKG_VERSION");
+    let line = handover_line(&handover, own);
+    let failed = matches!(
+        handover,
+        Handover::StillRunning { .. } | Handover::NoSuccessor { .. }
+    );
+    if !failed {
+        println!("{line}");
+    }
+    if handover != Handover::Packaged {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        for notice in crate::install::auto_reconcile(own, &cwd) {
+            println!("{notice}");
+        }
+        println!("{RECONCILE_SCOPE}");
+    }
+    if failed {
+        anyhow::bail!(line);
+    }
+    Ok(())
+}
+
+/// What `update finish` says about the hooks and skills it refreshed.
+pub(crate) const RECONCILE_SCOPE: &str = "Refreshed the installed hooks and skills for user scope and for this folder's project only; other projects refresh when a session starts in them.";
+
+/// The line `update finish` prints for `handover`, this binary at `own`.
+pub(crate) fn handover_line(handover: &Handover, own: &str) -> String {
+    match handover {
+        Handover::Packaged => "Inside an app package the daemon is never handed over: run `crystalline status` in a normal terminal.".to_string(),
+        Handover::NoDaemon => format!("No daemon is running; the next one starts with {own}."),
+        Handover::NotOlder { version } => format!("The daemon already runs {version}."),
+        Handover::Kept { version, why } => format!(
+            "The daemon ({version}) was left running, because it cannot be started again from here the way it ran: {why}."
+        ),
+        Handover::StillRunning { version } => format!(
+            "the daemon ({version}) did not stop when asked and still runs: run crystalline status to try again"
+        ),
+        Handover::HandedOver { from } => format!("Handed the daemon over from {from} to {own}."),
+        Handover::NoSuccessor { from } => format!(
+            "the daemon ({from}) stopped, but the new one did not start: run crystalline status to start it"
+        ),
+    }
+}
+
 /// The `brew` of the Homebrew this binary was installed by: `<prefix>/bin/brew`
 /// when the canonical exe lies under `<prefix>/Cellar/` and that file is
 /// there, so an agent's shell or a service without Homebrew on its `PATH`
@@ -676,8 +842,16 @@ pub(crate) fn checks_line(checks: &Checks, tag: &str) -> String {
 
 /// The apt steps for a verified .deb in `dir`: change into the folder, then
 /// `sudo apt install ./<deb>`, without `sudo` when already root (`euid` 0).
-/// `update now` never runs them.
-pub(crate) fn apt_steps(dir: &Path, deb: &str, euid: Option<u32>) -> String {
+/// Under `sudo` (`sudo_run`) the person's shell is not root and `dir` is a
+/// folder of root's they cannot change into, so the line keeps `sudo` and
+/// names the package by its full path. `update now` never runs them.
+pub(crate) fn apt_steps(dir: &Path, deb: &str, euid: Option<u32>, sudo_run: bool) -> String {
+    if sudo_run {
+        return format!(
+            "Install it with:\n  sudo apt install {}\n",
+            shell_quoted(&display_path(&dir.join(deb)))
+        );
+    }
     let sudo = if euid == Some(0) { "" } else { "sudo " };
     format!(
         "Install it with:\n  cd {}\n  {sudo}apt install ./{deb}\n",
@@ -1080,6 +1254,8 @@ mod tests {
             terminal,
             ask,
             euid: Some(1000),
+            sudo: false,
+            exe: None,
             now: now(),
         }
     }
@@ -1320,17 +1496,28 @@ mod tests {
         let dir = Path::new("/home/ada/.cache/crystalline/updates/v0.34.0");
         let deb = "crystalline_0.34.0_amd64.deb";
         assert_eq!(
-            apt_steps(dir, deb, Some(1000)),
+            apt_steps(dir, deb, Some(1000), false),
             "Install it with:\n  cd /home/ada/.cache/crystalline/updates/v0.34.0\n  sudo apt install ./crystalline_0.34.0_amd64.deb\n"
         );
         assert_eq!(
-            apt_steps(dir, deb, Some(0)),
+            apt_steps(dir, deb, Some(0), false),
             "Install it with:\n  cd /home/ada/.cache/crystalline/updates/v0.34.0\n  apt install ./crystalline_0.34.0_amd64.deb\n"
         );
         // A folder with a space or a quote stays one word.
         assert_eq!(
-            apt_steps(Path::new("/home/a b/it's"), deb, Some(1000)),
+            apt_steps(Path::new("/home/a b/it's"), deb, Some(1000), false),
             "Install it with:\n  cd '/home/a b/it'\\''s'\n  sudo apt install ./crystalline_0.34.0_amd64.deb\n"
+        );
+        // Under sudo: euid 0, but the person's shell is not root, and the
+        // folder is root's, so the full path and `sudo` stay.
+        assert_eq!(
+            apt_steps(
+                Path::new("/tmp/crystalline-update-x/v0.34.0"),
+                deb,
+                Some(0),
+                true
+            ),
+            "Install it with:\n  sudo apt install /tmp/crystalline-update-x/v0.34.0/crystalline_0.34.0_amd64.deb\n"
         );
     }
 
@@ -1451,6 +1638,128 @@ mod tests {
         assert!(
             !cache.path().join("updates").exists(),
             "no lock and no download folder"
+        );
+    }
+
+    #[test]
+    fn sudo_skips_finish_and_says_so() {
+        let exe = Path::new("/opt/crystalline/crystalline");
+        let spawner = Recording::new(0, Vec::new());
+        assert_eq!(after_swap(&spawner, exe, true).unwrap(), 0);
+        assert!(spawner.calls().is_empty(), "{:?}", spawner.calls());
+        assert_eq!(
+            SUDO_LEAVES_THE_DAEMON,
+            "Under sudo the daemon is not touched: run `crystalline status` as yourself."
+        );
+
+        let spawner = Recording::new(0, Vec::new());
+        assert_eq!(after_swap(&spawner, exe, false).unwrap(), 0);
+        assert_eq!(
+            spawner.calls(),
+            vec!["/opt/crystalline/crystalline update finish"]
+        );
+
+        let failing = Recording::new(3, Vec::new());
+        let err = after_swap(&failing, exe, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the binary is updated, but update finish failed (exit code 3): run crystalline status to hand the daemon over"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_is_not_writable_is_refused_with_the_manual_steps() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let install = tempfile::tempdir().unwrap();
+        let exe = install.path().join("crystalline");
+        std::fs::write(&exe, b"bin").unwrap();
+        assert_eq!(tarball_refusal(Some(&exe), Some(1000)), None);
+        std::fs::set_permissions(install.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let refusal = tarball_refusal(Some(&exe), Some(1000));
+        std::fs::set_permissions(install.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            refusal.unwrap(),
+            format!(
+                "update now does nothing: you cannot write to {}. Update by hand: take crystalline from the tar.gz of the newest release (https://github.com/jordiboehme/crystalline/releases/latest) and move it over {}.",
+                display_path(install.path()),
+                display_path(&exe)
+            )
+        );
+
+        // A folder of root's gets the sudo hint, but not for root itself.
+        let root_owned = Path::new("/usr/bin/true");
+        let refusal = tarball_refusal(Some(root_owned), Some(1000)).unwrap();
+        assert!(
+            refusal.starts_with(
+                "update now does nothing: you cannot write to /usr/bin. Run sudo crystalline update now, or update by hand: "
+            ),
+            "{refusal}"
+        );
+        assert_eq!(tarball_refusal(None, Some(1000)), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_tarball_folder_is_refused_before_the_lock() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let spawner = Recording::new(0, Vec::new());
+        let context = NowContext {
+            cache_dir: cache.path().to_path_buf(),
+            exe: Some(PathBuf::from("/usr/bin/true")),
+            ..ctx(InstallMethod::Tarball, &spawner, false, &never_asked)
+        };
+        let err = run_now(&context, true, true).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("update now does nothing: you cannot write to /usr/bin."),
+            "{err}"
+        );
+        assert!(!cache.path().join("updates").exists(), "no lock, no folder");
+        assert!(spawner.calls().is_empty());
+    }
+
+    #[test]
+    fn update_finish_names_what_it_did_and_why_not() {
+        let own = "0.34.0";
+        let kept = Handover::Kept {
+            version: "0.33.0".to_string(),
+            why: "it read CRYSTALLINE_DATABASE_URL from its environment and that variable is not set here".to_string(),
+        };
+        assert_eq!(
+            handover_line(&kept, own),
+            "The daemon (0.33.0) was left running, because it cannot be started again from here the way it ran: it read CRYSTALLINE_DATABASE_URL from its environment and that variable is not set here."
+        );
+        assert_eq!(
+            handover_line(
+                &Handover::HandedOver {
+                    from: "0.33.0".to_string()
+                },
+                own
+            ),
+            "Handed the daemon over from 0.33.0 to 0.34.0."
+        );
+        assert_eq!(
+            handover_line(&Handover::NoDaemon, own),
+            "No daemon is running; the next one starts with 0.34.0."
+        );
+        assert!(handover_line(&Handover::Packaged, own).contains("never handed over"));
+        assert!(
+            handover_line(
+                &Handover::NoSuccessor {
+                    from: "0.33.0".to_string()
+                },
+                own
+            )
+            .contains("did not start")
         );
     }
 }

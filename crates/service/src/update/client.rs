@@ -91,6 +91,17 @@ pub enum UpdateError {
     NoDigest,
     /// A download failed its verification.
     Verify(crystalline_core::update::VerifyError),
+    /// The binary could not be unpacked from the archive.
+    Extract(std::io::Error),
+    /// The archive does not hold the binary exactly once as a plain file.
+    NoMember,
+    /// The new binary's macOS code signature does not meet the release
+    /// requirement.
+    Codesign,
+    /// The new binary does not print the release's version.
+    VersionMismatch,
+    /// The new binary could not be put over the old one.
+    Swap(std::io::Error),
 }
 
 impl std::fmt::Display for UpdateError {
@@ -116,6 +127,17 @@ impl std::fmt::Display for UpdateError {
             }
             UpdateError::NoDigest => f.write_str("GitHub lists no sha256 digest for the download"),
             UpdateError::Verify(err) => write!(f, "verification failed: {err}"),
+            UpdateError::Extract(err) => write!(f, "cannot unpack the binary: {err}"),
+            UpdateError::NoMember => {
+                f.write_str("the archive does not hold the binary once as a plain file")
+            }
+            UpdateError::Codesign => f.write_str(
+                "the new binary's macOS code signature does not meet the release requirement",
+            ),
+            UpdateError::VersionMismatch => {
+                f.write_str("the new binary does not print the release's version")
+            }
+            UpdateError::Swap(err) => write!(f, "cannot replace the binary: {err}"),
         }
     }
 }
@@ -124,7 +146,10 @@ impl std::error::Error for UpdateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             UpdateError::Http(err) => Some(err),
-            UpdateError::Io(err) | UpdateError::Lock(err) => Some(err),
+            UpdateError::Io(err)
+            | UpdateError::Lock(err)
+            | UpdateError::Extract(err)
+            | UpdateError::Swap(err) => Some(err),
             UpdateError::Verify(err) => Some(err),
             _ => None,
         }

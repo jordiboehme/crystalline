@@ -2572,6 +2572,9 @@ fn run() -> anyhow::Result<()> {
         Some(Command::Update {
             cmd: UpdateCommand::VerifySums { sums, minisig, tag },
         }) => verify_sums(&sums, &minisig, &tag),
+        Some(Command::Update {
+            cmd: UpdateCommand::Finish,
+        }) => on_runtime(update::finish),
         Some(Command::HoldLock {
             secs,
             standalone,
@@ -5930,9 +5933,12 @@ enum UpdateCommand {
     /// Update to the newest stable release, as the install method allows.
     ///
     /// Homebrew: runs `brew upgrade jordiboehme/tap/crystalline`, then
-    /// says whether the version moved. .deb: downloads and verifies the
-    /// package, then prints the apt command; it never runs apt. MSI and zip:
-    /// downloads and verifies, then prints the steps. Every download is
+    /// says whether the version moved. tar.gz: downloads and verifies the
+    /// archive, checks the new binary (its code signature on macOS, then its
+    /// version), puts it in place of this one and hands the daemon over to
+    /// it; under sudo the daemon is not touched. .deb: downloads and verifies
+    /// the package, then prints the apt command; it never runs apt. MSI and
+    /// zip: downloads and verifies, then prints the steps. Every download is
     /// verified first: the digest GitHub lists, the signed SHA256SUMS and
     /// its minisign signature for the release tag.
     ///
@@ -5966,6 +5972,12 @@ enum UpdateCommand {
         #[arg(long)]
         tag: String,
     },
+    /// After a tar.gz update, run by the old binary as the new one: hand
+    /// the daemon over to this binary with its own start options, then
+    /// refresh the installed hooks and skills for user scope and this
+    /// folder's project. Hidden, and not a user step.
+    #[command(hide = true)]
+    Finish,
 }
 
 #[derive(Subcommand, Debug)]

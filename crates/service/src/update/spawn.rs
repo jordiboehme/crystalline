@@ -50,3 +50,55 @@ impl Spawner for SystemSpawner {
             .map_err(|_| std::io::Error::other(format!("{program} printed no text")))
     }
 }
+
+/// A spawner for the tests: every call is recorded as one line (`program
+/// args...`), `run` answers 0 and `output` what `answer` says.
+#[cfg(any(test, feature = "testing"))]
+pub struct Scripted<F> {
+    answer: F,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl<F> Scripted<F>
+where
+    F: Fn(&str, &[&str]) -> std::io::Result<String> + Send + Sync,
+{
+    /// A spawner whose `output` is `answer(program, args)`.
+    pub fn new(answer: F) -> Self {
+        Scripted {
+            answer,
+            calls: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Every call so far, in order.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn record(&self, program: &str, args: &[&str]) {
+        let mut call = vec![program];
+        call.extend_from_slice(args);
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(call.join(" "));
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl<F> Spawner for Scripted<F>
+where
+    F: Fn(&str, &[&str]) -> std::io::Result<String> + Send + Sync,
+{
+    fn run(&self, program: &str, args: &[&str]) -> std::io::Result<i32> {
+        self.record(program, args);
+        Ok(0)
+    }
+
+    fn output(&self, program: &str, args: &[&str]) -> std::io::Result<String> {
+        self.record(program, args);
+        (self.answer)(program, args)
+    }
+}

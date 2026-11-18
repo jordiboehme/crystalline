@@ -17,13 +17,13 @@ const TAG: &str = "v0.34.0";
 const ASSET: &str = "crystalline_0.34.0_amd64.deb";
 const BYTES: &str = "the release package";
 
-fn fixture(name: &str) -> PathBuf {
+pub(super) fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../core/tests/fixtures/update")
         .join(name)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -41,7 +41,7 @@ fn sums_for(asset: &str, bytes: &[u8]) -> String {
 }
 
 /// `data` signed with the fixture test key and `trusted_comment`.
-fn sign(data: &[u8], trusted_comment: &str) -> String {
+pub(super) fn sign(data: &[u8], trusted_comment: &str) -> String {
     let secret = std::fs::read_to_string(fixture("test.key")).unwrap();
     let sk = minisign::SecretKeyBox::from_string(&secret)
         .unwrap()
@@ -105,9 +105,9 @@ fn good_digest() -> Option<String> {
 /// The test key trusted through the debug-only seam while this lives
 /// (with `on`), and never after: dropped also when a test panics, so no
 /// later test in the same process trusts it by accident.
-struct TestKey;
+pub(super) struct TestKey;
 
-fn trust_test_key(on: bool) -> TestKey {
+pub(super) fn trust_test_key(on: bool) -> TestKey {
     // SAFETY: every test that touches the environment holds `ENV`.
     unsafe {
         if on {
@@ -126,7 +126,7 @@ impl Drop for TestKey {
     }
 }
 
-fn files_in(dir: &Path) -> Vec<String> {
+pub(super) fn files_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map(|entries| {
             entries

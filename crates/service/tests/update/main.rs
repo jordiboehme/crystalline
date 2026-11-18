@@ -10,6 +10,7 @@ mod fixture;
 
 mod check;
 mod now;
+mod swap;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
