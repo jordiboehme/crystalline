@@ -1109,3 +1109,192 @@ fn a_compaction_inside_a_subagent_keeps_the_parents_recall_list() {
     assert!(out.status.success());
     assert_eq!(recalled(), serde_json::json!([]));
 }
+
+// --- the session-start update block (S19) -----------------------------------
+
+/// A cache in the isolated state folder whose release is far newer than
+/// this binary and old enough to offer.
+fn seed_update_cache(home: &std::path::Path) {
+    let state = isolated_state_dir(home);
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("update-check.json"),
+        r#"{"v":1,"checked_at":"2026-11-18T08:00:00Z","outcome":{"kind":"release","version":"v99.0.0","published_at":"2026-01-01T00:00:00Z","first_seen":"2026-11-18T08:00:00Z"}}"#,
+    )
+    .unwrap();
+}
+
+/// The session-start block's stamp in the isolated state folder.
+fn notice_stamp(home: &std::path::Path) -> std::path::PathBuf {
+    isolated_state_dir(home).join("update-notice.json")
+}
+
+/// `prompt system` in the prompt fixture under `home`, acting as a tar.gz
+/// install (the debug-only method seam: a test binary is no official
+/// build) with the check `on` or off and nothing suppressing it (CI runs
+/// set `CI`). Returns stdout.
+fn prompt_for_update(home: &std::path::Path, extra: &[&str], stdin: &str, on: bool) -> String {
+    let mut cmd = crystalline();
+    isolate(&mut cmd, home);
+    cmd.env("CRYSTALLINE_TEST_UPDATE_METHOD", "tarball")
+        .env(
+            "CRYSTALLINE_UPDATE_CHECK",
+            if on { "true" } else { "false" },
+        )
+        .env_remove("CI")
+        .env_remove("NO_UPDATE_NOTIFIER");
+    let mut args = vec![
+        "prompt",
+        "system",
+        "--workspace",
+        "workspace",
+        "--config",
+        "config.yaml",
+    ];
+    args.extend_from_slice(extra);
+    let out = cmd
+        .current_dir(fixtures_dir().join("prompt-fixture"))
+        .args(&args)
+        .write_stdin(stdin.to_string())
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The block as the routing payload carries it, for a tar.gz install of
+/// this binary and 99.0.0 in the cache.
+fn expected_block() -> String {
+    format!(
+        "Crystalline 99.0.0 is available (this is {}, tar.gz). Notes: https://github.com/jordiboehme/crystalline/releases/tag/v99.0.0\nTell the user once. If they want it: run crystalline update now --yes. No user here: do nothing.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The agent context of one `prompt system` answer in `format`.
+fn context_of(format: &str, stdout: &str) -> String {
+    let field = |v: &serde_json::Value, path: &[&str]| {
+        let mut v = v;
+        for key in path {
+            v = &v[key];
+        }
+        v.as_str().unwrap_or_default().to_string()
+    };
+    match format {
+        "text" => stdout.to_string(),
+        "json" => {
+            let v: serde_json::Value = serde_json::from_str(stdout).expect("one JSON document");
+            field(&v, &["update"])
+        }
+        other => {
+            let v: serde_json::Value =
+                serde_json::from_str(stdout.trim()).expect("one JSON document");
+            match other {
+                "copilot" => field(&v, &["additionalContext"]),
+                "cursor" => field(&v, &["additional_context"]),
+                _ => field(&v, &["hookSpecificOutput", "additionalContext"]),
+            }
+        }
+    }
+}
+
+/// S19 and S21: with a newer release in the cache and the check on, every
+/// format carries the block once after the routing block and writes the
+/// stamp; the next session start does not repeat it.
+#[test]
+fn the_update_block_shows_once_in_every_format_and_writes_the_stamp() {
+    let block = expected_block();
+    for format in ["text", "json", "copilot", "cursor", "hook-specific"] {
+        let home = tempfile::tempdir().unwrap();
+        seed_update_cache(home.path());
+        let first = prompt_for_update(
+            home.path(),
+            &["--format", format],
+            r#"{"source":"startup"}"#,
+            true,
+        );
+        let context = context_of(format, &first);
+        if format == "json" {
+            assert_eq!(context, block, "{format}: {first}");
+        } else {
+            assert!(context.contains("astronomy"), "{format}: {context}");
+            assert!(
+                context.ends_with(&format!("\n{block}\n")),
+                "{format}: {context}"
+            );
+            assert_eq!(context.matches(&block).count(), 1, "{format}: {context}");
+        }
+        let stamp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(notice_stamp(home.path())).unwrap())
+                .unwrap();
+        assert_eq!(stamp["version"], "99.0.0", "{format}");
+        assert!(stamp.get("held").is_none(), "{format}: {stamp}");
+
+        let again = prompt_for_update(
+            home.path(),
+            &["--format", format],
+            r#"{"source":"startup"}"#,
+            true,
+        );
+        assert!(!again.contains("99.0.0"), "{format}: shown once: {again}");
+    }
+}
+
+/// Inside a subagent nothing is printed and no stamp is written.
+#[test]
+fn no_update_block_and_no_stamp_inside_a_subagent() {
+    let home = tempfile::tempdir().unwrap();
+    seed_update_cache(home.path());
+    let out = prompt_for_update(
+        home.path(),
+        &[],
+        r#"{"source":"startup","agent_id":"a1"}"#,
+        true,
+    );
+    assert!(!out.contains("99.0.0"), "{out}");
+    assert!(!notice_stamp(home.path()).exists());
+}
+
+/// The text format still prints the routing block on a resumed, cleared or
+/// compacted session (Claude Code's matcher filters `resume`); the update
+/// block is never in it, and nothing is stamped.
+#[test]
+fn no_update_block_after_resume_clear_compact_or_fork() {
+    for source in ["resume", "clear", "compact", "fork"] {
+        let home = tempfile::tempdir().unwrap();
+        seed_update_cache(home.path());
+        let out = prompt_for_update(
+            home.path(),
+            &[],
+            &format!(r#"{{"source":"{source}"}}"#),
+            true,
+        );
+        assert!(out.contains("astronomy"), "{source}: {out}");
+        assert!(!out.contains("99.0.0"), "{source}: {out}");
+        assert!(!notice_stamp(home.path()).exists(), "{source}");
+    }
+}
+
+/// Without a block the JSON document has no `update` field: no cache, or a
+/// cache while the check is off (which holds the decision back for an hour
+/// with a held stamp).
+#[test]
+fn json_without_a_block_has_no_update_field() {
+    let home = tempfile::tempdir().unwrap();
+    let out = prompt_for_update(home.path(), &["--json"], "", true);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("update").is_none(), "{out}");
+    assert!(!notice_stamp(home.path()).exists());
+
+    seed_update_cache(home.path());
+    let out = prompt_for_update(home.path(), &["--json"], "", false);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("update").is_none(), "{out}");
+    let stamp: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(notice_stamp(home.path())).unwrap()).unwrap();
+    assert_eq!(stamp["held"], true, "{stamp}");
+    // Turned on within the hour: the held stamp still decides.
+    let out = prompt_for_update(home.path(), &["--json"], "", true);
+    assert!(!out.contains("99.0.0"), "{out}");
+}

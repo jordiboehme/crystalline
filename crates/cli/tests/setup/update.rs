@@ -96,13 +96,13 @@ fn a_release_build_ignores_the_test_key() {
     );
 }
 
-/// S11: the key seam is read in exactly one place, an item compiled only
-/// into debug builds. It lives in core (`update::trusted_keys`), which both
-/// this CLI and the service's update client use, so no crate reads it twice.
-#[test]
-fn the_test_key_seam_is_debug_only() {
+/// The places under the src folders of cli, core and service that read the
+/// variable `name` (`var(` or `var_os(` of it, not `set_var(` or
+/// `remove_var(`), each asserted to sit in an item compiled only into debug
+/// builds.
+fn debug_only_reads(name: &str) -> Vec<String> {
     let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let name = "\"CRYSTALLINE_TEST_UPDATE_KEY\"";
+    let name = format!("\"{name}\"");
     let mut reads = Vec::new();
     for krate in ["cli", "core", "service"] {
         // Every .rs file under src, subfolders included.
@@ -151,12 +151,35 @@ fn the_test_key_seam_is_debug_only() {
             }
         }
     }
+    reads
+}
+
+/// S11: the key seam is read in exactly one place, an item compiled only
+/// into debug builds. It lives in core (`update::trusted_keys`), which both
+/// this CLI and the service's update client use, so no crate reads it twice.
+#[test]
+fn the_test_key_seam_is_debug_only() {
+    let reads = debug_only_reads("CRYSTALLINE_TEST_UPDATE_KEY");
     assert_eq!(
         reads.len(),
         1,
         "the seam is read in exactly one place: {reads:?}"
     );
     assert!(reads[0].starts_with("core: "), "{reads:?}");
+}
+
+/// S11: the install-method seam of the session-start block is read in
+/// exactly one place, an item compiled only into debug builds, so a release
+/// build never offers an update for a method it was not installed by.
+#[test]
+fn the_test_method_seam_is_debug_only() {
+    let reads = debug_only_reads("CRYSTALLINE_TEST_UPDATE_METHOD");
+    assert_eq!(
+        reads.len(),
+        1,
+        "the seam is read in exactly one place: {reads:?}"
+    );
+    assert!(reads[0].starts_with("cli: "), "{reads:?}");
 }
 
 /// A fake GitHub on 127.0.0.1 for `update check`: the API's latest release
