@@ -1237,6 +1237,10 @@ fn the_update_block_shows_once_in_every_format_and_writes_the_stamp() {
             r#"{"source":"startup"}"#,
             true,
         );
+        assert!(
+            again.contains("astronomy"),
+            "{format}: the routing block stays: {again}"
+        );
         assert!(!again.contains("99.0.0"), "{format}: shown once: {again}");
     }
 }

@@ -6481,13 +6481,19 @@ fn run_prompt(
 
     // The update block (spec S19): an update is ready, once per 24 h per
     // version, never in a subagent and only on a fresh start. Decided from
-    // the cache and the stamp before anything else is read.
-    let update_block = update::session_block_here(
-        session_start
-            .as_ref()
-            .is_some_and(SessionStartPayload::in_subagent),
-        session_start.as_ref().and_then(|p| p.source.as_deref()),
-    );
+    // the cache and the stamp before anything else is read. Never for a
+    // person who runs the command at a terminal (a hook runner always pipes
+    // stdin), so a hand run does not use up the day's block.
+    let update_block = (!std::io::stdin().is_terminal())
+        .then(|| {
+            update::session_block_here(
+                session_start
+                    .as_ref()
+                    .is_some_and(SessionStartPayload::in_subagent),
+                session_start.as_ref().and_then(|p| p.source.as_deref()),
+            )
+        })
+        .flatten();
     let update_text = update_block.as_ref().map(|block| block.text.as_str());
 
     // Notices go to stderr in every format, and they go there for the same

@@ -1587,25 +1587,15 @@ pub(crate) fn hint_needs_document(
 /// does not already turn the check off. The default config, also after a
 /// command run with `--config`: the hint is advisory.
 fn settings_for_hint() -> Option<(bool, u32)> {
-    update_settings(None)
-}
-
-/// [`settings_for_hint`]'s read, with the document read given up after
-/// `wait` when one is given (`None` then).
-fn update_settings(wait: Option<std::time::Duration>) -> Option<(bool, u32)> {
     let env = std::env::var("CRYSTALLINE_UPDATE_CHECK").ok();
-    let loaded = crate::on_runtime_value_current_thread(move || async move {
-        let read = crystalline_service::config_for_hint(move |loaded| {
+    let loaded = crate::on_runtime_value_current_thread(move || {
+        crystalline_service::config_for_hint(move |loaded| {
             hint_needs_document(
                 loaded.mode == crystalline_service::overlay::ConfigMode::Document,
                 env.as_deref(),
                 loaded.effective.update_check_enabled(),
             )
-        });
-        match wait {
-            Some(wait) => tokio::time::timeout(wait, read).await.ok().flatten(),
-            None => read.await,
-        }
+        })
     })
     .ok()??;
     Some((
@@ -1721,10 +1711,47 @@ pub(crate) fn session_block(inputs: &BlockInputs) -> Option<String> {
     ))
 }
 
-/// How long the session hook waits for the configuration document in
-/// document mode, read only when every cheaper condition already holds;
-/// the hook runs under a ten second limit beside the routing waits.
+/// How long the session hook waits for the settings, the configuration
+/// document in document mode included, read only when every cheaper
+/// condition already holds; the hook runs under a ten second limit beside
+/// the routing waits.
 const BLOCK_SETTINGS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most the session hook reads of the cache or the stamp file; both are
+/// a few hundred bytes, and a larger file means no block.
+const BLOCK_FILE_LIMIT: u64 = 64 * 1024;
+
+/// The text of `path` when it is at most `limit` bytes, else `None` (also
+/// when it cannot be read).
+fn read_small(path: &Path, limit: u64) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= limit).then_some(text)
+}
+
+/// `read` on a thread of its own, given up after `wait`: a hard limit.
+/// The session hook reads the settings ([`settings_for_hint`]) this way,
+/// since a runtime's drop would otherwise wait for a name lookup still
+/// running on its blocking pool. A thread given up on is left to finish or
+/// to end with the process.
+fn within<T: Send + 'static>(
+    wait: std::time::Duration,
+    read: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("crystalline-update-settings".into())
+        .spawn(move || {
+            let _ = send.send(read());
+        })
+        .ok()?;
+    receive.recv_timeout(wait).ok().flatten()
+}
 
 /// A block the session hook prints, and the stamp it writes once printed.
 pub(crate) struct ShownBlock {
@@ -1760,9 +1787,9 @@ fn write_stamp(path: &Path, stamp: &NoticeStamp) {
 /// every failure.
 pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Option<ShownBlock> {
     let state = crystalline_core::config::state_dir().ok()?;
-    let cache = std::fs::read_to_string(state.join(UPDATE_CACHE_FILE)).ok();
+    let cache = read_small(&state.join(UPDATE_CACHE_FILE), BLOCK_FILE_LIMIT);
     let path = state.join(NOTICE_STAMP_FILE);
-    let stamp = std::fs::read_to_string(&path).ok();
+    let stamp = read_small(&path, BLOCK_FILE_LIMIT);
     let current = this_version();
     let now = time::now();
     let (_, newer) = block_due(
@@ -1784,20 +1811,21 @@ pub(crate) fn session_block_here(in_subagent: bool, source: Option<&str>) -> Opt
         at: now,
         held,
     };
-    let shown = update_settings(Some(BLOCK_SETTINGS_WAIT)).and_then(|(check_on, min_age_hours)| {
-        session_block(&BlockInputs {
-            cache: cache.as_deref(),
-            stamp: stamp.as_deref(),
-            current: &current,
-            detection: &detection,
-            check_on,
-            suppressed,
-            in_subagent,
-            source,
-            now,
-            min_age_hours,
-        })
-    });
+    let shown =
+        within(BLOCK_SETTINGS_WAIT, settings_for_hint).and_then(|(check_on, min_age_hours)| {
+            session_block(&BlockInputs {
+                cache: cache.as_deref(),
+                stamp: stamp.as_deref(),
+                current: &current,
+                detection: &detection,
+                check_on,
+                suppressed,
+                in_subagent,
+                source,
+                now,
+                min_age_hours,
+            })
+        });
     match shown {
         Some(text) => Some(ShownBlock {
             text,
@@ -4138,5 +4166,31 @@ mod tests {
             ..block_inputs(Some(&cache), &current, &tarball)
         };
         assert!(session_block(&inputs).is_some());
+    }
+
+    #[test]
+    fn a_block_file_over_the_limit_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, "abcd").unwrap();
+        assert_eq!(read_small(&path, 4).as_deref(), Some("abcd"));
+        assert_eq!(read_small(&path, 3), None);
+        assert_eq!(read_small(&dir.path().join("missing"), 4), None);
+    }
+
+    /// The settings read stops waiting at its deadline.
+    #[test]
+    fn the_settings_wait_is_a_hard_limit() {
+        let started = std::time::Instant::now();
+        let slow = within(std::time::Duration::from_millis(50), || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Some(1)
+        });
+        assert_eq!(slow, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            within(std::time::Duration::from_secs(5), || Some(2)),
+            Some(2)
+        );
     }
 }
