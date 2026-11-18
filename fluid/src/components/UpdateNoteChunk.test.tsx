@@ -1,10 +1,11 @@
 /**
  * A tab left open across `crystalline update now` still names the old chunk
  * hashes, so the note's chunk may be gone when the chip is chosen. The
- * failure stays in the note's place: the rest of the page is still there.
+ * failure stays in the note's place as one short line with a reload, and
+ * the rest of the page is still there.
  */
 
-import { screen } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -35,7 +36,7 @@ beforeEach(() => {
 });
 
 describe("the update note's chunk", () => {
-  it("a failed chunk draws the reload prompt and keeps the page", async () => {
+  it("a failed chunk draws a short reload line in the note and keeps the page", async () => {
     // React and lazyChunk report the failed import; that is expected here.
     vi.spyOn(console, "error").mockImplementation(() => {});
     apiMock.mockImplementation(
@@ -61,12 +62,41 @@ describe("the update note's chunk", () => {
       }),
     );
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "This part of Fluid could not load.",
-    );
-    expect(screen.getByRole("button", { name: "Ada Lovelace" })).toBeVisible();
+    // The note's place holds one short line and a reload, not the page-wide
+    // prompt.
+    const note = await screen.findByRole("dialog", {
+      name: "Crystalline 0.35.0 available",
+    });
+    expect(note).toHaveTextContent("Reload the page to see the update.");
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+    await user.click(within(note).getByRole("button", { name: "Reload" }));
+    expect(reload).toHaveBeenCalledOnce();
+    vi.unstubAllGlobals();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(
+      screen.queryByText("This part of Fluid could not load.", {
+        exact: false,
+      }),
+    ).toBeNull();
+
+    // The page stays usable, and the chip is still in the menu.
     expect(
       screen.getByRole("heading", { name: "Home", level: 1 }),
+    ).toBeVisible();
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    const avatar = screen.getByRole("button", { name: "Ada Lovelace" });
+    await waitFor(() => {
+      expect(avatar).toHaveFocus();
+    });
+    await user.click(avatar);
+    expect(
+      await screen.findByRole("menuitem", {
+        name: "Crystalline 0.35.0 available",
+      }),
     ).toBeVisible();
   });
 });

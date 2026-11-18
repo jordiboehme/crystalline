@@ -33,6 +33,7 @@ import { useAuth } from "../auth/AuthContext";
 import type AvatarMenuBodyType from "./AvatarMenuBody";
 import { lazyChunk } from "../lazyChunk";
 import { LazyBoundary } from "./LazyBoundary";
+import { UpdateNoteFailed } from "./UpdateNoteShell";
 import { ITEM_CLASSES } from "./menu";
 import { Loading } from "./Loading";
 import { FOCUS_RING, Tooltip } from "./primitives";
@@ -133,7 +134,18 @@ export function AvatarMenu({
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
       {noteFor !== null && (
-        <LazyBoundary fallback={null}>
+        <LazyBoundary
+          fallback={null}
+          failed={
+            <UpdateNoteFailed
+              anchor={triggerRef}
+              available={noteFor}
+              onClose={() => {
+                setNoteFor(null);
+              }}
+            />
+          }
+        >
           <UpdateNote
             anchor={triggerRef}
             current={capabilities.serverVersion}
