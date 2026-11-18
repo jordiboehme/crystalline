@@ -1126,13 +1126,14 @@ fn header(response: &Response, name: &str) -> Option<String> {
 
 /// Resolves a rate limit reset time: `x-ratelimit-reset` is a Unix epoch
 /// timestamp, `retry-after` is a delta in seconds from now. The former is
-/// preferred when both are present.
+/// preferred when both are present. A delta too large for a date is held at
+/// the latest (or, negative, the earliest) instant.
 fn parse_reset(ratelimit_reset: Option<&str>, retry_after: Option<&str>) -> Option<Stamp> {
     if let Some(epoch) = ratelimit_reset.and_then(|value| value.parse::<i64>().ok()) {
         return Stamp::from_unix(epoch, 0);
     }
     let delta = retry_after.and_then(|value| value.parse::<i64>().ok())?;
-    Some(time::now() + time::seconds(delta))
+    Some(time::now().saturating_add(time::saturating_seconds(delta)))
 }
 
 /// Reads a non-2xx response body and extracts a human-readable message: the
@@ -1307,6 +1308,22 @@ mod tests {
     /// GitHub.com's REST base, which `auth_base` maps to `https://github.com`
     /// and `authorized_apps_url` to the page below.
     const API: &str = "https://api.github.com";
+
+    /// A `Retry-After` too large for a date is held at the latest instant,
+    /// and a negative one at the earliest, instead of panicking the request.
+    #[test]
+    fn a_huge_retry_after_is_held_instead_of_panicking() {
+        for huge in ["300000000000", "9223372036854775807"] {
+            assert_eq!(parse_reset(None, Some(huge)), Some(Stamp::LATEST), "{huge}");
+        }
+        assert_eq!(
+            parse_reset(None, Some("-9223372036854775808")),
+            Some(Stamp::EARLIEST)
+        );
+        let soon = parse_reset(None, Some("60")).unwrap();
+        assert!(soon > time::now() && soon < time::now() + time::seconds(120));
+        assert_eq!(parse_reset(None, Some("soon")), None);
+    }
 
     /// The applications page every fallback lands on for [`API`].
     const APPS_PAGE: &str = "https://github.com/settings/connections/applications";

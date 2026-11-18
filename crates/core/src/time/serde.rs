@@ -248,38 +248,46 @@ mod tests {
         maybe_on: Option<String>,
     }
 
-    /// (seconds, UTC date and time, its local form at each nonzero offset
-    /// of [`OFFSETS`]), the bytes chrono's serde wrote, without the
-    /// fraction and the offset.
-    const SECS: [(i64, &str, [&str; 4]); 6] = [
+    /// (seconds, UTC date and time, then each offset of the row with its
+    /// local form there), the bytes chrono's serde wrote, without the
+    /// fraction. Every row names its own offsets, so no row depends on the
+    /// order of another list.
+    /// One offset of a row: its seconds, how it is written and the local
+    /// date and time there.
+    type AtOffset = (i32, &'static str, &'static str);
+
+    const SECS: [(i64, &str, [AtOffset; 5]); 6] = [
         (
             1_767_608_239,
             "2026-01-05T10:17:19",
             [
-                "2026-01-05T12:17:19",
-                "2026-01-05T05:47:19",
-                "2026-01-05T16:02:19",
-                "2026-01-04T11:17:19",
+                (0, "Z", "2026-01-05T10:17:19"),
+                (7200, "+02:00", "2026-01-05T12:17:19"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "2026-01-05T05:47:19"),
+                (5 * 3600 + 45 * 60, "+05:45", "2026-01-05T16:02:19"),
+                (-23 * 3600, "-23:00", "2026-01-04T11:17:19"),
             ],
         ),
         (
             0,
             "1970-01-01T00:00:00",
             [
-                "1970-01-01T02:00:00",
-                "1969-12-31T19:30:00",
-                "1970-01-01T05:45:00",
-                "1969-12-31T01:00:00",
+                (0, "Z", "1970-01-01T00:00:00"),
+                (7200, "+02:00", "1970-01-01T02:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "1969-12-31T19:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "1970-01-01T05:45:00"),
+                (-23 * 3600, "-23:00", "1969-12-31T01:00:00"),
             ],
         ),
         (
             -1,
             "1969-12-31T23:59:59",
             [
-                "1970-01-01T01:59:59",
-                "1969-12-31T19:29:59",
-                "1970-01-01T05:44:59",
-                "1969-12-31T00:59:59",
+                (0, "Z", "1969-12-31T23:59:59"),
+                (7200, "+02:00", "1970-01-01T01:59:59"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "1969-12-31T19:29:59"),
+                (5 * 3600 + 45 * 60, "+05:45", "1970-01-01T05:44:59"),
+                (-23 * 3600, "-23:00", "1969-12-31T00:59:59"),
             ],
         ),
         // jiff's latest whole second (J4: 9999-12-31T23:59:59Z is past it).
@@ -287,10 +295,11 @@ mod tests {
             253_402_207_200,
             "9999-12-30T22:00:00",
             [
-                "9999-12-31T00:00:00",
-                "9999-12-30T17:30:00",
-                "9999-12-31T03:45:00",
-                "9999-12-29T23:00:00",
+                (0, "Z", "9999-12-30T22:00:00"),
+                (7200, "+02:00", "9999-12-31T00:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "9999-12-30T17:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "9999-12-31T03:45:00"),
+                (-23 * 3600, "-23:00", "9999-12-29T23:00:00"),
             ],
         ),
         // 0000-01-02: a day later than the year's first, so every offset
@@ -299,10 +308,11 @@ mod tests {
             -62_167_132_800,
             "0000-01-02T00:00:00",
             [
-                "0000-01-02T02:00:00",
-                "0000-01-01T19:30:00",
-                "0000-01-02T05:45:00",
-                "0000-01-01T01:00:00",
+                (0, "Z", "0000-01-02T00:00:00"),
+                (7200, "+02:00", "0000-01-02T02:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "0000-01-01T19:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "0000-01-02T05:45:00"),
+                (-23 * 3600, "-23:00", "0000-01-01T01:00:00"),
             ],
         ),
         // Leap year day at noon.
@@ -310,10 +320,11 @@ mod tests {
             1_709_208_000,
             "2024-02-29T12:00:00",
             [
-                "2024-02-29T14:00:00",
-                "2024-02-29T07:30:00",
-                "2024-02-29T17:45:00",
-                "2024-02-28T13:00:00",
+                (0, "Z", "2024-02-29T12:00:00"),
+                (7200, "+02:00", "2024-02-29T14:00:00"),
+                (-(4 * 3600 + 30 * 60), "-04:30", "2024-02-29T07:30:00"),
+                (5 * 3600 + 45 * 60, "+05:45", "2024-02-29T17:45:00"),
+                (-23 * 3600, "-23:00", "2024-02-28T13:00:00"),
             ],
         ),
     ];
@@ -328,26 +339,16 @@ mod tests {
         (1, ".000000001"),
     ];
 
-    /// (offset seconds, the offset written for it).
-    const OFFSETS: [(i32, &str); 5] = [
-        (0, "Z"),
-        (7200, "+02:00"),
-        (-(4 * 3600 + 30 * 60), "-04:30"),
-        (5 * 3600 + 45 * 60, "+05:45"),
-        (-23 * 3600, "-23:00"),
-    ];
-
     /// Every value of the matrix with the strings it must be written as.
     fn cases() -> Vec<(Ours, Texts)> {
         let mut out = Vec::new();
         for (secs, utc, locals) in SECS {
             for (nanos, fraction) in NANOS {
-                for (i, (offset, offset_text)) in OFFSETS.into_iter().enumerate() {
+                for (offset, offset_text, local) in locals {
                     let at = Stamp::from_unix(secs, nanos).unwrap();
                     let written = OffsetStamp::at_offset(at, offset).unwrap();
                     let present = nanos != 1;
                     let at_text = format!("{utc}{fraction}Z");
-                    let local = if i == 0 { utc } else { locals[i - 1] };
                     let written_text = format!("{local}{fraction}{offset_text}");
                     let on_text = utc[..10].to_string();
                     out.push((

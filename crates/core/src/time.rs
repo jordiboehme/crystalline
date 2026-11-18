@@ -84,6 +84,12 @@ impl Delta {
     /// The empty span.
     pub const ZERO: Delta = Delta(SignedDuration::ZERO);
 
+    /// The longest span, `i64::MAX` milliseconds (chrono's `TimeDelta::MAX`).
+    pub const MAX: Delta = Delta(SignedDuration::new(DELTA_MAX_SECS, DELTA_MAX_NANOS));
+
+    /// The longest negative span, `-Delta::MAX`.
+    pub const MIN: Delta = Delta(SignedDuration::new(-DELTA_MAX_SECS, -DELTA_MAX_NANOS));
+
     /// `value` when it is within chrono's range, else `None`. jiff keeps
     /// the seconds and the nanoseconds with the same sign.
     const fn bounded(value: SignedDuration) -> Option<Delta> {
@@ -153,6 +159,13 @@ pub const fn millis(n: i64) -> Delta {
 /// outside input, where [`seconds`] would panic.
 pub fn try_seconds(n: i64) -> Option<Delta> {
     Delta::bounded(SignedDuration::from_secs(n))
+}
+
+/// `n` seconds, held at the longest span either way when `n` is out of
+/// range. For a number from outside input that only moves an instant: with
+/// [`Stamp::saturating_add`] it never panics.
+pub fn saturating_seconds(n: i64) -> Delta {
+    try_seconds(n).unwrap_or(if n < 0 { Delta::MIN } else { Delta::MAX })
 }
 
 impl Delta {
@@ -253,6 +266,12 @@ impl Mul<i32> for Delta {
 impl Stamp {
     /// 1970-01-01T00:00:00Z.
     pub const UNIX_EPOCH: Stamp = Stamp(Timestamp::UNIX_EPOCH);
+
+    /// The latest whole second an instant holds: 9999-12-30T22:00:00Z.
+    pub const LATEST: Stamp = Stamp(Timestamp::constant(253_402_207_200, 0));
+
+    /// The earliest whole second an instant holds: -009999-01-02T01:59:59Z.
+    pub const EARLIEST: Stamp = Stamp(Timestamp::MIN);
 
     /// The instant at this UTC date and time of day, or `None` when there is
     /// no such date or time (second 0 to 59) or it is out of range.
@@ -357,6 +376,28 @@ impl Stamp {
     /// This instant moved back by `delta`, or `None` when out of range.
     pub fn checked_sub(self, delta: Delta) -> Option<Stamp> {
         self.0.checked_sub(delta.0).ok().map(Stamp)
+    }
+
+    /// This instant moved forward by `delta`, held at [`Stamp::LATEST`] or
+    /// [`Stamp::EARLIEST`] when that is out of range. For a span from
+    /// outside input (a token lifetime, a `Retry-After`, a setting), where
+    /// `+` would panic.
+    pub fn saturating_add(self, delta: Delta) -> Stamp {
+        self.checked_add(delta).unwrap_or(if delta.0.is_negative() {
+            Stamp::EARLIEST
+        } else {
+            Stamp::LATEST
+        })
+    }
+
+    /// This instant moved back by `delta`, held at [`Stamp::EARLIEST`] or
+    /// [`Stamp::LATEST`] when that is out of range.
+    pub fn saturating_sub(self, delta: Delta) -> Stamp {
+        self.checked_sub(delta).unwrap_or(if delta.0.is_negative() {
+            Stamp::LATEST
+        } else {
+            Stamp::EARLIEST
+        })
     }
 
     /// The span from `earlier` to this instant (negative when `earlier` is
@@ -720,6 +761,18 @@ impl Day {
 /// as `:59`.
 pub fn parse_rfc3339(s: &str) -> Option<OffsetStamp> {
     parse::rfc3339(s).and_then(offset_stamp_from_parts)
+}
+
+/// Whether `s` is an instant by the grammar of [`parse_rfc3339`] that lies
+/// past the latest one an instant holds, so `parse_rfc3339` refuses it:
+/// `9999-12-31T23:59:59Z`. 0.33.0 read such an instant, so a value stored
+/// as "far in the future" then can tell itself apart from one nobody can
+/// read.
+pub fn rfc3339_past_latest(s: &str) -> bool {
+    let Some(parts) = parse::rfc3339(s) else {
+        return false;
+    };
+    date_from_parts(&parts).is_some() && offset_stamp_from_parts(parts).is_none()
 }
 
 /// An instant as chrono's `FromStr` and `Deserialize` for `DateTime<Utc>`
@@ -1819,5 +1872,61 @@ mod tests {
         assert!(day.saturating_sub_days(i64::MIN) > day);
         assert!(day.saturating_sub_days(-(20000 * 366)) > day);
         assert_eq!(day.saturating_sub_days(i64::MIN), Day(Date::MAX));
+    }
+
+    #[test]
+    fn saturating_moves_stop_at_the_ends_instead_of_panicking() {
+        let now = base(0);
+        // Inside the range nothing is held.
+        assert_eq!(now.saturating_add(seconds(60)), now + seconds(60));
+        assert_eq!(now.saturating_sub(seconds(60)), now - seconds(60));
+        // The longest span either way, and past it.
+        assert_eq!(saturating_seconds(DELTA_MAX_SECS), seconds(DELTA_MAX_SECS));
+        for n in [DELTA_MAX_SECS, DELTA_MAX_SECS + 1, i64::MAX] {
+            let span = saturating_seconds(n);
+            if n > DELTA_MAX_SECS {
+                assert_eq!(span, Delta::MAX, "{n}");
+            }
+            assert_eq!(now.saturating_add(span), Stamp::LATEST, "{n}");
+            assert_eq!(now.saturating_sub(span), Stamp::EARLIEST, "{n}");
+            assert_eq!(now.saturating_add(-span), Stamp::EARLIEST, "{n}");
+            assert_eq!(now.saturating_sub(-span), Stamp::LATEST, "{n}");
+        }
+        assert_eq!(saturating_seconds(i64::MIN), Delta::MIN);
+        assert_eq!(saturating_seconds(-DELTA_MAX_SECS - 1), Delta::MIN);
+        // A span that only just crosses the latest instant from now.
+        let left = Stamp::LATEST.since(now).num_seconds();
+        assert_eq!(now.saturating_add(seconds(left)), Stamp::LATEST);
+        assert_eq!(now.saturating_add(seconds(left + 1)), Stamp::LATEST);
+        assert_eq!(Stamp::LATEST.rfc3339(), "9999-12-30T22:00:00+00:00");
+        assert_eq!(
+            parse_rfc3339(&Stamp::LATEST.rfc3339()).map(|at| at.stamp()),
+            Some(Stamp::LATEST)
+        );
+        assert_eq!(Stamp::EARLIEST.checked_sub(seconds(1)), None);
+    }
+
+    #[test]
+    fn an_instant_past_the_latest_is_told_apart_from_one_nobody_can_read() {
+        for past in [
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T00:00:00Z",
+            "9999-12-30T22:00:01Z",
+            "9999-12-31T01:00:00+02:00",
+        ] {
+            assert_eq!(parse_rfc3339(past), None, "{past}");
+            assert!(rfc3339_past_latest(past), "{past}");
+        }
+        for not_past in [
+            "9999-12-30T22:00:00Z",
+            "2026-01-05T10:17:19Z",
+            "never",
+            "",
+            "9999-12-32T00:00:00Z",
+            "9999-12-31T24:00:00Z",
+            "9999-12-31",
+        ] {
+            assert!(!rfc3339_past_latest(not_past), "{not_past}");
+        }
     }
 }

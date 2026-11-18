@@ -218,15 +218,17 @@ pub struct Join {
 /// presented. An instant that cannot be parsed reads as already over, which is
 /// the rule the store itself redeems by - a grant nobody can date is one
 /// nobody may work inside - and is unreachable from a redeemed grant, since
-/// that check has already refused it.
+/// that check has already refused it. An instant past the latest one a date
+/// holds is far in the future, as the store reads it too, and so is a window
+/// too long for this process's clock: both read as no window at all.
 pub fn grant_deadline(expires_at: Option<&str>) -> Option<Instant> {
     let at = expires_at?;
     let now = Instant::now();
     let Some(at) = time::parse_rfc3339(at) else {
-        return Some(now);
+        return (!time::rfc3339_past_latest(at)).then_some(now);
     };
     let left = at.stamp().since(time::now());
-    Some(now + left.to_std().unwrap_or(Duration::ZERO))
+    now.checked_add(left.to_std().unwrap_or(Duration::ZERO))
 }
 
 /// The later of two link windows, where `None` is a link with no window.
@@ -549,6 +551,25 @@ impl Joins {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deadline reads a link's window as the store does: past the
+    /// latest instant a date holds is no window at all, an instant nobody
+    /// can read is over now, a near one is a deadline ahead.
+    #[test]
+    fn a_far_future_expiry_is_no_deadline() {
+        assert_eq!(grant_deadline(None), None);
+        assert_eq!(grant_deadline(Some("9999-12-31T23:59:59Z")), None);
+        let before = Instant::now();
+        let over = grant_deadline(Some("never")).unwrap();
+        assert!(over >= before && over <= Instant::now());
+        let past = grant_deadline(Some("2001-01-01T00:00:00Z")).unwrap();
+        assert!(past <= Instant::now());
+        let soon = (time::now() + time::hours(1)).rfc3339();
+        let ahead = grant_deadline(Some(&soon)).unwrap();
+        assert!(ahead > Instant::now() + Duration::from_secs(3000));
+        // The latest instant itself is a window the clock may not reach.
+        let _ = grant_deadline(Some("9999-12-30T22:00:00Z"));
+    }
 
     fn browser(name: &str) -> Holder {
         Holder::Browser(format!("csrf-{name}"))

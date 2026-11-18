@@ -328,13 +328,18 @@ const CONTEXT_MAX_ITERATIONS: usize = 50;
 const CONTEXT_TOLERANCE: f64 = 1e-10;
 
 /// Read a positive-integer seconds value from an environment variable, falling
-/// back to `default` when unset, empty, unparseable or non-positive.
+/// back to `default` when unset, empty, unparseable or non-positive, and held
+/// at [`crystalline_index::MAX_ENV_SECS`] above it, so no instant computed
+/// from it leaves the range a date can hold.
 fn env_secs(key: &str, default: i64) -> i64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
+    env_secs_from(std::env::var(key).ok().as_deref(), default)
+}
+
+/// [`env_secs`] for the variable's value `raw`.
+fn env_secs_from(raw: Option<&str>, default: i64) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(default)
+        .map_or(default, |n| n.min(crystalline_index::MAX_ENV_SECS))
 }
 
 /// An error from an engine operation, mapped to actionable tool errors.
@@ -12879,6 +12884,29 @@ impl ReindexHooks for DaemonReindexHooks<'_> {
     /// domain's lock.
     fn walker(&self) -> Option<String> {
         self.collab.then(|| self.engine.instance_id.clone())
+    }
+}
+
+#[cfg(test)]
+mod env_secs_tests {
+    use super::*;
+
+    /// A seconds setting from the environment is held at 100 years, so the
+    /// stale and heartbeat windows built from it never panic.
+    #[test]
+    fn a_huge_seconds_setting_is_held_and_its_window_never_panics() {
+        assert_eq!(env_secs_from(None, 30), 30);
+        assert_eq!(env_secs_from(Some("x"), 30), 30);
+        assert_eq!(env_secs_from(Some("0"), 30), 30);
+        assert_eq!(env_secs_from(Some("45"), 30), 45);
+        for raw in ["300000000000", "9223372036854775807"] {
+            let secs = env_secs_from(Some(raw), 30);
+            assert_eq!(secs, crystalline_index::MAX_ENV_SECS, "{raw}");
+            let stale_before = (time::now() - time::seconds(secs)).rfc3339();
+            assert!(stale_before < time::now().rfc3339(), "{raw}");
+            let fresh = (2 * secs).min(secs / 2);
+            assert!(time::now().checked_sub(time::seconds(fresh)).is_some());
+        }
     }
 }
 
