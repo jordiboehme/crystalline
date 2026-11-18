@@ -10,7 +10,7 @@ Crystalline is an MCP server with a background daemon, a CLI and a web UI in one
 |---|---|---|
 | Runs a language model | No. The only models are small local ones that generate no text: an embedding model for search vectors and, while `evolve.contradictions` is on, a classifier that reads two lines and scores whether they contradict | Yes, through its provider |
 | Sends data to an LLM provider | No, unless you set a remote embedding endpoint (see below) | Yes, including everything Crystalline returns to it |
-| Runs shell commands | No. There is no shell or exec tool. The only processes it starts are its own daemon, the `crystalline` on the PATH (a version check during install) and the harness CLIs (`claude`, `codex`, `copilot`, or `gh copilot` as the fallback) during install, uninstall and provisioning | Yes, under its own permission rules |
+| Runs shell commands | No. There is no shell or exec tool. The only processes it starts are its own daemon, the `crystalline` on the PATH (a version check during install) and the harness CLIs (`claude`, `codex`, `copilot`, or `gh copilot` as the fallback) during install, uninstall and provisioning. `crystalline update now`, which only you or an agent in a shell runs, also starts `brew upgrade` and `brew --prefix` on a Homebrew install (after a yes or `--yes`), and on a tar.gz install `/usr/bin/codesign` (macOS), the new binary's `--version` and its `update finish` | Yes, under its own permission rules |
 | Reads files | Files in registered domain folders, its own config, state and model folders, and the harness settings during install and uninstall | Whatever its permissions allow |
 | Network | See [Outbound connections](#outbound-connections) | Its provider, and whatever its tools reach |
 
@@ -36,7 +36,9 @@ One connection happens by default. Every other one exists only after you turn it
 - **A PostgreSQL server** (opt-in). With `database.backend: postgres` and `database.url`, the search index lives in that database, and the index holds engram text. These keys are set with `crystalline config set` or their environment variables; no agent can change them, and the change applies at the next daemon start. The accounts, sessions and tokens live in the same database, and so do the settings and the domain registry, with `config.yaml` as a read-only base. A secret set with `crystalline config set` is stored there in plain text. One active instance owns it at a time; see [Run on PostgreSQL](deployment.md#run-on-postgresql).
 - **A connected Crystalline server** (opt-in). After `crystalline connect <url>`, or with `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` set, the daemon talks to that server with your token for it. A call for one of the server's domains goes to that server only, with what the call carries (for a write, the engram text). A search over all domains also sends the search text to every connected server. Your local engrams are never sent there. A small cache of each server's routing text and maintenance status stays on this machine. Sources are not in the settings registry, so an agent cannot add one with the `configure` tool. See [A local Crystalline with domains from shared servers](deployment.md#a-local-crystalline-with-domains-from-shared-servers).
 
-Nothing else. There is no telemetry and no update check.
+- **GitHub, for the update check** (opt-in, `update.check`, off by default). With the check on, the daemon sends one request a day, `GET https://api.github.com/repos/jordiboehme/crystalline/releases/latest`; after a failed request it tries again after four hours. The request carries no token and no cookie: `CRYSTALLINE_GITHUB_TOKEN` and the keychain are never read for it. It sends the User-Agent `crystalline/<version>` and, after the first answer, the ETag GitHub gave back (`If-None-Match`), which only saves bandwidth. With the check on, GitHub sees your address and the version once a day, nothing else. When the API answers with its rate limit, the lookup sends a second request, `HEAD https://github.com/jordiboehme/crystalline/releases/latest`, and reads the tag from its redirect. A proxy is taken from `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` only. The check never runs with `NO_UPDATE_NOTIFIER` or `CI` set, in Docker or in the Claude Desktop-only bundle, and the key is an operator setting, so an agent cannot turn it on with the `configure` tool. `crystalline update check` and `crystalline update now` make the same lookup when you run them, whatever the setting says, and `update now` then downloads the release files from `github.com` (which redirects to GitHub's download host). See [Updating](deployment.md#updating).
+
+Nothing else. There is no telemetry.
 
 ## A GitHub App and its tokens
 
@@ -120,7 +122,10 @@ On macOS and Linux the `XDG_*` variables move these folders. On Windows, config 
   - `tmp/`, the daemon's scratch folder;
   - `origins/`, the state of team domains (with the recorded ids of each repository connected through a GitHub App), and `origins/github-token.json` (plus `origins/github-token-personal-<name>.json` for personal GitHub identities and linked GitHub accounts, and `origins/github-app.json` for a GitHub App) only when the OS keychain cannot be used (on Windows these files get no extra access restriction; on macOS and Linux they are readable by the owner only). A GitHub App saved in the keychain leaves `origins/github-app.present`, which holds only the GitHub host;
   - `overlays/`, the review-mode drafts;
-  - `instance-id`, `installs.json` and `hooks/maintenance.json`.
+  - `instance-id`, `installs.json` and `hooks/maintenance.json`;
+  - `update-check.json`, the last result of the update check (written by the daemon's check and by `crystalline update check`), and `update-hint.json` and `update-notice.json`, which remember when the stderr hint and the session-start block last named a version.
+
+  The cache folder (`~/.cache/crystalline`, on Windows `%LOCALAPPDATA%\crystalline`) holds, beside the model cache, `updates/` with the files `crystalline update now` downloaded and verified, one folder per release tag, and its lock file.
 
   On macOS and Linux the state folder is readable by its owner only (mode `0700`), and so are both databases with their `-wal` and `-shm` files and `daemon.log` (mode `0600`). The daemon sets these modes when it starts, so an older install is tightened on its first start after an upgrade. On Windows nothing is changed.
 - The GitHub tokens and a saved GitHub App are otherwise kept in the OS keychain (Credential Manager on Windows). An App from the `CRYSTALLINE_GITHUB_APP_*` variables is never written down, and the App's installation tokens are kept in memory only.
@@ -148,6 +153,30 @@ sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 On macOS the command is `shasum -a 256 -c SHA256SUMS --ignore-missing`. On Windows, run `Get-FileHash <file>` in PowerShell and compare the hash with the line in `SHA256SUMS` by hand.
+
+Since 0.34.0, `SHA256SUMS.minisig` is a minisign signature over `SHA256SUMS`. Its trusted comment names the release tag, for example `tag:v0.34.0`, so an old signature cannot pass for a new release. Two public keys are built into Crystalline, and a signature by either one is accepted:
+
+- the online key, which the release workflow signs with (`crates/core/src/update/keys/online.pub`, key ID `AC457F93DB463C6F`):
+
+  ```
+  RWRvPEbbk39FrPS6oJA1keoQXJx9cF7aI8k9m6JcK2eFUyKIIxAYmfJC
+  ```
+
+- the offline key, kept off GitHub by the maintainer for a key rotation (`crates/core/src/update/keys/offline.pub`, key ID `3E3AEE836F215E0C`):
+
+  ```
+  RWQMXiFvg+46PrA7BssVKUH1T/ibuk7rN1eGcLPhGWgizLaUgC2QclPK
+  ```
+
+Check the signature by hand with [minisign](https://jedisct1.github.io/minisign/), with both files in the current folder, then check that the trusted comment it prints names the tag you downloaded:
+
+```sh
+minisign -Vm SHA256SUMS -P RWRvPEbbk39FrPS6oJA1keoQXJx9cF7aI8k9m6JcK2eFUyKIIxAYmfJC
+```
+
+`-p online.pub` reads the same key from the file in the repository. `crystalline update now` runs these checks itself before it uses a download (see [Updating](deployment.md#updating)): the digest GitHub lists for the file, the file's line in `SHA256SUMS`, the signature with the tag, and on macOS the code signature of the new binary. The release workflow checks the signature with the freshly built binary before it publishes anything, so a broken key stops the release and not the next update.
+
+What the signature protects: a file that was changed after the release was built, on GitHub or on the way to you, and an old release offered as the newest one. What it does not protect: anything that was built from the repository itself, such as a malicious change merged on main, because the workflow signs what it built. See [Known gaps](#known-gaps).
 
 Since 0.21.2, every release asset, `SHA256SUMS` included, has a build provenance attestation. It proves that the file was built by this repository's release workflow from the tagged commit. Verify it with the GitHub CLI. `gh` must be signed in (`gh auth login`) for this and for the `gh release verify` commands below; offline, download the attestation with `gh attestation download` and pass it with `--bundle`.
 
@@ -199,5 +228,7 @@ Crystalline is licensed under the Mozilla Public License 2.0 (see [LICENSE](../L
 - There is no server-side allowlist of tools and no read-only flag per local domain. Read-only is daemon-wide.
 - There is no encryption at rest and no built-in TLS.
 - The builds are not reproducible.
+- The release signature does not protect against a malicious change on main: the release workflow signs whatever it built from the tagged commit.
+- A leaked signing key cannot be revoked in binaries that are already installed. They accept a signature by that key until they are updated. The rule for a rotation: when the online key leaks or is lost, the next release is signed by hand with the offline key, and it builds in the offline key and a new online key and drops the old one. Both keys are never changed in the same release.
 
 These are tracked, and a report about any of them is welcome (see [SECURITY.md](../SECURITY.md)).
