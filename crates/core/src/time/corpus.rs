@@ -3,13 +3,13 @@
 //! and the serde adapters' inputs, each with what every parser makes of
 //! it, as literal strings.
 //!
-//! Written while chrono was still in the build: the differential test
-//! (`crates/core/tests/it/time_differential.rs`, which includes this file)
-//! held every row against chrono, with only the differences a ruling
-//! allows (J4: a leap second read as `:59`, a year outside 0000 to 9999
-//! refused). Without chrono, `time::tests::corpus_holds` keeps the parsers
-//! and the bytes the serde adapters write to these rows, and
-//! `time::tests::print_corpus` prints them again.
+//! Written while chrono was still in the build: a differential test held
+//! every row against chrono, with only the differences a ruling allows
+//! (J4: a leap second read as `:59`, a year outside 0000 to 9999 refused),
+//! so each row's strings are chrono's answer. chrono has left the build
+//! since; `time::tests::corpus_holds` keeps the parsers and the bytes the
+//! serde adapters write to these rows, and `time::tests::print_corpus`
+//! prints them again.
 
 /// What each parser makes of one input: the RFC 3339 bytes (`%Y-%m-%d`
 /// for a date) of the value it read, or `None` when it refuses the input.

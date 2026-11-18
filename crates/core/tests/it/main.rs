@@ -24,6 +24,5 @@ mod roundtrip;
 mod schema;
 mod structure;
 mod time_boundary;
-mod time_differential;
 mod translate;
 mod verify_smoke;

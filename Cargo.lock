@@ -1443,7 +1443,6 @@ name = "crystalline-core"
 version = "0.33.0"
 dependencies = [
  "anyhow",
- "chrono",
  "etcetera",
  "globset",
  "hmac 0.13.0",

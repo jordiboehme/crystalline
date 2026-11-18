@@ -2,9 +2,9 @@
 //! out. Nothing here knows a date library; `time.rs` turns the numbers into
 //! a value.
 //!
-//! Each grammar reproduces one chrono parser exactly, quirks included, and
-//! the differential test in `crates/core/tests/it/time_differential.rs`
-//! holds them to that:
+//! Each grammar reproduces one chrono parser of 0.33 exactly, quirks
+//! included. A differential test held them to that while chrono was in the
+//! build; the frozen corpus (`corpus.rs`) holds them to its answers now:
 //!
 //! - [`rfc3339`] for `DateTime::parse_from_rfc3339`
 //! - [`lenient`] for `FromStr` (and so serde's `Deserialize`) for

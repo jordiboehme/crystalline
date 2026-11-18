@@ -1,4 +1,0 @@
-# Files outside crystalline_core::time that still name chrono or use the
-# chrono bridge (from_chrono, into_chrono). Each crate's move onto
-# crystalline_core::time removes its lines; the list goes away with chrono
-# itself. Read by crates/core/tests/it/time_boundary.rs.

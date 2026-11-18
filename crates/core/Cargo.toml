@@ -46,9 +46,6 @@ libc = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_System_Com", "Win32_UI_Shell"] }
 
 [dev-dependencies]
-# The differential test reads every date grammar against chrono until
-# chrono leaves the build.
-chrono = { workspace = true, features = ["serde"] }
 minisign = { workspace = true }
 insta = { workspace = true }
 tempfile = { workspace = true }
