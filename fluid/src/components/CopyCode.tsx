@@ -8,21 +8,11 @@
  * again.
  */
 
-import { useSaid } from "./useSaid";
+import { copyText, useSaid } from "./useSaid";
 import { FOCUS_RING } from "./primitives";
 
 export default function CopyCode({ text }: { text: string }) {
   const [said, say] = useSaid();
-  const copy = () => {
-    void navigator.clipboard.writeText(text).then(
-      () => {
-        say("Copied");
-      },
-      () => {
-        say("Could not copy");
-      },
-    );
-  };
   return (
     <div
       data-anchor-skip=""
@@ -34,7 +24,9 @@ export default function CopyCode({ text }: { text: string }) {
       <button
         type="button"
         aria-label="Copy code"
-        onClick={copy}
+        onClick={() => {
+          copyText(text, say);
+        }}
         className={`rounded px-1 text-ink-3 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 hover:text-ink focus-visible:opacity-100 ${FOCUS_RING}`}
       >
         Copy

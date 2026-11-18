@@ -1231,6 +1231,18 @@ pub struct MeResponse {
     /// The server version, so a mismatched UI can say so.
     #[schema(example = "0.12.0")]
     version: &'static str,
+    /// A newer stable release this server's daily update check found, as
+    /// `major.minor.patch`, or null.
+    ///
+    /// Only an admin is told, by the same check the admin routes use; every
+    /// other caller gets null. Null as well when the check is off, its last
+    /// run failed or is more than 48 hours old, the release is younger than
+    /// `update.min_age_hours`, the version is not newer or not a stable
+    /// release, the build is not an official one, or `crystalline update now`
+    /// would not act for how this server was installed. Read-only: nothing
+    /// on this surface updates the server.
+    #[schema(example = "0.35.0")]
+    update_available: Option<String>,
 }
 
 /// Exchange credentials for a session: sets [`SESSION_COOKIE`] and returns the
@@ -2029,7 +2041,9 @@ pub async fn logout(
                    whether this session may drive the share surfaces \
                    (`can_share`: an admin always, an editor when \
                    `github.share_identity` is `personal`, the default with a GitHub App), and \
-                   which server version it is talking to. Also issues the CSRF token \
+                   which server version it is talking to, and, for an \
+                   admin only, a newer release the server's update check \
+                   found (`update_available`). Also issues the CSRF token \
                    every later mutating request must echo in `x-csrf-token`: a \
                    cookie session has its token reissued here, and an \
                    identity a proxy asserts (`auth.trusted_header` or \
@@ -2131,6 +2145,14 @@ pub async fn me(
         // A refused App refuses every share of a person. An admin keeps the
         // surface, because that is where the App's reason is read and fixed.
         && (identity.require_admin().is_ok() || !state.engine.github_app_refuses_shares());
+    // An admin alone is told about an update: the admin routes' own check,
+    // with no other exception, since only someone who can run a command on
+    // the server can act on it.
+    let update_available = if identity.require_admin().is_ok() {
+        state.update_available()
+    } else {
+        None
+    };
     Ok((
         jar,
         no_store(),
@@ -2151,6 +2173,7 @@ pub async fn me(
             // right now, which is what "serves OAuth" has to mean here.
             oauth: state.oauth.is_some(),
             version: crystalline_core::VERSION,
+            update_available,
         }),
     ))
 }

@@ -1584,6 +1584,19 @@ export type MeResponse = {
      * Whether this instance refuses content mutations.
      */
     read_only: boolean;
+    /**
+     * A newer stable release this server's daily update check found, as
+     * `major.minor.patch`, or null.
+     *
+     * Only an admin is told, by the same check the admin routes use; every
+     * other caller gets null. Null as well when the check is off, its last
+     * run failed or is more than 48 hours old, the release is younger than
+     * `update.min_age_hours`, the version is not newer or not a stable
+     * release, the build is not an official one, or `crystalline update now`
+     * would not act for how this server was installed. Read-only: nothing
+     * on this surface updates the server.
+     */
+    update_available?: string | null;
     user?: User | null;
     /**
      * The server version, so a mismatched UI can say so.

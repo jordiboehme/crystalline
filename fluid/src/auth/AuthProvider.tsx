@@ -34,6 +34,7 @@ import { ServerDown } from "../components/ServerDown";
 import { AuthContext } from "./AuthContext";
 import type { AuthValue, Capabilities } from "./AuthContext";
 import { LOGIN_MUTATION_KEY, ME_QUERY_KEY, SETUP_MUTATION_KEY } from "./keys";
+import { updateAvailableOf } from "./updateNote";
 
 /**
  * Run the probe, and hand the token it carries to the client on the way past.
@@ -71,6 +72,7 @@ function capabilitiesOf(me: MeResponse | undefined): Capabilities {
     // takes: an instance too old to say has never served it.
     oauth: me?.oauth ?? false,
     serverVersion: me?.version ?? "",
+    updateAvailable: updateAvailableOf(me?.update_available),
   };
 }
 

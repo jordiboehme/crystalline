@@ -534,6 +534,7 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
         auth.clone(),
         None,
         None,
+        None,
     )
     .unwrap();
     tokio::spawn(async move {
