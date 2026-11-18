@@ -8,6 +8,7 @@
 pub mod cache;
 pub mod facts;
 pub mod install;
+pub mod offer;
 pub mod release;
 pub mod verify;
 
@@ -20,6 +21,7 @@ pub use install::{
     CHANNEL_ENV, DetectedInstall, Detection, InstallMethod, MARKER_FILE, Refusal, archive_member,
     asset_name, detect, display_path, official_build, release_platform,
 };
+pub use offer::{offer, offer_stale_after};
 pub use release::{LatestRelease, Lookup};
 pub use verify::{Checks, Sha256Digest, SignedSums, VerifyError, verify_digest, verify_signature};
 

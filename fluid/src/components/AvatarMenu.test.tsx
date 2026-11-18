@@ -14,7 +14,10 @@ vi.mock("./AvatarMenuBody", () => {
 });
 
 vi.mock("../auth/AuthContext", () => ({
-  useAuth: () => ({ user: { display: "Ada Lovelace", name: "ada" } }),
+  useAuth: () => ({
+    user: { display: "Ada Lovelace", name: "ada" },
+    capabilities: { updateAvailable: null, serverVersion: "0.34.0" },
+  }),
 }));
 
 afterEach(() => {

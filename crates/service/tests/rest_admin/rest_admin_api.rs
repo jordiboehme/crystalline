@@ -14,12 +14,12 @@ use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
     AuthConfig, DatabaseBackend, DatabaseConfig, DomainEntry, GitHubConfig, GlobalConfig,
-    OidcConfig, OriginConfig, ResponseFormat, ServiceConfig,
+    OidcConfig, OriginConfig, ResponseFormat, ServiceConfig, UpdateConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
 use crystalline_service::Engine;
-use crystalline_service::daemon::http_router;
+use crystalline_service::daemon::{http_router, http_router_with_update};
 use crystalline_service::engine::ConnectAuth;
 use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
@@ -82,6 +82,11 @@ struct Options {
     /// trusted header, the public url and the allowed hosts), so the guard
     /// test can look for them in every response.
     operator_markers: bool,
+    /// Turn `update.check` on.
+    update_check: bool,
+    /// The daemon's update facts the probe reads; none by default, as for a
+    /// router with no daemon behind it.
+    update: Option<crystalline_service::rest::UpdateFactsSource>,
 }
 
 struct Fixture {
@@ -192,6 +197,12 @@ async fn serve(opts: Options) -> Fixture {
         public_url: opts.operator_markers.then(|| MARK_PUBLIC_URL.to_string()),
         ..ServiceConfig::default()
     });
+    if opts.update_check {
+        cfg.update = Some(UpdateConfig {
+            check: Some(true),
+            min_age_hours: None,
+        });
+    }
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
@@ -241,13 +252,23 @@ async fn serve(opts: Options) -> Fixture {
         .await
         .unwrap();
 
-    let router = http_router(
-        engine,
-        Arc::new(AtomicUsize::new(0)),
-        &[],
-        auth.clone(),
-        None,
-    )
+    let router = match opts.update {
+        Some(update) => http_router_with_update(
+            engine,
+            Arc::new(AtomicUsize::new(0)),
+            &[],
+            auth.clone(),
+            None,
+            update,
+        ),
+        None => http_router(
+            engine,
+            Arc::new(AtomicUsize::new(0)),
+            &[],
+            auth.clone(),
+            None,
+        ),
+    }
     .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -5761,4 +5782,215 @@ async fn a_person_unlocks_a_locally_locked_team_domain_by_discarding_the_manifes
         "{report}"
     );
     assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), team);
+}
+
+/// An answered cache that found `tag`: checked an hour ago, published three
+/// days ago, so it is fresh and past the default age gate.
+fn update_cache(tag: &str) -> crystalline_core::update::UpdateCache {
+    use crystalline_core::time;
+    let now = time::now();
+    crystalline_core::update::UpdateCache {
+        v: crystalline_core::update::UPDATE_CACHE_FORMAT,
+        checked_at: now.checked_sub(time::hours(1)).unwrap(),
+        outcome: crystalline_core::update::CheckOutcome::Release {
+            version: tag.to_string(),
+            published_at: Some(now.checked_sub(time::hours(72)).unwrap()),
+            first_seen: now.checked_sub(time::hours(2)).unwrap(),
+        },
+        etag: None,
+        last_release: None,
+    }
+}
+
+/// Update facts with everything open, as an official tarball install with
+/// the check on would answer them, for whichever setting it is asked with.
+fn open_update_facts(tag: &str) -> crystalline_service::rest::UpdateFactsSource {
+    use crystalline_core::update::{CheckState, InstallMethod, OffReason, UpdateFacts};
+    let cache = update_cache(tag);
+    Arc::new(move |setting_on| UpdateFacts {
+        method: InstallMethod::Tarball,
+        official: true,
+        refusal: None,
+        check: if setting_on {
+            CheckState::On
+        } else {
+            CheckState::Off(OffReason::NotTurnedOn)
+        },
+        cache: Some(cache.clone()),
+    })
+}
+
+/// `update_available` off the probe, asked as `session` or anonymously.
+async fn update_available(
+    addr: std::net::SocketAddr,
+    session: Option<&(String, String)>,
+) -> serde_json::Value {
+    let request = match session {
+        Some(session) => as_session(addr, reqwest::Method::GET, "/api/v1/auth/me", session),
+        None => client().get(format!("http://{addr}/api/v1/auth/me")),
+    };
+    let me: serde_json::Value = request.send().await.unwrap().json().await.unwrap();
+    let object = me.as_object().expect("the probe is an object");
+    assert!(
+        object.contains_key("update_available"),
+        "the field is always there, null when nothing is offered: {me}"
+    );
+    me["update_available"].clone()
+}
+
+/// Only an admin is told about an available update (S28): an editor, a
+/// viewer and the anonymous viewer get null from the same facts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_update_available_is_admin_only() {
+    let fx = serve(Options {
+        anonymous: true,
+        update_check: true,
+        update: Some(open_update_facts("v0.35.0")),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let vera = login(fx.addr, "vera", "verapw").await;
+    assert_eq!(update_available(fx.addr, Some(&admin)).await, "0.35.0");
+    assert_eq!(
+        update_available(fx.addr, Some(&eddy)).await,
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        update_available(fx.addr, Some(&vera)).await,
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        update_available(fx.addr, None).await,
+        serde_json::Value::Null,
+        "the anonymous viewer"
+    );
+
+    // The role is read on every request: an editor made admin is told on
+    // her next probe, and told nothing again once demoted, on the same
+    // session.
+    for (role, expected) in [
+        ("admin", serde_json::json!("0.35.0")),
+        ("editor", serde_json::Value::Null),
+    ] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::PATCH,
+            "/api/v1/users/eddy",
+            &admin,
+        )
+        .json(&serde_json::json!({ "role": role }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        assert_eq!(
+            update_available(fx.addr, Some(&eddy)).await,
+            expected,
+            "{role}"
+        );
+    }
+
+    // An agent's MCP token opens no identity on this surface, even the
+    // admin's own.
+    let issued: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/me/mcp-tokens",
+        &admin,
+    )
+    .json(&serde_json::json!({"label": "agent"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let token = issued["token"].as_str().expect("a token is issued");
+    // `resolve` reads only the trusted header, the forwarded headers and the
+    // session cookie, never `Authorization`, and `/auth/me` is a public path,
+    // so the token is ignored: with `auth.anonymous` on this fixture answers
+    // 200 as the anonymous viewer.
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fx.addr))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let me: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(me["user"], serde_json::Value::Null, "{me}");
+    assert_eq!(me["anonymous"], true, "{me}");
+    assert_eq!(me["update_available"], serde_json::Value::Null, "{me}");
+}
+
+/// A router with no daemon behind it names no update, and a daemon's facts
+/// name none while `update.check` is off: the setting is read live on every
+/// probe, not taken from the facts as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_update_available_is_null_without_a_source() {
+    let fx = serve(Options {
+        update_check: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    assert_eq!(
+        update_available(fx.addr, Some(&admin)).await,
+        serde_json::Value::Null
+    );
+
+    let off = serve(Options {
+        update: Some(open_update_facts("v0.35.0")),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(off.addr, "root", "rootpw").await;
+    assert_eq!(
+        update_available(off.addr, Some(&admin)).await,
+        serde_json::Value::Null,
+        "update.check is off"
+    );
+}
+
+/// The daemon's update state loads the cache file at start, so the note is
+/// there without a network call (S31). A test binary is never an official
+/// build, so the facts are taken as an official build's would be; everything
+/// else (the method, the check state, the cache read from the file without
+/// its ETag) is the daemon's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_loads_the_cache_at_start() {
+    use crystalline_core::update::{UPDATE_CACHE_FILE, UpdateFacts};
+    use crystalline_service::update::UpdateState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_path = dir.path().join(UPDATE_CACHE_FILE);
+    let mut cache = update_cache("v0.35.0");
+    cache.etag = Some("\"etag\"".to_string());
+    std::fs::write(&cache_path, serde_json::to_string(&cache).unwrap()).unwrap();
+    let exe = dir.path().join(if cfg!(windows) {
+        "crystalline.exe"
+    } else {
+        "crystalline"
+    });
+    std::fs::write(&exe, "binary").unwrap();
+    let none = |_: &str| None;
+    let state = Arc::new(UpdateState::detect(&exe, &none, Some(cache_path)));
+    let daemon = crystalline_service::daemon::update_facts_source(state);
+    let official: crystalline_service::rest::UpdateFactsSource =
+        Arc::new(move |setting_on| UpdateFacts {
+            official: true,
+            refusal: None,
+            ..daemon(setting_on)
+        });
+
+    let fx = serve(Options {
+        update_check: true,
+        update: Some(official),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    assert_eq!(update_available(fx.addr, Some(&admin)).await, "0.35.0");
 }

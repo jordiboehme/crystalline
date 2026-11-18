@@ -45,3 +45,19 @@ export function useSaid(
   }, [said, forMs]);
   return [said, setSaid];
 }
+
+/**
+ * Copy `text` and say how it went: "Copied", or "Could not copy" when the
+ * browser refused. The shared half of the code block's Copy and the update
+ * note's.
+ */
+export function copyText(text: string, say: (text: string) => void): void {
+  void navigator.clipboard.writeText(text).then(
+    () => {
+      say("Copied");
+    },
+    () => {
+      say("Could not copy");
+    },
+  );
+}

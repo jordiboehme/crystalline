@@ -17,6 +17,11 @@
  * Below the medium breakpoint the open menu is a bottom sheet: the stylesheet
  * (`.avatar-menu` in index.css) moves the same popper to the foot of the window
  * with a scrim, so there is one menu and one set of keys on every width.
+ *
+ * When the probe names a newer version (an admin only, spec S28), the body
+ * shows a quiet chip, and the chip opens a small popover anchored to this
+ * avatar (`UpdateNote.tsx`, lazy too). It lives here rather than in the body,
+ * because the body goes when the menu closes.
  */
 
 import { UserRoundX } from "lucide-react";
@@ -26,9 +31,14 @@ import type { ReactElement, RefObject } from "react";
 
 import { useAuth } from "../auth/AuthContext";
 import type AvatarMenuBodyType from "./AvatarMenuBody";
+import { lazyChunk } from "../lazyChunk";
+import { LazyBoundary } from "./LazyBoundary";
+import { UpdateNoteFailed } from "./UpdateNoteShell";
 import { ITEM_CLASSES } from "./menu";
 import { Loading } from "./Loading";
 import { FOCUS_RING, Tooltip } from "./primitives";
+
+const UpdateNote = lazyChunk(() => import("./UpdateNote"));
 
 let Menu: typeof AvatarMenuBodyType | undefined;
 let pending: Promise<void> | undefined;
@@ -58,8 +68,12 @@ export function AvatarMenu({
   /** Open the keyboard shortcut map, handing over the place focus returns to. */
   onShortcuts: (opener: HTMLElement | null) => void;
 }): ReactElement {
-  const { user } = useAuth();
+  const { user, capabilities } = useAuth();
   const triggerRef = useRef<HTMLButtonElement>(null);
+  // The version the open note names, taken when it opened: a later probe
+  // that drops or changes the field leaves an open note alone until the
+  // reader closes it.
+  const [noteFor, setNoteFor] = useState<string | null>(null);
   useEffect(() => {
     const timer = setTimeout(preload, 1500);
     return () => {
@@ -69,44 +83,80 @@ export function AvatarMenu({
   const label = user ? user.display : "Viewing anonymously";
   const initial = user ? (Array.from(user.display.trim())[0] ?? "?") : "";
 
+  const available = capabilities.updateAvailable;
   return (
-    <DropdownMenu.Root>
-      <Tooltip label={label}>
-        <DropdownMenu.Trigger
-          ref={triggerRef}
-          aria-label={label}
-          onPointerEnter={preload}
-          onFocus={preload}
-          className={`avatar ${user ? "" : "avatar-anon"} ${FOCUS_RING}`}
+    <>
+      <DropdownMenu.Root>
+        <Tooltip label={label}>
+          <DropdownMenu.Trigger
+            ref={triggerRef}
+            aria-label={label}
+            onPointerEnter={preload}
+            onFocus={preload}
+            className={`avatar ${user ? "" : "avatar-anon"} ${FOCUS_RING}`}
+          >
+            {user ? (
+              <span aria-hidden="true">{initial.toUpperCase()}</span>
+            ) : (
+              <UserRoundX aria-hidden="true" size={16} strokeWidth={1.75} />
+            )}
+          </DropdownMenu.Trigger>
+        </Tooltip>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="end"
+            sideOffset={6}
+            collisionPadding={8}
+            className="avatar-menu"
+            // Radix hands the focus back to the avatar a tick after the menu
+            // closes. When a link in the menu has taken the reader to another
+            // screen, that screen has already put the focus on its main
+            // region, and the avatar must not take it away again.
+            onCloseAutoFocus={(event) => {
+              const active = document.activeElement;
+              if (active instanceof HTMLElement && active !== document.body) {
+                event.preventDefault();
+              }
+            }}
+          >
+            <Body
+              triggerRef={triggerRef}
+              onShortcuts={onShortcuts}
+              onUpdateNote={() => {
+                // A tick later, so the menu has let go of the page (a modal
+                // menu holds the body's pointer events) before the note opens.
+                setTimeout(() => {
+                  setNoteFor(available);
+                });
+              }}
+            />
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+      {noteFor !== null && (
+        <LazyBoundary
+          fallback={null}
+          failed={
+            <UpdateNoteFailed
+              anchor={triggerRef}
+              available={noteFor}
+              onClose={() => {
+                setNoteFor(null);
+              }}
+            />
+          }
         >
-          {user ? (
-            <span aria-hidden="true">{initial.toUpperCase()}</span>
-          ) : (
-            <UserRoundX aria-hidden="true" size={16} strokeWidth={1.75} />
-          )}
-        </DropdownMenu.Trigger>
-      </Tooltip>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="end"
-          sideOffset={6}
-          collisionPadding={8}
-          className="avatar-menu"
-          // Radix hands the focus back to the avatar a tick after the menu
-          // closes. When a link in the menu has taken the reader to another
-          // screen, that screen has already put the focus on its main
-          // region, and the avatar must not take it away again.
-          onCloseAutoFocus={(event) => {
-            const active = document.activeElement;
-            if (active instanceof HTMLElement && active !== document.body) {
-              event.preventDefault();
-            }
-          }}
-        >
-          <Body triggerRef={triggerRef} onShortcuts={onShortcuts} />
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
+          <UpdateNote
+            anchor={triggerRef}
+            current={capabilities.serverVersion}
+            available={noteFor}
+            onClose={() => {
+              setNoteFor(null);
+            }}
+          />
+        </LazyBoundary>
+      )}
+    </>
   );
 }
 
@@ -118,9 +168,11 @@ export function AvatarMenu({
 function Body({
   triggerRef,
   onShortcuts,
+  onUpdateNote,
 }: {
   triggerRef: RefObject<HTMLButtonElement | null>;
   onShortcuts: (opener: HTMLElement | null) => void;
+  onUpdateNote: () => void;
 }): ReactElement {
   const [failed, setFailed] = useState(false);
   const [ready, setReady] = useState(Menu !== undefined);
@@ -162,6 +214,7 @@ function Body({
         onShortcuts={() => {
           onShortcuts(triggerRef.current);
         }}
+        onUpdateNote={onUpdateNote}
       />
     );
   }

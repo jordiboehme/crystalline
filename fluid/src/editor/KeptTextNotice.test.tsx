@@ -51,6 +51,7 @@ function auth(readOnly = false): AuthValue {
     needsSetup: false,
     oauth: false,
     serverVersion: "test",
+    updateAvailable: null,
   };
   return {
     user: userFixture(),
