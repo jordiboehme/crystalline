@@ -18,7 +18,9 @@ use crystalline_core::update::{
 use crystalline_core::version::Precedence;
 use crystalline_service::control::{answer_for_test, answer_for_test_with_update};
 use crystalline_service::update::check::run_update_checks;
-use crystalline_service::update::{UpdateState, check_suppressed, read_cache, run_check};
+use crystalline_service::update::{
+    UpdateState, check_now, check_suppressed, read_cache, run_check,
+};
 use serde_json::json;
 
 use super::{API_PATH, ENV, Fake, WEB_PATH, redirect_to, respond, use_fake};
@@ -924,4 +926,80 @@ async fn the_watch_holds_only_the_answered_shape() {
         held.known_release().map(|k| k.version),
         Some("v99.0.0".to_string())
     );
+}
+
+#[tokio::test]
+async fn check_now_asks_even_while_the_cache_stands() {
+    let _env = ENV.lock().await;
+    let fake = Fake::start(|_, path, _| match path {
+        API_PATH => respond(StatusCode::OK, &[], &api_release("v99.0.0")),
+        _ => respond(StatusCode::NOT_FOUND, &[], ""),
+    })
+    .await;
+    use_fake(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+    let start = time::now();
+    let first = run_check(&path, start).await;
+    assert_eq!(api_count(&fake), 1);
+    // The daily check would stand for a day; the explicit check asks again
+    // and writes the same cache, keeping first_seen.
+    let now = time::now();
+    let again = check_now(&path, now, || panic!("no lock was held")).await;
+    assert_eq!(api_count(&fake), 2);
+    assert_eq!(again.checked_at, now);
+    assert_eq!(release_outcome(&again).2, release_outcome(&first).2);
+    assert_eq!(read_cache(&path), Some(again));
+
+    // A cache dated in the future is never taken for one written since.
+    let mut future = read_cache(&path).unwrap();
+    future.checked_at = time::now().checked_add(time::hours(5)).unwrap();
+    std::fs::write(&path, serde_json::to_string(&future).unwrap()).unwrap();
+    check_now(&path, time::now(), || {}).await;
+    assert_eq!(api_count(&fake), 3);
+}
+
+#[tokio::test]
+async fn check_now_waits_for_a_held_lock_says_so_and_takes_its_check() {
+    let _env = ENV.lock().await;
+    let fake = Fake::start(|_, _, _| respond(StatusCode::OK, &[], &api_release("v99.0.0"))).await;
+    use_fake(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(UPDATE_CACHE_FILE);
+    let lock = dir.path().join(".update-check.json.lock");
+    std::fs::write(&lock, "another-holder").unwrap();
+    let now = time::now();
+    // The holder writes its check after `now` and lets go of the lock.
+    let holder = tokio::spawn({
+        let (path, lock) = (path.clone(), lock.clone());
+        async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let cache = UpdateCache {
+                v: UPDATE_CACHE_FORMAT,
+                checked_at: time::now(),
+                outcome: CheckOutcome::Release {
+                    version: "v99.0.0".to_string(),
+                    published_at: None,
+                    first_seen: time::now(),
+                },
+                etag: None,
+                last_release: None,
+            };
+            std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
+            std::fs::remove_file(&lock).unwrap();
+            cache
+        }
+    });
+    let said = AtomicUsize::new(0);
+    let got = tokio::time::timeout(
+        Duration::from_secs(10),
+        check_now(&path, now, || {
+            said.fetch_add(1, Ordering::SeqCst);
+        }),
+    )
+    .await
+    .expect("the wait ends when the holder writes");
+    assert_eq!(got, holder.await.unwrap(), "the holder's check is taken");
+    assert_eq!(said.load(Ordering::SeqCst), 1, "the wait is said once");
+    assert_eq!(api_count(&fake), 0, "nothing asked twice");
 }

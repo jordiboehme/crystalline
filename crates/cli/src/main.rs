@@ -37,6 +37,7 @@ mod receipt;
 mod render;
 mod skills_placement;
 mod sources;
+mod update;
 mod users;
 
 /// What `-V` and `--version` print. clap's `version` attribute feeds both as
@@ -402,10 +403,7 @@ enum Command {
         #[arg(default_value = "127.0.0.1:7411")]
         addr: String,
     },
-    /// Update Crystalline to the newest release.
-    // Hidden while its only verb is the hidden `verify-sums`; PR D of the
-    // self-update plan unhides it when `check`, `now` and `auto` arrive.
-    #[command(hide = true)]
+    /// Update Crystalline to the newest stable release.
     Update {
         #[command(subcommand)]
         cmd: UpdateCommand,
@@ -2565,6 +2563,9 @@ fn run() -> anyhow::Result<()> {
             pack,
         }) => desktop_bundle::run(kind, &outdir, binary, pack),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
+        Some(Command::Update {
+            cmd: UpdateCommand::Check { ignore_age },
+        }) => on_runtime(move || update::check(ignore_age, cli.json)),
         Some(Command::Update {
             cmd: UpdateCommand::VerifySums { sums, minisig, tag },
         }) => verify_sums(&sums, &minisig, &tag),
@@ -5907,6 +5908,21 @@ async fn domain_rename_dispatch(
 
 #[derive(Subcommand, Debug)]
 enum UpdateCommand {
+    /// Look up the newest stable release and what `update now` would do.
+    ///
+    /// Asks GitHub now, whether or not the daily check is on, and names the
+    /// install method, the action and the release notes; `--json` prints
+    /// the plan as JSON.
+    ///
+    /// Exit codes: 0 up to date, or the newer release is younger than the
+    /// release-age gate (the output says when it is offered); 10 an update
+    /// is available; 1 the check failed.
+    Check {
+        /// Offer a release however recently it was published (skips the
+        /// `update.min_age_hours` gate).
+        #[arg(long)]
+        ignore_age: bool,
+    },
     /// Release: check a `SHA256SUMS` signature with the compiled-in release
     /// keys and the tag in its trusted comment, so the publish job proves the
     /// key pair before anything is published. It checks no asset line: an

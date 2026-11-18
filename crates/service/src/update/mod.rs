@@ -6,5 +6,5 @@
 pub mod check;
 pub mod client;
 
-pub use check::{UpdateState, check_suppressed, read_cache, run_check};
+pub use check::{UpdateState, check_now, check_suppressed, detect_here, read_cache, run_check};
 pub use client::{UpdateError, download, latest_release};
