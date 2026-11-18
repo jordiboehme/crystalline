@@ -613,14 +613,14 @@ fn is_generated(block: &KeyBlock) -> bool {
 }
 
 /// The instant a `generated` mapping's `at` names, when it reads as RFC 3339.
-fn generated_at(value: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+fn generated_at(value: &Value) -> Option<crate::time::OffsetStamp> {
     let Value::Mapping(map) = value else {
         return None;
     };
     let Value::String(at) = map.get("at")? else {
         return None;
     };
-    chrono::DateTime::parse_from_rfc3339(at).ok()
+    crate::time::parse_rfc3339(at)
 }
 
 /// Merge three frontmatters key by key. `base` is `None` when both sides
@@ -845,6 +845,36 @@ fn without_generated(blocks: &KeyBlocks) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Review Focus 3 of the time-module move: two `generated` blocks naming
+    // the same instant in different offsets rank equal on the instant, so the
+    // greater block text wins, in both merge orders, as in 0.33.
+    #[test]
+    fn generated_merge_picks_like_0_33() {
+        let lines: &dyn Fn(&str, &str, &str) -> Option<String> = &|_, _, _| None;
+        let doc = |at: &str| {
+            format!(
+                "---\ntype: engram\ntitle: T\ngenerated: {{by: human:a, at: '{at}'}}\n---\n\nbody\n"
+            )
+        };
+        let base = doc("2026-01-01T00:00:00+00:00");
+        let utc = doc("2026-01-05T10:00:00+00:00");
+        let east = doc("2026-01-05T12:00:00+02:00");
+        assert_eq!(
+            merge_text(Some(&base), &utc, &east, lines),
+            MergedText::Clean(east.clone())
+        );
+        assert_eq!(
+            merge_text(Some(&base), &east, &utc, lines),
+            MergedText::Clean(east.clone())
+        );
+        // A later instant still wins over a greater text.
+        let later = doc("2026-01-05T10:00:01+00:00");
+        assert_eq!(
+            merge_text(Some(&base), &later, &east, lines),
+            MergedText::Clean(later.clone())
+        );
+    }
 
     const DOC: &str = "---\ntype: engram\ntitle: T\npermalink: t\n---\n\n# T\n\nBody.\n";
 

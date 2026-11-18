@@ -19,8 +19,6 @@
 
 use std::path::Path;
 
-use chrono::Datelike;
-
 use crate::engram::{Engram, RECOMMENDED_STATUSES};
 use crate::import::SENTINEL_FUTURE_YEAR;
 use crate::temporal::{DATE_FIELDS, describe};
@@ -135,7 +133,11 @@ pub(crate) fn check_engram(path: &Path, engram: &Engram, sink: &mut Sink) {
             None,
             "T004",
             Severity::Error,
-            format!("valid_from ({from}) is after valid_to ({to})"),
+            format!(
+                "valid_from ({}) is after valid_to ({})",
+                from.ymd(),
+                to.ymd()
+            ),
             None,
         );
     }
@@ -201,7 +203,10 @@ pub(crate) fn check_engram(path: &Path, engram: &Engram, sink: &mut Sink) {
             None,
             "T008",
             Severity::Warning,
-            format!("valid_to `{to}` looks like a sentinel far-future date"),
+            format!(
+                "valid_to `{}` looks like a sentinel far-future date",
+                to.ymd()
+            ),
             Some("remove the field; absence means valid forever".into()),
         );
     }

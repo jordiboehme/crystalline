@@ -11791,7 +11791,7 @@ fn ack_json(entry: &EvolveAck) -> Value {
         "scope": entry.scope,
         "note": entry.note,
         "by": entry.by,
-        "at": entry.at.map(|at| at.to_rfc3339()),
+        "at": entry.at.map(|at| at.rfc3339()),
     })
 }
 
@@ -12634,6 +12634,13 @@ fn now_offset() -> DateTime<FixedOffset> {
     chrono::Utc::now().fixed_offset()
 }
 
+/// A frontmatter date as the chrono date the engine's own types still hold.
+/// A stage 2 bridge: it goes when the engine moves onto
+/// `crystalline_core::time`.
+fn chrono_day(day: crystalline_core::time::Day) -> NaiveDate {
+    day.into_chrono()
+}
+
 /// The ISO date `spec` before today, for `timeframe` windows like `7d`, `24h`,
 /// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure.
 fn timeframe_cutoff(spec: &str) -> Option<String> {
@@ -12680,11 +12687,11 @@ fn build_markdown(
         status: Some(status.to_string()),
         ..Frontmatter::default()
     };
-    fm.recorded_at = chrono::NaiveDate::parse_from_str(recorded_at, "%Y-%m-%d").ok();
+    fm.recorded_at = crystalline_core::time::parse_date(recorded_at);
     fm.generated = Some(crystalline_core::Generated {
         by: actor.to_string(),
         model: model.map(str::to_string),
-        at: Some(now),
+        at: Some(crystalline_core::time::OffsetStamp::from_chrono(now)),
     });
     // Models routinely double-encode nested tool arguments, so an object
     // arriving as a JSON string is accepted by parsing it first.

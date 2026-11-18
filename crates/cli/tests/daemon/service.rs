@@ -7041,7 +7041,7 @@ fn serve_refuses_the_first_admin_on_a_name_with_drafts_and_keeps_serving() {
         Some("ada"),
         crystalline_core::kept::KeptKind::Engram,
         "plan.md",
-        chrono::Utc::now(),
+        crystalline_core::time::now(),
         "OLD ADA PRIVATE TEXT",
     )
     .unwrap();

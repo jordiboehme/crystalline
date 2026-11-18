@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use chrono::NaiveDate;
 pub use crystalline_core::config::DomainKind;
+use crystalline_core::time::Day;
 use crystalline_core::{Engram, slugify};
 use serde::{Deserialize, Serialize};
 
@@ -929,10 +930,10 @@ impl EngramRecord {
             title: fm.title.clone(),
             engram_type: fm.engram_type.clone(),
             status: fm.status.clone().unwrap_or_default(),
-            recorded_at: date_str(fm.recorded_at),
-            valid_from: date_str(fm.valid_from),
-            valid_to: date_str(fm.valid_to),
-            timestamp: fm.written_at().map(|t| t.to_rfc3339()),
+            recorded_at: date_str(fm.recorded_at.map(Day::into_chrono)),
+            valid_from: date_str(fm.valid_from.map(Day::into_chrono)),
+            valid_to: date_str(fm.valid_to.map(Day::into_chrono)),
+            timestamp: fm.written_at().map(|t| t.into_chrono().to_rfc3339()),
             description: fm.description.clone(),
             content: engram.body.clone(),
             metadata: serde_json::Value::Object(meta),

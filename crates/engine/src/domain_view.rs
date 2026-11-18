@@ -1660,7 +1660,7 @@ impl<'a> DomainView<'a> {
                     &set_frontmatter_field(&text, "permalink", asked),
                     mover,
                     None,
-                    chrono::Utc::now().fixed_offset(),
+                    crystalline_core::time::now().to_offset_utc(),
                 ),
                 asked.to_string(),
             ),
@@ -1680,7 +1680,12 @@ impl<'a> DomainView<'a> {
             if rebased == text {
                 text
             } else {
-                touch_generated(&rebased, mover, None, chrono::Utc::now().fixed_offset())
+                touch_generated(
+                    &rebased,
+                    mover,
+                    None,
+                    crystalline_core::time::now().to_offset_utc(),
+                )
             }
         };
         // Asked BEFORE either write, although the writer below asks it again:

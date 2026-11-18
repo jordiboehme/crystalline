@@ -181,7 +181,7 @@ impl Engine {
 
         // Phase 1: complete every note and settle which ones will be written,
         // so only those take in the files they link to.
-        let now = chrono::Utc::now().fixed_offset();
+        let now = crystalline_core::time::now().to_offset_utc();
         let mut notes: Vec<crystalline_core::linked::LinkedNote> = Vec::new();
         for (rel, abs) in files {
             let source = match std::fs::read_to_string(&abs) {

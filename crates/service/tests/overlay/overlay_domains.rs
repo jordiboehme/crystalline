@@ -10560,7 +10560,7 @@ async fn a_kept_text_of_a_removed_account_never_reaches_a_new_one() {
         Some("ada"),
         crystalline_core::kept::KeptKind::Engram,
         "plan.md",
-        chrono::Utc::now(),
+        crystalline_core::time::now(),
         "OLD ADA PRIVATE TEXT",
     )
     .unwrap();
@@ -10571,7 +10571,7 @@ async fn a_kept_text_of_a_removed_account_never_reaches_a_new_one() {
         None,
         crystalline_core::kept::KeptKind::Comment,
         "page.md",
-        chrono::Utc::now(),
+        crystalline_core::time::now(),
         "OLD ADA COMMENT",
     )
     .unwrap();

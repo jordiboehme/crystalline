@@ -7156,7 +7156,9 @@ async fn edit_engram_migrates_a_legacy_timestamp_to_generated() {
     );
     let engram = crystalline_core::parse_engram(&text).unwrap();
     let generated = engram.frontmatter.generated.unwrap();
-    assert!(generated.at.unwrap().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00");
+    assert!(
+        generated.at.unwrap().into_chrono().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00"
+    );
 }
 
 /// The agent reports the model that produced the words, and it lands beside the

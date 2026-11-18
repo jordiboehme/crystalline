@@ -355,7 +355,7 @@ pub fn set_aside_orphan<'a>(
     {
         return None;
     }
-    crystalline_core::kept::set_aside(root, name, chrono::Utc::now())
+    crystalline_core::kept::set_aside(root, name, crystalline_core::time::now())
         .err()
         .map(|err| format!("note: kept texts left under '{name}' could not be set aside: {err}"))
 }

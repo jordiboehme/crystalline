@@ -120,7 +120,7 @@ async fn a_leading_block_is_merged_into_the_one_frontmatter_on_both_storage_kind
         );
         assert_eq!(fm.permalink.as_deref(), Some("cache-policy"), "{domain}");
         assert_ne!(
-            fm.recorded_at.map(|d| d.to_string()).as_deref(),
+            fm.recorded_at.map(|d| d.ymd()).as_deref(),
             Some("2020-01-01"),
             "{domain}: recorded_at is engine-owned"
         );
@@ -130,7 +130,7 @@ async fn a_leading_block_is_merged_into_the_one_frontmatter_on_both_storage_kind
             "{domain}: generated is engine-owned"
         );
         assert_eq!(
-            fm.valid_from.map(|d| d.to_string()).as_deref(),
+            fm.valid_from.map(|d| d.ymd()).as_deref(),
             Some("2026-01-01"),
             "{domain}: a temporal key from the block lands typed"
         );

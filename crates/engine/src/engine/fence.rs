@@ -402,7 +402,7 @@ impl Engine {
                             None,
                             keep.kind,
                             keep.path,
-                            chrono::Utc::now(),
+                            crystalline_core::time::now(),
                             keep.text,
                         )
                         .map_err(|e| e.to_string())
@@ -569,7 +569,7 @@ impl Engine {
                         None,
                         crystalline_core::kept::KeptKind::Engram,
                         keep.rel,
-                        chrono::Utc::now(),
+                        crystalline_core::time::now(),
                         keep.text,
                     )
                     .map_err(|e| e.to_string())

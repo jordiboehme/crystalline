@@ -555,7 +555,7 @@ fn frontmatter_map(fm: &Frontmatter) -> IndexMap<String, YamlValue> {
             YamlValue::Sequence(fm.tags.iter().cloned().map(YamlValue::String).collect()),
         );
     }
-    let date = |d: chrono::NaiveDate| YamlValue::String(d.format("%Y-%m-%d").to_string());
+    let date = |d: crate::time::Day| YamlValue::String(d.ymd());
     if let Some(d) = fm.recorded_at {
         m.insert("recorded_at".into(), date(d));
     }
@@ -585,7 +585,7 @@ fn frontmatter_map(fm: &Frontmatter) -> IndexMap<String, YamlValue> {
                 let mut inner = IndexMap::new();
                 inner.insert("by".to_string(), YamlValue::String(v.by.clone()));
                 if let Some(at) = v.at {
-                    inner.insert("at".to_string(), YamlValue::String(at.to_rfc3339()));
+                    inner.insert("at".to_string(), YamlValue::String(at.rfc3339()));
                 }
                 YamlValue::Mapping(inner)
             })
@@ -596,12 +596,12 @@ fn frontmatter_map(fm: &Frontmatter) -> IndexMap<String, YamlValue> {
         let mut inner = IndexMap::new();
         inner.insert("by".to_string(), YamlValue::String(g.by.clone()));
         if let Some(at) = g.at {
-            inner.insert("at".to_string(), YamlValue::String(at.to_rfc3339()));
+            inner.insert("at".to_string(), YamlValue::String(at.rfc3339()));
         }
         m.insert("generated".into(), YamlValue::Mapping(inner));
     }
     if let Some(ts) = fm.timestamp {
-        m.insert("timestamp".into(), YamlValue::String(ts.to_rfc3339()));
+        m.insert("timestamp".into(), YamlValue::String(ts.rfc3339()));
     }
     if let Some(def) = &fm.schema_def {
         if let Some(entity) = &def.entity {

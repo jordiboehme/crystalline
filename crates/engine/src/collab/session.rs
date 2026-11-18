@@ -2460,7 +2460,7 @@ impl CollabSession {
             self.overlay.as_deref(),
             kind,
             &path,
-            chrono::Utc::now(),
+            crystalline_core::time::now(),
             &text,
         ) {
             Ok(file) => tracing::warn!(

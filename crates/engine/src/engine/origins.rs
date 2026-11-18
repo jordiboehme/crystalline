@@ -4770,7 +4770,7 @@ impl Engine {
                     None,
                     crystalline_core::kept::KeptKind::Engram,
                     path,
-                    chrono::Utc::now(),
+                    crystalline_core::time::now(),
                     &bytes,
                 )
                 .map_err(|source| EngineError::Io { path: what, source })?;
@@ -4991,7 +4991,7 @@ impl Engine {
                         Some(actor),
                         crystalline_core::kept::KeptKind::Engram,
                         path,
-                        chrono::Utc::now(),
+                        crystalline_core::time::now(),
                         &bytes,
                     )
                     .map_err(|source| EngineError::Io { path: what, source })?;
@@ -5578,7 +5578,7 @@ impl Engine {
             Some(actor),
             crystalline_core::kept::KeptKind::Engram,
             &row.path,
-            chrono::Utc::now(),
+            crystalline_core::time::now(),
             &row.content,
         )
         .map(|_| ())

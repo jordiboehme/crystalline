@@ -175,7 +175,7 @@ impl Engine {
         let Some(root) = self.kept_dir() else {
             return;
         };
-        match kept::set_aside(&root, name, chrono::Utc::now()) {
+        match kept::set_aside(&root, name, crystalline_core::time::now()) {
             Ok(Some(to)) => tracing::info!(
                 domain = name,
                 kept = %to.display(),
@@ -213,7 +213,7 @@ impl Engine {
         {
             return;
         }
-        match kept::set_aside(&root, name, chrono::Utc::now()) {
+        match kept::set_aside(&root, name, crystalline_core::time::now()) {
             Ok(Some(to)) => tracing::info!(
                 domain = name,
                 kept = %to.display(),
@@ -290,7 +290,7 @@ impl Engine {
         }) {
             return;
         }
-        match kept::set_aside(&root, name, chrono::Utc::now()) {
+        match kept::set_aside(&root, name, crystalline_core::time::now()) {
             Ok(Some(to)) => tracing::info!(
                 domain = name,
                 kept = %to.display(),
@@ -357,7 +357,7 @@ mod tests {
             None,
             KeptKind::Engram,
             "a.md",
-            chrono::Utc::now(),
+            crystalline_core::time::now(),
             "x",
         )
         .unwrap();

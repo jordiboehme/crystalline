@@ -1785,7 +1785,7 @@ async fn a_first_sign_in_on_a_name_with_drafts_reads_a_page_that_says_ask_an_adm
         Some("ada"),
         crystalline_core::kept::KeptKind::Engram,
         "plan.md",
-        chrono::Utc::now(),
+        crystalline_core::time::now(),
         "OLD ADA PRIVATE TEXT",
     )
     .unwrap();

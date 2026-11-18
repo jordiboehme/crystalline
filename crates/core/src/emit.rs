@@ -9,7 +9,6 @@
 //! re-emission, so non-canonical files keep every untouched byte. Sections are
 //! addressed by heading path such as `## API > ### Auth`.
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::engram::{
@@ -17,6 +16,7 @@ use crate::engram::{
 };
 use crate::headings::{HeadingSpan, heading_spans};
 use crate::parse::{continues_bullet, locate, parse_heading};
+use crate::time::{Day, OffsetStamp};
 
 /// The stand-in scalar the `generated` key carries through YAML serialization,
 /// swapped for the flow mapping afterwards. The YAML crate only emits block
@@ -82,7 +82,7 @@ fn generated_flow(g: &Generated) -> String {
         out.push_str(&format!(", model: {}", flow_scalar(model)));
     }
     if let Some(at) = g.at {
-        out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
+        out.push_str(&format!(", at: {}", flow_scalar(&at.rfc3339())));
     }
     out.push_str(" }");
     out
@@ -110,7 +110,7 @@ fn verified_flow(v: &Verified) -> String {
         out.push_str(&format!(", model: {}", flow_scalar(model)));
     }
     if let Some(at) = v.at {
-        out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
+        out.push_str(&format!(", at: {}", flow_scalar(&at.rfc3339())));
     }
     out.push_str(" }");
     out
@@ -187,25 +187,16 @@ fn frontmatter_mapping(fm: &Frontmatter) -> Mapping {
         put("status", Value::String(v.clone()));
     }
     if let Some(d) = fm.recorded_at {
-        put(
-            "recorded_at",
-            Value::String(d.format("%Y-%m-%d").to_string()),
-        );
+        put("recorded_at", Value::String(d.ymd()));
     }
     if let Some(d) = fm.valid_from {
-        put(
-            "valid_from",
-            Value::String(d.format("%Y-%m-%d").to_string()),
-        );
+        put("valid_from", Value::String(d.ymd()));
     }
     if let Some(d) = fm.valid_to {
-        put("valid_to", Value::String(d.format("%Y-%m-%d").to_string()));
+        put("valid_to", Value::String(d.ymd()));
     }
     if let Some(d) = fm.source_date {
-        put(
-            "source_date",
-            Value::String(d.format("%Y-%m-%d").to_string()),
-        );
+        put("source_date", Value::String(d.ymd()));
     }
     // `verified` takes the canonical slot the legacy `last_verified` held and
     // `stale_after` the one `review_after` held, so a file still carrying only
@@ -215,22 +206,13 @@ fn frontmatter_mapping(fm: &Frontmatter) -> Mapping {
         put("verified", Value::String(VERIFIED_PLACEHOLDER.to_string()));
     }
     if let Some(d) = fm.last_verified {
-        put(
-            "last_verified",
-            Value::String(d.format("%Y-%m-%d").to_string()),
-        );
+        put("last_verified", Value::String(d.ymd()));
     }
     if let Some(d) = fm.stale_after {
-        put(
-            "stale_after",
-            Value::String(d.format("%Y-%m-%d").to_string()),
-        );
+        put("stale_after", Value::String(d.ymd()));
     }
     if let Some(d) = fm.review_after {
-        put(
-            "review_after",
-            Value::String(d.format("%Y-%m-%d").to_string()),
-        );
+        put("review_after", Value::String(d.ymd()));
     }
     if let Some(v) = &fm.temporal_confidence {
         put("temporal_confidence", Value::String(v.clone()));
@@ -249,7 +231,7 @@ fn frontmatter_mapping(fm: &Frontmatter) -> Mapping {
         );
     }
     if let Some(ts) = fm.timestamp {
-        put("timestamp", Value::String(ts.to_rfc3339()));
+        put("timestamp", Value::String(ts.rfc3339()));
     }
     if let Some(schema) = &fm.schema_def {
         emit_schema_fields(&mut map, schema);
@@ -532,7 +514,7 @@ fn evolve_ack_flow(ack: &EvolveAck) -> String {
     }
     out.push_str(&format!(", by: {}", flow_scalar(&ack.by)));
     if let Some(at) = ack.at {
-        out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
+        out.push_str(&format!(", at: {}", flow_scalar(&at.rfc3339())));
     }
     out.push_str(" }");
     out
@@ -670,7 +652,7 @@ fn is_value_continuation(line: &str) -> bool {
 /// or the frontmatter block is absent.
 ///
 /// Only safe for a single-line scalar field. That is guaranteed for a date
-/// field that parsed into a `NaiveDate` and for an explicit null `key:` line;
+/// field that parsed into a [`Day`] and for an explicit null `key:` line;
 /// it must not be used on a key whose value spans several lines (a block
 /// sequence or a nested mapping), which would orphan the trailing lines.
 pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
@@ -718,12 +700,7 @@ pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
 /// the flow mapping above two orphaned indented lines - not YAML, so the engram
 /// would stop parsing and go invisible to the sweep, to reads and to search.
 /// The old value goes whole, whatever shape it was written in.
-pub fn touch_generated(
-    source: &str,
-    actor: &str,
-    model: Option<&str>,
-    now: DateTime<FixedOffset>,
-) -> String {
+pub fn touch_generated(source: &str, actor: &str, model: Option<&str>, now: OffsetStamp) -> String {
     let line = generated_flow(&Generated {
         by: actor.to_string(),
         model: model.map(str::to_string),
@@ -743,8 +720,8 @@ pub fn touch_generated(
 /// Block-aware for the same reason [`touch_generated`] is: a hand-written bound
 /// may sit on its own indented line under the key, and stranding it there would
 /// cost the engram its parse.
-pub fn set_stale_after(source: &str, date: NaiveDate) -> String {
-    let line = format!("stale_after: {}", date.format("%Y-%m-%d"));
+pub fn set_stale_after(source: &str, date: Day) -> String {
+    let line = format!("stale_after: {}", date.ymd());
     set_frontmatter_block_line(source, &["stale_after", "review_after"], line)
 }
 
@@ -1623,7 +1600,7 @@ mod tests {
             generated_flow(&Generated {
                 by: "Some Client (beta), v2".to_string(),
                 model: None,
-                at: DateTime::parse_from_rfc3339("2026-07-27T09:15:00+00:00").ok(),
+                at: crate::time::parse_rfc3339("2026-07-27T09:15:00+00:00"),
             })
         );
         let engram = crate::parse_engram(&source).unwrap();

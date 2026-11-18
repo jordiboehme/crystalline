@@ -2817,7 +2817,7 @@ async fn a_case_only_rename_moves_the_state_folders_body(store: Arc<Mutex<dyn St
         None,
         crystalline_core::kept::KeptKind::Engram,
         "alpha.md",
-        chrono::Utc::now(),
+        crystalline_core::time::Stamp::from_chrono(chrono::Utc::now()),
         "typed",
     )
     .unwrap();
@@ -2874,7 +2874,7 @@ async fn a_finished_rename_keeps_its_kept_texts_under_the_new_name_body(
             None,
             crystalline_core::kept::KeptKind::Engram,
             "alpha.md",
-            chrono::Utc::now(),
+            crystalline_core::time::Stamp::from_chrono(chrono::Utc::now()),
             "typed",
         )
         .unwrap();

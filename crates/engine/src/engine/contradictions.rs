@@ -104,8 +104,8 @@ impl ParsedFact {
         let fm = &engram.frontmatter;
         ParsedFact {
             status: fm.status.clone(),
-            valid_from: fm.valid_from,
-            valid_to: fm.valid_to,
+            valid_from: fm.valid_from.map(chrono_day),
+            valid_to: fm.valid_to.map(chrono_day),
             observations: engram
                 .observations
                 .iter()

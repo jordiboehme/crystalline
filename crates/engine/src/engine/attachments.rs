@@ -1001,7 +1001,12 @@ impl Engine {
                 edited = append_body(&edited, &line);
             }
         }
-        touch_generated(&edited, actor, None, now_offset())
+        touch_generated(
+            &edited,
+            actor,
+            None,
+            crystalline_core::time::now().to_offset_utc(),
+        )
     }
 
     /// Whether the text already declares this relation to this engram, in
