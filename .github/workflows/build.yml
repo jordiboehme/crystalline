@@ -318,10 +318,18 @@ jobs:
         if: matrix.codesign && steps.signing.outputs.sign == 'true'
         shell: bash
         env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           BIN: ${{ steps.bin.outputs.path }}
         run: |
           set -euo pipefail
+          # The Team ID the updater's code signature requirement names
+          # (crystalline_core::update::APPLE_TEAM_ID), read from the source,
+          # never from the secret: a certificate of another team must fail
+          # here, not in every macOS tar.gz update one release later.
+          team_id="$(sed -n 's/^pub const APPLE_TEAM_ID: &str = "\([A-Z0-9]*\)";$/\1/p' "$GITHUB_WORKSPACE/crates/core/src/update/mod.rs")"
+          if [ -z "$team_id" ]; then
+            echo "::error::no APPLE_TEAM_ID constant found in crates/core/src/update/mod.rs"
+            exit 1
+          fi
           keychain="$RUNNER_TEMP/signing.keychain-db"
           identity="$(security find-identity -v -p codesigning "$keychain" \
             | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
@@ -338,7 +346,10 @@ jobs:
           info="$(codesign --display --verbose=2 "$BIN" 2>&1)"
           echo "$info"
           grep -q "Identifier=io.github.jordiboehme.crystalline" <<< "$info"
-          grep -q "TeamIdentifier=${APPLE_TEAM_ID}" <<< "$info"
+          if ! grep -q "^TeamIdentifier=${team_id}$" <<< "$info"; then
+            echo "::error::the binary is signed for another team than ${team_id}, the one updates require"
+            exit 1
+          fi
           grep -q "(runtime)" <<< "$info"
 
       - name: Notarize the binary

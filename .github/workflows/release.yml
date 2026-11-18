@@ -631,12 +631,35 @@ jobs:
     env:
       TAG: ${{ needs.notes.outputs.sign_tag }}
     steps:
+      # minisign 0.12, the upstream Linux build, pinned by its SHA-256 (the
+      # archive is also signed by its author, key
+      # RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3, checked by
+      # hand when the pin was set). Never the distribution package, whose
+      # version moves with the runner image. A new pin changes both lines.
       - name: Install minisign
+        env:
+          MINISIGN_VERSION: '0.12'
+          MINISIGN_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y minisign
-          minisign -v
+          dir="$RUNNER_TEMP/minisign"
+          mkdir -p "$dir"
+          archive="$dir/minisign-linux.tar.gz"
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz"
+          echo "${MINISIGN_SHA256}  ${archive}" | sha256sum --check --strict
+          tar xzf "$archive" -C "$dir" minisign-linux/x86_64/minisign
+          mkdir -p "$dir/bin"
+          install -m 0755 "$dir/minisign-linux/x86_64/minisign" "$dir/bin/minisign"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          said="$("$dir/bin/minisign" -v)"
+          echo "$said"
+          if [ "$said" != "minisign ${MINISIGN_VERSION}" ]; then
+            echo "::error::expected minisign ${MINISIGN_VERSION}, got: $said"
+            exit 1
+          fi
 
       - name: Download the checksums
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -692,6 +715,7 @@ jobs:
     permissions: {}
     env:
       TAG: ${{ needs.notes.outputs.sign_tag }}
+      PUBLISH: ${{ needs.notes.outputs.publish }}
     steps:
       - name: Download the Linux amd64 binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -722,13 +746,31 @@ jobs:
           [ -n "$bin" ] || { echo "::error::no crystalline binary in the linux-amd64 archive"; exit 1; }
           chmod +x "$bin"
           # The test seams exist only in debug builds; the shipped binary
-          # must not even carry their names. A new seam adds its name here.
-          for seam in CRYSTALLINE_TEST_UPDATE_KEY; do
+          # must not even carry their names. A new seam adds its name here
+          # (packaging.rs checks that every updater seam is listed).
+          for seam in CRYSTALLINE_TEST_UPDATE_API CRYSTALLINE_TEST_UPDATE_DOWNLOAD CRYSTALLINE_TEST_UPDATE_KEY CRYSTALLINE_TEST_UPDATE_METHOD; do
             if grep -a -q "$seam" "$bin"; then
               echo "::error::the release binary carries the test seam $seam"
               exit 1
             fi
           done
+          # A release binary must say it is an official build, or every
+          # install of it refuses `update now`; a dry run's binary is built
+          # without a tag and must say it is not. Read from `doctor --json`
+          # with a config and database of its own, so it asks no daemon and
+          # no network.
+          home="$RUNNER_TEMP/official-home"
+          mkdir -p "$home"
+          official="$(HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" XDG_STATE_HOME="$home/state" XDG_CACHE_HOME="$home/cache" \
+            "$bin" doctor --json --config "$home/config.yaml" --db "$home/index.db" | jq -r '.update.official')" || true
+          want=false
+          if [ "$PUBLISH" = "true" ]; then
+            want=true
+          fi
+          if [ "$official" != "$want" ]; then
+            echo "::error::the release binary reports official=$official, expected $want for this run"
+            exit 1
+          fi
           "$bin" update verify-sums --tag "$TAG" signed/SHA256SUMS signed/SHA256SUMS.minisig
 
   publish:

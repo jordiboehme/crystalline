@@ -227,3 +227,61 @@ fn the_two_checksum_steps_are_the_same() {
     );
     assert_eq!(checksums, collect("publish"));
 }
+
+/// Every `CRYSTALLINE_TEST_UPDATE_*` name the sources hold is in the seam
+/// loop of release.yml's `check-signature` job, which fails a release
+/// whose binary carries one. A seam added to the code and not to the loop
+/// would ship unseen.
+#[test]
+fn the_release_checks_every_updater_seam() {
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&repo_file(".github/workflows/release.yml"))
+            .expect("release.yml parses");
+    let check = workflow["jobs"]["check-signature"]["steps"]
+        .as_sequence()
+        .expect("the check-signature job has steps")
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .find(|run| run.contains("for seam in "))
+        .expect("a step loops over the seams");
+    let looped: Vec<&str> = check
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("for seam in "))
+        .and_then(|rest| rest.strip_suffix("; do"))
+        .expect("the loop line")
+        .split_whitespace()
+        .collect();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found = std::collections::BTreeSet::new();
+    let mut dirs: Vec<PathBuf> = ["cli", "core", "engine", "service"]
+        .iter()
+        .map(|krate| root.join(krate).join("src"))
+        .collect();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a source folder") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a source file");
+            for (at, _) in text.match_indices("\"CRYSTALLINE_TEST_UPDATE_") {
+                let name: String = text[at + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                    .collect();
+                found.insert(name);
+            }
+        }
+    }
+    assert!(found.len() >= 4, "the four updater seams: {found:?}");
+    for name in &found {
+        assert!(
+            looped.contains(&name.as_str()),
+            "release.yml's seam loop misses {name}"
+        );
+    }
+}
