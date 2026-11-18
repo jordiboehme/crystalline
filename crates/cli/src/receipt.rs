@@ -42,6 +42,15 @@ pub(crate) struct Receipt {
         with = "time::serde::stamp_option"
     )]
     pub(crate) update_check_asked: Option<Stamp>,
+    /// When a non-interactive `crystalline install` said once that the
+    /// daily update check is off, so later scripted installs stay silent.
+    /// An interactive install still asks. Absent before 0.34.0.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::stamp_option"
+    )]
+    pub(crate) update_check_hinted: Option<Stamp>,
 }
 
 impl Default for Receipt {
@@ -50,6 +59,7 @@ impl Default for Receipt {
             format: FORMAT,
             installs: Vec::new(),
             update_check_asked: None,
+            update_check_hinted: None,
         }
     }
 }

@@ -2770,16 +2770,19 @@ pub(crate) const UPDATE_QUESTION: &str =
     "Check once a day for a newer Crystalline? Nothing is installed without you. [y/N] ";
 
 /// What a no prints, and the one stderr line a non-interactive install
-/// prints where it would have asked.
+/// prints, once per machine, where it would have asked. Information for
+/// the person, not an instruction.
 pub(crate) const UPDATE_STAYS_OFF: &str =
-    "Update check stays off. Turn it on with: crystalline update auto on";
+    "Daily update check: off (`crystalline update auto on` turns it on).";
 
 /// What [`should_ask`] decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ask {
     /// Ask at the terminal.
     Question,
-    /// Not a terminal: print [`UPDATE_STAYS_OFF`] on stderr, record nothing.
+    /// Not a terminal: print [`UPDATE_STAYS_OFF`] on stderr once per
+    /// machine (the receipt's `update_check_hinted`); the question's stamp
+    /// stays unset, so a later interactive install still asks.
     Hint,
     /// Say nothing and record nothing.
     Silent,
@@ -2872,6 +2875,14 @@ pub(crate) fn ask_with(seams: AskSeams<'_>) -> AskOutcome {
     ) {
         Ask::Silent => AskOutcome::Silent,
         Ask::Hint => {
+            if book.update_check_hinted.is_some() {
+                return AskOutcome::Silent;
+            }
+            book.update_check_hinted = Some(seams.now);
+            if receipt::save(seams.receipt, &book).is_err() {
+                // Unrecorded, it would be printed at every install.
+                return AskOutcome::Silent;
+            }
             let _ = writeln!(seams.err, "{UPDATE_STAYS_OFF}");
             AskOutcome::Hint
         }
@@ -3060,7 +3071,7 @@ mod update_question_tests {
         );
         assert_eq!(
             UPDATE_STAYS_OFF,
-            "Update check stays off. Turn it on with: crystalline update auto on"
+            "Daily update check: off (`crystalline update auto on` turns it on)."
         );
         assert_eq!(
             update::AUTO_ON,
@@ -3213,7 +3224,7 @@ mod update_question_tests {
     }
 
     #[test]
-    fn non_interactive_prints_the_hint_and_records_nothing() {
+    fn non_interactive_prints_the_hint_once_and_never_the_question_stamp() {
         let dir = tempfile::tempdir().unwrap();
         let receipt = dir.path().join("installs.json");
         let hint = run(
@@ -3231,7 +3242,30 @@ mod update_question_tests {
         assert_eq!(hint.outcome, AskOutcome::Hint);
         assert_eq!(hint.err, format!("{UPDATE_STAYS_OFF}\n"));
         assert_eq!((hint.asked, hint.turned_on), (0, 0));
-        assert!(!receipt.exists(), "no stamp, so a later install still asks");
+        assert_eq!(
+            stamp(&receipt),
+            None,
+            "no question stamp, so a later install still asks"
+        );
+        assert_eq!(
+            receipt::load(&receipt).unwrap().update_check_hinted,
+            Some(at())
+        );
+        // A second scripted install stays silent.
+        let again = run(
+            &receipt,
+            Case {
+                tty: false,
+                json: false,
+                env_set: false,
+                suppressed: false,
+                config_set: Some(false),
+                yes: true,
+            },
+            &mut on,
+        );
+        assert_eq!(again.outcome, AskOutcome::Silent);
+        assert_eq!(again.err, "");
         // A later interactive install does ask.
         let later = run(
             &receipt,

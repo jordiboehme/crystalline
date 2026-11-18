@@ -9,7 +9,10 @@ mod support;
 mod fixture;
 
 mod check;
+// Every test in these two drives the debug-only download and key seams.
+#[cfg(debug_assertions)]
 mod now;
+#[cfg(debug_assertions)]
 mod swap;
 
 use std::path::PathBuf;
