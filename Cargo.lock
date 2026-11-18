@@ -1554,6 +1554,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turso",
+ "url",
  "uuid",
  "walkdir",
 ]

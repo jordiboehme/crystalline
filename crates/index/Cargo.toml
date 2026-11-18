@@ -48,6 +48,9 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+# Parses a database URL strictly before any part of it is shown
+# (`postgres::sanitize_url`); already in the tree through crystalline-core.
+url = { workspace = true }
 
 # Local embedding stack, gated by `local-embeddings`. CPU everywhere except on
 # Apple Silicon Macs, where the target table below adds candle's `metal`

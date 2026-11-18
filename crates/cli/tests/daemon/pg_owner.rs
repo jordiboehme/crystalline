@@ -3027,6 +3027,19 @@ fn an_index_that_does_not_open_gets_the_advice_of_its_backend() {
     assert!(!err.contains("file is readable"), "{err}");
     assert!(!err.contains("reindex --wipe"), "{err}");
 
+    // A password with a raw `?` makes a URL that cannot be read safely: the
+    // words say "the configured database" and show no part of it.
+    let url = format!("postgres://u:pq?zw@127.0.0.1:{}/nodb", free_port());
+    let mut odd = vars;
+    odd[1] = ("CRYSTALLINE_DATABASE_URL", url.as_str());
+    let (ok, out, err) = run_vars(&env, &["reindex"], &odd);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains("the index in the configured database could not be opened"),
+        "{err}"
+    );
+    assert!(!err.contains("pq") && !err.contains("zw"), "{err}");
+
     let turso = Env::new("filedown");
     std::fs::create_dir_all(turso.state_dir().join("index.db/not-a-file")).unwrap();
     let (ok, out, err) = turso.run_full(&["reindex"]);

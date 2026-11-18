@@ -187,11 +187,21 @@ impl PgTarget {
         })
     }
 
+    /// The `host:port/db` of the URL for people to read, or `None` when the
+    /// URL does not parse cleanly enough to show any part of it safely (see
+    /// `sanitize_url`).
+    pub fn address(&self) -> Option<String> {
+        super::sanitize_url(&self.url)
+    }
+
     /// The database for people to read: `host:port/db` and the schema, with
     /// no credentials and no query string, for example
-    /// `db.internal:5432/crystalline, schema team_a`.
+    /// `db.internal:5432/crystalline, schema team_a`. When the address cannot
+    /// be shown safely it reads `(address not shown), schema team_a`.
     pub fn describe(&self) -> String {
-        let place = super::sanitize_url(&self.url).unwrap_or_else(|| "(unknown)".to_string());
+        let place = self
+            .address()
+            .unwrap_or_else(|| "(address not shown)".to_string());
         match &self.schema {
             Some(schema) => format!("{place}, schema {schema}"),
             None => format!("{place}, default schema"),
@@ -337,31 +347,104 @@ mod tests {
         assert_eq!(t.describe(), "db.internal:5432/crystalline, schema team_a");
         let t = PgTarget { schema: None, ..t };
         assert_eq!(t.describe(), "db.internal:5432/crystalline, default schema");
-        // Credentials in the query string, an `@` in the query with and
-        // without userinfo before the host, and a raw `/` or `@` in a
-        // password: none of it is ever shown.
+        // Credentials in the query string or the fragment: the address is
+        // still clean, so it is shown, without them.
         for url in [
             "postgres://db.internal:5432/crystalline?password=secret",
             "postgres://db.internal:5432/crystalline?sslpassword=secret&sslmode=require",
-            "postgres://db.internal:5432/crystalline?user=ada@corp&password=secret",
-            "postgres://ada:secret@db.internal:5432/crystalline?user=ada@corp&password=secret",
             "postgres://ada:secret@db.internal:5432/crystalline#password=secret",
-            "postgres://ada:se/cret@db.internal:5432/crystalline",
-            "postgres://ada:se@cret@db.internal:5432/crystalline",
         ] {
             let t = PgTarget {
                 url: url.to_string(),
                 schema: None,
             };
-            let shown = t.describe();
             assert_eq!(
-                shown, "db.internal:5432/crystalline, default schema",
+                t.address().as_deref(),
+                Some("db.internal:5432/crystalline"),
                 "{url}"
             );
-            assert!(
-                !shown.contains("secret") && !shown.contains("cret"),
-                "{url}"
-            );
+        }
+        let t = PgTarget {
+            url: "postgresql://ada:secret@DB.internal:5432/crystalline".to_string(),
+            schema: None,
+        };
+        assert_eq!(t.address().as_deref(), Some("DB.internal:5432/crystalline"));
+        // Anything in doubt shows no address at all: an `@` in the query with
+        // and without credentials before the host, and a password with a raw
+        // `?`, `#`, `/` or `@` in it, which is a URL that does not connect and
+        // so exactly the one a failed open names.
+        for url in [
+            "postgres://db.internal:5432/crystalline?user=ada@corp&password=secret",
+            "postgres://ada:secret@db.internal:5432/crystalline?user=ada@corp&password=secret",
+            "postgres://ada:se@cret@db.internal:5432/crystalline",
+            "postgres://ada:pa?ss@db/c",
+            "postgres://ada:pa#ss@db/c",
+            "postgres://ada:pa/ss@db/c",
+            "postgres://ada:12?ss@db/c",
+            "postgres://ada:12#ss@db/c",
+            "postgres://ada:12/ss@db/c",
+            "not a url",
+        ] {
+            let t = PgTarget {
+                url: url.to_string(),
+                schema: Some("team_a".to_string()),
+            };
+            assert_eq!(t.address(), None, "{url}");
+            assert_eq!(t.describe(), "(address not shown), schema team_a", "{url}");
+        }
+        // For every case above: no piece of a password (three characters or
+        // more) and not the user name is ever in the address shown. The two
+        // character pieces are left out because `cr` of `secret` is also in
+        // `crystalline`; a doubtful URL shows no address at all.
+        let cases: [(&str, &str); 13] = [
+            (
+                "postgres://ada:secret@db.internal:5432/crystalline?sslmode=require",
+                "secret",
+            ),
+            (
+                "postgres://db.internal:5432/crystalline?password=secret",
+                "secret",
+            ),
+            (
+                "postgres://db.internal:5432/crystalline?sslpassword=secret&sslmode=require",
+                "secret",
+            ),
+            (
+                "postgres://ada:secret@db.internal:5432/crystalline#password=secret",
+                "secret",
+            ),
+            (
+                "postgres://db.internal:5432/crystalline?user=ada@corp&password=secret",
+                "secret",
+            ),
+            (
+                "postgres://ada:secret@db.internal:5432/crystalline?user=ada@corp&password=secret",
+                "secret",
+            ),
+            (
+                "postgres://ada:se@cret@db.internal:5432/crystalline",
+                "se@cret",
+            ),
+            ("postgres://ada:pa?ss@db/c", "pa?ss"),
+            ("postgres://ada:pa#ss@db/c", "pa#ss"),
+            ("postgres://ada:pa/ss@db/c", "pa/ss"),
+            ("postgres://ada:12?ss@db/c", "12?ss"),
+            ("postgres://ada:12#ss@db/c", "12#ss"),
+            ("postgres://ada:12/ss@db/c", "12/ss"),
+        ];
+        for (url, password) in cases {
+            let shown = PgTarget {
+                url: url.to_string(),
+                schema: None,
+            }
+            .address()
+            .unwrap_or_default();
+            let chars: Vec<char> = password.chars().collect();
+            for window in chars.windows(3) {
+                let piece: String = window.iter().collect();
+                assert!(!shown.contains(&piece), "{url} showed {piece:?}: {shown}");
+            }
+            assert!(!shown.contains("ada"), "{url}: {shown}");
         }
     }
 

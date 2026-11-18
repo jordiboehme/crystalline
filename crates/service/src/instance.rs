@@ -2954,7 +2954,8 @@ pub enum IndexLocation {
     File(String),
     /// A Postgres database, described without credentials
     /// (`host:port/db, schema s`), or `None` when the configuration does not
-    /// name one this binary can describe.
+    /// name one this binary can describe, or its URL is not clean enough to
+    /// show any part of it.
     Database(Option<String>),
 }
 
@@ -2967,7 +2968,9 @@ impl IndexLocation {
             return IndexLocation::File(db.display().to_string());
         }
         #[cfg(feature = "postgres")]
-        if let Ok(target) = crystalline_index::postgres::PgTarget::from_config(&database) {
+        if let Ok(target) = crystalline_index::postgres::PgTarget::from_config(&database)
+            && target.address().is_some()
+        {
             return IndexLocation::Database(Some(target.describe()));
         }
         IndexLocation::Database(None)

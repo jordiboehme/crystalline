@@ -1482,27 +1482,46 @@ fn kind_str(kind: DomainKind) -> &'static str {
     }
 }
 
-/// Strip the scheme, any credentials and the query string from a connection url,
-/// leaving `host:port/dbname` for display. Never returns credentials.
+/// The `host:port/dbname` of a connection URL for display, with no scheme,
+/// credentials, query or fragment; `None` whenever that cannot be said for
+/// sure, and the caller then names "the configured database" instead.
 ///
-/// The query and the fragment are cut first, because they can hold an `@`
-/// and a password themselves (`?user=ada@corp&password=secret`). The
-/// credentials are then everything before the last `@` that is left. The cut
-/// is at the last `@`, not inside the authority up to the first `/`: a
-/// password written with a raw `/` in it (`ada:pa/ss@db`) would otherwise be
-/// read as the path and printed. A database name with an `@` in it loses its
-/// host in the display, which is the safe side of that trade.
-pub(crate) fn sanitize_url(url: &str) -> Option<String> {
-    let after_scheme = url.split("://").nth(1)?;
-    let before_query = after_scheme
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    let host_db = before_query
-        .rsplit_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(before_query);
-    Some(host_db.to_string())
+/// Splitting the text by hand cannot be made safe: a password written with a
+/// raw `?`, `#`, `/` or `@` in it moves where every such split lands, and the
+/// URL that does not connect is exactly the one a failed open shows. So the
+/// URL is parsed strictly, and anything in doubt gives `None`: a URL that
+/// does not parse, a scheme other than `postgres`/`postgresql`, no host, or
+/// an `@` anywhere but the one between clean credentials and the host (an
+/// `@` in the query, the path or a password, or one the parser did not read
+/// as the end of the credentials).
+pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+        return None;
+    }
+    let has_credentials = !parsed.username().is_empty() || parsed.password().is_some();
+    let ats = raw.matches('@').count();
+    if ats != usize::from(has_credentials) {
+        return None;
+    }
+    let host = parsed.host_str().filter(|h| !h.is_empty())?;
+    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let path = parsed.path();
+    // The raw text has to say the same as the parse up to the path: the
+    // scheme, then the credentials when there are any, then exactly the host
+    // and port. A raw reserved character in a password breaks that.
+    let authority = raw.split_once("://")?.1;
+    let after_credentials = match authority.split_once('@') {
+        Some((_, rest)) => rest,
+        None => authority,
+    };
+    // The parser lowercases the host, so the comparison ignores ASCII case.
+    let shown = format!("{host}{port}{path}");
+    let raw_head = after_credentials.get(..shown.len())?;
+    if !raw_head.eq_ignore_ascii_case(&shown) {
+        return None;
+    }
+    Some(shown)
 }
 
 /// The child rows recreated on every upsert, deleted in one statement and so
