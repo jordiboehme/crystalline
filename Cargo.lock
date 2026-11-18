@@ -1599,7 +1599,6 @@ dependencies = [
  "axum-extra",
  "base64 0.23.1",
  "bytes",
- "chrono",
  "crystalline-core",
  "crystalline-engine",
  "crystalline-identity",

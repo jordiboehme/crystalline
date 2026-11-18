@@ -19,10 +19,6 @@ crates/cli/tests/setup/install_desktop.rs
 crates/cli/tests/setup/kept.rs
 crates/cli/tests/setup/source_hooks.rs
 crates/cli/tests/team/github_app.rs
-crates/rest/Cargo.toml
-crates/rest/src/domains.rs
-crates/rest/src/kept.rs
-crates/rest/src/oauth.rs
 crates/service/Cargo.toml
 crates/service/src/automation_trigger.rs
 crates/service/src/claim.rs

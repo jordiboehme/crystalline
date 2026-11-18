@@ -679,10 +679,7 @@ impl ManifestSections {
         // The same scaffold `domain init` writes, named for this domain. Read
         // off the clock rather than off the document: it is an offer, not a
         // reading of anything, and `recorded_at` is the day somebody takes it.
-        let today = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
+        let today = crystalline_core::time::today_utc().ymd();
         let starter_document = manifest_template(domain, &today);
         let ManifestFacts {
             scope,
