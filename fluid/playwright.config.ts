@@ -49,8 +49,10 @@ export default defineConfig({
   },
   // Chromium runs every journey. WebKit runs the questions only it can
   // answer - mermaid labels under Safari's page zoom, a page printed from a
-  // wide window, a diagram turned into a PNG, and where Tab lands at a diagram - and nothing else, so the
-  // suite does not double its run time for answers chromium already gives.
+  // wide window, a diagram turned into a PNG, and where Tab lands at a diagram,
+  // and a press on the quick format bar's text style menu, which Safari does
+  // not focus - and nothing else, so the suite does not double its run time
+  // for answers chromium already gives.
   projects: [
     {
       name: "chromium",
@@ -61,7 +63,7 @@ export default defineConfig({
       name: "webkit",
       use: { ...devices["Desktop Safari"] },
       testMatch:
-        /(mermaid-zoom|print|diagram-png|diagram-tab|mcp-tokens|users-delete)\.spec\.ts/,
+        /(mermaid-zoom|print|diagram-png|diagram-tab|mcp-tokens|users-delete|quick-format)\.spec\.ts/,
     },
   ],
   // No preview server for the run against the embedded UI. Spread rather

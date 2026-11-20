@@ -5,14 +5,22 @@
  * either side, or taller than the viewport, has the bar by the caret. On a
  * selected picture it is named "Picture options" and stands by the image.
  *
- * - On text: Bold, Italic, Strikethrough, Inline code, Link and Wiki link,
- *   the sticky bar's own commands under the sticky bar's own names (the
- *   toolbar's name tells the two apart).
- * - In a cell: the same text group, then Insert row below, Insert column
- *   right, Delete row, Delete column, Align (left, center, right) and "More
- *   table actions", which opens the grid's Cell actions menu. The table verbs
- *   run through the grid's own action path (`runCellAction`), so they keep
- *   its undo groups, its focus rule and the cell they land in.
+ * - On text: Bold, Italic, Strikethrough, Inline code, the "Aa" text style
+ *   menu, Link and Wiki link: the sticky bar's own commands under its own
+ *   names (the toolbar's name tells the two apart), "Aa" after Inline code
+ *   as there. The menu is `TextStyleMenu` itself, so Title, Heading 1 to 3
+ *   and Body, the line's style checked, and a Reflection page's question
+ *   before a section heading stops being one (read from the buffer's
+ *   `headingQuestion`) are the sticky bar's. Its menu is drawn inside the
+ *   bar and its question is marked as the bar's, so the focus moving into
+ *   either never reads as the focus leaving the editor.
+ * - In a cell: the same text group without the style menu (a cell holds
+ *   inline text only, never a heading, and the sticky bar turns the menu
+ *   off there too), then Insert row below, Insert column right, Delete row,
+ *   Delete column, Align (left, center, right) and "More table actions",
+ *   which opens the grid's Cell actions menu. The table verbs run through
+ *   the grid's own action path (`runCellAction`), so they keep its undo
+ *   groups, its focus rule and the cell they land in.
  * - On a picture: `PictureControls`, its placement, size, alt text and
  *   removal. Its alt field takes the focus like a field: a press on it is
  *   not cancelled, and Left, Right, Home and End edit its text, with Left
@@ -89,8 +97,10 @@ import {
 import type { Format } from "./marks/formatting";
 import { judgeBeforeCommand } from "./marks/commandJudge";
 import { formatRefusal, toggleFormat } from "./marks/formatting";
+import { headingQuestion } from "./marks/deleting";
 import { focusBack } from "./focusBack";
 import { PictureControls, pictureLabels } from "./PictureControls";
+import { TextStyleMenu } from "./TextStyleMenu";
 import { insertWikilink } from "./toolbar";
 
 export interface FloatingBarProps {
@@ -341,12 +351,29 @@ export default function FloatingBar({
         : textItems(wikilinks, why);
   const inCell = visible && context.kind === "cell";
   const alignOff = inCell && !cellActionApplies(main, "Align left");
+  /**
+   * The text style menu, on text only: a style is a line's, and a cell holds
+   * no lines of its own (the sticky bar turns it off there too). Off, like
+   * the sticky bar's, while main is not the view a verb acts on.
+   */
+  const style = visible && context.kind === "text";
+  const styleOff = !style || target !== main;
+  /**
+   * The format buttons, then the style menu, then the rest: the sticky bar's
+   * order, where "Aa" follows Inline code.
+   */
+  const formatItems = items.filter((item) => item.format !== undefined);
+  const otherItems = items.filter((item) => item.format === undefined);
+  const enabled = (list: Item[]) =>
+    list.filter((item) => !item.disabled).map((item) => item.label);
   /** The enabled controls, in order: the roving tab stop is one of them. */
   const labels =
     picture !== null
       ? pictureLabels(picture.formattable)
       : [
-          ...items.filter((item) => !item.disabled).map((item) => item.label),
+          ...enabled(formatItems),
+          ...(styleOff ? [] : ["Text style"]),
+          ...enabled(otherItems),
           ...(inCell
             ? [...(alignOff ? [] : ["Align"]), "More table actions"]
             : []),
@@ -482,6 +509,30 @@ export default function FloatingBar({
     },
   });
 
+  const button = (item: Item) => (
+    <IconButton
+      key={item.label}
+      label={item.label}
+      icon={item.icon}
+      disabled={item.disabled ?? false}
+      {...(item.describedBy === undefined
+        ? {}
+        : { "aria-describedby": item.describedBy })}
+      {...(item.format && formats
+        ? { "aria-pressed": formats.has(item.format) }
+        : {})}
+      onClick={() => {
+        // From outside the editor's DOM: a waiting composition first (D60).
+        judgeBeforeCommand(verbTarget(main) ?? main);
+        item.run(main);
+        // The view Alt+F10 came from may be gone now (a verb that
+        // landed in another cell): Escape later returns to the target.
+        origin.current = null;
+      }}
+      {...roving(item.label)}
+    />
+  );
+
   return (
     <div
       ref={bar}
@@ -501,29 +552,21 @@ export default function FloatingBar({
           {formatWhy}
         </span>
       )}
-      {items.map((item) => (
-        <IconButton
-          key={item.label}
-          label={item.label}
-          icon={item.icon}
-          disabled={item.disabled ?? false}
-          {...(item.describedBy === undefined
-            ? {}
-            : { "aria-describedby": item.describedBy })}
-          {...(item.format && formats
-            ? { "aria-pressed": formats.has(item.format) }
-            : {})}
-          onClick={() => {
-            // From outside the editor's DOM: a waiting composition first (D60).
-            judgeBeforeCommand(verbTarget(main) ?? main);
-            item.run(main);
-            // The view Alt+F10 came from may be gone now (a verb that
-            // landed in another cell): Escape later returns to the target.
-            origin.current = null;
-          }}
-          {...roving(item.label)}
+      {formatItems.map(button)}
+      {style && (
+        <TextStyleMenu
+          view={main}
+          disabled={styleOff}
+          allow={(view) => verbTarget(view) === view}
+          // The document's question, as the buffer carries it: the bar is
+          // drawn only off Raw, where the hidden-mark layer holds it.
+          question={main.state.facet(headingQuestion)}
+          trigger={roving("Text style")}
+          inline
+          layer={{ [MARK]: "" }}
         />
-      ))}
+      )}
+      {otherItems.map(button)}
       {inCell && (
         <>
           <DropdownMenu.Root>
