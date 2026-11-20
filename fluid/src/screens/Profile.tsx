@@ -40,6 +40,7 @@
  * never by this screen.
  */
 
+import { focusLeft } from "../focusLeft";
 import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy } from "lucide-react";
@@ -114,9 +115,9 @@ interface Notice {
 /** The card's one primary: the way in most people will take. */
 const CONNECT_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.primary}`;
 
-const SECONDARY_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.secondary}`;
+const SECONDARY_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
 
-const DANGER_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.destructive}`;
+const DANGER_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.destructive}`;
 
 const MUTED = "text-sm text-slate-500 dark:text-slate-400";
 
@@ -1047,11 +1048,7 @@ function Disconnect({
         // taking the confirmation away there would eat the second press this
         // exists to require.
         const next = event.relatedTarget;
-        if (
-          confirming &&
-          next instanceof Node &&
-          !event.currentTarget.contains(next)
-        ) {
+        if (confirming && focusLeft(event.currentTarget, next)) {
           setConfirming(false);
         }
       }}
@@ -1392,11 +1389,7 @@ function TokenRow({
           }}
           onBlur={(event) => {
             const next = event.relatedTarget;
-            if (
-              confirming &&
-              next instanceof Node &&
-              !event.currentTarget.contains(next)
-            ) {
+            if (confirming && focusLeft(event.currentTarget, next)) {
               setConfirming(false);
             }
           }}
@@ -1820,11 +1813,7 @@ function GrantRow({
           }}
           onBlur={(event) => {
             const next = event.relatedTarget;
-            if (
-              confirming &&
-              next instanceof Node &&
-              !event.currentTarget.contains(next)
-            ) {
+            if (confirming && focusLeft(event.currentTarget, next)) {
               setConfirming(false);
             }
           }}

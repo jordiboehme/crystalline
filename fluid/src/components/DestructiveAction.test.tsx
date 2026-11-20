@@ -9,7 +9,7 @@
  * control's own and a parent's.
  */
 
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -270,5 +270,33 @@ describe("the destructive action", () => {
     // Giving up is the caller's to hear about: it owns the control that
     // armed this, and the focus that goes back to it.
     expect(onConfirmingChange).toHaveBeenCalledWith(false);
+  });
+
+  it("stays armed when focus moves to an ancestor, as Safari does on a click", async () => {
+    const onConfirm = vi.fn();
+    render(
+      <main tabIndex={0} data-testid="page">
+        <DestructiveAction
+          label="Make private"
+          confirmLabel="Confirm make private"
+          pending={false}
+          onConfirm={onConfirm}
+        />
+      </main>,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Make private" }));
+    const confirm = screen.getByRole("button", {
+      name: "Confirm make private",
+    });
+    // Safari's mousedown on the button: the focus goes to the focusable
+    // ancestor and the button never takes it.
+    fireEvent.focusOut(confirm, { relatedTarget: screen.getByTestId("page") });
+    expect(
+      screen.getByRole("button", { name: "Confirm make private" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(confirm);
+    expect(onConfirm).toHaveBeenCalled();
   });
 });

@@ -69,6 +69,7 @@ const COSTS: Readonly<Record<string, Cost>> = {
   // Measured locally on 2026-11-18 (chromium only, 2.1 s and 1.8 s),
   // rounded up; replace with a CI number.
   "update-note.spec.ts": { root: 3, path: 2 },
+  "users-delete.spec.ts": { root: 4, path: 4 },
 };
 
 /** The cost of a spec file the table does not name yet. */

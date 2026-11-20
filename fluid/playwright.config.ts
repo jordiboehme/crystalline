@@ -60,7 +60,8 @@ export default defineConfig({
     {
       name: "webkit",
       use: { ...devices["Desktop Safari"] },
-      testMatch: /(mermaid-zoom|print|diagram-png|diagram-tab)\.spec\.ts/,
+      testMatch:
+        /(mermaid-zoom|print|diagram-png|diagram-tab|mcp-tokens|users-delete)\.spec\.ts/,
     },
   ],
   // No preview server for the run against the embedded UI. Spread rather

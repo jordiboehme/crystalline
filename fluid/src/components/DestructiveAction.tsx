@@ -31,6 +31,7 @@
  *   what asked.
  */
 
+import { focusLeft } from "../focusLeft";
 import type { ReactElement, ReactNode } from "react";
 import { useEffect, useId, useRef, useState } from "react";
 
@@ -205,13 +206,15 @@ export function DestructiveAction({
         // out of the tab order a choice: a dialog closing behind this one
         // parks focus on a container of its own on the way out - which is
         // exactly what the command palette does to the row that armed this -
-        // and that is the dialog leaving rather than the reader.
+        // and that is the dialog leaving rather than the reader. Nor is an
+        // ancestor of the group one (see focusLeft: Safari parks focus there
+        // on a click).
         const next = event.relatedTarget;
         if (
           open &&
           next instanceof HTMLElement &&
           next.tabIndex >= 0 &&
-          !event.currentTarget.contains(next)
+          focusLeft(event.currentTarget, next)
         ) {
           setOpen(false);
         }

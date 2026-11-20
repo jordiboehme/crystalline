@@ -14,6 +14,7 @@
  * screen that is simply open.
  */
 
+import { focusLeft } from "../focusLeft";
 import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useId, useRef, useState } from "react";
@@ -387,11 +388,7 @@ function Disconnect({
         // taking the confirmation away there would eat the second press this
         // exists to require.
         const next = event.relatedTarget;
-        if (
-          confirming &&
-          next instanceof Node &&
-          !event.currentTarget.contains(next)
-        ) {
+        if (confirming && focusLeft(event.currentTarget, next)) {
           setConfirming(false);
         }
       }}
