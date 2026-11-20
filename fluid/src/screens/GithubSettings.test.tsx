@@ -3,8 +3,10 @@
  *
  * The only settings section this app ships, and the one screen where a
  * credential changes hands. What is pinned here is what an admin has to be
- * able to trust: that it exists for nobody else, that both ways in are on
- * offer, that the device flow shows the code and where to type it, that a
+ * able to trust: that it exists for nobody else, that it says first how the
+ * instance reaches GitHub, that the ways to store a token are the way in
+ * without an App and folded away beside one, that Disconnect is offered only
+ * where something is stored to remove, that the device flow shows the code and where to type it, that a
  * token typed in is sent once and left nowhere, and that every refusal is the
  * server's own sentence rather than a house message pasted over it.
  */
@@ -145,7 +147,7 @@ describe("the GitHub settings screen", () => {
       await screen.findByText(/nothing is filed at this address/i),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "GitHub" }),
+      screen.queryByRole("heading", { name: "GitHub connection" }),
     ).not.toBeInTheDocument();
     // The screen asks the server nothing, and the frame advertises no door
     // this session cannot open.
@@ -163,7 +165,9 @@ describe("the GitHub settings screen", () => {
     await user.click(
       await screen.findByRole("button", { name: "Ada Lovelace" }),
     );
-    const settings = await screen.findByRole("menuitem", { name: "Settings" });
+    const settings = await screen.findByRole("menuitem", {
+      name: "GitHub connection",
+    });
     expect(settings).toHaveAttribute("href", "/settings/github");
   });
 
@@ -172,14 +176,21 @@ describe("the GitHub settings screen", () => {
     renderApp("/settings/github");
 
     expect(
-      await screen.findByRole("heading", { name: "GitHub" }),
+      await screen.findByRole("heading", { name: "GitHub connection" }),
     ).toBeInTheDocument();
-    expect(await screen.findByText(/not connected/i)).toBeInTheDocument();
-    // Both ways in, side by side: the browser sign-in, and a token for an
-    // instance nobody is sitting in front of.
+    expect(await screen.findByText("Not connected.")).toBeInTheDocument();
+    // Without an App both ways in stand open, side by side: the browser
+    // sign-in as the primary, and a token for an instance nobody is sitting
+    // in front of. Nothing is folded, and nothing is stored to disconnect.
     expect(
       screen.getByRole("button", { name: /connect with github/i }),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Other ways to connect" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Disconnect" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByLabelText(/personal access token/i)).toHaveAttribute(
       "type",
       "password",
@@ -203,9 +214,212 @@ describe("the GitHub settings screen", () => {
     renderApp("/settings/github");
     expect(
       await screen.findByText(
-        /By default with a GitHub App, each person opens proposals under their own GitHub account.*set github.share_identity to instance/,
+        /Each person opens proposals under their own GitHub account.*This is the default with a GitHub App\. To have the App open them, set github.share_identity to instance\./,
       ),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /^Scheduled runs go through the App\. Shares from a terminal on the server need the owner's own sign-in: run crystalline connect github --personal there\.$/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says the App opens proposals in instance mode", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          token_store: "GitHub App",
+          app: APP,
+          share_identity: "instance",
+          share_identity_default: false,
+        }),
+    });
+    renderApp("/settings/github");
+    expect(
+      await screen.findByText(
+        /The App opens proposals and names the person who shares as the commit author\. To have each person open their own, set github.share_identity to personal\./,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/--personal/)).not.toBeInTheDocument();
+  });
+
+  it("names the owner's sign-in when personal is set, and promotes no connect for it", async () => {
+    // The page's connect stores the instance token, never the owner's own
+    // identity, so the way to that identity is the command, and the connect
+    // stays folded with the token form.
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          user: "crystalline-kb[bot]",
+          token_store: "GitHub App",
+          app: APP,
+          share_identity: "personal",
+          share_identity_default: false,
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(
+        /^Scheduled runs and shares from a terminal on the server need the owner's own sign-in: run crystalline connect github --personal there\.$/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/This is the default/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /connect with github/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Other ways to connect" }),
+    ).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("puts the App connection first and folds the other ways to connect", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          user: "crystalline-kb[bot]",
+          token_store: "GitHub App",
+          app: { ...APP, source: "environment" },
+          share_identity: "instance",
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(
+        "Connected through the GitHub App as crystalline-kb[bot].",
+      ),
+    ).toBeInTheDocument();
+    // Status first: the connection card comes before the App card.
+    const headings = screen
+      .getAllByRole("heading", { level: 2 })
+      .map((heading) => heading.textContent)
+      .filter((name) => name === "Connection" || name === "GitHub App");
+    expect(headings).toEqual(["Connection", "GitHub App"]);
+    // The App's source and secret, in sentences.
+    expect(
+      screen.getByText("Configured from the environment."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "People can link their own GitHub account in their profile.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/\(environment\)/)).not.toBeInTheDocument();
+    // Nothing is stored for Disconnect to remove, so it is not offered, and
+    // the ways to store an instance token are folded.
+    expect(
+      screen.queryByRole("button", { name: "Disconnect" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /connect with github/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/personal access token/i),
+    ).not.toBeInTheDocument();
+
+    const fold = screen.getByRole("button", { name: "Other ways to connect" });
+    expect(fold).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(fold);
+    expect(fold).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: /connect with github/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText(/personal access token/i)).toHaveAttribute(
+      "type",
+      "password",
+    );
+    expect(screen.getByText(/that token is not used/i)).toBeInTheDocument();
+  });
+
+  it("names the App when a token is stored beside it, and offers to remove the token", async () => {
+    // The status names the stored token whenever one is on file, but the App
+    // carries the work: the card says so and Disconnect removes the token.
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          user: "octo",
+          token_store: "keyring",
+          app: APP,
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(
+        "Connected through the GitHub App as crystalline-kb.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "A token for octo is also stored on this instance. It is not used while the App works.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Removes the token stored for octo."),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+    expect(
+      screen.getByText("The App keeps reading, pulling and sharing."),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no connect and no Disconnect while the token comes from the environment", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          user: "octo",
+          token_store: "environment",
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(
+        "Connected as octo, with the token set in CRYSTALLINE_GITHUB_TOKEN on the server.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Disconnect" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /connect with github/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/personal access token/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("says nothing is connected while the App is refused", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          app: {
+            ...APP,
+            install_url: null,
+            error: "the private key is not valid",
+          },
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(/Not connected: the GitHub App cannot be used/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "the private key is not valid",
+    );
   });
 
   it("names a GitHub App plainly, even before GitHub named its bot", async () => {
@@ -220,7 +434,7 @@ describe("the GitHub settings screen", () => {
     renderApp("/settings/github");
 
     expect(
-      await screen.findByText("Connected as GitHub App"),
+      await screen.findByText("Connected through the GitHub App."),
     ).toBeInTheDocument();
     expect(screen.queryByText(/did not name/i)).not.toBeInTheDocument();
   });
@@ -239,7 +453,7 @@ describe("the GitHub settings screen", () => {
 
     expect(
       await screen.findByText(
-        "Connected as crystalline-acme[bot] (GitHub App)",
+        "Connected through the GitHub App as crystalline-acme[bot].",
       ),
     ).toBeInTheDocument();
   });
@@ -322,8 +536,11 @@ describe("the GitHub settings screen", () => {
     await waitFor(() => {
       expect(field).toHaveValue("");
     });
-    expect(await screen.findByText(/connected as octo/i)).toBeInTheDocument();
-    expect(screen.getByText(/keyring/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "Connected as octo, with a token kept in the system keychain.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("leaves no copy of the token in the mutation cache", async () => {
@@ -415,10 +632,14 @@ describe("the GitHub settings screen", () => {
     });
     renderApp("/settings/github");
 
-    await userEvent.click(
-      await screen.findByRole("button", { name: "Disconnect" }),
-    );
+    expect(
+      await screen.findByText("Removes the token stored for octo."),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
     expect(forgotten).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/syncing them stops until this instance/i),
+    ).toBeInTheDocument();
 
     await userEvent.click(
       screen.getByRole("button", { name: /confirm disconnect/i }),
@@ -426,7 +647,10 @@ describe("the GitHub settings screen", () => {
     await waitFor(() => {
       expect(forgotten).toHaveBeenCalled();
     });
-    expect(await screen.findByText(/not connected/i)).toBeInTheDocument();
+    expect(await screen.findByText("Not connected.")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Connect again to keep team domains in step/),
+    ).toBeInTheDocument();
   });
 
   it("Create GitHub App posts the manifest form", async () => {
@@ -528,8 +752,15 @@ describe("the GitHub settings screen", () => {
     });
     renderApp("/settings/github");
 
-    expect(await screen.findByText("Client secret: set")).toBeInTheDocument();
-    expect(screen.queryByText(/not set/i)).not.toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "People can link their own GitHub account in their profile.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Saved in the system keychain."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/client secret/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/cannot link/i)).not.toBeInTheDocument();
   });
 
@@ -553,10 +784,9 @@ describe("the GitHub settings screen", () => {
       renderApp("/settings/github");
 
       expect(
-        await screen.findByText("Client secret: not set"),
-      ).toBeInTheDocument();
-      expect(
-        screen.getByText(/people cannot link their github account/i),
+        await screen.findByText(
+          /people cannot link their own github account yet, because the app has no client secret/i,
+        ),
       ).toBeInTheDocument();
       const command = screen.getByText(/crystalline github app set/);
       expect(command.textContent).toContain("--app-id 7");
@@ -581,7 +811,7 @@ describe("the GitHub settings screen", () => {
     renderApp("/settings/github");
 
     expect(
-      await screen.findByText("Client secret: not set"),
+      await screen.findByText(/the App has no client secret/),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -601,10 +831,9 @@ describe("the GitHub settings screen", () => {
     renderApp("/settings/github");
 
     expect(
-      await screen.findByText("Client secret: not set"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("Without it, people cannot link their GitHub account."),
+      await screen.findByText(
+        "People cannot link their own GitHub account yet, because the App has no client secret.",
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/restart/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/crystalline github app set/)).toBeNull();
@@ -692,7 +921,7 @@ describe("the GitHub settings screen", () => {
     renderApp("/settings/github");
 
     // The status has arrived: the connection line says so.
-    expect(await screen.findByText(/not connected/i)).toBeInTheDocument();
+    expect(await screen.findByText("Not connected.")).toBeInTheDocument();
     expect(screen.getByText("Reading the App")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Create GitHub App" }),
@@ -733,7 +962,7 @@ describe("the GitHub settings screen", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "GitHub" }),
+      await screen.findByRole("heading", { name: "GitHub connection" }),
     ).toBeInTheDocument();
   });
 });
