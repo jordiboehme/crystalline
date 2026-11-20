@@ -1039,8 +1039,11 @@ jobs:
 
   images:
     name: publish container images
-    # sbom too, so a release whose SBOMs failed pushes no image either.
-    needs: [notes, build, sbom]
+    # sbom too, so a release whose SBOMs failed pushes no image either. And
+    # publish: an image is pushed only once the release itself exists, signed
+    # and checked. In 0.34.0 a failed signing run had already pushed :0.34.0
+    # and :latest for a version that had no release yet.
+    needs: [notes, build, sbom, publish]
     runs-on: ubuntu-latest
     # Same guard as publish: workflow_dispatch is a build-matrix dry run
     # only, it never pushes an image.
@@ -1237,10 +1240,11 @@ jobs:
   # consumes nothing the build matrix produces, but it still waits on it: a tag
   # whose binaries failed to build is not a release, and a UI image published
   # for one would point at a Crystalline nobody can install. It waits on the
-  # SBOM job for the same reason.
+  # SBOM job for the same reason, and on publish, as the images job does: no
+  # image for a version whose release failed to sign or publish.
   fluid-image:
     name: publish the Fluid image
-    needs: [notes, build, sbom]
+    needs: [notes, build, sbom, publish]
     runs-on: ubuntu-latest
     # Same guard as publish and images: workflow_dispatch is a build-matrix
     # dry run only, it never pushes an image.
