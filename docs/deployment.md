@@ -313,7 +313,7 @@ Restart the daemon after upgrading the binary, before editing accounts, so both 
 
 Those three modes are about the people using Fluid. The agents connecting over HTTP MCP are governed separately, by `auth.mcp`, which is its own scenario with its own token-issuance story and its own consequences for what an authenticated agent may see: see [Authenticated agents](#authenticated-agents).
 
-An admin can also manage domains from Fluid itself: create local, virtual or GitHub team domains, connect GitHub under Settings, and download or import a domain as a zip archive. Download archive and Import archive on the domain page are the plain backup and restore story - the zip holds the domain's markdown files (MANIFEST included) and imports through the normal write path, so the index stays in sync.
+An admin can also manage domains from Fluid itself: create local, virtual or GitHub team domains, connect GitHub under Administration > GitHub connection in the avatar menu, and download or import a domain as a zip archive. Download archive and Import archive on the domain page are the plain backup and restore story - the zip holds the domain's markdown files (MANIFEST included) and imports through the normal write path, so the index stays in sync.
 
 Serve it over TLS anywhere but localhost. The session cookie is marked `Secure` for any browser `Host` that is not loopback, and for any request a proxy in front reports as `https`, so a browser on a plain `http://team.lan` is handed a cookie it refuses to store and signing in never sticks. Put a TLS terminator in front of the Fluid container and the same deployment works unchanged: Fluid passes an existing `X-Forwarded-Proto` through rather than overwriting it with its own hop.
 

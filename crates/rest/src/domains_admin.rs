@@ -1522,7 +1522,7 @@ pub async fn sync_now(
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
             "GitHub is not connected on this instance: connect it under \
-             Settings > GitHub, then retry the sync",
+             Administration > GitHub connection, then retry the sync",
         ));
     }
     let report = single_domain(
@@ -1708,7 +1708,7 @@ pub async fn share_changes_preview(
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
             "GitHub is not connected on this instance: connect it under \
-             Settings > GitHub, then retry",
+             Administration > GitHub connection, then retry",
         ));
     }
     Ok(Json(
@@ -1978,7 +1978,7 @@ pub async fn share_now(
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
             "GitHub is not connected on this instance: connect it under \
-             Settings > GitHub, then retry the share",
+             Administration > GitHub connection, then retry the share",
         ));
     }
     Ok(Json(
@@ -2127,7 +2127,7 @@ pub async fn withdraw_proposal(
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
             "GitHub is not connected on this instance: connect it under \
-             Settings > GitHub, then retry the withdraw",
+             Administration > GitHub connection, then retry the withdraw",
         ));
     }
     Ok(Json(
@@ -3102,7 +3102,7 @@ fn require_team_domain(state: &RestState, domain: &str, refusal: Refusal) -> Res
 fn github_off_conflict() -> ApiError {
     ApiError::conflict(
         "GitHub is switched off on this instance, so no origin can be \
-         reached: turn it on under Settings > GitHub",
+         reached: turn it on under Administration > GitHub connection",
     )
 }
 
@@ -3610,7 +3610,7 @@ async fn set_governed_visibility(
 fn github_not_ready_conflict() -> ApiError {
     ApiError::conflict(
         "GitHub is not connected on this instance: connect it under \
-         Settings > GitHub, then register the team domain",
+         Administration > GitHub connection, then register the team domain",
     )
 }
 

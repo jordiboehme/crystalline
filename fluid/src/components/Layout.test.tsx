@@ -504,7 +504,9 @@ describe("the layout", () => {
     );
     // GitHub settings are reached through the identity menu's Settings item;
     // the top bar carries no separate door to the same screen.
-    expect(screen.queryByRole("link", { name: "GitHub" })).toBeNull();
+    expect(
+      screen.queryByRole("link", { name: "GitHub connection" }),
+    ).toBeNull();
     // And nothing to share on an instance with no origins to share to.
     expect(screen.queryByRole("button", { name: "Share changes" })).toBeNull();
     // The old strip of Maintenance, width, text size, theme and help controls
@@ -575,10 +577,14 @@ describe("the layout", () => {
     expect(
       await screen.findByRole("menuitem", { name: "Users" }),
     ).toHaveAttribute("href", "/users");
-    expect(screen.getByRole("menuitem", { name: "Settings" })).toHaveAttribute(
-      "href",
-      "/settings/github",
-    );
+    // Under a heading of its own, so it reads as the instance's settings
+    // rather than the signed-in person's.
+    expect(
+      screen.getByRole("group", { name: "Administration" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "GitHub connection" }),
+    ).toHaveAttribute("href", "/settings/github");
     expect(screen.getByRole("menuitem", { name: "Log out" })).toBeVisible();
   });
 
@@ -592,7 +598,7 @@ describe("the layout", () => {
     await openAvatar(user);
 
     // The editor's own identity, and the way out. The screens behind Users and
-    // Settings both refuse anyone but an admin, and the frame offers no door
+    // GitHub connection both refuse anyone but an admin, and the frame offers no door
     // that will not open.
     expect(
       await screen.findByText("Editor on this instance", { exact: false }),
@@ -600,7 +606,10 @@ describe("the layout", () => {
     expect(screen.getByRole("menuitem", { name: "Maintenance" })).toBeVisible();
     expect(screen.getByRole("menuitem", { name: "Log out" })).toBeVisible();
     expect(screen.queryByRole("menuitem", { name: "Users" })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: "Settings" })).toBeNull();
+    expect(
+      screen.queryByRole("menuitem", { name: "GitHub connection" }),
+    ).toBeNull();
+    expect(screen.queryByRole("group", { name: "Administration" })).toBeNull();
   });
 
   it("writes the chosen theme onto the document", async () => {
@@ -2190,7 +2199,7 @@ describe("the avatar menu", () => {
       within(menu).getByRole("menuitem", { name: /^Handbook/ }),
     ).toBeVisible();
     // And nothing that needs an account.
-    for (const gone of ["Profile", "Users", "Settings", "Log out"]) {
+    for (const gone of ["Profile", "Users", "GitHub connection", "Log out"]) {
       expect(within(menu).queryByRole("menuitem", { name: gone })).toBeNull();
     }
   });
