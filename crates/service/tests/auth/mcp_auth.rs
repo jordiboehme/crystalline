@@ -1672,9 +1672,7 @@ async fn an_authenticated_member_reads_its_private_domain_over_mcp() {
     );
 }
 
-/// A tool call's answer as the agent reads it: the JSON its first content
-/// block carries, or the refusal text (a result with `isError`, or a
-/// JSON-RPC error) as `Err`.
+/// A tool call's JSON payload, or the refusal text on an error.
 fn answer_of(raw: &str) -> Result<serde_json::Value, String> {
     let payload = payload_of(raw);
     if let Some(message) = payload["error"]["message"].as_str() {
@@ -1685,6 +1683,9 @@ fn answer_of(raw: &str) -> Result<serde_json::Value, String> {
         .unwrap_or_default();
     if payload["result"]["isError"] == true {
         return Err(text.to_string());
+    }
+    if let Some(value) = payload["result"].get("structuredContent") {
+        return Ok(value.clone());
     }
     let body = text.split_once("\n\n---\n").map_or(text, |(head, _)| head);
     serde_json::from_str(body).map_err(|e| format!("not JSON ({e}):\n{text}"))

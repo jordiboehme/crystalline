@@ -171,9 +171,11 @@ async fn call_result(
         .unwrap_or_else(|e| panic!("{tool} must answer rather than fail: {e}"))
 }
 
-/// The JSON payload of a tool result: its first content block, cut at the
-/// horizontal rule a write verb's ride-along sentence would follow.
+/// The structured JSON or the legacy JSON before a write's trailer.
 fn payload_of(result: &rmcp::model::CallToolResult) -> Value {
+    if let Some(value) = &result.structured_content {
+        return value.clone();
+    }
     let whole = serde_json::to_value(result).unwrap();
     let text = whole
         .pointer("/content/0/text")
@@ -300,6 +302,9 @@ fn rpc_payload(raw: &str) -> Value {
 /// The tool payload inside a `tools/call` response.
 fn tool_payload(raw: &str) -> Value {
     let rpc = rpc_payload(raw);
+    if let Some(value) = rpc["result"].get("structuredContent") {
+        return value.clone();
+    }
     let text = rpc
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
