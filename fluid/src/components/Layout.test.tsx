@@ -502,7 +502,7 @@ describe("the layout", () => {
       "aria-controls",
       "domain-sidebar",
     );
-    // GitHub settings are reached through the identity menu's Settings item;
+    // The GitHub connection is reached through the identity menu's Administration group;
     // the top bar carries no separate door to the same screen.
     expect(
       screen.queryByRole("link", { name: "GitHub connection" }),

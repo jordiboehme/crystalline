@@ -958,7 +958,7 @@ describe("the GitHub settings screen", () => {
 
     await userEvent.keyboard("{Meta>}k{/Meta}");
     await userEvent.click(
-      await screen.findByRole("option", { name: /github settings/i }),
+      await screen.findByRole("option", { name: /github connection/i }),
     );
 
     expect(
