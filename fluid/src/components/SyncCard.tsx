@@ -184,7 +184,9 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
               role="status"
               className="text-sm text-slate-500 dark:text-slate-400"
             >
-              Not connected - connect GitHub under Settings to sync.
+              {
+                "Not connected - connect GitHub in the avatar menu, under Administration > GitHub connection, to sync."
+              }
             </p>
           )}
           {sync.probeError !== null && (

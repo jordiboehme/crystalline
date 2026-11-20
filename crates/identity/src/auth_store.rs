@@ -303,6 +303,75 @@ pub fn normalize_new_account_name(name: &str) -> Result<String> {
     Ok(folded)
 }
 
+/// The longest display name an account may carry, in characters (not bytes).
+///
+/// A display name is a label the UI prints in a heading, a byline and a user
+/// list, so it has to fit there; a hundred characters is far beyond any real
+/// name and short enough that nothing has to be cut on screen.
+pub const DISPLAY_NAME_MAX_CHARS: usize = 100;
+
+/// Whether `c` is an invisible format character a display name must not hold:
+/// the soft hyphen, the zero-width and joiner characters, the direction marks,
+/// embeddings, overrides and isolates, the invisible operators and the byte
+/// order mark. They print as nothing, so a name made of them looks empty, and
+/// the direction controls can make a name read as somebody else's.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
+/// The display name an account is given, from what a person or an admin sent.
+///
+/// Trimmed; empty (or `None`) resets it to the folded login name `login`, so a
+/// row is never nameless. Refused with [`RefusalKind::InvalidDisplayName`]
+/// when it is longer than [`DISPLAY_NAME_MAX_CHARS`] characters or holds a
+/// control character or an invisible format character. Spaces inside the name
+/// and its casing are kept as sent. Every path that writes a display name a
+/// person typed goes through here: an admin's edit, a person's own edit and a
+/// new account.
+pub fn normalize_display_name(login: &str, display: Option<&str>) -> Result<String> {
+    let Some(display) = display.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(login.to_string());
+    };
+    if display.chars().count() > DISPLAY_NAME_MAX_CHARS {
+        return Err(refuse(
+            RefusalKind::InvalidDisplayName,
+            format!(
+                "a display name can be at most {DISPLAY_NAME_MAX_CHARS} characters long: \
+                 pick a shorter one"
+            ),
+        ));
+    }
+    if display
+        .chars()
+        .any(|c| c.is_control() || is_invisible_format(c))
+    {
+        return Err(refuse(
+            RefusalKind::InvalidDisplayName,
+            "a display name cannot contain control characters or invisible characters".to_string(),
+        ));
+    }
+    Ok(display.to_string())
+}
+
+/// The display name a sign-in provider's claim or header gives a new account:
+/// [`normalize_display_name`], with the login name for a value it would
+/// refuse. A sign-in must not fail because a provider sends a long or odd
+/// name; the person can change it in their profile afterwards.
+fn provided_display_name(login: &str, display: Option<&str>) -> String {
+    normalize_display_name(login, display).unwrap_or_else(|_| login.to_string())
+}
+
 /// Fold one half of an identity key: trimmed, and never empty.
 ///
 /// Deliberately NOT lowercased, unlike an account name. An issuer url and a
@@ -1078,6 +1147,9 @@ pub enum RefusalKind {
     /// The GitHub account (host and numeric id) is already linked to another
     /// Crystalline account. See [`AuthStore::link_github`].
     GithubIdTaken,
+    /// The display name given is too long or holds a control or invisible
+    /// character. See [`normalize_display_name`].
+    InvalidDisplayName,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
@@ -1986,6 +2058,7 @@ impl AuthStore {
         password: &str,
     ) -> Result<()> {
         let name = normalize_new_account_name(name)?;
+        let display = normalize_display_name(&name, Some(display))?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.lock().await;
@@ -2008,7 +2081,7 @@ impl AuthStore {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
                     vec![
                         Value::Text(name.clone()),
-                        Value::Text(display.to_string()),
+                        Value::Text(display.clone()),
                         match email {
                             Some(e) => Value::Text(e.to_string()),
                             None => Value::Null,
@@ -2246,14 +2319,12 @@ impl AuthStore {
     /// trims to nothing) resets it to the folded login name, so a row is never
     /// nameless: the column is NOT NULL and the UI always has something to
     /// print. No last-admin guard applies - a display name changes nothing
-    /// about what the account may do.
+    /// about what the account may do. A name that is too long or holds a
+    /// control or invisible character is refused; see
+    /// [`normalize_display_name`].
     pub async fn set_display(&self, name: &str, display: Option<&str>) -> Result<()> {
         let name = normalize_account_name(name)?;
-        let display = display
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| name.clone());
+        let display = normalize_display_name(&name, display)?;
         let _guard = self.lock().await;
         let changed = self
             .db
@@ -3127,6 +3198,12 @@ impl AuthStore {
     /// The account is created with no password hash: it signs in through its
     /// provider, and there is no local credential to guess.
     ///
+    /// `display` is the provider's name for the person, and this is the only
+    /// time it is written: a later sign-in never overwrites the display name,
+    /// because the person may have changed it in their profile since. A value
+    /// [`normalize_display_name`] would refuse gives the login name instead of
+    /// failing the sign-in.
+    ///
     /// One `BEGIN IMMEDIATE` for the cap check, the name search, the insert
     /// and the link. Two first sign-ins racing therefore produce one account
     /// and one link, rather than an orphan account whose link lost.
@@ -3144,10 +3221,6 @@ impl AuthStore {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
         let base = normalize_new_account_name(desired_name)?;
-        let display = display
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
         let email = email
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -3185,7 +3258,7 @@ impl AuthStore {
                      VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
                     vec![
                         Value::Text(name.clone()),
-                        Value::Text(display.clone().unwrap_or_else(|| name.clone())),
+                        Value::Text(provided_display_name(&name, display)),
                         match &email {
                             Some(value) => Value::Text(value.clone()),
                             None => Value::Null,
@@ -3211,23 +3284,21 @@ impl AuthStore {
         self.db.finish(result).await
     }
 
-    /// Refresh what an account shows: its display name and its address, and
-    /// nothing else. Returns the account as it now stands, read back in the
-    /// same call so a caller never has to guess what it wrote.
+    /// Refresh an account's address from its sign-in provider, and nothing
+    /// else. Returns the account as it now stands, read back in the same call
+    /// so a caller never has to guess what it wrote.
     ///
-    /// A `None` leaves the stored value alone: an ID token that carries no
-    /// `name` this time says nothing about the person's name, and must never
-    /// be read as "they no longer have one". Role, disabled state and login
-    /// name are untouched by construction - they are not presentation data,
-    /// and a provider does not get to move them.
-    pub async fn refresh_presentation(
-        &self,
-        name: &str,
-        display: Option<&str>,
-        email: Option<&str>,
-    ) -> Result<User> {
+    /// A `None` (or a blank value) leaves the stored address alone: an ID
+    /// token that carries no `email` this time says nothing about whether the
+    /// person still has one, and must never be read as "they no longer have
+    /// one". The display name is not refreshed: a provider sets it once, when
+    /// [`AuthStore::provision_linked_user`] creates the account, and after that
+    /// it belongs to the person, who may change it in their profile. Role,
+    /// disabled state and login name are untouched by construction too - they
+    /// are not presentation data, and a provider does not get to move them.
+    pub async fn refresh_email(&self, name: &str, email: Option<&str>) -> Result<User> {
         let name = normalize_account_name(name)?;
-        let text = |value: Option<&str>| match value.map(str::trim).filter(|v| !v.is_empty()) {
+        let email = match email.map(str::trim).filter(|v| !v.is_empty()) {
             Some(value) => Value::Text(value.to_string()),
             None => Value::Null,
         };
@@ -3235,10 +3306,8 @@ impl AuthStore {
         let changed = self
             .db
             .execute(
-                "UPDATE users
-                 SET display = COALESCE(?2, display), email = COALESCE(?3, email)
-                 WHERE name = ?1",
-                vec![Value::Text(name.clone()), text(display), text(email)],
+                "UPDATE users SET email = COALESCE(?2, email) WHERE name = ?1",
+                vec![Value::Text(name.clone()), email],
             )
             .await
             .with_context(|| format!("updating user '{name}'"))?;

@@ -10008,6 +10008,88 @@
         }
       }
     },
+    "/api/v1/me": {
+      "patch": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`PATCH /me` - change the caller's own display name, answering with the\naccount as it now stands.",
+        "description": "Self-service in the shape of the other `/me` routes: no name in the path,\nbecause the session already names the account, so a caller can only ever\nreach its own. Every signed-in account may use it, viewers included; the\nanonymous viewer has no account and is answered 401. Role, Reflection\nlevel and the disabled flag stay on the admin route, `PATCH /users/{name}`:\nthe body here has no field for them, and an unknown field is refused.\n\nThe rules are the admin route's, in the store\n([`super::auth_store::normalize_display_name`]): trimmed, blank resets to\nthe login name, at most 100 characters, no control or invisible character.\n\nA read-only instance refuses it, as it refuses the admin route that writes\nthe same column. Unlike an MCP token, which a read-only server needs before\nan agent can connect at all, a display name is nothing anybody needs there.\nCSRF is the middleware's, as on every other unsafe route.",
+        "operationId": "update_my_profile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MyProfileBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Your account as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer, which has no account of its own.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but has no `display` or carries another field, or the display name is longer than 100 characters or holds a control or invisible character.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/me/github-identity": {
       "get": {
         "tags": [
@@ -15401,6 +15483,21 @@
             "type": "string"
           }
         }
+      },
+      "MyProfileBody": {
+        "type": "object",
+        "description": "Your own display name. Trimmed; empty or blank resets it to your login name. At most 100 characters, and no control or invisible characters.",
+        "required": [
+          "display"
+        ],
+        "properties": {
+          "display": {
+            "type": "string",
+            "description": "The new display name. Empty or blank resets it to the login name.",
+            "example": "Ada Lovelace"
+          }
+        },
+        "additionalProperties": false
       },
       "OauthErrorBody": {
         "type": "object",

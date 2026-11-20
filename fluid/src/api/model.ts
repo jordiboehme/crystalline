@@ -39,6 +39,9 @@ export type { CreateBody as CreateUserBody } from "./gen";
 /** What `PATCH /users/{name}` takes. */
 export type { PatchBody as PatchUserBody } from "./gen";
 
+/** What `PATCH /me` takes: your own display name. */
+export type { MyProfileBody } from "./gen";
+
 /** What `POST /domains/{domain}/engrams` takes. */
 export type { CreateEngramBody } from "./gen";
 

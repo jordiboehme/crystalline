@@ -31,6 +31,11 @@
  * that rule and says so in its own words, which name the command that gives
  * the account a password first.
  *
+ * Above the cards, under the name, {@link DisplayNameForm}: the one thing
+ * about the account itself a person may change here, their display name. Role
+ * and the rest stay with an admin. A sign-in provider sets the name only when
+ * it creates the account, so a name changed here is kept.
+ *
  * A fourth card, {@link OauthGrantsCard}, sits directly under the agent
  * access one: the clients this account connected through OAuth rather than
  * through a pasted token - a hosted client like Claude, or a local agent that
@@ -40,6 +45,7 @@
  * never by this screen.
  */
 
+import { focusLeft } from "../focusLeft";
 import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy } from "lucide-react";
@@ -71,6 +77,7 @@ import type {
   IdentityLink,
   IssuedMcpToken,
   McpTokenInfo,
+  MeResponse,
   OauthGrantInfo,
   User,
 } from "../api/model";
@@ -87,7 +94,9 @@ import {
   startSsoLink,
   unlinkIdentity,
 } from "../api/sso";
+import { USERS_QUERY_KEY, patchMyProfile } from "../api/users";
 import { useAuth } from "../auth/AuthContext";
+import { ME_QUERY_KEY } from "../auth/keys";
 import type { FromLocation } from "../auth/RequireAuth";
 import { navigateTo } from "../base";
 import {
@@ -114,9 +123,9 @@ interface Notice {
 /** The card's one primary: the way in most people will take. */
 const CONNECT_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.primary}`;
 
-const SECONDARY_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.secondary}`;
+const SECONDARY_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
 
-const DANGER_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.destructive}`;
+const DANGER_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.destructive}`;
 
 const MUTED = "text-sm text-slate-500 dark:text-slate-400";
 
@@ -150,11 +159,93 @@ export default function Profile() {
         <p className={`mt-1 ${MUTED}`}>
           {user.name} ({capabilities.role})
         </p>
+        {!capabilities.readOnly && <DisplayNameForm user={user} />}
       </header>
       <GithubIdentityCard />
       <SsoIdentityCard user={user} />
       <AgentAccessCard />
       <OauthGrantsCard />
+    </div>
+  );
+}
+
+/**
+ * Your own display name, changed through `PATCH /me`: the field starts at the
+ * name the app shows, and Save sends it. Blank is allowed and resets the name
+ * to the login name, as on the Users screen; the server trims it and refuses
+ * one that is too long or holds an invisible character, and that refusal is
+ * shown in its own words. On success the account the probe holds is replaced
+ * at once, so every place that prints the name (the heading above, the
+ * identity menu) shows the new one without a reload, and the probe and the
+ * user list are read again behind it.
+ *
+ * Not drawn on a read-only instance: the server refuses the change there, as
+ * it refuses an admin's.
+ */
+function DisplayNameForm({ user }: { user: User }) {
+  const queryClient = useQueryClient();
+  const fieldId = useId();
+  const [display, setDisplay] = useState(user.display);
+  const [notice, setNotice] = useState<Notice | null>(null);
+
+  const save = useMutation({
+    mutationFn: (next: string) => patchMyProfile({ display: next }),
+    onSuccess: (saved) => {
+      queryClient.setQueryData<MeResponse>(ME_QUERY_KEY, (me) =>
+        me ? { ...me, user: saved } : me,
+      );
+      setDisplay(saved.display);
+      setNotice({ kind: "done", text: "Your display name is saved." });
+      void refreshAfterWrite(queryClient, { queryKey: ME_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY });
+    },
+    onError: (error: Error) => {
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+
+  return (
+    <div className="mt-4 flex flex-col gap-2">
+      <form
+        className="flex flex-wrap items-end gap-3"
+        onSubmit={(event) => {
+          event.preventDefault();
+          setNotice(null);
+          save.mutate(display);
+        }}
+      >
+        <div className="flex flex-col gap-1">
+          <label
+            htmlFor={fieldId}
+            className="text-xs text-slate-500 dark:text-slate-400"
+          >
+            Display name
+          </label>
+          <input
+            id={fieldId}
+            autoComplete="name"
+            placeholder={user.name}
+            value={display}
+            onChange={(event) => {
+              setDisplay(event.target.value);
+            }}
+            className={`w-64 ${FIELD}`}
+          />
+        </div>
+        <button
+          type="submit"
+          aria-label="Save display name"
+          disabled={save.isPending || display === user.display}
+          className={SECONDARY_BUTTON}
+        >
+          Save
+        </button>
+      </form>
+      <p className={MUTED}>
+        Shown to others instead of your login name. Leave it empty to use{" "}
+        {user.name}.
+      </p>
+      {notice && <NoticeLine notice={notice} />}
     </div>
   );
 }
@@ -1047,11 +1138,7 @@ function Disconnect({
         // taking the confirmation away there would eat the second press this
         // exists to require.
         const next = event.relatedTarget;
-        if (
-          confirming &&
-          next instanceof Node &&
-          !event.currentTarget.contains(next)
-        ) {
+        if (confirming && focusLeft(event.currentTarget, next)) {
           setConfirming(false);
         }
       }}
@@ -1392,11 +1479,7 @@ function TokenRow({
           }}
           onBlur={(event) => {
             const next = event.relatedTarget;
-            if (
-              confirming &&
-              next instanceof Node &&
-              !event.currentTarget.contains(next)
-            ) {
+            if (confirming && focusLeft(event.currentTarget, next)) {
               setConfirming(false);
             }
           }}
@@ -1820,11 +1903,7 @@ function GrantRow({
           }}
           onBlur={(event) => {
             const next = event.relatedTarget;
-            if (
-              confirming &&
-              next instanceof Node &&
-              !event.currentTarget.contains(next)
-            ) {
+            if (confirming && focusLeft(event.currentTarget, next)) {
               setConfirming(false);
             }
           }}

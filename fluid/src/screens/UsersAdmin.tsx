@@ -13,6 +13,7 @@
  * but a refusal to offer somebody the door key to lock themselves out with.
  */
 
+import { focusLeft } from "../focusLeft";
 import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useRef, useState } from "react";
@@ -56,9 +57,9 @@ interface Notice {
  * The disabled Save reads as waiting for a change rather than as broken,
  * because the tier says so in the same words everywhere else in the app.
  */
-const ROW_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.secondary}`;
+const ROW_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
 
-const DANGER_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.destructive}`;
+const DANGER_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.destructive}`;
 
 export default function UsersAdmin() {
   const { capabilities } = useAuth();
@@ -611,7 +612,7 @@ function AccountRow({
             dismissed by the keyboard the way the rest of this screen can.
           */}
           <div
-            className="flex items-center gap-2"
+            className="flex shrink-0 items-center gap-2"
             onKeyDown={(event) => {
               if (event.key === "Escape" && confirming) {
                 event.stopPropagation();
@@ -624,11 +625,7 @@ function AccountRow({
               // mid-flight, and taking the confirmation away there would eat
               // the second click this exists to require.
               const next = event.relatedTarget;
-              if (
-                confirming &&
-                next instanceof Node &&
-                !event.currentTarget.contains(next)
-              ) {
+              if (confirming && focusLeft(event.currentTarget, next)) {
                 setConfirming(false);
               }
             }}

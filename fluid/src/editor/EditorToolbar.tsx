@@ -41,13 +41,13 @@ import {
   TextQuote,
   WandSparkles,
 } from "lucide-react";
-import { AlertDialog, DropdownMenu } from "radix-ui";
+import { DropdownMenu } from "radix-ui";
 import type { MouseEvent, ReactElement, ReactNode } from "react";
-import { useId, useRef, useState } from "react";
+import { useId } from "react";
 
 import { CALLOUT_WORDS } from "../components/calloutFace";
 import { ITEM_CLASSES, MENU_CLASSES, MENU_SEPARATOR } from "../components/menu";
-import { BUTTON, FOCUS_RING, IconButton } from "../components/primitives";
+import { FOCUS_RING, IconButton } from "../components/primitives";
 import type { CalloutKind } from "../markdown/callouts";
 import { CALLOUT_KINDS } from "../markdown/callouts";
 import type { StatusColour } from "../markdown/directives";
@@ -66,9 +66,7 @@ import type { Format } from "./marks/formatting";
 import { judgeBeforeCommand } from "./marks/commandJudge";
 import { formatRefusal, toggleFormat } from "./marks/formatting";
 import { mainSelectionParked } from "./parkedSelection";
-import { stepOffIdLines } from "./hiddenIdLines";
 import { InsertMenu, TRIGGER } from "./InsertMenu";
-import type { StyleLevel } from "./TextStyleMenu";
 import { TextStyleMenu } from "./TextStyleMenu";
 import { TableSizePicker } from "./TableSizePicker";
 import type { ImageAlign } from "./imageFormat";
@@ -92,12 +90,7 @@ import {
   DeleteRowIcon,
 } from "./tableIcons";
 import type { Align } from "./tableModel";
-import {
-  ORDERED_ITEM,
-  setHeadingLevel,
-  insertWikilink,
-  toggleLinePrefix,
-} from "./toolbar";
+import { ORDERED_ITEM, insertWikilink, toggleLinePrefix } from "./toolbar";
 import {
   tableAddColumnAfter,
   tableAddRowBelow,
@@ -342,62 +335,6 @@ function StatusSegment({
   );
 }
 
-/**
- * The one question a heading change can ask, in the shape of the other
- * dialogs in the editor (`ConfirmLeaveDialog`): the sentence the adapter
- * answered, the change as the primary answer, Cancel quiet. Escape and the
- * scrim mean Cancel.
- */
-function ConfirmHeadingDialog({
-  sentence,
-  onConfirm,
-  onCancel,
-  onClosed,
-}: {
-  sentence: string;
-  onConfirm: () => void;
-  onCancel: () => void;
-  /** Where focus goes once the dialog has closed: back to the buffer. */
-  onClosed: () => void;
-}): ReactElement {
-  return (
-    <AlertDialog.Root
-      open
-      onOpenChange={(next) => {
-        if (!next) {
-          onCancel();
-        }
-      }}
-    >
-      <AlertDialog.Portal>
-        <AlertDialog.Overlay className="fixed inset-0 z-50 bg-slate-900/40" />
-        <AlertDialog.Content
-          className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900"
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            onClosed();
-          }}
-        >
-          <AlertDialog.Title className="text-lg font-semibold">
-            Join sections?
-          </AlertDialog.Title>
-          <AlertDialog.Description className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-            {sentence}
-          </AlertDialog.Description>
-          <div className="mt-4 flex flex-wrap justify-end gap-2">
-            <AlertDialog.Cancel className={BUTTON.ghost}>
-              Cancel
-            </AlertDialog.Cancel>
-            <AlertDialog.Action className={BUTTON.primary} onClick={onConfirm}>
-              Join sections
-            </AlertDialog.Action>
-          </div>
-        </AlertDialog.Content>
-      </AlertDialog.Portal>
-    </AlertDialog.Root>
-  );
-}
-
 export function EditorToolbar({
   view: buffer,
   tableActive = false,
@@ -512,17 +449,6 @@ export function EditorToolbar({
   const formatOff = off || formatWhy !== null;
   const whyId = useId();
   const formatHint = formatWhy === null ? {} : { "aria-describedby": whyId };
-  /** The heading change waiting for the person's answer, if any. */
-  const [asking, setAsking] = useState<{
-    level: StyleLevel;
-    sentence: string;
-  } | null>(null);
-  /**
-   * Set as the heading menu picks a change that asks first, so the menu's
-   * close hands focus to the dialog rather than back to the buffer. A ref,
-   * because the menu closes before the state above has rendered.
-   */
-  const askingNow = useRef(false);
   /**
    * Whether a verb on main's line or caret may run now. The view a verb acts
    * on is `verbTarget`'s, read when it runs: the open cell's editor, else
@@ -555,245 +481,211 @@ export function EditorToolbar({
   /** A format button's pressed state, when the screen tells the formats. */
   const pressed = (format: Format) =>
     formats ? { "aria-pressed": formats.has(format) } : {};
-  /** The question a heading change on the caret's line asks, or null. */
-  const questionFor = (v: EditorView, level: StyleLevel): string | null => {
-    const line = v.state.doc.lineAt(v.state.selection.main.head).number;
-    return adapter?.confirmHeadingChange(v.state, line, level) ?? null;
-  };
-  const pickHeading = (v: EditorView, level: StyleLevel): boolean => {
-    // The line the change is made on, as `setHeadingLevel` will find it: off a
-    // hidden id line first, so the question is about that same line.
-    stepOffIdLines(v);
-    const sentence = questionFor(v, level);
-    if (sentence === null) {
-      return setHeadingLevel(v, level);
-    }
-    askingNow.current = true;
-    setAsking({ level, sentence });
-    return true;
-  };
-  const answered = () => {
-    askingNow.current = false;
-    setAsking(null);
-  };
-  const joinSections = () => {
-    const level = asking?.level;
-    answered();
-    // Asked again against the live text: in a room the lines may have moved
-    // while the dialog was open, and a line that no longer asks is left as
-    // it is.
-    if (view && level !== undefined && questionFor(view, level) !== null) {
-      setHeadingLevel(view, level, { joinSections: true });
-    }
-  };
+  // On the reading column the bar is one row that scrolls on a phone and
+  // wraps from md up, so a context segment (a callout's kind and fold, a
+  // label's colours) stands in view where the caret asks for it.
   return (
-    <>
-      {/*
-        On the reading column the bar is one row that scrolls on a phone and
-        wraps from md up, so a context segment (a callout's kind and fold, a
-        label's colours) stands in view where the caret asks for it.
-      */}
-      <div
-        role="toolbar"
-        aria-label="Formatting"
-        onMouseDown={keepSelection}
-        className={
-          bare
-            ? "sticky top-14 z-10 flex flex-nowrap items-center gap-0.5 overflow-x-auto border-b border-hair bg-canvas/95 py-1.5 backdrop-blur md:flex-wrap md:overflow-x-visible print:hidden"
-            : "sticky top-14 z-10 flex flex-wrap items-center gap-0.5 rounded-t border-b border-slate-200 bg-white/95 px-1.5 py-1 backdrop-blur print:hidden dark:border-slate-800 dark:bg-slate-950/95"
+    <div
+      role="toolbar"
+      aria-label="Formatting"
+      onMouseDown={keepSelection}
+      className={
+        bare
+          ? "sticky top-14 z-10 flex flex-nowrap items-center gap-0.5 overflow-x-auto border-b border-hair bg-canvas/95 py-1.5 backdrop-blur md:flex-wrap md:overflow-x-visible print:hidden"
+          : "sticky top-14 z-10 flex flex-wrap items-center gap-0.5 rounded-t border-b border-slate-200 bg-white/95 px-1.5 py-1 backdrop-blur print:hidden dark:border-slate-800 dark:bg-slate-950/95"
+      }
+    >
+      <IconButton
+        label="Bold"
+        icon={Bold}
+        disabled={formatOff}
+        {...formatHint}
+        {...pressed("strong")}
+        onClick={actInline((v) => toggleFormat(v, "strong"))}
+      />
+      <IconButton
+        label="Italic"
+        icon={Italic}
+        disabled={formatOff}
+        {...formatHint}
+        {...pressed("em")}
+        onClick={actInline((v) => toggleFormat(v, "em"))}
+      />
+      <IconButton
+        label="Strikethrough"
+        icon={Strikethrough}
+        disabled={formatOff}
+        {...formatHint}
+        {...pressed("strike")}
+        onClick={actInline((v) => toggleFormat(v, "strike"))}
+      />
+      <IconButton
+        label="Inline code"
+        icon={Code}
+        disabled={formatOff}
+        {...formatHint}
+        {...pressed("code")}
+        onClick={actInline((v) => toggleFormat(v, "code"))}
+      />
+      {formatWhy !== null && (
+        <span id={whyId} className="sr-only">
+          {formatWhy}
+        </span>
+      )}
+      <TextStyleMenu
+        view={view}
+        disabled={lineOff}
+        allow={mainTurn}
+        question={
+          adapter
+            ? (state, line, level) =>
+                adapter.confirmHeadingChange(state, line, level)
+            : null
         }
-      >
+      />
+      <IconButton
+        label="Bulleted list"
+        icon={List}
+        disabled={lineOff}
+        onClick={act((v) => toggleLinePrefix(v, "- "))}
+      />
+      <IconButton
+        label="Numbered list"
+        icon={ListOrdered}
+        disabled={lineOff}
+        onClick={act((v) => toggleLinePrefix(v, "1. ", ORDERED_ITEM))}
+      />
+      <IconButton
+        label="Task list"
+        icon={ListTodo}
+        disabled={lineOff}
+        onClick={act((v) => toggleLinePrefix(v, "- [ ] "))}
+      />
+      <IconButton
+        label="Blockquote"
+        icon={TextQuote}
+        disabled={lineOff}
+        onClick={act((v) => toggleLinePrefix(v, "> "))}
+      />
+      {/* Only where the document links engrams: a Reflection page does not. */}
+      {(adapter?.wikilinks ?? true) && (
         <IconButton
-          label="Bold"
-          icon={Bold}
-          disabled={formatOff}
-          {...formatHint}
-          {...pressed("strong")}
-          onClick={actInline((v) => toggleFormat(v, "strong"))}
-        />
-        <IconButton
-          label="Italic"
-          icon={Italic}
-          disabled={formatOff}
-          {...formatHint}
-          {...pressed("em")}
-          onClick={actInline((v) => toggleFormat(v, "em"))}
-        />
-        <IconButton
-          label="Strikethrough"
-          icon={Strikethrough}
-          disabled={formatOff}
-          {...formatHint}
-          {...pressed("strike")}
-          onClick={actInline((v) => toggleFormat(v, "strike"))}
-        />
-        <IconButton
-          label="Inline code"
-          icon={Code}
-          disabled={formatOff}
-          {...formatHint}
-          {...pressed("code")}
-          onClick={actInline((v) => toggleFormat(v, "code"))}
-        />
-        {formatWhy !== null && (
-          <span id={whyId} className="sr-only">
-            {formatWhy}
-          </span>
-        )}
-        <TextStyleMenu
-          view={view}
-          disabled={lineOff}
-          keepsFocus={() => askingNow.current}
-          onPick={(level) => {
-            if (view && verbTarget(view) === view) {
-              judgeBeforeCommand(view);
-              pickHeading(view, level);
-            }
-          }}
-        />
-        <IconButton
-          label="Bulleted list"
-          icon={List}
-          disabled={lineOff}
-          onClick={act((v) => toggleLinePrefix(v, "- "))}
-        />
-        <IconButton
-          label="Numbered list"
-          icon={ListOrdered}
-          disabled={lineOff}
-          onClick={act((v) => toggleLinePrefix(v, "1. ", ORDERED_ITEM))}
-        />
-        <IconButton
-          label="Task list"
-          icon={ListTodo}
-          disabled={lineOff}
-          onClick={act((v) => toggleLinePrefix(v, "- [ ] "))}
-        />
-        <IconButton
-          label="Blockquote"
-          icon={TextQuote}
-          disabled={lineOff}
-          onClick={act((v) => toggleLinePrefix(v, "> "))}
-        />
-        {/* Only where the document links engrams: a Reflection page does not. */}
-        {(adapter?.wikilinks ?? true) && (
-          <IconButton
-            label="Wiki link"
-            icon={Brackets}
-            disabled={off}
-            onClick={actInline(insertWikilink)}
-          />
-        )}
-        <IconButton
-          label="Link"
-          icon={Link}
+          label="Wiki link"
+          icon={Brackets}
           disabled={off}
-          onClick={actInline(linkVerb)}
+          onClick={actInline(insertWikilink)}
         />
-        {/*
+      )}
+      <IconButton
+        label="Link"
+        icon={Link}
+        disabled={off}
+        onClick={actInline(linkVerb)}
+      />
+      {/*
         The insert verbs are named buttons of their own, and this hairline
         only says they are a different kind of thing.
       */}
-        <Divider />
-        {/*
+      <Divider />
+      {/*
         An insert verb that asks a question first: how big. Its trigger is
         this bar's own icon button, so the row reads as one kind of thing
         whatever happens after the press.
       */}
-        <TableSizePicker view={lineOff ? null : view} allow={mainTurn} />
-        {/*
+      <TableSizePicker view={lineOff ? null : view} allow={mainTurn} />
+      {/*
         Every other element, as words: callouts, diagrams, blocks and inline
         elements, from the same registry as the slash menu.
       */}
-        <InsertMenu view={lineOff ? null : view} allow={mainTurn} />
-        {/*
+      <InsertMenu view={lineOff ? null : view} allow={mainTurn} />
+      {/*
         The other insert verb that asks first, and the only one whose question
         the browser asks: which file. Paste and drop reach the same flow with
         no button at all, so this is the way in for a file that is neither on
         the clipboard nor draggable onto the buffer.
       */}
-        {onAttach && (
-          <AttachButton
-            onAttach={(files) => {
-              // An upload inserts at main's selection: only on main's turn.
-              if (view && mainTurn(view)) {
-                judgeBeforeCommand(view);
-                onAttach(files);
-              }
-            }}
-            disabled={lineOff || attachDisabled}
-          />
-        )}
-        {imageActive && raw && !cellNow && (
-          <>
-            {/*
+      {onAttach && (
+        <AttachButton
+          onAttach={(files) => {
+            // An upload inserts at main's selection: only on main's turn.
+            if (view && mainTurn(view)) {
+              judgeBeforeCommand(view);
+              onAttach(files);
+            }
+          }}
+          disabled={lineOff || attachDisabled}
+        />
+      )}
+      {imageActive && raw && !cellNow && (
+        <>
+          {/*
             The same hairline, in front of the one menu that acts on the image
             the caret is on rather than on the document at large. Raw only:
             outside it the picture is drawn, a press selects it, and the
             floating bar holds its options (ruling 15).
           */}
-            <Divider />
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger asChild>
-                <IconButton
-                  label="Image format"
-                  icon={ImageFormatMenuIcon}
-                  disabled={off}
-                />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Portal>
-                <DropdownMenu.Content
-                  align="start"
-                  sideOffset={6}
-                  className={MENU_CLASSES}
-                  // The heading menu's discipline, for the same reason: Radix
-                  // hands focus back to the trigger on close, and this bar
-                  // always returns an author to the buffer instead.
-                  onCloseAutoFocus={(event) => {
-                    event.preventDefault();
-                    view?.focus();
-                  }}
-                >
-                  {PLACEMENTS.map(({ align, label, icon: Icon }) => (
-                    <DropdownMenu.Item
-                      key={align}
-                      className={ITEM_CLASSES}
-                      onSelect={act((v) =>
-                        // Centered is the default, and picking it means "as it
-                        // was": the whole fragment goes, width included.
-                        align === "center"
-                          ? clearImageFormat(v)
-                          : setImageAlign(v, align),
-                      )}
-                    >
-                      <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
-                      {label}
-                    </DropdownMenu.Item>
-                  ))}
-                  <DropdownMenu.Separator className={MENU_SEPARATOR} />
-                  {WIDTHS.map(({ width, label, icon: Icon }) => (
-                    <DropdownMenu.Item
-                      key={width}
-                      className={ITEM_CLASSES}
-                      onSelect={act((v) => setImageWidth(v, width))}
-                    >
-                      <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
-                      {label}
-                    </DropdownMenu.Item>
-                  ))}
-                </DropdownMenu.Content>
-              </DropdownMenu.Portal>
-            </DropdownMenu.Root>
-          </>
-        )}
-        {tableActive && !cellNow && (raw || !tableDrawn) && (
-          <>
-            {/*
+          <Divider />
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <IconButton
+                label="Image format"
+                icon={ImageFormatMenuIcon}
+                disabled={off}
+              />
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="start"
+                sideOffset={6}
+                className={MENU_CLASSES}
+                // The heading menu's discipline, for the same reason: Radix
+                // hands focus back to the trigger on close, and this bar
+                // always returns an author to the buffer instead.
+                onCloseAutoFocus={(event) => {
+                  event.preventDefault();
+                  view?.focus();
+                }}
+              >
+                {PLACEMENTS.map(({ align, label, icon: Icon }) => (
+                  <DropdownMenu.Item
+                    key={align}
+                    className={ITEM_CLASSES}
+                    onSelect={act((v) =>
+                      // Centered is the default, and picking it means "as it
+                      // was": the whole fragment goes, width included.
+                      align === "center"
+                        ? clearImageFormat(v)
+                        : setImageAlign(v, align),
+                    )}
+                  >
+                    <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
+                    {label}
+                  </DropdownMenu.Item>
+                ))}
+                <DropdownMenu.Separator className={MENU_SEPARATOR} />
+                {WIDTHS.map(({ width, label, icon: Icon }) => (
+                  <DropdownMenu.Item
+                    key={width}
+                    className={ITEM_CLASSES}
+                    onSelect={act((v) => setImageWidth(v, width))}
+                  >
+                    <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
+                    {label}
+                  </DropdownMenu.Item>
+                ))}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+        </>
+      )}
+      {tableActive && !cellNow && (raw || !tableDrawn) && (
+        <>
+          {/*
             The same hairline again, in front of the verbs that act on the
             table the caret is in rather than on the document at large.
           */}
-            <Divider />
-            {/*
+          <Divider />
+          {/*
             The glyphs are a mnemonic; the labels are the contract. Every one
             of these is a tooltip as well as an accessible name, because a row
             of small squares is not self-explanatory whatever is drawn in it.
@@ -805,115 +697,100 @@ export function EditorToolbar({
             can that could only say "something is destroyed". The axis was the
             half that went missing, and it was the half only the label carried.
           */}
-            <IconButton
-              label="Add row below"
-              icon={Rows3}
-              disabled={off}
-              onClick={act(tableAddRowBelow)}
-            />
-            <IconButton
-              label="Add column after"
-              icon={Columns3}
-              disabled={off}
-              onClick={act(tableAddColumnAfter)}
-            />
-            <IconButton
-              label="Delete row"
-              icon={DeleteRowIcon}
-              disabled={off}
-              onClick={act(tableDeleteRow)}
-            />
-            <IconButton
-              label="Delete column"
-              icon={DeleteColumnIcon}
-              disabled={off}
-              onClick={act(tableDeleteColumn)}
-            />
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger asChild>
-                <IconButton
-                  label="Align column"
-                  icon={AlignColumnIcon}
-                  disabled={off}
-                />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Portal>
-                <DropdownMenu.Content
-                  align="start"
-                  sideOffset={6}
-                  className={MENU_CLASSES}
-                  // The heading menu's discipline, for the same reason: Radix
-                  // hands focus back to the trigger on close, and this bar
-                  // always returns an author to the buffer instead - having
-                  // picked an alignment, or having pressed Escape.
-                  onCloseAutoFocus={(event) => {
-                    event.preventDefault();
-                    view?.focus();
-                  }}
-                >
-                  {ALIGNMENTS.map(({ align, label, icon: Icon }) => (
-                    <DropdownMenu.Item
-                      key={align}
-                      className={ITEM_CLASSES}
-                      onSelect={act((v) => tableAlignColumn(v, align))}
-                    >
-                      {/*
+          <IconButton
+            label="Add row below"
+            icon={Rows3}
+            disabled={off}
+            onClick={act(tableAddRowBelow)}
+          />
+          <IconButton
+            label="Add column after"
+            icon={Columns3}
+            disabled={off}
+            onClick={act(tableAddColumnAfter)}
+          />
+          <IconButton
+            label="Delete row"
+            icon={DeleteRowIcon}
+            disabled={off}
+            onClick={act(tableDeleteRow)}
+          />
+          <IconButton
+            label="Delete column"
+            icon={DeleteColumnIcon}
+            disabled={off}
+            onClick={act(tableDeleteColumn)}
+          />
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <IconButton
+                label="Align column"
+                icon={AlignColumnIcon}
+                disabled={off}
+              />
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="start"
+                sideOffset={6}
+                className={MENU_CLASSES}
+                // The heading menu's discipline, for the same reason: Radix
+                // hands focus back to the trigger on close, and this bar
+                // always returns an author to the buffer instead - having
+                // picked an alignment, or having pressed Escape.
+                onCloseAutoFocus={(event) => {
+                  event.preventDefault();
+                  view?.focus();
+                }}
+              >
+                {ALIGNMENTS.map(({ align, label, icon: Icon }) => (
+                  <DropdownMenu.Item
+                    key={align}
+                    className={ITEM_CLASSES}
+                    onSelect={act((v) => tableAlignColumn(v, align))}
+                  >
+                    {/*
                       Decoration beside the label rather than a second name:
                       the row is called what it was always called, and the
                       glyph is the app's own icon idiom at the size every
                       other one is drawn at.
                     */}
-                      <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
-                      {label}
-                    </DropdownMenu.Item>
-                  ))}
-                </DropdownMenu.Content>
-              </DropdownMenu.Portal>
-            </DropdownMenu.Root>
-            <IconButton
-              label="Prettify table"
-              icon={WandSparkles}
-              disabled={off}
-              onClick={act(tablePrettify)}
-            />
-          </>
-        )}
-        {calloutActive !== null && !cellNow && (
-          <>
-            {/*
+                    <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
+                    {label}
+                  </DropdownMenu.Item>
+                ))}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+          <IconButton
+            label="Prettify table"
+            icon={WandSparkles}
+            disabled={off}
+            onClick={act(tablePrettify)}
+          />
+        </>
+      )}
+      {calloutActive !== null && !cellNow && (
+        <>
+          {/*
             The same hairline, in front of what acts on the callout the caret
             is in: its kind and whether it starts open.
           */}
-            <Divider />
-            <CalloutSegment face={calloutActive} view={view} allow={mainTurn} />
-          </>
-        )}
-        {statusActive !== null && !cellNow && (
-          <>
-            <Divider />
-            <StatusSegment colour={statusActive} view={view} allow={mainTurn} />
-          </>
-        )}
-        {trailing !== undefined && (
-          <div className="ml-auto flex shrink-0 items-center pl-2">
-            {trailing}
-          </div>
-        )}
-      </div>
-      {/*
-        Outside the row: its mousedown guard is for the verbs, and React hands
-        a portal's events to the tree it was rendered in.
-      */}
-      {asking !== null && (
-        <ConfirmHeadingDialog
-          sentence={asking.sentence}
-          onConfirm={joinSections}
-          onCancel={answered}
-          onClosed={() => {
-            view?.focus();
-          }}
-        />
+          <Divider />
+          <CalloutSegment face={calloutActive} view={view} allow={mainTurn} />
+        </>
       )}
-    </>
+      {statusActive !== null && !cellNow && (
+        <>
+          <Divider />
+          <StatusSegment colour={statusActive} view={view} allow={mainTurn} />
+        </>
+      )}
+      {trailing !== undefined && (
+        <div className="ml-auto flex shrink-0 items-center pl-2">
+          {trailing}
+        </div>
+      )}
+    </div>
   );
 }

@@ -15,6 +15,7 @@ import {
   screen,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -31,6 +32,7 @@ import { gridExtension } from "./grid/index";
 import { openCellRange, setOpenCell } from "./grid/openCell";
 import { cleanupMarkViews, markView } from "../test/markKit";
 import { imagePreviews } from "./imagePreviews";
+import { headingQuestion } from "./marks/deleting";
 
 const DOC =
   "Intro words\n\n| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n\nOutro\n";
@@ -140,6 +142,7 @@ describe("the floating bar on a text selection", () => {
     });
     h.show();
     for (const name of [
+      "Text style",
       "Bold",
       "Italic",
       "Strikethrough",
@@ -341,13 +344,161 @@ describe("the floating bar on a text selection", () => {
     expect(quick("Italic")).toHaveFocus();
     fireEvent.keyDown(quick("Italic"), { key: "ArrowLeft" });
     expect(quick("Bold")).toHaveFocus();
-    fireEvent.keyDown(quick("Bold"), { key: "End" });
+    // The text style menu follows Inline code, as "Aa" does in the sticky bar.
+    fireEvent.keyDown(quick("Inline code"), { key: "ArrowRight" });
+    expect(quick("Text style")).toHaveFocus();
+    fireEvent.keyDown(quick("Text style"), { key: "ArrowRight" });
+    expect(quick("Link")).toHaveFocus();
+    fireEvent.keyDown(quick("Link"), { key: "End" });
     expect(quick("Wiki link")).toHaveFocus();
     fireEvent.keyDown(quick("Wiki link"), { key: "Home" });
     expect(quick("Bold")).toHaveFocus();
     fireEvent.keyDown(quick("Bold"), { key: "Escape" });
     expect(h.main.hasFocus).toBe(true);
     expect(h.main.state.selection.eq(before)).toBe(true);
+  });
+});
+
+describe("the text style menu in the floating bar", () => {
+  /** A bar on "Intro" selected in the first line. */
+  async function selected(extra: Extension[] = []): Promise<Harness> {
+    const h = harness(extra);
+    h.main.focus();
+    h.main.dispatch({ selection: { anchor: 0, head: 5 } });
+    await vi.waitFor(() => {
+      expect(h.context()?.kind).toBe("text");
+    });
+    h.show();
+    return h;
+  }
+
+  /** Alt+F10 into the bar, then right along it to the style menu. */
+  async function reachStyle(h: Harness): Promise<void> {
+    altF10(h.main.contentDOM);
+    await vi.waitFor(() => {
+      expect(quick("Bold")).toHaveFocus();
+    });
+    for (const from of ["Bold", "Italic", "Strikethrough", "Inline code"]) {
+      fireEvent.keyDown(quick(from), { key: "ArrowRight" });
+    }
+    expect(quick("Text style")).toHaveFocus();
+  }
+
+  /** The selected text, read from main's state. */
+  function selectedText(main: EditorView): string {
+    const sel = main.state.selection.main;
+    return main.state.sliceDoc(sel.from, sel.to);
+  }
+
+  test("a press opens it with the bar still up, and a level heads the selected line", async () => {
+    const h = await selected();
+    const user = userEvent.setup();
+    expect(quick("Text style")).toHaveTextContent("Aa");
+    await user.click(quick("Text style"));
+    const menu = await screen.findByRole("menu");
+    // The bar stays while its menu is open, and the selection stays in main.
+    expect(bar()).toContainElement(menu);
+    expect(selectedText(h.main)).toBe("Intro");
+    expect(
+      within(menu)
+        .getAllByRole("menuitemradio")
+        .map((item) => item.textContent),
+    ).toEqual(["Title", "Heading 1", "Heading 2", "Heading 3", "Body"]);
+    expect(
+      within(menu).getByRole("menuitemradio", { name: "Body" }),
+    ).toHaveAttribute("aria-checked", "true");
+    await user.click(
+      within(menu).getByRole("menuitemradio", { name: "Heading 1" }),
+    );
+    expect(bytes(h.main.state)).toBe(`## ${DOC}`);
+    expect(selectedText(h.main)).toBe("Intro");
+    await vi.waitFor(() => {
+      expect(h.main.hasFocus).toBe(true);
+    });
+    // One undo takes it back.
+    undo(h.main);
+    expect(bytes(h.main.state)).toBe(DOC);
+  });
+
+  test("it shows the style the line has, as the sticky bar does", async () => {
+    const h = await selected();
+    h.main.dispatch({ changes: { from: 0, insert: "## " } });
+    h.main.dispatch({ selection: { anchor: 3, head: 8 } });
+    await vi.waitFor(() => {
+      expect(bar()).toBeInTheDocument();
+    });
+    await userEvent.click(quick("Text style"));
+    const menu = await screen.findByRole("menu");
+    const checked = within(menu)
+      .getAllByRole("menuitemradio")
+      .filter((item) => item.getAttribute("aria-checked") === "true");
+    expect(checked.map((item) => item.textContent)).toEqual(["Heading 1"]);
+  });
+
+  test("the keyboard reaches it with Alt+F10, opens it and picks a style", async () => {
+    const h = await selected();
+    const user = userEvent.setup();
+    await reachStyle(h);
+    await user.keyboard("{Enter}");
+    const menu = await screen.findByRole("menu");
+    expect(bar()).toContainElement(menu);
+    await vi.waitFor(() => {
+      expect(menu).toContainElement(document.activeElement as HTMLElement);
+    });
+    // The first item is Title; Down moves on to Heading 1.
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toHaveTextContent("Heading 1");
+    await user.keyboard("{Enter}");
+    expect(bytes(h.main.state)).toBe(`## ${DOC}`);
+    expect(selectedText(h.main)).toBe("Intro");
+    await vi.waitFor(() => {
+      expect(h.main.hasFocus).toBe(true);
+    });
+  });
+
+  test("Escape in the menu changes nothing and hands back the selection", async () => {
+    const h = await selected();
+    const user = userEvent.setup();
+    const before = h.main.state.selection;
+    await reachStyle(h);
+    await user.keyboard("{Enter}");
+    await screen.findByRole("menu");
+    await user.keyboard("{Escape}");
+    await vi.waitFor(() => {
+      expect(screen.queryByRole("menu")).toBeNull();
+    });
+    await vi.waitFor(() => {
+      expect(h.main.hasFocus).toBe(true);
+    });
+    expect(bytes(h.main.state)).toBe(DOC);
+    expect(h.main.state.selection.eq(before)).toBe(true);
+  });
+
+  test("a change the document asks about keeps the bar up behind the question", async () => {
+    const h = await selected([headingQuestion.of(() => "Joins it above.")]);
+    const user = userEvent.setup();
+    await user.click(quick("Text style"));
+    await user.click(
+      await screen.findByRole("menuitemradio", { name: "Heading 2" }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Joins it above.");
+    expect(bytes(h.main.state)).toBe(DOC);
+    await vi.waitFor(() => {
+      expect(dialog).toContainElement(document.activeElement as HTMLElement);
+    });
+    // Behind the modal question, so out of the accessibility tree for now.
+    expect(
+      screen.getByRole("toolbar", { name: "Quick format", hidden: true }),
+    ).toBeInTheDocument();
+    await user.click(
+      within(dialog).getByRole("button", { name: "Join sections" }),
+    );
+    expect(bytes(h.main.state)).toBe(`### ${DOC}`);
+    await vi.waitFor(() => {
+      expect(h.main.hasFocus).toBe(true);
+    });
+    expect(bar()).toBeInTheDocument();
   });
 });
 
@@ -403,6 +554,10 @@ describe("the floating bar in an open cell", () => {
     ]) {
       expect(quick(name)).toBeInTheDocument();
     }
+    // A cell holds no line of its own to make a heading.
+    expect(
+      within(bar()).queryByRole("button", { name: "Text style" }),
+    ).toBeNull();
     fireEvent.click(quick("More table actions"));
     expect(
       document.querySelector('[role="menu"][aria-label="Cell actions"]'),

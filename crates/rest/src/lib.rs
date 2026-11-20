@@ -241,6 +241,7 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::list,
         users_api::create,
         users_api::update,
+        users_api::update_me,
         users_api::reset_password,
         users_api::remove,
         users_api::discard_drafts,
@@ -361,6 +362,7 @@ use crate::scope::{DomainAccess, DomainRight};
         draft_links::AcceptedDraft,
         users_api::CreateBody,
         users_api::PatchBody,
+        users_api::MyProfileBody,
         users_api::PasswordBody,
         users_api::UserResponse,
         users_api::UsersResponse,
@@ -1280,6 +1282,11 @@ fn routes(state: RestState) -> Router {
             "/me/mcp-tokens",
             get(mcp_tokens::list).post(mcp_tokens::issue),
         )
+        // The caller's own display name, the one field of an account a person
+        // may change about themselves: no name in the path for the reason the
+        // routes above carry none. Refused on a read-only instance, like the
+        // admin route that writes the same column. See [`users_api::update_me`].
+        .route("/me", patch(users_api::update_me))
         .route("/me/mcp-tokens/{id}/rotate", post(mcp_tokens::rotate))
         .route("/me/mcp-tokens/{id}", delete(mcp_tokens::revoke))
         // The caller's own OAuth grants - the clients connected through

@@ -779,7 +779,7 @@ export function Layout() {
       });
       frame.push({
         id: "github-settings",
-        title: "GitHub settings",
+        title: "GitHub connection",
         run: () => {
           void navigate(githubSettingsRoute());
         },

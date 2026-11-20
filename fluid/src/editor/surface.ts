@@ -30,6 +30,7 @@ import { diagramLayer } from "./diagram/loader";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
+import { listIndentKeymap } from "./listIndent";
 import type { Format } from "./marks";
 import {
   crossEdge,
@@ -263,6 +264,10 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // view always has). Its `Prec.high` wrapper - not its position here - is
     // what beats defaultKeymap's own Mod-i; see `formatKeymap`.
     formatKeymap,
+    // Tab and Shift+Tab nest and lift list items, in Raw mode too; anywhere
+    // else they return false and Tab moves the focus as before. The table
+    // cell editor is not built from this array and keeps its own Tab.
+    listIndentKeymap,
     // Typing help rather than preview, so it stays on in raw mode: outside
     // the compartment the Raw toggle empties. One `autocompletion` for every
     // source, because two would fight over the override. The `/` menu comes

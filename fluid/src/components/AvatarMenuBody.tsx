@@ -219,7 +219,16 @@ export default function AvatarMenuBody({
             </Link>
           </DropdownMenu.Item>
           {capabilities.canAdminister && (
-            <>
+            <DropdownMenu.Group aria-label="Administration">
+              {/*
+                Headed, so the rows under it read as the instance's and not as
+                the signed-in person's own settings, which is what a bare
+                "Settings" under "Profile" looked like. Each row names what it
+                is about, never only a service, for the same reason.
+              */}
+              <div className="hidden px-2.5 pt-2 pb-1 text-[11.5px] font-semibold tracking-wider text-faint uppercase md:block">
+                Administration
+              </div>
               <DropdownMenu.Item className={ITEM_CLASSES} asChild>
                 <Link to={usersRoute()} {...PREFETCH.users}>
                   <Users {...glyph} className={ICON} />
@@ -227,18 +236,17 @@ export default function AvatarMenuBody({
                 </Link>
               </DropdownMenu.Item>
               {/*
-                Named for what the screen is rather than for the service it
-                talks to: it is where this instance's settings are kept, and
-                the one page of them today is the repository connection team
-                domains are tracked with.
+                Named for the one page behind it, the repository connection
+                team domains are tracked with, until the instance settings
+                get a home of their own.
               */}
               <DropdownMenu.Item className={ITEM_CLASSES} asChild>
                 <Link to={githubSettingsRoute()} {...PREFETCH.github}>
                   <Settings {...glyph} className={ICON} />
-                  Settings
+                  GitHub connection
                 </Link>
               </DropdownMenu.Item>
-            </>
+            </DropdownMenu.Group>
           )}
         </>
       )}

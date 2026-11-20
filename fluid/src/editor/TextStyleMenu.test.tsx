@@ -1,7 +1,7 @@
 /**
  * The "Aa" text style menu: one radio group for what the caret's line is -
- * a title, a heading or body text. The menu is the control; the writes are
- * `setHeadingLevel`'s, and a Reflection's question comes from the bar.
+ * a title, a heading or body text. The writes are `setHeadingLevel`'s, and
+ * a Reflection's question is the one the bar hands the menu.
  */
 
 import { history, undo } from "@codemirror/commands";

@@ -435,6 +435,116 @@ describe("the profile screen", () => {
   });
 });
 
+describe("the display name control", () => {
+  it("saves your own display name and shows it at once wherever your name is read", async () => {
+    // The server's account, which the probe reads and the PATCH changes. The
+    // probe's re-read after the save is held, so what the screen shows in
+    // the meantime can only come from the account the PATCH answered with.
+    let stored = userFixture({ role: "viewer" });
+    let probes = 0;
+    serveAs("viewer", {
+      "/auth/me": () => {
+        probes += 1;
+        return probes === 1
+          ? meResponse({ user: stored })
+          : new Promise<never>(() => {});
+      },
+      "/me": (_path, init) => {
+        expect(init?.method).toBe("PATCH");
+        stored = userFixture({ role: "viewer", display: "Ada, Countess" });
+        return { user: stored };
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Display name");
+    expect(field).toHaveValue("Ada Lovelace");
+    const save = screen.getByRole("button", { name: "Save display name" });
+    expect(save).toBeDisabled();
+
+    const user = userEvent.setup();
+    await user.clear(field);
+    await user.type(field, "  Ada, Countess ");
+    await user.click(save);
+
+    expect(sentBody("/me", "PATCH")).toEqual({ display: "  Ada, Countess " });
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Your display name is saved.",
+    );
+    // The heading and the identity menu both read the cached probe, which
+    // carries the saved account, trimmed by the server, before any reload.
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Ada, Countess" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Ada, Countess" }),
+    ).toBeInTheDocument();
+    expect(field).toHaveValue("Ada, Countess");
+    expect(
+      screen.getByRole("button", { name: "Save display name" }),
+    ).toBeDisabled();
+  });
+
+  it("sends an empty name, which the server resets to the login name", async () => {
+    let stored = userFixture();
+    serveAs("editor", {
+      "/auth/me": () => meResponse({ user: stored }),
+      "/me": () => {
+        stored = userFixture({ display: "ada" });
+        return { user: stored };
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Display name");
+    const user = userEvent.setup();
+    await user.clear(field);
+    await user.click(screen.getByRole("button", { name: "Save display name" }));
+
+    expect(sentBody("/me", "PATCH")).toEqual({ display: "" });
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "ada" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the server's own words when the name is refused, and keeps what was typed", async () => {
+    serveAs("editor", {
+      "/me": () => {
+        throw new ApiProblem(
+          422,
+          "unprocessable entity",
+          "a display name can be at most 100 characters long: pick a shorter one",
+        );
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Display name");
+    const user = userEvent.setup();
+    await user.clear(field);
+    await user.type(field, "Too long");
+    await user.click(screen.getByRole("button", { name: "Save display name" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "a display name can be at most 100 characters long: pick a shorter one",
+    );
+    expect(field).toHaveValue("Too long");
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Ada Lovelace" }),
+    ).toBeInTheDocument();
+  });
+
+  it("is not offered on a read-only instance, which refuses the change", async () => {
+    serveAs("editor", {}, { read_only: true });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Ada Lovelace" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Display name")).not.toBeInTheDocument();
+  });
+});
+
 describe("the agent access card", () => {
   it("lists the caller's own tokens, never a secret", async () => {
     serveAs("editor", {

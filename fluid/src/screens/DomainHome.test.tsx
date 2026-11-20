@@ -2387,7 +2387,7 @@ describe("the team sync card", () => {
 
     expect(
       await within(card).findByText(
-        /not connected - connect GitHub under Settings to sync/i,
+        /not connected - connect GitHub in the avatar menu, under Administration > GitHub connection, to sync/i,
       ),
     ).toBeVisible();
   });
@@ -2496,7 +2496,7 @@ describe("the team sync card", () => {
           throw new ApiProblem(
             409,
             "conflict",
-            "GitHub is disabled on this instance: connect it under Settings > GitHub",
+            "GitHub is disabled on this instance: connect it under Administration > GitHub connection",
           );
         },
       },

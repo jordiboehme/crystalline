@@ -423,7 +423,7 @@ async fn virtual_creates_and_disconnected_github_mode_is_a_conflict() {
             .as_str()
             .unwrap()
             .to_lowercase()
-            .contains("settings"),
+            .contains("administration > github connection"),
         "the refusal points at the fix: {problem}"
     );
 
@@ -597,7 +597,7 @@ async fn github_domain_name_peek_needs_admin_and_a_connection() {
             .as_str()
             .unwrap()
             .to_lowercase()
-            .contains("settings"),
+            .contains("administration > github connection"),
         "the refusal points at the fix: {problem}"
     );
 }
@@ -2408,7 +2408,7 @@ async fn a_disabled_github_names_the_fix_on_both_sync_endpoints() {
                 .as_str()
                 .unwrap()
                 .to_lowercase()
-                .contains("settings"),
+                .contains("administration > github connection"),
             "the refusal points at the fix: {problem}"
         );
     }
@@ -2654,7 +2654,7 @@ async fn a_disabled_github_names_the_fix_on_the_sync_summary() {
             .as_str()
             .unwrap()
             .to_lowercase()
-            .contains("settings"),
+            .contains("administration > github connection"),
         "the refusal points at the fix: {problem}"
     );
 }
@@ -2724,7 +2724,7 @@ async fn a_disconnected_github_refuses_the_pull_and_names_the_connection() {
         "the refusal names the connection, not a missing repo: {problem}"
     );
     assert!(
-        detail.contains("settings"),
+        detail.contains("administration > github connection"),
         "and it points at the screen that fixes it: {problem}"
     );
 
@@ -2792,7 +2792,7 @@ async fn a_disconnected_github_refuses_the_share_routes_and_names_the_connection
             "{path} names the connection, not a missing repo: {problem}"
         );
         assert!(
-            detail.contains("settings"),
+            detail.contains("administration > github connection"),
             "{path} points at the screen that fixes it: {problem}"
         );
     }

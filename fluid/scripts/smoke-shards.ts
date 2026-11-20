@@ -62,6 +62,9 @@ const COSTS: Readonly<Record<string, Cost>> = {
   "page-title.spec.ts": { root: 3, path: 3 },
   "pictures.spec.ts": { root: 137, path: 130 },
   "print.spec.ts": { root: 16, path: 17 },
+  // Measured locally on 2026-11-20 (chromium and webkit, 36 s together),
+  // rounded up; replace with a CI number.
+  "quick-format.spec.ts": { root: 37, path: 37 },
   "reflection.spec.ts": { root: 55, path: 60 },
   "smoke.spec.ts": { root: 66, path: 70 },
   "sso-login.spec.ts": { root: 1, path: 1 },
@@ -69,6 +72,7 @@ const COSTS: Readonly<Record<string, Cost>> = {
   // Measured locally on 2026-11-18 (chromium only, 2.1 s and 1.8 s),
   // rounded up; replace with a CI number.
   "update-note.spec.ts": { root: 3, path: 2 },
+  "users-delete.spec.ts": { root: 4, path: 4 },
 };
 
 /** The cost of a spec file the table does not name yet. */

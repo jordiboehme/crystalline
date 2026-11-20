@@ -1793,6 +1793,16 @@ export type MovedFrom = {
 };
 
 /**
+ * Your own display name. Trimmed; empty or blank resets it to your login name. At most 100 characters, and no control or invisible characters.
+ */
+export type MyProfileBody = {
+    /**
+     * The new display name. Empty or blank resets it to the login name.
+     */
+    display: string;
+};
+
+/**
  * An OAuth error, sent as `application/json`. The only failures on this surface that are not RFC 9457 problem details: the client reading them speaks OAuth and branches on `error`.
  */
 export type OauthErrorBody = {
@@ -7735,6 +7745,47 @@ export type GetGraphResponses = {
 };
 
 export type GetGraphResponse = GetGraphResponses[keyof GetGraphResponses];
+
+export type UpdateMyProfileData = {
+    body: MyProfileBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/me';
+};
+
+export type UpdateMyProfileErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity, or the anonymous viewer, which has no account of its own.
+     */
+    401: ProblemDetail;
+    /**
+     * A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The body is JSON but has no `display` or carries another field, or the display name is longer than 100 characters or holds a control or invisible character.
+     */
+    422: ProblemDetail;
+};
+
+export type UpdateMyProfileError = UpdateMyProfileErrors[keyof UpdateMyProfileErrors];
+
+export type UpdateMyProfileResponses = {
+    /**
+     * Your account as it now stands.
+     */
+    200: UserResponse;
+};
+
+export type UpdateMyProfileResponse = UpdateMyProfileResponses[keyof UpdateMyProfileResponses];
 
 export type DisconnectMyGithubIdentityData = {
     body?: never;
