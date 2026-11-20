@@ -355,7 +355,7 @@ describe("the GitHub settings screen", () => {
 
     expect(
       await screen.findByText(
-        "Connected through the GitHub App as crystalline-kb.",
+        "Connected through the GitHub App crystalline-kb.",
       ),
     ).toBeInTheDocument();
     expect(

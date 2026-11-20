@@ -392,14 +392,16 @@ function ConnectionLines({
     const app = connection?.app ?? null;
     // The bot's login is only in the status when no token is stored beside
     // the App; otherwise the App is named by its slug.
-    const bot =
-      store === APP_STORE ? (connection?.user ?? null) : (app?.slug ?? null);
+    const bot = store === APP_STORE ? (connection?.user ?? null) : null;
+    const slug = app?.slug ?? null;
     return (
       <div className="flex flex-col gap-1 text-sm">
         <p>
-          {bot === null
-            ? "Connected through the GitHub App."
-            : `Connected through the GitHub App as ${bot}.`}
+          {bot !== null
+            ? `Connected through the GitHub App as ${bot}.`
+            : slug !== null
+              ? `Connected through the GitHub App ${slug}.`
+              : "Connected through the GitHub App."}
         </p>
         {(route.storedToken || route.environmentToken) && (
           <p className="text-slate-500 dark:text-slate-400">
