@@ -2037,8 +2037,9 @@ fn account_is_disabled() -> ApiError {
 /// 2. A `(issuer, subject)` pair this instance has seen signs into the account
 ///    it is linked to. Its role, its login name and its disabled state are
 ///    untouched: the provider asserts who somebody is, never what they may do
-///    here. Only the display name and the address refresh, because those are
-///    the provider's to restate.
+///    here. Only the address refreshes. The display name is set from the
+///    provider's claim when the account is created and never after: from then
+///    on it is the person's own, and they may change it in their profile.
 /// 3. Anything else is a person this instance has never seen, and gets a fresh
 ///    account at `auth.oidc.default_role` with a derived name and a stored
 ///    link.
@@ -2068,15 +2069,13 @@ async fn resolve_oidc_identity(
         if user.disabled {
             return Err(account_is_disabled());
         }
-        // Presentation only, and only what was actually sent: an ID token that
-        // carries no `name` this time is not a person who lost their name.
+        // The address only, and only when one was sent: an ID token that
+        // carries no `email` this time is not a person who lost their address.
+        // The `name` claim is not written back - it named the account once,
+        // when it was created, and the display name is the person's since.
         return Ok(state
             .auth
-            .refresh_presentation(
-                &user.name,
-                claims.display.as_deref(),
-                claims.email.as_deref(),
-            )
+            .refresh_email(&user.name, claims.email.as_deref())
             .await?);
     }
     let derived = derive_account_name(&claims);

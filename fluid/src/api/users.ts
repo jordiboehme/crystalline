@@ -6,6 +6,7 @@
 import { api, encodeSegment } from "./client";
 import type {
   CreateUserBody,
+  MyProfileBody,
   PatchUserBody,
   User,
   UserResponse,
@@ -36,6 +37,18 @@ export async function patchUser(
   body: PatchUserBody,
 ): Promise<User> {
   const patched = await api<UserResponse>(`/users/${encodeSegment(name)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+  return patched.user;
+}
+
+/**
+ * Change your own display name. Blank resets it to your login name; the server
+ * trims it and refuses one that is too long or holds an invisible character.
+ */
+export async function patchMyProfile(body: MyProfileBody): Promise<User> {
+  const patched = await api<UserResponse>("/me", {
     method: "PATCH",
     body: JSON.stringify(body),
   });

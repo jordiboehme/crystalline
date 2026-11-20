@@ -285,7 +285,8 @@ fn store_error(e: anyhow::Error) -> ApiError {
             | RefusalKind::IssuerAlreadyHeld
             | RefusalKind::NoSuchToken
             | RefusalKind::CapReached
-            | RefusalKind::GithubIdTaken,
+            | RefusalKind::GithubIdTaken
+            | RefusalKind::InvalidDisplayName,
         )
         | None => ApiError::internal(format!("{e:#}")),
     }

@@ -1059,20 +1059,42 @@ async fn proxy_headers_provision_once_and_return_on_the_same_subject() {
     assert_eq!(links[0].subject, "ada");
     assert_eq!(links[0].linked_by, "jit");
 
-    // The same person again, with the proxy sending a renamed display: one
-    // account still, and the presentation follows.
+    // The same person again, with the proxy sending a renamed display and a
+    // new address: one account still, the address follows, and the display
+    // name does not. `Remote-Name` named the account when it was created and
+    // never after, so a name the person chose in their profile is not undone
+    // by the next request.
     let again = client()
         .get(format!("http://{}/api/v1/auth/me", fixture.addr))
         .header("Remote-User", "ada")
         .header("Remote-Name", "Countess Lovelace")
-        .header("Remote-Email", "ada@example.test")
+        .header("Remote-Email", "ada@contoso.test")
         .send()
         .await
         .unwrap();
     assert_eq!(again.status(), 200);
     let me: serde_json::Value = again.json().await.unwrap();
-    assert_eq!(me["user"]["display"], "Countess Lovelace");
+    assert_eq!(me["user"]["display"], "Ada Lovelace");
+    assert_eq!(me["user"]["email"], "ada@contoso.test");
     assert_eq!(fixture.auth.list_users().await.unwrap().len(), 1);
+
+    fixture
+        .auth
+        .set_display("ada", Some("Ada, Countess of Lovelace"))
+        .await
+        .unwrap();
+    let after_rename = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Name", "Ada Lovelace")
+        .send()
+        .await
+        .unwrap();
+    let me: serde_json::Value = after_rename.json().await.unwrap();
+    assert_eq!(
+        me["user"]["display"], "Ada, Countess of Lovelace",
+        "the person's own name survives the proxy's"
+    );
 }
 
 /// The forwarded user is a subject, not a claim on a local account of the same

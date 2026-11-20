@@ -52,7 +52,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use super::auth::{Caller, Identity};
-use super::auth_store::{ReflectionLevel, Role, User};
+use super::auth_store::{ReflectionLevel, RefusalKind, Role, StoreRefusal, User};
 use super::{
     ApiError, ApiJson, ApiPath, ProblemDetail, RestState, check_password, refuse_read_only,
 };
@@ -556,6 +556,99 @@ pub async fn update(
     Ok(Json(UserResponse { user }))
 }
 
+/// What `PATCH /me` takes: the one thing a person may change about their own
+/// account here, their display name.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(description = "Your own display name. Trimmed; empty or blank \
+                        resets it to your login name. At most 100 characters, \
+                        and no control or invisible characters.")]
+pub struct MyProfileBody {
+    /// The new display name. Empty or blank resets it to the login name.
+    #[schema(example = "Ada Lovelace")]
+    display: String,
+}
+
+/// `PATCH /me` - change the caller's own display name, answering with the
+/// account as it now stands.
+///
+/// Self-service in the shape of the other `/me` routes: no name in the path,
+/// because the session already names the account, so a caller can only ever
+/// reach its own. Every signed-in account may use it, viewers included; the
+/// anonymous viewer has no account and is answered 401. Role, Reflection
+/// level and the disabled flag stay on the admin route, `PATCH /users/{name}`:
+/// the body here has no field for them, and an unknown field is refused.
+///
+/// The rules are the admin route's, in the store
+/// ([`super::auth_store::normalize_display_name`]): trimmed, blank resets to
+/// the login name, at most 100 characters, no control or invisible character.
+///
+/// A read-only instance refuses it, as it refuses the admin route that writes
+/// the same column. Unlike an MCP token, which a read-only server needs before
+/// an agent can connect at all, a display name is nothing anybody needs there.
+/// CSRF is the middleware's, as on every other unsafe route.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/me",
+    tag = "users",
+    operation_id = "update_my_profile",
+    request_body = MyProfileBody,
+    responses(
+        (status = 200, description = "Your account as it now stands.", body = UserResponse),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity, or the anonymous viewer, which has no \
+                           account of its own.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "A cookie session did not echo its CSRF token, this \
+                           instance is read-only, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The body is JSON but has no `display` or carries \
+                           another field, or the display \
+                           name is longer than 100 characters or holds a control \
+                           or invisible character.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn update_me(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiJson(body): ApiJson<MyProfileBody>,
+) -> Result<Json<UserResponse>, ApiError> {
+    let user = identity.require_account()?;
+    refuse_read_only(&state)?;
+    state
+        .auth
+        .set_display(&user.name, Some(body.display.as_str()))
+        .await
+        .map_err(|e| store_error(e, &user.name))?;
+    let user = read_back(&state, &user.name).await?;
+    Ok(Json(UserResponse { user }))
+}
+
 /// `POST /users/{name}/password` - replace an account's password, answering
 /// with the account as it now stands.
 ///
@@ -903,6 +996,16 @@ fn folded(name: &str) -> String {
 /// about, for the one message that has to be rewritten rather than passed
 /// through; pass `""` where there is no single one.
 fn store_error(e: anyhow::Error, subject: &str) -> ApiError {
+    // A display name the store refused is the caller's to fix, in the store's
+    // own words, which name the rule and not the account.
+    if StoreRefusal::kind_of(&e) == Some(RefusalKind::InvalidDisplayName) {
+        return ApiError::unprocessable(
+            e.chain()
+                .find_map(|cause| cause.downcast_ref::<StoreRefusal>())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("{e:#}")),
+        );
+    }
     let detail = format!("{e:#}");
     if detail.contains("UNIQUE constraint") {
         // The store's message here is the database's, and it names a column.

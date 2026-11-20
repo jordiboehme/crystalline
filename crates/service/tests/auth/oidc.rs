@@ -1813,8 +1813,10 @@ async fn a_first_sign_in_on_a_name_with_drafts_reads_a_page_that_says_ask_an_adm
 
 /// The first sign-in provisions an account; the second lands in the same one
 /// even though the provider has renamed the person since. `(issuer, sub)` is
-/// the key, and a username is presentation data that follows the rename
-/// rather than moving the account.
+/// the key, and a username does not move the account. The provider's name
+/// sets the display name only when the account is created: a later sign-in
+/// never overwrites it, so a name the person chose in their profile stays.
+/// The address still follows the provider.
 #[tokio::test]
 async fn first_sign_in_provisions_and_second_reuses_despite_renames() {
     let idp = FakeIdp::start().await;
@@ -1830,6 +1832,10 @@ async fn first_sign_in_provisions_and_second_reuses_despite_renames() {
     assert_eq!(provisioned.display, "Ada");
     assert_eq!(provisioned.role, Role::Viewer);
 
+    // A returning sign-in with the same name writes nothing over it either.
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    assert_eq!(ctx.user("ada.lovelace").await.unwrap().display, "Ada");
+
     idp.set_user(IdpUser {
         subject: "sub-1".to_string(),
         preferred_username: Some("Countess".to_string()),
@@ -1842,16 +1848,31 @@ async fn first_sign_in_provisions_and_second_reuses_despite_renames() {
         "the subject is the key, not the username"
     );
     let same = ctx.user("ada.lovelace").await.expect("the same account");
-    assert_eq!(same.display, "Ada L", "the display name follows the rename");
+    assert_eq!(
+        same.display, "Ada",
+        "the provider set the display name once, at creation, and a later \
+         sign-in does not overwrite it"
+    );
     assert_eq!(
         same.email.as_deref(),
         Some("new@example.test"),
-        "the address is presentation data and follows too"
+        "the address follows the provider"
     );
     assert_eq!(
         same.role,
         Role::Viewer,
         "a returning sign-in changes no role"
+    );
+
+    // A name the person chose in their profile survives the next sign-in.
+    ctx.auth
+        .set_display("ada.lovelace", Some("Ada, Countess of Lovelace"))
+        .await
+        .unwrap();
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    assert_eq!(
+        ctx.user("ada.lovelace").await.unwrap().display,
+        "Ada, Countess of Lovelace"
     );
 }
 

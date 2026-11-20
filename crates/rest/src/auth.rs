@@ -875,31 +875,29 @@ fn forwarded_group_list(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-/// What the proxy's presentation headers change about `user`, or `None` when
-/// they change nothing.
+/// The address the proxy's `Remote-Email` header gives `user`, or `None` when
+/// it changes nothing.
 ///
 /// Every request in this mode carries the headers, so a resolver that wrote
 /// them back each time would put a database write, under the store's own guard,
 /// in front of every authenticated read on the instance. Comparing first makes
-/// the write what it should be: something that happens when the person's name
-/// or address actually changed at the provider.
+/// the write what it should be: something that happens when the person's
+/// address actually changed at the provider.
 ///
 /// An absent header asks for nothing rather than asking for a clear: a proxy
 /// that stopped sending `Remote-Email` has said nothing about whether the
 /// person still has an address, which is the same rule the single sign-on path
 /// applies to an absent claim.
-fn presentation_update<'h>(
-    user: &User,
-    display: Option<&'h str>,
-    email: Option<&'h str>,
-) -> Option<(Option<&'h str>, Option<&'h str>)> {
-    let display = display
+///
+/// `Remote-Name` is not read here at all. It names the account when the
+/// account is created ([`provision_forwarded_user`]) and never after: the
+/// display name then belongs to the person, who may change it in their
+/// profile, and a proxy that kept restating its own spelling would undo that
+/// on the next request.
+fn email_update<'h>(user: &User, email: Option<&'h str>) -> Option<&'h str> {
+    email
         .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != user.display);
-    let email = email
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && Some(*value) != user.email.as_deref());
-    (display.is_some() || email.is_some()).then_some((display, email))
+        .filter(|value| !value.is_empty() && Some(*value) != user.email.as_deref())
 }
 
 /// The account a forward-auth request is served as: the one linked to
@@ -930,7 +928,7 @@ async fn proxy_header_user(
         None => provision_forwarded_user(state, subject, display, email).await?,
     };
     // Refused before anything is written back: a disabled account is not a
-    // person whose display name we go on maintaining.
+    // person whose address we go on maintaining.
     if user.disabled {
         return Err(ApiError::forbidden("this account is disabled"));
     }
@@ -941,11 +939,8 @@ async fn proxy_header_user(
     // what a caller sees is the previous sighting rather than this one, which
     // is what "last seen" means anyway.
     state.auth.mark_seen(&user.name).await?;
-    match presentation_update(&user, display, email) {
-        Some((display, email)) => Ok(state
-            .auth
-            .refresh_presentation(&user.name, display, email)
-            .await?),
+    match email_update(&user, email) {
+        Some(email) => Ok(state.auth.refresh_email(&user.name, Some(email)).await?),
         None => Ok(user),
     }
 }
@@ -2593,38 +2588,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_presentation_asks_for_no_write() {
+    fn an_unchanged_address_asks_for_no_write() {
         let user = stored_user("Ada Lovelace", Some("ada@example.test"));
         assert!(
-            presentation_update(&user, Some("Ada Lovelace"), Some("ada@example.test")).is_none(),
-            "every request carries the headers, so an unchanged pair must not write"
+            email_update(&user, Some("ada@example.test")).is_none(),
+            "every request carries the headers, so an unchanged address must not write"
         );
         assert!(
-            presentation_update(&user, None, None).is_none(),
+            email_update(&user, None).is_none(),
             "an absent header asks for nothing"
         );
         assert!(
-            presentation_update(&user, Some("  Ada Lovelace  "), None).is_none(),
+            email_update(&user, Some("  ada@example.test  ")).is_none(),
             "and neither does one that only differs by the whitespace around it"
         );
     }
 
     #[test]
-    fn a_changed_presentation_asks_only_for_what_changed() {
+    fn a_changed_address_asks_for_a_write() {
         let user = stored_user("Ada Lovelace", Some("ada@example.test"));
         assert_eq!(
-            presentation_update(&user, Some("Countess Lovelace"), Some("ada@example.test")),
-            Some((Some("Countess Lovelace"), None)),
-            "the address is unchanged, so it is not rewritten"
-        );
-        assert_eq!(
-            presentation_update(&user, None, Some("ada@contoso.test")),
-            Some((None, Some("ada@contoso.test"))),
+            email_update(&user, Some("ada@contoso.test")),
+            Some("ada@contoso.test"),
         );
         let unnamed = stored_user("ada", None);
         assert_eq!(
-            presentation_update(&unnamed, None, Some("ada@example.test")),
-            Some((None, Some("ada@example.test"))),
+            email_update(&unnamed, Some("ada@example.test")),
+            Some("ada@example.test"),
             "an account with no address stored takes the one the proxy sends"
         );
     }

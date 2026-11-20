@@ -12,6 +12,7 @@ import {
   createUser,
   deleteUser,
   fetchUsers,
+  patchMyProfile,
   patchUser,
   resetPassword,
 } from "./users";
@@ -54,6 +55,16 @@ describe("the users api module", () => {
       "/users/ada",
       expect.objectContaining({ method: "DELETE" }),
     );
+  });
+
+  it("sends your own display name to /me and unwraps the account", async () => {
+    apiMock.mockResolvedValue({ user: { name: "ada", display: "Ada L" } });
+    const user = await patchMyProfile({ display: "Ada L" });
+    expect(apiMock).toHaveBeenLastCalledWith("/me", {
+      method: "PATCH",
+      body: JSON.stringify({ display: "Ada L" }),
+    });
+    expect(user).toEqual({ name: "ada", display: "Ada L" });
   });
 
   it("encodes a name that needs it", async () => {

@@ -2914,6 +2914,144 @@ async fn an_admin_edits_display_names_and_resets_passwords() {
     assert_eq!(probe.status(), 200);
 }
 
+/// `PATCH /me`: every signed-in account changes its own display name and
+/// nothing else. The name is trimmed, blank resets it to the login name, and a
+/// name that is too long or holds an invisible character is refused in the
+/// house problem shape without changing anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_changes_their_own_display_name_and_only_their_own() {
+    let fx = serve(Options::default()).await;
+    let viewer = login(fx.addr, "vera", "verapw").await;
+
+    let patch_me = |body: serde_json::Value| {
+        as_session(fx.addr, reqwest::Method::PATCH, "/api/v1/me", &viewer)
+            .json(&body)
+            .send()
+    };
+
+    let changed = patch_me(serde_json::json!({"display": "  Vera Rubin  "}))
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), 200, "a viewer may change their own name");
+    let body: serde_json::Value = changed.json().await.unwrap();
+    assert_eq!(body["user"]["name"], "vera");
+    assert_eq!(body["user"]["display"], "Vera Rubin", "trimmed");
+    assert_eq!(body["user"]["role"], "viewer");
+
+    // The probe every screen reads sees it at once.
+    let me: serde_json::Value =
+        as_session(fx.addr, reqwest::Method::GET, "/api/v1/auth/me", &viewer)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(me["user"]["display"], "Vera Rubin");
+
+    // Nothing else about the account can ride along: there is no field for a
+    // role or the disabled flag, and an unknown field is refused.
+    let escalate = patch_me(serde_json::json!({"display": "Vera", "role": "admin"}))
+        .await
+        .unwrap();
+    assert_eq!(escalate.status(), 422);
+    let users = fx.auth.list_users().await.unwrap();
+    let vera = users.iter().find(|u| u.name == "vera").unwrap();
+    assert_eq!(vera.role, Role::Viewer, "no role moved");
+    assert_eq!(
+        vera.display, "Vera Rubin",
+        "and the refused body wrote nothing"
+    );
+
+    // Only the caller's own account: everybody else keeps their name.
+    let eddy = users.iter().find(|u| u.name == "eddy").unwrap();
+    assert_eq!(eddy.display, "Eddy");
+
+    // Too long, and invisible characters: refused, in words, unchanged.
+    for bad in [
+        "x".repeat(101),
+        "Vera\u{200B}".to_string(),
+        "Ve\nra".to_string(),
+    ] {
+        let refused = patch_me(serde_json::json!({"display": bad})).await.unwrap();
+        assert_eq!(refused.status(), 422, "{bad:?}");
+        assert_eq!(
+            refused.headers()["content-type"],
+            "application/problem+json"
+        );
+        let problem: serde_json::Value = refused.json().await.unwrap();
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains("a display name"),
+            "{problem}"
+        );
+    }
+    let at_cap = patch_me(serde_json::json!({"display": "y".repeat(100)}))
+        .await
+        .unwrap();
+    assert_eq!(
+        at_cap.status(),
+        200,
+        "100 characters is the cap, not past it"
+    );
+
+    // Blank resets to the login name.
+    let reset = patch_me(serde_json::json!({"display": "   "}))
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 200);
+    let body: serde_json::Value = reset.json().await.unwrap();
+    assert_eq!(body["user"]["display"], "vera");
+
+    // The admin route keeps the same rules.
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"display": "x".repeat(101)}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422);
+
+    // No account, no profile: no session is a 401.
+    let anonymous = client()
+        .patch(format!("http://{}/api/v1/me", fx.addr))
+        .json(&serde_json::json!({"display": "Ghost"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401);
+}
+
+/// A read-only instance refuses `PATCH /me`, as it refuses the admin route
+/// that writes the same column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_refuses_a_display_name_change() {
+    let fx = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let viewer = login(fx.addr, "vera", "verapw").await;
+    let refused = as_session(fx.addr, reqwest::Method::PATCH, "/api/v1/me", &viewer)
+        .json(&serde_json::json!({"display": "Vera Rubin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    let users = fx.auth.list_users().await.unwrap();
+    assert_eq!(
+        users.iter().find(|u| u.name == "vera").unwrap().display,
+        "Vera"
+    );
+}
+
 /// Session revocation through the API, both triggers (spec section 10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deactivation_and_reset_revoke_live_sessions_through_the_api() {
@@ -3604,6 +3742,18 @@ fn write_ops() -> Vec<WriteOp> {
         // a read-only instance with `auth.mcp` on is exactly where an agent
         // cannot connect at all until somebody issues it a token, and a token
         // is account state in the accounts database rather than knowledge.
+        // The caller's own display name: every signed-in account may change
+        // its own, viewers included, and nobody can name another account
+        // here because the path names none. Refused on a read-only instance
+        // like the admin route that writes the same column: a display name is
+        // nothing a read-only server needs, unlike the MCP token rows below.
+        WriteOp {
+            method: Method::PATCH,
+            path: "/api/v1/me",
+            body: Some(serde_json::json!({"display": "The write matrix"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/me/mcp-tokens",

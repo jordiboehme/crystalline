@@ -656,6 +656,20 @@ async fn display_names_are_editable_and_clearing_resets_to_the_login_name() {
     );
 
     assert!(store.set_display("ghost", Some("Ghost")).await.is_err());
+
+    let refused = store
+        .set_display("ada", Some("Ada\u{200B}"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&refused),
+        Some(RefusalKind::InvalidDisplayName)
+    );
+    assert_eq!(
+        store.list_users().await.unwrap()[0].display,
+        "ada",
+        "a refused name changes nothing"
+    );
 }
 
 /// Two `AuthStore` handles on one file see each other's writes as they
@@ -3764,9 +3778,11 @@ async fn removing_an_account_takes_its_identity_links() {
     );
 }
 
-/// Presentation data refreshes, and an absent claim clears nothing.
+/// A sign-in refreshes the address, and an absent claim clears nothing. The
+/// display name is never touched: a provider sets it only when the account is
+/// created.
 #[tokio::test]
-async fn refreshing_presentation_never_clears_what_was_not_sent() {
+async fn refreshing_the_address_never_clears_what_was_not_sent_nor_moves_the_display_name() {
     let (store, _guard) = test_store().await;
     store
         .add_user(
@@ -3778,17 +3794,122 @@ async fn refreshing_presentation_never_clears_what_was_not_sent() {
         )
         .await
         .unwrap();
+    store.set_display("ada", Some("Ada L")).await.unwrap();
     let refreshed = store
-        .refresh_presentation("ada", Some("Ada L"), Some("new@example.test"))
+        .refresh_email("ada", Some("new@example.test"))
         .await
         .unwrap();
-    assert_eq!(refreshed.display, "Ada L");
+    assert_eq!(refreshed.display, "Ada L", "the person's own name stays");
     assert_eq!(refreshed.email.as_deref(), Some("new@example.test"));
-    assert_eq!(refreshed.role, Role::Editor, "presentation moves no role");
+    assert_eq!(refreshed.role, Role::Editor, "an address moves no role");
 
-    let untouched = store.refresh_presentation("ada", None, None).await.unwrap();
+    let untouched = store.refresh_email("ada", None).await.unwrap();
     assert_eq!(untouched.display, "Ada L");
     assert_eq!(untouched.email.as_deref(), Some("new@example.test"));
+}
+
+/// A provider's name is the display name of the account it creates, and a
+/// name the store would refuse from a person gives the login name instead of
+/// failing the sign-in.
+#[tokio::test]
+async fn a_provisioned_account_takes_the_provider_name_or_falls_back_to_the_login() {
+    let (store, _guard) = test_store().await;
+    let ada = store
+        .provision_linked_user(
+            "https://idp.example",
+            "sub-ada",
+            "ada",
+            Some("  Ada Lovelace "),
+            None,
+            Role::Viewer,
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ada.display, "Ada Lovelace");
+
+    let long = "x".repeat(DISPLAY_NAME_MAX_CHARS + 1);
+    let bob = store
+        .provision_linked_user(
+            "https://idp.example",
+            "sub-bob",
+            "bob",
+            Some(&long),
+            None,
+            Role::Viewer,
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob.display, "bob");
+
+    let eve = store
+        .provision_linked_user(
+            "https://idp.example",
+            "sub-eve",
+            "eve",
+            Some("Eve\u{202E}evE"),
+            None,
+            Role::Viewer,
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(eve.display, "eve");
+}
+
+/// The display name rule every typed name goes through: trimmed, blank resets
+/// to the login name, a length cap in characters, and no control or invisible
+/// format characters.
+#[test]
+fn display_names_are_trimmed_capped_and_free_of_invisible_characters() {
+    assert_eq!(
+        normalize_display_name("ada", Some("  Ada  Lovelace ")).unwrap(),
+        "Ada  Lovelace"
+    );
+    assert_eq!(normalize_display_name("ada", Some("  ")).unwrap(), "ada");
+    assert_eq!(normalize_display_name("ada", None).unwrap(), "ada");
+
+    let at_cap = "\u{00E9}".repeat(DISPLAY_NAME_MAX_CHARS);
+    assert_eq!(
+        normalize_display_name("ada", Some(&at_cap)).unwrap(),
+        at_cap,
+        "the cap counts characters, not bytes"
+    );
+    let over = "a".repeat(DISPLAY_NAME_MAX_CHARS + 1);
+    let err = normalize_display_name("ada", Some(&over)).unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::InvalidDisplayName)
+    );
+    assert!(format!("{err}").contains("at most 100 characters"), "{err}");
+
+    for bad in [
+        "Ada\nLovelace",
+        "Ada\tL",
+        "Ada\u{0007}",
+        "Ada\u{200B}",
+        "Ada\u{202E}",
+        "Ada\u{2066}x",
+        "\u{FEFF}Ada",
+        "Ada\u{00AD}",
+    ] {
+        let err = normalize_display_name("ada", Some(bad)).unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::InvalidDisplayName),
+            "{bad:?}"
+        );
+    }
+    // Real names with marks, scripts and emoji are fine.
+    for good in [
+        "Zoë",
+        "\u{5F20}\u{4F1F}",
+        "J\u{00F6}rg \u{1F600}",
+        "O'Brien-Smith",
+    ] {
+        assert_eq!(normalize_display_name("ada", Some(good)).unwrap(), good);
+    }
 }
 
 /// Two first sign-ins for one subject leave one account and one link.
