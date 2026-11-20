@@ -36,6 +36,9 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value,
         params = params.with_arguments(map);
     }
     let result = peer.call_tool(params).await.map_err(|e| e.to_string())?;
+    if let Some(payload) = result.structured_content {
+        return Ok(payload);
+    }
     let v = serde_json::to_value(&result).unwrap();
     let text = v
         .pointer("/content/0/text")
@@ -739,9 +742,16 @@ async fn call_with_links(peer: &Peer<RoleClient>, tool: &str, args: Value) -> (V
         params = params.with_arguments(map);
     }
     let result = serde_json::to_value(peer.call_tool(params).await.unwrap()).unwrap();
+    body_and_links(&result)
+}
+
+fn body_and_links(result: &Value) -> (Value, Vec<Value>) {
     assert_ne!(result["isError"], true, "{result}");
     let blocks = result["content"].as_array().unwrap();
-    let body: Value = serde_json::from_str(blocks[0]["text"].as_str().unwrap()).unwrap();
+    let body = result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or_else(|| serde_json::from_str(blocks[0]["text"].as_str().unwrap()).unwrap());
     let links = blocks
         .iter()
         .filter(|b| b["type"] == "resource_link")
@@ -807,12 +817,25 @@ async fn a_mounted_read_engram_carries_resource_links_for_its_attachments() {
     machine.connect(&server, "acme", "keeper").await;
     machine.mount();
     let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
-    let (engram, links) = call_with_links(
-        client.peer(),
-        "read_engram",
-        json!({ "identifier": "shot-note", "domain": "open" }),
-    )
-    .await;
+    let params = CallToolRequestParams::new("read_engram").with_arguments(
+        json!({ "identifier": "shot-note", "domain": "open" })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let result = serde_json::to_value(client.peer().call_tool(params).await.unwrap()).unwrap();
+    let (engram, links) = body_and_links(&result);
+    assert_eq!(engram["permalink"], "shot-note");
+    assert!(
+        engram["content"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("assets/shot.png"))
+    );
+    let blocks = result["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), links.len() + 1);
+    assert_eq!(blocks[0]["type"], "text");
+    let text: Value = serde_json::from_str(blocks[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text, result["structuredContent"]);
     assert!(engram.get("files").is_none(), "{engram}");
     assert_eq!(links.len(), 1, "{links:?}");
     assert_eq!(links[0]["uri"], "crystalline://open/assets/shot.png");

@@ -3840,10 +3840,15 @@ async fn a_read_only_grantee_presenting_a_link_is_answered_the_draft() {
         &fx.viewer_bearer,
     )
     .await;
+    let result = &read["result"];
     assert!(
-        said(&read).contains("A page only alice has"),
+        result["structuredContent"]["content"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("A page only alice has")),
         "the link opens her draft for reading: {read}"
     );
+    super::assert_engram_text_matches_structure(result);
+    assert_eq!(result["content"].as_array().unwrap().len(), 1);
     assert!(
         !fx.engine.joins().holds(
             "vera",

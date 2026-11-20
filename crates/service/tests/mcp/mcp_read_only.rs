@@ -274,26 +274,21 @@ async fn the_read_tools_mark_the_locked_domain() {
     };
     assert_eq!(row("archive")["read_only"], true, "{listing}");
     assert!(row("eng").get("read_only").is_none(), "{listing}");
-    let read: Value = serde_json::from_str(&text(
-        &call(
-            peer,
-            "read_engram",
-            json!({ "domain": "archive", "identifier": "alpha" }),
-        )
-        .await,
-    ))
-    .unwrap();
-    assert_eq!(read["read_only"], true, "{read}");
-    let open: Value = serde_json::from_str(&text(
-        &call(
-            peer,
-            "read_engram",
-            json!({ "domain": "eng", "identifier": "alpha" }),
-        )
-        .await,
-    ))
-    .unwrap();
-    assert!(open.get("read_only").is_none(), "{open}");
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "archive", "identifier": "alpha" }),
+    )
+    .await;
+    assert_eq!(read["structuredContent"]["read_only"], true, "{read}");
+    let open = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "alpha" }),
+    )
+    .await;
+    let open = open["structuredContent"].as_object().unwrap();
+    assert!(!open.contains_key("read_only"), "{open:?}");
     let browsed: Value = serde_json::from_str(&text(
         &call(peer, "browse_domain", json!({ "domain": "archive" })).await,
     ))
