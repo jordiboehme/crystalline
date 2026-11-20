@@ -158,6 +158,9 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value,
     }
     match peer.call_tool(params).await {
         Ok(result) => {
+            if let Some(payload) = result.structured_content {
+                return Ok(payload);
+            }
             let v = serde_json::to_value(&result).unwrap();
             let text = v
                 .pointer("/content/0/text")

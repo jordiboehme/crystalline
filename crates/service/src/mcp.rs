@@ -2425,7 +2425,8 @@ impl McpServer {
             "write_engram" | "edit_engram" => ok_written(value),
             "move_engram" => ok_moved(value),
             "split_engram" => ok_split(value),
-            "read_engram" | "delete_engram" | "infer_schema" => ok(value),
+            "read_engram" => Ok(CallToolResult::structured(value)),
+            "delete_engram" | "infer_schema" => ok(value),
             "search_engrams" => self.ok_found(value),
             // The Reflection tools render as their own handlers do: one page,
             // a write and a thread as plain JSON; a queue, a tree and a thread
@@ -3067,15 +3068,11 @@ impl McpServer {
     /// MANIFEST `domain_name` a sync saw change
     /// ([`Engine::rename_guidance_once`]).
     ///
-    /// The domain is the answer's top-level `domain`, read off the first
-    /// text block up to the trailer rule ([`ok`]), so a read and a write
-    /// verb are covered alike. The line goes after the receipt as a trailer
-    /// the way [`McpServer::nudged`] adds one: a rule and the sentence, which
-    /// leaves the JSON in front of the rule as it was. An error, an answer
-    /// that is not a JSON object (a TOON listing) or one with no top-level
-    /// `domain` is handed back unchanged, and so is the answer of a caller
-    /// (`scope`) who may not rename the domain: the line asks for a step only
-    /// such a caller can take.
+    /// A structured result names its domain in the payload and carries the
+    /// guidance as a separate text block. A legacy JSON result names its
+    /// domain in the first text block and carries the line as a trailer
+    /// ([`ok`]). Errors, replies without a domain and callers who may not
+    /// rename the domain receive no guidance.
     async fn with_rename_guidance(
         &self,
         mut result: CallToolResult,
@@ -3085,22 +3082,33 @@ impl McpServer {
         if result.is_error == Some(true) {
             return result;
         }
-        let Some(ContentBlock::Text(text)) = result.content.first_mut() else {
-            return result;
+        let legacy_text = match (&result.structured_content, result.content.first_mut()) {
+            (None, Some(ContentBlock::Text(text))) => Some(text),
+            _ => None,
         };
-        let receipt = text.text.split("\n\n---\n").next().unwrap_or_default();
-        let Some(domain) = serde_json::from_str::<Value>(receipt)
-            .ok()
-            .and_then(|value| value.get("domain")?.as_str().map(str::to_string))
+        let legacy_payload = legacy_text.as_ref().and_then(|text| {
+            let receipt = text.text.split("\n\n---\n").next()?;
+            serde_json::from_str::<Value>(receipt).ok()
+        });
+        let Some(domain) = result
+            .structured_content
+            .as_ref()
+            .or(legacy_payload.as_ref())
+            .and_then(|payload| payload.get("domain"))
+            .and_then(Value::as_str)
         else {
             return result;
         };
         if let Some(line) = self
             .engine
-            .rename_guidance_once(session, &domain, scope)
+            .rename_guidance_once(session, domain, scope)
             .await
         {
-            text.text.push_str(&format!("\n\n---\n{line}"));
+            if let Some(text) = legacy_text {
+                text.text.push_str(&format!("\n\n---\n{line}"));
+            } else {
+                result.content.push(ContentBlock::text(line));
+            }
         }
         result
     }
@@ -3535,7 +3543,7 @@ impl McpServer {
                 &self.reflection_caller(&ctx),
             )
             .await;
-        let mut result = ok(value)?;
+        let mut result = CallToolResult::structured(value);
         result.content.extend(file_links(&domain, &files));
         if include_images == Some(true) {
             let rc = self.reflection_caller(&ctx);

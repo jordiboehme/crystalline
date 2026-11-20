@@ -45,6 +45,8 @@ impl Harness {
             )
             .unwrap();
             std::fs::write(dir.join("note.md"), NOTE).unwrap();
+            std::fs::create_dir_all(dir.join("assets")).unwrap();
+            std::fs::write(dir.join("assets/legacy.txt"), "A text attachment.").unwrap();
             let mut entry = DomainEntry::file(dir).with_name_origin(NameOrigin::Explicit);
             entry.canonical_seen = Some(declared.to_string());
             if name == "eng" {
@@ -99,18 +101,11 @@ impl Harness {
     }
 }
 
-/// The first text block of a `read_engram` answer for `note` in `domain`.
-async fn read_text(client: &RunningService<RoleClient, ()>, domain: &str) -> String {
-    let mut params = CallToolRequestParams::new("read_engram");
-    if let Value::Object(map) = json!({ "identifier": "note", "domain": domain }) {
-        params = params.with_arguments(map);
-    }
-    let result = client.call_tool(params).await.unwrap();
-    let value = serde_json::to_value(result).unwrap();
-    value["content"][0]["text"]
-        .as_str()
-        .expect("a text block")
-        .to_string()
+async fn read(client: &RunningService<RoleClient, ()>, domain: &str, identifier: &str) -> Value {
+    let args = json!({ "identifier": identifier, "domain": domain });
+    let params =
+        CallToolRequestParams::new("read_engram").with_arguments(args.as_object().unwrap().clone());
+    serde_json::to_value(client.call_tool(params).await.unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -118,24 +113,54 @@ async fn the_rename_guidance_appears_once_per_session_and_domain() {
     let harness = Harness::new().await;
     let (first, _server) = harness.connect().await;
 
-    let answer = read_text(&first, "eng").await;
-    assert!(answer.ends_with(&format!("\n\n---\n{LINE}")), "{answer}");
-    let receipt = answer.split("\n\n---\n").next().unwrap();
-    let receipt: Value = serde_json::from_str(receipt).unwrap();
-    assert_eq!(receipt["domain"], "eng");
-
-    let again = read_text(&first, "eng").await;
-    assert!(!again.contains(LINE), "once per session: {again}");
-
-    let other = read_text(&first, "ops").await;
-    assert!(
-        !other.contains("renamed from"),
-        "a domain with no question: {other}"
+    let answer = read(&first, "eng", "note").await;
+    assert_eq!(answer["structuredContent"]["domain"], "eng");
+    assert_eq!(answer["structuredContent"]["content"], NOTE);
+    super::assert_engram_text_matches_structure(&answer);
+    assert_eq!(
+        answer["content"].as_array().unwrap()[1..],
+        [json!({ "type": "text", "text": LINE })]
     );
 
+    let again = read(&first, "eng", "note").await;
+    assert_eq!(again["structuredContent"], answer["structuredContent"]);
+    assert_eq!(
+        again["content"].as_array().unwrap(),
+        &answer["content"].as_array().unwrap()[..1]
+    );
+
+    let other = read(&first, "ops", "note").await;
+    assert_eq!(other["structuredContent"]["domain"], "ops");
+    super::assert_engram_text_matches_structure(&other);
+    assert_eq!(other["content"].as_array().unwrap().len(), 1);
+
     let (second, _server) = harness.connect().await;
-    let fresh = read_text(&second, "eng").await;
-    assert!(fresh.contains(LINE), "a new session is told again: {fresh}");
+    let fresh = read(&second, "eng", "note").await;
+    assert_eq!(fresh["content"], answer["content"]);
+}
+
+#[tokio::test]
+async fn a_legacy_text_result_keeps_its_rename_trailer() {
+    let harness = Harness::new().await;
+    let (first, _server) = harness.connect().await;
+
+    let answer = read(&first, "eng", "assets/legacy.txt").await;
+    let text = answer["content"][0]["text"].as_str().unwrap();
+    let (receipt, trailer) = text.split_once("\n\n---\n").unwrap();
+    assert_eq!(trailer, LINE);
+    let receipt: Value = serde_json::from_str(receipt).unwrap();
+    assert_eq!(receipt["domain"], "eng");
+    assert_eq!(receipt["text"], "A text attachment.");
+    assert!(answer.get("structuredContent").is_none());
+
+    let again = read(&first, "eng", "assets/legacy.txt").await;
+    let again = again["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(again).unwrap(), receipt);
+
+    let structured = read(&first, "eng", "note").await;
+    assert_eq!(structured["structuredContent"]["domain"], "eng");
+    super::assert_engram_text_matches_structure(&structured);
+    assert_eq!(structured["content"].as_array().unwrap().len(), 1);
 }
 
 /// The first JSON-RPC payload in an SSE-framed or plain-JSON response.
@@ -204,13 +229,13 @@ async fn the_rename_guidance_goes_only_to_callers_who_may_rename() {
     )
     .await;
     let read = payload(&eddy.call_tool("read_engram", args.clone()).await);
-    let text = read["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(text.contains("\"domain\""), "the read is answered: {read}");
-    assert!(
-        !text.contains("renamed from"),
-        "an editor is not told: {text}"
+    let result = &read["result"];
+    assert_eq!(result["structuredContent"]["domain"], "eng");
+    super::assert_engram_text_matches_structure(result);
+    assert_eq!(
+        result["content"].as_array().unwrap().len(),
+        1,
+        "an editor is not told: {read}"
     );
 
     let root = crate::support::McpTestSession::open(
@@ -219,8 +244,12 @@ async fn the_rename_guidance_goes_only_to_callers_who_may_rename() {
     )
     .await;
     let read = payload(&root.call_tool("read_engram", args).await);
-    let text = read["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(text.contains(LINE), "an admin is told: {read}");
+    let result = &read["result"];
+    assert_eq!(result["structuredContent"]["domain"], "eng");
+    super::assert_engram_text_matches_structure(result);
+    assert_eq!(
+        result["content"].as_array().unwrap()[1..],
+        [json!({ "type": "text", "text": LINE })],
+        "an admin is told: {read}"
+    );
 }

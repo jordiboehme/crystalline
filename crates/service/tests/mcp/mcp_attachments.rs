@@ -492,9 +492,7 @@ async fn a_skill_resource_still_reads_back_unchanged() {
 ///
 /// Five references go in and two links come out: the duplicate collapses, the
 /// fenced example never counted, the absolute URL is somebody else's file and
-/// the unresolvable one is left to `evolve_engrams` to flag. The JSON payload
-/// stays the first block, so every existing client reads the same first text
-/// block it always did.
+/// the unresolvable one is left to `evolve_engrams` to flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_engram_links_the_attachments_it_references_and_only_those() {
     let h = Harness::new().await;
@@ -507,9 +505,7 @@ async fn read_engram_links_the_attachments_it_references_and_only_those() {
     )
     .await;
 
-    let first = &result["content"][0];
-    assert_eq!(first["type"], json!("text"), "the payload leads: {first}");
-    let payload: Value = serde_json::from_str(first["text"].as_str().unwrap()).unwrap();
+    let payload = &result["structuredContent"];
     assert_eq!(payload["permalink"].as_str(), Some("shots"));
 
     let links = resource_links(&result);
@@ -543,6 +539,8 @@ async fn read_engram_links_the_attachments_it_references_and_only_those() {
     assert_eq!(links[1]["mimeType"].as_str(), Some("application/json"));
     assert_eq!(links[1]["size"].as_u64(), Some(JSON.len() as u64));
 
+    super::assert_engram_text_matches_structure(&result);
+    assert_eq!(result["content"].as_array().unwrap().len(), links.len() + 1);
     // No bytes ever ride in a tool result: that is what the links exist for.
     for block in result["content"].as_array().unwrap() {
         assert!(
@@ -552,8 +550,7 @@ async fn read_engram_links_the_attachments_it_references_and_only_those() {
     }
 }
 
-/// An engram referencing nothing gets exactly what it always got: one text
-/// block, no links.
+/// An engram without attachments carries the same payload in both representations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_engram_without_references_carries_no_links() {
     let h = Harness::new().await;
@@ -565,12 +562,9 @@ async fn an_engram_without_references_carries_no_links() {
         json!({ "identifier": "manifest", "domain": "eng" }),
     )
     .await;
-    assert_eq!(
-        result["content"].as_array().unwrap().len(),
-        1,
-        "one text block and nothing appended: {:?}",
-        result["content"]
-    );
+    assert_eq!(result["structuredContent"]["permalink"], "manifest");
+    super::assert_engram_text_matches_structure(&result);
+    assert_eq!(result["content"].as_array().unwrap().len(), 1);
 }
 
 /// **The tool list does not move.** The read surface is resources and content
@@ -749,7 +743,16 @@ async fn the_whole_read_surface_is_served_over_streamable_http_too() {
         )
         .await,
     );
-    let links = resource_links(&read["result"]);
+    let result = &read["result"];
+    let body = &result["structuredContent"];
+    assert!(
+        body["content"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("The dashboard as it looked in Q3:"))
+    );
+    let links = resource_links(result);
+    super::assert_engram_text_matches_structure(result);
+    assert_eq!(result["content"].as_array().unwrap().len(), links.len() + 1);
     assert_eq!(links.len(), 2, "the two resolved references: {read}");
     assert_eq!(
         links[0]["uri"].as_str(),
@@ -1003,7 +1006,8 @@ async fn read_engram_with_include_images_returns_image_blocks() {
         images[1]["data"].as_str(),
         Some(BASE64.encode(&second).as_str())
     );
-    // Images come after the links.
+    super::assert_engram_text_matches_structure(&result);
+    // The JSON text comes first and the images follow the links.
     let kinds: Vec<&str> = result["content"]
         .as_array()
         .unwrap()

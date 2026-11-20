@@ -682,7 +682,10 @@ impl Mcp {
         if answer["result"]["isError"] == true {
             return Err(text);
         }
-        Ok(text)
+        Ok(answer["result"]
+            .get("structuredContent")
+            .map(Value::to_string)
+            .unwrap_or(text))
     }
 }
 

@@ -166,8 +166,7 @@ async fn serve(
     (client, server)
 }
 
-/// One tool call: whether it is an error result, and its text, parsed as JSON
-/// where it is JSON.
+/// One tool call: whether it is an error and the structured or text payload.
 async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> (bool, Value) {
     let mut params = CallToolRequestParams::new(tool.to_string());
     if let Value::Object(map) = args {
@@ -177,6 +176,9 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> (bool, Value)
         .call_tool(params)
         .await
         .unwrap_or_else(|e| panic!("{tool}: {e}"));
+    if let Some(value) = result.structured_content {
+        return (result.is_error.unwrap_or(false), value);
+    }
     let v = serde_json::to_value(&result).unwrap();
     let text = v
         .pointer("/content/0/text")

@@ -136,8 +136,11 @@ async fn try_call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Va
     }
 }
 
-/// The JSON a successful call answered in its first text block.
+/// The JSON payload of a successful call.
 fn body(result: &Value) -> Value {
+    if let Some(value) = result.get("structuredContent") {
+        return value.clone();
+    }
     let text = result["content"][0]["text"].as_str().unwrap();
     let json = text.split("\n\n---\n").next().unwrap();
     serde_json::from_str(json).unwrap()
@@ -226,6 +229,7 @@ async fn a_picture_round_trips_byte_for_byte_and_comes_back_as_an_image_too() {
     )
     .await
     .unwrap();
+    assert!(down.get("structuredContent").is_none(), "{down}");
     let file = body(&down);
     assert!(
         file.get("base64").is_none(),

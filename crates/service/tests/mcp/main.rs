@@ -22,3 +22,14 @@ mod mcp_skills;
 mod mcp_subscriptions;
 mod mcp_uploads;
 mod stub;
+
+fn assert_engram_text_matches_structure(result: &serde_json::Value) {
+    let block = &result["content"][0];
+    assert_eq!(block["type"], "text", "{result}");
+    let text = block["text"]
+        .as_str()
+        .expect("first block carries JSON text");
+    let value: serde_json::Value =
+        serde_json::from_str(text).expect("first block carries a complete JSON payload");
+    assert_eq!(value, result["structuredContent"]);
+}
