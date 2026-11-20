@@ -646,6 +646,33 @@ test.describe("hidden marks", () => {
     expect(body).toBe(BUOY.replace("- [ ] Paint", "- [~] Paint"));
   });
 
+  test("Tab and Shift+Tab nest and lift a list item, Escape and then Tab leaves the editor", async ({
+    page,
+  }) => {
+    const permalink = await createEngram(page, titled("Marks List Tab"));
+    const source = await edit(page, permalink);
+    const nested = "- First buoy\n  - Second buoy is **red**";
+    await clickBeside(line(source, "Second buoy"), "Second", "after");
+    await page.keyboard.press("Tab");
+    await expect(source).toBeFocused();
+    await expect.poll(async () => (await held(page)).doc).toContain(nested);
+    const body = await bodySatisfies(page, permalink, (b) =>
+      b.includes(nested),
+    );
+    expect(body).toBe(BUOY.replace("- Second buoy", "  - Second buoy"));
+    await page.keyboard.press("Shift+Tab");
+    await expect(source).toBeFocused();
+    await expect
+      .poll(async () => (await held(page)).doc)
+      .toContain("- First buoy\n- Second buoy is **red**");
+    // Escape and then Tab moves the focus out and writes nothing.
+    const before = (await held(page)).doc;
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Tab");
+    await expect(source).not.toBeFocused();
+    expect((await held(page)).doc).toBe(before);
+  });
+
   test("Text style Heading 1 writes a level two heading", async ({ page }) => {
     const permalink = await createEngram(page, titled("Marks Heading"));
     const source = await edit(page, permalink);
