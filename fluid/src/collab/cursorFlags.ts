@@ -37,6 +37,13 @@ const look = Prec.high(
       // Until the ink below is set: near-black reads on the whole palette.
       color: "#0b0d13",
       pointerEvents: "none",
+      // A layer of its own. The flag hangs above its line, outside the
+      // line's box, and Safari repaints only that box when a caret moves or
+      // goes: the old flag stayed on the screen, half covered by the next
+      // line, until something else redrew the spot. Composited, the flag is
+      // drawn and taken away as a whole.
+      willChange: "transform",
+      transform: "translateZ(0)",
     },
     ".cm-ySelectionCaret > .cm-ySelectionCaretDot": {
       display: "none",
