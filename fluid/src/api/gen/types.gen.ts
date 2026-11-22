@@ -302,6 +302,55 @@ export type AutomationResponse = {
 };
 
 /**
+ * What a bulk action does to each account it names.
+ */
+export type BulkAction = 'deactivate' | 'reactivate' | 'role';
+
+/**
+ * One change for a selection of accounts. Each account is changed as `PATCH /users/{name}` would change it, so the last-admin guard applies to every one, and the caller's own account is refused. `role` is required with the `role` action and refused with the others.
+ */
+export type BulkBody = {
+    /**
+     * What to do to each account.
+     */
+    action: BulkAction;
+    /**
+     * The login names, in any casing. Repeats count once. At most 500.
+     */
+    names: Array<string>;
+    role?: Role | null;
+};
+
+/**
+ * What `POST /users/bulk` answers with: one entry per distinct account, in the
+ * order they were sent.
+ */
+export type BulkResponse = {
+    /**
+     * One result per account.
+     */
+    results: Array<BulkResult>;
+};
+
+/**
+ * What happened to one account of a bulk request.
+ */
+export type BulkResult = {
+    /**
+     * Whether the change was made.
+     */
+    done: boolean;
+    /**
+     * The refusal, in a sentence, when `done` is false.
+     */
+    message?: string | null;
+    /**
+     * The account, as the store keys it.
+     */
+    name: string;
+};
+
+/**
  * What happened to the engram: the four things the sync engine counts, and
  * `files` for an attachment.
  */
@@ -9110,6 +9159,47 @@ export type CreateUserResponses = {
 };
 
 export type CreateUserResponse = CreateUserResponses[keyof CreateUserResponses];
+
+export type BulkUsersData = {
+    body: BulkBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/users/bulk';
+};
+
+export type BulkUsersErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * No names, more than 500, or a `role` that does not fit the action.
+     */
+    422: ProblemDetail;
+};
+
+export type BulkUsersError = BulkUsersErrors[keyof BulkUsersErrors];
+
+export type BulkUsersResponses = {
+    /**
+     * A result per account.
+     */
+    200: BulkResponse;
+};
+
+export type BulkUsersResponse = BulkUsersResponses[keyof BulkUsersResponses];
 
 export type DeleteUserData = {
     body?: never;

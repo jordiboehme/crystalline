@@ -3136,6 +3136,185 @@ async fn the_last_admin_is_protected_through_the_api() {
     }
 }
 
+/// `POST /users/bulk` answers per account: some are done, an unknown name and
+/// the caller's own account are refused in a sentence, and a disabled account
+/// loses its sessions exactly as it does on the single route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_change_reports_per_account() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let bulk = |body: serde_json::Value| {
+        as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin).json(&body)
+    };
+
+    let resp = bulk(serde_json::json!({
+        "names": ["Eddy", "vera", "ghost", "root", "eddy"],
+        "action": "deactivate"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4, "a repeat counts once: {body}");
+    assert_eq!(results[0]["name"], "eddy");
+    assert_eq!(results[0]["done"], true);
+    assert!(results[0].get("message").is_none());
+    assert_eq!(results[1]["done"], true);
+    assert_eq!(results[2]["name"], "ghost");
+    assert_eq!(results[2]["done"], false);
+    assert!(
+        results[2]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no such user")
+    );
+    assert_eq!(results[3]["name"], "root");
+    assert_eq!(results[3]["done"], false);
+    assert!(
+        results[3]["message"]
+            .as_str()
+            .unwrap()
+            .contains("your own account")
+    );
+
+    let users = fx.auth.list_users().await.unwrap();
+    let state = |n: &str| users.iter().find(|u| u.name == n).unwrap().disabled;
+    assert!(state("eddy") && state("vera") && !state("root"));
+    let dead = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), 401, "disabling ends the sessions");
+
+    let resp = bulk(serde_json::json!({"names": ["eddy", "vera"], "action": "reactivate"}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["done"] == true)
+    );
+    assert!(
+        fx.auth
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .all(|u| !u.disabled)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_role_change_guards_every_account() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    fx.auth
+        .add_user("alex", "Alex", None, Role::Admin, "alexpw")
+        .await
+        .unwrap();
+    let bulk = |body: serde_json::Value| {
+        as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin).json(&body)
+    };
+
+    let resp = bulk(serde_json::json!({
+        "names": ["mark", "tina", "root", "alex"],
+        "action": "role",
+        "role": "viewer"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let done: Vec<bool> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["done"].as_bool().unwrap())
+        .collect();
+    assert_eq!(done, [true, true, false, true], "{body}");
+    let users = fx.auth.list_users().await.unwrap();
+    let role = |n: &str| users.iter().find(|u| u.name == n).unwrap().role;
+    assert_eq!(role("mark"), Role::Viewer);
+    assert_eq!(role("alex"), Role::Viewer);
+    assert_eq!(
+        role("root"),
+        Role::Admin,
+        "the caller's own role is untouched"
+    );
+
+    // The same guard the single route has: the only enabled admin cannot be
+    // taken out, shown here at the store the bulk route asks first.
+    let err = fx
+        .auth
+        .check_change_of("root", "demote", true)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("last admin"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_request_is_validated_and_admin_only() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    for body in [
+        serde_json::json!({"names": [], "action": "deactivate"}),
+        serde_json::json!({"names": ["mark"], "action": "role"}),
+        serde_json::json!({"names": ["mark"], "action": "deactivate", "role": "viewer"}),
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "{body}");
+    }
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/bulk",
+        &editor,
+    )
+    .json(&serde_json::json!({"names": ["mark"], "action": "deactivate"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    let resp = as_session(ro.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+        .json(&serde_json::json!({"names": ["mark"], "action": "deactivate"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "read-only refuses like the other routes"
+    );
+    assert!(
+        !ro.auth
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .any(|u| u.disabled)
+    );
+}
+
 /// Every mutating user-admin route is refused on a read-only instance, ahead
 /// of the checks each one would otherwise run: an unknown account is never
 /// probed, and a change that would otherwise be well-formed is refused before
@@ -3600,6 +3779,13 @@ fn write_ops() -> Vec<WriteOp> {
             method: Method::POST,
             path: "/api/v1/users",
             body: Some(serde_json::json!({"name": "new", "role": "viewer", "password": "pw"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/users/bulk",
+            body: Some(serde_json::json!({"names": ["nobody"], "action": "deactivate"})),
             min_role: Role::Admin,
             read_only_exempt: false,
         },

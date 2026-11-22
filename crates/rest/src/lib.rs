@@ -241,6 +241,7 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::list,
         users_api::create,
         users_api::update,
+        users_api::bulk,
         users_api::update_me,
         users_api::reset_password,
         users_api::remove,
@@ -1182,6 +1183,7 @@ fn routes(state: RestState) -> Router {
         // viewer. See [`users_api`] for the three rules these first mutating
         // routes are held to.
         .route("/users", get(users_api::list).post(users_api::create))
+        .route("/users/bulk", post(users_api::bulk))
         .route(
             "/users/{name}",
             patch(users_api::update).delete(users_api::remove),

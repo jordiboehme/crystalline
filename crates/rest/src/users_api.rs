@@ -810,6 +810,235 @@ pub async fn update(
     Ok(Json(UserResponse { user }))
 }
 
+/// The most accounts one bulk request names, so a body cannot keep the store's
+/// write lock busy for long.
+const BULK_LIMIT: usize = 500;
+
+/// What a bulk action does to each account it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkAction {
+    /// Disable the accounts, ending their sessions.
+    Deactivate,
+    /// Enable the accounts again.
+    Reactivate,
+    /// Give the accounts the role sent in `role`.
+    Role,
+}
+
+impl BulkAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            BulkAction::Deactivate => "deactivate",
+            BulkAction::Reactivate => "reactivate",
+            BulkAction::Role => "role",
+        }
+    }
+}
+
+/// What `POST /users/bulk` takes.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(description = "One change for a selection of accounts. Each account \
+                        is changed as `PATCH /users/{name}` would change it, \
+                        so the last-admin guard applies to every one, and the \
+                        caller's own account is refused. `role` is required \
+                        with the `role` action and refused with the others.")]
+pub struct BulkBody {
+    /// The login names, in any casing. Repeats count once. At most 500.
+    names: Vec<String>,
+    /// What to do to each account.
+    action: BulkAction,
+    /// The new role, for the `role` action.
+    #[serde(default)]
+    #[schema(value_type = Option<super::schemas::Role>)]
+    role: Option<Role>,
+}
+
+/// What happened to one account of a bulk request.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct BulkResult {
+    /// The account, as the store keys it.
+    name: String,
+    /// Whether the change was made.
+    done: bool,
+    /// The refusal, in a sentence, when `done` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// What `POST /users/bulk` answers with: one entry per distinct account, in the
+/// order they were sent.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct BulkResponse {
+    /// One result per account.
+    results: Vec<BulkResult>,
+}
+
+/// `POST /users/bulk` - deactivate, reactivate or give a role to a selection of
+/// accounts in one request.
+///
+/// It behaves as N single `PATCH /users/{name}` calls, one after the other: the
+/// last-admin guard (`check_change_of`) runs for every account against the
+/// roster as the earlier ones left it, disabling ends the account's sessions as
+/// the single route does, and the caller's own account is refused. A refusal is
+/// that account's result, not the request's: the answer is a 200 with a result
+/// per account, and the rest are still done. One INFO line records the caller,
+/// the action and the counts.
+#[utoipa::path(
+    post,
+    path = "/api/v1/users/bulk",
+    tag = "users",
+    operation_id = "bulk_users",
+    request_body = BulkBody,
+    responses(
+        (status = 200, description = "A result per account.", body = BulkResponse),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "No names, more than 500, or a `role` that does not \
+                           fit the action.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn bulk(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiJson(body): ApiJson<BulkBody>,
+) -> Result<Json<BulkResponse>, ApiError> {
+    let caller = identity.require_admin()?;
+    refuse_read_only(&state)?;
+    if body.names.is_empty() {
+        return Err(ApiError::unprocessable("name at least one account"));
+    }
+    if body.names.len() > BULK_LIMIT {
+        return Err(ApiError::unprocessable(format!(
+            "at most {BULK_LIMIT} accounts in one request"
+        )));
+    }
+    match (body.action, body.role) {
+        (BulkAction::Role, None) => {
+            return Err(ApiError::unprocessable("the role action needs a role"));
+        }
+        (BulkAction::Deactivate | BulkAction::Reactivate, Some(_)) => {
+            return Err(ApiError::unprocessable(
+                "a role goes with the role action only",
+            ));
+        }
+        _ => {}
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    for raw in &body.names {
+        let name = folded(raw);
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let outcome = bulk_one(&state, &caller, &name, body.action, body.role).await;
+        results.push(match outcome {
+            Ok(()) => BulkResult {
+                name,
+                done: true,
+                message: None,
+            },
+            Err(message) => BulkResult {
+                name,
+                done: false,
+                message: Some(message),
+            },
+        });
+    }
+    let done = results.iter().filter(|r| r.done).count();
+    tracing::info!(
+        "{} ran bulk {} on {} accounts: {} done, {} refused",
+        caller.name(),
+        body.action.as_str(),
+        results.len(),
+        done,
+        results.len() - done,
+    );
+    if done > 0 {
+        crate::readers_changed(&state);
+    }
+    Ok(Json(BulkResponse { results }))
+}
+
+/// One account of a bulk request: the guard first, then the write, each in the
+/// store's own words. The error is the sentence for the result.
+async fn bulk_one(
+    state: &RestState,
+    caller: &Caller,
+    name: &str,
+    action: BulkAction,
+    role: Option<Role>,
+) -> Result<(), String> {
+    let store = &state.auth;
+    if name == caller.name() {
+        let what = match action {
+            BulkAction::Deactivate => "disable",
+            BulkAction::Reactivate => "reactivate",
+            BulkAction::Role => "change the role of",
+        };
+        return Err(format!(
+            "refusing to {what} your own account ('{name}'): ask another admin to do it, \
+             or use `crystalline users` on the server"
+        ));
+    }
+    let said = |e: anyhow::Error| format!("{e:#}");
+    match (action, role) {
+        (BulkAction::Deactivate, _) => {
+            store
+                .check_change_of(name, "disable", true)
+                .await
+                .map_err(said)?;
+            store.set_disabled(name, true).await.map_err(said)
+        }
+        (BulkAction::Reactivate, _) => {
+            store
+                .check_change_of(name, "reactivate", false)
+                .await
+                .map_err(said)?;
+            store.set_disabled(name, false).await.map_err(said)
+        }
+        (BulkAction::Role, Some(role)) => {
+            store
+                .check_change_of(name, "demote", role != Role::Admin)
+                .await
+                .map_err(said)?;
+            store.set_role(name, role).await.map_err(said)
+        }
+        (BulkAction::Role, None) => Err("the role action needs a role".to_string()),
+    }
+}
+
 /// What `PATCH /me` takes: the one thing a person may change about their own
 /// account here, their display name.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

@@ -12407,6 +12407,88 @@
         }
       }
     },
+    "/api/v1/users/bulk": {
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`POST /users/bulk` - deactivate, reactivate or give a role to a selection of\naccounts in one request.",
+        "description": "It behaves as N single `PATCH /users/{name}` calls, one after the other: the\nlast-admin guard (`check_change_of`) runs for every account against the\nroster as the earlier ones left it, disabling ends the account's sessions as\nthe single route does, and the caller's own account is refused. A refusal is\nthat account's result, not the request's: the answer is a 200 with a result\nper account, and the rest are still done. One INFO line records the caller,\nthe action and the counts.",
+        "operationId": "bulk_users",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "A result per account.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No names, more than 500, or a `role` that does not fit the action.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/{name}": {
       "delete": {
         "tags": [
@@ -13416,6 +13498,89 @@
                 "type": "null"
               }
             ]
+          }
+        }
+      },
+      "BulkAction": {
+        "type": "string",
+        "description": "What a bulk action does to each account it names.",
+        "enum": [
+          "deactivate",
+          "reactivate",
+          "role"
+        ]
+      },
+      "BulkBody": {
+        "type": "object",
+        "description": "One change for a selection of accounts. Each account is changed as `PATCH /users/{name}` would change it, so the last-admin guard applies to every one, and the caller's own account is refused. `role` is required with the `role` action and refused with the others.",
+        "required": [
+          "names",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkAction",
+            "description": "What to do to each account."
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The login names, in any casing. Repeats count once. At most 500."
+          },
+          "role": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "The new role, for the `role` action."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "BulkResponse": {
+        "type": "object",
+        "description": "What `POST /users/bulk` answers with: one entry per distinct account, in the\norder they were sent.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkResult"
+            },
+            "description": "One result per account."
+          }
+        }
+      },
+      "BulkResult": {
+        "type": "object",
+        "description": "What happened to one account of a bulk request.",
+        "required": [
+          "name",
+          "done"
+        ],
+        "properties": {
+          "done": {
+            "type": "boolean",
+            "description": "Whether the change was made."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The refusal, in a sentence, when `done` is false."
+          },
+          "name": {
+            "type": "string",
+            "description": "The account, as the store keys it."
           }
         }
       },
