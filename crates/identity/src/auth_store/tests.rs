@@ -7332,3 +7332,52 @@ mod postgres {
         assert_eq!(count(&other).await, 0);
     }
 }
+
+/// The listing and the single read say how each account signs in and whether
+/// it has a GitHub link; a read made to authenticate does not look. Runs on
+/// whichever backend the suite is pointed at.
+#[tokio::test]
+async fn a_user_read_carries_the_sign_in_kind_and_the_github_link() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("pw", "Pw", None, Role::Viewer, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .provision_linked_user(
+            "https://idp.example",
+            "s1",
+            "sso",
+            None,
+            None,
+            Role::Viewer,
+            100,
+        )
+        .await
+        .unwrap();
+    store
+        .add_token_only_user("bot", "Bot", None, Role::Editor, "ci")
+        .await
+        .unwrap();
+    store.ensure_user("prox", Role::Viewer, 100).await.unwrap();
+    store
+        .link_github("pw", "github.com", 42, "pw-gh")
+        .await
+        .unwrap();
+
+    let listed = store.list_users().await.unwrap();
+    let of = |name: &str| listed.iter().find(|u| u.name == name).unwrap();
+    assert_eq!(of("pw").sign_in, Some(SignInKind::Password));
+    assert_eq!(of("sso").sign_in, Some(SignInKind::Oidc));
+    assert_eq!(of("bot").sign_in, Some(SignInKind::TokenOnly));
+    assert_eq!(of("prox").sign_in, Some(SignInKind::Proxy));
+    assert_eq!(of("pw").github_linked, Some(true));
+    assert_eq!(of("bot").github_linked, Some(false));
+
+    let one = store.user("bot").await.unwrap().unwrap();
+    assert_eq!(one.sign_in, Some(SignInKind::TokenOnly));
+    assert_eq!(one.github_linked, Some(false));
+    let session = store.create_session("pw", 60).await.unwrap();
+    let (read, _csrf) = store.session_user(&session.token).await.unwrap().unwrap();
+    assert_eq!((read.sign_in, read.github_linked), (None, None));
+}

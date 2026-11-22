@@ -54,9 +54,9 @@ pub struct User {
     pub last_seen: Option<String>,
     /// The Reflection level on every shared domain.
     pub reflection: ReflectionLevel,
-    /// How this account signs in. Filled by [`AuthStore::user`] and
-    /// [`AuthStore::list_users`]; `None` (and left out of the JSON) on a user
-    /// read for authentication, which does not look.
+    /// How this account signs in. Filled when one account or the account list
+    /// is read; left out of the JSON where the account was read only to
+    /// authenticate a request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sign_in: Option<SignInKind>,
     /// Whether a GitHub link exists for this account. Filled like `sign_in`.
@@ -64,11 +64,16 @@ pub struct User {
     pub github_linked: Option<bool>,
 }
 
-/// How an account signs in, worked out from what it holds: a password, else an
-/// identity link to a single sign-on provider, else a personal token, else
-/// nothing of its own (a proxy or trusted-header account, which an upstream
-/// authenticates). An account that holds a password is `Password` even when it
-/// also has links or tokens.
+/// How an account signs in, worked out from what it holds, in this order: a
+/// password (`password`, even when it also has links or tokens), else an
+/// identity link to a sign-on provider (`oidc`), else any personal token row
+/// (`token_only`), else nothing of its own (`proxy`: an upstream proxy or
+/// trusted header authenticates it).
+///
+/// `proxy` and `token_only` are inferred, since nothing stores the kind: the
+/// token table has no expiry or revoked column, so any row counts, an expired
+/// or unused one too, and a proxy account that was later given a token shows
+/// as `token_only`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SignInKind {

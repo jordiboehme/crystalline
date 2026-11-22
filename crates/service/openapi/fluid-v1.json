@@ -12240,7 +12240,7 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "minimum": 1
             }
           },
           {
@@ -12250,7 +12250,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "maximum": 500,
+              "minimum": 1
             }
           }
         ],
@@ -16679,7 +16680,7 @@
       },
       "SignInKind": {
         "type": "string",
-        "description": "How an account signs in, worked out from what it holds: a password, else an\nidentity link to a single sign-on provider, else a personal token, else\nnothing of its own (a proxy or trusted-header account, which an upstream\nauthenticates). An account that holds a password is `Password` even when it\nalso has links or tokens.",
+        "description": "How an account signs in, worked out from what it holds, in this order: a\npassword (`password`, even when it also has links or tokens), else an\nidentity link to a sign-on provider (`oidc`), else any personal token row\n(`token_only`), else nothing of its own (`proxy`: an upstream proxy or\ntrusted header authenticates it).\n\n`proxy` and `token_only` are inferred, since nothing stores the kind: the\ntoken table has no expiry or revoked column, so any row counts, an expired\nor unused one too, and a proxy account that was later given a token shows\nas `token_only`.",
         "enum": [
           "password",
           "oidc",
@@ -17099,7 +17100,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/SignInKind",
-                "description": "How this account signs in. Filled by [`AuthStore::user`] and\n[`AuthStore::list_users`]; `None` (and left out of the JSON) on a user\nread for authentication, which does not look."
+                "description": "How this account signs in. Filled when one account or the account list\nis read; left out of the JSON where the account was read only to\nauthenticate a request."
               },
               {
                 "type": "null"

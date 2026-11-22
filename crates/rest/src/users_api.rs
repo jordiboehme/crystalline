@@ -187,10 +187,12 @@ pub struct ListQuery {
     dir: Option<SortDir>,
     /// The page, from 1. Only read together with `limit`.
     #[serde(default)]
+    #[param(minimum = 1)]
     page: Option<usize>,
     /// Accounts per page (1 to 500). Without it every matching account comes
     /// back in one answer.
     #[serde(default)]
+    #[param(minimum = 1, maximum = 500)]
     limit: Option<usize>,
 }
 
