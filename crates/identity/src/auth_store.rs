@@ -408,6 +408,56 @@ pub struct User {
     pub last_seen: Option<String>,
     /// The Reflection level on every shared domain.
     pub reflection: ReflectionLevel,
+    /// How this account signs in. Filled by [`AuthStore::user`] and
+    /// [`AuthStore::list_users`]; `None` (and left out of the JSON) on a user
+    /// read for authentication, which does not look.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInKind>,
+    /// Whether a GitHub link exists for this account. Filled like `sign_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_linked: Option<bool>,
+}
+
+/// How an account signs in, worked out from what it holds: a password, else an
+/// identity link to a single sign-on provider, else a personal token, else
+/// nothing of its own (a proxy or trusted-header account, which an upstream
+/// authenticates). An account that holds a password is `Password` even when it
+/// also has links or tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInKind {
+    /// A password this instance verifies.
+    Password,
+    /// An identity link to a sign-on provider (OIDC).
+    Oidc,
+    /// No password and no link: an upstream proxy or trusted header
+    /// authenticates it.
+    Proxy,
+    /// No password and no link, but a personal token: reachable by token only.
+    TokenOnly,
+}
+
+impl SignInKind {
+    /// The name the API and the filters use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignInKind::Password => "password",
+            SignInKind::Oidc => "oidc",
+            SignInKind::Proxy => "proxy",
+            SignInKind::TokenOnly => "token_only",
+        }
+    }
+
+    /// The kind a filter names, or `None` for an unknown word.
+    pub fn parse(word: &str) -> Option<SignInKind> {
+        match word {
+            "password" => Some(SignInKind::Password),
+            "oidc" => Some(SignInKind::Oidc),
+            "proxy" => Some(SignInKind::Proxy),
+            "token_only" => Some(SignInKind::TokenOnly),
+            _ => None,
+        }
+    }
 }
 
 /// One identity an external provider asserts, tied to one account.
@@ -1636,6 +1686,18 @@ const NO_REDIRECT_HOST: &str = "an address with no host";
 /// The columns every user read selects, in the order [`user_from_row`] decodes.
 const USER_COLUMNS: &str = "name, display, email, role, disabled, last_seen_at, reflection";
 
+/// [`USER_COLUMNS`] plus the sign-in kind and the GitHub link flag, decoded by
+/// [`user_from_row`] at columns 7 and 8. Only for reads that end in a `User`
+/// with nothing trailing, since the extra columns would shift a trailing one.
+const USER_COLUMNS_WITH_SIGN_IN: &str =
+    "name, display, email, role, disabled, last_seen_at, reflection,
+     CASE WHEN pass_hash IS NOT NULL THEN 'password'
+          WHEN EXISTS (SELECT 1 FROM identity_link il WHERE il.\"user\" = users.name) THEN 'oidc'
+          WHEN EXISTS (SELECT 1 FROM mcp_tokens mt WHERE mt.\"user\" = users.name) THEN 'token_only'
+          ELSE 'proxy' END,
+     CASE WHEN EXISTS (SELECT 1 FROM github_link gl WHERE gl.account = users.name)
+          THEN 1 ELSE 0 END";
+
 /// [`USER_COLUMNS`] qualified for the session join, where `users` is aliased
 /// `u`. Same columns in the same order, so [`user_from_row`] decodes both.
 const USER_COLUMNS_JOINED: &str =
@@ -2561,7 +2623,7 @@ impl AuthStore {
         Ok(self
             .db
             .query_first(
-                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                &format!("SELECT {USER_COLUMNS_WITH_SIGN_IN} FROM users WHERE name = ?1"),
                 vec![Value::Text(name)],
             )
             .await?
@@ -2600,7 +2662,7 @@ impl AuthStore {
         let rows = self
             .db
             .query(
-                &format!("SELECT {USER_COLUMNS} FROM users ORDER BY name"),
+                &format!("SELECT {USER_COLUMNS_WITH_SIGN_IN} FROM users ORDER BY name"),
                 vec![],
             )
             .await
@@ -7198,7 +7260,8 @@ async fn ensure_column(conn: &Connection, table: &str, column_def: &str) -> Resu
     }
 }
 
-/// Decode the [`USER_COLUMNS`] prefix of a row.
+/// Decode the [`USER_COLUMNS`] prefix of a row, and the two trailing columns
+/// of [`USER_COLUMNS_WITH_SIGN_IN`] when the row has them.
 fn user_from_row(row: &AuthRow) -> User {
     User {
         name: cell_text(row, 0).unwrap_or_default(),
@@ -7208,6 +7271,11 @@ fn user_from_row(row: &AuthRow) -> User {
         disabled: matches!(row.get_value(4), Ok(Value::Integer(i)) if i != 0),
         last_seen: cell_text(row, 5),
         reflection: reflection_level_from_db(cell_text(row, 6)),
+        sign_in: cell_text(row, 7).and_then(|kind| SignInKind::parse(&kind)),
+        github_linked: match row.get_value(8) {
+            Ok(Value::Integer(i)) => Some(i != 0),
+            _ => None,
+        },
     }
 }
 

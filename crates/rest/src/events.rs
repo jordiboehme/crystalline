@@ -803,6 +803,8 @@ mod tests {
                 disabled: false,
                 last_seen: None,
                 reflection: crate::ReflectionLevel::Default,
+                sign_in: None,
+                github_linked: None,
             }),
             csrf: None,
             anonymous: false,

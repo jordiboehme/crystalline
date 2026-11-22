@@ -1523,6 +1523,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turso",
+ "unicode-normalization",
  "url",
 ]
 

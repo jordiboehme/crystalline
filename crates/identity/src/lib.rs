@@ -3,6 +3,7 @@
 //! joins into somebody else's draft. No HTTP surface and no engine live
 //! here; the engine and the JSON API both read these types.
 
+pub mod account_match;
 pub mod auth_store;
 pub mod join;
 pub mod scope;

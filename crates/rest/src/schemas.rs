@@ -54,6 +54,33 @@ pub struct User {
     pub last_seen: Option<String>,
     /// The Reflection level on every shared domain.
     pub reflection: ReflectionLevel,
+    /// How this account signs in. Filled by [`AuthStore::user`] and
+    /// [`AuthStore::list_users`]; `None` (and left out of the JSON) on a user
+    /// read for authentication, which does not look.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInKind>,
+    /// Whether a GitHub link exists for this account. Filled like `sign_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_linked: Option<bool>,
+}
+
+/// How an account signs in, worked out from what it holds: a password, else an
+/// identity link to a single sign-on provider, else a personal token, else
+/// nothing of its own (a proxy or trusted-header account, which an upstream
+/// authenticates). An account that holds a password is `Password` even when it
+/// also has links or tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInKind {
+    /// A password this instance verifies.
+    Password,
+    /// An identity link to a sign-on provider (OIDC).
+    Oidc,
+    /// No password and no link: an upstream proxy or trusted header
+    /// authenticates it.
+    Proxy,
+    /// No password and no link, but a personal token: reachable by token only.
+    TokenOnly,
 }
 
 /// One identity an external provider asserts, tied to one account.
@@ -656,8 +683,19 @@ mod tests {
                 disabled: false,
                 last_seen: None,
                 reflection: ReflectionLevel::Default,
+                sign_in: Some(auth_store::SignInKind::Password),
+                github_linked: Some(false),
             }]),
             published::<super::User>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::SignInKind::Password,
+                auth_store::SignInKind::Oidc,
+                auth_store::SignInKind::Proxy,
+                auth_store::SignInKind::TokenOnly
+            ]),
+            published::<super::SignInKind>()
         );
         assert_eq!(
             keys([auth_store::IdentityLink {

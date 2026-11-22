@@ -12145,16 +12145,132 @@
         "tags": [
           "users"
         ],
-        "summary": "Every account, by name.",
-        "description": "An account carries no password material, so the rows go out as they come back from the store. Admin only: the account list names every way into the instance and who holds it.",
+        "summary": "The accounts, searched, filtered, sorted and paged.",
+        "description": "An account carries no password material, so the rows go out as they come back from the store. Admin only: the account list names every way into the instance and who holds it. `q` matches a prefix or word prefix of the login or display name (case and accents folded) or a whole email address. Sorting is by `sort` and `dir` with the login name as the tiebreak; an account never seen sorts last by `last_seen` in both directions. Without `limit` every matching account is answered, by name, and `page` is ignored. `total` counts the matches before paging; paging by `last_seen` can shift as accounts are seen.",
         "operationId": "list_users",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Search text: a prefix or word prefix of the login or display name (case\nand accents folded), or a whole email address.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "ada"
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "Only accounts with this role.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Role"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Only active or only disabled accounts.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/StateFilter"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Only accounts that sign in this way.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/KindFilter"
+            }
+          },
+          {
+            "name": "seen_before",
+            "in": "query",
+            "description": "Only accounts last seen before this instant (RFC 3339). An account\nnever seen is not before anything.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-11-01T00:00:00Z"
+          },
+          {
+            "name": "seen_after",
+            "in": "query",
+            "description": "Only accounts last seen after this instant (RFC 3339).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-11-01T00:00:00Z"
+          },
+          {
+            "name": "github",
+            "in": "query",
+            "description": "`true` for accounts with a GitHub link, `false` for those without.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "The column to sort by. Default `name`; `name` breaks every tie.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SortColumn"
+            }
+          },
+          {
+            "name": "dir",
+            "in": "query",
+            "description": "The direction. Default `asc`.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SortDir"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "The page, from 1. Only read together with `limit`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Accounts per page (1 to 500). Without it every matching account comes\nback in one answer.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Every account.",
+            "description": "The matching accounts.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UsersResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A filter, `page` or `limit` is malformed.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
                 }
               }
             }
@@ -14744,6 +14860,16 @@
           }
         }
       },
+      "KindFilter": {
+        "type": "string",
+        "description": "A sign-in kind a `GET /users` filter names.",
+        "enum": [
+          "password",
+          "oidc",
+          "proxy",
+          "token_only"
+        ]
+      },
       "LeaveBody": {
         "type": "object",
         "description": "The key the join was opened under.",
@@ -16551,6 +16677,36 @@
           }
         }
       },
+      "SignInKind": {
+        "type": "string",
+        "description": "How an account signs in, worked out from what it holds: a password, else an\nidentity link to a single sign-on provider, else a personal token, else\nnothing of its own (a proxy or trusted-header account, which an upstream\nauthenticates). An account that holds a password is `Password` even when it\nalso has links or tokens.",
+        "enum": [
+          "password",
+          "oidc",
+          "proxy",
+          "token_only"
+        ]
+      },
+      "SortColumn": {
+        "type": "string",
+        "description": "The column `GET /users` sorts by.",
+        "enum": [
+          "name",
+          "display",
+          "role",
+          "state",
+          "last_seen",
+          "kind"
+        ]
+      },
+      "SortDir": {
+        "type": "string",
+        "description": "The direction of a sort.",
+        "enum": [
+          "asc",
+          "desc"
+        ]
+      },
       "StartGithubLinkResponse": {
         "type": "object",
         "description": "What `POST /me/github-link/start` answers: where to send the browser.",
@@ -16603,6 +16759,14 @@
             "example": "Tag Aliases"
           }
         }
+      },
+      "StateFilter": {
+        "type": "string",
+        "description": "The state a `GET /users` filter names.",
+        "enum": [
+          "active",
+          "disabled"
+        ]
       },
       "TagAliasDeclView": {
         "type": "object",
@@ -16903,6 +17067,13 @@
             "description": "Optional contact address; never used for login.",
             "example": "ada@example.com"
           },
+          "github_linked": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether a GitHub link exists for this account. Filled like `sign_in`."
+          },
           "last_seen": {
             "type": [
               "string",
@@ -16923,6 +17094,17 @@
           "role": {
             "$ref": "#/components/schemas/Role",
             "description": "What this account may do."
+          },
+          "sign_in": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SignInKind",
+                "description": "How this account signs in. Filled by [`AuthStore::user`] and\n[`AuthStore::list_users`]; `None` (and left out of the JSON) on a user\nread for authentication, which does not look."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -16943,15 +17125,21 @@
         "type": "object",
         "description": "What `GET /users` answers with. A wrapper rather than a bare array, matching\nthe `{\"users\": [...]}` envelope `crystalline users list --json` prints.",
         "required": [
-          "users"
+          "users",
+          "total"
         ],
         "properties": {
+          "total": {
+            "type": "integer",
+            "description": "How many accounts match the filters in all, whatever the page.",
+            "minimum": 0
+          },
           "users": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/User"
             },
-            "description": "Every account, by name."
+            "description": "The accounts of the asked page, or every matching account when no\n`limit` was given."
           }
         }
       },

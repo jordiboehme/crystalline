@@ -116,6 +116,9 @@ similar = "3.2.1"
 # in inside a line, so neither ever splits a surrogate pair or a compound
 # emoji (crates/engine). Already in the graph through other crates.
 unicode-segmentation = "1.13.3"
+# Accent folding for the account matcher (crates/identity). Already in the
+# graph through url.
+unicode-normalization = "0.1.26"
 # Cheaply cloned byte buffers for the collab broadcast fan-out; also the shape
 # axum's WebSocket binary frames take, so a frame crosses the seam without a
 # copy. Already in the graph through axum and tokio.

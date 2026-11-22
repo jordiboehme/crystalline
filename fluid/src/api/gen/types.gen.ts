@@ -1216,6 +1216,11 @@ export type KeptTextsResponse = {
 };
 
 /**
+ * A sign-in kind a `GET /users` filter names.
+ */
+export type KindFilter = 'password' | 'oidc' | 'proxy' | 'token_only';
+
+/**
  * The key the join was opened under.
  */
 export type LeaveBody = {
@@ -2555,6 +2560,25 @@ export type ShareBody = {
 };
 
 /**
+ * How an account signs in, worked out from what it holds: a password, else an
+ * identity link to a single sign-on provider, else a personal token, else
+ * nothing of its own (a proxy or trusted-header account, which an upstream
+ * authenticates). An account that holds a password is `Password` even when it
+ * also has links or tokens.
+ */
+export type SignInKind = 'password' | 'oidc' | 'proxy' | 'token_only';
+
+/**
+ * The column `GET /users` sorts by.
+ */
+export type SortColumn = 'name' | 'display' | 'role' | 'state' | 'last_seen' | 'kind';
+
+/**
+ * The direction of a sort.
+ */
+export type SortDir = 'asc' | 'desc';
+
+/**
  * What `POST /me/github-link/start` answers: where to send the browser.
  */
 export type StartGithubLinkResponse = {
@@ -2594,6 +2618,11 @@ export type StarterStanzaView = {
      */
     section: string;
 };
+
+/**
+ * The state a `GET /users` filter names.
+ */
+export type StateFilter = 'active' | 'disabled';
 
 /**
  * One `old -> canonical` mapping, both sides verbatim.
@@ -2819,6 +2848,10 @@ export type User = {
      */
     email?: string | null;
     /**
+     * Whether a GitHub link exists for this account. Filled like `sign_in`.
+     */
+    github_linked?: boolean | null;
+    /**
      * When this account last resolved a session or arrived through the
      * trusted header, RFC 3339. Null for an account never seen.
      */
@@ -2836,6 +2869,7 @@ export type User = {
      * What this account may do.
      */
     role: Role;
+    sign_in?: SignInKind | null;
 };
 
 /**
@@ -2855,7 +2889,12 @@ export type UserResponse = {
  */
 export type UsersResponse = {
     /**
-     * Every account, by name.
+     * How many accounts match the filters in all, whatever the page.
+     */
+    total: number;
+    /**
+     * The accounts of the asked page, or every matching account when no
+     * `limit` was given.
      */
     users: Array<User>;
 };
@@ -8940,11 +8979,63 @@ export type GetSyncSummaryResponse = GetSyncSummaryResponses[keyof GetSyncSummar
 export type ListUsersData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Search text: a prefix or word prefix of the login or display name (case
+         * and accents folded), or a whole email address.
+         */
+        q?: string;
+        /**
+         * Only accounts with this role.
+         */
+        role?: Role;
+        /**
+         * Only active or only disabled accounts.
+         */
+        state?: StateFilter;
+        /**
+         * Only accounts that sign in this way.
+         */
+        kind?: KindFilter;
+        /**
+         * Only accounts last seen before this instant (RFC 3339). An account
+         * never seen is not before anything.
+         */
+        seen_before?: string;
+        /**
+         * Only accounts last seen after this instant (RFC 3339).
+         */
+        seen_after?: string;
+        /**
+         * `true` for accounts with a GitHub link, `false` for those without.
+         */
+        github?: boolean;
+        /**
+         * The column to sort by. Default `name`; `name` breaks every tie.
+         */
+        sort?: SortColumn;
+        /**
+         * The direction. Default `asc`.
+         */
+        dir?: SortDir;
+        /**
+         * The page, from 1. Only read together with `limit`.
+         */
+        page?: number;
+        /**
+         * Accounts per page (1 to 500). Without it every matching account comes
+         * back in one answer.
+         */
+        limit?: number;
+    };
     url: '/api/v1/users';
 };
 
 export type ListUsersErrors = {
+    /**
+     * A filter, `page` or `limit` is malformed.
+     */
+    400: ProblemDetail;
     /**
      * No identity.
      */
@@ -8959,7 +9050,7 @@ export type ListUsersError = ListUsersErrors[keyof ListUsersErrors];
 
 export type ListUsersResponses = {
     /**
-     * Every account.
+     * The matching accounts.
      */
     200: UsersResponse;
 };

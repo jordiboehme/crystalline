@@ -49,21 +49,26 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use crystalline_identity::account_match::{AccountMatcher, fold};
 use serde::Deserialize;
 
 use super::auth::{Caller, Identity};
-use super::auth_store::{ReflectionLevel, RefusalKind, Role, StoreRefusal, User};
+use super::auth_store::{ReflectionLevel, RefusalKind, Role, SignInKind, StoreRefusal, User};
 use super::{
-    ApiError, ApiJson, ApiPath, ProblemDetail, RestState, check_password, refuse_read_only,
+    ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, check_password,
+    refuse_read_only,
 };
 
 /// What `GET /users` answers with. A wrapper rather than a bare array, matching
 /// the `{"users": [...]}` envelope `crystalline users list --json` prints.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct UsersResponse {
-    /// Every account, by name.
+    /// The accounts of the asked page, or every matching account when no
+    /// `limit` was given.
     #[schema(value_type = Vec<super::schemas::User>)]
     users: Vec<User>,
+    /// How many accounts match the filters in all, whatever the page.
+    total: usize,
 }
 
 /// What every writing route but `DELETE` answers with: the account as stored,
@@ -75,7 +80,237 @@ pub struct UserResponse {
     user: User,
 }
 
-/// `GET /users` - every account, by name.
+/// The state a `GET /users` filter names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateFilter {
+    /// Accounts that may sign in.
+    Active,
+    /// Disabled accounts.
+    Disabled,
+}
+
+/// A sign-in kind a `GET /users` filter names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KindFilter {
+    /// A password this instance verifies.
+    Password,
+    /// A sign-on provider link (OIDC).
+    Oidc,
+    /// Authenticated by an upstream proxy or trusted header.
+    Proxy,
+    /// No password and no link, but a personal token.
+    TokenOnly,
+}
+
+impl KindFilter {
+    fn kind(self) -> SignInKind {
+        match self {
+            KindFilter::Password => SignInKind::Password,
+            KindFilter::Oidc => SignInKind::Oidc,
+            KindFilter::Proxy => SignInKind::Proxy,
+            KindFilter::TokenOnly => SignInKind::TokenOnly,
+        }
+    }
+}
+
+/// The column `GET /users` sorts by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumn {
+    /// The login name (the default).
+    Name,
+    /// The display name, case and accents folded.
+    Display,
+    /// The role, least to most privileged.
+    Role,
+    /// Active before disabled.
+    State,
+    /// When the account was last seen; an account never seen sorts last in
+    /// both directions.
+    LastSeen,
+    /// The sign-in kind, by its name.
+    Kind,
+}
+
+/// The direction of a sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDir {
+    /// Smallest first (the default).
+    Asc,
+    /// Largest first.
+    Desc,
+}
+
+/// The most accounts one page may hold.
+const MAX_PAGE_SIZE: usize = 500;
+
+/// The query string `GET /users` takes. Every field is optional; with none of
+/// them the answer is every account by name, as it always was.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListQuery {
+    /// Search text: a prefix or word prefix of the login or display name (case
+    /// and accents folded), or a whole email address.
+    #[serde(default)]
+    #[param(example = "ada")]
+    q: Option<String>,
+    /// Only accounts with this role.
+    #[serde(default)]
+    #[param(value_type = Option<super::schemas::Role>)]
+    role: Option<Role>,
+    /// Only active or only disabled accounts.
+    #[serde(default)]
+    state: Option<StateFilter>,
+    /// Only accounts that sign in this way.
+    #[serde(default)]
+    kind: Option<KindFilter>,
+    /// Only accounts last seen before this instant (RFC 3339). An account
+    /// never seen is not before anything.
+    #[serde(default)]
+    #[param(example = "2026-11-01T00:00:00Z")]
+    seen_before: Option<String>,
+    /// Only accounts last seen after this instant (RFC 3339).
+    #[serde(default)]
+    #[param(example = "2026-11-01T00:00:00Z")]
+    seen_after: Option<String>,
+    /// `true` for accounts with a GitHub link, `false` for those without.
+    #[serde(default)]
+    github: Option<bool>,
+    /// The column to sort by. Default `name`; `name` breaks every tie.
+    #[serde(default)]
+    sort: Option<SortColumn>,
+    /// The direction. Default `asc`.
+    #[serde(default)]
+    dir: Option<SortDir>,
+    /// The page, from 1. Only read together with `limit`.
+    #[serde(default)]
+    page: Option<usize>,
+    /// Accounts per page (1 to 500). Without it every matching account comes
+    /// back in one answer.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Where a role stands from least to most privileged, for sorting.
+fn role_rank(role: Role) -> u8 {
+    match role {
+        Role::None => 0,
+        Role::Viewer => 1,
+        Role::Editor => 2,
+        Role::Admin => 3,
+    }
+}
+
+/// An RFC 3339 filter value as an instant, or the 400 that names the filter.
+fn instant_filter(name: &str, value: Option<&str>) -> Result<Option<i64>, ApiError> {
+    let Some(value) = value else { return Ok(None) };
+    crystalline_core::time::parse_rfc3339(value)
+        .map(|at| Some(at.stamp().unix_micros()))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "{name} must be an RFC 3339 time, such as 2026-11-01T00:00:00Z"
+            ))
+        })
+}
+
+/// The instant an account was last seen, in microseconds, if it ever was.
+fn seen_micros(user: &User) -> Option<i64> {
+    user.last_seen
+        .as_deref()
+        .and_then(crystalline_core::time::parse_lenient_stamp)
+        .map(|at| at.unix_micros())
+}
+
+/// Filter, sort and page `users` as `query` asks, returning the page and how
+/// many accounts matched before paging.
+///
+/// Lives apart from the handler so the rules (the `last_seen` NULL order, the
+/// `name` tiebreak, the paging) read in one place.
+fn select_users(users: Vec<User>, query: &ListQuery) -> Result<(Vec<User>, usize), ApiError> {
+    let before = instant_filter("seen_before", query.seen_before.as_deref())?;
+    let after = instant_filter("seen_after", query.seen_after.as_deref())?;
+    if query.page == Some(0) {
+        return Err(ApiError::bad_request("page starts at 1"));
+    }
+    if let Some(limit) = query.limit
+        && !(1..=MAX_PAGE_SIZE).contains(&limit)
+    {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_PAGE_SIZE}"
+        )));
+    }
+    let matcher = query
+        .q
+        .as_deref()
+        .map(|q| AccountMatcher::new(q, true))
+        .filter(|matcher| !matcher.is_empty());
+    let mut rows: Vec<User> = users
+        .into_iter()
+        .filter(|user| {
+            matcher
+                .as_ref()
+                .is_none_or(|m| m.matches(&user.name, &user.display, user.email.as_deref()))
+                && query.role.is_none_or(|role| user.role == role)
+                && query.state.is_none_or(|state| match state {
+                    StateFilter::Active => !user.disabled,
+                    StateFilter::Disabled => user.disabled,
+                })
+                && query
+                    .kind
+                    .is_none_or(|kind| user.sign_in == Some(kind.kind()))
+                && query.github.is_none_or(|g| user.github_linked == Some(g))
+                && before.is_none_or(|b| seen_micros(user).is_some_and(|seen| seen < b))
+                && after.is_none_or(|a| seen_micros(user).is_some_and(|seen| seen > a))
+        })
+        .collect();
+    let total = rows.len();
+    let column = query.sort.unwrap_or(SortColumn::Name);
+    let descending = query.dir == Some(SortDir::Desc);
+    rows.sort_by(|a, b| {
+        let by_column = match column {
+            SortColumn::Name => a.name.cmp(&b.name),
+            SortColumn::Display => fold(&a.display).cmp(&fold(&b.display)),
+            SortColumn::Role => role_rank(a.role).cmp(&role_rank(b.role)),
+            SortColumn::State => a.disabled.cmp(&b.disabled),
+            SortColumn::Kind => {
+                let kind = |u: &User| u.sign_in.map(SignInKind::as_str);
+                kind(a).cmp(&kind(b))
+            }
+            SortColumn::LastSeen => {
+                // A never-seen account sorts after every seen one whichever
+                // way the sort runs, so the direction applies to the seen
+                // ones only.
+                return match (seen_micros(a), seen_micros(b)) {
+                    (Some(x), Some(y)) => {
+                        let order = x.cmp(&y);
+                        (if descending { order.reverse() } else { order })
+                            .then_with(|| a.name.cmp(&b.name))
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.name.cmp(&b.name),
+                };
+            }
+        };
+        (if descending {
+            by_column.reverse()
+        } else {
+            by_column
+        })
+        .then_with(|| a.name.cmp(&b.name))
+    });
+    if let Some(limit) = query.limit {
+        let skip = (query.page.unwrap_or(1) - 1).saturating_mul(limit);
+        rows = rows.into_iter().skip(skip).take(limit).collect();
+    }
+    Ok((rows, total))
+}
+
+/// `GET /users` - the accounts, filtered, sorted and paged as asked; every
+/// account, by name, when nothing is asked.
 ///
 /// [`User`] carries no password material, so the rows go out as they come back
 /// from the store. Admin only: the account list names every way into the
@@ -85,12 +320,27 @@ pub struct UserResponse {
     path = "/api/v1/users",
     tag = "users",
     operation_id = "list_users",
-    summary = "Every account, by name.",
+    summary = "The accounts, searched, filtered, sorted and paged.",
     description = "An account carries no password material, so the rows go out \
                    as they come back from the store. Admin only: the account \
-                   list names every way into the instance and who holds it.",
+                   list names every way into the instance and who holds it. \
+                   `q` matches a prefix or word prefix of the login or display \
+                   name (case and accents folded) or a whole email address. \
+                   Sorting is by `sort` and `dir` with the login name as the \
+                   tiebreak; an account never seen sorts last by `last_seen` in \
+                   both directions. Without `limit` every matching account is \
+                   answered, by name, and `page` is ignored. `total` counts the \
+                   matches before paging; paging by `last_seen` can shift as \
+                   accounts are seen.",
+    params(ListQuery),
     responses(
-        (status = 200, description = "Every account.", body = UsersResponse),
+        (status = 200, description = "The matching accounts.", body = UsersResponse),
+        (
+            status = 400,
+            description = "A filter, `page` or `limit` is malformed.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
         (
             status = 401,
             description = "No identity.",
@@ -109,6 +359,7 @@ pub struct UserResponse {
 pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
+    ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<UsersResponse>, ApiError> {
     identity.require_admin()?;
     let users = state
@@ -116,7 +367,8 @@ pub async fn list(
         .list_users()
         .await
         .map_err(|e| store_error(e, ""))?;
-    Ok(Json(UsersResponse { users }))
+    let (users, total) = select_users(users, &query)?;
+    Ok(Json(UsersResponse { users, total }))
 }
 
 /// What `POST /users` takes. `display` defaults to the name as typed, matching
@@ -1161,6 +1413,8 @@ mod tests {
             disabled: false,
             last_seen: None,
             reflection: ReflectionLevel::Default,
+            sign_in: None,
+            github_linked: None,
         });
         for spelling in ["root", "ROOT", "  Root  "] {
             let refused = refuse_self(&caller, spelling, "delete")
@@ -1216,5 +1470,82 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert!(check_password(" ").is_ok(), "a space is a character");
+    }
+    fn user(name: &str, seen: Option<&str>) -> User {
+        User {
+            name: name.to_string(),
+            display: name.to_string(),
+            email: None,
+            role: Role::Viewer,
+            disabled: false,
+            last_seen: seen.map(str::to_string),
+            reflection: ReflectionLevel::Default,
+            sign_in: Some(SignInKind::Password),
+            github_linked: Some(false),
+        }
+    }
+
+    fn query(text: &str) -> ListQuery {
+        let pairs: Vec<(String, String)> = text
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (k, v) = p.split_once('=').unwrap();
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        let object: serde_json::Map<String, serde_json::Value> = pairs
+            .into_iter()
+            .map(|(k, v)| {
+                let value = v
+                    .parse::<usize>()
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::String(v));
+                (k, value)
+            })
+            .collect();
+        serde_json::from_value(serde_json::Value::Object(object)).unwrap()
+    }
+
+    fn names(users: &[User]) -> Vec<&str> {
+        users.iter().map(|u| u.name.as_str()).collect()
+    }
+
+    fn roster() -> Vec<User> {
+        vec![
+            user("a", None),
+            user("b", Some("2026-11-02T10:00:00Z")),
+            user("c", Some("2026-11-01T10:00:00+00:00")),
+            user("d", None),
+            // Seen later than "b" by the clock, though it sorts earlier as text.
+            user("e", Some("2026-11-02T09:30:00-02:00")),
+        ]
+    }
+
+    #[test]
+    fn never_seen_sorts_last_in_both_directions_and_ties_break_by_name() {
+        let (asc, _) = select_users(roster(), &query("sort=last_seen")).unwrap();
+        assert_eq!(names(&asc), ["c", "b", "e", "a", "d"]);
+        let (desc, _) = select_users(roster(), &query("sort=last_seen&dir=desc")).unwrap();
+        assert_eq!(names(&desc), ["e", "b", "c", "a", "d"]);
+    }
+
+    #[test]
+    fn the_time_filters_compare_instants_and_skip_accounts_never_seen() {
+        let (rows, total) =
+            select_users(roster(), &query("seen_after=2026-11-01T12:00:00Z")).unwrap();
+        assert_eq!(names(&rows), ["b", "e"]);
+        assert_eq!(total, 2);
+        let (rows, _) = select_users(roster(), &query("seen_before=2026-11-02T09:30:00Z")).unwrap();
+        assert_eq!(names(&rows), ["c"]);
+    }
+
+    #[test]
+    fn no_limit_means_everything_and_paging_reports_the_whole_total() {
+        let (all, total) = select_users(roster(), &query("page=3")).unwrap();
+        assert_eq!((all.len(), total), (5, 5));
+        let (page, total) = select_users(roster(), &query("limit=2&page=3")).unwrap();
+        assert_eq!(names(&page), ["e"]);
+        assert_eq!(total, 5);
     }
 }

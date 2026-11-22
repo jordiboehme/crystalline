@@ -39,6 +39,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+# Accent folding for the account matcher (`account_match.rs`).
+unicode-normalization = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true }
 sqlx = { workspace = true, optional = true }
