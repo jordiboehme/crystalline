@@ -268,14 +268,14 @@ assert_cmd = "2.2.2"
 # against (crates/service). `rust_crypto` rather than `aws_lc_rs`: every crate
 # it names - rsa, sha2 0.10, p256, p384, ed25519-dalek - is already in the
 # graph through openidconnect, so the backend adds no new C or assembly build.
-jsonwebtoken = { version = "11.1.0", default-features = false, features = [
+jsonwebtoken = { version = "12.0.0", default-features = false, features = [
     "use_pem",
     "rust_crypto",
 ] }
 # Dev-only beside it: reads a PKCS#8 test key back out of its PEM so the fake
 # provider can publish the matching JWKS. Already in the graph through
 # openidconnect.
-rsa = { version = "0.9.10", features = ["pem"] }
+rsa = "0.10.0"
 tempfile = "3.27.0"
 # o200k_base tokenizer for the TOON vs JSON payload measurement test; pulls no
 # serde_json (verified against its crates.io dependency list), so it cannot

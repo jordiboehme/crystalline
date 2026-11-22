@@ -62,7 +62,7 @@ impl TestKey {
         use rsa::pkcs8::DecodePrivateKey as _;
         use rsa::traits::PublicKeyParts as _;
 
-        let private = rsa::RsaPrivateKey::from_pkcs8_pem(self.pem).expect("the fixture is PKCS#8");
+        let private = rsa::PrivateKey::from_pkcs8_pem(self.pem).expect("the fixture is PKCS#8");
         let public = private.to_public_key();
         let b64 = |bytes: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         serde_json::json!({
@@ -70,8 +70,8 @@ impl TestKey {
             "use": "sig",
             "alg": "RS256",
             "kid": self.kid,
-            "n": b64(public.n().to_bytes_be()),
-            "e": b64(public.e().to_bytes_be()),
+            "n": b64(public.n_bytes().to_vec()),
+            "e": b64(public.e_bytes().to_vec()),
         })
     }
 }
