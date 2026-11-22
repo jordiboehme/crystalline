@@ -334,7 +334,7 @@ async fn require_right(
 /// The right check on its own, for the one route that decides whether to make
 /// it at all (a member leaving needs no level) after the three checks above
 /// have already run.
-async fn refuse_below(
+pub(crate) async fn refuse_below(
     state: &RestState,
     identity: &Identity,
     domain: &str,

@@ -9,6 +9,90 @@
     "version": "v1"
   },
   "paths": {
+    "/api/v1/accounts/search": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Find enabled accounts by typed text, for a people picker.",
+        "description": "With `domain`, open to whoever may manage that domain's members (its owner, a manager, an instance admin); a domain the caller may not see is answered 404, exactly as for one nobody registered, and a caller who sees it but does not manage it is 403. Without `domain`, instance admins only. `q` matches a prefix or word prefix of the login or display name, case and accents folded; an admin may also give a whole email address. A `q` shorter than two characters answers an empty list. At most ten accounts, disabled ones left out, each with whether it is already a member of `domain`. At most 60 searches per minute per caller, then 429 with `Retry-After`.",
+        "operationId": "search_accounts",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "What was typed: a prefix or word prefix of a login or display name\n(case and accents folded). At least two characters, else the answer is\nempty. An admin may also give a whole email address.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "ada"
+          },
+          {
+            "name": "domain",
+            "in": "query",
+            "description": "The domain the person is picked for. Without it the search is for\ninstance admins only.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "kb"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The matching accounts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountSearchResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No account identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not manage the domain's members, or (without `domain`) is not an admin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many searches; `Retry-After` says when to retry.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/activity": {
       "get": {
         "tags": [
@@ -13165,6 +13249,47 @@
               "null"
             ],
             "description": "Why not, in the server's own words, or null when it is editable. What\nthe editor shows above a buffer it opened read-only."
+          }
+        }
+      },
+      "AccountHit": {
+        "type": "object",
+        "description": "One account the search found.",
+        "required": [
+          "name",
+          "display",
+          "member"
+        ],
+        "properties": {
+          "display": {
+            "type": "string",
+            "description": "The display name.",
+            "example": "Ada Lovelace"
+          },
+          "member": {
+            "type": "boolean",
+            "description": "Whether the account is already a member of the asked domain (its\nowner counts). Always `false` without `domain`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The login name.",
+            "example": "ada"
+          }
+        }
+      },
+      "AccountSearchResponse": {
+        "type": "object",
+        "description": "What `GET /accounts/search` answers with.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountHit"
+            },
+            "description": "At most ten matching enabled accounts, by login name."
           }
         }
       },

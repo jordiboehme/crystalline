@@ -30,6 +30,7 @@ mod auth;
 mod automation;
 mod schemas;
 use crystalline_identity::auth_store;
+mod account_search;
 mod discovery;
 mod domain_path;
 mod domains;
@@ -238,6 +239,7 @@ use crate::scope::{DomainAccess, DomainRight};
         reflections::asset_remove,
         reflections::asset_move,
         events::stream_events,
+        account_search::search,
         users_api::list,
         users_api::create,
         users_api::update,
@@ -362,6 +364,8 @@ use crate::scope::{DomainAccess, DomainRight};
         draft_links::TokenBody,
         draft_links::LeaveBody,
         draft_links::AcceptedDraft,
+        account_search::AccountHit,
+        account_search::AccountSearchResponse,
         users_api::CreateBody,
         users_api::PatchBody,
         users_api::MyProfileBody,
@@ -494,6 +498,8 @@ pub struct RestState {
     /// startup from `auth.login.*` like the rest of the auth settings. See
     /// [`login_throttle`].
     login_throttle: Arc<LoginThrottle>,
+    /// The per-caller budget of `GET /accounts/search`. See [`account_search`].
+    search_limiter: Arc<account_search::SearchLimiter>,
     /// The daemon's shutdown signal, which every open event stream ends on:
     /// a stream that outlived the drain would hold `axum::serve`'s graceful
     /// shutdown until its browser hung up. `None` on a router built by a
@@ -576,6 +582,7 @@ impl RestState {
             setup_token: None,
             login_slots: auth::login_slots(),
             login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
+            search_limiter: Arc::default(),
             shutdown: None,
             streams: Arc::new(events::StreamSlots::default()),
             webhook_slots: Arc::new(Semaphore::new(github_webhook::CONCURRENT)),
@@ -686,6 +693,11 @@ impl RestState {
         work: F,
     ) -> Result<F::Output, ApiError> {
         auth::with_login_slot(&self.login_slots, work).await
+    }
+
+    /// The account-search budget, for the one handler that consults it.
+    pub(crate) fn search_limiter(&self) -> &account_search::SearchLimiter {
+        &self.search_limiter
     }
 
     /// The login throttle, for the one handler that consults it.
@@ -1184,6 +1196,7 @@ fn routes(state: RestState) -> Router {
         // routes are held to.
         .route("/users", get(users_api::list).post(users_api::create))
         .route("/users/bulk", post(users_api::bulk))
+        .route("/accounts/search", get(account_search::search))
         .route(
             "/users/{name}",
             patch(users_api::update).delete(users_api::remove),

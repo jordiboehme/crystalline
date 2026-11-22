@@ -63,6 +63,35 @@ export type AcceptedDraft = {
 };
 
 /**
+ * One account the search found.
+ */
+export type AccountHit = {
+    /**
+     * The display name.
+     */
+    display: string;
+    /**
+     * Whether the account is already a member of the asked domain (its
+     * owner counts). Always `false` without `domain`.
+     */
+    member: boolean;
+    /**
+     * The login name.
+     */
+    name: string;
+};
+
+/**
+ * What `GET /accounts/search` answers with.
+ */
+export type AccountSearchResponse = {
+    /**
+     * At most ten matching enabled accounts, by login name.
+     */
+    results: Array<AccountHit>;
+};
+
+/**
  * Acknowledge one finding on one engram: the engram by permalink, the rule id that fired, an optional note saying why it is intentional and, for a rule that fires more than once on an engram, the row's own `scope`. Omit the scope and the server picks the finding by running detection, which is the right answer for every rule that fires once.
  */
 export type AckBody = {
@@ -3036,6 +3065,55 @@ export type WithdrawBody = {
      */
     revert?: boolean | null;
 };
+
+export type SearchAccountsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * What was typed: a prefix or word prefix of a login or display name
+         * (case and accents folded). At least two characters, else the answer is
+         * empty. An admin may also give a whole email address.
+         */
+        q?: string;
+        /**
+         * The domain the person is picked for. Without it the search is for
+         * instance admins only.
+         */
+        domain?: string;
+    };
+    url: '/api/v1/accounts/search';
+};
+
+export type SearchAccountsErrors = {
+    /**
+     * No account identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller may not manage the domain's members, or (without `domain`) is not an admin.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * Too many searches; `Retry-After` says when to retry.
+     */
+    429: ProblemDetail;
+};
+
+export type SearchAccountsError = SearchAccountsErrors[keyof SearchAccountsErrors];
+
+export type SearchAccountsResponses = {
+    /**
+     * The matching accounts.
+     */
+    200: AccountSearchResponse;
+};
+
+export type SearchAccountsResponse = SearchAccountsResponses[keyof SearchAccountsResponses];
 
 export type GetActivityData = {
     body?: never;
