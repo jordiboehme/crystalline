@@ -1806,11 +1806,11 @@ impl super::Engine {
     /// The scope a question about `domain` is decided for: `scope` itself,
     /// except the open tier inside an MCP request ([`as_mcp_call`]) on a
     /// domain GitHub governs, which acts as `github.agent_identity` (as
-    /// [`Scope::Agent`]: that account, clamped to editor) when that is set. Without it,
+    /// [`Scope::OpenTierIdentity`]: that account, clamped to editor) when that is set. Without it,
     /// and for every other anonymous caller, it stays anonymous there.
     pub fn scope_on(&self, scope: &Scope, domain: &str) -> Scope {
         match self.open_tier_agent(scope) {
-            Some(account) if self.github_governs(domain) => Scope::Agent { account },
+            Some(account) if self.github_governs(domain) => Scope::OpenTierIdentity { account },
             _ => scope.clone(),
         }
     }
@@ -1825,7 +1825,10 @@ impl super::Engine {
         domain: &str,
     ) -> bool {
         if caller.open_tier && self.github_governs(domain) {
-            return matches!(self.scope_on(&caller.scope, domain), Scope::Agent { .. });
+            return matches!(
+                self.scope_on(&caller.scope, domain),
+                Scope::OpenTierIdentity { .. }
+            );
         }
         caller.may_comment()
     }

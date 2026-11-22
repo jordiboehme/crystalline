@@ -2204,9 +2204,9 @@ impl McpServer {
             Scope::Unrestricted => true,
             Scope::Anonymous => !self.engine.auth_mcp(),
             Scope::User { admin, .. } => *admin,
-            // Never resolved at the edge (see `Scope::Agent`), and at most an
+            // Never resolved at the edge (see `Scope::OpenTierIdentity`), and at most an
             // editor where it is: not an admin.
-            Scope::Agent { .. } => false,
+            Scope::OpenTierIdentity { .. } => false,
         }
     }
 
@@ -4229,7 +4229,7 @@ impl McpServer {
             }
             // The agent identity stands in for the open tier on one governed
             // domain only; it is not the person behind this session.
-            Scope::Anonymous | Scope::Agent { .. } => {
+            Scope::Anonymous | Scope::OpenTierIdentity { .. } => {
                 return ok(json!({
                     "connected": false,
                     "url": Value::Null,

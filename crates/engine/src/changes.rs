@@ -529,7 +529,7 @@ pub fn change_label(scope: &crate::scope::Scope) -> Option<String> {
         crate::scope::Scope::User { account, .. } => Some(account.clone()),
         crate::scope::Scope::Unrestricted
         | crate::scope::Scope::Anonymous
-        | crate::scope::Scope::Agent { .. } => None,
+        | crate::scope::Scope::OpenTierIdentity { .. } => None,
     }
 }
 

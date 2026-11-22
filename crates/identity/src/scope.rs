@@ -85,7 +85,7 @@ pub enum Scope {
     /// about one governed domain. It is that account with an instance role
     /// of at most editor, so an admin named here gives the unauthenticated
     /// open tier its GitHub grant and nothing more.
-    Agent {
+    OpenTierIdentity {
         /// The login name, as the auth store keys it.
         account: String,
     },
@@ -115,7 +115,7 @@ pub fn overlay_actor(scope: &Scope) -> Option<String> {
         Scope::User { account, .. } => Some(account.clone()),
         // The open tier's writes run as anonymous; the agent stand-in only
         // answers rights questions, so it holds no draft.
-        Scope::Anonymous | Scope::Agent { .. } => None,
+        Scope::Anonymous | Scope::OpenTierIdentity { .. } => None,
     }
 }
 
@@ -1378,7 +1378,7 @@ impl DomainAccess {
 
     /// The per-domain Reflection grant `scope` holds on `domain`: only a
     /// signed-in account ([`Scope::User`]) holds one. The MCP open tier
-    /// ([`Scope::Anonymous`], and [`Scope::Agent`] even when the account it
+    /// ([`Scope::Anonymous`], and [`Scope::OpenTierIdentity`] even when the account it
     /// acts as holds a grant) never does.
     async fn grant_of(
         &self,
@@ -2056,7 +2056,7 @@ impl DomainAccess {
         let governance = self.governance();
         let anonymous = self.resolve_in(&Principal::Anonymous, &governance).await?;
         let principal = self
-            .principal(&Scope::Agent {
+            .principal(&Scope::OpenTierIdentity {
                 account: agent.to_string(),
             })
             .await?;
@@ -2202,7 +2202,7 @@ impl DomainAccess {
             // The open tier as `github.agent_identity`: an admin is clamped
             // to editor, so on a governed domain it gets its GitHub grant
             // and never the instance admin's `Own`.
-            Scope::Agent { account } => {
+            Scope::OpenTierIdentity { account } => {
                 let Some(user) = self.auth.user(account).await? else {
                     return Ok(Principal::Anonymous);
                 };
@@ -4357,7 +4357,7 @@ mod tests {
     }
 
     /// An instance admin named as `github.agent_identity` gives the open
-    /// tier its GitHub grant and nothing more: as `Scope::Agent` it is an
+    /// tier its GitHub grant and nothing more: as `Scope::OpenTierIdentity` it is an
     /// editor, so it never owns a governed domain and never sees a private
     /// one it has no GitHub read on.
     #[tokio::test]
@@ -4365,7 +4365,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let governor = base_governor().grant("boss", "gh-lab", MemberLevel::Viewer);
         let access = governed_access(&dir, governor).await;
-        let agent = Scope::Agent {
+        let agent = Scope::OpenTierIdentity {
             account: "boss".to_string(),
         };
         assert_eq!(
@@ -5658,7 +5658,7 @@ mod tests {
                 .unwrap(),
             ReflectionRight::Edit
         );
-        let agent = Scope::Agent {
+        let agent = Scope::OpenTierIdentity {
             account: "ann".into(),
         };
         assert_eq!(

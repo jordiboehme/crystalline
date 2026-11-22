@@ -678,9 +678,8 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<crystalline_identity::auth_store::VisibilityWrite> {
         let set_by = match scope {
-            crate::scope::Scope::User { account, .. } | crate::scope::Scope::Agent { account } => {
-                account.as_str()
-            }
+            crate::scope::Scope::User { account, .. }
+            | crate::scope::Scope::OpenTierIdentity { account } => account.as_str(),
             crate::scope::Scope::Unrestricted | crate::scope::Scope::Anonymous => {
                 crate::scope::OWNER_IDENTITY_NAME
             }
@@ -1630,7 +1629,7 @@ impl Engine {
         let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
-            crate::scope::Scope::Anonymous | crate::scope::Scope::Agent { .. } => {
+            crate::scope::Scope::Anonymous | crate::scope::Scope::OpenTierIdentity { .. } => {
                 ShareActor::HttpAgent
             }
         };
