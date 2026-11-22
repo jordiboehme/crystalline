@@ -69,7 +69,7 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-
 # rather than pulling OpenSSL, so the musl static release binaries stay
 # self-contained; the runtime query API is used (no compile-time macros) so no
 # live database is needed at build time. Gated behind the `postgres` feature.
-sqlx = { version = "0.9.0", default-features = false, features = [
+sqlx = { version = "0.9.1", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
