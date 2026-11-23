@@ -106,7 +106,13 @@ export function UserDetail({
     },
     onError: (error: Error, _body, context) => {
       if (context) {
-        queryClient.setQueryData(userKey(name), context.one);
+        // A panel still on the table's row had no copy of its own: drop the
+        // optimistic one, and the rolled back row shows through again.
+        if (context.one === undefined) {
+          queryClient.removeQueries({ queryKey: userKey(name), exact: true });
+        } else {
+          queryClient.setQueryData(userKey(name), context.one);
+        }
         for (const [key, page] of context.pages) {
           queryClient.setQueryData(key, page);
         }
@@ -152,7 +158,8 @@ export function UserDetail({
       onNotice({ kind: "done", text: `Deleted ${name}.` });
       queryClient.removeQueries({ queryKey: userKey(name) });
       void invalidate();
-      void navigate(listTo);
+      // Replace, so the back button does not return to the deleted account.
+      void navigate(listTo, { replace: true });
     },
     onError: (error: Error) => {
       onNotice({ kind: "problem", text: problemDetail(error) });

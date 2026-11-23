@@ -339,6 +339,8 @@ describe("the users table", () => {
       expect(lastListing().get("q")).toBe("ed");
     });
     expect(lastListing().get("page")).toBe("1");
+    // The address changed under the field, and the typing goes on there.
+    expect(searchField()).toHaveFocus();
   });
 
   it("searches at once on Enter", async () => {
@@ -348,13 +350,8 @@ describe("the users table", () => {
     await screen.findByRole("search", { name: "Find accounts" });
 
     await user.type(searchField(), "no{Enter}");
-    // Well inside the pause the typing waits for.
-    await waitFor(
-      () => {
-        expect(lastListing().get("q")).toBe("no");
-      },
-      { timeout: 200 },
-    );
+    // At once, without the pause the typing waits for.
+    expect(lastListing().get("q")).toBe("no");
   });
 
   it("filters by role, state, sign-in, GitHub and last seen", async () => {
@@ -638,6 +635,34 @@ describe("an account's detail panel", () => {
       expect(roleSelect).toHaveValue("admin");
     });
     expect(within(await rowFor("root")).getByText("admin")).toBeInTheDocument();
+  });
+
+  it("takes a refused change back even before the panel has read the account", async () => {
+    serveAs("admin", {
+      // The panel's own read never answers, so it shows the table's row.
+      "/users": (path) =>
+        path.includes("limit=")
+          ? listingFor(path)
+          : new Promise(() => undefined),
+      "/users/root": () => {
+        throw new ApiProblem(
+          409,
+          "conflict",
+          "add or enable another admin first",
+        );
+      },
+    });
+    renderApp("/admin/users/root");
+
+    const panel = await panelFor("root");
+    const roleSelect = within(panel).getByRole("combobox", {
+      name: "Role for root",
+    });
+    await userEvent.selectOptions(roleSelect, "viewer");
+    expect(await screen.findByText(/another admin first/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(roleSelect).toHaveValue("admin");
+    });
   });
 
   it("shows a role change in the panel and the row before the server has answered", async () => {
@@ -956,6 +981,38 @@ describe("bulk changes", () => {
     expect(apiMock.mock.calls.some(([path]) => path === "/users/bulk")).toBe(
       false,
     );
+  });
+
+  it("never counts or sends a tick that is not on the page shown", async () => {
+    const user = userEvent.setup();
+    const later: { answer: () => void } = { answer: () => undefined };
+    const other = { ...account("nora"), name: "olga" };
+    serveAs("admin", {
+      "/users": (path) => {
+        if (new URLSearchParams(path.split("?")[1]).get("page") !== "2") {
+          return { users: accounts(), total: 120 };
+        }
+        return new Promise((resolve) => {
+          later.answer = () => {
+            resolve({ users: [other], total: 120 });
+          };
+        });
+      },
+    });
+    renderApp("/admin/users");
+    await rowFor("eddy");
+    await user.click(screen.getByRole("button", { name: "Next page" }));
+    await waitFor(() => {
+      expect(lastListing().get("page")).toBe("2");
+    });
+    // The first page is still drawn while the second loads; a tick there
+    // belongs to no row of the page that arrives.
+    await user.click(screen.getByRole("checkbox", { name: "Select nora" }));
+    act(() => {
+      later.answer();
+    });
+    await rowFor("olga");
+    expect(screen.queryByText(/selected$/)).toBeNull();
   });
 
   it("starts with nothing selected on another page or sort", async () => {

@@ -166,9 +166,16 @@ function UsersScreen() {
     key: string;
     names: ReadonlySet<string>;
   }>({ key: requestKey, names: new Set() });
-  const selected =
-    selection.key === requestKey ? selection.names : new Set<string>();
   const selectable = accounts.filter((account) => account.name !== user?.name);
+  // Only rows on screen count, so a tick on the page being left, or an
+  // account a refresh took away, is never sent.
+  const selected = new Set(
+    selection.key === requestKey
+      ? selectable
+          .map((account) => account.name)
+          .filter((name) => selection.names.has(name))
+      : [],
+  );
 
   function select(names: ReadonlySet<string>) {
     setSelection({ key: requestKey, names });
@@ -477,7 +484,7 @@ function SearchAndFilters({
           type="search"
           value={text}
           autoComplete="off"
-          placeholder="Name, display name or email"
+          placeholder="Name, display name or whole email"
           onChange={(event) => {
             setText(event.target.value);
           }}
