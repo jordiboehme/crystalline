@@ -281,3 +281,68 @@ async fn an_unknown_outcome_reads_as_no_state() {
         row_modified(&store, "guides/a.md").await
     );
 }
+
+/// Writes keep the state: a person's edit between two reconciles, an edit
+/// on disk the sync picks up, a full reindex, and the `follows` rewrite a
+/// move makes on a follower.
+#[tokio::test]
+async fn writes_and_a_full_reindex_keep_the_state() {
+    let (fx, store) = reflecting_on().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    put(
+        &fx,
+        "guides/b.md",
+        "---\nfollows: guides/a.md\n---\n# B\n\n## One\n\nSecond.\n",
+    )
+    .await;
+    let a = record(&fx, "guides/a.md", ReconcileOutcome::Updated, "v1").await;
+    let b = record(&fx, "guides/b.md", ReconcileOutcome::Unchanged, "v2").await;
+    let read = async |path: &str| {
+        fx.engine
+            .reflection_reconcile("eng", path)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    put(&fx, "guides/a.md", "# A\n\n## One\n\nFirst, changed.\n").await;
+    assert_eq!(read("guides/a.md").await, a, "a person's write");
+
+    std::fs::write(
+        fx.root.join("reflections/guides/a.md"),
+        "# A\n\n## One\n\nChanged on disk.\n",
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    {
+        let store = store.lock().await;
+        let id = store.domain_id("eng").await.unwrap().unwrap();
+        let row = store
+            .get_reflection(id, "guides/a.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.content.contains("Changed on disk."),
+            "the sync took the edit"
+        );
+    }
+    assert_eq!(read("guides/a.md").await, a, "a change on disk");
+
+    fx.engine.reindex(true).await.unwrap();
+    assert_eq!(read("guides/a.md").await, a, "a full reindex");
+    assert_eq!(read("guides/b.md").await, b, "a full reindex");
+
+    fx.engine
+        .move_reflection("eng", "guides/a.md", "guides/c.md", &person())
+        .await
+        .unwrap();
+    assert!(
+        file(&fx, "guides/b.md")
+            .unwrap()
+            .contains("follows: guides/c.md"),
+        "the follower was rewritten"
+    );
+    assert_eq!(read("guides/b.md").await, b, "the follower keeps its own");
+    assert_eq!(read("guides/c.md").await, a, "the moved page keeps its own");
+}
