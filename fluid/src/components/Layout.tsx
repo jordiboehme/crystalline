@@ -113,6 +113,7 @@ import {
 } from "../navWidth";
 import { useWide } from "../useWide";
 import { GithubAccessBanner } from "./GithubAccessBanner";
+import { MissedPagesBanner } from "./MissedReflectionPages";
 import { OutlineSlotContext } from "./outlineSlot";
 import { CommandPalette, openPalette } from "./CommandPalette";
 import { CreateDomainDialog } from "./CreateDomainDialog";
@@ -992,6 +993,7 @@ export function Layout() {
                       className="relative min-w-0 flex-1 py-6 focus:outline-none"
                     >
                       {capabilities.canAdminister && <GithubAccessBanner />}
+                      {capabilities.canAdminister && <MissedPagesBanner />}
                       <Outlet />
                       <ReadyFlash />
                     </main>

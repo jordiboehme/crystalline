@@ -29,12 +29,12 @@ export const LOOP_SLOWER_HINT =
   "The reflect loop runs less often than this page's freshness.";
 
 /** A span of time: "3 hours", or "less than a minute". */
-function span(seconds: number): string {
+export function span(seconds: number): string {
   return seconds < 60 ? "less than a minute" : ageText(seconds);
 }
 
 /** "checked 2 hours ago", or "checked just now". */
-function checked(seconds: number): string {
+export function checked(seconds: number): string {
   return seconds < 60 ? "checked just now" : `checked ${ageText(seconds)} ago`;
 }
 
