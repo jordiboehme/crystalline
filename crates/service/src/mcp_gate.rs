@@ -82,7 +82,10 @@ use std::task::{Context, Poll};
 use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 
-use crate::rest::{AuthStore, MCP_TOKEN_PREFIX, OAUTH_ACCESS_PREFIX, OriginRule, Role};
+use crate::rest::{
+    AGENT_TOKEN_PREFIX, AuthStore, MCP_TOKEN_PREFIX, OAUTH_ACCESS_PREFIX, OriginRule, Role,
+};
+use crate::scope::Scope;
 
 /// The account a request authenticated as, inserted into the request
 /// extensions the transport hands on. rmcp copies the remaining
@@ -263,6 +266,9 @@ enum Presented {
     Mcp(String),
     /// An OAuth access token, [`OAUTH_ACCESS_PREFIX`].
     Oauth(String),
+    /// An agent token, [`AGENT_TOKEN_PREFIX`]: looked up in the agents'
+    /// own table and never as an account's.
+    Agent(String),
 }
 
 /// What the `401` says, which is a function of this instance's configuration
@@ -305,6 +311,9 @@ fn presented_token(headers: &axum::http::HeaderMap, oauth: bool) -> Option<Prese
     let credential = credential.trim();
     if credential.starts_with(MCP_TOKEN_PREFIX) {
         return Some(Presented::Mcp(credential.to_string()));
+    }
+    if credential.starts_with(AGENT_TOKEN_PREFIX) {
+        return Some(Presented::Agent(credential.to_string()));
     }
     if oauth && credential.starts_with(OAUTH_ACCESS_PREFIX) {
         return Some(Presented::Oauth(credential.to_string()));
@@ -392,6 +401,16 @@ fn store_unavailable() -> Response {
 pub(crate) enum Bearer {
     /// A live credential of this account.
     Account(McpIdentity),
+    /// A live agent token, resolved to the agent's scope
+    /// ([`Scope::Agent`]). No door opens to an agent yet: each one answers
+    /// `refused`, which is the very refusal an unknown token gets, so a
+    /// door that is to admit agents has to take this arm on purpose.
+    Agent {
+        /// The agent's scope.
+        scope: Scope,
+        /// The one refusal, built for this request.
+        refused: Response,
+    },
     /// No credential, one that is not ours in shape, or one that resolves to
     /// nobody: the one refusal.
     Refused(Response),
@@ -427,7 +446,24 @@ pub(crate) async fn resolve_bearer(
     // One lookup, whichever door the credential came through, and it is also
     // what stamps `last_used` so a token list or a connected-client list in
     // Fluid can show when an agent last connected.
+    if let Presented::Agent(token) = &presented {
+        return match auth.agent_for_token(token).await {
+            Ok(Some(agent)) => Bearer::Agent {
+                scope: agent.scope(),
+                refused: refusal(challenge()),
+            },
+            Ok(None) => Bearer::Refused(refusal(challenge())),
+            Err(error) => {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "an agent token check could not read the account store"
+                );
+                Bearer::Unavailable(store_unavailable())
+            }
+        };
+    }
     let resolved = match (&presented, &origin) {
+        (Presented::Agent(_), _) => Ok(None),
         (Presented::Mcp(token), _) => auth.mcp_token_user(token).await,
         (Presented::Oauth(token), Some(origin)) => auth.oauth_access_user(token, origin).await,
         // No origin is no audience, and an audience-bound credential with
@@ -488,6 +524,14 @@ where
         Box::pin(async move {
             let identity = match resolve_bearer(&auth, oauth.as_ref(), request.headers()).await {
                 Bearer::Account(identity) => identity,
+                // No MCP call is open to an agent yet.
+                Bearer::Agent { scope, refused } => {
+                    tracing::debug!(
+                        ?scope,
+                        "an agent token at the MCP door, which agents cannot pass yet"
+                    );
+                    return Ok(refused);
+                }
                 Bearer::Refused(response) | Bearer::Unavailable(response) => return Ok(response),
             };
             let named = session_of(&request);
@@ -541,7 +585,9 @@ mod tests {
     /// separately where it matters.
     fn credential(presented: &Option<Presented>) -> Option<&str> {
         match presented {
-            Some(Presented::Mcp(token) | Presented::Oauth(token)) => Some(token),
+            Some(Presented::Mcp(token) | Presented::Oauth(token) | Presented::Agent(token)) => {
+                Some(token)
+            }
             None => None,
         }
     }
@@ -624,6 +670,90 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// An agent token reaches the agents' own lookup, whatever `auth.oauth`
+    /// says, and never the account or OAuth one.
+    #[test]
+    fn an_agent_token_reaches_only_the_agent_door() {
+        let agent = format!("{AGENT_TOKEN_PREFIX}{}", "d".repeat(64));
+        for oauth in [false, true] {
+            assert!(
+                matches!(
+                    presented_token(request_with(Some(&format!("Bearer {agent}"))).headers(), oauth),
+                    Some(Presented::Agent(token)) if token == agent
+                ),
+                "oauth {oauth}"
+            );
+        }
+    }
+
+    /// **A live agent token is resolved and refused at the MCP door**, with
+    /// the bytes an unknown token gets, and never reaches the transport. Its
+    /// scope is resolved all the same, which the door that opens to agents
+    /// later will read.
+    #[tokio::test]
+    async fn a_live_agent_token_is_resolved_and_refused_like_an_unknown_one() {
+        let (_tmp, store, _admin, _editor) = store_with_two_agents().await;
+        let (_, issued) = store
+            .add_agent(
+                "nightly",
+                None,
+                crate::rest::AgentLoops::Both,
+                "ada",
+                "",
+                crate::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+            )
+            .await
+            .unwrap();
+        let headers = request_with(Some(&format!("Bearer {}", issued.token)));
+        match resolve_bearer(&store, None, headers.headers()).await {
+            Bearer::Agent { scope, refused } => {
+                assert_eq!(
+                    scope,
+                    Scope::Agent {
+                        name: "nightly".to_string(),
+                        loops: crate::rest::AgentLoops::Both,
+                    }
+                );
+                assert_eq!(refused.status(), axum::http::StatusCode::UNAUTHORIZED);
+            }
+            _ => panic!("a live agent token resolves to the agent"),
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut gate = McpGate::new(
+            CapturingService(seen.clone()),
+            Some(store.clone()),
+            Arc::new(SessionOwners::default()),
+        );
+        let agent = tower_service::Service::call(
+            &mut gate,
+            request_with(Some(&format!("Bearer {}", issued.token))),
+        )
+        .await
+        .unwrap();
+        let unknown = tower_service::Service::call(
+            &mut gate,
+            request_with(Some(&format!(
+                "Bearer {AGENT_TOKEN_PREFIX}{}",
+                "0".repeat(64)
+            ))),
+        )
+        .await
+        .unwrap();
+        assert!(seen.lock().unwrap().is_none(), "the transport saw nothing");
+        assert_eq!(agent.status(), unknown.status());
+        assert_eq!(
+            agent.headers()[axum::http::header::WWW_AUTHENTICATE],
+            unknown.headers()[axum::http::header::WWW_AUTHENTICATE]
+        );
+        let body = |r: Response| async move {
+            axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+        assert_eq!(body(agent).await, body(unknown).await);
     }
 
     /// **The refusal is a function of the configuration and of nothing a

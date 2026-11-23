@@ -163,6 +163,14 @@ async fn handle(State(state): State<CtlState>, headers: HeaderMap, body: Body) -
     }
     let identity = match resolve_bearer(&state.auth, state.oauth.as_ref(), &headers).await {
         Bearer::Account(identity) => identity,
+        // No ctl command is open to an agent yet.
+        Bearer::Agent { scope, refused } => {
+            tracing::debug!(
+                ?scope,
+                "an agent token at the ctl route, which agents cannot pass yet"
+            );
+            return refused;
+        }
         Bearer::Refused(response) | Bearer::Unavailable(response) => return response,
     };
     let body = match axum::body::to_bytes(body, crate::rest::MAX_TOOL_BODY_BYTES).await {

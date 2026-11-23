@@ -2553,3 +2553,37 @@ async fn the_account_search_is_capped_and_rate_limited() {
     let keeper = ctx.as_user("keeper").await;
     keeper.get_text("/api/v1/accounts/search?q=pal", 403).await;
 }
+
+/// An agent is never a person: the account search finds no agent, whatever
+/// the query, because agents live in their own table.
+#[tokio::test]
+async fn an_agent_never_appears_in_the_account_search() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.auth
+        .add_user("nina", "Nina", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    ctx.auth
+        .add_agent(
+            "nightly",
+            Some("Nightly runner"),
+            crystalline_service::rest::AgentLoops::Both,
+            "boss",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    let boss = ctx.as_user("boss").await;
+    for q in ["ni", "nightly", "Nightly%20runner", "runner"] {
+        let body = boss
+            .get_json(&format!("/api/v1/accounts/search?q={q}"))
+            .await;
+        assert!(
+            !body.to_string().contains("nightly"),
+            "an agent showed up for {q}: {body}"
+        );
+    }
+    let body = boss.get_json("/api/v1/accounts/search?q=ni").await;
+    assert_eq!(body["results"][0]["name"], "nina", "{body}");
+}

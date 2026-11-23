@@ -511,3 +511,43 @@ async fn a_hidden_domain_is_refused_like_an_unknown_one() {
     }
     assert_eq!(texts[0], texts[1], "{texts:?}");
 }
+
+/// **A live agent token is resolved and refused at the ctl route**, with the
+/// answer a token nobody issued gets, for `status` and for every automation
+/// verb alike. No ctl command is open to an agent yet; the change that opens
+/// the automation verbs has to change this test on purpose.
+#[tokio::test]
+async fn an_agent_token_is_refused_at_the_ctl_route() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let (_, issued) = server
+        .auth
+        .add_agent(
+            "nightly",
+            None,
+            crystalline_service::rest::AgentLoops::Both,
+            "keeper",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    assert!(
+        server
+            .auth
+            .agent_for_token(&issued.token)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let unknown = format!("cag_{}", "0".repeat(64));
+    for cmd in [
+        status(),
+        json!({ "v": 1, "cmd": "automation_status" }),
+        json!({ "v": 1, "cmd": "tool", "tool": "list_domains", "args": {} }),
+    ] {
+        let (code, reply) = server.ctl(Some(&issued.token), cmd.clone()).await;
+        let (unknown_code, unknown_reply) = server.ctl(Some(&unknown), cmd.clone()).await;
+        assert_eq!(code, 401, "{cmd}: {reply}");
+        assert_eq!((code, &reply), (unknown_code, &unknown_reply), "{cmd}");
+    }
+}

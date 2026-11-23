@@ -712,6 +712,87 @@ async fn every_rejected_credential_gets_the_identical_refusal() {
     assert_eq!(ok.status(), 200);
 }
 
+/// **An agent token is resolved and refused at the MCP door, and is no
+/// identity on the JSON API.** No door opens to an agent yet: a live agent
+/// token gets the bytes a missing header gets, on the handshake and on the
+/// stateless modern-era path, and on `/api/v1` it is answered exactly like a
+/// request with no credential at all (the JSON API takes no bearer). The door
+/// that admits agents has to change this test on purpose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_token_is_refused_at_the_mcp_door_and_on_the_json_api() {
+    let (addr, _guard, store) = serve_with_mcp_auth(true).await;
+    let (_, live) = store
+        .add_agent(
+            "nightly",
+            None,
+            crystalline_service::rest::AgentLoops::Both,
+            "root",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    // The token really is live: the store resolves it.
+    assert!(store.agent_for_token(&live.token).await.unwrap().is_some());
+    let revoked = store
+        .issue_agent_token("nightly", "second", 86_400)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .revoke_agent_token("nightly", revoked.id)
+            .await
+            .unwrap()
+    );
+
+    let baseline = post_initialize(&addr, None).await;
+    assert_eq!(baseline.status(), 401);
+    let baseline = baseline.text().await.unwrap();
+    for token in [
+        live.token.clone(),
+        revoked.token.clone(),
+        format!("cag_{}", "0".repeat(64)),
+    ] {
+        let resp = post_initialize(&addr, Some(&format!("Bearer {token}"))).await;
+        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer");
+        assert_eq!(resp.text().await.unwrap(), baseline);
+    }
+    let stateless = post_stateless_tools_list(&addr, Some(&live.token)).await;
+    assert_eq!(stateless.status(), 401);
+    let nobody = post_stateless_tools_list(&addr, None).await;
+    assert_eq!(
+        stateless.text().await.unwrap(),
+        nobody.text().await.unwrap()
+    );
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for path in ["/api/v1/agents", "/api/v1/domains", "/api/v1/auth/me"] {
+        let bare = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        let with_agent = client
+            .get(format!("http://{addr}{path}"))
+            .bearer_auth(&live.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(with_agent.status(), bare.status(), "{path}");
+        // `/auth/me` is public and answers "nobody" either way; the other two
+        // are closed to a request with no session.
+        if path != "/api/v1/auth/me" {
+            assert_eq!(with_agent.status(), 401, "{path} served an agent token");
+        }
+        assert_eq!(
+            with_agent.text().await.unwrap(),
+            bare.text().await.unwrap(),
+            "{path}"
+        );
+    }
+}
+
 /// The gate wraps the transport, not the router: the health probe an
 /// orchestrator polls and the JSON API's own auth rules are untouched by
 /// `auth.mcp`. If the gate ever migrates up to the router, this is what fails.

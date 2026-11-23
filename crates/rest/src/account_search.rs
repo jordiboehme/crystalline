@@ -235,8 +235,9 @@ pub async fn search(
         .list_users()
         .await
         .map_err(|e| ApiError::internal(format!("listing accounts: {e:#}")))?;
-    // Agents (Task 5) are not people and must be filtered out here once they
-    // exist; today every row of `list_users` is an account.
+    // Agents are not people and never appear here, with no filter needed:
+    // they live in their own `agents` table, and `list_users` reads `users`
+    // alone. `an_agent_never_appears_in_the_account_search` pins it.
     users.retain(|u| !u.disabled && matcher.matches(&u.name, &u.display, u.email.as_deref()));
     users.sort_by(|a, b| a.name.cmp(&b.name));
     let results = users
