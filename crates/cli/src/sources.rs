@@ -49,8 +49,13 @@ pub fn unshared_warning(local: &str, source: &str, changes: usize) -> String {
 }
 
 /// The prefixes of the tokens a Crystalline server issues: a personal MCP
-/// token, and an OAuth access and refresh token.
-const TOKEN_PREFIXES: [&str; 3] = ["cmt_", "coa_", "cor_"];
+/// token, an OAuth access and refresh token, and an agent token.
+const TOKEN_PREFIXES: [&str; 4] = [
+    crystalline_service::rest::MCP_TOKEN_PREFIX,
+    crystalline_service::rest::OAUTH_ACCESS_PREFIX,
+    crystalline_service::rest::OAUTH_REFRESH_PREFIX,
+    crystalline_service::rest::AGENT_TOKEN_PREFIX,
+];
 
 /// Whether a command-line word looks like a token a server issued.
 pub fn looks_like_token(word: &str) -> bool {
@@ -956,6 +961,36 @@ mod tests {
             !token.contains("cmt_"),
             "a token is never repeated: {token}"
         );
+    }
+
+    /// An agent token is a token like the others: never taken on the
+    /// command line, and never repeated in the refusal.
+    #[test]
+    fn an_agent_token_on_the_command_line_is_refused() {
+        let token = format!("cag_{}", "a".repeat(64));
+        assert!(looks_like_token(&token));
+        assert_eq!(TOKEN_PREFIXES, ["cmt_", "coa_", "cor_", "cag_"]);
+        for args in [
+            vec![
+                "connect".to_string(),
+                "https://kb.example".to_string(),
+                token.clone(),
+            ],
+            vec![
+                "connect".to_string(),
+                "https://kb.example".to_string(),
+                format!("--token={token}"),
+            ],
+        ] {
+            let refusal = inline_token_refusal(&args).expect("refused");
+            assert!(!refusal.contains("cag_"), "never repeated: {refusal}");
+            assert!(
+                refusal.contains("crystalline connect https://kb.example"),
+                "{refusal}"
+            );
+        }
+        let inside = not_a_server_address(&format!("https://kb.example/{token}"));
+        assert!(!inside.contains("cag_"), "{inside}");
     }
 
     #[test]
