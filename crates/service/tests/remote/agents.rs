@@ -568,3 +568,45 @@ async fn with_auth_mcp_off_an_agent_token_is_told_agents_need_it() {
     let agent = server.auth.agent("nightly").await.unwrap().unwrap();
     assert_eq!(agent.tokens[0].last_used, None);
 }
+
+/// **Every agent call is logged at INFO** with the agent, the tool (or the
+/// ctl verb), the domain it names and whether it was refused: an MCP tool
+/// call refused outside a run, one allowed inside, and a ctl verb.
+#[tokio::test]
+async fn every_agent_call_is_logged_with_the_agent_the_tool_and_the_domain() {
+    let (logs, _guard) = crate::support::capture_logs();
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let token = agent(&server, "writer", AgentLoops::Evolve).await;
+    let args = json!({ "domain": "open", "identifier": "open-note" });
+    call(&server, &token, "read_engram", args.clone(), None)
+        .await
+        .unwrap_err();
+    work_for_both_loops(&server).await;
+    take(&server, &token, "evolve").await;
+    call(&server, &token, "read_engram", args, None)
+        .await
+        .unwrap();
+    let lines = logs.lines();
+    let calls: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("INFO") && l.contains("agent tool call"))
+        .collect();
+    assert_eq!(calls.len(), 2, "{lines:#?}");
+    for (line, refused) in calls.iter().zip([true, false]) {
+        assert!(
+            line.contains("agent=writer")
+                && line.contains("tool=read_engram")
+                && line.contains("domain=open")
+                && line.contains(&format!("refused={refused}")),
+            "{line}"
+        );
+    }
+    assert!(
+        lines.iter().any(|l| l.starts_with("INFO")
+            && l.contains("agent ctl call")
+            && l.contains("agent=writer")
+            && l.contains("command=automation_lease_take")
+            && l.contains("domain=open")),
+        "{lines:#?}"
+    );
+}
