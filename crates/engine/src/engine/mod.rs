@@ -1329,6 +1329,11 @@ pub struct Engine {
     /// file from one the engine wrote itself. No entry at all: no walk since
     /// this engine started.
     reflection_walks: std::sync::Mutex<HashMap<String, Option<BTreeMap<String, String>>>>,
+    // What the freshness clocks read of each page's text, by domain, then
+    // path, with the checksum it was read at (`freshness::PageFacts`): a
+    // status poll reads the page stamps and fetches the text only of a page
+    // whose checksum moved.
+    page_facts: freshness::FactsMemo,
     // Overrides where per-domain origin state (the base snapshot, conflict
     // records, `state.json`) is read and written, for tests: `None` means the
     // real `crystalline_core::config::origin_state_dir`, a real machine path
@@ -2745,6 +2750,7 @@ impl Engine {
             backup_held: Default::default(),
             backup_archived_logged: Default::default(),
             reflection_walks: Default::default(),
+            page_facts: Default::default(),
             origins_dir_override: None,
             state_dir_override: None,
             connect_auth: Arc::new(RealConnectAuth),
@@ -9642,6 +9648,7 @@ mod domains;
 mod edit;
 mod evolve;
 mod fence;
+mod freshness;
 mod github;
 pub use github::{
     GITHUB_OFF_PLAIN, LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK,

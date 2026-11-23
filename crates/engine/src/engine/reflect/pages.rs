@@ -313,11 +313,11 @@ pub(super) fn stale_item(
     let freshness = settings.freshness.as_ref()?;
     let state = inputs.states.get(path)?;
     let at = crystalline_core::time::parse_rfc3339(&state.last_reconciled)?.stamp();
-    let elapsed = now - at.unix_seconds();
-    if elapsed < freshness.seconds {
+    let timing = freshness.timing(at.unix_seconds(), now);
+    if !timing.stale() {
         return None;
     }
-    let period = elapsed / freshness.seconds;
+    let period = timing.period;
     let recorded_at = state.outcome.is_some().then(|| at.unix_millis());
     let pact_hash = inputs.hashes.get(path).map(String::as_str).unwrap_or("");
     let version = stale_version(freshness, state, recorded_at, period, pact_hash);
@@ -350,7 +350,7 @@ pub(super) fn stale_item(
             path: path.to_string(),
             section: None,
             heading: String::new(),
-            age_secs: elapsed - freshness.seconds,
+            age_secs: timing.last_checked_secs - freshness.seconds,
             extra,
             basis: version,
         },

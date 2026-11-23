@@ -113,6 +113,32 @@ fn is_page(path: &str) -> bool {
     matches!(r::classify(path), r::ReflectionFile::Page(_))
 }
 
+/// The reconcile state of every page among `stamps` (the Reflection's rows
+/// without their text): the state `stored` records for it, or the seed from
+/// its row's modified time. A state recorded for a path with no page row is
+/// left out. What [`Engine::reflection_reconciles`] answers, for a caller
+/// that read the rows itself.
+pub(crate) fn page_reconciles(
+    stamps: &[crystalline_index::ReflectionStamp],
+    stored: Vec<ReflectionReconcile>,
+) -> BTreeMap<String, PageReconcile> {
+    let mut stored: BTreeMap<String, ReflectionReconcile> = stored
+        .into_iter()
+        .map(|state| (state.path.clone(), state))
+        .collect();
+    stamps
+        .iter()
+        .filter(|stamp| is_page(&stamp.path))
+        .map(|stamp| {
+            let state = match stored.remove(&stamp.path) {
+                Some(state) => PageReconcile::read(state, &stamp.modified),
+                None => PageReconcile::seeded(&stamp.modified),
+            };
+            (stamp.path.clone(), state)
+        })
+        .collect()
+}
+
 impl Engine {
     /// The reconcile state of the page at `page` of `domain`'s Reflection,
     /// read through the reader. `None` when there is no such page (or the
@@ -155,23 +181,8 @@ impl Engine {
         // reads as seeded or without its new state until the next read,
         // which is no worse than the read before the write.
         let stamps = reader.list_reflection_stamps(id).await?;
-        let mut stored: BTreeMap<String, ReflectionReconcile> = reader
-            .reflection_reconciles(id)
-            .await?
-            .into_iter()
-            .map(|state| (state.path.clone(), state))
-            .collect();
-        Ok(stamps
-            .into_iter()
-            .filter(|stamp| is_page(&stamp.path))
-            .map(|stamp| {
-                let state = match stored.remove(&stamp.path) {
-                    Some(state) => PageReconcile::read(state, &stamp.modified),
-                    None => PageReconcile::seeded(&stamp.modified),
-                };
-                (stamp.path, state)
-            })
-            .collect())
+        let stored = reader.reflection_reconciles(id).await?;
+        Ok(page_reconciles(&stamps, stored))
     }
 
     /// `write_reflection` with `action: reconciled`: record that the page

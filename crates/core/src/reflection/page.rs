@@ -117,6 +117,61 @@ pub struct Freshness {
     pub seconds: i64,
 }
 
+/// Where a page with a [`Freshness`] stands at one instant
+/// ([`Freshness::timing`]). Every age is whole seconds and never negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageTiming {
+    /// Seconds since the last reconcile; 0 when that time lies ahead of the
+    /// clock (a host takeover by a machine whose clock is behind).
+    pub last_checked_secs: i64,
+    /// Whole spans since the last reconcile: 0 while the page is fresh, 1
+    /// once it is due, and one more for each span after that. A `stale`
+    /// item's version moves with it.
+    pub period: i64,
+    /// Seconds until the next span ends: when a fresh page falls due, or
+    /// when a due page enters its next period (and, one span after it fell
+    /// due, turns overdue). Always more than 0.
+    pub next_due_in_secs: i64,
+    /// Seconds since the page turned overdue, when it is: one whole span
+    /// after it fell due, so a page reconciled once per run of a slower
+    /// schedule is due between runs and overdue only when a run missed it
+    /// (design 2.2).
+    pub overdue_secs: Option<i64>,
+}
+
+impl PageTiming {
+    /// Whether the page is due: its freshness ran out.
+    pub fn stale(&self) -> bool {
+        self.period > 0
+    }
+}
+
+impl Freshness {
+    /// Where a page with this freshness stands at `now`, last reconciled at
+    /// `last_reconciled` (both seconds since the epoch). Saturates rather
+    /// than overflows.
+    pub fn timing(&self, last_reconciled: i64, now: i64) -> PageTiming {
+        let span = self.seconds.max(1);
+        let elapsed = now.saturating_sub(last_reconciled);
+        if elapsed < 0 {
+            return PageTiming {
+                last_checked_secs: 0,
+                period: 0,
+                next_due_in_secs: span.saturating_sub(elapsed).max(1),
+                overdue_secs: None,
+            };
+        }
+        let period = elapsed / span;
+        let next = period.saturating_add(1).saturating_mul(span);
+        PageTiming {
+            last_checked_secs: elapsed,
+            period,
+            next_due_in_secs: next.saturating_sub(elapsed).max(1),
+            overdue_secs: (period >= 2).then(|| elapsed - 2 * span),
+        }
+    }
+}
+
 /// Read a freshness: any span of an hour or more, in `build_context`'s
 /// timeframe grammar exactly ([`crate::time::timeframe_seconds`]), so a
 /// person who knows one knows the other: `6h`, `1d`, `7d`, `2w`, `2m` (months
@@ -683,6 +738,69 @@ mod tests {
             .iter()
             .map(|f| (f.page.as_str(), f.key, f.value.as_str(), f.reason))
             .collect()
+    }
+
+    const H: i64 = 3_600;
+
+    fn hourly() -> Freshness {
+        parse_freshness("1h").unwrap()
+    }
+
+    /// Fresh for one span, due (stale) from its end, overdue only once one
+    /// whole further span was missed (design 2.2): a 1h page last checked 5
+    /// hours ago is overdue since 3 hours.
+    #[test]
+    fn a_page_is_due_after_one_span_and_overdue_after_two() {
+        let at = 1_000_000;
+        let fresh = hourly().timing(at, at + 30 * 60);
+        assert_eq!(fresh.period, 0);
+        assert!(!fresh.stale());
+        assert_eq!(fresh.last_checked_secs, 30 * 60);
+        assert_eq!(
+            fresh.next_due_in_secs,
+            30 * 60,
+            "due at the end of the span"
+        );
+        assert_eq!(fresh.overdue_secs, None);
+
+        let due = hourly().timing(at, at + H + 10);
+        assert!(due.stale());
+        assert_eq!(due.period, 1);
+        assert_eq!(due.next_due_in_secs, H - 10, "the next period starts then");
+        assert_eq!(due.overdue_secs, None, "one span late is due, not overdue");
+
+        let edge = hourly().timing(at, at + 2 * H);
+        assert_eq!(edge.period, 2);
+        assert_eq!(edge.overdue_secs, Some(0), "overdue from two spans on");
+        assert_eq!(edge.next_due_in_secs, H, "never now: strictly ahead");
+
+        let late = hourly().timing(at, at + 5 * H);
+        assert_eq!(late.last_checked_secs, 5 * H);
+        assert_eq!(late.overdue_secs, Some(3 * H), "overdue since 3 hours");
+    }
+
+    /// A reconcile time ahead of the clock (a host takeover by a machine
+    /// whose clock is behind) reads as checked just now: no negative age,
+    /// nothing due, and the next due time one span after that reconcile.
+    #[test]
+    fn a_reconcile_ahead_of_the_clock_is_clamped() {
+        let at = 1_000_000;
+        let ahead = hourly().timing(at, at - 600);
+        assert_eq!(ahead.last_checked_secs, 0);
+        assert_eq!(ahead.period, 0);
+        assert_eq!(ahead.overdue_secs, None);
+        assert_eq!(ahead.next_due_in_secs, H + 600);
+    }
+
+    /// A very long span or a time far off never overflows.
+    #[test]
+    fn long_spans_saturate() {
+        let ages = parse_freshness("100y").unwrap();
+        let t = ages.timing(i64::MIN / 2, i64::MAX / 2);
+        assert!(t.next_due_in_secs > 0);
+        let t = ages.timing(i64::MAX / 2, i64::MIN / 2);
+        assert!(t.next_due_in_secs > 0);
+        assert_eq!(t.last_checked_secs, 0);
     }
 
     #[test]

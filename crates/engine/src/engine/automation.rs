@@ -23,6 +23,9 @@ use crate::scope::{ReflectionCaller, ReflectionRight, Scope};
 const MANIFEST_FILE: &str = "MANIFEST.md";
 
 /// Why a domain whose loop can run nowhere here is not due.
+/// How the key of a due `stale` item starts (`stale:<page>#:`).
+const STALE_KEY: &str = "stale:";
+
 const NOT_HOSTED_HERE: &str = "not hosted here";
 
 /// The refusal of a take while another run holds a fresh lease.
@@ -1039,7 +1042,7 @@ impl Engine {
     }
 
     /// Now, for the automation verbs: the test clock when one is set.
-    fn automation_clock(&self) -> OffsetStamp {
+    pub(crate) fn automation_clock(&self) -> OffsetStamp {
         #[cfg(any(test, feature = "testing"))]
         if let Some(at) = *self.automation_now.lock().unwrap() {
             return at;
@@ -1599,10 +1602,18 @@ impl Engine {
         let counts = match lp {
             Loop::Reflect => {
                 let items = due.as_ref().map(|d| d.items.as_slice()).unwrap_or_default();
-                let of = |kind: &str| items.iter().filter(|(k, _)| k.kind == kind).count();
+                // A page whose freshness ran out is counted on its own: the
+                // trigger sends it without waiting for quiet sources.
+                let stale = |k: &DueKey| k.kind == "update" && k.key.starts_with(STALE_KEY);
+                let of = |kind: &str| {
+                    items
+                        .iter()
+                        .filter(|(k, _)| k.kind == kind && !stale(k))
+                        .count()
+                };
                 let pages = items
                     .iter()
-                    .filter(|(k, page)| k.kind == "update" && !page.is_empty())
+                    .filter(|(k, page)| k.kind == "update" && !stale(k) && !page.is_empty())
                     .map(|(_, page)| page.as_str())
                     .collect::<BTreeSet<_>>()
                     .len();
@@ -1611,12 +1622,20 @@ impl Engine {
                     "feedback": of("feedback"),
                     "updates": of("update"),
                     "pages_to_update": pages,
+                    "stale": items.iter().filter(|(k, _)| stale(k)).count(),
                 })
             }
             Loop::Evolve => json!({
                 "mechanical": due.as_ref().map_or(0, |d| d.items.len()),
                 "judgment": due.as_ref().map_or(0, |d| d.judgment),
             }),
+        };
+        // When the next page falls due, with counts and without: the cheap
+        // poll a runner makes to know when to come back, and the trigger's
+        // timer. Only where the loop runs here.
+        let next_stale = match (lp, &runs_on, id) {
+            (Loop::Reflect, Runs::Here, Some(_)) => self.next_stale(domain).await?,
+            _ => None,
         };
         let is_due = running.is_none()
             && (force || backing_off.is_none())
@@ -1645,6 +1664,8 @@ impl Engine {
             },
             "last_run": last_run.map(run_json),
             "delivery": delivery,
+            "next_stale_at": next_stale.as_ref().map(|(_, at)| at.as_str()),
+            "next_stale_in_secs": next_stale.as_ref().map(|(secs, _)| *secs),
         }))
     }
 

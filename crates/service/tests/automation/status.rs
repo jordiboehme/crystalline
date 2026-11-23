@@ -273,3 +273,134 @@ async fn a_status_call_folds_the_callers_visibility_once() {
         );
     }
 }
+
+/// `eng` (nothing else due) with the page `w.md` the agent wrote from the
+/// one engram, with a freshness of one day and its reconcile recorded at `at`.
+async fn rolling_page(at: &str) -> Fx {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let files = files();
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, b)| (*p, b.as_str())).collect();
+    let fx = fixture_on(
+        Arc::new(Mutex::new(store)),
+        &borrowed,
+        |_, _| {},
+        None,
+        None,
+        None,
+    )
+    .await;
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: "w.md".into(),
+                markdown: Some("---\nfreshness: 1d\n---\n# Week\n\n## Now\n\nText.\n".into()),
+                sources: std::collections::BTreeMap::from([
+                    ("_top".to_string(), Vec::new()),
+                    ("Now".to_string(), vec!["notes/deploys".to_string()]),
+                ]),
+                ..Default::default()
+            },
+            &ReflectionCaller::agent(Scope::Unrestricted, "claude-code", false),
+        )
+        .await
+        .unwrap();
+    reconciled_at(&fx, "w.md", at).await;
+    fx
+}
+
+/// Record a reconcile of `path` at `at` exactly.
+async fn reconciled_at(fx: &Fx, path: &str, at: &str) {
+    let store = fx.engine.store();
+    let store = store.lock().await;
+    let id = store.domain_id("eng").await.unwrap().unwrap();
+    store
+        .set_reflection_reconcile(
+            id,
+            &crystalline_index::ReflectionReconcile {
+                path: path.to_string(),
+                last_reconciled: at.to_string(),
+                outcome: "unchanged".to_string(),
+                pact_hash: String::new(),
+                version: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+fn now_at(engine: &Engine, at: &str) {
+    engine.set_automation_now(Some(time::parse_rfc3339(at).unwrap()));
+}
+
+/// A page whose freshness ran out is due work for a run, counted on its own
+/// (`stale`, not among the `updates`), and the status names when the next
+/// page falls due, with counts and without (the cheap poll a runner makes
+/// to know when to come back), from the automation clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_page_is_due_work_and_the_status_says_when_the_next_is() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+
+    now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
+    for counts in [true, false] {
+        let fresh = status_with(&fx.engine, Loop::Reflect, counts).await;
+        let entry = &fresh["domains"][0];
+        assert_eq!(entry["next_stale_at"], "2026-10-22T10:00:00Z", "{fresh}");
+        assert_eq!(entry["next_stale_in_secs"], 22 * 3600, "{fresh}");
+        if counts {
+            assert_eq!(entry["due"], false, "{fresh}");
+            assert_eq!(entry["counts"]["stale"], 0, "{fresh}");
+        }
+    }
+
+    now_at(&fx.engine, "2026-10-22T11:00:00+00:00");
+    let before = fx.engine.due_detections();
+    let cheap = status_with(&fx.engine, Loop::Reflect, false).await;
+    assert_eq!(fx.engine.due_detections(), before, "no detection: {cheap}");
+    assert_eq!(
+        cheap["domains"][0]["next_stale_in_secs"],
+        23 * 3600,
+        "a due page names the start of its next period: {cheap}"
+    );
+    let due = status_with(&fx.engine, Loop::Reflect, true).await;
+    let entry = &due["domains"][0];
+    assert_eq!(entry["due"], true, "{due}");
+    assert_eq!(entry["counts"]["stale"], 1, "{due}");
+    assert_eq!(
+        entry["counts"]["updates"], 0,
+        "stale is its own count: {due}"
+    );
+    assert_eq!(entry["counts"]["pages_to_update"], 0, "{due}");
+    assert_eq!(entry["next_stale_at"], "2026-10-23T10:00:00Z", "{due}");
+}
+
+/// A retired page and a page without a freshness are never due and name
+/// no next time; with no page that keeps itself current both are null.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_rolling_page_there_is_no_next_stale_time() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: "w.md".into(),
+                action: Some("retire".into()),
+                ..Default::default()
+            },
+            &ReflectionCaller::person(Scope::Unrestricted, "jordi"),
+        )
+        .await
+        .unwrap();
+    now_at(&fx.engine, "2026-10-25T10:00:00+00:00");
+    for counts in [true, false] {
+        let answer = status_with(&fx.engine, Loop::Reflect, counts).await;
+        let entry = &answer["domains"][0];
+        assert_eq!(entry["next_stale_at"], Value::Null, "{answer}");
+        assert_eq!(entry["next_stale_in_secs"], Value::Null, "{answer}");
+        if counts {
+            // The engram the retired page cited is unreflected now; that
+            // is an update, never a stale page.
+            assert_eq!(entry["counts"]["stale"], 0, "{answer}");
+        }
+    }
+}

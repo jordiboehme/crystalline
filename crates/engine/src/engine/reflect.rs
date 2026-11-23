@@ -1032,7 +1032,8 @@ impl Engine {
         };
         items.extend(pages::page_items(&view, &inputs));
         if stale {
-            let now = time::now().unix_seconds();
+            // The automation clock, as the status and the trigger read it.
+            let now = self.automation_clock().stamp().unix_seconds();
             let mut found: Vec<(Item, i64)> = view
                 .pages
                 .keys()
@@ -1589,8 +1590,9 @@ impl Engine {
     /// Every item of `domain`'s reflect queue that a headless run would
     /// work, each with its stable key and its version (R3), for the
     /// automation status: what the caller may see, and no update of a page
-    /// a person has open in a live editor. The caller curates the
-    /// Reflection; the gate refuses anyone else.
+    /// a person has open in a live editor. A page whose freshness ran out
+    /// (`stale`) is due work too. The caller curates the Reflection; the
+    /// gate refuses anyone else.
     pub(super) async fn reflect_due_items(
         &self,
         domain: &str,
@@ -1607,7 +1609,7 @@ impl Engine {
                 Detail::Count,
                 &threads,
                 &caller.scope,
-                false,
+                true,
             )
             .await?;
         let rooms = self.collab_rooms();
