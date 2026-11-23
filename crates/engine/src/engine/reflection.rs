@@ -1885,6 +1885,12 @@ impl Engine {
         // changes nothing; the stored record keeps it either way.
         let new_owner = match (p.owner.as_deref().map(str::trim), current.as_deref()) {
             (None, _) => None,
+            (Some(_), _) if r::is_pact_file(&p.path) => {
+                return Err(EngineError::Invalid(format!(
+                    "an owner is named for a page, and '{}' is a pact file; leave owner out",
+                    p.path
+                )));
+            }
             (Some(owner), Some(stored)) => {
                 if r::read_provenance(stored).page.owner.as_deref() != Some(owner) {
                     return Err(EngineError::Invalid(format!(

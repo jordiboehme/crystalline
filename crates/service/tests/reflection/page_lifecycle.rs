@@ -272,6 +272,8 @@ async fn an_owner_is_checked_when_the_page_is_created() {
         ("arch/one.md", "PACT.md", "names no page"),
         ("arch/one.md", "old.md", "retired"),
         ("arch/one.md", "arch/one.md", "itself"),
+        // A pact file is no page, so it has no owner.
+        ("arch.pact.md", "arch.md", "pact file"),
         // An existing page takes no new owner.
         ("notes.md", "arch.md", "created"),
     ] {
@@ -283,6 +285,7 @@ async fn an_owner_is_checked_when_the_page_is_created() {
         assert!(refused.to_string().contains(says), "{owner}: {refused}");
     }
     assert!(file(&fx, "arch/one.md").is_none(), "nothing was written");
+    assert!(file(&fx, "arch.pact.md").is_none(), "nothing was written");
     assert_eq!(record(&fx, "notes.md").owner, None);
 
     // A page under the new path's folder follows it as its folder parent,
@@ -660,6 +663,22 @@ async fn a_reconcile_is_refused_for_what_is_no_live_page() {
         .await
         .unwrap_err();
     assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
+    // A run records a reconcile only in the domain it works on.
+    let elsewhere = Limit {
+        writes: Some(vec!["other".into()]),
+        ..Limit::default()
+    };
+    let refused = within(
+        Some(elsewhere),
+        fx.engine
+            .write_reflection(&reconciled("guides/a.md", "unchanged", "v1"), &agent()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("cannot write to eng"),
+        "{refused}"
+    );
     for path in ["guides/a.md", "old.md"] {
         let state = fx
             .engine
