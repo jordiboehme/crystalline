@@ -991,3 +991,39 @@ async fn a_reconcile_without_a_version_is_refused_while_the_page_is_stale() {
         .await
         .unwrap();
 }
+
+/// A run that stopped at its cap part way through an owner's pages resumes
+/// (design 3.5): the owner's `stale` item names, beside every page it owns,
+/// those reconciled since the owner was (`owned_reconciled`), so the next
+/// run skips them. A page with no reconcile recorded is never among them.
+#[tokio::test]
+async fn a_stale_owner_names_the_owned_pages_already_reconciled() {
+    let fx = weekly().await;
+    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# Week\n").await;
+    owned(&fx, "guides/week/mon.md", "guides/week.md").await;
+    owned(&fx, "guides/week/tue.md", "guides/week.md").await;
+    reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
+    let before = queue(&fx, &with_stale()).await;
+    assert_eq!(
+        items(&before, "stale")[0]["owned_reconciled"],
+        serde_json::json!([]),
+        "{before}"
+    );
+
+    fx.engine
+        .write_reflection(&reconciled("guides/week/mon.md", "updated", ""), &agent())
+        .await
+        .unwrap();
+    let after = queue(&fx, &with_stale()).await;
+    let item = items(&after, "stale")[0];
+    assert_eq!(
+        item["owned"],
+        serde_json::json!(["guides/week/mon.md", "guides/week/tue.md"]),
+        "{item}"
+    );
+    assert_eq!(
+        item["owned_reconciled"],
+        serde_json::json!(["guides/week/mon.md"]),
+        "{item}"
+    );
+}

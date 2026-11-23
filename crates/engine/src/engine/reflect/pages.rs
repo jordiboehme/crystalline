@@ -331,13 +331,28 @@ pub(super) fn stale_item(
             );
         }
     }
+    // The owned pages reconciled since the owner was: a run that stopped at
+    // its cap part way through them resumes after them (design 3.5). Only a
+    // recorded reconcile counts, never the seed of a page with none.
+    let owned = view.owned_tree(path);
+    let owned_reconciled: Vec<&String> = owned
+        .iter()
+        .filter(|child| {
+            inputs.states.get(child.as_str()).is_some_and(|child| {
+                child.outcome.is_some()
+                    && crystalline_core::time::parse_rfc3339(&child.last_reconciled)
+                        .is_some_and(|t| t.stamp() > at)
+            })
+        })
+        .collect();
     let extra = json!({
         "freshness": freshness.written,
         "last_reconciled": state.last_reconciled,
         "outcome": state.outcome.map(|o| o.as_str()),
         "pacts": chain,
         "pact_hash": pact_hash,
-        "owned": view.owned_tree(path),
+        "owned": owned,
+        "owned_reconciled": owned_reconciled,
         "unsettled": inputs.unsettled.get(path).cloned().unwrap_or_default(),
         "version": version,
         PACT_TEXTS: Value::Object(texts),
