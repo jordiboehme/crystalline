@@ -813,7 +813,7 @@ pub fn registry() -> Vec<HotStatement> {
             issued_by: "Store::lead_vectors",
             turso: || crystalline_index::turso::lead_vectors_sql(BASE_SCREEN),
             #[cfg(feature = "postgres")]
-            postgres: || crystalline_index::postgres::lead_vectors_sql(BASE_SCREEN, 0),
+            postgres: || crystalline_index::postgres::lead_vectors_sql(BASE_SCREEN),
             literals: &["1", "'fake'"],
             #[cfg(feature = "postgres")]
             literals_pg: None,

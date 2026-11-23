@@ -278,7 +278,7 @@ describe("the move dialog", () => {
       name: "Continue to the engram",
     });
     expect(onward).toHaveAccessibleDescription(
-      expect.stringContaining("These engrams still link the old address:"),
+      /These engrams still link the old address:/,
     );
     expect(dialog).toHaveClass("overflow-y-auto");
     expect(within(dialog).queryByRole("alert")).toBeNull();
