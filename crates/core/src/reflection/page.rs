@@ -403,6 +403,222 @@ fn folder_parent(page: &str, pages: &BTreeMap<String, PageLinks>) -> Option<Stri
     }
 }
 
+/// The frontmatter keys only a curator changes: a room never shows them and
+/// puts the stored values back, and a whole-page write below curate keeps
+/// them ([`carry_page_keys`]).
+pub const PAGE_KEYS: [&str; 3] = [FRESHNESS_KEY, FOLLOWS_KEY, STATUS_KEY];
+
+/// The [`PAGE_KEYS`] `source`'s frontmatter holds, with their values as
+/// parsed (a key with no value is there with `Null`). Empty when there is no
+/// frontmatter or it is no mapping.
+pub fn page_key_values(source: &str) -> BTreeMap<&'static str, serde_yaml_ng::Value> {
+    let Some(parts) = split_frontmatter(source) else {
+        return BTreeMap::new();
+    };
+    let Ok(serde_yaml_ng::Value::Mapping(map)) = serde_yaml_ng::from_str(parts.yaml) else {
+        return BTreeMap::new();
+    };
+    PAGE_KEYS
+        .iter()
+        .filter_map(|key| map.get(*key).map(|value| (*key, value.clone())))
+        .collect()
+}
+
+/// `source` without the [`PAGE_KEYS`] in its frontmatter: what a room
+/// shows. A frontmatter that held nothing else goes with them; one the
+/// author wrote empty stays. A frontmatter that cannot be cut key by key is
+/// left as it is.
+pub fn without_page_keys(source: &str) -> String {
+    carry_page_keys(source, None, &PAGE_KEYS).unwrap_or_else(|_| source.to_string())
+}
+
+/// `text` with the frontmatter keys `keys` (of [`PAGE_KEYS`]) as `stored`
+/// holds them: each is taken out of `text`, and the key blocks `stored` has
+/// for them go back byte for byte, each after the key it followed in
+/// `stored` (the nearest earlier one `text` still has), else first. So a
+/// text that only lost these keys comes back as `stored` wrote them. With no
+/// `stored` (or none of the keys in it) they are only taken out; a
+/// frontmatter left with nothing goes. `Err` when `text`'s frontmatter
+/// cannot be cut key by key; a `stored` that cannot be cut gives nothing
+/// back.
+pub fn carry_page_keys(text: &str, stored: Option<&str>, keys: &[&str]) -> Result<String, String> {
+    use crate::frontmatter::{KeyBlock, key_blocks};
+    let is_key = |block: &KeyBlock| keys.contains(&block.key.as_str());
+    let carried: Vec<KeyBlock> = stored
+        .and_then(split_frontmatter)
+        .and_then(|parts| key_blocks(parts.yaml))
+        .map(|blocks| blocks.blocks)
+        .unwrap_or_default();
+    let cuttable = |yaml: &str| {
+        key_blocks(yaml).ok_or_else(|| {
+            "this reflection's frontmatter cannot be read key by key (a flow-style block, a line before the first key, or a key that does not stand on its own); write it as plain `key: value` lines"
+                .to_string()
+        })
+    };
+    let (open, preamble, mut blocks, close, body) = match split_frontmatter(text) {
+        Some(parts) => {
+            let cut = cuttable(parts.yaml)?;
+            (
+                parts.open.to_string(),
+                cut.preamble,
+                cut.blocks,
+                parts.close.to_string(),
+                parts.body.to_string(),
+            )
+        }
+        None => (
+            "---\n".to_string(),
+            String::new(),
+            Vec::new(),
+            "---\n\n".to_string(),
+            text.to_string(),
+        ),
+    };
+    let removed = blocks.iter().any(|b| is_key(b));
+    blocks.retain(|b| !is_key(b));
+    // Each stored key block goes after the nearest key before it in `stored`
+    // that the text still has, after what was put there already, so two
+    // carried keys keep their stored order.
+    let mut placed_after: BTreeMap<Option<String>, usize> = BTreeMap::new();
+    for (at, block) in carried.iter().enumerate() {
+        if !is_key(block) {
+            continue;
+        }
+        let anchor = carried[..at]
+            .iter()
+            .rev()
+            .filter(|earlier| !is_key(earlier))
+            .find(|earlier| blocks.iter().any(|b| b.parsed_key == earlier.parsed_key))
+            .map(|earlier| earlier.key.clone());
+        let base = match &anchor {
+            Some(key) => blocks
+                .iter()
+                .position(|b| &b.key == key)
+                .map_or(0, |i| i + 1),
+            None => 0,
+        };
+        let seen = placed_after.entry(anchor).or_default();
+        let mut copy = block.clone();
+        if !copy.text.ends_with('\n') {
+            copy.text.push('\n');
+        }
+        blocks.insert(base + *seen, copy);
+        *seen += 1;
+    }
+    let inserted = placed_after.values().sum::<usize>() > 0;
+    if !inserted && !removed {
+        return Ok(text.to_string());
+    }
+    if blocks.is_empty() && preamble.trim().is_empty() {
+        // The text's frontmatter held only these keys: it goes with them.
+        // (One the author wrote empty never gets here: nothing was taken.)
+        return Ok(body.trim_start_matches(['\n', '\r']).to_string());
+    }
+    let mut yaml = preamble;
+    for block in &blocks {
+        yaml.push_str(&block.text);
+        if !block.text.ends_with('\n') {
+            yaml.push('\n');
+        }
+    }
+    Ok(format!("{open}{yaml}{close}{body}"))
+}
+
+/// `source` with a `follows` that names the page `from` naming `to`
+/// instead, and how many it changed (0 or 1): the page `from` moved. Other
+/// frontmatter keys and the body stay byte for byte.
+pub fn rewrite_follows(source: &str, from: &str, to: &str) -> (String, usize) {
+    use crate::frontmatter::key_blocks;
+    let Some(parts) = split_frontmatter(source) else {
+        return (source.to_string(), 0);
+    };
+    let Some(cut) = key_blocks(parts.yaml) else {
+        return (source.to_string(), 0);
+    };
+    let follows_from = |value: &serde_yaml_ng::Value| value.as_str().map(str::trim) == Some(from);
+    if !cut
+        .blocks
+        .iter()
+        .any(|b| b.key == FOLLOWS_KEY && follows_from(&b.value))
+    {
+        return (source.to_string(), 0);
+    }
+    let mut yaml = cut.preamble;
+    for block in &cut.blocks {
+        if block.key == FOLLOWS_KEY && follows_from(&block.value) {
+            let mut map = serde_yaml_ng::Mapping::new();
+            map.insert(FOLLOWS_KEY.into(), to.into());
+            yaml.push_str(&serde_yaml_ng::to_string(&map).unwrap_or_default());
+        } else {
+            yaml.push_str(&block.text);
+            if !block.text.ends_with('\n') {
+                yaml.push('\n');
+            }
+        }
+    }
+    (
+        format!("{}{yaml}{}{}", parts.open, parts.close, parts.body),
+        1,
+    )
+}
+
+/// Why the page at `page` may not be written with `follows: <target>`, or
+/// `None` when it may: `target` must name an existing page of this
+/// Reflection, and following it must not close a cycle ([`would_cycle`]),
+/// which the sentence names page by page. `pages` holds every page that
+/// exists with its links, `page` itself among them.
+pub fn follows_refusal(
+    page: &str,
+    target: &serde_yaml_ng::Value,
+    pages: &BTreeMap<String, PageLinks>,
+) -> Option<String> {
+    let Some(target) = target.as_str().map(str::trim) else {
+        return Some(format!(
+            "follows {} {FOLLOWS_NO_PAGE_WRITE}",
+            as_written(target)
+        ));
+    };
+    if let Err(reason) = follows_target(target) {
+        let reason = if reason == FOLLOWS_OTHER_DOMAIN {
+            FOLLOWS_OTHER_DOMAIN_WRITE
+        } else {
+            FOLLOWS_NO_PAGE_WRITE
+        };
+        return Some(format!("follows '{target}' {reason}"));
+    }
+    if !pages.contains_key(target) {
+        return Some(format!(
+            "follows '{target}' names a page that does not exist; write that page first or name another"
+        ));
+    }
+    if !would_cycle(page, target, pages) {
+        return None;
+    }
+    // The way round, from the page through `target` and back.
+    let mut tried = pages.clone();
+    tried.entry(page.to_string()).or_default().follows = Some(target.to_string());
+    let mut way = vec![page.to_string()];
+    let mut current = page.to_string();
+    let mut ignored = Vec::new();
+    while let Some((next, _)) = step(&current, &tried, None, &mut ignored) {
+        way.push(next.clone());
+        if next == page || way.len() > tried.len() + 1 {
+            break;
+        }
+        current = next;
+    }
+    Some(format!(
+        "follows '{target}' would close a cycle ({}): a page cannot follow itself, so choose a page that does not lead back to '{page}'",
+        way.join(" > ")
+    ))
+}
+
+/// The end of the refusal for a `follows` that names no page.
+const FOLLOWS_NO_PAGE_WRITE: &str =
+    "names no page of this Reflection; name a page path such as arch/overview.md";
+/// The end of the refusal for a `follows` that names another domain's page.
+const FOLLOWS_OTHER_DOMAIN_WRITE: &str = "names a page of another domain; a page follows only pages of its own Reflection, so name a page path such as arch/overview.md";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +1109,128 @@ mod tests {
             !would_cycle("z.md", "x.md", &looped),
             "a cycle above that does not reach the page is not this write's"
         );
+    }
+
+    /// A room shows a page without its curator keys, and putting the stored
+    /// ones back gives the stored text byte for byte: in their place among
+    /// the other keys, and with a frontmatter that held only them.
+    #[test]
+    fn page_keys_come_out_for_a_room_and_go_back_as_stored() {
+        let stored = "---\ntitle: A\nfreshness: 1d\nsummary: s\nfollows: arch/b.md\nstatus: archived\n---\n\n# A\n\nBody.\n";
+        let room = without_page_keys(stored);
+        assert_eq!(room, "---\ntitle: A\nsummary: s\n---\n\n# A\n\nBody.\n");
+        assert_eq!(
+            carry_page_keys(&room, Some(stored), &PAGE_KEYS).unwrap(),
+            stored
+        );
+
+        let only = "---\nfreshness: 6h\nfollows: \"b.md\"\n---\n\n# A\n";
+        let room = without_page_keys(only);
+        assert_eq!(room, "# A\n");
+        assert_eq!(
+            carry_page_keys(&room, Some(only), &PAGE_KEYS).unwrap(),
+            only
+        );
+
+        // What the text typed for a key is replaced by the stored value, and
+        // a key the stored page lacks is taken out.
+        let typed = "---\ntitle: A\nfreshness: 1h\nstatus: archived\n---\n\n# A\n";
+        let stored = "---\ntitle: A\nfreshness: 1d\n---\n\n# A\n";
+        assert_eq!(
+            carry_page_keys(typed, Some(stored), &PAGE_KEYS).unwrap(),
+            stored
+        );
+        assert_eq!(
+            carry_page_keys(typed, None, &PAGE_KEYS).unwrap(),
+            "---\ntitle: A\n---\n\n# A\n"
+        );
+
+        // Only the keys named are carried.
+        assert_eq!(
+            carry_page_keys(typed, Some(stored), &[FRESHNESS_KEY]).unwrap(),
+            "---\ntitle: A\nfreshness: 1d\nstatus: archived\n---\n\n# A\n"
+        );
+
+        // A page with none of the keys is left byte for byte, an empty
+        // frontmatter the author wrote too.
+        for text in ["# A\n", "---\n---\n\n# A\n", "---\ntitle: A\n---\n# A\n"] {
+            assert_eq!(without_page_keys(text), text);
+            assert_eq!(
+                carry_page_keys(text, Some("# B\n"), &PAGE_KEYS).unwrap(),
+                text
+            );
+        }
+    }
+
+    /// The keys a frontmatter holds, a key without a value among them.
+    #[test]
+    fn page_key_values_read_what_is_there() {
+        let values = page_key_values("---\ntitle: A\nfreshness: 1d\nfollows:\n---\n# A\n");
+        assert_eq!(values.len(), 2, "{values:?}");
+        assert_eq!(values[FRESHNESS_KEY].as_str(), Some("1d"));
+        assert!(values[FOLLOWS_KEY].is_null());
+        assert!(page_key_values("# A\n").is_empty());
+    }
+
+    /// A follows that named a moved page names its new path; nothing else
+    /// changes.
+    #[test]
+    fn a_follows_follows_its_page_when_it_moves() {
+        let page = "---\ntitle: C\nfollows: arch/b.md\nfreshness: 1d\n---\n\n# C\n";
+        let (moved, n) = rewrite_follows(page, "arch/b.md", "new place/b.md");
+        assert_eq!(n, 1);
+        assert_eq!(
+            moved,
+            "---\ntitle: C\nfollows: new place/b.md\nfreshness: 1d\n---\n\n# C\n"
+        );
+        assert_eq!(
+            read_page_settings(&moved, "c.md", &PageRecord::default())
+                .0
+                .follows
+                .as_deref(),
+            Some("new place/b.md")
+        );
+        let (same, n) = rewrite_follows(page, "arch/x.md", "y.md");
+        assert_eq!((same.as_str(), n), (page, 0));
+    }
+
+    /// A follows is written only when it names an existing page of this
+    /// Reflection that does not lead back; a cycle is named page by page.
+    #[test]
+    fn a_follows_is_refused_when_it_names_no_page_or_closes_a_cycle() {
+        let all = pages(&[
+            ("a.md", None, None),
+            ("b.md", Some("c.md"), None),
+            ("c.md", Some("a.md"), None),
+            ("d.md", None, None),
+        ]);
+        let v = |s: &str| serde_yaml_ng::Value::String(s.into());
+        assert_eq!(follows_refusal("a.md", &v("d.md"), &all), None);
+        let cycle = follows_refusal("a.md", &v("b.md"), &all).unwrap();
+        assert!(cycle.contains("a.md > b.md > c.md > a.md"), "{cycle}");
+        assert!(
+            follows_refusal("a.md", &v("a.md"), &all)
+                .unwrap()
+                .contains("a.md > a.md")
+        );
+        assert!(
+            follows_refusal("a.md", &v("gone.md"), &all)
+                .unwrap()
+                .contains("does not exist")
+        );
+        assert!(
+            follows_refusal("a.md", &v("crystalline://ops/x.md"), &all)
+                .unwrap()
+                .contains("another domain")
+        );
+        for no_page in ["PACT.md", "d.pact.md", "reflections/d.md"] {
+            assert!(
+                follows_refusal("a.md", &v(no_page), &all)
+                    .unwrap()
+                    .contains("names no page"),
+                "{no_page}"
+            );
+        }
+        assert!(follows_refusal("a.md", &serde_yaml_ng::Value::Bool(true), &all).is_some());
     }
 }
