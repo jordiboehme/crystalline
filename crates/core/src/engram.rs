@@ -48,6 +48,19 @@ pub const RECOMMENDED_STATUSES: &[&str] = &[
     "legacy",
 ];
 
+/// Statuses that mark knowledge as retired: an engram no longer holds, a
+/// Reflection page is retired. Exact lowercase match, the same stance as the
+/// canonical current filter; a caller holding a status as written lowercases
+/// it first.
+pub const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
+
+/// Whether a status belongs to the retired set ([`RETIRED_STATUSES`]).
+/// Exact lowercase match. Retirement is terminal: the consolidation sweep
+/// never flags a retired engram for being old, unverified or unlinked.
+pub fn is_retired_status(status: &str) -> bool {
+    RETIRED_STATUSES.contains(&status)
+}
+
 /// A parsed Engram: typed frontmatter, the verbatim body and the structured
 /// elements scanned out of the body.
 #[derive(Debug, Clone, PartialEq, Serialize)]

@@ -1473,17 +1473,11 @@ pub fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
 /// into memory at once.
 pub const LEXICAL_CANDIDATE_CAP: usize = 5000;
 
-/// Statuses that mark knowledge as retired. Exact lowercase match, the same
-/// stance as the canonical current filter.
-pub const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
-
-/// Whether a status belongs to the retired set. Exact lowercase match, the
-/// counterpart of [`is_current_status`]. Retirement is terminal: the
-/// consolidation sweep never flags a retired engram for being old, unverified
-/// or unlinked.
-pub fn is_retired_status(status: &str) -> bool {
-    RETIRED_STATUSES.contains(&status)
-}
+/// The retired set and its test live in crystalline-core, the lowest crate
+/// that needs them (a Reflection page is retired by the same words); they
+/// stay reachable here under their old names. The counterpart of
+/// [`is_current_status`].
+pub use crystalline_core::{RETIRED_STATUSES, is_retired_status};
 
 /// The statuses that mean "this is what holds now", as one equivalence class.
 /// `stable` is the canonical word Crystalline writes and the OKF v0.2 spelling;
