@@ -20,6 +20,7 @@ mod nudges;
 mod own_writes;
 mod page_lifecycle;
 mod page_rights;
+mod page_view;
 mod queue;
 mod reach;
 mod read_limit;

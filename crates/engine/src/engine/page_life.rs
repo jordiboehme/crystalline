@@ -196,6 +196,118 @@ impl Engine {
         }))
     }
 
+    /// A curator's change to the settings of the page at `change.path`
+    /// (`PATCH /domains/{domain}/reflection/settings`, design 3.2): each key
+    /// left out keeps its value, an empty value takes the key off and any
+    /// other value sets it. The new text is the stored one with only those
+    /// frontmatter keys changed, written as a whole-page write against the
+    /// stored checksum, so a live room takes it in, the index and the
+    /// backup follow and `follows` is checked as on every write. Answers
+    /// the write's receipt with the page as a read shows it (`page`).
+    ///
+    /// Refused: below curate; a pact file or a missing page; nothing to
+    /// change; a `freshness` that does not read, under an hour, or on an
+    /// owned page (it is reconciled with its owner); a retired word in
+    /// `status` (retire the page instead) and any `status` change on a
+    /// retired page (restore it instead).
+    pub async fn set_reflection_page_settings(
+        &self,
+        domain: &str,
+        change: &crate::params::PageSettingsChange,
+        caller: &ReflectionCaller,
+    ) -> Result<Value> {
+        let inner = change.path.as_str();
+        let access = self.page_settings_gate(domain, inner, caller).await?;
+        let wanted: Vec<(&str, Option<&str>)> = [
+            (r::FRESHNESS_KEY, change.freshness.as_deref()),
+            (r::FOLLOWS_KEY, change.follows.as_deref()),
+            (r::STATUS_KEY, change.status.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|v| (key, Some(v.trim()).filter(|v| !v.is_empty()))))
+        .collect();
+        if wanted.is_empty() {
+            return Err(EngineError::Invalid(
+                "a settings change names freshness, follows or status; send at least one".into(),
+            ));
+        }
+        let stored = read_opt(&access.abs(inner))?.ok_or_else(|| no_page(domain, inner))?;
+        let record = r::read_provenance(&stored).page;
+        let retired = record.retired.is_some() || is_retired(&stored, inner);
+        let mut text = stored.clone();
+        for (key, value) in &wanted {
+            match (*key, *value) {
+                (r::FRESHNESS_KEY, Some(spec)) => {
+                    r::parse_freshness(spec).map_err(|reason| {
+                        EngineError::Invalid(format!("freshness '{spec}' {reason}"))
+                    })?;
+                    if let Some(owner) = &record.owner {
+                        return Err(EngineError::Invalid(format!(
+                            "'{inner}' is owned by '{owner}' and is reconciled with it, so it takes no freshness of its own; give '{owner}' the freshness instead"
+                        )));
+                    }
+                }
+                (r::STATUS_KEY, _) if retired => {
+                    return Err(EngineError::Invalid(format!(
+                        "'{inner}' is retired; restore it (write_reflection action=restore) to change its status"
+                    )));
+                }
+                (r::STATUS_KEY, Some(status))
+                    if crystalline_core::is_retired_status(&status.to_lowercase()) =>
+                {
+                    return Err(EngineError::Invalid(format!(
+                        "status '{status}' retires the page; retire '{inner}' instead (write_reflection action=retire), which keeps the page it was owned by so a restore can put it back"
+                    )));
+                }
+                _ => {}
+            }
+            // A cleared key is sent with no value: a curator's whole-page
+            // write takes it off (a key left out keeps its stored value).
+            text = set_page_key(&text, key, *value)?;
+        }
+        let receipt = self
+            .write_reflection(
+                &crate::params::WriteReflectionParams {
+                    domain: domain.to_string(),
+                    path: inner.to_string(),
+                    markdown: Some(text),
+                    expected_checksum: Some(sha256_hex(stored.as_bytes())),
+                    ..Default::default()
+                },
+                caller,
+            )
+            .await?;
+        let written = read_opt(&access.abs(inner))?.ok_or_else(|| no_page(domain, inner))?;
+        let mut receipt = receipt;
+        receipt["page"] = self.page_view(access.domain_id, inner, &written).await?;
+        Ok(receipt)
+    }
+
+    /// The gate of a settings change: curate, a writable domain, and a page
+    /// (no pact file).
+    async fn page_settings_gate(
+        &self,
+        domain: &str,
+        inner: &str,
+        caller: &ReflectionCaller,
+    ) -> Result<ReflectionAccess> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let access = self
+            .require_reflection_to_write(domain, caller, ReflectionRight::Curate)
+            .await?;
+        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
+        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        if r::is_pact_file(inner) {
+            return Err(EngineError::Invalid(format!(
+                "'{inner}' is a pact file, no page: only a page has settings"
+            )));
+        }
+        Ok(access)
+    }
+
     /// Change the frontmatter or the block of the page at `inner` through
     /// `change`, which is handed the stored text, under the page's lock.
     async fn change_page_record(
@@ -301,15 +413,26 @@ pub(super) const EMPTY_OWNER: &str =
 /// `text` with its `status` set to `status`, or taken out with `None`.
 fn set_status(text: &str, status: Option<&str>) -> Result<String> {
     let stored = status
-        .map(|status| {
-            let mut map = serde_yaml_ng::Mapping::new();
-            map.insert(r::STATUS_KEY.into(), status.into());
-            serde_yaml_ng::to_string(&map)
-                .map(|yaml| format!("---\n{yaml}---\n"))
-                .map_err(|e| EngineError::Internal(e.to_string()))
-        })
+        .map(|status| key_block(r::STATUS_KEY, serde_yaml_ng::Value::from(status)))
         .transpose()?;
     r::carry_page_keys(text, stored.as_deref(), &[r::STATUS_KEY]).map_err(EngineError::Invalid)
+}
+
+/// `text` with the page key `key` set to `value`, or written with no value
+/// for `None`: how a curator's whole-page write takes a key off.
+fn set_page_key(text: &str, key: &str, value: Option<&str>) -> Result<String> {
+    let value = value.map_or(serde_yaml_ng::Value::Null, serde_yaml_ng::Value::from);
+    let stored = key_block(key, value)?;
+    r::carry_page_keys(text, Some(&stored), &[key]).map_err(EngineError::Invalid)
+}
+
+/// A frontmatter holding only `key: value`, YAML safe.
+fn key_block(key: &str, value: serde_yaml_ng::Value) -> Result<String> {
+    let mut map = serde_yaml_ng::Mapping::new();
+    map.insert(key.into(), value);
+    serde_yaml_ng::to_string(&map)
+        .map(|yaml| format!("---\n{yaml}---\n"))
+        .map_err(|e| EngineError::Internal(e.to_string()))
 }
 
 /// Whether the page `text` at `inner` is retired by its `status`.

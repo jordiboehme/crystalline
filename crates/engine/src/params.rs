@@ -785,6 +785,27 @@ pub struct WriteReflectionParams {
     pub disclosed: Option<String>,
 }
 
+/// A change to a Reflection page's settings, the frontmatter keys only a
+/// curator changes (`PATCH /domains/{domain}/reflection/settings`): each
+/// key left out keeps its value, an empty value takes the key off the page,
+/// and any other value sets it. The page's text is not touched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageSettingsChange {
+    /// The page's path inside reflections/.
+    pub path: String,
+    /// How often the page is brought in line with its pacts: 1h, 6h, 1d,
+    /// 7d, 30d or any span of an hour or more.
+    #[serde(default)]
+    pub freshness: Option<String>,
+    /// The page of this Reflection whose pact this page follows.
+    #[serde(default)]
+    pub follows: Option<String>,
+    /// The page's status; a retired word is refused (retire the page
+    /// instead).
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 /// Parameters for `discuss`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DiscussParams {

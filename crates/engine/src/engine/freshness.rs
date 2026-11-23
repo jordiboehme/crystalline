@@ -319,8 +319,20 @@ impl Engine {
     ///   missed it: the loop runs less often than the page's freshness.
     /// - `waiting`: a due page waits for a live editor that has it open.
     ///
-    /// Null for a page with no freshness, a retired page and a missing one.
-    /// Needs the right to read the Reflection.
+    /// - `part_of`: `{path, title}` of the page that owns this one, null
+    ///   for a page on its own (design 2.3).
+    /// - `clock_of`: the page whose freshness keeps this one current: the
+    ///   page itself, or for an owned page the first page up its owners
+    ///   that has a freshness; null when none has.
+    ///
+    /// An owned page is reconciled with its owner and never due on its own:
+    /// it answers that page's `freshness`, `last_reconciled` and
+    /// `last_checked_secs` (null when no owner up the way has a freshness),
+    /// `due_in_secs`, `overdue_secs` and `missed_secs` null and `stale`,
+    /// `loop_slower_than_freshness` and `waiting` false.
+    ///
+    /// Null for a page on its own with no freshness, a retired page and a
+    /// missing one. Needs the right to read the Reflection.
     pub async fn reflection_page_clock(
         &self,
         domain: &str,
@@ -329,22 +341,84 @@ impl Engine {
     ) -> Result<Value> {
         self.require_reflection(domain, caller, ReflectionRight::Read)
             .await?;
-        let Some(clock) = self.page_clock(domain, path).await? else {
+        if let Some(clock) = self.page_clock(domain, path).await? {
+            let waiting = clock.timing.stale() && self.waits_for_the_room(domain, path).await;
+            return Ok(json!({
+                "path": clock.path,
+                "freshness": clock.freshness.written,
+                "last_reconciled": clock.last_reconciled,
+                "last_checked_secs": clock.timing.last_checked_secs,
+                "due_in_secs": (!clock.timing.stale()).then_some(clock.timing.next_due_in_secs),
+                "stale": clock.timing.stale(),
+                "overdue_secs": clock.timing.overdue_secs,
+                "missed_secs": clock.timing.missed_secs,
+                "loop_slower_than_freshness": clock.timing.loop_slower_than_freshness,
+                "waiting": waiting,
+                "part_of": null,
+                "clock_of": clock.path,
+            }));
+        }
+        let Some((part_of, kept_by)) = self.owners_clock(domain, path).await? else {
             return Ok(Value::Null);
         };
-        let waiting = clock.timing.stale() && self.waits_for_the_room(domain, path).await;
         Ok(json!({
-            "path": clock.path,
-            "freshness": clock.freshness.written,
-            "last_reconciled": clock.last_reconciled,
-            "last_checked_secs": clock.timing.last_checked_secs,
-            "due_in_secs": (!clock.timing.stale()).then_some(clock.timing.next_due_in_secs),
-            "stale": clock.timing.stale(),
-            "overdue_secs": clock.timing.overdue_secs,
-            "missed_secs": clock.timing.missed_secs,
-            "loop_slower_than_freshness": clock.timing.loop_slower_than_freshness,
-            "waiting": waiting,
+            "path": path,
+            "freshness": kept_by.as_ref().map(|c| c.freshness.written.clone()),
+            "last_reconciled": kept_by.as_ref().map(|c| c.last_reconciled.clone()),
+            "last_checked_secs": kept_by.as_ref().map(|c| c.timing.last_checked_secs),
+            "due_in_secs": null,
+            "stale": false,
+            "overdue_secs": null,
+            "missed_secs": null,
+            "loop_slower_than_freshness": false,
+            "waiting": false,
+            "part_of": part_of,
+            "clock_of": kept_by.as_ref().map(|c| c.path.clone()),
         }))
+    }
+
+    /// For the owned page at `path` of `domain`'s Reflection: `{path,
+    /// title}` of its owner, and the clock of the first page up its owners
+    /// that has one. `None` for a page that is missing, retired or owned by
+    /// no page.
+    async fn owners_clock(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<(Value, Option<PageClock>)>> {
+        let reader = self.reader();
+        let Some(id) = reader.domain_id(domain).await? else {
+            return Ok(None);
+        };
+        let owner_of = |text: &str| r::read_provenance(text).page.owner;
+        let Some(row) = reader.get_reflection(id, path).await? else {
+            return Ok(None);
+        };
+        let Some(owner) = owner_of(&row.content) else {
+            return Ok(None);
+        };
+        let title = match reader.get_reflection(id, &owner).await? {
+            Some(row) => row.title,
+            None => owner.clone(),
+        };
+        let part_of = json!({ "path": owner, "title": title });
+        // Up the owners until one keeps a clock; a loop written by hand
+        // ends where it comes back.
+        let mut seen = std::collections::BTreeSet::from([path.to_string()]);
+        let mut next = Some(owner);
+        while let Some(page) = next.take() {
+            if !seen.insert(page.clone()) {
+                break;
+            }
+            if let Some(clock) = self.page_clock(domain, &page).await? {
+                return Ok(Some((part_of, Some(clock))));
+            }
+            next = match reader.get_reflection(id, &page).await? {
+                Some(row) => owner_of(&row.content),
+                None => None,
+            };
+        }
+        Ok(Some((part_of, None)))
     }
 
     /// Every page of the Reflections served here that a reflect run missed

@@ -2885,6 +2885,12 @@ impl Engine {
                 continue;
             }
             let sections = r::split_sections(&row.content).len().saturating_sub(1);
+            // A retired page is hidden in the navigation behind a switch,
+            // and an owned page names its owner (design 2.3, 2.4).
+            let record = r::read_provenance(&row.content).page;
+            let retired = r::read_page_settings(&row.content, &row.path, &record)
+                .0
+                .retired();
             root.insert(
                 &row.path,
                 json!({
@@ -2894,6 +2900,8 @@ impl Engine {
                     "title": row.title,
                     "open_threads": open_threads(&row.path),
                     "sections": sections,
+                    "retired": retired,
+                    "owner": record.owner,
                 }),
             );
         }
@@ -3064,6 +3072,12 @@ impl Engine {
             "sections": sections,
             "threads": open,
         });
+        // What the page says about itself beside its text: its settings,
+        // the pacts it follows, its owner and its retirement. A pact file is
+        // no page and has none of it.
+        if matches!(r::classify(inner), r::ReflectionFile::Page(_)) {
+            answer["page"] = self.page_view(access.domain_id, inner, &text).await?;
+        }
         // Who has the page open in a co-editing room (R77): nested, as the
         // contract and Fluid read it; absent while no room is open.
         if let Some(rooms) = self.collab_rooms() {
@@ -3208,6 +3222,27 @@ impl Engine {
         let hits = crystalline_index::reflection::rank_sections(
             &rows, query, mode, &vectors, floor, limit, page,
         );
+        // A hit on a retired page says so: search still finds it, shown
+        // faded (design 2.4).
+        let retired: BTreeSet<&str> = hits
+            .items
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .filter(|path| {
+                rows.iter()
+                    .find(|row| row.path == *path)
+                    .is_some_and(|row| super::page_life::is_retired(&row.content, path))
+            })
+            .collect();
+        let items: Vec<Value> = hits
+            .items
+            .iter()
+            .map(|hit| {
+                let mut item = json!(hit);
+                item["retired"] = json!(retired.contains(hit.path.as_str()));
+                item
+            })
+            .collect();
         Ok(json!({
             "domain": domain,
             "query": query,
@@ -3215,8 +3250,8 @@ impl Engine {
             "total": hits.total,
             "page": hits.page,
             "limit": hits.limit,
-            "count": hits.items.len(),
-            "hits": hits.items,
+            "count": items.len(),
+            "hits": items,
         }))
     }
 }

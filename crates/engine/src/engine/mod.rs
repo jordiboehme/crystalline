@@ -9689,6 +9689,7 @@ mod names;
 mod origins;
 pub use origins::{READERS_REQUIRED, leave_out_for_non_admin};
 mod page_life;
+mod page_view;
 mod read;
 pub use page_life::RETIRED_STATUS;
 mod reconcile;
