@@ -1543,8 +1543,20 @@ export type LoopDelivery = {
 export type LoopRun = {
     /**
      * The account the run worked as; only for a caller who may run the loop.
+     * `null` for a run by an agent of the loops, which `agent` names.
      */
     account?: string | null;
+    /**
+     * The unique name of the agent of the loops the run worked as; only for
+     * a caller who may run the loop, and `null` for a person's run or the
+     * machine's own.
+     */
+    agent?: string | null;
+    /**
+     * The name `agent` is shown under, read when the answer is made; `null`
+     * without an agent, or once the agent is gone.
+     */
+    agent_display?: string | null;
     /**
      * Items done.
      */

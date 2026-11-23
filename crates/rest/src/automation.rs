@@ -31,8 +31,20 @@ pub struct LoopRun {
     #[schema(example = "n8n")]
     pub runner: String,
     /// The account the run worked as; only for a caller who may run the loop.
+    /// `null` for a run by an agent of the loops, which `agent` names.
     #[schema(example = "robot")]
     pub account: Option<String>,
+    /// The unique name of the agent of the loops the run worked as; only for
+    /// a caller who may run the loop, and `null` for a person's run or the
+    /// machine's own.
+    #[serde(default)]
+    #[schema(example = "nightly")]
+    pub agent: Option<String>,
+    /// The name `agent` is shown under, read when the answer is made; `null`
+    /// without an agent, or once the agent is gone.
+    #[serde(default)]
+    #[schema(example = "Nightly curator")]
+    pub agent_display: Option<String>,
     /// `done`, `stopped_at_cap`, `failed`, `nothing_due` or `expired`.
     #[schema(example = "done")]
     pub outcome: String,
@@ -153,7 +165,9 @@ fn state(entry: &Value) -> Result<Option<LoopState>, ApiError> {
                    caller sees its own share. Every reader gets the last run \
                    (when, which runner, the outcome and the counts) and the \
                    runner working now. A caller who may run the loop also \
-                   gets the run's summary, pull request and account, and, \
+                   gets the run's summary, pull request and account (or, \
+                   for a run by an agent of the loops, the agent's name \
+                   and display name), and, \
                    with `counts` on, how many items wait for a person. Only a \
                    domain manager or an instance admin gets `delivery`, the \
                    state of the loop's webhook trigger where the MANIFEST \
@@ -203,8 +217,27 @@ pub async fn read(
             query.counts.unwrap_or(true),
         )
         .await?;
-    Ok(Json(AutomationResponse {
-        reflect: state(&overview["reflect"])?,
-        evolve: state(&overview["evolve"])?,
-    }))
+    let mut reflect = state(&overview["reflect"])?;
+    let mut evolve = state(&overview["evolve"])?;
+    for loop_state in [reflect.as_mut(), evolve.as_mut()].into_iter().flatten() {
+        if let Some(run) = loop_state.last_run.as_mut() {
+            show_agent(&state_, run).await;
+        }
+    }
+    Ok(Json(AutomationResponse { reflect, evolve }))
+}
+
+/// Fill in the display name of the agent a run worked as. A store that
+/// cannot be read leaves it out; the unique name stays.
+async fn show_agent(state: &RestState, run: &mut LoopRun) {
+    let Some(name) = run.agent.as_deref() else {
+        return;
+    };
+    run.agent_display = match state.auth.agent_display(name).await {
+        Ok(display) => display,
+        Err(e) => {
+            tracing::warn!("the display name of agent {name} could not be read: {e:#}");
+            None
+        }
+    };
 }

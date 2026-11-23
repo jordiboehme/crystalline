@@ -722,8 +722,8 @@ impl Subscriber {
 /// that was shared with everyone.
 fn audience_admits(audience: &DomainAudience, scope: &Scope) -> bool {
     match (audience, scope) {
-        // No request on this surface resolves to an agent; were one to, it
-        // reads nothing until its rights are spelled out.
+        // No request on this surface resolves to an agent of the loops (the
+        // JSON API takes no agent token); were one to, it reads nothing here.
         (_, Scope::Agent { .. }) => false,
         (DomainAudience::Everyone, _) | (_, Scope::Unrestricted) => true,
         (DomainAudience::Accounts(accounts), Scope::User { account, admin }) => {

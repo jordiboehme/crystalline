@@ -2125,7 +2125,7 @@
           "domains"
         ],
         "summary": "When the reflect and evolve loops last ran on this domain.",
-        "description": "Reading needs the right to read the domain, and each caller sees its own share. Every reader gets the last run (when, which runner, the outcome and the counts) and the runner working now. A caller who may run the loop also gets the run's summary, pull request and account, and, with `counts` on, how many items wait for a person. Only a domain manager or an instance admin gets `delivery`, the state of the loop's webhook trigger where the MANIFEST turns it on. Never the items a run left.",
+        "description": "Reading needs the right to read the domain, and each caller sees its own share. Every reader gets the last run (when, which runner, the outcome and the counts) and the runner working now. A caller who may run the loop also gets the run's summary, pull request and account (or, for a run by an agent of the loops, the agent's name and display name), and, with `counts` on, how many items wait for a person. Only a domain manager or an instance admin gets `delivery`, the state of the loop's webhook trigger where the MANIFEST turns it on. Never the items a run left.",
         "operationId": "read_automation",
         "parameters": [
           {
@@ -15891,8 +15891,24 @@
               "string",
               "null"
             ],
-            "description": "The account the run worked as; only for a caller who may run the loop.",
+            "description": "The account the run worked as; only for a caller who may run the loop.\n`null` for a run by an agent of the loops, which `agent` names.",
             "example": "robot"
+          },
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique name of the agent of the loops the run worked as; only for\na caller who may run the loop, and `null` for a person's run or the\nmachine's own.",
+            "example": "nightly"
+          },
+          "agent_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name `agent` is shown under, read when the answer is made; `null`\nwithout an agent, or once the agent is gone.",
+            "example": "Nightly curator"
           },
           "done": {
             "type": "integer",
