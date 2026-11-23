@@ -104,10 +104,14 @@ async fn a_stdio_read_of_a_mounted_page_open_in_the_servers_editor_is_live_and_d
     .unwrap();
     assert_eq!(read["live"], true, "{read}");
     assert!(
-        read["content"]
+        read["markdown"]
             .as_str()
             .unwrap()
             .contains("a person typed this")
+    );
+    assert!(
+        read.get("content").is_none(),
+        "no top-level content: {read}"
     );
     assert_eq!(read["domain"], "open");
     let present = room.present().await;
@@ -150,7 +154,7 @@ async fn a_draft_link_works_on_a_mounted_domain_and_lapses_after_the_last_call()
     .await
     .unwrap();
     assert!(
-        read["content"]
+        read["markdown"]
             .as_str()
             .unwrap()
             .contains("keeper drafted this"),
@@ -943,7 +947,7 @@ async fn a_026_server_reads_without_links_and_refuses_a_file_naming_the_version(
     )
     .await;
     assert!(
-        engram["content"]
+        engram["markdown"]
             .as_str()
             .is_some_and(|c| c.contains("assets/shot.png")),
         "{engram}"

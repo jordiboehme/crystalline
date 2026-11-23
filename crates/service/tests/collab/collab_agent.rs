@@ -2797,8 +2797,13 @@ struct Wire {
 impl Wire {
     /// A connection to a server over `engine`, not yet opened.
     fn to(engine: Arc<Engine>) -> Wire {
+        Wire::over(McpServer::new(engine))
+    }
+
+    /// A connection to `server`, not yet opened.
+    fn over(server: McpServer) -> Wire {
         let (client_io, server_io) = tokio::io::duplex(1 << 18);
-        let server = ServedSession::spawn(McpServer::new(engine), server_io);
+        let server = ServedSession::spawn(server, server_io);
         let (read, write) = tokio::io::split(client_io);
         Wire {
             write,
@@ -2933,6 +2938,39 @@ async fn a_person_typing_in_alpha() -> (
     publish_name(&joined, &doc, "Jordi").await;
     append_line(&joined, &doc, "typed but never saved").await;
     (tmp, engine, sessions, joined, doc, scratch)
+}
+
+/// **An agent reading a page somebody is typing in gets the unsaved text under
+/// `markdown`, on both transports.** The live answer keeps every other key it
+/// had (`live`, `present`) and carries no top-level `content` (issue #237:
+/// hosted ChatGPT shows `{}` for a JSON text result that has one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_read_answers_the_unsaved_text_under_markdown() {
+    for http in [false, true] {
+        let (_tmp, engine, _sessions, _joined, _doc, _scratch) = a_person_typing_in_alpha().await;
+        let mut wire = Wire::over(if http {
+            McpServer::new_http(engine.clone())
+        } else {
+            McpServer::new(engine.clone())
+        });
+        wire.open(modern(1, "server/discover", json!({}))).await;
+        let read = wire
+            .call(modern(
+                2,
+                "tools/call",
+                json!({ "name": "read_engram", "arguments": { "domain": "eng", "identifier": "alpha" } }),
+            ))
+            .await;
+        let answer = payload_of(&read);
+        assert_eq!(answer["live"], json!(true), "http: {http}: {answer}");
+        assert!(
+            answer["markdown"]
+                .as_str()
+                .is_some_and(|text| text.contains("typed but never saved")),
+            "http: {http}: the unsaved text is under markdown: {answer}"
+        );
+        assert!(answer.get("content").is_none(), "http: {http}: {answer}");
+    }
 }
 
 /// A wholesale overwrite of a document somebody has open is refused for a

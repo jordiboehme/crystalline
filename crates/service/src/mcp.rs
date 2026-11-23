@@ -2498,7 +2498,8 @@ impl McpServer {
             "write_engram" | "edit_engram" => ok_written(value),
             "move_engram" => ok_moved(value),
             "split_engram" => ok_split(value),
-            "read_engram" | "delete_engram" | "infer_schema" => ok(value),
+            "read_engram" => ok(with_markdown_body(value)),
+            "delete_engram" | "infer_schema" => ok(value),
             "search_engrams" => self.ok_found(value),
             // The Reflection tools render as their own handlers do: one page,
             // a write and a thread as plain JSON; a queue, a tree and a thread
@@ -3608,7 +3609,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier under assets/ (domain required, for example assets/diagrams/flow.png) downloads that file attachment instead: domain, path, mime, size and sha256 plus text for a text file (SVG included) or base64 for other binary; a png, jpeg, gif or webp up to 5 MiB comes as an image block you can look at, with a note and no base64, unless you pass include_images: false: then it comes as base64 and no image block. To copy a picture (into the Reflection, for example), read it with include_images: false, then write_asset with that base64. To edit a picture, download it here with include_images: false, change it, then write it back with write_engram path and overwrite: true. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier (a file under assets/ is the one exception, above): a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Pass include_images true to also get the pictures it links (png, jpeg, gif, webp; at most 8 and 5 MiB) as image content you can look at with vision, for a picture marked as needing vision. An engram from a domain served by another machine carries them too, and resources/read fetches them from that server (Crystalline 0.27 or newer there). Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. When their editor cannot save right now (its save is in conflict or was refused) the reply carries the saved version instead, which is where your edits go, with room: waiting, present and room_note: tell the person what room_note says. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section. The answer carries read_only: true when you cannot write in the engram's domain; propose the change to a person instead of editing.",
+        description = "Read an engram's full markdown (the `markdown` field) and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier under assets/ (domain required, for example assets/diagrams/flow.png) downloads that file attachment instead: domain, path, mime, size and sha256 plus text for a text file (SVG included) or base64 for other binary; a png, jpeg, gif or webp up to 5 MiB comes as an image block you can look at, with a note and no base64, unless you pass include_images: false: then it comes as base64 and no image block. To copy a picture (into the Reflection, for example), read it with include_images: false, then write_asset with that base64. To edit a picture, download it here with include_images: false, change it, then write it back with write_engram path and overwrite: true. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier (a file under assets/ is the one exception, above): a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Pass include_images true to also get the pictures it links (png, jpeg, gif, webp; at most 8 and 5 MiB) as image content you can look at with vision, for a picture marked as needing vision. An engram from a domain served by another machine carries them too, and resources/read fetches them from that server (Crystalline 0.27 or newer there). Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. When their editor cannot save right now (its save is in conflict or was refused) the reply carries the saved version instead, which is where your edits go, with room: waiting, present and room_note: tell the person what room_note says. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section. The answer carries read_only: true when you cannot write in the engram's domain; propose the change to a person instead of editing.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -3644,7 +3645,7 @@ impl McpServer {
                 &self.reflection_caller(&ctx),
             )
             .await;
-        let mut result = ok(value)?;
+        let mut result = ok(with_markdown_body(value))?;
         result.content.extend(file_links(&domain, &files));
         if include_images == Some(true) {
             let rc = self.reflection_caller(&ctx);
@@ -6763,6 +6764,29 @@ fn file_links(domain: &str, files: &[LinkedFile]) -> Vec<ContentBlock> {
 }
 
 /// `files` on a remote read answer, left out when the read shows none.
+/// The engram text of a `read_engram` answer under the name MCP clients get
+/// it by: `markdown`, the key `read_reflection` already uses.
+///
+/// Hosted ChatGPT drops a JSON text result whose top level has a `content`
+/// key and shows `{}` (issue #237), so the MCP answer never carries one. The
+/// rename happens here, at the MCP layer, and nowhere below it: the engine's
+/// value, the REST API, the CLI and the remote tool door keep `content`
+/// (they have their own consumers), which is also why [`McpServer::linked_files`]
+/// reads `content` and runs before this. A mounted read goes through the same
+/// function, so a server of any version, which all answer `content`, reads
+/// the same as a local one. Only the top-level key moves; an observation's
+/// own `content` stays. An answer that already has `markdown`, or none, is
+/// left as it is.
+fn with_markdown_body(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut()
+        && !obj.contains_key("markdown")
+        && let Some(body) = obj.remove("content")
+    {
+        obj.insert("markdown".into(), body);
+    }
+    value
+}
+
 fn with_files(value: &mut Value, files: Vec<LinkedFile>) {
     if files.is_empty() {
         return;

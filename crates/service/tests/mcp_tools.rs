@@ -2259,7 +2259,7 @@ async fn write_read_overwrite_and_domain_errors() {
     )
     .await
     .unwrap();
-    assert!(read["content"].as_str().unwrap().contains("chose alpha"));
+    assert!(read["markdown"].as_str().unwrap().contains("chose alpha"));
     assert_eq!(read["title"], json!("Alpha"));
 
     // Overwrite conflict without the flag.
@@ -2410,7 +2410,7 @@ async fn edit_operations_and_subsection_regression() {
     )
     .await
     .unwrap();
-    let body = read["content"].as_str().unwrap();
+    let body = read["markdown"].as_str().unwrap();
     assert!(body.contains("new api intro"), "section replaced: {body}");
     assert!(body.contains("### Auth"), "subsection kept: {body}");
     assert!(
@@ -2459,7 +2459,7 @@ async fn edit_operations_and_subsection_regression() {
     )
     .await
     .unwrap();
-    assert!(read["content"].as_str().unwrap().contains("appended line"));
+    assert!(read["markdown"].as_str().unwrap().contains("appended line"));
 }
 
 /// Whether the vocabulary response reports a near-duplicate cluster that contains
@@ -5389,7 +5389,7 @@ async fn in_review_mode_set_frontmatter_sources_is_a_draft() {
     )
     .await
     .unwrap();
-    assert_eq!(read["content"], PAGE, "no draft: {read}");
+    assert_eq!(read["markdown"], PAGE, "no draft: {read}");
     let out = call(
         peer,
         "edit_engram",
@@ -5415,7 +5415,7 @@ async fn in_review_mode_set_frontmatter_sources_is_a_draft() {
     .await
     .unwrap();
     assert!(
-        read["content"]
+        read["markdown"]
             .as_str()
             .unwrap()
             .contains("sources:\n- https://example.com/a\n- https://example.com/b\n"),
@@ -8362,7 +8362,7 @@ async fn a_crlf_engram_reads_as_lf_over_mcp_and_its_checksum_guards_an_edit() {
     )
     .await
     .unwrap();
-    let content = read["content"].as_str().unwrap();
+    let content = read["markdown"].as_str().unwrap();
     assert!(!content.contains('\r'), "{content:?}");
     assert!(
         content.contains("Written on a windows machine.\n"),
@@ -9429,4 +9429,136 @@ async fn the_write_reflection_description_names_placed_after_section() {
         ),
         "{description}"
     );
+}
+
+// --- no answer has a top-level `content` key (issue #237) -------------------
+
+/// Hosted ChatGPT shows `{}` for a tool result whose JSON text has a
+/// top-level `content` key (issue #237), so no tool answer may carry one:
+/// `read_engram` names its text `markdown`, as `read_reflection` does.
+///
+/// **What this covers.** Every tool the server lists is called once with
+/// representative arguments on both transports, and the text block is checked
+/// for a top-level `content` key whether it is JSON or TOON. A tool the table
+/// below does not name fails the test, so a tool added later has to be
+/// looked at here before it ships. A tool the harness cannot answer in full
+/// (it needs a team, a provisioning source or a connected account) is called
+/// with arguments it refuses: the refusal text must hold no `content` key
+/// either, and its success shape is pinned by the tool's own tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_answer_has_a_top_level_content_key() {
+    for http in [false, true] {
+        for pin_json in [true, false] {
+            let h = Harness::build(&["eng"], false, pin_json).await;
+            let (client, _server) = if http {
+                h.connect_http().await
+            } else {
+                h.connect().await
+            };
+            let peer = client.peer();
+            for (title, body) in [
+                (
+                    "Alpha",
+                    "- [decision] we chose alpha #core\n- [fact] it is fast #core\n- [lesson] measure first #core",
+                ),
+                (
+                    "Beta",
+                    "- [fact] beta exists #core\n- [fact] beta links alpha #core\n- [lesson] keep notes #core",
+                ),
+            ] {
+                let receipt = call_text(
+                    peer,
+                    "write_engram",
+                    json!({ "domain": "eng", "title": title, "content": body }),
+                )
+                .await
+                .unwrap();
+                assert!(!has_top_level_content(&receipt), "write_engram: {receipt}");
+            }
+
+            let tools = peer.list_tools(Default::default()).await.unwrap().tools;
+            for tool in &tools {
+                let name = tool.name.as_ref();
+                let args = representative_args(name).unwrap_or_else(|| {
+                    panic!(
+                        "tool {name} has no representative arguments in \
+                         no_tool_answer_has_a_top_level_content_key: add them, and keep its \
+                         answer free of a top-level `content` key (issue #237)"
+                    )
+                });
+                let mut params = CallToolRequestParams::new(name.to_string());
+                if let Value::Object(map) = args {
+                    params = params.with_arguments(map);
+                }
+                let Ok(result) = peer.call_tool(params).await else {
+                    continue;
+                };
+                for block in serde_json::to_value(&result).unwrap()["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = block["text"].as_str() {
+                        assert!(
+                            !has_top_level_content(text),
+                            "{name} (http: {http}, json: {pin_json}) answered a top-level \
+                             `content` key: {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True when `text` is a JSON object with a `content` key, or a TOON object
+/// with a `content` line at its top level.
+fn has_top_level_content(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text.split_once("\n\n---\n").map_or(text, |(h, _)| h)) {
+        Ok(Value::Object(map)) => map.contains_key("content"),
+        Ok(_) => false,
+        Err(_) => text
+            .lines()
+            .any(|line| line.starts_with("content:") || line.starts_with("content[")),
+    }
+}
+
+/// Arguments that make each tool answer, or refuse, in a harness holding the
+/// domain `eng` and the engrams `alpha` and `beta`. None for a tool this
+/// table has not seen.
+fn representative_args(tool: &str) -> Option<Value> {
+    Some(match tool {
+        "read_engram" => json!({ "identifier": "alpha", "domain": "eng" }),
+        "search_engrams" => json!({ "query": "alpha" }),
+        "build_context" => json!({ "url": "crystalline://eng/alpha" }),
+        "recent_activity" => json!({}),
+        "list_domains" => json!({ "include_routing": true }),
+        "browse_domain" => json!({ "domain": "eng" }),
+        "validate_engrams" => json!({ "domain": "eng" }),
+        "infer_schema" => json!({ "domain": "eng" }),
+        "vocabulary" => json!({ "domain": "eng" }),
+        "evolve_engrams" => json!({ "domain": "eng" }),
+        "skills" => json!({}),
+        "configure" => json!({}),
+        "reflect" => json!({ "domain": "eng", "action": "status" }),
+        "read_reflection" => json!({ "domain": "eng" }),
+        "discuss" => json!({ "domain": "eng", "action": "list" }),
+        "edit_engram" => json!({
+            "domain": "eng", "identifier": "beta", "operation": "append",
+            "content": "- [fact] appended #core"
+        }),
+        "move_engram" => {
+            json!({ "domain": "eng", "identifier": "beta", "destination": "notes/beta.md" })
+        }
+        "split_engram" => {
+            json!({ "domain": "eng", "identifier": "alpha", "title": "Split Off", "observations": ["- [fact] it is fast #core"] })
+        }
+        "delete_engram" => json!({ "domain": "eng", "identifier": "gone" }),
+        // Refused or minimal: each needs a team, a source or a connected
+        // account this harness has none of.
+        "write_engram" | "write_reflection" | "add_domain" | "remove_domain" | "update_domain"
+        | "share_changes" | "origin_status" | "resolve_conflict" | "withdraw_proposal"
+        | "discard_changes" | "provision" | "onboarding" | "connector" => json!({}),
+        _ => return None,
+    })
 }
