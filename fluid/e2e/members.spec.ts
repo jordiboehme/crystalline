@@ -104,6 +104,11 @@ function badge(within: ReturnType<typeof homeCard>) {
   return within.getByText("private", { exact: true });
 }
 
+/** The sidebar row's lock: its mark for a private domain. */
+function lock(within: ReturnType<typeof homeCard>) {
+  return within.getByRole("img", { name: "Private domain" });
+}
+
 /**
  * Wait until this browser has a domain listing on screen.
  *
@@ -154,7 +159,7 @@ test("an invitation is what makes a private domain visible", async ({
   // the field the listing carries now, rather than a read per domain.
   await expect(homeCard(owner)).toBeVisible();
   await expect(badge(homeArticle(owner))).toBeVisible();
-  await expect(badge(sidebarLink(owner))).toBeVisible();
+  await expect(lock(sidebarLink(owner))).toBeVisible();
 
   // Nobody else sees it at all yet. Not a refusal and not an empty card: the
   // name is the whole of what a private domain keeps, so the listing simply
@@ -194,7 +199,7 @@ test("an invitation is what makes a private domain visible", async ({
   await reloadHome(member);
   await expect(homeCard(member)).toBeVisible();
   await expect(badge(homeArticle(member))).toBeVisible();
-  await expect(badge(sidebarLink(member))).toBeVisible();
+  await expect(lock(sidebarLink(member))).toBeVisible();
   // The engram view's own address: the bare one opens on the Reflection
   // once it is on, which reflection.spec.ts does to this domain, so the
   // journey holds whichever file runs first.
@@ -234,7 +239,7 @@ test("an invitation is what makes a private domain visible", async ({
     // Visible first, then unbadged: a badge assertion on a domain that is not
     // there at all would pass for the wrong reason.
     await expect(badge(homeArticle(page))).toHaveCount(0);
-    await expect(badge(sidebarLink(page))).toHaveCount(0);
+    await expect(lock(sidebarLink(page))).toHaveCount(0);
   }
 });
 

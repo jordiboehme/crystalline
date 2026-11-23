@@ -393,13 +393,63 @@ describe("the layout", () => {
 
     const domains = await screen.findByRole("navigation", { name: "Domains" });
     const lab = await within(domains).findByRole("link", { name: /^lab/ });
-    expect(lab).toHaveTextContent("private");
+    expect(lab).toHaveAccessibleName(/^lab\b.*Private domain/);
+    expect(
+      within(lab).getByRole("img", { name: "Private domain" }),
+    ).toBeVisible();
     // The badge rides on the listing's own field, so a row that does not say
     // it is private wears nothing - the same as a row from a server that
     // never heard of the field.
     expect(
       within(domains).getByRole("link", { name: /^eng/ }),
-    ).not.toHaveTextContent("private");
+    ).not.toHaveAccessibleName(/Private domain/);
+  });
+
+  it("marks a domain whose Reflection the caller may read, after the name", async () => {
+    serveSignedIn({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+          { name: "ops", kind: "file", engrams: 2, when_to_use: [] },
+        ],
+      }),
+      "/reflection/domains": () => ({
+        domains: [
+          {
+            domain: "eng",
+            state: "on",
+            right: "read",
+            engrams_visible: true,
+            home: "here",
+            home_url: null,
+            open_threads: 0,
+          },
+          // No right: not offered, so no mark either.
+          {
+            domain: "ops",
+            state: "on",
+            right: "none",
+            engrams_visible: true,
+            home: "here",
+            home_url: null,
+            open_threads: 0,
+          },
+        ],
+      }),
+    });
+
+    renderApp("/");
+
+    const domains = await screen.findByRole("navigation", { name: "Domains" });
+    const eng = await within(domains).findByRole("link", { name: /^eng/ });
+    await within(eng).findByRole("img", { name: "Has a Reflection" });
+    expect(eng).toHaveAccessibleName(/^eng\b.*Has a Reflection/);
+    expect(
+      within(domains).getByRole("link", { name: /^ops/ }),
+    ).not.toHaveAccessibleName(/Reflection/);
+    // A name is cut before its marks, never the marks.
+    expect(within(eng).getByText("eng")).toHaveClass("truncate");
   });
 
   it("says what went wrong instead of emptying the sidebar", async () => {
@@ -1242,6 +1292,118 @@ describe("the sidebar's own width", () => {
     expect(
       within(nav).queryByRole("button", { name: "Close the sidebar" }),
     ).toBeNull();
+  });
+
+  it("has a divider that is a separator, pointer only", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+
+    const divider = await screen.findByRole("separator", {
+      name: "Sidebar width",
+    });
+    expect(divider).toHaveAttribute("aria-orientation", "vertical");
+    expect(divider).toHaveAttribute("aria-valuenow", "256");
+    expect(divider).toHaveAttribute("aria-valuemin", "200");
+    expect(divider).toHaveAttribute("aria-valuemax", "480");
+    // No keyboard handling: it is not a tab stop.
+    expect(divider).not.toHaveAttribute("tabindex");
+  });
+
+  it("drags to a width within 200 and 480 and remembers it", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const divider = await screen.findByRole("separator", {
+      name: "Sidebar width",
+    });
+    const column = divider.parentElement as HTMLElement;
+    expect(column.style.width).toBe("256px");
+
+    fireEvent.pointerDown(divider, { clientX: 256, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(divider, { clientX: 356, pointerId: 1 });
+    expect(column.style.width).toBe("356px");
+    expect(divider).toHaveAttribute("aria-valuenow", "356");
+    fireEvent.pointerMove(divider, { clientX: 900, pointerId: 1 });
+    expect(column.style.width).toBe("480px");
+    fireEvent.pointerUp(divider, { clientX: 900, pointerId: 1 });
+
+    expect(column.style.width).toBe("480px");
+    expect(localStorage.getItem("fluid.navWidth")).toBe("480");
+  });
+
+  it("holds at 200 while dragging and folds to the rail on release under it", async () => {
+    localStorage.setItem("fluid.navWidth", "300");
+    serveSignedIn();
+
+    renderApp("/");
+    const divider = await screen.findByRole("separator", {
+      name: "Sidebar width",
+    });
+    const column = divider.parentElement as HTMLElement;
+    expect(column.style.width).toBe("300px");
+
+    fireEvent.pointerDown(divider, { clientX: 300, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(divider, { clientX: 100, pointerId: 1 });
+    expect(column.style.width).toBe("200px");
+    fireEvent.pointerUp(divider, { clientX: 100, pointerId: 1 });
+
+    expect(
+      await screen.findByRole("button", { name: "Expand the sidebar" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("separator")).toBeNull();
+    expect(localStorage.getItem("fluid.nav")).toBe("rail");
+    // The width it had is kept for the way back out.
+    expect(localStorage.getItem("fluid.navWidth")).toBe("300");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Expand the sidebar" }),
+    );
+    const again = await screen.findByRole("separator");
+    expect((again.parentElement as HTMLElement).style.width).toBe("300px");
+  });
+
+  it("goes back to the default on a double click", async () => {
+    localStorage.setItem("fluid.navWidth", "400");
+    serveSignedIn();
+
+    renderApp("/");
+    const divider = await screen.findByRole("separator", {
+      name: "Sidebar width",
+    });
+    const column = divider.parentElement as HTMLElement;
+    expect(column.style.width).toBe("400px");
+
+    fireEvent.doubleClick(divider);
+
+    expect(column.style.width).toBe("256px");
+    expect(localStorage.getItem("fluid.navWidth")).toBeNull();
+  });
+
+  it("cancels a drag that the system cancels", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const divider = await screen.findByRole("separator", {
+      name: "Sidebar width",
+    });
+    const column = divider.parentElement as HTMLElement;
+    fireEvent.pointerDown(divider, { clientX: 256, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(divider, { clientX: 300, pointerId: 1 });
+    fireEvent.pointerCancel(divider, { pointerId: 1 });
+
+    expect(column.style.width).toBe("256px");
+    expect(localStorage.getItem("fluid.navWidth")).toBeNull();
+  });
+
+  it("draws the default when the stored width is out of range or storage refuses", async () => {
+    localStorage.setItem("fluid.navWidth", "9000");
+    serveSignedIn();
+
+    renderApp("/");
+    const divider = await screen.findByRole("separator", {
+      name: "Sidebar width",
+    });
+    expect((divider.parentElement as HTMLElement).style.width).toBe("256px");
   });
 
   it("reads a stored rail preference at mount", async () => {

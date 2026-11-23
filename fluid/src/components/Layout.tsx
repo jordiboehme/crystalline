@@ -23,7 +23,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import {
+  BookOpen,
   House,
+  Lock,
   PanelLeft,
   PanelLeftClose,
   PanelLeftOpen,
@@ -102,6 +104,13 @@ import {
   usersRoute,
 } from "../paths";
 import { PREFETCH } from "../prefetch";
+import {
+  NAV_WIDTH_DEFAULT,
+  NAV_WIDTH_KEY,
+  saveNavWidth,
+  settleNavWidth,
+  storedNavWidth,
+} from "../navWidth";
 import { useWide } from "../useWide";
 import { GithubAccessBanner } from "./GithubAccessBanner";
 import { OutlineSlotContext } from "./outlineSlot";
@@ -119,12 +128,14 @@ import {
   switchHome,
   useReflectionStatus,
 } from "./ReflectionModeSwitch";
+import { SidebarDivider } from "./SidebarDivider";
 import { ShareDialog } from "./ShareDialog";
 import { SharePickerDialog } from "./SharePickerDialog";
 import { ShatterGem } from "./ShatterGem";
 import { ownedPhrase, shareBadgeCount } from "./changes";
 import { Loading, ReadyFlash } from "./Loading";
 import { Chip, FOCUS_RING, IconButton, SIDE, Tooltip } from "./primitives";
+import type { IconComponent } from "./primitives";
 import { keyLabel } from "../platform";
 import { SidebarStateContext, useSidebarState } from "./sidebarState";
 import type { SidebarCreate, SidebarState } from "./sidebarState";
@@ -589,6 +600,10 @@ export function Layout() {
   // is shut from inside (its close button, Escape).
   const navToggleRef = useRef<HTMLButtonElement | null>(null);
   const [rail, setRail] = useState(storedRail);
+  // The width on screen, which a drag moves at every step, and the one last
+  // settled, which is what the rail gives back and what is stored.
+  const [navWidth, setNavWidth] = useState(storedNavWidth);
+  const settledNavWidth = useRef(navWidth);
   const [fullWidth, setFullWidth] = useState(storedFullWidth);
   const [largeText, setLargeText] = useState(storedLargeText);
   const [engramsOrder, setEngramsOrderState] = useState(storedEngramsOrder);
@@ -669,6 +684,33 @@ export function Layout() {
       }
       return next;
     });
+  };
+
+  const settleNav = (raw: number) => {
+    const settled = settleNavWidth(raw);
+    if (settled.kind === "rail") {
+      // Dragged under the minimum: the rail, with the width it had before.
+      setNavWidth(settledNavWidth.current);
+      setRail(true);
+      try {
+        localStorage.setItem(NAV_STATE_KEY, "rail");
+      } catch {
+        // The session keeps the choice.
+      }
+      return;
+    }
+    settledNavWidth.current = settled.width;
+    setNavWidth(settled.width);
+    saveNavWidth(settled.width);
+  };
+  const resetNavWidth = () => {
+    settledNavWidth.current = NAV_WIDTH_DEFAULT;
+    setNavWidth(NAV_WIDTH_DEFAULT);
+    try {
+      localStorage.removeItem(NAV_WIDTH_KEY);
+    } catch {
+      // The session keeps the choice.
+    }
   };
 
   // The same choice about the frame, made about the content rather than about
@@ -923,6 +965,10 @@ export function Layout() {
                     <DomainSidebar
                       open={navOpen}
                       rail={rail && wide}
+                      width={navWidth}
+                      onDragWidth={setNavWidth}
+                      onSettleWidth={settleNav}
+                      onResetWidth={resetNavWidth}
                       onToggleRail={toggleRail}
                       onDismiss={() => {
                         setNavOpen(false);
@@ -1387,6 +1433,10 @@ function SearchBox() {
 function DomainSidebar({
   open,
   rail,
+  width,
+  onDragWidth,
+  onSettleWidth,
+  onResetWidth,
   onToggleRail,
   onDismiss,
   drawerToggle,
@@ -1394,6 +1444,11 @@ function DomainSidebar({
 }: {
   open: boolean;
   rail: boolean;
+  /** The column's width in pixels while it is expanded. */
+  width: number;
+  onDragWidth: (width: number) => void;
+  onSettleWidth: (raw: number) => void;
+  onResetWidth: () => void;
   onToggleRail: () => void;
   /** Shut the phone drawer from inside it (close button, Escape, scrim). */
   onDismiss: () => void;
@@ -1606,12 +1661,26 @@ function DomainSidebar({
   // the frame is capped narrower than the window.
   return (
     <div
-      className={`shrink-0 border-r border-hair bg-chrome print:hidden ${
+      className={`relative shrink-0 border-r border-hair bg-chrome print:hidden ${
         rail
           ? "w-12 shadow-[-48px_0_0_var(--chrome),-96px_0_0_var(--chrome),-144px_0_0_var(--chrome),-192px_0_0_var(--chrome)]"
-          : "w-64 shadow-[-256px_0_0_var(--chrome)]"
+          : ""
       }`}
+      // The expanded width is the person's, so it is a style; the shadow
+      // carries the chrome colour on to the window's left edge, as wide as
+      // the column is.
+      style={
+        rail ? undefined : { width, boxShadow: `-${width}px 0 0 var(--chrome)` }
+      }
     >
+      {!rail && (
+        <SidebarDivider
+          width={width}
+          onDrag={onDragWidth}
+          onSettle={onSettleWidth}
+          onReset={onResetWidth}
+        />
+      )}
       <nav
         id="domain-sidebar"
         aria-label={label}
@@ -1671,6 +1740,8 @@ function DomainList({
   // A failed Reflection listing counts as none: the sentence is about what
   // this list can show, and the failure is not worth hiding it for.
   const noReflections = reflections.data?.length === 0 || reflections.isError;
+  // The listing holds only the Reflections this caller may read.
+  const withReflection = new Set(reflections.data?.map((row) => row.domain));
   return (
     <>
       {/* The first label of the column, so it does not need the gap above it. */}
@@ -1682,7 +1753,10 @@ function DomainList({
       <ul className="flex flex-col gap-0.5">
         {domains?.map((domain) => (
           <li key={domain.name}>
-            <DomainLink domain={domain} />
+            <DomainLink
+              domain={domain}
+              reflection={withReflection.has(domain.name)}
+            />
           </li>
         ))}
       </ul>
@@ -1724,7 +1798,13 @@ function DomainList({
   );
 }
 
-function DomainLink({ domain }: { domain: DomainSummary }) {
+function DomainLink({
+  domain,
+  reflection,
+}: {
+  domain: DomainSummary;
+  reflection: boolean;
+}) {
   return (
     <NavLink
       to={domainRoute(domain.name)}
@@ -1739,16 +1819,51 @@ function DomainLink({ domain }: { domain: DomainSummary }) {
         link rather than beside it, unlike the home card and the domain
         screen: the whole row is the target here, and a chip hanging outside
         it would be the one part of the row that does not take a click. The
-        link then reads "lab private 12", which is the row said out loud.
+        link then reads "lab Private domain 12", which is the row said out
+        loud. The markers follow the name and are never cut: a long name is
+        truncated before them.
       */}
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate">{domain.name}</span>
-        {domain.private && <Chip variant="accent">private</Chip>}
-      </span>
+        {/* Spaces in the markup keep the row's accessible name in words. */}
+        {domain.private && (
+          <>
+            {" "}
+            <DomainMark label="Private domain" icon={Lock} />
+          </>
+        )}
+        {reflection && (
+          <>
+            {" "}
+            <DomainMark label="Has a Reflection" icon={BookOpen} />
+          </>
+        )}
+      </span>{" "}
       {domain.engrams !== null && (
         <span className={SIDE.count}>{domain.engrams}</span>
       )}
     </NavLink>
+  );
+}
+
+/** A muted mark after a domain's name, with a tooltip and an accessible name. */
+function DomainMark({
+  label,
+  icon: Icon,
+}: {
+  label: string;
+  icon: IconComponent;
+}) {
+  return (
+    <Tooltip label={label} side="right">
+      <span
+        role="img"
+        aria-label={label}
+        className="shrink-0 text-slate-600 dark:text-muted"
+      >
+        <Icon aria-hidden="true" size={13} strokeWidth={1.75} />
+      </span>
+    </Tooltip>
   );
 }
 
