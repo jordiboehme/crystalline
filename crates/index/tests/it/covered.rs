@@ -5,7 +5,8 @@
 
 use crystalline_index::reflection::index_reflection_row;
 use crystalline_index::{
-    ChunkParams, DomainId, DomainKind, ReflectionCovered, ReflectionRow, Store, TursoStore,
+    ChunkParams, DomainId, DomainKind, EngramRecord, FileStamp, ReflectionCovered, ReflectionRow,
+    Store, TursoStore,
 };
 
 /// Run a body against Turso (always) and Postgres (when configured).
@@ -70,15 +71,63 @@ async fn write(store: &dyn Store, domain: DomainId, path: &str, content: &str) {
 }
 
 fn covered(path: &str, permalink: &str) -> ReflectionCovered {
+    covered_at(path, permalink, &format!("sum-{permalink}"))
+}
+
+fn covered_at(path: &str, permalink: &str, checksum: &str) -> ReflectionCovered {
     ReflectionCovered {
         path: path.to_string(),
         permalink: permalink.to_string(),
-        checksum: format!("sum-{permalink}"),
+        checksum: checksum.to_string(),
+    }
+}
+
+/// The engram `permalink` of `domain` in the index, at checksum `sha`.
+async fn engram_at(store: &dyn Store, domain: DomainId, permalink: &str, sha: &str) {
+    let content = format!("# {permalink}\n");
+    store
+        .upsert_engram(
+            domain,
+            &EngramRecord {
+                path: format!("{permalink}.md"),
+                permalink: permalink.to_string(),
+                title: permalink.to_string(),
+                engram_type: "engram".to_string(),
+                status: "current".to_string(),
+                recorded_at: None,
+                valid_from: None,
+                valid_to: None,
+                timestamp: None,
+                description: None,
+                content: content.clone(),
+                metadata: serde_json::json!({}),
+                tags: Vec::new(),
+                observations: Vec::new(),
+                relations: Vec::new(),
+                links: Vec::new(),
+                stamp: FileStamp {
+                    mtime: 0,
+                    size: content.len() as u64,
+                    sha256: sha.to_string(),
+                },
+                actor: String::new(),
+                tombstone: false,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// `w/a` to `w/c` in the index at the checksums the pages cite.
+async fn engrams(store: &dyn Store, domain: DomainId) {
+    for permalink in ["w/a", "w/b", "w/c"] {
+        engram_at(store, domain, permalink, &format!("sum-{permalink}")).await;
     }
 }
 
 async fn kept_and_released(store: &dyn Store) {
     let eng = domain(store, "eng").await;
+    engrams(store, eng).await;
     let week = |cites: &[&str]| citing("freshness: 7d\n", cites);
     write(store, eng, "week.md", &week(&["w/a", "w/b"])).await;
     write(store, eng, "plain.md", &citing("", &["w/c"])).await;
@@ -107,6 +156,7 @@ parity!(
 
 async fn moves_and_goes(store: &dyn Store) {
     let eng = domain(store, "eng").await;
+    engrams(store, eng).await;
     let week = |cites: &[&str]| citing("freshness: 7d\n", cites);
     write(store, eng, "week.md", &week(&["w/a", "w/b"])).await;
     write(store, eng, "week.md", &week(&["w/b"])).await;
@@ -150,4 +200,35 @@ async fn moves_and_goes(store: &dyn Store) {
 parity!(
     the_kept_set_moves_with_its_page_and_goes_with_the_page_and_the_domain,
     moves_and_goes
+);
+
+/// A dropped engram is kept with its checksum at the drop, not the one the
+/// page cited; one the index no longer holds is not kept; and a kept engram
+/// whose checksum moved since leaves the set the next time it is touched.
+async fn drop_time_checksum(store: &dyn Store) {
+    let eng = domain(store, "eng").await;
+    engrams(store, eng).await;
+    let week = |cites: &[&str]| citing("freshness: 7d\n", cites);
+    write(store, eng, "week.md", &week(&["w/a", "w/b", "w/c"])).await;
+    // w/a changed while the page cited it; w/c is gone from the index.
+    engram_at(store, eng, "w/a", "sum-new").await;
+    store.delete_engram(eng, "w/c.md").await.unwrap();
+    write(store, eng, "week.md", &week(&["w/b"])).await;
+    assert_eq!(
+        store.reflection_covered(eng).await.unwrap(),
+        vec![covered_at("week.md", "w/a", "sum-new")]
+    );
+
+    // w/a moves on; the next drop prunes the dead row.
+    engram_at(store, eng, "w/a", "sum-newer").await;
+    write(store, eng, "week.md", &week(&[])).await;
+    assert_eq!(
+        store.reflection_covered(eng).await.unwrap(),
+        vec![covered("week.md", "w/b")]
+    );
+}
+
+parity!(
+    a_dropped_engram_is_kept_at_its_checksum_when_dropped,
+    drop_time_checksum
 );

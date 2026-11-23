@@ -241,7 +241,8 @@ fn hit(row: &ReflectionRow, section: &Section, snippet: String, score: f64) -> R
 /// Beside the row it keeps the engrams the page covers after it dropped
 /// them ([`crystalline_core::reflection::cover_change`], rule A of the
 /// reflect queue), from the row as stored before and the new text: so an
-/// engine write, an edit on disk and a pull all count.
+/// engine write, an edit on disk and a pull all count. A dropped engram is
+/// kept with its checksum in the index at the drop.
 pub async fn index_reflection_row<S: Store + ?Sized>(
     store: &S,
     domain: DomainId,
@@ -256,13 +257,66 @@ pub async fn index_reflection_row<S: Store + ?Sized>(
     );
     store.upsert_reflection(domain, row).await?;
     if !covered.is_empty() {
-        store
-            .update_reflection_covered(domain, &row.path, &covered.add, &covered.remove)
-            .await?;
+        keep_covered(store, domain, &row.path, covered).await?;
     }
     let chunks = crate::embed::chunk_reflection(&row.title, &row.content, params);
     store
         .replace_reflection_chunks(domain, &row.path, &chunks)
+        .await
+}
+
+/// Apply `change` to the engrams the page at `path` keeps covered. Each
+/// dropped engram is kept with its checksum in the index now, at the drop,
+/// not the one the page cited: a reconcile that saw the engram change and
+/// then dropped it as last week's has reflected that change. A dropped
+/// engram the index no longer holds is not kept. While the set is touched
+/// anyway, the page's kept engrams whose checksum moved since (or that are
+/// gone) leave it: they cover nothing any more.
+async fn keep_covered<S: Store + ?Sized>(
+    store: &S,
+    domain: DomainId,
+    path: &str,
+    change: crystalline_core::reflection::CoverChange,
+) -> Result<()> {
+    let kept: Vec<crate::ReflectionCovered> = store
+        .reflection_covered(domain)
+        .await?
+        .into_iter()
+        .filter(|kept| kept.path == path)
+        .collect();
+    let mut wanted: Vec<String> = change
+        .add
+        .iter()
+        .map(|(permalink, _)| permalink.clone())
+        .chain(kept.iter().map(|kept| kept.permalink.clone()))
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+    let now: HashMap<String, String> = store
+        .cited_engrams(domain, &wanted)
+        .await?
+        .into_iter()
+        .map(|cited| (cited.permalink, cited.sha256))
+        .collect();
+    let add: Vec<(String, String)> = change
+        .add
+        .into_iter()
+        .filter_map(|(permalink, _)| {
+            let checksum = now.get(&permalink)?.clone();
+            Some((permalink, checksum))
+        })
+        .collect();
+    let mut remove = change.remove;
+    for kept in kept {
+        let dropped_again = add
+            .iter()
+            .any(|(permalink, _)| *permalink == kept.permalink);
+        if !dropped_again && now.get(&kept.permalink) != Some(&kept.checksum) {
+            remove.push(kept.permalink);
+        }
+    }
+    store
+        .update_reflection_covered(domain, path, &add, &remove)
         .await
 }
 
