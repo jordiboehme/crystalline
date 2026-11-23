@@ -1319,6 +1319,74 @@ async fn a_settings_change_under_unsaved_typing_raises_no_conflict() {
     assert!(saved.contains("freshness: 6h\n"), "{saved}");
 }
 
+/// The settings route under the same unsaved typing: the change lands in
+/// the room without a conflict, the receipt shows the new value, and the
+/// editor's save keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_patch_under_unsaved_typing_raises_no_conflict() {
+    let (addr, _scratch, tmp) = serve_reflection().await;
+    let file = tmp.path().join("eng/reflections/guides/s.md");
+    std::fs::write(
+        &file,
+        "---\ntitle: S\nfreshness: 1d\n---\n\n# S\n\n## One\n<!-- r:dddd4444 -->\n\nFirst.\n",
+    )
+    .unwrap();
+    let ed = login(addr, "ed", "pw12345678").await;
+    let ann = login(addr, "ann", "pw12345678").await;
+    let page = "/api/v1/collab-reflection/eng/guides/s.md";
+    let mut curator = connect(addr, page, Some(&ed.0), same_host(addr))
+        .await
+        .unwrap();
+    let ed_doc = client_doc();
+    curator.send(binary(step1(&ed_doc))).await.unwrap();
+    apply(&ed_doc, &next_sync_step2(&mut curator).await);
+    let mut editor = connect(addr, page, Some(&ann.0), same_host(addr))
+        .await
+        .unwrap();
+    let ann_doc = client_doc();
+    editor.send(binary(step1(&ann_doc))).await.unwrap();
+    apply(&ann_doc, &next_sync_step2(&mut editor).await);
+
+    editor
+        .send(binary(update_frame(&append_line(
+            &ann_doc,
+            "Unsaved by ann.",
+        ))))
+        .await
+        .unwrap();
+    apply(&ed_doc, &next_sync_update(&mut curator).await);
+
+    let patch = client()
+        .patch(format!(
+            "http://{addr}/api/v1/domains/eng/reflection/settings"
+        ))
+        .header("cookie", format!("fluid_session={}", ed.0))
+        .header("x-csrf-token", &ed.1)
+        .json(&serde_json::json!({ "path": "guides/s.md", "freshness": "6h" }))
+        .send()
+        .await
+        .unwrap();
+    let status = patch.status();
+    let receipt: serde_json::Value = patch.json().await.unwrap();
+    assert_eq!(status, 200, "{receipt}");
+    assert_eq!(receipt["landed"], "live", "{receipt}");
+    assert!(receipt["room_note"].is_null(), "no room note: {receipt}");
+    assert_eq!(receipt["page"]["freshness"], "6h", "{receipt}");
+
+    editor
+        .send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    let seen = controls_until(&mut editor, "saved").await;
+    assert!(
+        !seen.iter().any(|k| k == "conflict" || k == "save_failed"),
+        "{seen:?}"
+    );
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains("Unsaved by ann."), "{saved}");
+    assert!(saved.contains("freshness: 6h\n"), "{saved}");
+}
+
 // --- a room over somebody else's draft ---------------------------------------
 
 /// The instance the overlay tests run against: one file domain `team` that
