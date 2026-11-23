@@ -1222,6 +1222,103 @@ async fn a_reflection_room_keeps_the_page_settings_for_both_authors() {
     assert!(!saved.contains("archived"), "{saved}");
 }
 
+/// The control kinds that reach `socket` up to and including the first of
+/// `kind`.
+async fn controls_until(socket: &mut Socket, kind: &str) -> Vec<String> {
+    let read = async {
+        let mut seen = Vec::new();
+        loop {
+            let frame = next_binary(socket).await;
+            for message in messages_of(&frame) {
+                if let Message::Custom(tag, payload) = message
+                    && tag == control::CONTROL_TAG
+                    && let Some(control) = control::decode(&payload)
+                {
+                    let this = control_kind(&control);
+                    seen.push(this.clone());
+                    if this == kind {
+                        return seen;
+                    }
+                }
+            }
+        }
+    };
+    tokio::time::timeout(FRAME_TIMEOUT, read)
+        .await
+        .unwrap_or_else(|_| panic!("no {kind} control arrived"))
+}
+
+/// A curator changes a page setting through the API while an editor in the
+/// room has typing nobody saved yet: the change is invisible to the room
+/// (its text holds no settings), so it raises no conflict, and the editor's
+/// save lands her line and keeps the curator's value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_change_under_unsaved_typing_raises_no_conflict() {
+    let (addr, _scratch, tmp) = serve_reflection().await;
+    let file = tmp.path().join("eng/reflections/guides/s.md");
+    std::fs::write(
+        &file,
+        "---\ntitle: S\nfreshness: 1d\n---\n\n# S\n\n## One\n<!-- r:dddd4444 -->\n\nFirst.\n",
+    )
+    .unwrap();
+    let ed = login(addr, "ed", "pw12345678").await;
+    let ann = login(addr, "ann", "pw12345678").await;
+    let page = "/api/v1/collab-reflection/eng/guides/s.md";
+    let mut curator = connect(addr, page, Some(&ed.0), same_host(addr))
+        .await
+        .unwrap();
+    let ed_doc = client_doc();
+    curator.send(binary(step1(&ed_doc))).await.unwrap();
+    apply(&ed_doc, &next_sync_step2(&mut curator).await);
+    let mut editor = connect(addr, page, Some(&ann.0), same_host(addr))
+        .await
+        .unwrap();
+    let ann_doc = client_doc();
+    editor.send(binary(step1(&ann_doc))).await.unwrap();
+    apply(&ann_doc, &next_sync_step2(&mut editor).await);
+
+    // Typed, not saved; the room has taken it in once it reaches ed.
+    editor
+        .send(binary(update_frame(&append_line(
+            &ann_doc,
+            "Unsaved by ann.",
+        ))))
+        .await
+        .unwrap();
+    apply(&ed_doc, &next_sync_update(&mut curator).await);
+    let stored = std::fs::read_to_string(&file).unwrap();
+    assert!(!stored.contains("Unsaved by ann."), "{stored}");
+
+    let changed = stored.replace("freshness: 1d", "freshness: 6h");
+    let put = client()
+        .put(format!(
+            "http://{addr}/api/v1/domains/eng/reflections/guides/s.md"
+        ))
+        .header("cookie", format!("fluid_session={}", ed.0))
+        .header("x-csrf-token", &ed.1)
+        .json(&serde_json::json!({ "markdown": changed }))
+        .send()
+        .await
+        .unwrap();
+    let status = put.status();
+    let receipt: serde_json::Value = put.json().await.unwrap();
+    assert_eq!(status, 200, "{receipt}");
+    assert!(receipt.get("room").is_none(), "no room note: {receipt}");
+
+    editor
+        .send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    let seen = controls_until(&mut editor, "saved").await;
+    assert!(
+        !seen.iter().any(|k| k == "conflict" || k == "save_failed"),
+        "{seen:?}"
+    );
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains("Unsaved by ann."), "{saved}");
+    assert!(saved.contains("freshness: 6h\n"), "{saved}");
+}
+
 // --- a room over somebody else's draft ---------------------------------------
 
 /// The instance the overlay tests run against: one file domain `team` that

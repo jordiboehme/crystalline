@@ -3602,8 +3602,9 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        // A page pact alone is a curator's to delete, as to write.
-        let need = if r::is_pact_file(inner) {
+        // A page pact alone is a curator's to delete, as to write. (PACT.md
+        // is refused below for everyone, with the agreement's sentence.)
+        let need = if r::pact_page_of(inner).is_some() {
             ReflectionRight::Curate
         } else {
             ReflectionRight::Edit

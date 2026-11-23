@@ -126,6 +126,14 @@ async fn a_page_pact_alone_is_deleted_only_by_a_curator() {
         .unwrap();
     assert!(file(&fx, "guides/a.pact.md").is_none());
     assert!(file(&fx, "guides/a.md").is_some());
+    // PACT.md is nobody's to delete, and an editor hears why.
+    let err = fx
+        .engine
+        .delete_reflection("eng", "PACT.md", &ann)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("agreement"), "{err}");
 }
 
 /// A page pact moves with its page and never on its own, and no page moves
