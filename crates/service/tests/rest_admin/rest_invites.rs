@@ -497,6 +497,91 @@ async fn a_read_only_instance_refuses_invite_changes() {
     assert!(fx.auth.invites(None, None).await.unwrap().is_empty());
 }
 
+/// Whether the caller may invite to one domain, as the members read says it.
+async fn can_invite(fx: &Fixture, session: &(String, String), domain: &str) -> Value {
+    let (status, _, body) = call(
+        fx,
+        session,
+        Method::GET,
+        &format!("/api/v1/domains/{domain}/members"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{domain}: {body}");
+    body["can_invite"].clone()
+}
+
+/// The members read says whether `POST /invites` would make a link to that
+/// domain for this caller: an admin always on a private domain, its owner
+/// and manager only with `auth.invites.managers` on, an editor or a viewer
+/// never, a shared domain never, and a read-only instance never. Where it
+/// says yes, the create route agrees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_members_read_says_who_may_invite() {
+    let off = serve(Options::default()).await;
+    for (name, want) in [
+        ("root", true),
+        ("olga", false),
+        ("mona", false),
+        ("eve", false),
+    ] {
+        let session = login(&off, name).await;
+        assert_eq!(
+            can_invite(&off, &session, "team").await,
+            want,
+            "{name}, off"
+        );
+        assert_eq!(
+            can_invite(&off, &session, "eng").await,
+            false,
+            "{name}, shared"
+        );
+    }
+
+    let on = serve(Options {
+        managers: true,
+        ..Options::default()
+    })
+    .await;
+    for (name, want) in [
+        ("root", true),
+        ("olga", true),
+        ("mona", true),
+        ("eve", false),
+    ] {
+        let session = login(&on, name).await;
+        assert_eq!(can_invite(&on, &session, "team").await, want, "{name}, on");
+        assert_eq!(
+            can_invite(&on, &session, "eng").await,
+            false,
+            "{name}, shared"
+        );
+        let (status, body) = create(&on, &session, json!({"domain": "team"})).await;
+        assert_eq!(
+            status == 201,
+            want,
+            "{name}: the create route agrees: {body}"
+        );
+    }
+    let vera = login(&on, "vera").await;
+    assert_eq!(can_invite(&on, &vera, "eng").await, false, "vera, shared");
+
+    let read_only = serve(Options {
+        managers: true,
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    for name in ["root", "olga", "mona"] {
+        let session = login(&read_only, name).await;
+        assert_eq!(
+            can_invite(&read_only, &session, "team").await,
+            false,
+            "{name}, read-only"
+        );
+    }
+}
+
 /// The list names the way in this instance offers a link's holder, so the
 /// maker's screen knows whether a local-account link means anything: `local`
 /// on a plain instance, `proxy` behind a forward-auth proxy. Every caller who

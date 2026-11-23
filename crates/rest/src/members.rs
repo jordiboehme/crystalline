@@ -148,6 +148,12 @@ pub struct MembersResponse {
         example = "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub"
     )]
     pub archived_reason: Option<String>,
+    /// Whether this caller may make an invite link to this domain here:
+    /// true for an instance admin, and for its owner or a manager while
+    /// `auth.invites.managers` is on, on a private domain GitHub does not
+    /// govern and a writable instance. The same gates `POST /invites`
+    /// applies.
+    pub can_invite: bool,
 }
 
 /// Who decides access to a domain.
@@ -467,6 +473,7 @@ pub async fn list(
         })?;
     let reflection_collaborators =
         reflection_collaborators_for(&state, &identity, &domain, right).await?;
+    let can_invite = crate::invites_api::can_invite(&state, &identity, &domain).await;
     if governed {
         // Who GitHub lists is shown to the people who write here (GitHub
         // write, maintain or admin, or an instance admin), never to a
@@ -521,6 +528,7 @@ pub async fn list(
             visibility_fixed_by,
             closed_reason,
             archived_reason,
+            can_invite,
         }));
     }
     let Some(acl) = acl else {
@@ -535,6 +543,7 @@ pub async fn list(
             visibility_fixed_by: None,
             closed_reason: None,
             archived_reason: None,
+            can_invite,
         }));
     };
     let members = state
@@ -556,6 +565,7 @@ pub async fn list(
         visibility_fixed_by: None,
         closed_reason: None,
         archived_reason: None,
+        can_invite,
     }))
 }
 

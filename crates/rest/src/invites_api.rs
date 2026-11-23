@@ -168,6 +168,62 @@ fn right_of(level: MemberLevel) -> DomainRight {
     }
 }
 
+/// The 403 a non-admin gets while `auth.invites.managers` is off: only an
+/// admin makes links then.
+fn refuse_unless_open(state: &RestState, admin: bool) -> Result<(), ApiError> {
+    if !admin && !state.auth_cfg.invites_managers {
+        return Err(ApiError::forbidden(ADMINS_ONLY));
+    }
+    Ok(())
+}
+
+/// Refuse a link to `domain` that cannot give membership there: a shared
+/// domain (409), one whose access follows GitHub (409), and, for a caller
+/// who is not an instance admin, one they do not manage (403).
+async fn refuse_link_to(
+    state: &RestState,
+    identity: &Identity,
+    admin: bool,
+    domain: &str,
+) -> Result<(), ApiError> {
+    if state
+        .auth
+        .domain_visibility(domain)
+        .await
+        .map_err(|e| ApiError::internal(format!("reading this domain's visibility: {e:#}")))?
+        .is_none()
+    {
+        return Err(ApiError::conflict(
+            "this domain is shared, so an invite link cannot give membership of it: make it \
+             private first",
+        ));
+    }
+    if state.engine.github_governs(domain) {
+        return Err(ApiError::conflict(crate::members::FOLLOWS_GITHUB));
+    }
+    if !admin {
+        crate::members::refuse_below(state, identity, domain, DomainRight::Manage, "manager")
+            .await?;
+    }
+    Ok(())
+}
+
+/// Whether `POST /invites` would make a link to `domain` for this caller,
+/// so the members card offers "Invite someone new" only where it works.
+/// The same gates as the create route, in one place: an account, an admin
+/// or `auth.invites.managers` on, a writable instance, and a private domain
+/// GitHub does not govern that the caller manages (an admin any). It says
+/// nothing about the setting to a caller who could not invite anyway.
+pub(crate) async fn can_invite(state: &RestState, identity: &Identity, domain: &str) -> bool {
+    let Ok(user) = identity.require_account() else {
+        return false;
+    };
+    let admin = user.role == Role::Admin;
+    refuse_unless_open(state, admin).is_ok()
+        && refuse_read_only(state).is_ok()
+        && refuse_link_to(state, identity, admin, domain).await.is_ok()
+}
+
 /// The address a token is handed over at: under `service.public_url` when
 /// it is set, else the base path alone, for the browser to complete.
 fn link_for(state: &RestState, token: &str) -> (String, bool) {
@@ -300,9 +356,7 @@ pub async fn create(
 ) -> Result<(StatusCode, NoStore, Json<CreatedInviteResponse>), ApiError> {
     let user = identity.require_account()?;
     let admin = user.role == Role::Admin;
-    if !admin && !state.auth_cfg.invites_managers {
-        return Err(ApiError::forbidden(ADMINS_ONLY));
-    }
+    refuse_unless_open(&state, admin)?;
     // A hidden domain answers 404 before anything else is said about it, on a
     // read-only instance too, as the membership routes do.
     if let Some(domain) = body.domain.as_deref() {
@@ -336,24 +390,8 @@ pub async fn create(
         .as_ref()
         .map(|_| body.level.unwrap_or(MemberLevel::Viewer));
     if let Some(domain) = body.domain.as_deref() {
-        if state
-            .auth
-            .domain_visibility(domain)
-            .await
-            .map_err(|e| ApiError::internal(format!("reading this domain's visibility: {e:#}")))?
-            .is_none()
-        {
-            return Err(ApiError::conflict(
-                "this domain is shared, so an invite link cannot give membership of it: make it \
-                 private first",
-            ));
-        }
-        if state.engine.github_governs(domain) {
-            return Err(ApiError::conflict(crate::members::FOLLOWS_GITHUB));
-        }
+        refuse_link_to(&state, &identity, admin, domain).await?;
         if !admin {
-            crate::members::refuse_below(&state, &identity, domain, DomainRight::Manage, "manager")
-                .await?;
             let own = state
                 .access
                 .right(&identity.scope(), domain)

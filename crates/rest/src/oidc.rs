@@ -1625,15 +1625,16 @@ pub async fn callback(
     if let Some(token) = invite {
         // A person's browser lands here: every refusal is a page, and nobody
         // is signed in when the link could not be redeemed.
-        let user = match resolve_oidc_invite(&state, &claims, &token).await {
-            Ok(user) => user,
+        let (user, domain) = match resolve_oidc_invite(&state, &claims, &token).await {
+            Ok(redeemed) => redeemed,
             Err(err) => {
                 let page = super::github_link::plain_page(err.status, "Invite", &err.detail);
                 return Ok((jar, super::auth::no_store(), page).into_response());
             }
         };
         let jar = super::auth::issue_session(&state, jar, &headers, &user).await?;
-        return Ok((jar, super::auth::no_store(), found(&state.base_path.href())).into_response());
+        let landing = invite_landing(&state, domain.as_deref());
+        return Ok((jar, super::auth::no_store(), found(&landing)).into_response());
     }
     let user = resolve_oidc_identity(&state, claims, &identity).await;
     let user = match user {
@@ -2157,8 +2158,27 @@ async fn resolve_oidc_identity(
     }
 }
 
+/// Where the browser lands after an invite sign-on: the invited domain's
+/// page under the base path, so the person sees where they were let in, or
+/// the application root for a link without a domain.
+fn invite_landing(state: &RestState, domain: Option<&str>) -> String {
+    const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    match domain {
+        Some(domain) => format!(
+            "{}/d/{}",
+            state.base_path.as_str(),
+            percent_encoding::utf8_percent_encode(domain, SEGMENT)
+        ),
+        None => state.base_path.href(),
+    }
+}
+
 /// Redeem the invite link `token` for the identity a sign-on just validated,
-/// and answer the account to sign in.
+/// and answer the account to sign in and the domain the link let it into.
 ///
 /// The same two cases [`resolve_oidc_identity`] tells apart, never a match by
 /// address: an identity linked to an account redeems for that account (the
@@ -2170,7 +2190,7 @@ async fn resolve_oidc_invite(
     state: &RestState,
     claims: &OidcClaims,
     token: &str,
-) -> Result<User, ApiError> {
+) -> Result<(User, Option<String>), ApiError> {
     use super::auth_store::InviteRedeemer;
     use super::invite_redeem::{log_redeemed, redeem_error, refuse_beyond_store};
     super::refuse_read_only(state)?;
@@ -2236,7 +2256,7 @@ async fn resolve_oidc_invite(
     };
     log_redeemed(&done);
     super::readers_changed(state);
-    Ok(done.user)
+    Ok((done.user, done.invite.domain))
 }
 
 /// Case 1 of [`resolve_oidc_identity`]: tie this identity to the account whose

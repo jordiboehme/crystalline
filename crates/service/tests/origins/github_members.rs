@@ -339,6 +339,17 @@ async fn an_invite_link_never_reaches_a_governed_domain() {
         "{body}"
     );
     assert!(fx.auth.invites(None, None).await.unwrap().is_empty());
+    // The members read tells the card the same: no link to make here.
+    let (status, members) = call(
+        &fx,
+        &root,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/members",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{members}");
+    assert_eq!(members["can_invite"], false, "{members}");
 
     // A link made before the domain's access followed GitHub is not
     // redeemed: confirm says the one sentence, redeem says why.

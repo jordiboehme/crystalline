@@ -2708,6 +2708,7 @@ async fn an_invite_is_redeemed_after_the_sign_on() {
     let (done, authorize) = redeem_by_sign_on(&ctx, &token).await;
     assert!(!authorize.contains(&token), "the token stays server side");
     assert_eq!(done.status(), 302, "signed in");
+    assert_eq!(location(&done), "/d/eng", "lands on the invited domain");
     assert!(
         cookies_from(&done)
             .iter()
@@ -2721,6 +2722,47 @@ async fn an_invite_is_redeemed_after_the_sign_on() {
     );
     let used = ctx.auth.invites(None, None).await.unwrap();
     assert_eq!(used[0].used_by.as_deref(), Some("nina"));
+}
+
+/// A link without a domain lands the new account on the application root,
+/// since there is no domain to show.
+#[tokio::test]
+async fn an_invite_without_a_domain_lands_on_the_root() {
+    use crystalline_service::rest::{InviteLimits, NewInvite};
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("root", "root@example.test", Role::Admin)
+        .await;
+    let token = ctx
+        .auth
+        .create_invite(
+            &NewInvite {
+                role: Role::Viewer,
+                domain: None,
+                level: None,
+                label: None,
+                local_account: false,
+                created_by: "root",
+                ttl_secs: 3_600,
+            },
+            InviteLimits {
+                per_creator: 10,
+                max_users: 100,
+            },
+        )
+        .await
+        .unwrap()
+        .token;
+    idp.set_user(IdpUser {
+        subject: "sub-nina".to_string(),
+        preferred_username: Some("nina".to_string()),
+        name: None,
+        email: None,
+    });
+    let (done, _) = redeem_by_sign_on(&ctx, &token).await;
+    assert_eq!(done.status(), 302, "signed in");
+    assert_eq!(location(&done), "/");
+    assert!(ctx.user("nina").await.is_some());
 }
 
 /// An identity already linked to an account redeems for that account: the

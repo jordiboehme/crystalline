@@ -2099,6 +2099,14 @@ export type MembersResponse = {
      */
     archived_reason?: string | null;
     /**
+     * Whether this caller may make an invite link to this domain here:
+     * true for an instance admin, and for its owner or a manager while
+     * `auth.invites.managers` is on, on a private domain GitHub does not
+     * govern and a writable instance. The same gates `POST /invites`
+     * applies.
+     */
+    can_invite: boolean;
+    /**
      * Why this domain is closed (the GitHub App is not installed on its
      * repository), for an instance admin; `null` otherwise.
      */

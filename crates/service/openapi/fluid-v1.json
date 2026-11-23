@@ -17324,7 +17324,8 @@
           "visibility",
           "members",
           "governance",
-          "overridden"
+          "overridden",
+          "can_invite"
         ],
         "properties": {
           "archived_reason": {
@@ -17334,6 +17335,10 @@
             ],
             "description": "On a domain GitHub governs whose repository is archived on GitHub,\nthe sentence that says the domain is read-only for everybody until\nthe repository is unarchived; `null` otherwise.",
             "example": "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub"
+          },
+          "can_invite": {
+            "type": "boolean",
+            "description": "Whether this caller may make an invite link to this domain here:\ntrue for an instance admin, and for its owner or a manager while\n`auth.invites.managers` is on, on a private domain GitHub does not\ngovern and a writable instance. The same gates `POST /invites`\napplies."
           },
           "closed_reason": {
             "type": [
