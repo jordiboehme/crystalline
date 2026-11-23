@@ -1,65 +1,102 @@
 /**
- * Account administration, the admin-only screen: who may sign in, what each
- * account may do, and the levers an admin has - create, role, display name,
- * deactivate/reactivate, password reset, delete, and ending a removed account's
- * drafts. Every refusal is the
- * server's own sentence (NOT_LAST_ADMIN above all), shown where the action
- * happened; the force escape hatches exist only in the CLI, on purpose.
+ * Account administration, the admin-only screen, built for hundreds of
+ * accounts: a table to find them, a detail panel to change one, and a bulk
+ * bar to change many.
  *
- * Nothing here asks the server whether an action is allowed before offering
- * it. The server decides, every time, and this screen is built to carry the
- * answer back rather than to predict it: the one thing it declines to draw is
- * the caller's own deactivate control, which is not a guess about the rules
- * but a refusal to offer somebody the door key to lock themselves out with.
+ * The table holds no edit fields. It is searched, filtered, sorted and paged
+ * by the server, and all of that lives in the address (see `usersQuery.ts`),
+ * so a list can be linked and the back button walks through it. A row opens
+ * the account at `/admin/users/<name>`: beside the table at wide widths, the
+ * whole page at narrow ones.
+ *
+ * Every refusal is the server's own sentence (NOT_LAST_ADMIN above all), shown
+ * where the action happened; the force escape hatches exist only in the CLI,
+ * on purpose. Nothing here asks the server whether an action is allowed
+ * before offering it. The one thing the screen declines to draw is a way for
+ * the caller to deactivate their own account: no deactivate in their panel,
+ * and no checkbox on their row.
  */
 
-import { focusLeft } from "../focusLeft";
-import { usePageTitle } from "../usePageTitle";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useId, useRef, useState } from "react";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { ArrowDown, ArrowUp } from "lucide-react";
+import { useEffect, useId, useRef, useState } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { problemDetail } from "../api/client";
-import type { PatchUserBody, ReflectionLevel, Role, User } from "../api/model";
-import type { DiscardedDrafts } from "../api/users";
+import type {
+  BulkAction,
+  BulkResult,
+  KindFilter,
+  ReflectionLevel,
+  Role,
+  SortColumn,
+  StateFilter,
+  User,
+} from "../api/model";
+import type { DiscardedDrafts, UsersPageRequest } from "../api/users";
 import {
   USERS_QUERY_KEY,
+  bulkUsers,
   createUser,
-  deleteUser,
   discardUserDrafts,
-  fetchUsers,
-  patchUser,
-  resetPassword,
+  fetchUsersPage,
+  usersPageKey,
 } from "../api/users";
 import { useAuth } from "../auth/AuthContext";
+import { focusLeft } from "../focusLeft";
 import { Loading } from "../components/Loading";
-import { BUTTON, CONTROL_HEIGHT, FIELD } from "../components/primitives";
+import {
+  BUTTON,
+  CONTROL_HEIGHT,
+  FIELD,
+  FOCUS_RING,
+} from "../components/primitives";
 import { ReflectionLevelSelect } from "../components/ReflectionLevelSelect";
-import { raiseForNone, reflectionAfter } from "../components/reflectionLevels";
+import { reflectionAfter } from "../components/reflectionLevels";
 import { formatDay } from "../format";
-import NotFound from "./NotFound";
+import { usersRoute } from "../paths";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { usePageTitle } from "../usePageTitle";
+import NotFound from "./NotFound";
+import type { Notice } from "./accounts";
+import { ROLES, signInWords } from "./accounts";
+import { UserDetail } from "./UserDetail";
+import {
+  PAGE_SIZES,
+  isFiltered,
+  narrowed,
+  readUsersSearch,
+  writeUsersSearch,
+} from "./usersQuery";
 
-/** The roles an account can hold, least privileged first, as the API orders them. */
-const ROLES: Role[] = ["none", "viewer", "editor", "admin"];
-
-/** What the screen is currently saying, and whether it is bad news. */
-interface Notice {
-  kind: "problem" | "done";
-  text: string;
-}
-
-/**
- * The row's own buttons, from the shared tiers rather than hand-rolled here.
- *
- * Secondary throughout: every one of them acts on the account whose row it
- * sits on, and none of them is the thing an admin came to this screen to do -
- * that is "Add user" at the bottom, which is the only primary on the screen.
- * The disabled Save reads as waiting for a change rather than as broken,
- * because the tier says so in the same words everywhere else in the app.
- */
-const ROW_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
-
+const SECONDARY = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
 const DANGER_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.destructive}`;
+const LABEL = "text-xs text-slate-500 dark:text-slate-400";
+
+/** How long typing in the search waits before the list follows it. */
+export const SEARCH_DELAY_MS = 300;
+
+/** The table's columns, in order, with the sort each one asks for. */
+const COLUMNS: readonly { sort: SortColumn; label: string }[] = [
+  { sort: "name", label: "Name" },
+  { sort: "display", label: "Display name" },
+  { sort: "role", label: "Role" },
+  { sort: "state", label: "State" },
+  { sort: "kind", label: "Sign-in" },
+  { sort: "last_seen", label: "Last seen" },
+];
+
+const KIND_OPTIONS: readonly { value: KindFilter; label: string }[] = [
+  { value: "password", label: "Password" },
+  { value: "oidc", label: "SSO" },
+  { value: "proxy", label: "Proxy" },
+  { value: "token_only", label: "Token only" },
+];
 
 export default function UsersAdmin() {
   const { capabilities } = useAuth();
@@ -67,74 +104,104 @@ export default function UsersAdmin() {
   if (!capabilities.canAdminister) {
     return <NotFound />;
   }
-  return <UsersPanel />;
+  return <UsersScreen />;
 }
 
-function UsersPanel() {
+/** The address of the list or of one account, keeping the list's search. */
+function usersAddress(search: URLSearchParams, name?: string): string {
+  const query = search.toString();
+  const path =
+    name === undefined
+      ? usersRoute()
+      : `${usersRoute()}/${encodeURIComponent(name)}`;
+  return query === "" ? path : `${path}?${query}`;
+}
+
+function UsersScreen() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { user } = useAuth();
-  const users = useQuery({ queryKey: USERS_QUERY_KEY, queryFn: fetchUsers });
+  const { name: openName } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const request = readUsersSearch(searchParams);
+  const requestKey = JSON.stringify(request);
   const [notice, setNotice] = useState<Notice | null>(null);
 
-  const invalidate = () =>
-    refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY });
+  /** Change what is listed; typing replaces the history entry, the rest push. */
+  function setRequest(
+    change: (current: UsersPageRequest) => UsersPageRequest,
+    replace = false,
+  ) {
+    setSearchParams(
+      (current) => writeUsersSearch(change(readUsersSearch(current))),
+      { replace },
+    );
+  }
 
-  const patch = useMutation({
-    mutationFn: ({ name, body }: { name: string; body: PatchUserBody }) =>
-      patchUser(name, body),
-    // Optimistic for the non-content edits the quality bar names (role,
-    // display, state): apply, roll back on refusal, resettle from the server.
-    onMutate: async ({ name, body }) => {
-      await queryClient.cancelQueries({ queryKey: USERS_QUERY_KEY });
-      const before = queryClient.getQueryData<User[]>(USERS_QUERY_KEY);
-      queryClient.setQueryData<User[]>(USERS_QUERY_KEY, (old) =>
-        (old ?? []).map((account) =>
-          account.name === name ? withPatch(account, body) : account,
-        ),
-      );
+  const listing = useQuery({
+    queryKey: usersPageKey(request),
+    queryFn: () => fetchUsersPage(request),
+    placeholderData: keepPreviousData,
+  });
+  const accounts = listing.data?.users ?? [];
+  const total = listing.data?.total ?? 0;
+  const lastPage = Math.max(1, Math.ceil(total / request.size));
+
+  // A page past the end (a bookmark, or the last account of the last page
+  // deactivated away) goes to the last page there is, without a word.
+  const pastTheEnd =
+    listing.data !== undefined &&
+    !listing.isPlaceholderData &&
+    request.page > lastPage;
+  useEffect(() => {
+    if (pastTheEnd) {
+      setRequest((current) => ({ ...current, page: lastPage }), true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pastTheEnd, lastPage]);
+
+  // The selection belongs to one page of one list: a different page, filter
+  // or sort starts with nothing selected.
+  const [selection, setSelection] = useState<{
+    key: string;
+    names: ReadonlySet<string>;
+  }>({ key: requestKey, names: new Set() });
+  const selected =
+    selection.key === requestKey ? selection.names : new Set<string>();
+  const selectable = accounts.filter((account) => account.name !== user?.name);
+
+  function select(names: ReadonlySet<string>) {
+    setSelection({ key: requestKey, names });
+  }
+
+  const [results, setResults] = useState<{
+    said: string;
+    rows: BulkResult[];
+  } | null>(null);
+
+  const bulk = useMutation({
+    mutationFn: bulkUsers,
+    onMutate: () => {
       setNotice(null);
-      return { before };
+      setResults(null);
     },
-    onError: (error: Error, _vars, context) => {
-      if (context?.before) {
-        queryClient.setQueryData(USERS_QUERY_KEY, context.before);
-      }
-      setNotice({ kind: "problem", text: problemDetail(error) });
-    },
-    onSettled: () => void invalidate(),
-  });
-
-  const remove = useMutation({
-    mutationFn: deleteUser,
-    onSuccess: (_result, name) => {
-      setNotice({ kind: "done", text: `Deleted ${name}.` });
-      void invalidate();
+    onSuccess: (rows, body) => {
+      setResults({ said: bulkWords(body.action, body.role ?? null), rows });
+      select(new Set());
     },
     onError: (error: Error) => {
       setNotice({ kind: "problem", text: problemDetail(error) });
     },
-  });
-
-  const reset = useMutation({
-    mutationFn: ({ name, password }: { name: string; password: string }) =>
-      resetPassword(name, password),
-    onSuccess: (_result, { name }) => {
-      setNotice({
-        kind: "done",
-        text: `Replaced the password for ${name}. Its sessions and agent connections are signed out.`,
-      });
-      void invalidate();
-    },
-    onError: (error: Error) => {
-      setNotice({ kind: "problem", text: problemDetail(error) });
-    },
+    onSettled: () =>
+      void refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY }),
   });
 
   const add = useMutation({
     mutationFn: createUser,
     onSuccess: (created) => {
       setNotice({ kind: "done", text: `Added ${created.name}.` });
-      void invalidate();
+      void refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY });
+      void navigate(usersAddress(searchParams, created.name));
     },
     onError: (error: Error) => {
       setNotice({ kind: "problem", text: problemDetail(error) });
@@ -159,7 +226,8 @@ function UsersPanel() {
     },
   });
 
-  const accounts = users.data ?? [];
+  const listTo = usersAddress(searchParams);
+  const open = openName !== undefined;
 
   return (
     <div className="flex flex-col gap-6">
@@ -167,8 +235,8 @@ function UsersPanel() {
         <h1 className="text-display">Users</h1>
         <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
           Who may sign in to this instance, and what each of them may do. The
-          server decides every one of these changes; whatever it refuses is said
-          here in its own words.
+          server decides every change; what it refuses is said here in its own
+          words.
         </p>
       </header>
 
@@ -185,92 +253,786 @@ function UsersPanel() {
         </p>
       )}
 
-      {users.isPending && <AccountsSkeleton />}
-
-      {users.error && (
-        <p
-          role="alert"
-          className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+      <div
+        className={
+          open
+            ? "2xl:grid 2xl:grid-cols-[minmax(0,1fr)_20rem] 2xl:items-start 2xl:gap-6"
+            : undefined
+        }
+      >
+        <div
+          className={`flex min-w-0 flex-col gap-4 ${open ? "hidden 2xl:flex" : ""}`}
         >
-          {problemDetail(users.error)}
-        </p>
-      )}
+          <SearchAndFilters request={request} onChange={setRequest} />
 
-      {!users.isPending && !users.error && accounts.length === 0 && (
-        <p className="rounded border border-dashed border-slate-300 px-3 py-6 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
-          No accounts yet. Add one below, or let a trusted-header proxy
-          provision them as people arrive through it.
-        </p>
-      )}
+          {results && (
+            <BulkResults
+              said={results.said}
+              rows={results.rows}
+              onDismiss={() => {
+                setResults(null);
+              }}
+            />
+          )}
 
-      {accounts.length > 0 && (
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <caption className="sr-only">
-              Every account on this instance
-            </caption>
-            {/*
-              Sentence case: these are six short words a reader glances at
-              once, and setting them in capitals made the quietest row on the
-              screen the loudest thing on it.
-            */}
-            <thead className="text-caption font-semibold text-slate-500 dark:text-slate-400">
-              <tr>
-                <th scope="col" className="px-2 py-2">
-                  Name
+          {selected.size > 0 && (
+            <BulkBar
+              count={selected.size}
+              pending={bulk.isPending}
+              onRun={(action, role) => {
+                bulk.mutate({
+                  names: [...selected],
+                  action,
+                  ...(action === "role" ? { role } : {}),
+                });
+              }}
+              onClear={() => {
+                select(new Set());
+              }}
+            />
+          )}
+
+          {request.sort === "last_seen" && (
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              Sorted by last seen: an account that signs in while you page can
+              move to another page.
+            </p>
+          )}
+
+          {listing.isPending && <AccountsSkeleton />}
+
+          {listing.error && (
+            <p
+              role="alert"
+              className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+            >
+              {problemDetail(listing.error)}
+            </p>
+          )}
+
+          {listing.data && accounts.length === 0 && (
+            <p className="rounded border border-dashed border-slate-300 px-3 py-6 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
+              {isFiltered(request)
+                ? "No account matches."
+                : "No accounts yet. Add one below, or let a trusted-header proxy provision them as people arrive through it."}
+            </p>
+          )}
+
+          {accounts.length > 0 && (
+            <AccountsTable
+              accounts={accounts}
+              request={request}
+              self={user?.name}
+              openName={openName}
+              selected={selected}
+              allSelected={
+                selectable.length > 0 &&
+                selectable.every((account) => selected.has(account.name))
+              }
+              linkTo={(name) => usersAddress(searchParams, name)}
+              onSort={(sort) => {
+                setRequest((current) =>
+                  narrowed(current, {
+                    sort,
+                    dir:
+                      current.sort === sort
+                        ? current.dir === "asc"
+                          ? "desc"
+                          : "asc"
+                        : sort === "last_seen"
+                          ? "desc"
+                          : "asc",
+                  }),
+                );
+              }}
+              onSelect={(name, on) => {
+                const next = new Set(selected);
+                if (on) next.add(name);
+                else next.delete(name);
+                select(next);
+              }}
+              onSelectAll={(on) => {
+                select(
+                  on
+                    ? new Set(selectable.map((account) => account.name))
+                    : new Set(),
+                );
+              }}
+            />
+          )}
+
+          {listing.data && total > 0 && (
+            <Pager
+              request={request}
+              total={total}
+              shown={accounts.length}
+              lastPage={lastPage}
+              onPage={(page) => {
+                setRequest((current) => ({ ...current, page }));
+              }}
+              onSize={(size) => {
+                setRequest((current) => narrowed(current, { size }));
+              }}
+            />
+          )}
+
+          <CreateForm
+            pending={add.isPending}
+            onCreate={(body) => add.mutateAsync(body)}
+          />
+
+          <EndDraftsForm
+            pending={endDrafts.isPending}
+            onEnd={(name) => endDrafts.mutateAsync(name)}
+          />
+        </div>
+
+        {open && (
+          <UserDetail
+            name={openName}
+            fromList={accounts.find((account) => account.name === openName)}
+            isSelf={openName === user?.name}
+            listTo={listTo}
+            onNotice={setNotice}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The search field and the filters.
+ *
+ * Typing follows into the address after a short pause, replacing the history
+ * entry so the back button does not step through every letter; Enter applies
+ * at once. A filter applies when it is chosen.
+ */
+function SearchAndFilters({
+  request,
+  onChange,
+}: {
+  request: UsersPageRequest;
+  onChange: (
+    change: (current: UsersPageRequest) => UsersPageRequest,
+    replace?: boolean,
+  ) => void;
+}) {
+  const ids = {
+    q: useId(),
+    role: useId(),
+    state: useId(),
+    kind: useId(),
+    github: useId(),
+    after: useId(),
+    before: useId(),
+  };
+  const [text, setText] = useState(request.q);
+  // The search the address last got from this field. When the address moves
+  // on its own (the back button, a link), the field follows it; while the
+  // person types, it does not, or a late answer would undo their typing.
+  const [applied, setApplied] = useState(request.q);
+  if (request.q !== applied) {
+    setApplied(request.q);
+    setText(request.q);
+  }
+
+  function apply(value: string, replace: boolean) {
+    setApplied(value);
+    onChange((current) => narrowed(current, { q: value }), replace);
+  }
+
+  useEffect(() => {
+    if (text === applied) return;
+    const timer = window.setTimeout(() => {
+      apply(text, true);
+    }, SEARCH_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text, applied]);
+
+  const githubValue =
+    request.github === null ? "" : request.github ? "true" : "false";
+
+  return (
+    <div
+      role="search"
+      aria-label="Find accounts"
+      className="flex flex-col gap-3"
+    >
+      <form
+        className="flex flex-col gap-1"
+        onSubmit={(event) => {
+          event.preventDefault();
+          apply(text, false);
+        }}
+      >
+        <label htmlFor={ids.q} className={LABEL}>
+          Search
+        </label>
+        <input
+          id={ids.q}
+          type="search"
+          value={text}
+          autoComplete="off"
+          placeholder="Name, display name or email"
+          onChange={(event) => {
+            setText(event.target.value);
+          }}
+          className={`w-full max-w-md ${FIELD}`}
+        />
+      </form>
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="flex flex-col gap-1">
+          <label htmlFor={ids.role} className={LABEL}>
+            Role
+          </label>
+          <select
+            id={ids.role}
+            value={request.role ?? ""}
+            onChange={(event) => {
+              const role = (event.target.value || null) as Role | null;
+              onChange((current) => narrowed(current, { role }));
+            }}
+            className={FIELD}
+          >
+            <option value="">Any role</option>
+            {ROLES.map((role) => (
+              <option key={role} value={role}>
+                {role}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label htmlFor={ids.state} className={LABEL}>
+            State
+          </label>
+          <select
+            id={ids.state}
+            value={request.state ?? ""}
+            onChange={(event) => {
+              const state = (event.target.value || null) as StateFilter | null;
+              onChange((current) => narrowed(current, { state }));
+            }}
+            className={FIELD}
+          >
+            <option value="">Any state</option>
+            <option value="active">Active</option>
+            <option value="disabled">Disabled</option>
+          </select>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label htmlFor={ids.kind} className={LABEL}>
+            Sign-in
+          </label>
+          <select
+            id={ids.kind}
+            value={request.kind ?? ""}
+            onChange={(event) => {
+              const kind = (event.target.value || null) as KindFilter | null;
+              onChange((current) => narrowed(current, { kind }));
+            }}
+            className={FIELD}
+          >
+            <option value="">Any sign-in</option>
+            {KIND_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label htmlFor={ids.github} className={LABEL}>
+            GitHub
+          </label>
+          <select
+            id={ids.github}
+            value={githubValue}
+            onChange={(event) => {
+              const value = event.target.value;
+              const github = value === "" ? null : value === "true";
+              onChange((current) => narrowed(current, { github }));
+            }}
+            className={FIELD}
+          >
+            <option value="">Linked or not</option>
+            <option value="true">Linked</option>
+            <option value="false">Not linked</option>
+          </select>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label htmlFor={ids.after} className={LABEL}>
+            Seen after
+          </label>
+          <input
+            id={ids.after}
+            type="date"
+            value={request.seenAfter ?? ""}
+            onChange={(event) => {
+              const seenAfter = event.target.value || null;
+              onChange((current) => narrowed(current, { seenAfter }));
+            }}
+            className={FIELD}
+          />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label htmlFor={ids.before} className={LABEL}>
+            Seen before
+          </label>
+          <input
+            id={ids.before}
+            type="date"
+            value={request.seenBefore ?? ""}
+            onChange={(event) => {
+              const seenBefore = event.target.value || null;
+              onChange((current) => narrowed(current, { seenBefore }));
+            }}
+            className={FIELD}
+          />
+        </div>
+        {isFiltered(request) && (
+          <button
+            type="button"
+            onClick={() => {
+              setApplied("");
+              setText("");
+              onChange((current) =>
+                narrowed(current, {
+                  q: "",
+                  role: null,
+                  state: null,
+                  kind: null,
+                  github: null,
+                  seenAfter: null,
+                  seenBefore: null,
+                }),
+              );
+            }}
+            className={SECONDARY}
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The accounts of one page. Each column header sorts by it; the login name
+ * opens the account. No cell is an edit field.
+ */
+function AccountsTable({
+  accounts,
+  request,
+  self,
+  openName,
+  selected,
+  allSelected,
+  linkTo,
+  onSort,
+  onSelect,
+  onSelectAll,
+}: {
+  accounts: User[];
+  request: UsersPageRequest;
+  self: string | undefined;
+  openName: string | undefined;
+  selected: ReadonlySet<string>;
+  allSelected: boolean;
+  linkTo: (name: string) => string;
+  onSort: (sort: SortColumn) => void;
+  onSelect: (name: string, on: boolean) => void;
+  onSelectAll: (on: boolean) => void;
+}) {
+  const selectAll = useRef<HTMLInputElement>(null);
+  const some = selected.size > 0 && !allSelected;
+  useEffect(() => {
+    if (selectAll.current) selectAll.current.indeterminate = some;
+  }, [some]);
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-sm">
+        <caption className="sr-only">Accounts on this page</caption>
+        <thead className="text-caption font-semibold text-slate-500 dark:text-slate-400">
+          <tr>
+            <th scope="col" className="w-8 px-2 py-2">
+              <input
+                ref={selectAll}
+                type="checkbox"
+                aria-label="Select every account on this page"
+                checked={allSelected}
+                onChange={(event) => {
+                  onSelectAll(event.target.checked);
+                }}
+              />
+            </th>
+            {COLUMNS.map((column) => {
+              const sorted = request.sort === column.sort;
+              return (
+                <th
+                  key={column.sort}
+                  scope="col"
+                  aria-sort={
+                    sorted
+                      ? request.dir === "asc"
+                        ? "ascending"
+                        : "descending"
+                      : undefined
+                  }
+                  className="px-2 py-2 whitespace-nowrap"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSort(column.sort);
+                    }}
+                    className={`inline-flex items-center gap-1 rounded hover:text-slate-900 dark:hover:text-slate-100 ${FOCUS_RING} ${sorted ? "text-slate-900 dark:text-slate-100" : ""}`}
+                  >
+                    {column.label}
+                    {sorted &&
+                      (request.dir === "asc" ? (
+                        <ArrowUp aria-hidden="true" className="h-3 w-3" />
+                      ) : (
+                        <ArrowDown aria-hidden="true" className="h-3 w-3" />
+                      ))}
+                  </button>
                 </th>
-                <th scope="col" className="px-2 py-2">
-                  Display
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+          {accounts.map((account) => {
+            const lastSeen = account.last_seen ?? null;
+            const here = account.name === openName;
+            return (
+              <tr
+                key={account.name}
+                className={here ? "bg-accent-tint" : undefined}
+              >
+                <td className="px-2 py-2">
+                  {account.name !== self && (
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${account.name}`}
+                      checked={selected.has(account.name)}
+                      onChange={(event) => {
+                        onSelect(account.name, event.target.checked);
+                      }}
+                    />
+                  )}
+                </td>
+                <th scope="row" className="px-2 py-2 font-normal">
+                  <Link
+                    to={linkTo(account.name)}
+                    aria-current={here ? "page" : undefined}
+                    className={`rounded font-mono text-link underline-offset-2 hover:underline ${FOCUS_RING}`}
+                  >
+                    {account.name}
+                  </Link>
                 </th>
-                <th scope="col" className="px-2 py-2">
-                  Role
-                </th>
-                <th scope="col" className="px-2 py-2">
-                  Reflection
-                </th>
-                <th scope="col" className="px-2 py-2">
-                  State
-                </th>
-                <th scope="col" className="px-2 py-2">
-                  Last seen
-                </th>
-                <th scope="col" className="px-2 py-2">
-                  Actions
-                </th>
+                <td className="max-w-48 truncate px-2 py-2">
+                  {account.display}
+                </td>
+                <td className="px-2 py-2">{account.role}</td>
+                <td className="px-2 py-2">
+                  {account.disabled ? "Disabled" : "Active"}
+                </td>
+                <td className="px-2 py-2 whitespace-nowrap">
+                  {signInWords(account.sign_in)}
+                </td>
+                <td className="px-2 py-2 whitespace-nowrap tabular-nums">
+                  {lastSeen === null ? (
+                    <span className="text-slate-500 dark:text-slate-400">
+                      Never
+                    </span>
+                  ) : (
+                    formatDay(lastSeen)
+                  )}
+                </td>
               </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-              {accounts.map((account) => (
-                <AccountRow
-                  key={account.name}
-                  account={account}
-                  isSelf={account.name === user?.name}
-                  onPatch={(body) => {
-                    patch.mutate({ name: account.name, body });
-                  }}
-                  onReset={(password) => {
-                    reset.mutate({ name: account.name, password });
-                  }}
-                  onDelete={() => {
-                    remove.mutate(account.name);
-                  }}
-                />
-              ))}
-            </tbody>
-          </table>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Where the page stands in the list, the way to the next one, and the page size. */
+function Pager({
+  request,
+  total,
+  shown,
+  lastPage,
+  onPage,
+  onSize,
+}: {
+  request: UsersPageRequest;
+  total: number;
+  shown: number;
+  lastPage: number;
+  onPage: (page: number) => void;
+  onSize: (size: number) => void;
+}) {
+  const sizeId = useId();
+  const first = (request.page - 1) * request.size + 1;
+  const last = first + shown - 1;
+  return (
+    <nav
+      aria-label="Pages"
+      className="flex flex-wrap items-center gap-3 text-sm"
+    >
+      <p className="tabular-nums">
+        {shown === 0
+          ? `${String(total)} accounts`
+          : `${String(first)} to ${String(last)} of ${String(total)}`}
+      </p>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          disabled={request.page <= 1}
+          onClick={() => {
+            onPage(request.page - 1);
+          }}
+          className={SECONDARY}
+        >
+          Previous page
+        </button>
+        <span className="tabular-nums">
+          Page {request.page} of {lastPage}
+        </span>
+        <button
+          type="button"
+          disabled={request.page >= lastPage}
+          onClick={() => {
+            onPage(request.page + 1);
+          }}
+          className={SECONDARY}
+        >
+          Next page
+        </button>
+      </div>
+      <div className="flex items-center gap-2">
+        <label htmlFor={sizeId} className={LABEL}>
+          Per page
+        </label>
+        <select
+          id={sizeId}
+          value={request.size}
+          onChange={(event) => {
+            onSize(Number(event.target.value));
+          }}
+          className={FIELD}
+        >
+          {PAGE_SIZES.map((size) => (
+            <option key={size} value={size}>
+              {size}
+            </option>
+          ))}
+        </select>
+      </div>
+    </nav>
+  );
+}
+
+/** What a bulk action is, as the confirm and the results say it. */
+function bulkWords(action: BulkAction, role: Role | null): string {
+  switch (action) {
+    case "deactivate":
+      return "Deactivate";
+    case "reactivate":
+      return "Reactivate";
+    case "role":
+      return `Set role ${role ?? ""}`.trim();
+  }
+}
+
+/** "1 account" or "3 accounts". */
+function accountsWord(count: number): string {
+  return count === 1 ? "1 account" : `${String(count)} accounts`;
+}
+
+/**
+ * The selection's actions. Each one asks once more, naming the action and how
+ * many accounts it touches, before it goes to the server.
+ */
+function BulkBar({
+  count,
+  pending,
+  onRun,
+  onClear,
+}: {
+  count: number;
+  pending: boolean;
+  onRun: (action: BulkAction, role: Role) => void;
+  onClear: () => void;
+}) {
+  const roleId = useId();
+  const [role, setRole] = useState<Role>("viewer");
+  const [asking, setAsking] = useState<BulkAction | null>(null);
+  const firstStep = useRef<HTMLDivElement>(null);
+  const question =
+    asking === null
+      ? ""
+      : `${bulkWords(asking, role)} for ${accountsWord(count)}?`;
+
+  function giveUp() {
+    setAsking(null);
+    firstStep.current?.querySelector("button")?.focus();
+  }
+
+  return (
+    <section
+      aria-label="Selected accounts"
+      className="flex flex-col gap-3 rounded border border-slate-200 bg-slate-50 p-3 text-sm dark:border-slate-800 dark:bg-slate-900"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && asking !== null) {
+          event.stopPropagation();
+          giveUp();
+        }
+      }}
+    >
+      <div ref={firstStep} className="flex flex-wrap items-center gap-2">
+        <span className="font-medium">{accountsWord(count)} selected</span>
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => {
+            setAsking("deactivate");
+          }}
+          className={SECONDARY}
+        >
+          Deactivate
+        </button>
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => {
+            setAsking("reactivate");
+          }}
+          className={SECONDARY}
+        >
+          Reactivate
+        </button>
+        <label htmlFor={roleId} className="sr-only">
+          New role for the selected accounts
+        </label>
+        <select
+          id={roleId}
+          value={role}
+          onChange={(event) => {
+            setRole(event.target.value as Role);
+            setAsking(null);
+          }}
+          className={FIELD}
+        >
+          {ROLES.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => {
+            setAsking("role");
+          }}
+          className={SECONDARY}
+        >
+          Set role
+        </button>
+        <button
+          type="button"
+          onClick={onClear}
+          className={`${CONTROL_HEIGHT} ${BUTTON.ghost}`}
+        >
+          Clear selection
+        </button>
+      </div>
+      {asking !== null && (
+        <div
+          className="flex flex-wrap items-center gap-2"
+          onBlur={(event) => {
+            if (focusLeft(event.currentTarget, event.relatedTarget)) {
+              setAsking(null);
+            }
+          }}
+        >
+          <p>{question}</p>
+          <button
+            type="button"
+            autoFocus
+            disabled={pending}
+            onClick={() => {
+              onRun(asking, role);
+              setAsking(null);
+            }}
+            className={asking === "deactivate" ? DANGER_BUTTON : SECONDARY}
+          >
+            {`${bulkWords(asking, role)} ${accountsWord(count)}`}
+          </button>
+          <button type="button" onClick={giveUp} className={SECONDARY}>
+            Cancel
+          </button>
         </div>
       )}
+    </section>
+  );
+}
 
-      <CreateForm
-        pending={add.isPending}
-        onCreate={(body) => add.mutateAsync(body)}
-      />
-
-      <EndDraftsForm
-        pending={endDrafts.isPending}
-        onEnd={(name) => endDrafts.mutateAsync(name)}
-      />
-    </div>
+/** What a bulk action did, account by account, refusals first. */
+function BulkResults({
+  said,
+  rows,
+  onDismiss,
+}: {
+  said: string;
+  rows: BulkResult[];
+  onDismiss: () => void;
+}) {
+  const refused = rows.filter((row) => !row.done);
+  const done = rows.filter((row) => row.done);
+  return (
+    <section
+      aria-label="Bulk results"
+      role={refused.length > 0 ? "alert" : "status"}
+      className={`flex flex-col gap-2 rounded border px-3 py-2 text-sm ${
+        refused.length > 0
+          ? "border-red-300 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+          : "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
+      }`}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <p className="font-medium">
+          {said}: {String(done.length)} done
+          {refused.length > 0 ? `, ${String(refused.length)} refused` : ""}.
+        </p>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className={`${CONTROL_HEIGHT} ${BUTTON.ghost}`}
+        >
+          Dismiss
+        </button>
+      </div>
+      <ul className="flex flex-col gap-0.5">
+        {[...refused, ...done].map((row) => (
+          <li key={row.name}>
+            <span className="font-mono">{row.name}</span>
+            {": "}
+            {row.done ? "done" : (row.message ?? "refused")}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
@@ -388,294 +1150,8 @@ function EndDraftsForm({
 }
 
 /**
- * One account, and every lever an admin has on it.
- *
- * The row holds its own draft state - the display name being typed, the
- * password being set, whether a delete has been asked for once - because those
- * are about this row and nothing else on the screen needs to know them. It is
- * keyed by login name above, so a refetch that reorders the listing does not
- * carry a half-typed name onto somebody else's row.
- */
-function AccountRow({
-  account,
-  isSelf,
-  onPatch,
-  onReset,
-  onDelete,
-}: {
-  account: User;
-  isSelf: boolean;
-  onPatch: (body: PatchUserBody) => void;
-  onReset: (password: string) => void;
-  onDelete: () => void;
-}) {
-  const [display, setDisplay] = useState(account.display);
-  const [password, setPassword] = useState("");
-  const [resetting, setResetting] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-  const deleteTrigger = useRef<HTMLButtonElement>(null);
-  const lastSeen = account.last_seen ?? null;
-
-  /** Give up on the pending delete, and hand the focus back to what asked. */
-  function abandonDelete() {
-    setConfirming(false);
-    deleteTrigger.current?.focus();
-  }
-
-  return (
-    <tr className="align-top">
-      {/*
-        The login name is the row's header, not a cell like the others: it is
-        what every control in the row is about, and marking it up as one is
-        what lets a screen reader say whose row a bare "Reset password" is on.
-      */}
-      <th scope="row" className="px-2 py-2 font-normal">
-        {/*
-          Not a control, and still on the row's one line: the login name is
-          what every control beside it is about, so it stands at their height
-          rather than at the top of the cell. The mono face stays - a login
-          name is an identifier, and this column is a column of them.
-        */}
-        <span className={`flex ${CONTROL_HEIGHT} items-center font-mono`}>
-          {account.name}
-        </span>
-      </th>
-
-      <td className="px-2 py-2">
-        <form
-          className="flex items-center gap-1"
-          onSubmit={(event) => {
-            event.preventDefault();
-            onPatch({ display });
-          }}
-        >
-          <label className="sr-only" htmlFor={`display-${account.name}`}>
-            Display name for {account.name}
-          </label>
-          <input
-            id={`display-${account.name}`}
-            value={display}
-            onChange={(event) => {
-              setDisplay(event.target.value);
-            }}
-            className={`w-32 ${FIELD}`}
-          />
-          <button
-            type="submit"
-            aria-label={`Save display for ${account.name}`}
-            disabled={display === account.display}
-            className={ROW_BUTTON}
-          >
-            Save
-          </button>
-        </form>
-      </td>
-
-      <td className="px-2 py-2">
-        <label className="sr-only" htmlFor={`role-${account.name}`}>
-          Role for {account.name}
-        </label>
-        <select
-          id={`role-${account.name}`}
-          value={account.role}
-          onChange={(event) => {
-            const role = event.target.value as Role;
-            const reflection = raiseForNone(role, account.reflection);
-            onPatch(
-              reflection === account.reflection
-                ? { role }
-                : { role, reflection },
-            );
-          }}
-          className={FIELD}
-        >
-          {ROLES.map((role) => (
-            <option key={role} value={role}>
-              {role}
-            </option>
-          ))}
-        </select>
-      </td>
-
-      <td className="px-2 py-2">
-        <ReflectionLevelSelect
-          label={`Reflection for ${account.name}`}
-          knowledge={account.role}
-          value={account.reflection}
-          onChange={(reflection) => {
-            onPatch({ reflection });
-          }}
-        />
-      </td>
-
-      <td className="px-2 py-2">
-        <div className={`flex ${CONTROL_HEIGHT} items-center gap-2`}>
-          <span>{account.disabled ? "Disabled" : "Active"}</span>
-          {/*
-            Not offered on the caller's own row. The server refuses it anyway;
-            this only declines to hold the door open for somebody about to
-            lock themselves out of their own instance.
-          */}
-          {!isSelf && (
-            <button
-              type="button"
-              aria-label={`${account.disabled ? "Reactivate" : "Deactivate"} ${account.name}`}
-              onClick={() => {
-                onPatch({ disabled: !account.disabled });
-              }}
-              className={ROW_BUTTON}
-            >
-              {account.disabled ? "Reactivate" : "Deactivate"}
-            </button>
-          )}
-        </div>
-      </td>
-
-      <td className="px-2 py-2 tabular-nums">
-        <span className={`flex ${CONTROL_HEIGHT} items-center`}>
-          {lastSeen === null ? (
-            <span className="text-slate-500 dark:text-slate-400">Never</span>
-          ) : (
-            formatDay(lastSeen)
-          )}
-        </span>
-      </td>
-
-      <td className="px-2 py-2">
-        <div className="flex flex-wrap items-center gap-2">
-          {resetting ? (
-            <form
-              className="flex items-center gap-1"
-              onSubmit={(event) => {
-                event.preventDefault();
-                onReset(password);
-                setPassword("");
-                setResetting(false);
-              }}
-            >
-              <label className="sr-only" htmlFor={`password-${account.name}`}>
-                New password for {account.name}
-              </label>
-              <input
-                id={`password-${account.name}`}
-                type="password"
-                autoComplete="new-password"
-                required
-                autoFocus
-                value={password}
-                onChange={(event) => {
-                  setPassword(event.target.value);
-                }}
-                className={`w-36 ${FIELD}`}
-              />
-              <button
-                type="submit"
-                aria-label={`Set password for ${account.name}`}
-                className={ROW_BUTTON}
-              >
-                Set
-              </button>
-              <button
-                type="button"
-                aria-label={`Cancel the password reset for ${account.name}`}
-                onClick={() => {
-                  setPassword("");
-                  setResetting(false);
-                }}
-                className={ROW_BUTTON}
-              >
-                Cancel
-              </button>
-            </form>
-          ) : (
-            /*
-              Named by its own text rather than an `aria-label` naming the
-              account: the row header beside it already says whose row this
-              is, and a label reading "reset password for eddy" would also
-              answer a query for the password field, which is a different
-              control on a different form.
-            */
-            <button
-              type="button"
-              onClick={() => {
-                setResetting(true);
-              }}
-              className={ROW_BUTTON}
-            >
-              Reset password
-            </button>
-          )}
-
-          {/*
-            Two steps rather than a browser confirm: a dialog the browser owns
-            cannot be reached by a test, cannot be styled and cannot be
-            dismissed by the keyboard the way the rest of this screen can.
-          */}
-          <div
-            className="flex shrink-0 items-center gap-2"
-            onKeyDown={(event) => {
-              if (event.key === "Escape" && confirming) {
-                event.stopPropagation();
-                abandonDelete();
-              }
-            }}
-            onBlur={(event) => {
-              // Only when the focus actually landed somewhere else. A
-              // `focusout` with no destination is what a click looks like
-              // mid-flight, and taking the confirmation away there would eat
-              // the second click this exists to require.
-              const next = event.relatedTarget;
-              if (confirming && focusLeft(event.currentTarget, next)) {
-                setConfirming(false);
-              }
-            }}
-          >
-            <button
-              ref={deleteTrigger}
-              type="button"
-              aria-label={`Delete ${account.name}`}
-              aria-expanded={confirming}
-              onClick={() => {
-                setConfirming(true);
-              }}
-              className={DANGER_BUTTON}
-            >
-              Delete
-            </button>
-            {confirming && (
-              <>
-                <button
-                  type="button"
-                  aria-label={`Confirm delete of ${account.name}`}
-                  autoFocus
-                  onClick={() => {
-                    setConfirming(false);
-                    onDelete();
-                  }}
-                  className={DANGER_BUTTON}
-                >
-                  Confirm delete
-                </button>
-                <button
-                  type="button"
-                  aria-label={`Keep ${account.name}`}
-                  onClick={abandonDelete}
-                  className={ROW_BUTTON}
-                >
-                  Keep
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      </td>
-    </tr>
-  );
-}
-
-/**
  * Add an account. The password is the initial one; the account can be given a
- * new one from its row.
+ * new one from its details.
  *
  * The fields are emptied only once the server has taken the account. A name
  * already in use is the commonest refusal here, and a form that wiped itself
@@ -852,28 +1328,4 @@ function CreateForm({
 /** The accounts listing's loading block, in the app's one loading look. */
 function AccountsSkeleton() {
   return <Loading label="Loading accounts" subject="the accounts" />;
-}
-
-/**
- * The optimistic copy of an account with a patch applied.
- *
- * Field by field rather than a spread, because the patch body says "leave this
- * alone" with an absent or null field and an account says nothing with null:
- * spreading one into the other would blank a role the admin never touched.
- */
-function withPatch(account: User, body: PatchUserBody): User {
-  const next: User = { ...account };
-  if (body.role !== undefined && body.role !== null) {
-    next.role = body.role;
-  }
-  if (body.reflection !== undefined && body.reflection !== null) {
-    next.reflection = body.reflection;
-  }
-  if (body.display !== undefined && body.display !== null) {
-    next.display = body.display;
-  }
-  if (body.disabled !== undefined && body.disabled !== null) {
-    next.disabled = body.disabled;
-  }
-  return next;
 }

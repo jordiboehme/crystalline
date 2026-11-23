@@ -66,7 +66,12 @@ export default function AdminArea() {
 function AdminFrame() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
-  const current = PAGES.find((page) => page.to === pathname) ?? null;
+  // The page itself or any address inside it (an account at
+  // `/admin/users/<name>`, or a trailing slash).
+  const current =
+    PAGES.find(
+      (page) => pathname === page.to || pathname.startsWith(`${page.to}/`),
+    ) ?? null;
   return (
     <div className="flex flex-col gap-6 lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:gap-14">
       <div className="flex items-center gap-4 lg:hidden">

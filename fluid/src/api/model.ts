@@ -33,6 +33,18 @@ export type { UsersResponse } from "./gen";
 /** The `{"user": ...}` envelope every user mutation answers with. */
 export type { UserResponse } from "./gen";
 
+/** How `GET /users` sorts, filters and pages, and what `POST /users/bulk` takes and answers. */
+export type {
+  BulkAction,
+  BulkBody,
+  BulkResult,
+  KindFilter,
+  SignInKind,
+  SortColumn,
+  SortDir,
+  StateFilter,
+} from "./gen";
+
 /** What `POST /users` takes. */
 export type { CreateBody as CreateUserBody } from "./gen";
 

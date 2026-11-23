@@ -160,6 +160,25 @@ describe("the Administration area", () => {
     ).toHaveAttribute("aria-current", "page");
   });
 
+  it("keeps Users the current page at an account's address", async () => {
+    serveAs("admin", { "/users": () => ({ users: [], total: 0 }) });
+    renderApp("/admin/users/eddy");
+    expect(
+      within(await adminNav()).getByRole("link", { name: "Users" }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      screen.getByRole("combobox", { name: "Administration page" }),
+    ).toHaveValue("/admin/users");
+  });
+
+  it("keeps the current page with a trailing slash", async () => {
+    serveAs("admin");
+    renderApp("/admin/general/");
+    expect(
+      within(await adminNav()).getByRole("link", { name: "General" }),
+    ).toHaveAttribute("aria-current", "page");
+  });
+
   it("answers an unknown page under the area with not-found, inside the frame", async () => {
     serveAs("admin");
     renderApp("/admin/nonsense");

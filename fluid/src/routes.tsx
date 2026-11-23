@@ -623,8 +623,13 @@ export function AppRoutes() {
                 </LazyBoundary>
               }
             />
+            {/*
+              One route for the list and for one account in it: the detail
+              panel is part of the list screen, which keeps its search,
+              selection and scroll while accounts open and close beside it.
+            */}
             <Route
-              path="users"
+              path="users/:name?"
               element={
                 <LazyBoundary fallback={USERS_FALLBACK}>
                   <UsersAdmin />
