@@ -280,6 +280,10 @@ fn reflection_allow_list() -> &'static [(&'static str, &'static [&'static str])]
                 "engine/src/engine/reflection.rs",
                 "engine/src/engine/rename_domain.rs",
                 "engine/src/engine/threads.rs",
+                // The owned pages and a reconcile's pact hash are read from
+                // the Reflection's pages.
+                "engine/src/engine/page_life.rs",
+                "engine/src/engine/reconcile.rs",
             ],
         ),
         (
@@ -302,6 +306,8 @@ fn reflection_allow_list() -> &'static [(&'static str, &'static [&'static str])]
                 // The automation status asks whether a person has a page
                 // open, so its update is not due while they type.
                 "engine/src/engine/reflect.rs",
+                // A retire or a restore lets an open room take the change in.
+                "engine/src/engine/page_life.rs",
             ],
         ),
         (
