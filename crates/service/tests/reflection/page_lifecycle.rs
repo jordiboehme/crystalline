@@ -829,3 +829,69 @@ async fn a_move_keeps_the_pact_hash_of_the_page_and_its_followers() {
     assert_eq!(stored_hash(&fx, "guides/b.md").await.unwrap(), b);
     assert_eq!(fresh_hash(&fx, "guides/b.md", &files), b);
 }
+
+/// A retire keeps the status the page had, and a restore puts it back; a
+/// page that had none comes back with none.
+#[tokio::test]
+async fn a_restore_brings_back_the_status_the_page_had() {
+    let fx = reflecting().await;
+    put(&fx, "draft.md", &format!("---\nstatus: draft\n---\n{PAGE}")).await;
+    put(&fx, "plain.md", PAGE).await;
+    for page in ["draft.md", "plain.md"] {
+        fx.engine
+            .write_reflection(&act("retire", page), &agent())
+            .await
+            .unwrap();
+    }
+    let retired = record(&fx, "draft.md").retired.unwrap();
+    assert_eq!(retired.was_status.as_deref(), Some("draft"));
+    assert!(file(&fx, "draft.md").unwrap().contains("status: archived"));
+    for page in ["draft.md", "plain.md"] {
+        fx.engine
+            .write_reflection(&act("restore", page), &person())
+            .await
+            .unwrap();
+    }
+    let draft = file(&fx, "draft.md").unwrap();
+    assert!(
+        draft.contains("status: draft") && !draft.contains("archived"),
+        "{draft}"
+    );
+    assert!(!file(&fx, "plain.md").unwrap().contains("status"));
+}
+
+/// An empty owner names no page, on a write and on a restore alike.
+#[tokio::test]
+async fn an_empty_owner_is_refused_everywhere() {
+    let fx = reflecting().await;
+    put(&fx, "old.md", PAGE).await;
+    fx.engine
+        .write_reflection(&act("retire", "old.md"), &agent())
+        .await
+        .unwrap();
+    for owner in ["", "  "] {
+        let on_write = fx
+            .engine
+            .write_reflection(&owned("new.md", owner, PAGE), &agent())
+            .await
+            .unwrap_err();
+        let on_restore = fx
+            .engine
+            .write_reflection(
+                &WriteReflectionParams {
+                    owner: Some(owner.into()),
+                    ..act("restore", "old.md")
+                },
+                &person(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(on_write.to_string(), on_restore.to_string());
+        assert!(
+            on_write.to_string().contains("leave owner out"),
+            "{on_write}"
+        );
+    }
+    assert!(file(&fx, "new.md").is_none());
+    assert!(record(&fx, "old.md").retired.is_some(), "still retired");
+}

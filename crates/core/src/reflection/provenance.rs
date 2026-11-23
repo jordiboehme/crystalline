@@ -275,6 +275,10 @@ pub struct Retirement {
     /// back under that page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was_owned_by: Option<String>,
+    /// The page's `status` when it was retired, so a restore puts it back;
+    /// `None` when it had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_status: Option<String>,
     /// Keys this binary does not know, kept through a read and a write.
     #[serde(flatten)]
     pub other: serde_yaml_ng::Mapping,
@@ -821,6 +825,7 @@ mod tests {
                 at: "2026-11-20T10:00:00Z".into(),
                 by: "ada".into(),
                 was_owned_by: Some("arch/overview.md".into()),
+                was_status: Some("draft".into()),
                 other: serde_yaml_ng::Mapping::new(),
             }),
             ..PageRecord::default()
@@ -846,7 +851,7 @@ mod tests {
         assert_eq!(keys, ["0abc1234", "aaaa1111", "_page"], "{block}");
         assert!(
             block.ends_with(
-                "_page:\n  owner: arch/overview.md\n  retired:\n    at: 2026-11-20T10:00:00Z\n    by: ada\n    was_owned_by: arch/overview.md\n"
+                "_page:\n  owner: arch/overview.md\n  retired:\n    at: 2026-11-20T10:00:00Z\n    by: ada\n    was_owned_by: arch/overview.md\n    was_status: draft\n"
             ),
             "{block}"
         );

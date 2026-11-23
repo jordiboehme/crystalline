@@ -106,15 +106,17 @@ impl Engine {
                 )));
             }
             was_owned_by = prov.page.owner.take();
+            // The status it has now comes back with a restore.
+            let was_status = r::read_page_settings(text, inner, &prov.page).0.status;
             prov.page.retired = Some(r::Retirement {
                 at: time::now().rfc3339_secs_z(),
                 by: caller.author.name.clone(),
                 was_owned_by: was_owned_by.clone(),
+                was_status,
                 other: Default::default(),
             });
             let text = r::write_provenance(text, &prov).map_err(EngineError::Invalid)?;
-            let status = format!("---\n{}: {RETIRED_STATUS}\n---\n", r::STATUS_KEY);
-            r::carry_page_keys(&text, Some(&status), &[r::STATUS_KEY]).map_err(EngineError::Invalid)
+            set_status(&text, Some(RETIRED_STATUS))
         })
         .await?;
         Ok(json!({
@@ -137,7 +139,10 @@ impl Engine {
         owner: Option<&str>,
         caller: &ReflectionCaller,
     ) -> Result<Value> {
-        let owner = owner.map(str::trim).filter(|o| !o.is_empty());
+        let owner = owner.map(str::trim);
+        if owner == Some("") {
+            return Err(EngineError::Invalid(EMPTY_OWNER.into()));
+        }
         let access = self.page_record_gate(domain, inner, caller).await?;
         let abs = access.abs(inner);
         let _lock = self.lock_file(&abs).await;
@@ -169,11 +174,16 @@ impl Engine {
             self.refuse_owner(access.domain_id, inner, owner, Some(&text), follows)
                 .await?;
         }
-        prov.page.retired = None;
+        // The status the page had before it was retired comes back; none
+        // stays none.
+        let was_status = prov
+            .page
+            .retired
+            .take()
+            .and_then(|retired| retired.was_status);
         prov.page.owner = owner.map(str::to_string);
         let changed = r::write_provenance(&text, &prov).map_err(EngineError::Invalid)?;
-        let changed =
-            r::carry_page_keys(&changed, None, &[r::STATUS_KEY]).map_err(EngineError::Invalid)?;
+        let changed = set_status(&changed, was_status.as_deref())?;
         self.land_page_record(domain, &access, inner, &abs, &changed, caller)
             .await?;
         drop(_lock);
@@ -282,6 +292,24 @@ impl Engine {
             );
         }
     }
+}
+
+/// The refusal of an empty `owner`, on a write and on a restore alike.
+pub(super) const EMPTY_OWNER: &str =
+    "owner names no page; name a page path such as arch/overview.md, or leave owner out";
+
+/// `text` with its `status` set to `status`, or taken out with `None`.
+fn set_status(text: &str, status: Option<&str>) -> Result<String> {
+    let stored = status
+        .map(|status| {
+            let mut map = serde_yaml_ng::Mapping::new();
+            map.insert(r::STATUS_KEY.into(), status.into());
+            serde_yaml_ng::to_string(&map)
+                .map(|yaml| format!("---\n{yaml}---\n"))
+                .map_err(|e| EngineError::Internal(e.to_string()))
+        })
+        .transpose()?;
+    r::carry_page_keys(text, stored.as_deref(), &[r::STATUS_KEY]).map_err(EngineError::Invalid)
 }
 
 /// Whether the page `text` at `inner` is retired by its `status`.

@@ -1885,6 +1885,9 @@ impl Engine {
         // changes nothing; the stored record keeps it either way.
         let new_owner = match (p.owner.as_deref().map(str::trim), current.as_deref()) {
             (None, _) => None,
+            (Some(""), _) => {
+                return Err(EngineError::Invalid(super::page_life::EMPTY_OWNER.into()));
+            }
             (Some(_), _) if r::is_pact_file(&p.path) => {
                 return Err(EngineError::Invalid(format!(
                     "an owner is named for a page, and '{}' is a pact file; leave owner out",
@@ -3289,6 +3292,21 @@ struct StagedMove {
 /// frontmatter that cannot be cut is left as it is: that page then names a
 /// page that is gone, which the queue tells a curator.
 fn owner_rewrite(text: &str, from: &str, to: &str) -> (String, usize) {
+    // The screen asks this of every other page of the Reflection: a page
+    // whose text does not even hold the path, or whose record names it
+    // nowhere, is answered before its block is touched.
+    if !text.contains(from) {
+        return (text.to_string(), 0);
+    }
+    let record = r::read_provenance(text).page;
+    let names = record.owner.as_deref() == Some(from)
+        || record
+            .retired
+            .as_ref()
+            .is_some_and(|retired| retired.was_owned_by.as_deref() == Some(from));
+    if !names {
+        return (text.to_string(), 0);
+    }
     r::rewrite_owner(text, from, to).unwrap_or_else(|_| (text.to_string(), 0))
 }
 
