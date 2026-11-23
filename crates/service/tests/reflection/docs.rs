@@ -1293,7 +1293,7 @@ async fn a_failed_index_leaves_the_page(fx: Fx) {
 }
 
 /// What the bus heard of the Reflection, in order: kind, path, from.
-fn reflection_events(
+pub fn reflection_events(
     rx: &mut tokio::sync::broadcast::Receiver<crystalline_service::changes::Envelope>,
 ) -> Vec<(
     crystalline_service::changes::ReflectionChangeKind,

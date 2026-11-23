@@ -228,9 +228,6 @@ pub(crate) enum RowOp<'a> {
         seen: Option<&'a crystalline_index::AttachmentRow>,
     },
     /// A page's reconcile state, as recorded.
-    // Built only by the tests until the `reconciled` action of
-    // `write_reflection` records one.
-    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
     Reconcile(&'a crystalline_index::ReflectionReconcile),
     /// A page's reconcile state goes with it from `from` to `to`. Put it
     /// before the [`RowOp::DeletePage`] of `from`, which takes the state

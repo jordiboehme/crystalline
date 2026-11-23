@@ -26,6 +26,7 @@ use crystalline_index::ReflectionReconcile;
 
 use super::fence::{DiskUndo, OnRefusal, RowOp};
 use super::*;
+use crate::scope::{ReflectionCaller, ReflectionRight};
 
 /// What a reconcile did to its page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,12 +174,99 @@ impl Engine {
             .collect())
     }
 
+    /// `write_reflection` with `action: reconciled`: record that the page
+    /// at `inner` was brought in line with its pacts now, with `outcome`
+    /// (`updated` or `unchanged`), the version of the queue item it settled
+    /// and the pact hash the page has now ([`r::page_pact_hash`], computed
+    /// here, never sent). A curator's (an agent of the reflect loop is one;
+    /// an unattended run writes only into the domain it works on). The page
+    /// must exist and not be retired: a retired page is never reconciled.
+    /// Nothing is written into the file, so no backup commit follows; open
+    /// tabs hear a change event and read the new state.
+    pub(crate) async fn reconciled_reflection(
+        &self,
+        domain: &str,
+        inner: &str,
+        outcome: Option<&str>,
+        version: Option<&str>,
+        caller: &ReflectionCaller,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let access = self
+            .require_reflection_to_write(domain, caller, ReflectionRight::Curate)
+            .await?;
+        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
+        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        if !is_page(inner) {
+            return Err(EngineError::Invalid(format!(
+                "'{inner}' is no page: only a page is reconciled, never PACT.md or a page pact"
+            )));
+        }
+        let outcome = outcome.and_then(ReconcileOutcome::parse).ok_or_else(|| {
+            EngineError::Invalid(
+                "reconciled needs outcome: updated (the reconcile changed the page) or unchanged"
+                    .into(),
+            )
+        })?;
+        let version = version.unwrap_or_default();
+        // Under the page's lock, so the page checked is the page recorded.
+        let abs = access.abs(inner);
+        let _lock = self.lock_file(&abs).await;
+        let text = read_opt(&abs)?.ok_or_else(|| {
+            EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"))
+        })?;
+        if super::page_life::is_retired(&text, inner) {
+            return Err(EngineError::Invalid(format!(
+                "'{inner}' is retired, and a retired page is never reconciled; restore it first"
+            )));
+        }
+        let rows = self
+            .store
+            .lock()
+            .await
+            .list_reflections(access.domain_id)
+            .await?;
+        // The page as it is on disk, which its row follows.
+        let files = rows
+            .iter()
+            .filter(|row| row.path != inner)
+            .map(|row| (row.path.as_str(), row.content.as_str()))
+            .chain([(inner, text.as_str())]);
+        let pact_hash = r::page_pact_hash(inner, files).unwrap_or_default();
+        let state = self
+            .record_reflection_reconcile(
+                domain,
+                access.domain_id,
+                inner,
+                outcome,
+                &pact_hash,
+                version,
+            )
+            .await?;
+        drop(_lock);
+        self.announce_reflection(
+            domain,
+            inner,
+            ReflectionChangeKind::Changed,
+            None,
+            crate::changes::change_label(&caller.scope),
+        );
+        Ok(json!({
+            "domain": domain,
+            "path": inner,
+            "outcome": outcome.as_str(),
+            "last_reconciled": state.last_reconciled,
+            "pact_hash": state.pact_hash,
+            "version": state.version,
+        }))
+    }
+
     /// Record a reconcile of the page at `page` now, behind the host-lock
     /// fence. No rights are checked here: the caller has checked them, and
     /// that the page exists.
-    // Only the tests call it until the `reconciled` action of
-    // `write_reflection` does.
-    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
     pub(crate) async fn record_reflection_reconcile(
         &self,
         domain: &str,

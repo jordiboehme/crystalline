@@ -1715,6 +1715,16 @@ impl Engine {
                 self.restore_reflection(&p.domain, &p.path, p.owner.as_deref(), caller)
                     .await
             }
+            "reconciled" => {
+                self.reconciled_reflection(
+                    &p.domain,
+                    &p.path,
+                    p.outcome.as_deref(),
+                    p.version.as_deref(),
+                    caller,
+                )
+                .await
+            }
             "move_asset" => {
                 let to = p.to.as_deref().ok_or_else(|| {
                     EngineError::Invalid(
@@ -1732,7 +1742,7 @@ impl Engine {
             }
             "write_asset" => self.write_reflection_asset(p, caller).await,
             other => Err(EngineError::Invalid(format!(
-                "`{other}` is not a write_reflection action; use write, move, delete, settle, retire, restore, write_asset, move_asset or delete_asset"
+                "`{other}` is not a write_reflection action; use write, move, delete, settle, retire, restore, reconciled, write_asset, move_asset or delete_asset"
             ))),
         }
     }

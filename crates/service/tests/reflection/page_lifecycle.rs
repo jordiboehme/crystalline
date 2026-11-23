@@ -97,7 +97,8 @@ async fn an_unattended_session_retires_instead_of_deleting() {
     // What it does instead goes through.
     within(
         Some(Limit::default()),
-        fx.engine.write_reflection(&act("retire", "guides/a.md"), &agent()),
+        fx.engine
+            .write_reflection(&act("retire", "guides/a.md"), &agent()),
     )
     .await
     .unwrap();
@@ -526,4 +527,244 @@ async fn a_move_takes_the_owned_pages_along() {
         r::feedback_changes(&one, &file(&fx, ".reflected/arch/one.md").unwrap()).is_empty(),
         "the rewrite owes no feedback"
     );
+}
+
+// --- reconciled ---------------------------------------------------------------
+
+fn reconciled(path: &str, outcome: &str, version: &str) -> WriteReflectionParams {
+    WriteReflectionParams {
+        outcome: Some(outcome.into()),
+        version: Some(version.into()),
+        ..act("reconciled", path)
+    }
+}
+
+/// The pact hash of `page` computed now from the files on disk named in
+/// `files` (every page and pact file the chain can reach).
+fn fresh_hash(fx: &Fx, page: &str, files: &[&str]) -> String {
+    let texts: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|path| Some((path.to_string(), file(fx, path)?)))
+        .collect();
+    r::page_pact_hash(page, texts.iter().map(|(p, t)| (p.as_str(), t.as_str()))).expect("a page")
+}
+
+async fn stored_hash(fx: &Fx, page: &str) -> Option<String> {
+    fx.engine
+        .reflection_reconcile("eng", page)
+        .await
+        .unwrap()
+        .expect("a page")
+        .pact_hash
+}
+
+/// `reconciled` records the reconcile beside the page: its outcome, the
+/// item's version and the pact hash the page has now. The file is not
+/// touched, and open tabs hear a change event.
+#[tokio::test]
+async fn a_reconcile_is_recorded_beside_the_page_and_announced() {
+    use crystalline_service::changes::ReflectionChangeKind as K;
+    use crystalline_service::engine::ReconcileOutcome;
+    let fx = reflecting().await;
+    put(&fx, "PACT.md", "# Pact\n\n## Tone\n\nPlain.\n").await;
+    put(
+        &fx,
+        "guides/a.md",
+        &format!("---\nfreshness: 1d\n---\n{PAGE}"),
+    )
+    .await;
+    let before = file(&fx, "guides/a.md").unwrap();
+    let mut rx = fx.engine.changes().subscribe();
+
+    let receipt = fx
+        .engine
+        .write_reflection(&reconciled("guides/a.md", "unchanged", "v1"), &agent())
+        .await
+        .unwrap();
+    assert_eq!(receipt["outcome"], "unchanged", "{receipt}");
+
+    let state = fx
+        .engine
+        .reflection_reconcile("eng", "guides/a.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.outcome, Some(ReconcileOutcome::Unchanged));
+    assert_eq!(state.version.as_deref(), Some("v1"));
+    assert_eq!(
+        state.pact_hash,
+        Some(fresh_hash(&fx, "guides/a.md", &["PACT.md", "guides/a.md"]))
+    );
+    assert_eq!(receipt["last_reconciled"], state.last_reconciled.as_str());
+    assert_eq!(file(&fx, "guides/a.md").unwrap(), before, "the file stays");
+    assert_eq!(
+        crate::docs::reflection_events(&mut rx),
+        vec![(K::Changed, "guides/a.md".to_string(), None)]
+    );
+
+    fx.engine
+        .write_reflection(&reconciled("guides/a.md", "updated", "v2"), &agent())
+        .await
+        .unwrap();
+    let state = fx
+        .engine
+        .reflection_reconcile("eng", "guides/a.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.outcome, Some(ReconcileOutcome::Updated));
+    assert_eq!(state.version.as_deref(), Some("v2"));
+}
+
+/// `reconciled` needs a known outcome, a page that exists and is not
+/// retired (a retired page is never reconciled), and curate access.
+#[tokio::test]
+async fn a_reconcile_is_refused_for_what_is_no_live_page() {
+    let (fx, ann, _) = crate::page_rights::editor_and_curator().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    put(
+        &fx,
+        "guides/a.pact.md",
+        "# Pact of A\n\n## Tone\n\nShort.\n",
+    )
+    .await;
+    put(&fx, "old.md", PAGE).await;
+    fx.engine
+        .write_reflection(&act("retire", "old.md"), &person())
+        .await
+        .unwrap();
+
+    let cases: Vec<(WriteReflectionParams, &str)> = vec![
+        (act("reconciled", "guides/a.md"), "outcome"),
+        (reconciled("guides/a.md", "done", "v1"), "outcome"),
+        (reconciled("gone.md", "unchanged", "v1"), "no reflection"),
+        (reconciled("old.md", "unchanged", "v1"), "retired"),
+        (reconciled("PACT.md", "unchanged", "v1"), "page"),
+        (reconciled("guides/a.pact.md", "unchanged", "v1"), "page"),
+    ];
+    for (params, says) in cases {
+        let refused = fx
+            .engine
+            .write_reflection(&params, &person())
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains(says),
+            "{}: {refused}",
+            params.path
+        );
+    }
+    let refused = fx
+        .engine
+        .write_reflection(&reconciled("guides/a.md", "unchanged", "v1"), &ann)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
+    for path in ["guides/a.md", "old.md"] {
+        let state = fx
+            .engine
+            .reflection_reconcile("eng", path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.outcome, None, "{path}: nothing recorded");
+    }
+}
+
+/// Only `reconciled` records a reconcile: a write, a retire and a restore
+/// leave the page with no recorded one.
+#[tokio::test]
+async fn no_other_write_records_a_reconcile() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    fx.engine
+        .write_reflection(&owned("arch/one.md", "arch.md", PAGE), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&act("retire", "arch/one.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&act("restore", "arch/one.md"), &person())
+        .await
+        .unwrap();
+    for path in ["arch.md", "arch/one.md"] {
+        let state = fx
+            .engine
+            .reflection_reconcile("eng", path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.outcome, None, "{path}");
+        assert_eq!(state.pact_hash, None, "{path}");
+    }
+}
+
+/// A curator's move keeps the pact hash of the moved page and of the pages
+/// that follow it: the stored hash stays equal to one computed now, though
+/// the move rebased a link in the page's pact, relinked `PACT.md` and
+/// rewrote the follower's `follows`.
+#[tokio::test]
+async fn a_move_keeps_the_pact_hash_of_the_page_and_its_followers() {
+    let fx = reflecting().await;
+    put(
+        &fx,
+        "PACT.md",
+        "# Pact\n\n## Tone\n\nSee [a](guides/a.md).\n",
+    )
+    .await;
+    put(
+        &fx,
+        "guides/a.md",
+        &format!("---\nfreshness: 1d\n---\n{PAGE}"),
+    )
+    .await;
+    put(
+        &fx,
+        "guides/a.pact.md",
+        "# Pact of A\n\n## Tone\n\nLike [b](b.md).\n",
+    )
+    .await;
+    put(
+        &fx,
+        "guides/b.md",
+        &format!("---\nfollows: guides/a.md\n---\n{PAGE}"),
+    )
+    .await;
+    for page in ["guides/a.md", "guides/b.md"] {
+        fx.engine
+            .write_reflection(&reconciled(page, "unchanged", "v1"), &agent())
+            .await
+            .unwrap();
+    }
+    let (a, b) = (
+        stored_hash(&fx, "guides/a.md").await.unwrap(),
+        stored_hash(&fx, "guides/b.md").await.unwrap(),
+    );
+    assert_ne!(a, b, "the follower follows one pact more");
+    let pact_before = file(&fx, "guides/a.pact.md").unwrap();
+    let agreement_before = file(&fx, "PACT.md").unwrap();
+
+    fx.engine
+        .move_reflection("eng", "guides/a.md", "design/c.md", &person())
+        .await
+        .unwrap();
+
+    assert_ne!(
+        file(&fx, "design/c.pact.md").unwrap(),
+        pact_before,
+        "rebased"
+    );
+    assert_ne!(file(&fx, "PACT.md").unwrap(), agreement_before, "relinked");
+    assert!(
+        file(&fx, "guides/b.md")
+            .unwrap()
+            .contains("follows: design/c.md")
+    );
+    let files = ["PACT.md", "design/c.md", "design/c.pact.md", "guides/b.md"];
+    assert_eq!(stored_hash(&fx, "design/c.md").await.unwrap(), a);
+    assert_eq!(fresh_hash(&fx, "design/c.md", &files), a);
+    assert_eq!(stored_hash(&fx, "guides/b.md").await.unwrap(), b);
+    assert_eq!(fresh_hash(&fx, "guides/b.md", &files), b);
 }
