@@ -1218,8 +1218,6 @@ fn domain_host_of(r: &Row) -> DomainHost {
     }
 }
 
-/// The read of one automation lease row, in [`automation_lease_of`]'s column
-/// order.
 /// The columns [`reconcile_of`] reads, in its order.
 const RECONCILE_SELECT: &str = "SELECT path, last_reconciled, outcome, pact_hash, version \
      FROM reflection_reconcile";
@@ -1235,6 +1233,8 @@ fn reconcile_of(row: &Row) -> Option<ReflectionReconcile> {
     })
 }
 
+/// The read of one automation lease row, in [`automation_lease_of`]'s column
+/// order.
 const AUTOMATION_LEASE_SQL: &str = "SELECT instance_id, account, runner, token, taken_at, renewed_at, unshared_at_start, due_at_start, pr_url, written FROM automation_lease WHERE domain_id=?1 AND loop_kind=?2";
 
 /// An [`AutomationLease`] from a row read by [`AUTOMATION_LEASE_SQL`]'s
@@ -5190,31 +5190,24 @@ impl Store for TursoStore {
         if from == to {
             return Ok(());
         }
-        let moving = vec![Value::Integer(domain.0), Value::Text(from.to_string())];
-        if query_first(
-            &self.conn,
-            "SELECT 1 FROM reflection_reconcile WHERE domain_id=?1 AND path=?2",
-            moving,
-        )
-        .await?
-        .is_none()
-        {
-            return Ok(());
-        }
+        let key = vec![
+            Value::Integer(domain.0),
+            Value::Text(from.to_string()),
+            Value::Text(to.to_string()),
+        ];
+        // The target's state goes only when there is one to take its place.
         self.conn
             .execute(
-                "DELETE FROM reflection_reconcile WHERE domain_id=?1 AND path=?2",
-                vec![Value::Integer(domain.0), Value::Text(to.to_string())],
+                "DELETE FROM reflection_reconcile WHERE domain_id=?1 AND path=?3 \
+                 AND EXISTS (SELECT 1 FROM reflection_reconcile \
+                 WHERE domain_id=?1 AND path=?2)",
+                key.clone(),
             )
             .await?;
         self.conn
             .execute(
                 "UPDATE reflection_reconcile SET path=?3 WHERE domain_id=?1 AND path=?2",
-                vec![
-                    Value::Integer(domain.0),
-                    Value::Text(from.to_string()),
-                    Value::Text(to.to_string()),
-                ],
+                key,
             )
             .await?;
         Ok(())

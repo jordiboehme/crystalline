@@ -4339,8 +4339,10 @@ pub trait Store: ReadStore {
 
     /// Replace the reconcile state of the page `state.path` of `domain`'s
     /// Reflection with `state`. The state goes with the page row
-    /// ([`Store::delete_reflection`]) and with the domain row, and stays
-    /// through [`Store::clear_domain`], so a full reindex keeps it.
+    /// ([`Store::delete_reflection`]) and with the domain row. A write of the
+    /// page row ([`Store::upsert_reflection`]) leaves it alone, so an edit, a
+    /// sync and a full reindex, which only upsert the rows of pages still
+    /// there, keep it.
     async fn set_reflection_reconcile(
         &self,
         domain: DomainId,

@@ -4167,9 +4167,9 @@ impl Store for PostgresStore {
                 return Ok(false);
             };
             // `domain_lock`, the two automation tables, `reflection_disclosure`,
-            // `reflection_reconcile` and `tag_alias` name the row without a cascade, and `relation`
-            // and `link` carry its id with no key at all, so each is cleared
-            // before the row itself.
+            // `reflection_reconcile` and `tag_alias` name the row without a
+            // cascade, and `relation` and `link` carry its id with no key at
+            // all, so each is cleared before the row itself.
             for sql in [
                 "DELETE FROM domain_spelling WHERE domain_id=$1",
                 // A chunk is not content, so it does not keep the row; it
@@ -5423,22 +5423,18 @@ impl Store for PostgresStore {
         }
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
-        let there: Option<(i32,)> =
-            sqlx::query_as("SELECT 1 FROM reflection_reconcile WHERE domain_id=$1 AND path=$2")
-                .bind(domain.0)
-                .bind(from)
-                .fetch_optional(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-        if there.is_none() {
-            return Ok(());
-        }
-        sqlx::query("DELETE FROM reflection_reconcile WHERE domain_id=$1 AND path=$2")
-            .bind(domain.0)
-            .bind(to)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
+        // The target's state goes only when there is one to take its place.
+        sqlx::query(
+            "DELETE FROM reflection_reconcile WHERE domain_id=$1 AND path=$3 \
+             AND EXISTS (SELECT 1 FROM reflection_reconcile \
+             WHERE domain_id=$1 AND path=$2)",
+        )
+        .bind(domain.0)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
         sqlx::query("UPDATE reflection_reconcile SET path=$3 WHERE domain_id=$1 AND path=$2")
             .bind(domain.0)
             .bind(from)

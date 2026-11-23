@@ -346,3 +346,41 @@ async fn writes_and_a_full_reindex_keep_the_state() {
     assert_eq!(read("guides/b.md").await, b, "the follower keeps its own");
     assert_eq!(read("guides/c.md").await, a, "the moved page keeps its own");
 }
+
+/// A stored state whose path has no page row is no page's: the list leaves
+/// it out.
+#[tokio::test]
+async fn a_state_without_a_page_row_is_left_out() {
+    let (fx, store) = reflecting_on().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    {
+        let store = store.lock().await;
+        let id = store.domain_id("eng").await.unwrap().unwrap();
+        store
+            .set_reflection_reconcile(
+                id,
+                &ReflectionReconcile {
+                    path: "guides/gone.md".into(),
+                    last_reconciled: "2026-11-20T10:00:00Z".into(),
+                    outcome: "updated".into(),
+                    pact_hash: "h".into(),
+                    version: "v".into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let all = fx.engine.reflection_reconciles("eng").await.unwrap();
+    assert_eq!(
+        all.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["guides/a.md"],
+        "{all:?}"
+    );
+    assert_eq!(
+        fx.engine
+            .reflection_reconcile("eng", "guides/gone.md")
+            .await
+            .unwrap(),
+        None
+    );
+}

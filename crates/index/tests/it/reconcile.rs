@@ -1,8 +1,8 @@
 //! The reconcile state of a Reflection page: one row per page, kept beside
 //! the page row and never in the file. A set replaces the page's row, a move
 //! carries it to the new path, and it goes with the page row and with the
-//! domain row. A domain rename keeps it, and so does a full reindex, which
-//! clears and rebuilds the page rows but not the state.
+//! domain row. A domain rename keeps it, and so does a write of the page row,
+//! which is all a reindex does to a page that is still there.
 
 use crystalline_index::{
     DomainId, DomainKind, ReflectionReconcile, ReflectionRow, Store, TursoStore,
@@ -175,9 +175,10 @@ async fn goes_with_the_page_row(store: &dyn Store) {
             .is_some()
     );
 
-    // A full reindex clears the page rows by domain and writes them again;
-    // the state stays, so not every page is due after it.
-    store.clear_domain(eng).await.unwrap();
+    // A write of the page row (an edit, a sync, a full reindex) only
+    // upserts it and never touches the state, so not every page is due
+    // after a reindex.
+    page(store, eng, "b.md").await;
     assert!(
         store
             .reflection_reconcile(eng, "b.md")
