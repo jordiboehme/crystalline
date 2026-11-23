@@ -123,8 +123,15 @@ async fn run(
             Some(Value::Bool(force)) => *force,
             Some(_) => return Err(Failure::invalid("force must be true or false")),
         };
+        // `counts: false` skips the due work, for a frequent poll that needs
+        // only whether a run is going, the last run and where the loop runs.
+        let counts = match request.get("counts") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(counts)) => *counts,
+            Some(_) => return Err(Failure::invalid("counts must be true or false")),
+        };
         return Ok(engine
-            .automation_status_forced(lp, &domains, scope, force)
+            .automation_status_with(lp, &domains, scope, force, counts)
             .await?);
     }
     let domain = text(request, "domain")?;

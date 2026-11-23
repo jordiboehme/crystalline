@@ -12,7 +12,7 @@ Every runner asks first. When nothing is due, it ends at once and starts no agen
 
 | Command | What it does |
 |---|---|
-| `crystalline <loop> status [--domain D]...` | Shows per domain what is due, as counts, plus a run that is going, the last run and the webhook state. `--json` prints the answer as it came. |
+| `crystalline <loop> status [--domain D]... [--no-counts]` | Shows per domain what is due, as counts, plus a run that is going, the last run and the webhook state. `--no-counts` works out nothing that is due (see [A frequent poll](#a-frequent-poll)). `--json` prints the answer as it came. |
 | `crystalline <loop> run [--domain D]` | Works what is due with a headless Claude Code agent: takes the lease, runs the agent with the prompt the server answers (`automation_prompt`), shares its changes as a pull request, records the run and releases the lease. Without `--domain` it works every due domain in turn. |
 | `crystalline <loop> watch [--domain D]... [--interval S]` | Checks the status every `--interval` seconds (default 60) and runs when something is due. Runs until it gets SIGTERM or Ctrl-C. |
 | `crystalline <loop> prompt --domain D [--max-items N] [--skills-loaded [true\|false]] [--config FILE]` | Prints the shipped prompt, for a runner that starts its own agent, with the skills line this machine's `skills.serve` gives. `--json` prints what the `automation_prompt` verb answers (see [The prompt for your own agent](#the-prompt-for-your-own-agent)). |
@@ -34,10 +34,16 @@ Exit codes, so a shell `if` reads naturally:
 
 | Command | 0 | 1 | 2 |
 |---|---|---|---|
-| `status` | something is due | nothing is due | an error |
+| `status` | something is due, or `--no-counts` | nothing is due | an error |
 | `run` | the run is done or stopped at its item cap | nothing is due, or a run already holds the lease | the run failed, or an error |
 
 A scheduler reads every code that is not 0 as a failed job. The Kubernetes and GitHub examples use a small wrapper, [`examples/kubernetes/crystalline-loop.sh`](../examples/kubernetes/crystalline-loop.sh), that turns 1 into 0 and passes SIGTERM on to the run.
+
+### A frequent poll
+
+To work out what is due, the status sweeps each domain: the reflect queue reads every page and its threads, the evolve sweep reads every engram. That is fine once a minute, but too much for a dashboard that polls every second. Send `"counts": false` with `automation_status` (`crystalline <loop> status --no-counts`): the answer still says per domain whether a run is going (`running`), the last run, where the loop runs (`runs_on`), the backoff (`reason`) and the webhook state, but `due`, `counts` and `left_for_person` are `null`. Without `counts`, or with `true`, the answer is the full one.
+
+The status reads through the store's read connections, so a poll never waits for a write in progress, and a lease taken or a run recorded is seen by the next status.
 
 ### Local or remote
 

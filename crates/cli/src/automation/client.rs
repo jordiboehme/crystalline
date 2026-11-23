@@ -82,12 +82,14 @@ impl AutomationClient {
 
     /// The status of `lp` on `domains`, or on every domain in scope. With
     /// `force` a loop that backs off after failed runs counts as due when it
-    /// has work.
+    /// has work; without `counts` nothing due is worked out (`due`, `counts`
+    /// and `left_for_person` are null).
     pub(super) async fn status(
         &self,
         lp: Loop,
         domains: &[String],
         force: bool,
+        counts: bool,
     ) -> anyhow::Result<Value> {
         let mut rest = if domains.is_empty() {
             json!({})
@@ -96,6 +98,9 @@ impl AutomationClient {
         };
         if force {
             rest["force"] = json!(true);
+        }
+        if !counts {
+            rest["counts"] = json!(false);
         }
         self.verb("automation_status", lp, rest).await
     }

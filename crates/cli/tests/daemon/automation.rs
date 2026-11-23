@@ -207,6 +207,16 @@ fn status_exit_codes_follow_due() {
         "{}",
         explain(&quiet)
     );
+    // Without counts nothing due is worked out: the line says so, and the
+    // exit code does not claim that nothing is due.
+    let cheap = env.output(&["evolve", "status", "--domain", "quiet", "--no-counts"]);
+    assert_eq!(code(&cheap), Some(0), "{}", explain(&cheap));
+    assert_eq!(
+        String::from_utf8_lossy(&cheap.stdout).trim(),
+        "quiet: not counted",
+        "{}",
+        explain(&cheap)
+    );
     let all = env.output(&["evolve", "status"]);
     assert_eq!(code(&all), Some(0), "{}", explain(&all));
     let unknown = env.output(&["evolve", "status", "--domain", "nope"]);
