@@ -2398,8 +2398,10 @@ impl Engine {
     }
 
     /// A reflection as a room reads it: the page without the block that
-    /// names its source engrams, for everyone in the room; the checksum is
-    /// the file's, so every stale check compares file against file.
+    /// names its source engrams and without the settings only a curator
+    /// changes (`freshness`, `follows`, `status`), for everyone in the room;
+    /// its saves put the stored settings back. The checksum is the file's,
+    /// so every stale check compares file against file.
     pub async fn reflection_room_text(&self, domain: &str, inner: &str) -> Result<EngramText> {
         let not_found =
             || EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"));
@@ -2412,7 +2414,7 @@ impl Engine {
             permalink: inner.to_string(),
             path: r::domain_rel(inner),
             checksum: sha256_hex(file.as_bytes()),
-            content: without_provenance(&file),
+            content: r::without_page_keys(&without_provenance(&file)),
         })
     }
 
@@ -2420,7 +2422,10 @@ impl Engine {
     /// as the room decided them (the signed-in accounts that edited since
     /// its last save, and those that typed a heading still without an id);
     /// an empty list records nobody, or "someone" when the room says so.
-    /// The stored bookkeeping wins over whatever the room text carries.
+    /// The stored bookkeeping wins over whatever the room text carries, and
+    /// so do the stored page settings (`freshness`, `follows`, `status`):
+    /// the room never shows them, and a save puts them back as stored, so
+    /// nobody changes them in a room, a curator neither.
     /// Section ids are assigned on the `final_save` only. Answers the
     /// receipt a room reads (`checksum`, `permalink`, `path`); `permalink`
     /// is `inner`, so a reflection room is never re-keyed.
@@ -2514,8 +2519,10 @@ impl Engine {
             final_save,
             &now(),
         )?;
+        let final_text = r::write_provenance(&composed, &prov).map_err(EngineError::Invalid)?;
         let final_text = crystalline_core::to_lf(
-            &r::write_provenance(&composed, &prov).map_err(EngineError::Invalid)?,
+            &r::carry_page_keys(&final_text, current.as_deref(), &r::PAGE_KEYS)
+                .map_err(EngineError::Invalid)?,
         )
         .into_owned();
         // A refused save puts the files back and keeps nothing itself: the

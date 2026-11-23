@@ -1124,6 +1124,104 @@ async fn a_reflection_room_records_the_signed_in_typist_and_nobody_else() {
     );
 }
 
+/// Two authors in one room over a page with settings: a curator (`ed`) and
+/// an editor (`ann`). The room shows neither `freshness`, `follows` nor
+/// `status`; the editor's saves never change them, a value typed into the
+/// editor included; and a curator's change through the API is not undone by
+/// the editor's next save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reflection_room_keeps_the_page_settings_for_both_authors() {
+    let (addr, _scratch, tmp) = serve_reflection().await;
+    let file = tmp.path().join("eng/reflections/guides/s.md");
+    std::fs::write(
+        &file,
+        "---\ntitle: S\nfreshness: 1d\nfollows: guides/a.md\nstatus: current\n---\n\n# S\n\n## One\n<!-- r:dddd4444 -->\n\nFirst.\n",
+    )
+    .unwrap();
+    let ed = login(addr, "ed", "pw12345678").await;
+    let ann = login(addr, "ann", "pw12345678").await;
+    let page = "/api/v1/collab-reflection/eng/guides/s.md";
+
+    let mut curator = connect(addr, page, Some(&ed.0), same_host(addr))
+        .await
+        .unwrap();
+    let ed_doc = client_doc();
+    curator.send(binary(step1(&ed_doc))).await.unwrap();
+    apply(&ed_doc, &next_sync_step2(&mut curator).await);
+    let mut editor = connect(addr, page, Some(&ann.0), same_host(addr))
+        .await
+        .unwrap();
+    let ann_doc = client_doc();
+    editor.send(binary(step1(&ann_doc))).await.unwrap();
+    apply(&ann_doc, &next_sync_step2(&mut editor).await);
+    let shown = {
+        let text = ann_doc.get_or_insert_text("content");
+        text.get_string(&ann_doc.transact())
+    };
+    for key in ["freshness", "follows", "status", "reflection:"] {
+        assert!(!shown.contains(key), "{key} in the room: {shown}");
+    }
+    assert!(shown.starts_with("---\ntitle: S\n---\n"), "{shown}");
+
+    // The editor types a freshness of her own and a line, and saves.
+    let typed = shown.replace("title: S\n", "title: S\nfreshness: 1h\nstatus: archived\n")
+        + "Typed by ann.\n";
+    editor
+        .send(binary(update_frame(&replace_all(&ann_doc, &typed))))
+        .await
+        .unwrap();
+    editor
+        .send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    wait_for_control(&mut editor, "saved").await;
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains("Typed by ann."), "{saved}");
+    assert!(
+        saved.starts_with("---\ntitle: S\nfreshness: 1d\nfollows: guides/a.md\nstatus: current\n"),
+        "the stored settings stay: {saved}"
+    );
+
+    // The curator changes the freshness through the API while the room is
+    // open.
+    let changed = saved.replace("freshness: 1d", "freshness: 6h");
+    let put = client()
+        .put(format!(
+            "http://{addr}/api/v1/domains/eng/reflections/guides/s.md"
+        ))
+        .header("cookie", format!("fluid_session={}", ed.0))
+        .header("x-csrf-token", &ed.1)
+        .json(&serde_json::json!({ "markdown": changed }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200, "{}", put.text().await.unwrap());
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("freshness: 6h")
+    );
+
+    // The editor's next save keeps the curator's value.
+    editor
+        .send(binary(update_frame(&append_line(
+            &ann_doc,
+            "Again by ann.",
+        ))))
+        .await
+        .unwrap();
+    editor
+        .send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    wait_for_control(&mut editor, "saved").await;
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains("Again by ann."), "{saved}");
+    assert!(saved.contains("freshness: 6h\n"), "{saved}");
+    assert!(!saved.contains("freshness: 1h"), "{saved}");
+    assert!(!saved.contains("archived"), "{saved}");
+}
+
 // --- a room over somebody else's draft ---------------------------------------
 
 /// The instance the overlay tests run against: one file domain `team` that

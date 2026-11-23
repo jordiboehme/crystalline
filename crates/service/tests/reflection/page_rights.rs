@@ -151,3 +151,61 @@ async fn a_page_pact_is_never_moved_on_its_own() {
     assert!(file(&fx, "guides/a.pact.md").is_some());
     assert!(file(&fx, "guides/b.md").is_some());
 }
+
+const SET: &str = "---\ntitle: A\nfreshness: 1d\nfollows: guides/b.md\nstatus: current\n---\n\n# A\n\n## One\n\nFirst.\n";
+
+/// A room never shows the settings, and its saves never change them: a save
+/// of the room text as it came is no write at all, and a key typed into the
+/// editor is replaced by the stored one.
+#[tokio::test]
+async fn a_room_neither_shows_nor_changes_the_settings() {
+    let (fx, _ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/a.md", SET, &curator).await.unwrap();
+    let stored = file(&fx, "guides/a.md").unwrap();
+    let room = fx
+        .engine
+        .reflection_room_text("eng", "guides/a.md")
+        .await
+        .unwrap();
+    for key in ["freshness", "follows", "status", "reflection:"] {
+        assert!(!room.content.contains(key), "{key}: {}", room.content);
+    }
+    assert!(room.content.contains("title: A"), "{}", room.content);
+    let saved = fx
+        .engine
+        .save_reflection_room(
+            "eng",
+            "guides/a.md",
+            &room.content,
+            &room.checksum,
+            &crystalline_service::SectionAuthors::plain(vec!["ann".into()]),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(file(&fx, "guides/a.md").unwrap(), stored, "no change");
+    assert_eq!(saved["checksum"], room.checksum.as_str());
+
+    let typed = room
+        .content
+        .replace("title: A\n", "title: A\nfreshness: 1h\nstatus: archived\n")
+        .replace("First.", "First, changed.");
+    fx.engine
+        .save_reflection_room(
+            "eng",
+            "guides/a.md",
+            &typed,
+            &room.checksum,
+            &crystalline_service::SectionAuthors::plain(vec!["ann".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    let after = file(&fx, "guides/a.md").unwrap();
+    assert!(after.contains("First, changed."), "{after}");
+    assert!(
+        after.starts_with("---\ntitle: A\nfreshness: 1d\nfollows: guides/b.md\nstatus: current\n"),
+        "{after}"
+    );
+}
