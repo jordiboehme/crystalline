@@ -157,6 +157,75 @@ pub fn owned_pages<'a>(
     owned
 }
 
+/// What a write of a page changes in the engrams it keeps covered after it
+/// dropped them (rule A of the reflect queue): [`cover_change`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoverChange {
+    /// The engrams of the page's own domain the write dropped from a page
+    /// with a freshness (or an owned page), each with its checksum when the
+    /// page cited it: they stay covered while that checksum holds.
+    pub add: Vec<(String, String)>,
+    /// The engrams the page cites again: it covers them by citing them.
+    pub remove: Vec<String>,
+}
+
+impl CoverChange {
+    /// Whether the write changes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
+}
+
+/// The engrams of the page's own domain a page cites, each with the
+/// checksum its first citing source recorded.
+fn own_cited(provenance: &Provenance) -> BTreeMap<String, String> {
+    let mut cited = BTreeMap::new();
+    for source in provenance.values().flat_map(|record| record.sources.iter()) {
+        if source.domain.is_none() {
+            cited
+                .entry(source.engram.clone())
+                .or_insert_with(|| source.checksum.clone());
+        }
+    }
+    cited
+}
+
+/// What the write of the page at `path` from `before` (its text as stored,
+/// `None` for a new page) to `after` changes in the engrams it keeps
+/// covered. An engram of the page's own domain that `before` cites and
+/// `after` does not is kept, with the checksum `before` recorded for it,
+/// when `after` is a page with a freshness or an owned page that is not
+/// retired: a page that keeps itself current drops last week's change, and
+/// that change is still reflected. An engram `after` cites and `before` did
+/// not leaves the kept set. Citing another domain's engram covers nothing of
+/// this one, so only sources of the page's own domain count. Nothing for
+/// `PACT.md`, a page pact or anything that is no page.
+pub fn cover_change(path: &str, before: Option<&str>, after: &str) -> CoverChange {
+    if is_pact_file(path) || !matches!(classify(path), ReflectionFile::Page(_)) {
+        return CoverChange::default();
+    }
+    let Some(before) = before else {
+        return CoverChange::default();
+    };
+    let was = own_cited(&read_provenance(before));
+    let provenance = read_provenance(after);
+    let now = own_cited(&provenance);
+    let (settings, _) = read_page_settings(after, path, &provenance.page);
+    let rolling = !settings.retired()
+        && (settings.freshness.is_some() || provenance.page.owner.is_some());
+    CoverChange {
+        add: if rolling {
+            was.iter()
+                .filter(|(engram, _)| !now.contains_key(*engram))
+                .map(|(engram, checksum)| (engram.clone(), checksum.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        remove: now.into_keys().filter(|engram| !was.contains_key(engram)).collect(),
+    }
+}
+
 /// `source` with an `owner` or a `was_owned_by` in its page record that
 /// names the page `from` naming `to` instead, and how many it changed: the
 /// page `from` moved. Nothing else of the record or the page changes; a
@@ -235,6 +304,73 @@ pub fn owner_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page whose one section cites the engrams `cites` of its own domain
+    /// (each with the checksum `sum-<permalink>`), with `front` as extra
+    /// frontmatter lines.
+    fn citing(front: &str, cites: &[&str]) -> String {
+        let mut block = String::from("reflection:\n  a1b2:\n    sources:\n");
+        for cite in cites {
+            block.push_str(&format!(
+                "    - engram: {cite}\n      checksum: sum-{cite}\n"
+            ));
+        }
+        if cites.is_empty() {
+            block = String::new();
+        }
+        format!("---\n{front}{block}---\n# Week\n\n## A\n<!-- id: a1b2 -->\n\nText.\n")
+    }
+
+    #[test]
+    fn a_rolling_page_keeps_what_it_drops_and_a_plain_page_does_not() {
+        let before = citing("freshness: 7d\n", &["weekly/a", "weekly/b"]);
+        let after = citing("freshness: 7d\n", &["weekly/b", "weekly/c"]);
+        assert_eq!(
+            cover_change("guides/week.md", Some(&before), &after),
+            CoverChange {
+                add: vec![("weekly/a".into(), "sum-weekly/a".into())],
+                remove: vec!["weekly/c".into()],
+            }
+        );
+        let plain_before = citing("", &["weekly/a", "weekly/b"]);
+        let plain_after = citing("", &["weekly/b"]);
+        assert!(cover_change("guides/plain.md", Some(&plain_before), &plain_after).is_empty());
+    }
+
+    #[test]
+    fn an_owned_page_keeps_what_it_drops_and_a_retired_one_does_not() {
+        let owned = |cites: &[&str]| {
+            citing("", cites).replace(
+                "reflection:\n",
+                "reflection:\n  _page:\n    owner: guides/week.md\n",
+            )
+        };
+        let change = cover_change(
+            "guides/week/a.md",
+            Some(&owned(&["weekly/a"])),
+            &owned(&["weekly/b"]),
+        );
+        assert_eq!(change.add, vec![("weekly/a".into(), "sum-weekly/a".into())]);
+
+        let retired = citing("freshness: 7d\nstatus: archived\n", &["weekly/b"]);
+        let change = cover_change(
+            "guides/week.md",
+            Some(&citing("freshness: 7d\n", &["weekly/a", "weekly/b"])),
+            &retired,
+        );
+        assert!(change.add.is_empty(), "{change:?}");
+    }
+
+    #[test]
+    fn a_new_page_a_pact_and_another_domains_source_change_nothing() {
+        let page = citing("freshness: 7d\n", &["weekly/a"]);
+        assert!(cover_change("guides/week.md", None, &page).is_empty());
+        let bare = citing("freshness: 7d\n", &[]);
+        assert!(cover_change("guides/week.pact.md", Some(&page), &bare).is_empty());
+        assert!(cover_change("PACT.md", Some(&page), &bare).is_empty());
+        let foreign = page.replace("    - engram:", "    - domain: harbor\n      engram:");
+        assert!(cover_change("guides/week.md", Some(&foreign), &bare).is_empty());
+    }
 
     fn page(follows: Option<&str>, owner: Option<&str>) -> PageLinks {
         PageLinks {

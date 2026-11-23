@@ -178,6 +178,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "reflection reconcile state",
         sql: SCHEMA_V31,
     },
+    Migration {
+        version: 32,
+        label: "reflection covered engrams",
+        sql: SCHEMA_V32,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -990,6 +995,23 @@ CREATE TABLE reflection_reconcile (
 );
 "#;
 
+// The engrams of a page's own domain that a page with a freshness (or an
+// owned page) cited and then dropped, with each engram's checksum when the
+// page cited it: such an engram stays covered for the reflect queue until
+// its checksum moves (rule A). Written beside the page row by the one
+// writer of page rows, so engine writes and the sync both keep it. Goes with
+// the page row (`delete_reflection`), moves with the page and does not
+// cascade from `domain`: `wipe()` and the empty-row drop clear it by hand.
+const SCHEMA_V32: &str = r#"
+CREATE TABLE reflection_covered (
+    domain_id INTEGER NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    permalink TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    PRIMARY KEY(domain_id, path, permalink)
+);
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1019,7 +1041,7 @@ CREATE TABLE attachment_blob (
 /// before it. `reflection` and `reflection_asset` reference `domain(id)` too,
 /// and so does `reflection_chunk`, which goes before `reflection`.
 /// `automation_lease` and `automation_run` reference `domain(id)` as well, and so do
-/// `reflection_disclosure` and `reflection_reconcile`.
+/// `reflection_disclosure`, `reflection_reconcile` and `reflection_covered`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_vector",
     "contradiction",
@@ -1045,6 +1067,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "automation_run",
     "reflection_disclosure",
     "reflection_reconcile",
+    "reflection_covered",
     "domain_spelling",
     "domain",
 ];

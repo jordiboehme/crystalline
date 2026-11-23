@@ -130,7 +130,8 @@ use crate::store::{
     FileStamp, FtsMode, GraphSlice, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery,
     InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, NewReflectionChunk,
     OBSERVATION_VECTOR_CHUNK, ObservationVector, OutboundRef, Page, RebuildKind, RecentFilter,
-    ReferenceCandidates, ReflectionReconcile, ReflectionRow, ReflectionStamp, ScoredPair,
+    ReferenceCandidates, ReflectionCovered, ReflectionReconcile, ReflectionRow, ReflectionStamp,
+    ScoredPair,
     SearchHit, SearchMode, SearchQuery, SectionVector, SpellingPlan, Store, StoreInfo,
     StoredEngram, Vocabulary, build_vocabulary, changed_spellings, count_references_to_sql,
     domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
@@ -3673,6 +3674,26 @@ impl ReadStore for PostgresStore {
         Ok(rows.into_iter().map(reconcile_of).collect())
     }
 
+    async fn reflection_covered(&self, domain: DomainId) -> Result<Vec<ReflectionCovered>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT path, permalink, checksum FROM reflection_covered WHERE domain_id=$1 \
+             ORDER BY path COLLATE \"C\", permalink COLLATE \"C\"",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, permalink, checksum)| ReflectionCovered {
+                path,
+                permalink,
+                checksum,
+            })
+            .collect())
+    }
+
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
         let mut conn = self.acquire().await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
@@ -4181,6 +4202,7 @@ impl Store for PostgresStore {
                 "DELETE FROM automation_run WHERE domain_id=$1",
                 "DELETE FROM reflection_disclosure WHERE domain_id=$1",
                 "DELETE FROM reflection_reconcile WHERE domain_id=$1",
+                "DELETE FROM reflection_covered WHERE domain_id=$1",
                 "DELETE FROM relation WHERE domain_id=$1",
                 "DELETE FROM link WHERE domain_id=$1",
                 "DELETE FROM domain WHERE id=$1",
@@ -5466,6 +5488,57 @@ impl Store for PostgresStore {
             .execute(&mut *c)
             .await
             .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM reflection_covered WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(to)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("UPDATE reflection_covered SET path=$3 WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(from)
+            .bind(to)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn update_reflection_covered(
+        &self,
+        domain: DomainId,
+        path: &str,
+        add: &[(String, String)],
+        remove: &[String],
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        for (permalink, checksum) in add {
+            sqlx::query(
+                "INSERT INTO reflection_covered (domain_id, path, permalink, checksum) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (domain_id, path, permalink) DO UPDATE SET \
+                 checksum=excluded.checksum",
+            )
+            .bind(domain.0)
+            .bind(path)
+            .bind(permalink)
+            .bind(checksum)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        }
+        for permalink in remove {
+            sqlx::query(
+                "DELETE FROM reflection_covered WHERE domain_id=$1 AND path=$2 AND permalink=$3",
+            )
+            .bind(domain.0)
+            .bind(path)
+            .bind(permalink)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        }
         Ok(())
     }
 
@@ -5664,6 +5737,12 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
         sqlx::query("DELETE FROM reflection_reconcile WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(path)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM reflection_covered WHERE domain_id=$1 AND path=$2")
             .bind(domain.0)
             .bind(path)
             .execute(&mut *c)

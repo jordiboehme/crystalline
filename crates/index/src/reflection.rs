@@ -237,13 +237,29 @@ fn hit(row: &ReflectionRow, section: &Section, snippet: String, score: f64) -> R
 /// `reconcile_rows` runs inside the apply's transaction. A row written
 /// without its chunks would never be re-chunked, because the prefilter trusts
 /// its stamp.
+///
+/// Beside the row it keeps the engrams the page covers after it dropped
+/// them ([`crystalline_core::reflection::cover_change`], rule A of the
+/// reflect queue), from the row as stored before and the new text: so an
+/// engine write, an edit on disk and a pull all count.
 pub async fn index_reflection_row<S: Store + ?Sized>(
     store: &S,
     domain: DomainId,
     row: &ReflectionRow,
     params: &ChunkParams,
 ) -> Result<()> {
+    let before = store.get_reflection(domain, &row.path).await?;
+    let covered = crystalline_core::reflection::cover_change(
+        &row.path,
+        before.as_ref().map(|stored| stored.content.as_str()),
+        &row.content,
+    );
     store.upsert_reflection(domain, row).await?;
+    if !covered.is_empty() {
+        store
+            .update_reflection_covered(domain, &row.path, &covered.add, &covered.remove)
+            .await?;
+    }
     let chunks = crate::embed::chunk_reflection(&row.title, &row.content, params);
     store
         .replace_reflection_chunks(domain, &row.path, &chunks)

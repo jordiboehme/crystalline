@@ -480,14 +480,15 @@ DELETE FROM auth_schema_migration WHERE version IN (2, 3);
 
 With `database.schema` set, name each table in that schema, for example `team_a.invites` and `team_a.auth_schema_migration`. On Turso an older binary ignores the new tables in `web-auth.db`.
 
-0.35.0 also raises the index ledger, `schema_migration`, to v34 on PostgreSQL and to v31 on Turso. The new table `reflection_reconcile` keeps when each Reflection page was last checked. A binary older than 0.35.0 refuses this index on both backends with "this index was upgraded by a newer Crystalline", and its `crystalline reindex --wipe` refuses it too. To go back, stop every instance, then drop the table and its ledger row. Only the last-checked times are lost: each page then counts as checked when it last changed.
+0.35.0 also raises the index ledger, `schema_migration`, to v35 on PostgreSQL and to v32 on Turso. The new table `reflection_reconcile` keeps when each Reflection page was last checked, and `reflection_covered` keeps the engrams a page with a freshness cited and later dropped, which still count as reflected. A binary older than 0.35.0 refuses this index on both backends with "this index was upgraded by a newer Crystalline", and its `crystalline reindex --wipe` refuses it too. To go back, stop every instance, then drop the tables and their ledger rows. Only the last-checked times and the dropped engrams are lost: each page then counts as checked when it last changed, and an engram no page cites now shows as unreflected again.
 
 ```sql
+DROP TABLE reflection_covered;
 DROP TABLE reflection_reconcile;
-DELETE FROM schema_migration WHERE version = 34;
+DELETE FROM schema_migration WHERE version IN (34, 35);
 ```
 
-With `database.schema` set, name both tables in that schema. On Turso, run the same statements with `version = 31` on `index.db` in the state folder, for example with `sqlite3`, while no Crystalline runs.
+With `database.schema` set, name every table in that schema. On Turso, run the same statements with `version IN (31, 32)` on `index.db` in the state folder, for example with `sqlite3`, while no Crystalline runs.
 
 **File domains.** The files of a domain stay on the disk of the instance that serves them. The index in Postgres is built from those files, so keep the knowledge folder on a volume or restore it from its Git remote, and a lost index is rebuilt with `crystalline reindex --full`. The engrams of a virtual domain live only in the database, so back it up or export it with `crystalline domain export`.
 

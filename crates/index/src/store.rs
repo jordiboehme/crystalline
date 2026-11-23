@@ -2675,6 +2675,22 @@ pub struct ReflectionReconcile {
     pub version: String,
 }
 
+/// An engram of a page's own domain that a page with a freshness (or an
+/// owned page) once cited and later dropped, with the engram's checksum
+/// when the page cited it: [`ReadStore::reflection_covered`]. Such an
+/// engram counts as covered while its checksum stays the same (rule A of
+/// the reflect queue). Written by
+/// [`crate::reflection::index_reflection_row`] only, beside the page row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectionCovered {
+    /// The page's path inside `reflections/`.
+    pub path: String,
+    /// The engram's permalink in the page's domain.
+    pub permalink: String,
+    /// SHA-256 hex of the engram file when the page cited it.
+    pub checksum: String,
+}
+
 /// Which table a domain's files are kept in. Each table keeps its own rows;
 /// one body of code reads and writes them all, the table chosen here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3572,6 +3588,11 @@ pub trait ReadStore: Send + Sync {
     /// one, sorted by path in byte order.
     async fn reflection_reconciles(&self, domain: DomainId) -> Result<Vec<ReflectionReconcile>>;
 
+    /// Every engram a page of `domain`'s Reflection keeps covered after it
+    /// dropped it ([`ReflectionCovered`]), sorted by path, then permalink,
+    /// in byte order.
+    async fn reflection_covered(&self, domain: DomainId) -> Result<Vec<ReflectionCovered>>;
+
     /// The lease of `loop_kind` on `domain` as stored, a stale one included.
     async fn automation_lease(
         &self,
@@ -4188,8 +4209,8 @@ pub trait Store: ReadStore {
     /// Insert or replace one reflection's row, keyed by `(domain, path)`.
     async fn upsert_reflection(&self, domain: DomainId, row: &ReflectionRow) -> Result<()>;
 
-    /// Remove one reflection's row, its chunks and its reconcile state.
-    /// `false` when there was no row.
+    /// Remove one reflection's row, its chunks, its reconcile state and the
+    /// engrams it keeps covered. `false` when there was no row.
     async fn delete_reflection(&self, domain: DomainId, path: &str) -> Result<bool>;
 
     /// Replace one page's chunk rows with a freshly computed set, carrying over
@@ -4366,11 +4387,25 @@ pub trait Store: ReadStore {
     ) -> Result<bool>;
 
     /// Carry the reconcile state of the page at `from` to `to`, for a page
-    /// move: a state at `to` is replaced, and a page with none at `from`
-    /// leaves `to` as it is. Two statements, so run it inside the caller's
-    /// transaction, with the page rows it moves beside.
+    /// move, and the engrams it keeps covered: a state at `to` is replaced,
+    /// and a page with none at `from` leaves `to` as it is; the covered
+    /// engrams of `to` are replaced by those of `from`. Several statements,
+    /// so run it inside the caller's transaction, with the page rows it
+    /// moves beside.
     async fn move_reflection_reconcile(&self, domain: DomainId, from: &str, to: &str)
     -> Result<()>;
+
+    /// Change the engrams the page at `path` keeps covered: each of `add`
+    /// (permalink, checksum) is set, replacing a checksum stored for that
+    /// permalink, then each permalink of `remove` goes. Run it inside the
+    /// caller's transaction, beside the page row.
+    async fn update_reflection_covered(
+        &self,
+        domain: DomainId,
+        path: &str,
+        add: &[(String, String)],
+        remove: &[String],
+    ) -> Result<()>;
 
     /// Record one run of `loop_kind` on `domain`, then keep only the newest
     /// `keep` runs of that domain and loop.

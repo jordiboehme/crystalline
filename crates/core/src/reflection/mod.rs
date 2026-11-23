@@ -60,7 +60,8 @@ pub use provenance::{
     respell_source_domains, source_domains_named, text_changed, title_of, write_provenance,
 };
 pub use reconcile::{
-    owned_pages, owner_refusal, pact_hash, pact_hashes, page_pact_hash, rewrite_owner,
+    CoverChange, cover_change, owned_pages, owner_refusal, pact_hash, pact_hashes, page_pact_hash,
+    rewrite_owner,
 };
 pub use sections::{
     Section, SectionKeyMiss, TOP_SECTION, WrittenIds, assign_ids, drop_written_ids, edit_section,

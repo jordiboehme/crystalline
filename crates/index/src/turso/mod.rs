@@ -60,7 +60,8 @@ use crate::store::{
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FtsMode, GraphSlice, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery,
     InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, NewReflectionChunk, ObservationVector,
-    OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ReflectionReconcile,
+    OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ReflectionCovered,
+    ReflectionReconcile,
     ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchQuery, SectionVector,
     SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
     count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
@@ -3499,6 +3500,26 @@ impl ReadStore for TursoStore {
         Ok(rows.iter().filter_map(reconcile_of).collect())
     }
 
+    async fn reflection_covered(&self, domain: DomainId) -> Result<Vec<ReflectionCovered>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT path, permalink, checksum FROM reflection_covered \
+             WHERE domain_id=?1 ORDER BY path, permalink",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some(ReflectionCovered {
+                    path: cell_text(row, 0)?,
+                    permalink: cell_text(row, 1)?,
+                    checksum: cell_text(row, 2)?,
+                })
+            })
+            .collect())
+    }
+
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
         let rows = query_all(
             &self.conn,
@@ -3988,6 +4009,7 @@ impl Store for TursoStore {
                 "DELETE FROM automation_run WHERE domain_id=?1",
                 "DELETE FROM reflection_disclosure WHERE domain_id=?1",
                 "DELETE FROM reflection_reconcile WHERE domain_id=?1",
+                "DELETE FROM reflection_covered WHERE domain_id=?1",
                 "DELETE FROM relation WHERE domain_id=?1",
                 "DELETE FROM link WHERE domain_id=?1",
                 "DELETE FROM domain WHERE id=?1",
@@ -5232,9 +5254,60 @@ impl Store for TursoStore {
         self.conn
             .execute(
                 "UPDATE reflection_reconcile SET path=?3 WHERE domain_id=?1 AND path=?2",
+                key.clone(),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM reflection_covered WHERE domain_id=?1 AND path=?3",
+                key.clone(),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE reflection_covered SET path=?3 WHERE domain_id=?1 AND path=?2",
                 key,
             )
             .await?;
+        Ok(())
+    }
+
+    async fn update_reflection_covered(
+        &self,
+        domain: DomainId,
+        path: &str,
+        add: &[(String, String)],
+        remove: &[String],
+    ) -> Result<()> {
+        for (permalink, checksum) in add {
+            self.conn
+                .execute(
+                    "INSERT INTO reflection_covered (domain_id, path, permalink, checksum) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(domain_id, path, permalink) DO UPDATE SET \
+                     checksum=excluded.checksum",
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Text(path.to_string()),
+                        Value::Text(permalink.clone()),
+                        Value::Text(checksum.clone()),
+                    ],
+                )
+                .await?;
+        }
+        for permalink in remove {
+            self.conn
+                .execute(
+                    "DELETE FROM reflection_covered \
+                     WHERE domain_id=?1 AND path=?2 AND permalink=?3",
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Text(path.to_string()),
+                        Value::Text(permalink.clone()),
+                    ],
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -5412,6 +5485,12 @@ impl Store for TursoStore {
         self.conn
             .execute(
                 "DELETE FROM reflection_reconcile WHERE domain_id=?1 AND path=?2",
+                key.clone(),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM reflection_covered WHERE domain_id=?1 AND path=?2",
                 key.clone(),
             )
             .await?;
