@@ -3626,6 +3626,7 @@ async fn admins_manage_agents_and_their_tokens() {
         .unwrap();
     assert_eq!(listed["agents"][0]["name"], "nightly");
     assert_eq!(listed["agents"][0]["tokens"][0]["state"], "live");
+    assert_eq!(listed["auth_mcp"], true, "{listed}");
     assert!(
         !listed.to_string().contains(&token),
         "never the token again"
@@ -5596,4 +5597,16 @@ async fn an_agent_is_refused_while_auth_mcp_is_off() {
         "{body}"
     );
     assert!(fx.auth.agents().await.unwrap().is_empty());
+    // The list says so before anyone tries, from the same setting the
+    // refusal reads, so a screen can hold its create button back.
+    let listed: serde_json::Value =
+        as_session(fx.addr, reqwest::Method::GET, "/api/v1/agents", &admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(listed["auth_mcp"], false, "{listed}");
+    assert_eq!(listed["agents"], serde_json::json!([]), "{listed}");
 }

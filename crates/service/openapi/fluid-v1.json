@@ -14487,7 +14487,8 @@
         "type": "object",
         "description": "What `GET /agents` answers with.",
         "required": [
-          "agents"
+          "agents",
+          "auth_mcp"
         ],
         "properties": {
           "agents": {
@@ -14496,6 +14497,10 @@
               "$ref": "#/components/schemas/Agent"
             },
             "description": "Every agent with its tokens, by name."
+          },
+          "auth_mcp": {
+            "type": "boolean",
+            "description": "Whether `auth.mcp` is on in the effective configuration, the value a\nnew agent is checked against. Agents work only with it on. The MCP\nendpoint reads the setting when the server starts, so a change made\nsince needs a restart there."
           }
         }
       },
@@ -16535,7 +16540,8 @@
         "type": "object",
         "description": "What `GET /invites` answers with.",
         "required": [
-          "invites"
+          "invites",
+          "sign_in"
         ],
         "properties": {
           "invites": {
@@ -16544,6 +16550,10 @@
               "$ref": "#/components/schemas/Invite"
             },
             "description": "The links, newest first, never with their tokens."
+          },
+          "sign_in": {
+            "$ref": "#/components/schemas/InviteSignIn",
+            "description": "The way in this instance offers a link's holder: `proxy` or `oidc`\nwhen an identity provider names people, else `local`. Only where it\nis not `local` does a link's `local_account` flag change anything."
           }
         }
       },

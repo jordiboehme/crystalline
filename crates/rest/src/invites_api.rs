@@ -29,6 +29,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Deserialize;
 
+use super::invite_redeem::{InviteSignIn, offered_sign_in};
+
 use super::auth::{Identity, NoStore, no_store};
 use super::auth_store::{
     INVITE_DEFAULT_TTL_SECS, INVITE_PENDING_MAX_ADMIN, INVITE_PENDING_MAX_MANAGER, Invite,
@@ -51,6 +53,10 @@ pub struct InvitesResponse {
     /// The links, newest first, never with their tokens.
     #[schema(value_type = Vec<super::schemas::Invite>)]
     invites: Vec<Invite>,
+    /// The way in this instance offers a link's holder: `proxy` or `oidc`
+    /// when an identity provider names people, else `local`. Only where it
+    /// is not `local` does a link's `local_account` flag change anything.
+    sign_in: InviteSignIn,
 }
 
 /// The query string `GET /invites` takes.
@@ -214,7 +220,10 @@ pub async fn list(
         .invites(creator, query.state)
         .await
         .map_err(store_error)?;
-    Ok(Json(InvitesResponse { invites }))
+    Ok(Json(InvitesResponse {
+        invites,
+        sign_in: offered_sign_in(&state),
+    }))
 }
 
 /// `POST /invites` - make an invite link, answering 201 with it, its token

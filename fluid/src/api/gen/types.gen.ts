@@ -213,6 +213,13 @@ export type AgentsResponse = {
      * Every agent with its tokens, by name.
      */
     agents: Array<Agent>;
+    /**
+     * Whether `auth.mcp` is on in the effective configuration, the value a
+     * new agent is checked against. Agents work only with it on. The MCP
+     * endpoint reads the setting when the server starts, so a change made
+     * since needs a restart there.
+     */
+    auth_mcp: boolean;
 };
 
 /**
@@ -1497,6 +1504,12 @@ export type InvitesResponse = {
      * The links, newest first, never with their tokens.
      */
     invites: Array<Invite>;
+    /**
+     * The way in this instance offers a link's holder: `proxy` or `oidc`
+     * when an identity provider names people, else `local`. Only where it
+     * is not `local` does a link's `local_account` flag change anything.
+     */
+    sign_in: InviteSignIn;
 };
 
 /**

@@ -496,3 +496,35 @@ async fn a_read_only_instance_refuses_invite_changes() {
     assert_eq!(status, 200, "{listed}");
     assert!(fx.auth.invites(None, None).await.unwrap().is_empty());
 }
+
+/// The list names the way in this instance offers a link's holder, so the
+/// maker's screen knows whether a local-account link means anything: `local`
+/// on a plain instance, `proxy` behind a forward-auth proxy. Every caller who
+/// may list sees it, a manager's own list included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_list_names_the_way_in() {
+    let fx = serve(Options::default()).await;
+    let root = login(&fx, "root").await;
+    let (status, body) = list(&fx, &root, "").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sign_in"], "local", "{body}");
+    let mona = login(&fx, "mona").await;
+    let (status, body) = list(&fx, &mona, "?state=pending").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sign_in"], "local", "{body}");
+
+    let fx = serve(Options {
+        proxy_headers: true,
+        ..Options::default()
+    })
+    .await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/invites", fx.addr))
+        .header("remote-user", "root")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["sign_in"], "proxy", "{body}");
+}

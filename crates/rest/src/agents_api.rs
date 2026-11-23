@@ -31,6 +31,11 @@ pub struct AgentsResponse {
     /// Every agent with its tokens, by name.
     #[schema(value_type = Vec<super::schemas::Agent>)]
     agents: Vec<Agent>,
+    /// Whether `auth.mcp` is on in the effective configuration, the value a
+    /// new agent is checked against. Agents work only with it on. The MCP
+    /// endpoint reads the setting when the server starts, so a change made
+    /// since needs a restart there.
+    auth_mcp: bool,
 }
 
 /// A freshly issued agent token. `token` is shown here and nowhere else.
@@ -175,7 +180,10 @@ pub async fn list(
 ) -> Result<Json<AgentsResponse>, ApiError> {
     identity.require_admin()?;
     let agents = state.auth.agents().await.map_err(store_error)?;
-    Ok(Json(AgentsResponse { agents }))
+    Ok(Json(AgentsResponse {
+        agents,
+        auth_mcp: state.engine.auth_mcp(),
+    }))
 }
 
 /// `POST /agents` - create an agent and issue its first token, answering 201
