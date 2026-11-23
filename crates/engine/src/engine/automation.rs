@@ -264,6 +264,7 @@ impl Engine {
         scope: &Scope,
         force: bool,
     ) -> Result<Value> {
+        let started = tokio::time::Instant::now();
         let named: Vec<String> = if domains.is_empty() {
             self.loop_domains(lp, scope).await?
         } else {
@@ -280,6 +281,7 @@ impl Engine {
         for domain in &named {
             out.push(self.loop_status(lp, domain, scope, true, force).await?);
         }
+        crate::log_elapsed!(started, "loop" = ?lp, domains = named.len(), "automation_status answered");
         Ok(json!({ "loop": lp, "domains": out }))
     }
 
@@ -331,6 +333,7 @@ impl Engine {
         only: Option<Loop>,
         counts: bool,
     ) -> Result<Value> {
+        let started = tokio::time::Instant::now();
         self.require_domain(domain, scope).await?;
         let manager = !matches!(scope, Scope::Anonymous)
             && self.domain_right(scope, domain).await? >= crate::scope::DomainRight::Manage;
@@ -366,6 +369,7 @@ impl Engine {
             }
             out.insert(lp.as_str().to_string(), entry);
         }
+        crate::log_elapsed!(started, ?domain, "loop" = ?only, counts, "automation_overview answered");
         Ok(Value::Object(out))
     }
 

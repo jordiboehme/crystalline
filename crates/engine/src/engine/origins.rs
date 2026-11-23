@@ -2112,6 +2112,7 @@ impl Engine {
             if clean_before.is_none() {
                 clean_before = Some(self.rename_questions_already_clean().await);
             }
+            let _pass = crate::timing::Pass::of("origin poll", &name);
             match self.origin_update_one(&name, &entry).await {
                 Ok(v) => {
                     let up_to_date = v["up_to_date"].as_bool().unwrap_or(false);
