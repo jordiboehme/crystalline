@@ -1035,6 +1035,10 @@ pub struct Engine {
     // (`Engine::loop_work`). See `Engine::due_detections`.
     #[cfg(any(test, feature = "testing"))]
     due_detections: std::sync::atomic::AtomicU64,
+    // How many reads of page texts the page clocks made (one per bulk read
+    // or per page). See `Engine::page_text_reads`.
+    #[cfg(any(test, feature = "testing"))]
+    page_text_reads: std::sync::atomic::AtomicU64,
     // How many times a caller's visibility was folded rather than recalled
     // from the call's memo. See `Engine::visibility_folds`.
     #[cfg(any(test, feature = "testing"))]
@@ -2660,6 +2664,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             due_detections: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
+            page_text_reads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
             visibility_folds: std::sync::atomic::AtomicU64::new(0),
             reflection_generations: std::sync::Mutex::default(),
             pending_cache: std::sync::Mutex::default(),
@@ -4207,6 +4213,15 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn reflection_text_loads(&self) -> u64 {
         self.reflection_text_loads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many reads of page texts the page clocks made since this engine
+    /// was built: one per bulk read of a Reflection's texts, one per page
+    /// read alone. A poll whose pages did not change does not move it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn page_text_reads(&self) -> u64 {
+        self.page_text_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

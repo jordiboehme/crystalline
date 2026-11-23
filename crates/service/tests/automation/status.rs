@@ -750,3 +750,47 @@ async fn the_next_stale_time_never_waits_for_the_writer_lock() {
     }
     drop(held);
 }
+
+/// The page clocks read the page texts in one query when nothing is
+/// remembered (the first status after a start), and then only the text of
+/// a page whose checksum moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cold_page_memo_reads_the_texts_in_one_query() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+    for n in 0..12 {
+        fx.engine
+            .write_reflection(
+                &WriteReflectionParams {
+                    domain: "eng".into(),
+                    path: format!("p{n}.md"),
+                    markdown: Some("---\nfreshness: 1d\n---\n# P\n".into()),
+                    sources: std::collections::BTreeMap::from([("_top".to_string(), Vec::new())]),
+                    ..Default::default()
+                },
+                &ReflectionCaller::agent(Scope::Unrestricted, "claude-code", false),
+            )
+            .await
+            .unwrap();
+    }
+    now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
+    let before = fx.engine.page_text_reads();
+    status_with(&fx.engine, Loop::Reflect, false).await;
+    assert_eq!(fx.engine.page_text_reads(), before + 1, "one bulk read");
+    status_with(&fx.engine, Loop::Reflect, false).await;
+    assert_eq!(fx.engine.page_text_reads(), before + 1, "all remembered");
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: "p3.md".into(),
+                markdown: Some("---\nfreshness: 2d\n---\n# P\n".into()),
+                sources: std::collections::BTreeMap::from([("_top".to_string(), Vec::new())]),
+                ..Default::default()
+            },
+            &ReflectionCaller::agent(Scope::Unrestricted, "claude-code", false),
+        )
+        .await
+        .unwrap();
+    status_with(&fx.engine, Loop::Reflect, false).await;
+    assert_eq!(fx.engine.page_text_reads(), before + 2, "one page read");
+}

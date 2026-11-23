@@ -196,6 +196,7 @@ impl Engine {
         facts.retain(|path, _| stamps.iter().any(|stamp| &stamp.path == path));
         if moved.len() > BULK_AFTER || (facts.is_empty() && !moved.is_empty()) {
             // Nothing remembered, or much moved: one read of every text.
+            self.count_page_text_read();
             for row in reader.list_reflections(id).await? {
                 if matches!(r::classify(&row.path), r::ReflectionFile::Page(_)) {
                     let page = PageFacts::read(&row.path, &row.content);
@@ -205,6 +206,7 @@ impl Engine {
         } else {
             for stamp in moved {
                 // A page gone between the two reads is left out.
+                self.count_page_text_read();
                 if let Some(row) = reader.get_reflection(id, &stamp.path).await? {
                     let page = PageFacts::read(&row.path, &row.content);
                     facts.insert(stamp.path.clone(), (row.sha256, page));
@@ -250,6 +252,14 @@ impl Engine {
         let runs = reflect_runs(&*reader, id).await?;
         let now = self.automation_clock().stamp().unix_seconds();
         Ok(clocks(&stamps, &facts, &states, now, &runs).pop())
+    }
+
+    /// Count one read of page texts for the tests
+    /// (`Engine::page_text_reads`).
+    fn count_page_text_read(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        self.page_text_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// When the next page of `domain`'s Reflection falls due or enters its
