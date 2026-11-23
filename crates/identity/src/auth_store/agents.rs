@@ -634,6 +634,47 @@ impl AuthStore {
         self.agents_where(None).await
     }
 
+    /// The loops `name` runs, or `None` when there is no such agent or it is
+    /// disabled: what a rights decision reads, without the tokens.
+    pub async fn agent_loops(&self, name: &str) -> Result<Option<AgentLoops>> {
+        let Ok(name) = normalize_account_name(name) else {
+            return Ok(None);
+        };
+        let _guard = self.lock().await;
+        let Some(row) = self
+            .db
+            .query_first(
+                "SELECT loops, disabled FROM agents WHERE name = ?1",
+                vec![Value::Text(name)],
+            )
+            .await
+            .context("reading an agent's loops")?
+        else {
+            return Ok(None);
+        };
+        if matches!(row.get_value(1), Ok(Value::Integer(n)) if n != 0) {
+            return Ok(None);
+        }
+        Ok(AgentLoops::parse(&cell_text(&row, 0).unwrap_or_default()))
+    }
+
+    /// The name `name` is shown under, or `None` when there is no such agent.
+    pub async fn agent_display(&self, name: &str) -> Result<Option<String>> {
+        let Ok(name) = normalize_account_name(name) else {
+            return Ok(None);
+        };
+        let _guard = self.lock().await;
+        let row = self
+            .db
+            .query_first(
+                "SELECT display FROM agents WHERE name = ?1",
+                vec![Value::Text(name)],
+            )
+            .await
+            .context("reading an agent's display name")?;
+        Ok(row.and_then(|row| cell_text(&row, 0)))
+    }
+
     /// One agent with its tokens, or `None`.
     pub async fn agent(&self, name: &str) -> Result<Option<Agent>> {
         let name = normalize_account_name(name)?;

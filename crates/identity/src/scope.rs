@@ -59,6 +59,28 @@ use crate::auth_store::{
 /// everywhere at once.
 pub const OWNER_IDENTITY_NAME: &str = "owner";
 
+/// The prefix that names an agent wherever a name could also be an account's:
+/// the account half of `generated.by` (`<client>-for-agent:<name>`), the
+/// account a loop lease and a run record carry. Accounts and agents share one
+/// namespace, so a bare name is unique at any one time; the prefix keeps it
+/// unique over time too, because no account may be made under a name that
+/// starts with it ([`crate::auth_store::normalize_new_account_name`]), so a
+/// record an agent left never reads as a person's, not even after the agent
+/// is removed and its name is taken by a person.
+pub const AGENT_KEY_PREFIX: &str = "agent:";
+
+/// The key `name`, an agent's unique name, is recorded under
+/// ([`AGENT_KEY_PREFIX`]).
+pub fn agent_key(name: &str) -> String {
+    format!("{AGENT_KEY_PREFIX}{name}")
+}
+
+/// The agent a recorded key names, or `None` for an account's name.
+pub fn agent_of_key(key: &str) -> Option<&str> {
+    key.strip_prefix(AGENT_KEY_PREFIX)
+        .filter(|name| !name.is_empty())
+}
+
 /// Who a request is acting as.
 ///
 /// Resolved once, at the edge, by whichever surface accepted the request, and
@@ -93,9 +115,10 @@ pub enum Scope {
     },
     /// An agent of the loops, resolved from its token
     /// ([`crate::auth_store::AuthStore::agent_for_token`]). An identity of
-    /// its own, never an account: it holds no membership, no instance role
-    /// and no draft, and until its rights are spelled out every check here
-    /// gives it nothing.
+    /// its own, never an account: it holds no membership and no instance
+    /// role. It reaches every domain of the instance for its loops (evolve
+    /// writes the knowledge, reflect curates the Reflection), closed domains
+    /// excepted, and never manages or owns one; see `decide`.
     Agent {
         /// The agent's unique name, as the auth store keys it.
         name: String,
@@ -328,9 +351,30 @@ enum Principal {
     },
     /// Nobody in particular.
     Anonymous,
-    /// An agent of the loops ([`Scope::Agent`]). It gets nothing on any
-    /// domain until its rights are spelled out in each decision below.
-    Agent,
+    /// An agent of the loops ([`Scope::Agent`]), with the loops it may run
+    /// now: those its scope names that its row still has. Both `false` for an
+    /// agent that is gone or disabled, which gets nothing anywhere.
+    Agent {
+        /// It runs evolve, which writes knowledge.
+        evolve: bool,
+        /// It runs reflect, which curates the Reflection.
+        reflect: bool,
+    },
+}
+
+/// What an agent's loops give it on a domain that is not closed, private
+/// domains and domains GitHub governs included: evolve writes the knowledge,
+/// reflect reads it (a curator reads the engrams it cites), neither gives
+/// nothing. Never more than [`DomainRight::Write`]: an agent manages no
+/// domain and owns none.
+fn agent_right(evolve: bool, reflect: bool) -> DomainRight {
+    if evolve {
+        DomainRight::Write
+    } else if reflect {
+        DomainRight::Read
+    } else {
+        DomainRight::None
+    }
 }
 
 /// The whole policy, as a pure function of one caller and one domain.
@@ -371,7 +415,9 @@ fn decide(
             Some(_) => DomainRight::None,
             None => DomainRight::Read,
         },
-        Principal::Agent => DomainRight::None,
+        // Every domain of the instance for its loops, private ones included:
+        // no owner, membership or acl row is read for it.
+        Principal::Agent { evolve, reflect } => agent_right(*evolve, *reflect),
         Principal::Account { name, role, .. } => {
             if *role == Role::Admin {
                 return DomainRight::Own;
@@ -435,14 +481,19 @@ fn decide_governed(principal: &Principal, private: bool, governed: Governed) -> 
             Principal::Account {
                 role: Role::Admin, ..
             } => DomainRight::Own,
-            Principal::Account { .. } | Principal::Anonymous | Principal::Agent => {
+            // An agent stays out of a closed domain like every member does:
+            // only the machine owner and the instance admins get in.
+            Principal::Account { .. } | Principal::Anonymous | Principal::Agent { .. } => {
                 DomainRight::None
             }
         };
     }
     match principal {
         Principal::Unrestricted => DomainRight::Own,
-        Principal::Agent => DomainRight::None,
+        // GitHub's grant is not asked for an agent: it is no GitHub user, and
+        // its reach is every domain of the instance for its loops, private
+        // or shared, whatever the repository's visibility.
+        Principal::Agent { evolve, reflect } => agent_right(*evolve, *reflect),
         Principal::Anonymous => {
             if !private && governed.public {
                 DomainRight::Read
@@ -476,7 +527,8 @@ fn instance_cap(principal: &Principal) -> DomainRight {
     match principal {
         Principal::Unrestricted => DomainRight::Own,
         Principal::Anonymous => DomainRight::Read,
-        Principal::Agent => DomainRight::None,
+        // Evolve writes, reflect reads; no instance role above editor.
+        Principal::Agent { evolve, reflect } => agent_right(*evolve, *reflect),
         Principal::Account { role, .. } => match role {
             // It never writes an engram. `Read`, not `None`, so a write gate
             // refuses it as forbidden on a private domain it reads instead of
@@ -533,7 +585,22 @@ fn decide_reflection(
     let knowledge = decide(principal, acl, level, github);
     let reflection = match principal {
         Principal::Unrestricted => return ReflectionRight::Curate,
-        Principal::Agent => return ReflectionRight::None,
+        // Reflect curates on every domain it reaches, evolve alone reads
+        // (an evolve run reads the Reflection, it does not curate it), and
+        // a closed domain gives it nothing. Decided here and nowhere else:
+        // no grant, write list or membership row is read for an agent, and
+        // its knowledge Write from evolve does not make it a curator.
+        Principal::Agent { evolve, reflect } => {
+            return if knowledge == DomainRight::None {
+                ReflectionRight::None
+            } else if *reflect {
+                ReflectionRight::Curate
+            } else if *evolve {
+                ReflectionRight::Read
+            } else {
+                ReflectionRight::None
+            };
+        }
         Principal::Anonymous => {
             return if knowledge >= DomainRight::Read {
                 ReflectionRight::Read
@@ -2144,6 +2211,9 @@ impl DomainAccess {
             Principal::Account {
                 role: Role::None,
                 ..
+            } | Principal::Agent {
+                evolve: false,
+                reflect: false,
             }
         );
         let acls = self.auth.private_domains().await?;
@@ -2214,7 +2284,21 @@ impl DomainAccess {
         match scope {
             Scope::Unrestricted => Ok(Principal::Unrestricted),
             Scope::Anonymous => Ok(Principal::Anonymous),
-            Scope::Agent { .. } => Ok(Principal::Agent),
+            // The row is read again, as an account's is: a removed or
+            // disabled agent gets nothing, and the loops are those the scope
+            // names that the row still has, so a change only ever narrows a
+            // session that is already open.
+            Scope::Agent { name, loops, .. } => {
+                let stored = self.auth.agent_loops(name).await?;
+                let (evolve, reflect) = match stored {
+                    Some(stored) => (
+                        loops.evolve() && stored.evolve(),
+                        loops.reflect() && stored.reflect(),
+                    ),
+                    None => (false, false),
+                };
+                Ok(Principal::Agent { evolve, reflect })
+            }
             Scope::User { account, admin } => {
                 let Some(user) = self.auth.user(account).await? else {
                     return Ok(Principal::Anonymous);
@@ -5776,5 +5860,301 @@ mod tests {
             .await
             .unwrap();
         assert!(!access.readers_cover("shared", "other").await.unwrap());
+    }
+
+    // ---- Agents of the loops (0.35.0, spec D2) ----
+
+    /// An agent scope as a resolved token gives it.
+    fn agent(name: &str, loops: AgentLoops) -> Scope {
+        Scope::Agent {
+            name: name.to_string(),
+            loops,
+            token_id: 1,
+            token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// [`github_cast`] with `gh-vault` closed, `shared` a plain shared domain
+    /// and the agents `both` (both loops), `curator` (reflect) and `writer`
+    /// (evolve).
+    async fn agent_access(dir: &tempfile::TempDir) -> (Arc<AuthStore>, DomainAccess) {
+        let auth = store(dir).await;
+        github_cast(&auth).await;
+        for (name, loops) in [
+            ("both", AgentLoops::Both),
+            ("curator", AgentLoops::Reflect),
+            ("writer", AgentLoops::Evolve),
+        ] {
+            auth.add_agent(name, None, loops, "cli", "", 86_400 * 30)
+                .await
+                .unwrap();
+        }
+        let governor = base_governor().public("gh-open").close("gh-vault");
+        let access = DomainAccess::new(auth.clone()).with_governor(Arc::new(governor));
+        (auth, access)
+    }
+
+    /// The rights table, cell by cell: evolve writes the knowledge, reflect
+    /// curates the Reflection and reads the knowledge, on every domain the
+    /// instance has - shared, private to somebody else, governed by GitHub
+    /// shared or private - and nothing on a closed one. Never Manage or Own.
+    #[tokio::test]
+    async fn an_agent_reaches_every_domain_for_its_loops_and_no_closed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_auth, access) = agent_access(&dir).await;
+        use DomainRight as D;
+        use ReflectionRight as R;
+        // (domain, kind) -> for (both, curator, writer): (knowledge, reflection)
+        let open = [
+            ("shared", "shared"),
+            ("lab", "private to keeper"),
+            ("gh-open", "governed, shared, public"),
+            ("gh-lab", "governed, private"),
+        ];
+        for (domain, kind) in open {
+            for (name, loops, knowledge, reflection) in [
+                ("both", AgentLoops::Both, D::Write, R::Curate),
+                ("curator", AgentLoops::Reflect, D::Read, R::Curate),
+                ("writer", AgentLoops::Evolve, D::Write, R::Read),
+            ] {
+                let scope = agent(name, loops);
+                let label = format!("{name} on {domain} ({kind})");
+                assert_eq!(
+                    access.right(&scope, domain).await.unwrap(),
+                    knowledge,
+                    "{label}"
+                );
+                assert_eq!(
+                    access.write_right(&scope, domain).await.unwrap(),
+                    knowledge,
+                    "{label}"
+                );
+                assert_eq!(
+                    access
+                        .write_rights(&scope)
+                        .await
+                        .unwrap()
+                        .write_right(domain),
+                    knowledge,
+                    "{label}"
+                );
+                assert_eq!(
+                    access.reflection_right(&scope, domain).await.unwrap(),
+                    reflection,
+                    "{label}"
+                );
+                let screen = access.visibility(&scope).await.unwrap().screen();
+                assert!(screen.admits(domain), "{label}");
+            }
+        }
+        // Closed: the agent stays out, as every member does.
+        for (name, loops) in [
+            ("both", AgentLoops::Both),
+            ("curator", AgentLoops::Reflect),
+            ("writer", AgentLoops::Evolve),
+        ] {
+            let scope = agent(name, loops);
+            assert_eq!(access.right(&scope, "gh-vault").await.unwrap(), D::None);
+            assert_eq!(
+                access.write_right(&scope, "gh-vault").await.unwrap(),
+                D::None
+            );
+            assert_eq!(
+                access.reflection_right(&scope, "gh-vault").await.unwrap(),
+                R::None
+            );
+            let screen = access.visibility(&scope).await.unwrap().screen();
+            assert!(!screen.admits("gh-vault"), "{name}");
+        }
+    }
+
+    /// The private ladder functions answer the agent arm directly: the most
+    /// an agent gets is Write, never the Manage or Own an owner, a manager or
+    /// an admin gets, whatever the acl, the membership row or GitHub says.
+    #[test]
+    fn the_agent_arms_never_give_more_than_write() {
+        let acl = DomainAcl {
+            domain: "lab".to_string(),
+            owner: "both".to_string(),
+        };
+        let manager = GithubKnowledge::Level(MemberLevel::Manager);
+        let full = Principal::Agent {
+            evolve: true,
+            reflect: true,
+        };
+        assert_eq!(decide(&full, None, None, None), DomainRight::Write);
+        assert_eq!(
+            decide(&full, Some(&acl), Some(MemberLevel::Manager), None),
+            DomainRight::Write,
+            "an acl naming the agent's name as owner does not make it the owner"
+        );
+        assert_eq!(
+            decide_governed(&full, true, governed(manager).unwrap()),
+            DomainRight::Write
+        );
+        assert_eq!(instance_cap(&full), DomainRight::Write);
+        let closed = Governed {
+            knowledge: manager,
+            public: true,
+            closed: true,
+        };
+        assert_eq!(decide_governed(&full, false, closed), DomainRight::None);
+        assert_eq!(
+            decide_reflection(
+                &full,
+                None,
+                None,
+                ReflectionLevel::Contributor,
+                Some(ReflectionLevel::Contributor),
+                Some(closed),
+                false,
+            ),
+            ReflectionRight::None
+        );
+        let gone = Principal::Agent {
+            evolve: false,
+            reflect: false,
+        };
+        assert_eq!(decide(&gone, None, None, None), DomainRight::None);
+        assert_eq!(instance_cap(&gone), DomainRight::None);
+        assert_eq!(
+            decide_reflection(
+                &gone,
+                None,
+                None,
+                ReflectionLevel::Contributor,
+                None,
+                None,
+                false
+            ),
+            ReflectionRight::None
+        );
+        // Evolve's knowledge Write does not make it a curator; the account
+        // rule (Write curates) is not the agent's.
+        let writer = Principal::Agent {
+            evolve: true,
+            reflect: false,
+        };
+        assert_eq!(
+            decide_reflection(
+                &writer,
+                None,
+                None,
+                ReflectionLevel::Default,
+                None,
+                None,
+                false
+            ),
+            ReflectionRight::Read
+        );
+    }
+
+    /// The loops are those the scope names that the row still has: a removed
+    /// agent's token gets nothing anywhere, a scope narrower than the row
+    /// stays narrow, and a scope wider than the row is cut to the row.
+    #[tokio::test]
+    async fn a_removed_agent_gets_nothing_and_the_loops_only_narrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth, access) = agent_access(&dir).await;
+        // Wider than the row: `curator` only reflects.
+        let wide = agent("curator", AgentLoops::Both);
+        assert_eq!(
+            access.right(&wide, "shared").await.unwrap(),
+            DomainRight::Read
+        );
+        // Narrower than the row: `both` asked as a reflect session.
+        let narrow = agent("both", AgentLoops::Reflect);
+        assert_eq!(
+            access.right(&narrow, "shared").await.unwrap(),
+            DomainRight::Read
+        );
+        assert_eq!(
+            access.reflection_right(&narrow, "shared").await.unwrap(),
+            ReflectionRight::Curate
+        );
+
+        auth.remove_agent("writer").await.unwrap();
+        let gone = agent("writer", AgentLoops::Evolve);
+        for domain in ["shared", "lab", "gh-open", "gh-lab"] {
+            assert_eq!(
+                access.right(&gone, domain).await.unwrap(),
+                DomainRight::None
+            );
+            assert_eq!(
+                access.reflection_right(&gone, domain).await.unwrap(),
+                ReflectionRight::None
+            );
+        }
+        let visibility = access.visibility(&gone).await.unwrap();
+        assert!(!visibility.screen().admits("shared"));
+        assert!(!visibility.screen().admits("lab"));
+        // A name no agent ever had is the same.
+        let never = agent("nobody", AgentLoops::Both);
+        assert_eq!(
+            access.right(&never, "shared").await.unwrap(),
+            DomainRight::None
+        );
+    }
+
+    /// No answer about who reads a domain counts an agent: the reader list,
+    /// the page readers and every cover answer are what they are with no
+    /// agent at all. An agent reads every domain, so counting it would make
+    /// every private domain's readers "everybody" and let a Reflection page
+    /// cite anything.
+    #[tokio::test]
+    async fn no_reader_answer_counts_an_agent() {
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = governed_access(
+            &plain_dir,
+            base_governor().public("gh-open").close("gh-vault"),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_auth, access) = agent_access(&dir).await;
+        let domains = ["shared", "lab", "gh-open", "gh-lab", "gh-vault"];
+        for domain in domains {
+            let readers = access.readers_of(domain).await.unwrap();
+            assert_eq!(readers, plain.readers_of(domain).await.unwrap(), "{domain}");
+            if let Some(readers) = &readers {
+                for name in ["both", "curator", "writer"] {
+                    assert!(!readers.contains(name), "{name} read {domain}");
+                }
+            }
+            assert_eq!(
+                access.page_readers(domain).await.unwrap(),
+                plain.page_readers(domain).await.unwrap(),
+                "{domain}"
+            );
+            for source in domains {
+                assert_eq!(
+                    access.readers_cover(domain, source).await.unwrap(),
+                    plain.readers_cover(domain, source).await.unwrap(),
+                    "{domain} citing {source}"
+                );
+            }
+        }
+    }
+
+    /// The agent key reads back, an account name is no agent's key, and no
+    /// account or agent may be made under a name that starts with the prefix.
+    #[tokio::test]
+    async fn the_agent_prefix_is_no_name_anybody_can_take() {
+        assert_eq!(agent_key("nightly"), "agent:nightly");
+        assert_eq!(agent_of_key("agent:nightly"), Some("nightly"));
+        assert_eq!(agent_of_key("nightly"), None);
+        assert_eq!(agent_of_key("agent:"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        let err = auth
+            .add_user("Agent:Nightly", "x", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("agent:"), "{err}");
+        let err = auth
+            .add_agent("agent:nightly", None, AgentLoops::Both, "cli", "", 86_400)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("agent:"), "{err}");
     }
 }

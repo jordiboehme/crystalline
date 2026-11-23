@@ -312,6 +312,16 @@ pub fn normalize_new_account_name(name: &str) -> Result<String> {
             ),
         ));
     }
+    if folded.starts_with(crate::scope::AGENT_KEY_PREFIX) {
+        return Err(refuse(
+            RefusalKind::InvalidName,
+            format!(
+                "a name starting with '{}' is how an agent is named in the records of its \
+                 writes and runs, so no account or agent may take it: pick another name",
+                crate::scope::AGENT_KEY_PREFIX
+            ),
+        ));
+    }
     Ok(folded)
 }
 
