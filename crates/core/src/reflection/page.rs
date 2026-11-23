@@ -474,7 +474,7 @@ pub fn carry_page_keys(text: &str, stored: Option<&str>, keys: &[&str]) -> Resul
             text.to_string(),
         ),
     };
-    let removed = blocks.iter().any(|b| is_key(b));
+    let removed = blocks.iter().any(&is_key);
     blocks.retain(|b| !is_key(b));
     // Each stored key block goes after the nearest key before it in `stored`
     // that the text still has, after what was put there already, so two

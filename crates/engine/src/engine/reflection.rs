@@ -2678,9 +2678,8 @@ impl Engine {
                 Some(value) if value.is_null() => carried.push(key),
                 Some(_) if curator => {}
                 Some(value) => {
-                    let guarded = key != r::STATUS_KEY
-                        || retired(value)
-                        || before.is_some_and(|v| retired(v));
+                    let guarded =
+                        key != r::STATUS_KEY || retired(value) || before.is_some_and(retired);
                     if guarded && before != Some(value) {
                         return Err(page_key_refusal(
                             &p.domain,
