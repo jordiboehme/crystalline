@@ -50,7 +50,8 @@ async fn put(fx: &Fx, path: &str, text: &str) {
 /// are `sections`, each with one line of text.
 async fn sourced(fx: &Fx, path: &str, title: &str, sections: &[(&str, &[&str])]) {
     let mut text = format!("# {title}\n");
-    let mut sources = BTreeMap::new();
+    // `_top` with no sources names the top as curated.
+    let mut sources = BTreeMap::from([("_top".to_string(), Vec::new())]);
     for (heading, cites) in sections {
         text.push_str(&format!("\n## {heading}\n\nAbout {heading}.\n"));
         sources.insert(
@@ -221,15 +222,6 @@ async fn owned(fx: &Fx, path: &str, owner: &str) {
     fx.engine.write_reflection(&p, &agent()).await.unwrap();
 }
 
-fn age_file(fx: &Fx, rel: &str, secs: u64) {
-    let file = std::fs::File::options()
-        .write(true)
-        .open(fx.root.join(rel))
-        .unwrap();
-    file.set_modified(SystemTime::now() - Duration::from_secs(secs))
-        .unwrap();
-}
-
 const DAY: i64 = 86_400;
 
 /// A page whose freshness ran out gets one `stale` item: its freshness, when
@@ -242,7 +234,8 @@ const DAY: i64 = 86_400;
 async fn a_page_whose_freshness_ran_out_is_stale() {
     let fx = weekly().await;
     put(&fx, "PACT.md", "# Pact\n\n## Tone\n\nPlain.\n").await;
-    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# This week\n\n## A\n\nText.\n").await;
+    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# This week\n").await;
+    sourced(&fx, "guides/week.md", "This week", &[("A", &["weekly/a"])]).await;
     put(&fx, "guides/week.pact.md", "# Week pact\n\n## Scope\n\nLast seven days.\n").await;
     put(&fx, "guides/fresh.md", "---\nfreshness: 7d\n---\n# Fresh\n").await;
     put(&fx, "guides/gone.md", "---\nfreshness: 1d\n---\n# Gone\n").await;
@@ -257,7 +250,7 @@ async fn a_page_whose_freshness_ran_out_is_stale() {
     // A person's change to a section of the stale page: unsettled.
     let text = std::fs::read_to_string(fx.root.join("reflections/guides/week.md"))
         .unwrap()
-        .replace("Text.", "Text, edited.");
+        .replace("About A.", "About A, edited.");
     put(&fx, "guides/week.md", &text).await;
 
     let q = queue(&fx, &with_stale()).await;
@@ -279,7 +272,14 @@ async fn a_page_whose_freshness_ran_out_is_stale() {
     );
     assert_eq!(item["pact_hash"], state.pact_hash.clone().unwrap().as_str());
     assert_eq!(item["owned"], serde_json::json!(["guides/week/mon.md"]));
-    assert_eq!(item["unsettled"].as_array().unwrap().len(), 1, "{item}");
+    let a_id = r::split_sections(
+        &std::fs::read_to_string(fx.root.join("reflections/guides/week.md")).unwrap(),
+    )
+    .into_iter()
+    .find(|section| section.heading == "A")
+    .and_then(|section| section.id)
+    .unwrap();
+    assert_eq!(item["unsettled"], serde_json::json!([a_id]), "{item}");
     assert!(item["version"].as_str().is_some_and(|v| !v.is_empty()));
     // Each pact text once per answer.
     assert!(
@@ -371,14 +371,16 @@ async fn the_hint_counts_only_what_the_run_may_read() {
         .unwrap();
     assert_eq!(hint(&q), 1, "harbor is hidden from the run: {q}");
 
-    // Nothing changed since the last reconcile.
-    age_file(&fx, "runbooks/deploy.md", 3 * DAY as u64);
+    // Nothing changed since the last reconcile: every engram's last change
+    // is older than it.
     let harbor = crate::fixture::root_of(&fx, "harbor");
-    for f in ["team/a.md", "team/b.md"] {
-        let file = std::fs::File::options()
-            .write(true)
-            .open(harbor.join(f))
-            .unwrap();
+    for (abs, title, permalink) in [
+        (fx.root.join("runbooks/deploy.md"), "Deploy", "runbooks/deploy"),
+        (harbor.join("team/a.md"), "A", "team/a"),
+        (harbor.join("team/b.md"), "B", "team/b"),
+    ] {
+        std::fs::write(&abs, engram(title, permalink, "- [fact] older")).unwrap();
+        let file = std::fs::File::options().write(true).open(&abs).unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(3 * DAY as u64))
             .unwrap();
     }
@@ -476,8 +478,6 @@ async fn a_late_reconcile_for_an_older_period_is_refused() {
 
     // A page reconciled for the first time: its seeded item's version is
     // never older than a recorded reconcile.
-    let seeded = r::page_pact_hash("guides/new.md", std::iter::empty()).unwrap_or_default();
-    let _ = seeded;
     fx.engine
         .write_reflection(&reconciled("guides/new.md", "updated", "0:1:abc"), &agent())
         .await

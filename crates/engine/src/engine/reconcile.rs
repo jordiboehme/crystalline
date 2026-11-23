@@ -183,6 +183,9 @@ impl Engine {
     /// must exist and not be retired: a retired page is never reconciled.
     /// Nothing is written into the file, so no backup commit follows; open
     /// tabs hear a change event and read the new state.
+    ///
+    /// A `version` of a `stale` item handed out before the reconcile
+    /// recorded now is refused: that period was already reconciled.
     pub(crate) async fn reconciled_reflection(
         &self,
         domain: &str,
@@ -221,6 +224,22 @@ impl Engine {
         if super::page_life::is_retired(&text, inner) {
             return Err(EngineError::Invalid(format!(
                 "'{inner}' is retired, and a retired page is never reconciled; restore it first"
+            )));
+        }
+        // A late call for an older period: the `stale` item it answers was
+        // handed out before the reconcile recorded now, so another run (or
+        // this one, again) already brought the page in line. A version that
+        // is no stale item's, and a page with no recorded reconcile, are
+        // taken as sent.
+        if let Some(base) = super::reflect::stale_base(version)
+            && let Some(state) = self.reflection_reconcile(domain, inner).await?
+            && state.outcome.is_some()
+            && let Some(at) = time::parse_rfc3339(&state.last_reconciled)
+            && base < at.stamp().unix_millis()
+        {
+            return Err(EngineError::Conflict(format!(
+                "this reconcile answers an older period of '{inner}': the page was reconciled again at {} after that stale item was handed out, so nothing is recorded; read the reflect queue again for the page's current item",
+                state.last_reconciled
             )));
         }
         let rows = self
