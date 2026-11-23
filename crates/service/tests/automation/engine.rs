@@ -1514,3 +1514,83 @@ async fn an_agent_sees_the_loops_as_the_machines_run_does() {
         }
     }
 }
+
+/// A reflect-only agent reads the knowledge and writes none, yet curates the
+/// Reflection all the way: it answers a thread, writes a page with a section
+/// citing an engram, settles a section and edits PACT.md. An evolve-only agent,
+/// which writes the knowledge, curates none of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = reflecting().await;
+    let thread = open_thread(&fx, "aaaa1111", "Still true?").await;
+    std::fs::create_dir_all(fx.root.join("runbooks")).unwrap();
+    std::fs::write(
+        fx.root.join("runbooks/deploy.md"),
+        engram("Deploy", "runbooks/deploy", "Deploys run at night."),
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    with_agents(&fx).await;
+
+    let page = WriteReflectionParams {
+        domain: "eng".into(),
+        path: "d.md".into(),
+        markdown: Some(PAGE.into()),
+        sources: BTreeMap::from([(
+            "Night deploys".to_string(),
+            vec!["runbooks/deploy".to_string()],
+        )]),
+        ..Default::default()
+    };
+    let pact = WriteReflectionParams {
+        domain: "eng".into(),
+        path: "PACT.md".into(),
+        markdown: Some("# Pact\n\nKeep it short.\n".into()),
+        ..Default::default()
+    };
+    let settle = WriteReflectionParams {
+        domain: "eng".into(),
+        action: Some("settle".into()),
+        path: "d.md".into(),
+        sections: vec!["aaaa1111".to_string()],
+        outcome: Some("kept".into()),
+        ..Default::default()
+    };
+
+    let writer = ReflectionCaller::agent(
+        agent_scope("writer", AgentLoops::Evolve),
+        "claude-code/2.0 for agent:writer",
+        false,
+    );
+    for (label, params) in [("page", &page), ("pact", &pact), ("settle", &settle)] {
+        let refused = fx
+            .engine
+            .write_reflection(params, &writer)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, EngineError::Forbidden(_)),
+            "{label}: {refused}"
+        );
+    }
+
+    let curator = ReflectionCaller::agent(
+        agent_scope("curator", AgentLoops::Reflect),
+        "claude-code/2.0 for agent:curator",
+        false,
+    );
+    step(&fx, &curator, "answer", &thread, "Yes, still true.").await;
+    let written = fx.engine.write_reflection(&page, &curator).await.unwrap();
+    assert!(written.get("path").is_some(), "{written}");
+    fx.engine.write_reflection(&pact, &curator).await.unwrap();
+    // Nothing a person changed waits to be settled, but the right is there:
+    // whatever the answer, it is no refusal of the right.
+    if let Err(e) = fx.engine.write_reflection(&settle, &curator).await {
+        assert!(!matches!(e, EngineError::Forbidden(_)), "{e}");
+    }
+    let text = std::fs::read_to_string(fx.root.join("reflections/d.md")).unwrap();
+    assert!(text.contains("runbooks/deploy"), "{text}");
+    let pact_text = std::fs::read_to_string(fx.root.join("reflections/PACT.md")).unwrap();
+    assert!(pact_text.contains("Keep it short."), "{pact_text}");
+}

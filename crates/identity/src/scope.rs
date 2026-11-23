@@ -6168,5 +6168,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("agent:"), "{err}");
+        // Every other way an account comes into being.
+        let refusals = [
+            auth.add_first_admin("agent:root", "Root", "pw12345678")
+                .await
+                .map(|_| ()),
+            auth.ensure_user_created("agent:proxied", Role::Editor, 0)
+                .await
+                .map(|_| ()),
+            auth.provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "agent:sso",
+                None,
+                None,
+                Role::Editor,
+                0,
+            )
+            .await
+            .map(|_| ()),
+            auth.add_token_only_user("agent:bot", "Bot", None, Role::Editor, "")
+                .await
+                .map(|_| ()),
+        ];
+        for refused in refusals {
+            let err = refused.unwrap_err();
+            assert!(err.to_string().contains("agent:"), "{err}");
+        }
+        assert!(auth.list_users().await.unwrap().is_empty());
     }
 }
