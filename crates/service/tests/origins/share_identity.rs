@@ -1383,7 +1383,8 @@ fn pull_bodies(forge: &Forge) -> Vec<String> {
 /// A run by an agent shares exactly as the machine's run does, row by row, and
 /// says whose run it was: through the App the commit's author is the agent at
 /// the bot's noreply address, with the bot as committer; on the instance
-/// credential GitHub records that credential's user. Where `personal` is set by
+/// credential the agent at that credential's account's noreply address, with
+/// that account as committer. Where `personal` is set by
 /// name the agent is refused at the take and at the share, nothing reaches
 /// GitHub and the run's file stays here, unshared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1434,10 +1435,18 @@ async fn a_run_by_an_agent_shares_as_the_machine_and_names_the_agent() {
     assert_eq!(shared.unwrap()["outcome"], "shared");
     assert!(writes(&fx.forge).iter().all(|a| *a == bearer("ghs_test")));
 
-    // No App, key absent or `instance`: the instance credential, which
-    // authors the commit; the pull request names the agent.
-    for key in [None, Some("instance")] {
+    // No App, key absent or `instance`: the instance credential. The agent is
+    // the author at the noreply address of the credential's own account, which
+    // is the committer. Where that account cannot be read (the second cell),
+    // GitHub records the credential's account as ever and the share goes out.
+    for (key, readable) in [(None, true), (Some("instance"), false)] {
         let fx = case(App::None, key).await;
+        if readable {
+            fx.forge.users.lock().unwrap().insert(
+                INSTANCE_TOKEN.to_string(),
+                (3003, "instance-gh".to_string()),
+            );
+        }
         let (take, shared) = agent_run_shares(&fx).await;
         assert!(take["share_refused"].is_null(), "{key:?}: {take}");
         assert_eq!(shared.unwrap()["outcome"], "shared", "{key:?}");
@@ -1448,12 +1457,27 @@ async fn a_run_by_an_agent_shares_as_the_machine_and_names_the_agent() {
             "{key:?}: {all:?}"
         );
         let commits = fx.forge.commits();
-        assert!(
-            commits
-                .iter()
-                .all(|c| c.get("author").is_none() && c.get("committer").is_none()),
-            "{key:?}: {commits:?}"
-        );
+        assert_eq!(commits.len(), 1, "{key:?}: {commits:?}");
+        if readable {
+            assert_eq!(
+                commits[0]["author"]["name"], "Nightly Curator (agent:nightly)",
+                "{commits:?}"
+            );
+            assert_eq!(
+                commits[0]["author"]["email"],
+                "3003+instance-gh@users.noreply.127.0.0.1"
+            );
+            assert_eq!(commits[0]["committer"]["name"], "instance-gh");
+            assert_eq!(
+                commits[0]["committer"]["email"],
+                commits[0]["author"]["email"]
+            );
+        } else {
+            assert!(
+                commits[0].get("author").is_none() && commits[0].get("committer").is_none(),
+                "{commits:?}"
+            );
+        }
         let bodies = pull_bodies(&fx.forge);
         assert!(
             bodies.iter().any(|b| b.contains("(agent:nightly).")),

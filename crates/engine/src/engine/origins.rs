@@ -5999,10 +5999,43 @@ impl Engine {
                 .map_err(|e| refusal_for(actor, e))?,
         };
         let login = token.user_display().map(str::to_string);
-        Ok((
-            Arc::new(GitHubProvider::new(api_url, Some(token.access_token))),
-            login,
-        ))
+        let mut provider = GitHubProvider::new(api_url.clone(), Some(token.access_token.clone()));
+        if let ShareActor::Agent(name) = actor {
+            provider = self
+                .agent_commit_on_token(provider, name, api_url.as_deref(), &token.access_token)
+                .await;
+        }
+        Ok((Arc::new(provider), login))
+    }
+
+    /// A provider whose commits name the agent of the loops `name` as their
+    /// author, for a share on the instance credential (no App): the author
+    /// is [`Engine::agent_author_name`] at the `noreply` address of the
+    /// credential's own GitHub account (`<id>+<login>@users.noreply.<host>`,
+    /// read with `GET /user`), and that account is the committer. Attribution
+    /// never fails a share: when the account cannot be read, a warning is
+    /// logged and GitHub records the credential's account as it always does.
+    async fn agent_commit_on_token(
+        &self,
+        provider: GitHubProvider,
+        name: &str,
+        api_url: Option<&str>,
+        token: &str,
+    ) -> GitHubProvider {
+        let committer = match crystalline_remote::token_user_identity(api_url, token).await {
+            Ok(identity) => identity,
+            Err(e) => {
+                tracing::warn!(
+                    "the instance credential's GitHub account could not be read, so it authors the share of agent {name}: {e}"
+                );
+                return provider;
+            }
+        };
+        let author = crystalline_remote::CommitIdentity {
+            name: self.agent_author_name(name).await,
+            email: committer.email.clone(),
+        };
+        provider.with_commit_identities(crystalline_remote::CommitIdentities { author, committer })
     }
 
     /// The login a share by `actor` would go out on, the one
