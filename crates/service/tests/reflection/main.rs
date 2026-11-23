@@ -28,5 +28,6 @@ mod rest;
 mod rights;
 mod search;
 mod sources;
+mod stale_queue;
 mod switch;
 mod threads;
