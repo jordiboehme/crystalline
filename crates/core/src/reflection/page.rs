@@ -34,8 +34,8 @@ pub const FOLDER_PARENT: &str = "folder parent";
 /// The shortest freshness a page may have: one hour.
 pub const MIN_FRESHNESS_SECONDS: i64 = 3600;
 
-/// A `freshness` that is not a whole number and a unit.
-pub const FRESHNESS_UNREADABLE: &str = "is not a duration like 1h, 6h, 1d, 7d or 30d (a whole number and m, h, d, w or y), so it is ignored";
+/// A `freshness` that does not read as a timeframe.
+pub const FRESHNESS_UNREADABLE: &str = "is not a duration like 1h, 6h, 1d, 7d or 30d (a whole number and h, d, w, m for months or y), so it is ignored";
 /// A `freshness` under [`MIN_FRESHNESS_SECONDS`].
 pub const FRESHNESS_TOO_SHORT: &str = "is shorter than the minimum of 1 hour, so it is ignored";
 /// A `freshness` on a page another page owns: the owner's reconcile keeps
@@ -108,34 +108,16 @@ pub struct Freshness {
     pub seconds: i64,
 }
 
-/// Read a freshness: a whole number and a unit, any duration of an hour or
-/// more. The grammar is `build_context`'s timeframe (`6h`, `1d`, `7d`, `2w`,
-/// `1y`), with one difference: `m` is minutes here (the timeframe reads it
-/// as months), so `30m` is a finding under the minimum and `90m` is an hour
-/// and a half. Units: `m` (minutes), `h` (hours), `d` (days), `w` (weeks),
-/// `y` (365 days). A bare number, another unit, a sign, a fraction or a
-/// space is not read, and nothing falls back to a default. `Err` holds the
-/// reason: [`FRESHNESS_UNREADABLE`] or [`FRESHNESS_TOO_SHORT`] (under
-/// [`MIN_FRESHNESS_SECONDS`], a zero included).
+/// Read a freshness: any span of an hour or more, in `build_context`'s
+/// timeframe grammar exactly ([`crate::time::timeframe_seconds`]), so a
+/// person who knows one knows the other: `6h`, `1d`, `7d`, `2w`, `2m` (months
+/// of 30 days), `1y`, and a bare number of days (`7`). There is no minute
+/// unit. `Err` holds the reason: [`FRESHNESS_UNREADABLE`] when it does not
+/// read, [`FRESHNESS_TOO_SHORT`] when it reads to less than
+/// [`MIN_FRESHNESS_SECONDS`] (`0h`, `0d`, a negative span).
 pub fn parse_freshness(spec: &str) -> Result<Freshness, &'static str> {
     let written = spec.trim();
-    let Some(unit) = written.chars().last() else {
-        return Err(FRESHNESS_UNREADABLE);
-    };
-    let per_unit: i64 = match unit {
-        'm' => 60,
-        'h' => 3600,
-        'd' => 86_400,
-        'w' => 7 * 86_400,
-        'y' => 365 * 86_400,
-        _ => return Err(FRESHNESS_UNREADABLE),
-    };
-    let digits = &written[..written.len() - unit.len_utf8()];
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(FRESHNESS_UNREADABLE);
-    }
-    let count: i64 = digits.parse().map_err(|_| FRESHNESS_UNREADABLE)?;
-    let seconds = count.checked_mul(per_unit).ok_or(FRESHNESS_UNREADABLE)?;
+    let seconds = crate::time::timeframe_seconds(written).ok_or(FRESHNESS_UNREADABLE)?;
     if seconds < MIN_FRESHNESS_SECONDS {
         return Err(FRESHNESS_TOO_SHORT);
     }
@@ -206,6 +188,8 @@ pub fn read_page_settings(
     if let Some(value) = map.get(FRESHNESS_KEY).filter(|v| !v.is_null()) {
         let read = match value {
             serde_yaml_ng::Value::String(spec) => parse_freshness(spec),
+            // `freshness: 7` is the timeframe's bare number of days.
+            serde_yaml_ng::Value::Number(n) => parse_freshness(&n.to_string()),
             _ => Err(FRESHNESS_UNREADABLE),
         };
         match read {
@@ -545,8 +529,12 @@ mod tests {
             ("14d", 14 * 86_400),
             ("90d", 90 * 86_400),
             ("1y", 365 * 86_400),
-            ("60m", 3600),
-            ("90m", 90 * 60),
+            // The timeframe's grammar exactly: a bare number is days, `m`
+            // is months of 30 days.
+            ("7", 7 * 86_400),
+            ("2m", 60 * 86_400),
+            ("7 d", 7 * 86_400),
+            ("9223372036854775807w", i64::MAX),
         ] {
             let read = parse_freshness(spec).unwrap();
             assert_eq!(read.seconds, seconds, "{spec}");
@@ -559,23 +547,19 @@ mod tests {
         for spec in [
             "",
             "d",
-            "1",
-            "7",
+            "h",
             "1mo",
             "1s",
+            "1min",
             "1.5d",
-            "-1d",
-            "+1d",
-            "1 d",
             "1H",
             "one day",
             "99999999999999999999d",
-            "9223372036854775807w",
         ] {
             assert_eq!(parse_freshness(spec), Err(FRESHNESS_UNREADABLE), "{spec:?}");
         }
-        // Under an hour: minutes below 60, or a zero.
-        for spec in ["59m", "30m", "1m", "0m", "0h", "0d", "0w", "00h"] {
+        // Under an hour: a zero or a negative span.
+        for spec in ["0h", "0d", "0", "0m", "-1d"] {
             assert_eq!(parse_freshness(spec), Err(FRESHNESS_TOO_SHORT), "{spec}");
         }
         assert_eq!(MIN_FRESHNESS_SECONDS, 3600);
@@ -624,10 +608,11 @@ mod tests {
     #[test]
     fn a_freshness_that_does_not_read_is_a_finding_and_ignored() {
         for (yaml, value, reason) in [
-            ("freshness: 30m", "30m", FRESHNESS_TOO_SHORT),
+            ("freshness: 0d", "0d", FRESHNESS_TOO_SHORT),
+            ("freshness: 0", "0", FRESHNESS_TOO_SHORT),
             ("freshness: 1mo", "1mo", FRESHNESS_UNREADABLE),
             ("freshness: soon", "soon", FRESHNESS_UNREADABLE),
-            ("freshness: 7", "7", FRESHNESS_UNREADABLE),
+            ("freshness: true", "true", FRESHNESS_UNREADABLE),
             ("freshness: 0h", "0h", FRESHNESS_TOO_SHORT),
             ("freshness: [1d]", "- 1d", FRESHNESS_UNREADABLE),
         ] {
@@ -640,6 +625,20 @@ mod tests {
                 "{yaml}"
             );
         }
+    }
+
+    #[test]
+    fn a_bare_number_reads_as_days_as_in_the_timeframe() {
+        let (settings, findings) =
+            read_page_settings("---\nfreshness: 7\n---\n", "a.md", &PageRecord::default());
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(
+            settings.freshness,
+            Some(Freshness {
+                written: "7".into(),
+                seconds: 7 * 86_400
+            })
+        );
     }
 
     #[test]

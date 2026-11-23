@@ -12739,22 +12739,19 @@ fn now_offset() -> OffsetStamp {
 }
 
 /// The ISO date `spec` before today, for `timeframe` windows like `7d`, `24h`,
-/// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure. A window
+/// `2w`, `3m`, `1y`, read by [`time::timeframe_seconds`]. Falls back to seven
+/// days on a parse failure. A window
 /// reaching past the earliest date the calendar holds stops there instead of
 /// failing, so an agent's `20000y` still lists everything.
 fn timeframe_cutoff(spec: &str) -> Option<String> {
-    let spec = spec.trim();
-    let (num, unit) = spec.split_at(spec.find(|c: char| c.is_alphabetic()).unwrap_or(spec.len()));
-    let n: i64 = num.trim().parse().unwrap_or(7);
-    let days = match unit.trim() {
-        "h" => n.saturating_add(23) / 24,
-        "d" | "" => n,
-        "w" => n.saturating_mul(7),
-        "m" => n.saturating_mul(30),
-        "y" => n.saturating_mul(365),
-        _ => 7,
+    // Hours round up to whole days; what does not read falls back to a week.
+    let seconds = time::timeframe_seconds(spec).unwrap_or(7 * 86_400);
+    let days = if seconds > 0 {
+        (seconds - 1) / 86_400 + 1
+    } else {
+        0
     };
-    let cutoff = time::today_utc().saturating_sub_days(days.max(0));
+    let cutoff = time::today_utc().saturating_sub_days(days);
     Some(cutoff.ymd())
 }
 

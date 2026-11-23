@@ -168,6 +168,28 @@ pub fn saturating_seconds(n: i64) -> Delta {
     try_seconds(n).unwrap_or(if n < 0 { Delta::MIN } else { Delta::MAX })
 }
 
+/// The span a `timeframe` spells, in seconds: a whole number, then a unit
+/// (`h` hours, `d` or none days, `w` weeks, `m` months of 30 days, `y`
+/// years of 365 days), with spaces around either part allowed: `24h`, `7d`,
+/// `7`, `2w`, `3m`, `1y`. `None` when the number or the unit does not read.
+/// A span too long for the seconds is held at the longest one. One grammar
+/// for every window a person types: `build_context`'s and
+/// `recent_activity`'s `timeframe` and a Reflection page's `freshness`.
+pub fn timeframe_seconds(spec: &str) -> Option<i64> {
+    let spec = spec.trim();
+    let (num, unit) = spec.split_at(spec.find(|c: char| c.is_alphabetic()).unwrap_or(spec.len()));
+    let n: i64 = num.trim().parse().ok()?;
+    let per_unit: i64 = match unit.trim() {
+        "h" => 3600,
+        "d" | "" => 86_400,
+        "w" => 7 * 86_400,
+        "m" => 30 * 86_400,
+        "y" => 365 * 86_400,
+        _ => return None,
+    };
+    Some(n.saturating_mul(per_unit))
+}
+
 impl Delta {
     /// Whole days in the span, truncated toward zero.
     pub fn num_days(&self) -> i64 {
@@ -861,6 +883,35 @@ fn day_from_parts(parts: Parts) -> Option<Day> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_timeframe_spells_a_span_in_seconds() {
+        for (spec, seconds) in [
+            ("24h", 24 * 3600),
+            ("7d", 7 * 86_400),
+            ("7", 7 * 86_400),
+            (" 7 d ", 7 * 86_400),
+            ("2w", 14 * 86_400),
+            ("3m", 90 * 86_400),
+            ("1y", 365 * 86_400),
+            ("0h", 0),
+            ("-2d", -2 * 86_400),
+            ("9223372036854775807h", i64::MAX),
+        ] {
+            assert_eq!(timeframe_seconds(spec), Some(seconds), "{spec}");
+        }
+        for spec in [
+            "",
+            "h",
+            "1.5d",
+            "1H",
+            "1mo",
+            "soon",
+            "99999999999999999999d",
+        ] {
+            assert_eq!(timeframe_seconds(spec), None, "{spec:?}");
+        }
+    }
     use super::corpus::{CORPUS, Expect};
     use super::serde::{offset_stamp_json, stamp_json};
     use super::*;
