@@ -100,7 +100,7 @@ pub use crystalline_engine::similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarPr
 pub use crystalline_identity::join::{Holder, Join, Joins};
 pub use crystalline_identity::scope::{
     DomainAccess, DomainRight, DomainScreen, DomainVisibility, ReflectionCaller, ReflectionRight,
-    Scope, WriteRights, overlay_actor, reflection_right_word, write_list_matches,
+    Scope, WriteRights, overlay_actor, parse_write_list, reflection_right_word, write_list_matches,
 };
 pub use crystalline_remote::ops::DiscardTarget;
 pub use daemon::EXIT_FENCED;

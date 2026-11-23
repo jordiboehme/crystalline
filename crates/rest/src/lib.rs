@@ -272,6 +272,9 @@ use crate::scope::{DomainAccess, DomainRight};
         github_link::unlink,
         github_webhook::receive,
         users_api::unlink_github,
+        users_api::get_one,
+        users_api::get_writes,
+        users_api::set_writes,
         agents_api::list,
         agents_api::create,
         agents_api::remove,
@@ -391,6 +394,10 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::KindFilter,
         users_api::SortColumn,
         users_api::SortDir,
+        users_api::UserDetailResponse,
+        users_api::DraftCount,
+        users_api::WritesResponse,
+        users_api::WritesBody,
         schemas::Agent,
         schemas::AgentLoops,
         schemas::AgentToken,
@@ -1244,9 +1251,15 @@ fn routes(state: RestState) -> Router {
         .route("/accounts/search", get(account_search::search))
         .route(
             "/users/{name}",
-            patch(users_api::update).delete(users_api::remove),
+            get(users_api::get_one)
+                .patch(users_api::update)
+                .delete(users_api::remove),
         )
         .route("/users/{name}/drafts", delete(users_api::discard_drafts))
+        .route(
+            "/users/{name}/writes",
+            get(users_api::get_writes).put(users_api::set_writes),
+        )
         // Admin only, inside the handlers, like the users routes; see
         // [`agents_api`].
         .route("/agents", get(agents_api::list).post(agents_api::create))

@@ -13399,6 +13399,67 @@
       }
     },
     "/api/v1/users/{name}": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`GET /users/{name}` - one account, its write list and its drafts.",
+        "description": "The account in the shape the list answers with, sign-in kind and GitHub\nlink included. An agent is not an account, so its name answers 404.",
+        "operationId": "get_user",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The account.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDetailResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
       "delete": {
         "tags": [
           "users"
@@ -13821,6 +13882,158 @@
                 "description": "Seconds to wait before trying again."
               }
             },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{name}/writes": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`GET /users/{name}/writes` - an account's write list.",
+        "operationId": "get_user_writes",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The write list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WritesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`PUT /users/{name}/writes` - replace or remove an account's write list,\nas `crystalline users writes` does. The list only lowers rights.",
+        "operationId": "set_user_writes",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WritesBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The write list as stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WritesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An entry is not a domain name or a name prefix with one `*` at the end, or the list is empty.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -15513,6 +15726,26 @@
               "null"
             ],
             "description": "What you may not do with these conflicts here, in a sentence to show:\non a read-only server or without write access none can be settled,\nand on a read-only domain or an archived repository only the team's\ntext can be taken. Null when every choice is open or nothing is listed."
+          }
+        }
+      },
+      "DraftCount": {
+        "type": "object",
+        "description": "What one domain holds in an account's drafts, counted and never read.",
+        "required": [
+          "domain",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many drafts, kept texts and open draft rooms the account has there.",
+            "minimum": 0
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain."
           }
         }
       },
@@ -18901,6 +19134,39 @@
           }
         }
       },
+      "UserDetailResponse": {
+        "type": "object",
+        "description": "What `GET /users/{name}` answers with: the account, its write list and\nwhat it holds in drafts.",
+        "required": [
+          "user"
+        ],
+        "properties": {
+          "drafts": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/DraftCount"
+            },
+            "description": "What the account holds in drafts, per domain, only domains with any.\nNull when a domain's drafts could not be read. The drafts are the\nperson's own, so this route only counts them."
+          },
+          "user": {
+            "$ref": "#/components/schemas/User",
+            "description": "The account, as the list shows it."
+          },
+          "writes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The domains the account may write to, or null when it has no write\nlist and writes wherever its role and memberships allow."
+          }
+        }
+      },
       "UserResponse": {
         "type": "object",
         "description": "What every writing route but `DELETE` answers with: the account as stored,\nread back after the write rather than echoed from the request.",
@@ -19053,6 +19319,46 @@
             ],
             "description": "Restore the shared files from the origin as the proposal closes.",
             "example": false
+          }
+        }
+      },
+      "WritesBody": {
+        "type": "object",
+        "description": "The whole write list. Each entry is a domain name or a name prefix ending in one `*`; entries are trimmed and repeats count once. `null` removes the list, so the account writes wherever its role and memberships allow; an empty list is refused.",
+        "properties": {
+          "writes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The new list, or null to remove it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WritesResponse": {
+        "type": "object",
+        "description": "What both verbs on `/users/{name}/writes` answer with.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The account, as the store keys it."
+          },
+          "writes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The write list, or null when the account has none."
           }
         }
       }

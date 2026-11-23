@@ -3319,6 +3319,200 @@ async fn a_bulk_request_is_validated_and_admin_only() {
     );
 }
 
+/// `GET /users/{name}` answers one account in the list's shape, with its
+/// write list and a drafts summary; an unknown name, an invalid one and an
+/// agent's name are all 404, and only an admin may ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_account_is_read_with_its_write_list_and_drafts() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let get = |path: &str| as_session(fx.addr, reqwest::Method::GET, path, &admin).send();
+
+    let resp = get("/api/v1/users/Eddy").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["user"]["name"], "eddy");
+    assert_eq!(body["user"]["sign_in"], "password");
+    assert_eq!(body["user"]["github_linked"], false);
+    assert!(body["writes"].is_null(), "{body}");
+    assert_eq!(body["drafts"], serde_json::json!([]), "{body}");
+
+    fx.auth
+        .set_write_list("eddy", &["eng".to_string(), "agents-*".to_string()])
+        .await
+        .unwrap();
+    let body: serde_json::Value = get("/api/v1/users/eddy")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["writes"], serde_json::json!(["agents-*", "eng"]));
+
+    fx.auth
+        .add_agent(
+            "nightly",
+            None,
+            crystalline_service::rest::AgentLoops::Both,
+            "root",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    for path in [
+        "/api/v1/users/ghost",
+        "/api/v1/users/nightly",
+        "/api/v1/users/not%20a%20name",
+        "/api/v1/users/nightly/writes",
+    ] {
+        assert_eq!(get(path).await.unwrap().status(), 404, "{path}");
+    }
+
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    for path in ["/api/v1/users/mark", "/api/v1/users/mark/writes"] {
+        let resp = as_session(fx.addr, reqwest::Method::GET, path, &editor)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{path}");
+    }
+    let anonymous = reqwest::Client::new()
+        .get(format!("http://{}/api/v1/users/mark", fx.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401);
+}
+
+/// The write list round trip over `/users/{name}/writes`: set, read, the
+/// same checks `crystalline users writes` makes, removed with null, and
+/// refused on a read-only instance and to anyone but an admin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_list_is_set_read_and_removed() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let put = |name: &str, body: serde_json::Value| {
+        as_session(
+            fx.addr,
+            reqwest::Method::PUT,
+            &format!("/api/v1/users/{name}/writes"),
+            &admin,
+        )
+        .json(&body)
+        .send()
+    };
+
+    let resp = put(
+        "Mark",
+        serde_json::json!({"writes": [" eng ", "agents-*", "eng", ""]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "mark");
+    assert_eq!(body["writes"], serde_json::json!(["agents-*", "eng"]));
+    assert_eq!(
+        fx.auth.write_list("mark").await.unwrap(),
+        Some(vec!["agents-*".to_string(), "eng".to_string()])
+    );
+    let read: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/users/mark/writes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(read, body);
+
+    for bad in [
+        serde_json::json!({"writes": []}),
+        serde_json::json!({"writes": ["  "]}),
+        serde_json::json!({"writes": ["*"]}),
+        serde_json::json!({"writes": ["agents/*"]}),
+        serde_json::json!({"writes": ["a*b"]}),
+    ] {
+        let resp = put("mark", bad.clone()).await.unwrap();
+        assert_eq!(resp.status(), 422, "{bad}");
+    }
+    assert_eq!(
+        fx.auth.write_list("mark").await.unwrap().map(|l| l.len()),
+        Some(2),
+        "a refused list leaves the stored one alone"
+    );
+    assert_eq!(
+        put("ghost", serde_json::json!({"writes": ["eng"]}))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    let resp = put("mark", serde_json::json!({"writes": null}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["writes"].is_null());
+    assert_eq!(fx.auth.write_list("mark").await.unwrap(), None);
+
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/users/mark/writes",
+        &editor,
+    )
+    .json(&serde_json::json!({"writes": ["eng"]}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    let resp = as_session(
+        ro.addr,
+        reqwest::Method::PUT,
+        "/api/v1/users/mark/writes",
+        &admin,
+    )
+    .json(&serde_json::json!({"writes": ["eng"]}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "read-only refuses like the other routes"
+    );
+    assert_eq!(ro.auth.write_list("mark").await.unwrap(), None);
+    let resp = as_session(
+        ro.addr,
+        reqwest::Method::GET,
+        "/api/v1/users/mark/writes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "reading stays open on a read-only instance"
+    );
+}
+
 /// Every mutating user-admin route is refused on a read-only instance, ahead
 /// of the checks each one would otherwise run: an unknown account is never
 /// probed, and a change that would otherwise be well-formed is refused before
@@ -3950,6 +4144,13 @@ fn write_ops() -> Vec<WriteOp> {
             method: Method::PATCH,
             path: "/api/v1/users/mark",
             body: Some(serde_json::json!({"display": "M"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/users/mark/writes",
+            body: Some(serde_json::json!({"writes": ["eng", "agents-*"]})),
             min_role: Role::Admin,
             read_only_exempt: false,
         },

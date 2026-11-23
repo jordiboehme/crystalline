@@ -976,6 +976,20 @@ export type DraftConflictsResponse = {
 };
 
 /**
+ * What one domain holds in an account's drafts, counted and never read.
+ */
+export type DraftCount = {
+    /**
+     * How many drafts, kept texts and open draft rooms the account has there.
+     */
+    count: number;
+    /**
+     * The domain.
+     */
+    domain: string;
+};
+
+/**
  * Where the resolution landed: in your draft.
  */
 export type DraftResolveReceipt = {
@@ -3364,6 +3378,28 @@ export type User = {
 };
 
 /**
+ * What `GET /users/{name}` answers with: the account, its write list and
+ * what it holds in drafts.
+ */
+export type UserDetailResponse = {
+    /**
+     * What the account holds in drafts, per domain, only domains with any.
+     * Null when a domain's drafts could not be read. The drafts are the
+     * person's own, so this route only counts them.
+     */
+    drafts?: Array<DraftCount> | null;
+    /**
+     * The account, as the list shows it.
+     */
+    user: User;
+    /**
+     * The domains the account may write to, or null when it has no write
+     * list and writes wherever its role and memberships allow.
+     */
+    writes?: Array<string> | null;
+};
+
+/**
  * What every writing route but `DELETE` answers with: the account as stored,
  * read back after the write rather than echoed from the request.
  */
@@ -3472,6 +3508,30 @@ export type WithdrawBody = {
      * Restore the shared files from the origin as the proposal closes.
      */
     revert?: boolean | null;
+};
+
+/**
+ * The whole write list. Each entry is a domain name or a name prefix ending in one `*`; entries are trimmed and repeats count once. `null` removes the list, so the account writes wherever its role and memberships allow; an empty list is refused.
+ */
+export type WritesBody = {
+    /**
+     * The new list, or null to remove it.
+     */
+    writes?: Array<string> | null;
+};
+
+/**
+ * What both verbs on `/users/{name}/writes` answer with.
+ */
+export type WritesResponse = {
+    /**
+     * The account, as the store keys it.
+     */
+    name: string;
+    /**
+     * The write list, or null when the account has none.
+     */
+    writes?: Array<string> | null;
 };
 
 export type SearchAccountsData = {
@@ -10168,6 +10228,44 @@ export type DeleteUserResponses = {
 
 export type DeleteUserResponse = DeleteUserResponses[keyof DeleteUserResponses];
 
+export type GetUserData = {
+    body?: never;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}';
+};
+
+export type GetUserErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+};
+
+export type GetUserError = GetUserErrors[keyof GetUserErrors];
+
+export type GetUserResponses = {
+    /**
+     * The account.
+     */
+    200: UserDetailResponse;
+};
+
+export type GetUserResponse = GetUserResponses[keyof GetUserResponses];
+
 export type UpdateUserData = {
     body: PatchBody;
     path: {
@@ -10353,6 +10451,90 @@ export type ResetUserPasswordResponses = {
 };
 
 export type ResetUserPasswordResponse = ResetUserPasswordResponses[keyof ResetUserPasswordResponses];
+
+export type GetUserWritesData = {
+    body?: never;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/writes';
+};
+
+export type GetUserWritesErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+};
+
+export type GetUserWritesError = GetUserWritesErrors[keyof GetUserWritesErrors];
+
+export type GetUserWritesResponses = {
+    /**
+     * The write list.
+     */
+    200: WritesResponse;
+};
+
+export type GetUserWritesResponse = GetUserWritesResponses[keyof GetUserWritesResponses];
+
+export type SetUserWritesData = {
+    body: WritesBody;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/writes';
+};
+
+export type SetUserWritesErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * An entry is not a domain name or a name prefix with one `*` at the end, or the list is empty.
+     */
+    422: ProblemDetail;
+};
+
+export type SetUserWritesError = SetUserWritesErrors[keyof SetUserWritesErrors];
+
+export type SetUserWritesResponses = {
+    /**
+     * The write list as stored.
+     */
+    200: WritesResponse;
+};
+
+export type SetUserWritesResponse = SetUserWritesResponses[keyof SetUserWritesResponses];
 
 export type ValidateDocumentData = {
     body: ValidateBody;

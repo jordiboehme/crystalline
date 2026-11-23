@@ -853,6 +853,57 @@ pub fn write_list_matches(patterns: &[String], domain: &str) -> bool {
         })
 }
 
+/// Check a write list as an admin typed it: entries trimmed, empties dropped,
+/// duplicates kept once, each one a domain name or a name prefix with one
+/// `*` at the end. A list with no entry is refused: no list at all is a
+/// cleared list. Shared by `crystalline users writes` and the REST route, so
+/// both accept exactly the same lists.
+pub fn parse_write_list<'a>(raw: impl IntoIterator<Item = &'a str>) -> Result<Vec<String>> {
+    let mut entries: Vec<String> = Vec::new();
+    for entry in raw.into_iter().map(str::trim).filter(|e| !e.is_empty()) {
+        check_write_entry(entry)?;
+        if !entries.iter().any(|e| e == entry) {
+            entries.push(entry.to_string());
+        }
+    }
+    if entries.is_empty() {
+        anyhow::bail!(
+            "the write list is empty: give at least one entry, or clear the list to remove it"
+        );
+    }
+    Ok(entries)
+}
+
+/// One entry: a domain name, or a name prefix with one `*` at the end. The
+/// stem is checked with the domain-name rule; a prefix is checked with one
+/// letter after it (unless the stem is already at the length limit), so
+/// `agents-*` and `team.*` pass while `agents/*` does not. A bare `*` names
+/// every domain, which is the same as no list, and is refused.
+fn check_write_entry(entry: &str) -> Result<()> {
+    use crystalline_core::config::registration::{
+        DOMAIN_NAME_RULE, MAX_DOMAIN_NAME_CHARS, validate_domain_name,
+    };
+    let (stem, prefix) = match entry.strip_suffix('*') {
+        Some(stem) => (stem, true),
+        None => (entry, false),
+    };
+    // A prefix is checked as the shortest name it can match, the stem plus
+    // one character. A stem already at the length limit can only match
+    // itself, so it is checked as it is.
+    let probe = if prefix && stem.chars().count() < MAX_DOMAIN_NAME_CHARS {
+        format!("{stem}x")
+    } else {
+        stem.to_string()
+    };
+    if stem.is_empty() || stem.contains('*') || validate_domain_name(&probe).is_err() {
+        anyhow::bail!(
+            "'{entry}' is not a domain name or a name prefix with one * at the end: \
+             {DOMAIN_NAME_RULE}"
+        );
+    }
+    Ok(())
+}
+
 /// Resolves a [`Scope`] against the membership records in the auth database.
 ///
 /// Held by the engine (behind a `OnceLock`, installed when the HTTP surface

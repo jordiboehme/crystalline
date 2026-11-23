@@ -32,9 +32,6 @@ use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crystalline_core::config::registration::{
-    DOMAIN_NAME_RULE, MAX_DOMAIN_NAME_CHARS, validate_domain_name,
-};
 use crystalline_service::SecretRoute;
 use crystalline_service::rest::{AuthStore, LINKED_BY_CLI, ReflectionLevel, Role, User};
 use crystalline_service::write_list_matches;
@@ -854,51 +851,19 @@ fn print_users(
     );
 }
 
-/// Split `--writes` / `users writes` input into checked entries: trimmed,
-/// empties dropped, duplicates kept once, each one a domain name or a name
-/// prefix with one `*` at the end. A list with no entry is refused: no list
-/// at all is `--clear`.
+/// Split `--writes` / `users writes` input at commas into checked entries
+/// (see [`crystalline_service::parse_write_list`]). A list with no entry is
+/// refused: no list at all is `--clear`.
 fn parse_write_list(raw: &str) -> Result<Vec<String>> {
-    let mut entries: Vec<String> = Vec::new();
-    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        check_write_entry(entry)?;
-        if !entries.iter().any(|e| e == entry) {
-            entries.push(entry.to_string());
+    crystalline_service::parse_write_list(raw.split(',')).map_err(|e| {
+        if format!("{e}").starts_with("the write list is empty") {
+            anyhow!(
+                "the write list is empty: give at least one entry, or use --clear to remove the list"
+            )
+        } else {
+            e
         }
-    }
-    if entries.is_empty() {
-        bail!(
-            "the write list is empty: give at least one entry, or use --clear to remove the list"
-        );
-    }
-    Ok(entries)
-}
-
-/// One entry: a domain name, or a name prefix with one `*` at the end. The
-/// stem is checked with the domain-name rule; a prefix is checked with one
-/// letter after it (unless the stem is already at the length limit), so
-/// `agents-*` and `team.*` pass while `agents/*` does not. A bare `*` names
-/// every domain, which is the same as no list, and is refused.
-fn check_write_entry(entry: &str) -> Result<()> {
-    let (stem, prefix) = match entry.strip_suffix('*') {
-        Some(stem) => (stem, true),
-        None => (entry, false),
-    };
-    // A prefix is checked as the shortest name it can match, the stem plus
-    // one character. A stem already at the length limit can only match
-    // itself, so it is checked as it is.
-    let probe = if prefix && stem.chars().count() < MAX_DOMAIN_NAME_CHARS {
-        format!("{stem}x")
-    } else {
-        stem.to_string()
-    };
-    if stem.is_empty() || stem.contains('*') || validate_domain_name(&probe).is_err() {
-        bail!(
-            "'{entry}' is not a domain name or a name prefix with one * at the end: \
-             {DOMAIN_NAME_RULE}"
-        );
-    }
-    Ok(())
+    })
 }
 
 /// Warn, on stderr, about every entry no registered domain matches. The entry

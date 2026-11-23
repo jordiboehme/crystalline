@@ -1434,6 +1434,273 @@ pub async fn unlink_github(
     )))
 }
 
+/// What one domain holds in an account's drafts, counted and never read.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct DraftCount {
+    /// The domain.
+    domain: String,
+    /// How many drafts, kept texts and open draft rooms the account has there.
+    count: u64,
+}
+
+/// What `GET /users/{name}` answers with: the account, its write list and
+/// what it holds in drafts.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct UserDetailResponse {
+    /// The account, as the list shows it.
+    #[schema(value_type = super::schemas::User)]
+    user: User,
+    /// The domains the account may write to, or null when it has no write
+    /// list and writes wherever its role and memberships allow.
+    writes: Option<Vec<String>>,
+    /// What the account holds in drafts, per domain, only domains with any.
+    /// Null when a domain's drafts could not be read. The drafts are the
+    /// person's own, so this route only counts them.
+    drafts: Option<Vec<DraftCount>>,
+}
+
+/// What both verbs on `/users/{name}/writes` answer with.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct WritesResponse {
+    /// The account, as the store keys it.
+    name: String,
+    /// The write list, or null when the account has none.
+    writes: Option<Vec<String>>,
+}
+
+/// What `PUT /users/{name}/writes` takes: the whole list.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(description = "The whole write list. Each entry is a domain name or \
+                        a name prefix ending in one `*`; entries are trimmed \
+                        and repeats count once. `null` removes the list, so \
+                        the account writes wherever its role and memberships \
+                        allow; an empty list is refused.")]
+pub struct WritesBody {
+    /// The new list, or null to remove it.
+    writes: Option<Vec<String>>,
+}
+
+/// The stored account under `name`, or the 404 every route here answers for
+/// a name with no account (a name that is not even a valid login included).
+async fn existing_account(state: &RestState, name: &str) -> Result<User, ApiError> {
+    let missing = || ApiError::not_found(format!("no account named '{}'", folded(name)));
+    let Ok(account) = crate::auth_store::normalize_account_name(name) else {
+        return Err(missing());
+    };
+    state
+        .auth
+        .user(&account)
+        .await
+        .map_err(|e| store_error(e, &account))?
+        .ok_or_else(missing)
+}
+
+/// `GET /users/{name}` - one account, its write list and its drafts.
+///
+/// The account in the shape the list answers with, sign-in kind and GitHub
+/// link included. An agent is not an account, so its name answers 404.
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{name}",
+    tag = "users",
+    operation_id = "get_user",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    responses(
+        (status = 200, description = "The account.", body = UserDetailResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn get_one(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+) -> Result<Json<UserDetailResponse>, ApiError> {
+    identity.require_admin()?;
+    let user = existing_account(&state, &name).await?;
+    let writes = state
+        .auth
+        .write_list(&user.name)
+        .await
+        .map_err(|e| store_error(e, &user.name))?;
+    // A domain whose drafts cannot be read is logged by the engine; the
+    // account itself still answers.
+    let drafts = state
+        .engine
+        .account_drafts(&user.name)
+        .await
+        .ok()
+        .map(|held| {
+            held.into_iter()
+                .map(|(domain, count)| DraftCount { domain, count })
+                .collect()
+        });
+    Ok(Json(UserDetailResponse {
+        user,
+        writes,
+        drafts,
+    }))
+}
+
+/// `GET /users/{name}/writes` - an account's write list.
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{name}/writes",
+    tag = "users",
+    operation_id = "get_user_writes",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    responses(
+        (status = 200, description = "The write list.", body = WritesResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn get_writes(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+) -> Result<Json<WritesResponse>, ApiError> {
+    identity.require_admin()?;
+    let user = existing_account(&state, &name).await?;
+    let writes = state
+        .auth
+        .write_list(&user.name)
+        .await
+        .map_err(|e| store_error(e, &user.name))?;
+    Ok(Json(WritesResponse {
+        name: user.name,
+        writes,
+    }))
+}
+
+/// `PUT /users/{name}/writes` - replace or remove an account's write list,
+/// as `crystalline users writes` does. The list only lowers rights.
+#[utoipa::path(
+    put,
+    path = "/api/v1/users/{name}/writes",
+    tag = "users",
+    operation_id = "set_user_writes",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    request_body = WritesBody,
+    responses(
+        (status = 200, description = "The write list as stored.", body = WritesResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "An entry is not a domain name or a name prefix \
+                           with one `*` at the end, or the list is empty.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_writes(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+    ApiJson(body): ApiJson<WritesBody>,
+) -> Result<Json<WritesResponse>, ApiError> {
+    let caller = identity.require_admin()?;
+    refuse_read_only(&state)?;
+    let user = existing_account(&state, &name).await?;
+    match body.writes {
+        None => {
+            state
+                .auth
+                .clear_write_list(&user.name)
+                .await
+                .map_err(|e| store_error(e, &user.name))?;
+            tracing::info!("{} removed the write list of {}", caller.name(), user.name);
+        }
+        Some(raw) => {
+            let entries =
+                crystalline_identity::scope::parse_write_list(raw.iter().map(String::as_str))
+                    .map_err(|e| ApiError::unprocessable(format!("{e:#}")))?;
+            state
+                .auth
+                .set_write_list(&user.name, &entries)
+                .await
+                .map_err(|e| store_error(e, &user.name))?;
+            tracing::info!(
+                "{} set the write list of {} to {} entries",
+                caller.name(),
+                user.name,
+                entries.len()
+            );
+        }
+    }
+    let writes = state
+        .auth
+        .write_list(&user.name)
+        .await
+        .map_err(|e| store_error(e, &user.name))?;
+    Ok(Json(WritesResponse {
+        name: user.name,
+        writes,
+    }))
+}
+
 /// Refuse an admin acting destructively on its own account. `verb` names what
 /// was asked for, and the message is deliberately unlike the store's last-admin
 /// one: this refusal can fire while other admins exist, and what it protects is
