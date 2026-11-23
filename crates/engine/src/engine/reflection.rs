@@ -1710,6 +1710,11 @@ impl Engine {
                 self.settle_reflection(&p.domain, &p.path, &p.sections, outcome, caller)
                     .await
             }
+            "retire" => self.retire_reflection(&p.domain, &p.path, caller).await,
+            "restore" => {
+                self.restore_reflection(&p.domain, &p.path, p.owner.as_deref(), caller)
+                    .await
+            }
             "move_asset" => {
                 let to = p.to.as_deref().ok_or_else(|| {
                     EngineError::Invalid(
@@ -1727,7 +1732,7 @@ impl Engine {
             }
             "write_asset" => self.write_reflection_asset(p, caller).await,
             other => Err(EngineError::Invalid(format!(
-                "`{other}` is not a write_reflection action; use write, move, delete, settle, write_asset, move_asset or delete_asset"
+                "`{other}` is not a write_reflection action; use write, move, delete, settle, retire, restore, write_asset, move_asset or delete_asset"
             ))),
         }
     }
@@ -1761,7 +1766,8 @@ impl Engine {
         }
         // A pact file (PACT.md or a page pact) is written by curators;
         // everyone else proposes a change through a thread on it.
-        let need = if p.sources.is_empty() && !r::is_pact_file(&p.path) {
+        // So is naming an owner, which the page record keeps (spec 2.3).
+        let need = if p.sources.is_empty() && !r::is_pact_file(&p.path) && p.owner.is_none() {
             ReflectionRight::Edit
         } else {
             ReflectionRight::Curate
@@ -1864,6 +1870,22 @@ impl Engine {
             self.refuse_only_elsewhere(&p.domain, access.domain_id, ElsewhereRow::Page(&p.path))
                 .await?;
         }
+        // An owner is named when the page is created (spec 2.3): a page a
+        // person made is never claimed later. Sent again as stored, it
+        // changes nothing; the stored record keeps it either way.
+        let new_owner = match (p.owner.as_deref().map(str::trim), current.as_deref()) {
+            (None, _) => None,
+            (Some(owner), Some(stored)) => {
+                if r::read_provenance(stored).page.owner.as_deref() != Some(owner) {
+                    return Err(EngineError::Invalid(format!(
+                        "owner is named when a page is created; '{}' exists already, so leave owner out",
+                        p.path
+                    )));
+                }
+                None
+            }
+            (Some(owner), None) => Some(owner.to_string()),
+        };
         let (incoming, heading_stripped, placed_after_section) = match op {
             None => match (&p.markdown, current.as_deref()) {
                 (Some(markdown), _) => (markdown.clone(), None, false),
@@ -1899,6 +1921,13 @@ impl Engine {
         let incoming = self
             .settle_page_keys(p, &access, current.as_deref(), &incoming)
             .await?;
+        if let Some(owner) = &new_owner {
+            let follows = r::read_page_settings(&incoming, &p.path, &r::PageRecord::default())
+                .0
+                .follows;
+            self.refuse_owner(access.domain_id, &p.path, owner, None, follows)
+                .await?;
+        }
         // An engram attachment is copied into reflections/assets/
         // first; a write that adds an embed of one is refused, nothing
         // written. An embed the stored page already holds (written by hand
@@ -2161,6 +2190,9 @@ impl Engine {
                 }
             }
         }
+        if let Some(owner) = new_owner {
+            prov.page.owner = Some(owner);
+        }
         let final_text = stamp_reflected(&text, &mut prov, &advanced)?;
         // What a person must confirm (`super::disclosure`): the sources the
         // reach rule refuses that this person has not shared on this page.
@@ -2287,6 +2319,9 @@ impl Engine {
             "ids_assigned": minted,
             "curated": curated,
         });
+        if let Some(owner) = r::read_provenance(&final_text).page.owner {
+            receipt["owner"] = json!(owner);
+        }
         note_domain_names_normalized(&mut receipt, normalized);
         note_markdown_findings(
             &mut receipt,
@@ -2745,7 +2780,7 @@ impl Engine {
     /// page at `page` as `current` holds it (or with no links when it is
     /// new): what a `follows` a write sets is checked against. Pact files,
     /// threads and baselines are no pages.
-    async fn page_links(
+    pub(super) async fn page_links(
         &self,
         domain_id: DomainId,
         page: &str,
@@ -3227,6 +3262,18 @@ struct StagedMove {
     /// Each follower whose frontmatter changes: its path, its file and its
     /// new text.
     refollowed: Vec<(String, PathBuf, String)>,
+    /// How many `follows` of the followers now name the new path.
+    follows_rewritten: usize,
+    /// How many owners and former owners in their records do.
+    owners_rewritten: usize,
+}
+
+/// `text` with an owner or a former owner in its page record that names
+/// `from` naming `to` ([`r::rewrite_owner`]), and how many changed. A
+/// frontmatter that cannot be cut is left as it is: that page then names a
+/// page that is gone, which the queue tells a curator.
+fn owner_rewrite(text: &str, from: &str, to: &str) -> (String, usize) {
+    r::rewrite_owner(text, from, to).unwrap_or_else(|_| (text.to_string(), 0))
 }
 
 impl Engine {
@@ -3359,7 +3406,7 @@ impl Engine {
                 change_label(&caller.scope),
             );
         }
-        // A follows that followed the move: nobody's change.
+        // A follows or an owner that followed the move: nobody's change.
         for (inner, _, _) in &staged.refollowed {
             self.announce_reflection(domain, inner, ReflectionChangeKind::Changed, None, None);
         }
@@ -3372,7 +3419,8 @@ impl Engine {
             "links_rewritten": links,
             "threads_moved": threads_moved,
             "pact_moved": staged.pact.is_some(),
-            "follows_rewritten": staged.refollowed.len(),
+            "follows_rewritten": staged.follows_rewritten,
+            "owners_rewritten": staged.owners_rewritten,
         });
         if !failed.is_empty() {
             receipt["links_failed"] = json!(failed);
@@ -3430,9 +3478,10 @@ impl Engine {
                 mv.relink_moved(text, inner).1
             });
         // The pages that follow the moved page follow it to its new path, in
-        // this move: they wait for an open room like a link rewrite.
+        // this move, and so do the pages it owns or owned (their record names
+        // it): they wait for an open room like a link rewrite.
         let followers = rooms_to_rewrite(access, others.iter().map(String::as_str), &|text, _| {
-            r::rewrite_follows(text, from, to).1
+            r::rewrite_follows(text, from, to).1 + owner_rewrite(text, from, to).1
         });
         linking.extend(
             followers
@@ -3496,13 +3545,18 @@ impl Engine {
             }
             _ => None,
         };
-        // Each follower names the new path; only its frontmatter changes,
+        // Each follower names the new path in its `follows`, and each page
+        // it owns or owned in its record; only the frontmatter changes,
         // which no section and no baseline holds.
         let mut refollowed = Vec::new();
+        let (mut follows_rewritten, mut owners_rewritten) = (0, 0);
         for (inner, abs) in followers.iter().zip(follower_abs) {
             if let Some(text) = read_opt(abs)? {
-                let (text, n) = r::rewrite_follows(&text, from, to);
-                if n > 0 {
+                let (text, follows) = r::rewrite_follows(&text, from, to);
+                let (text, owners) = owner_rewrite(&text, from, to);
+                follows_rewritten += follows;
+                owners_rewritten += owners;
+                if follows + owners > 0 {
                     refollowed.push((
                         inner.clone(),
                         abs.clone(),
@@ -3526,6 +3580,8 @@ impl Engine {
             baseline: old_baseline.is_some().then_some(moved.baseline),
             pact,
             refollowed,
+            follows_rewritten,
+            owners_rewritten,
         })
     }
 

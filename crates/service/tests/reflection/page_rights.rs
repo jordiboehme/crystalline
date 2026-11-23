@@ -17,7 +17,7 @@ const PACT: &str = "# Pact of A\n\n## Tone\n\nShort.\n";
 /// `eng` with its Reflection on, private to `keeper`; `ann` a member who
 /// edits the Reflection (contributor) and does not curate it. The machine
 /// owner (`person()`) curates.
-async fn editor_and_curator() -> (Fx, ReflectionCaller, ReflectionCaller) {
+pub async fn editor_and_curator() -> (Fx, ReflectionCaller, ReflectionCaller) {
     let fx = reflecting().await;
     let auth = Arc::new(
         AuthStore::open(&fx.tmp.path().join("web-auth.db"))

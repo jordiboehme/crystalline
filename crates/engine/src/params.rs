@@ -677,7 +677,11 @@ pub struct WriteReflectionParams {
     pub domain: String,
     /// write (the default: create or replace a reflection or PACT.md, or
     /// change one section of it with operation), move, delete, settle (mark
-    /// people's changes to sections as taken in or kept), write_asset
+    /// people's changes to sections as taken in or kept), retire (take a
+    /// page out of the navigation, kept and restorable; an unattended
+    /// session retires and never deletes), restore (bring a retired page
+    /// back), reconciled (record that a page was brought in line with its
+    /// pacts, with outcome updated or unchanged), write_asset
     /// (upload a file under reflections/assets/: path, and content or
     /// base64; replacing one with overwrite needs curate access), move_asset
     /// or delete_asset (move or remove a file under reflections/assets/; both
@@ -746,9 +750,19 @@ pub struct WriteReflectionParams {
     pub sections: Vec<String>,
     /// settle: kept (the person's text stands and the sources stay) or
     /// taken_in (you changed the engrams to match; their checksums are
-    /// refreshed).
+    /// refreshed). reconciled: updated (the page changed) or unchanged.
     #[serde(default)]
     pub outcome: Option<String>,
+    /// write, on create only: the page that owns the new page, by its path
+    /// inside reflections/. Reconciling the owner keeps its owned pages
+    /// current. restore: the page the retired page was owned by, to put it
+    /// back under that page; leave it out to restore it as a page of its own.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// reconciled: the version of the queue item the reconcile settled, as
+    /// the item gave it.
+    #[serde(default)]
+    pub version: Option<String>,
     /// write: the checksum read_reflection returned; a reflection that changed
     /// since is refused rather than overwritten.
     #[serde(default)]

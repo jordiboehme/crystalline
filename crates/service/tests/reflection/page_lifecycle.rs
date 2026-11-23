@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crystalline_core::automation::Loop;
+use crystalline_core::reflection as r;
 use crystalline_service::params::{DiscussParams, WriteReflectionParams};
 use crystalline_service::read_limit::{Limit, within};
 use crystalline_service::rest::{AgentLoops, AuthStore};
@@ -93,6 +94,14 @@ async fn an_unattended_session_retires_instead_of_deleting() {
     .unwrap_err();
     refused_as_unattended(&refused, "guides/a.md");
 
+    // What it does instead goes through.
+    within(
+        Some(Limit::default()),
+        fx.engine.write_reflection(&act("retire", "guides/a.md"), &agent()),
+    )
+    .await
+    .unwrap();
+
     fx.engine
         .write_reflection(&delete("guides/a.md"), &person())
         .await
@@ -174,4 +183,347 @@ async fn a_lease_holder_cannot_delete_a_page() {
         .unwrap_err();
     refused_as_unattended(&refused, "guides/a.md");
     assert!(file(&fx, "guides/a.md").is_some(), "the page stays");
+}
+
+// --- owned pages ------------------------------------------------------------
+
+fn owned(path: &str, owner: &str, text: &str) -> WriteReflectionParams {
+    WriteReflectionParams {
+        owner: Some(owner.into()),
+        ..write(path, text)
+    }
+}
+
+fn act(action: &str, path: &str) -> WriteReflectionParams {
+    WriteReflectionParams {
+        domain: "eng".into(),
+        action: Some(action.into()),
+        path: path.into(),
+        ..Default::default()
+    }
+}
+
+fn record(fx: &Fx, path: &str) -> r::PageRecord {
+    r::read_provenance(&file(fx, path).expect("the page is there")).page
+}
+
+/// A page an agent creates with `owner` is owned by that page: the record
+/// says so, the owner's set is read from the pages, and a hand-written
+/// record in the text sets nothing.
+#[tokio::test]
+async fn a_page_created_with_an_owner_is_owned_by_it() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    let receipt = fx
+        .engine
+        .write_reflection(&owned("arch/one.md", "arch.md", PAGE), &agent())
+        .await
+        .unwrap();
+    assert_eq!(receipt["owner"], "arch.md", "{receipt}");
+    assert_eq!(record(&fx, "arch/one.md").owner.as_deref(), Some("arch.md"));
+
+    // The agent's next write of the page keeps the owner, sent or not.
+    fx.engine
+        .write_reflection(
+            &owned("arch/one.md", "arch.md", "# A\n\n## One\n\nSecond.\n"),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&write("arch/one.md", "# A\n\n## One\n\nThird.\n"), &agent())
+        .await
+        .unwrap();
+    assert_eq!(record(&fx, "arch/one.md").owner.as_deref(), Some("arch.md"));
+
+    // A record written into the text owns nothing: the block is Crystalline's.
+    fx.engine
+        .write_reflection(
+            &write(
+                "arch/two.md",
+                "---\nreflection:\n  _page:\n    owner: arch.md\n---\n# Two\n",
+            ),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record(&fx, "arch/two.md").owner, None);
+
+    let set = fx.engine.reflection_owned_pages("eng").await.unwrap();
+    assert_eq!(set.get("arch.md"), Some(&vec!["arch/one.md".to_string()]));
+}
+
+/// An owner is set on create only, names an existing page that is not
+/// retired and leads nowhere back, and is a curator's to set.
+#[tokio::test]
+async fn an_owner_is_checked_when_the_page_is_created() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    put(&fx, "notes.md", PAGE).await;
+    put(&fx, "old.md", PAGE).await;
+    fx.engine
+        .write_reflection(&act("retire", "old.md"), &agent())
+        .await
+        .unwrap();
+
+    for (path, owner, says) in [
+        ("arch/one.md", "gone.md", "does not exist"),
+        ("arch/one.md", "PACT.md", "names no page"),
+        ("arch/one.md", "old.md", "retired"),
+        ("arch/one.md", "arch/one.md", "itself"),
+        // An existing page takes no new owner.
+        ("notes.md", "arch.md", "created"),
+    ] {
+        let refused = fx
+            .engine
+            .write_reflection(&owned(path, owner, PAGE), &agent())
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains(says), "{owner}: {refused}");
+    }
+    assert!(file(&fx, "arch/one.md").is_none(), "nothing was written");
+    assert_eq!(record(&fx, "notes.md").owner, None);
+
+    // A page under the new path's folder follows it as its folder parent,
+    // so it cannot own it.
+    put(&fx, "arch/z/child.md", PAGE).await;
+    let refused = fx
+        .engine
+        .write_reflection(&owned("arch/z.md", "arch/z/child.md", PAGE), &agent())
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("leads back"), "{refused}");
+    assert!(file(&fx, "arch/z.md").is_none());
+}
+
+/// Retiring takes a page out of its owner's set and keeps the owner as the
+/// page it was owned by; the status says retired, and it owes no feedback.
+/// A restore brings it back, standalone or under the page it was owned by.
+#[tokio::test]
+async fn a_retired_page_keeps_its_former_owner_and_comes_back() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    fx.engine
+        .write_reflection(&owned("arch/one.md", "arch.md", PAGE), &agent())
+        .await
+        .unwrap();
+
+    let receipt = fx
+        .engine
+        .write_reflection(&act("retire", "arch/one.md"), &agent())
+        .await
+        .unwrap();
+    assert_eq!(receipt["retired"], true, "{receipt}");
+    let text = file(&fx, "arch/one.md").unwrap();
+    assert!(text.contains("status: archived"), "{text}");
+    let page = record(&fx, "arch/one.md");
+    assert_eq!(page.owner, None);
+    let retired = page.retired.expect("a retired record");
+    assert_eq!(retired.was_owned_by.as_deref(), Some("arch.md"));
+    assert_eq!(retired.by, "claude-code");
+    assert!(!retired.at.is_empty());
+    assert!(
+        r::feedback_changes(&text, &file(&fx, ".reflected/arch/one.md").unwrap()).is_empty(),
+        "a retire owes no feedback"
+    );
+    assert!(
+        fx.engine
+            .reflection_owned_pages("eng")
+            .await
+            .unwrap()
+            .is_empty(),
+        "no longer in its owner's set"
+    );
+    let again = fx
+        .engine
+        .write_reflection(&act("retire", "arch/one.md"), &agent())
+        .await
+        .unwrap_err();
+    assert!(again.to_string().contains("already retired"), "{again}");
+
+    // Back under another page than the former owner: refused.
+    let refused = fx
+        .engine
+        .write_reflection(
+            &WriteReflectionParams {
+                owner: Some("notes.md".into()),
+                ..act("restore", "arch/one.md")
+            },
+            &person(),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("arch.md"), "{refused}");
+
+    let receipt = fx
+        .engine
+        .write_reflection(
+            &WriteReflectionParams {
+                owner: Some("arch.md".into()),
+                ..act("restore", "arch/one.md")
+            },
+            &person(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["restored"], true, "{receipt}");
+    let text = file(&fx, "arch/one.md").unwrap();
+    assert!(!text.contains("status:"), "{text}");
+    let page = record(&fx, "arch/one.md");
+    assert_eq!(page.owner.as_deref(), Some("arch.md"));
+    assert_eq!(page.retired, None);
+
+    // Retired again and restored on its own.
+    fx.engine
+        .write_reflection(&act("retire", "arch/one.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&act("restore", "arch/one.md"), &person())
+        .await
+        .unwrap();
+    let page = record(&fx, "arch/one.md");
+    assert_eq!((page.owner, page.retired), (None, None));
+    let refused = fx
+        .engine
+        .write_reflection(&act("restore", "arch/one.md"), &person())
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("not retired"), "{refused}");
+}
+
+/// A restore under a former owner that is gone is refused; on its own it
+/// goes through.
+#[tokio::test]
+async fn a_restore_under_a_gone_owner_is_refused() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    fx.engine
+        .write_reflection(&owned("arch/one.md", "arch.md", PAGE), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&act("retire", "arch/one.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&delete("arch.md"), &person())
+        .await
+        .unwrap();
+    let refused = fx
+        .engine
+        .write_reflection(
+            &WriteReflectionParams {
+                owner: Some("arch.md".into()),
+                ..act("restore", "arch/one.md")
+            },
+            &person(),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("does not exist"), "{refused}");
+    fx.engine
+        .write_reflection(&act("restore", "arch/one.md"), &person())
+        .await
+        .unwrap();
+}
+
+/// Only a curator retires, restores or names an owner; PACT.md and page
+/// pacts are no pages to retire.
+#[tokio::test]
+async fn retire_restore_and_owner_are_a_curators() {
+    let (fx, ann, _) = crate::page_rights::editor_and_curator().await;
+    put(&fx, "notes.md", PAGE).await;
+    let refused = fx
+        .engine
+        .write_reflection(&owned("arch/one.md", "notes.md", PAGE), &ann)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
+    for action in ["retire", "restore"] {
+        let refused = fx
+            .engine
+            .write_reflection(&act(action, "notes.md"), &ann)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, EngineError::Forbidden(_)),
+            "{action}: {refused}"
+        );
+    }
+    assert!(file(&fx, "arch/one.md").is_none());
+    assert!(!file(&fx, "notes.md").unwrap().contains("status"));
+
+    put(&fx, "arch.md", PAGE).await;
+    put(&fx, "arch.pact.md", "# Pact of arch\n\n## Tone\n\nShort.\n").await;
+    for path in ["PACT.md", "arch.pact.md"] {
+        let refused = fx
+            .engine
+            .write_reflection(&act("retire", path), &person())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, EngineError::Invalid(_)),
+            "{path}: {refused}"
+        );
+    }
+    let missing = fx
+        .engine
+        .write_reflection(&act("retire", "gone.md"), &person())
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, EngineError::NotFound(_)), "{missing}");
+}
+
+/// A move rewrites the owner and the former owner that name the moved page,
+/// in the move itself, and the owner's set follows.
+#[tokio::test]
+async fn a_move_takes_the_owned_pages_along() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    fx.engine
+        .write_reflection(&owned("arch/one.md", "arch.md", PAGE), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&owned("arch/two.md", "arch.md", PAGE), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&act("retire", "arch/two.md"), &agent())
+        .await
+        .unwrap();
+    let receipt = fx
+        .engine
+        .write_reflection(
+            &WriteReflectionParams {
+                to: Some("design.md".into()),
+                ..act("move", "arch.md")
+            },
+            &person(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["owners_rewritten"], 2, "{receipt}");
+    assert_eq!(
+        record(&fx, "arch/one.md").owner.as_deref(),
+        Some("design.md")
+    );
+    assert_eq!(
+        record(&fx, "arch/two.md")
+            .retired
+            .unwrap()
+            .was_owned_by
+            .as_deref(),
+        Some("design.md")
+    );
+    let set = fx.engine.reflection_owned_pages("eng").await.unwrap();
+    assert_eq!(set.get("design.md"), Some(&vec!["arch/one.md".to_string()]));
+    assert!(!set.contains_key("arch.md"), "{set:?}");
+    // The index row holds the rewrite too: the set is read from it.
+    let one = file(&fx, "arch/one.md").unwrap();
+    assert!(
+        r::feedback_changes(&one, &file(&fx, ".reflected/arch/one.md").unwrap()).is_empty(),
+        "the rewrite owes no feedback"
+    );
 }
