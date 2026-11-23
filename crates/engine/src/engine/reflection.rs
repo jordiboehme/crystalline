@@ -3293,9 +3293,19 @@ struct StagedMove {
     /// baseline when it has one, and how many links changed.
     pacts: Vec<(String, PathBuf, String, Option<String>, usize)>,
     /// The reconcile states whose stored pact hash the move would leave
-    /// stale only because it rewrote paths: each with the hash computed
-    /// after the move, at the page's path after it.
-    rehashed: Vec<crystalline_index::ReflectionReconcile>,
+    /// stale only because it rewrote paths, as read: each at the page's path
+    /// after the move, with the hash computed after it.
+    rehashed: Vec<Rehash>,
+}
+
+/// A stored pact hash a move carries along: the page's path after the
+/// move, the hash and the time its state held when the move read it, and
+/// the hash after the move.
+struct Rehash {
+    path: String,
+    seen_hash: String,
+    seen_at: String,
+    hash: String,
 }
 
 /// `text` with an owner or a former owner in its page record that names
@@ -3432,7 +3442,12 @@ impl Engine {
             ops.push(RowOp::Page { inner, text, abs });
         }
         // After the state's own move: a page's state is at its new path.
-        ops.extend(staged.rehashed.iter().map(RowOp::Reconcile));
+        ops.extend(staged.rehashed.iter().map(|rehash| RowOp::RehashReconcile {
+            path: &rehash.path,
+            seen_hash: &rehash.seen_hash,
+            seen_at: &rehash.seen_at,
+            hash: &rehash.hash,
+        }));
         self.commit_reflection_rows(access.domain_id, &ops, OnRefusal::put_back(domain, undo))
             .await?;
         self.move_disclosures(access.domain_id, from, to).await?;
@@ -3656,10 +3671,17 @@ impl Engine {
             };
             let baseline_abs = access.abs(&r::baseline_path(inner));
             let baseline = read_opt(&baseline_abs)?;
+            // One pact that cannot be relinked holds the whole move: the
+            // move rewrites it in its own commit, with the hashes that
+            // follow it.
             let out = r::relink(&text, baseline.as_deref().unwrap_or(""), &|s| {
                 mv.relink_moved(s, inner)
             })
-            .map_err(EngineError::Invalid)?;
+            .map_err(|e| {
+                EngineError::Invalid(format!(
+                    "moving '{from}' rewrites the links of the pact file '{inner}', and '{inner}' cannot be rewritten: {e}; fix '{inner}' first, then move again"
+                ))
+            })?;
             if out.links > 0 {
                 relinked.push((
                     inner.clone(),
@@ -3694,11 +3716,21 @@ impl Engine {
     /// path after it. A state whose stored hash already differs from the
     /// hash before the move stays as it is: that change is real and stays
     /// to be seen. Read once, in bulk, under the move's locks.
+    ///
+    /// The locks hold the moved page, its pact, the followers and the
+    /// relinked pacts, not every page whose chain runs through them, so a
+    /// `reconciled` of such a page may run beside the move. The update is a
+    /// compare-and-set ([`RowOp::RehashReconcile`]) that touches only the
+    /// hash: a reconcile recorded between this read and the move's commit
+    /// wins. A reconcile that computed its hash before the move and records
+    /// it after the commit stores the hash before the move; the queue then
+    /// reads that page's pact as changed once, which costs one more
+    /// reconcile and loses nothing.
     async fn rehash_after_move(
         &self,
         mv: &PageMove<'_>,
         staged: &StagedMove,
-    ) -> Result<Vec<crystalline_index::ReflectionReconcile>> {
+    ) -> Result<Vec<Rehash>> {
         let (rows, states) = {
             let store = self.store.lock().await;
             let rows = store.list_reflections(mv.access.domain_id).await?;
@@ -3737,12 +3769,11 @@ impl Engine {
                 };
                 let was = before.get(&state.path)?;
                 let now = after.get(&at)?;
-                (state.pact_hash == *was && now != was).then(|| {
-                    crystalline_index::ReflectionReconcile {
-                        path: at,
-                        pact_hash: now.clone(),
-                        ..state
-                    }
+                (state.pact_hash == *was && now != was).then(|| Rehash {
+                    path: at,
+                    seen_hash: state.pact_hash,
+                    seen_at: state.last_reconciled,
+                    hash: now.clone(),
                 })
             })
             .collect())

@@ -5412,6 +5412,30 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn swap_reflection_reconcile_hash(
+        &self,
+        domain: DomainId,
+        path: &str,
+        seen_hash: &str,
+        seen_at: &str,
+        hash: &str,
+    ) -> Result<bool> {
+        let mut conn = self.acquire().await?;
+        let done = sqlx::query(
+            "UPDATE reflection_reconcile SET pact_hash=$5 \
+             WHERE domain_id=$1 AND path=$2 AND pact_hash=$3 AND last_reconciled=$4",
+        )
+        .bind(domain.0)
+        .bind(path)
+        .bind(seen_hash)
+        .bind(seen_at)
+        .bind(hash)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(done.rows_affected() > 0)
+    }
+
     async fn move_reflection_reconcile(
         &self,
         domain: DomainId,

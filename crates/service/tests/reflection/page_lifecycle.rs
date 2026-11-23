@@ -1060,3 +1060,36 @@ async fn an_agent_of_the_reflect_loop_owns_retires_and_reconciles() {
     let set = fx.engine.reflection_owned_pages("eng").await.unwrap();
     assert_eq!(set.get("arch.md"), Some(&vec!["arch/one.md".to_string()]));
 }
+
+/// A pact file whose links a move must rewrite, and whose frontmatter
+/// cannot be rewritten, holds the move up: the refusal names the file and
+/// says to fix it first, and nothing moves.
+#[tokio::test]
+async fn a_pact_that_cannot_be_relinked_holds_the_move_and_is_named() {
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    // A section reflected as it stands, under a flow-style frontmatter that
+    // cannot be cut key by key: the move's relink must restamp it.
+    let body = "# Pact\n\n## Tone\n<!-- r:aaaa1111 -->\n\nSee [a](guides/a.md).\n";
+    let section = r::split_sections(body)
+        .into_iter()
+        .find(|s| s.id.as_deref() == Some("aaaa1111"))
+        .unwrap();
+    let hash = r::section_hash(&section.text);
+    let pact = format!(
+        "---\n{{title: Pact, reflection: {{aaaa1111: {{reflected: {hash}}}}}}}\n---\n{body}"
+    );
+    std::fs::write(fx.root.join("reflections/PACT.md"), &pact).unwrap();
+    fx.engine.sync(None).await.unwrap();
+
+    let refused = fx
+        .engine
+        .move_reflection("eng", "guides/a.md", "guides/c.md", &person())
+        .await
+        .unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("'PACT.md'") && text.contains("fix"), "{text}");
+    assert!(file(&fx, "guides/a.md").is_some(), "nothing moved");
+    assert!(file(&fx, "guides/c.md").is_none());
+    assert_eq!(file(&fx, "PACT.md").unwrap(), pact);
+}

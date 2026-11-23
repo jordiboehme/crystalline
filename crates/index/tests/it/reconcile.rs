@@ -233,3 +233,77 @@ async fn wiped(store: &dyn Store) {
 }
 
 parity!(a_wipe_takes_the_state, wiped);
+
+/// A move's hash update is a compare-and-set: it changes only the stored
+/// hash, and only while the row still holds the hash and the time the move
+/// read. A reconcile written in between wins.
+async fn swap_lands_on_what_was_read(store: &dyn Store) {
+    let eng = domain(store, "eng").await;
+    let read = state("a.md", "2026-11-20T10:00:00Z", "updated");
+    store.set_reflection_reconcile(eng, &read).await.unwrap();
+
+    // Another hash or another time than read: nothing changes.
+    for (hash, at) in [
+        ("hash-other", read.last_reconciled.as_str()),
+        (read.pact_hash.as_str(), "2026-11-20T09:00:00Z"),
+    ] {
+        assert!(
+            !store
+                .swap_reflection_reconcile_hash(eng, "a.md", hash, at, "hash-new")
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store.reflection_reconcile(eng, "a.md").await.unwrap(),
+        Some(read.clone())
+    );
+
+    // As read: only the hash changes.
+    assert!(
+        store
+            .swap_reflection_reconcile_hash(
+                eng,
+                "a.md",
+                &read.pact_hash,
+                &read.last_reconciled,
+                "hash-new"
+            )
+            .await
+            .unwrap()
+    );
+    let swapped = ReflectionReconcile {
+        pact_hash: "hash-new".to_string(),
+        ..read.clone()
+    };
+    assert_eq!(
+        store.reflection_reconcile(eng, "a.md").await.unwrap(),
+        Some(swapped)
+    );
+
+    // A reconcile recorded after the read wins over the swap.
+    let later = state("a.md", "2026-11-20T12:00:00Z", "unchanged");
+    store.set_reflection_reconcile(eng, &later).await.unwrap();
+    assert!(
+        !store
+            .swap_reflection_reconcile_hash(eng, "a.md", "hash-new", &read.last_reconciled, "x")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.reflection_reconcile(eng, "a.md").await.unwrap(),
+        Some(later)
+    );
+    // No row, no swap.
+    assert!(
+        !store
+            .swap_reflection_reconcile_hash(eng, "gone.md", "h", "t", "x")
+            .await
+            .unwrap()
+    );
+}
+
+parity!(
+    a_hash_swap_lands_only_on_the_row_it_read,
+    swap_lands_on_what_was_read
+);

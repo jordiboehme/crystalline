@@ -5181,6 +5181,31 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn swap_reflection_reconcile_hash(
+        &self,
+        domain: DomainId,
+        path: &str,
+        seen_hash: &str,
+        seen_at: &str,
+        hash: &str,
+    ) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE reflection_reconcile SET pact_hash=?5 \
+                 WHERE domain_id=?1 AND path=?2 AND pact_hash=?3 AND last_reconciled=?4",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(path.to_string()),
+                    Value::Text(seen_hash.to_string()),
+                    Value::Text(seen_at.to_string()),
+                    Value::Text(hash.to_string()),
+                ],
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
     async fn move_reflection_reconcile(
         &self,
         domain: DomainId,

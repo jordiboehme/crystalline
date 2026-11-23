@@ -4349,6 +4349,22 @@ pub trait Store: ReadStore {
         state: &ReflectionReconcile,
     ) -> Result<()>;
 
+    /// Set the stored pact hash of the page at `path` to `hash`, only while
+    /// its state still holds `seen_hash` and `seen_at` (its
+    /// `last_reconciled`), the state the caller read: `false` and nothing
+    /// written when there is no state or another writer changed it in
+    /// between. Nothing else of the state changes. A page move uses it to
+    /// carry the hashes it alone changed, so a reconcile recorded meanwhile
+    /// wins.
+    async fn swap_reflection_reconcile_hash(
+        &self,
+        domain: DomainId,
+        path: &str,
+        seen_hash: &str,
+        seen_at: &str,
+        hash: &str,
+    ) -> Result<bool>;
+
     /// Carry the reconcile state of the page at `from` to `to`, for a page
     /// move: a state at `to` is replaced, and a page with none at `from`
     /// leaves `to` as it is. Two statements, so run it inside the caller's
