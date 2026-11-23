@@ -162,8 +162,10 @@ pub fn owned_pages<'a>(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoverChange {
     /// The engrams of the page's own domain the write dropped from a page
-    /// with a freshness (or an owned page), each with its checksum when the
-    /// page cited it: they stay covered while that checksum holds.
+    /// with a freshness (or an owned page), each with the checksum the page
+    /// recorded when it cited it. The index keeps each with its checksum at
+    /// the drop instead ([`cover_change`]); it stays covered while that
+    /// checksum holds.
     pub add: Vec<(String, String)>,
     /// The engrams the page cites again: it covers them by citing them.
     pub remove: Vec<String>,
@@ -193,13 +195,19 @@ fn own_cited(provenance: &Provenance) -> BTreeMap<String, String> {
 /// What the write of the page at `path` from `before` (its text as stored,
 /// `None` for a new page) to `after` changes in the engrams it keeps
 /// covered. An engram of the page's own domain that `before` cites and
-/// `after` does not is kept, with the checksum `before` recorded for it,
-/// when `after` is a page with a freshness or an owned page that is not
+/// `after` does not is kept when `after` is a page with a freshness or an
+/// owned page that is not
 /// retired: a page that keeps itself current drops last week's change, and
 /// that change is still reflected. An engram `after` cites and `before` did
 /// not leaves the kept set. Citing another domain's engram covers nothing of
 /// this one, so only sources of the page's own domain count. Nothing for
 /// `PACT.md`, a page pact or anything that is no page.
+///
+/// The checksum in [`CoverChange::add`] is the one `before` recorded; the
+/// index does not store it. It keeps each dropped engram with the engram's
+/// own checksum at the drop, read from its engram rows
+/// (`crystalline_index::reflection::index_reflection_row`): a reconcile that
+/// saw the engram change and then dropped it has reflected that change.
 pub fn cover_change(path: &str, before: Option<&str>, after: &str) -> CoverChange {
     if is_pact_file(path) || !matches!(classify(path), ReflectionFile::Page(_)) {
         return CoverChange::default();

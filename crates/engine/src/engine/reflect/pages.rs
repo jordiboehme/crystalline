@@ -292,8 +292,13 @@ pub(crate) fn stale_base(version: &str) -> Option<i64> {
 }
 
 /// One page's `stale` item, when its freshness ran out at `now` (seconds
-/// since the epoch): `changed_engrams` is filled in later, from the engrams changed
-/// since `last_reconciled`, which the item keeps in `since`.
+/// since the epoch). Its `changed_engrams` is filled in later
+/// (`Detail::Full` only), from the engrams changed since `last_reconciled`,
+/// which comes back beside the item: how many engrams changed since then in
+/// the domains the caller may read, or null when that is unknown. It is
+/// unknown when a readable domain lives on a connected server, or when a
+/// configured file domain has not been walked (its folder is missing or
+/// unreadable, or the first sync has not reached it), never 0.
 pub(super) fn stale_item(
     view: &PageView,
     inputs: &PageInputs<'_>,
@@ -353,6 +358,45 @@ pub(super) fn stale_item(
     ))
 }
 
+/// Whether a domain the caller may read lives on a connected server
+/// (`elsewhere`: the local names of the mounted domains and of the local
+/// copies a server replaces), so the engrams changed in it cannot be
+/// counted here. One hidden from the caller does not count, and a session
+/// under a read limit is never routed to a server, so it reads none.
+pub(super) fn counted_elsewhere<'a>(
+    elsewhere: impl IntoIterator<Item = &'a String>,
+    hidden: &std::collections::HashSet<String>,
+    limited: bool,
+) -> bool {
+    !limited && elsewhere.into_iter().any(|name| !hidden.contains(name))
+}
+
 /// The key under which a `stale` item carries the texts of its pacts until
 /// the answer gathers them once per answer.
 pub(super) const PACT_TEXTS: &str = "_pact_texts";
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::counted_elsewhere;
+
+    #[test]
+    fn a_readable_mount_makes_the_count_unknown() {
+        let mounts = ["acme-eng".to_string(), "acme-ops".to_string()];
+        let none = HashSet::new();
+        assert!(counted_elsewhere(&mounts, &none, false), "readable mounts");
+        let one = HashSet::from(["acme-eng".to_string()]);
+        assert!(
+            counted_elsewhere(&mounts, &one, false),
+            "acme-ops is readable"
+        );
+        let both = HashSet::from(["acme-eng".to_string(), "acme-ops".to_string()]);
+        assert!(!counted_elsewhere(&mounts, &both, false), "both hidden");
+        assert!(
+            !counted_elsewhere(&mounts, &none, true),
+            "a limited run reads no mount"
+        );
+        assert!(!counted_elsewhere(&[], &none, false), "no mount");
+    }
+}

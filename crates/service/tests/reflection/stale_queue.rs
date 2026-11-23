@@ -390,11 +390,11 @@ async fn stale_goes_to_a_run_or_on_request_and_is_no_nudge() {
     assert!(paths(&q, "stale").is_empty(), "asked not to: {q}");
 }
 
-/// The hint counts the engrams changed since the last reconcile in the
+/// `changed_engrams` counts the engrams changed since the last reconcile in the
 /// domains the run may read: under a read limit, a hidden domain counts
 /// nothing. With nothing changed it is 0.
 #[tokio::test]
-async fn the_hint_counts_only_what_the_run_may_read() {
+async fn changed_engrams_counts_only_what_the_run_may_read() {
     let fx = beside(
         &[(
             "runbooks/deploy.md",

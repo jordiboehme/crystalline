@@ -250,20 +250,38 @@ impl Engine {
     /// each base row (a file's modification time, a virtual write's time),
     /// sorted: what a `stale` item's `changed_engrams` counts from. The read
     /// limit of an unattended run hides the domains it may not read. `None`
-    /// when a domain it may read cannot be counted here: one a connected
-    /// server replaces, or a file domain with no index row yet. A count left out is
-    /// unknown, never 0, which would say that nothing changed.
+    /// when a domain the caller may read cannot be counted here, so the
+    /// count is unknown, never 0, which would say that nothing changed:
+    /// - a domain mounted from a connected server, under any name, or a
+    ///   local copy a server replaces: its engrams change on the server
+    ///   ([`pages::counted_elsewhere`]; a run under a read limit is never
+    ///   routed to a server and reads none of them);
+    /// - a file domain with no index row yet: configured, but not walked
+    ///   (its folder is missing or unreadable, or the first sync has not
+    ///   reached it), so what changed in it is not known.
     async fn engram_change_times(&self, scope: &Scope) -> Result<Option<Vec<i64>>> {
         let hidden = self.hidden_domains(scope).await?.unwrap_or_default();
         let shadowed = self.shadowed_domains();
+        let mounted: Vec<String> = self
+            .sources()
+            .map(|sources| {
+                sources
+                    .table()
+                    .mounts
+                    .iter()
+                    .map(|mount| mount.local.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let limited = crate::read_limit::current().is_some();
+        if pages::counted_elsewhere(mounted.iter().chain(&shadowed), &hidden, limited) {
+            return Ok(None);
+        }
         let reader = self.reader();
         let mut times = Vec::new();
         for name in self.known_domain_names() {
-            if hidden.contains(&name) {
+            if hidden.contains(&name) || shadowed.contains(&name) {
                 continue;
-            }
-            if shadowed.contains(&name) {
-                return Ok(None);
             }
             let Some(id) = reader.domain_id(&name).await? else {
                 // A virtual domain gets its row with its first engram, so
