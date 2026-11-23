@@ -283,6 +283,65 @@ impl Engine {
         Ok(receipt)
     }
 
+    /// The stored pact hash a write of the page at `inner` carries along
+    /// when it changes only the page's `freshness` or `status` (design 3.2):
+    /// `(seen_hash, seen_at, hash)` when the stored state held the hash of
+    /// the page as it was (`current`) and the new text (`written`) differs
+    /// from it only by those two keys. A change of `follows` that brings
+    /// other pacts is no such change: the page then really follows another
+    /// pact, and its `page_pact_changed` item stays. `None` otherwise,
+    /// including for a page with no stored hash; a change on disk or by a
+    /// pull never comes here, so it still raises the item.
+    pub(super) async fn settings_rehash(
+        &self,
+        domain_id: DomainId,
+        inner: &str,
+        current: Option<&str>,
+        written: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if !matches!(r::classify(inner), r::ReflectionFile::Page(_)) {
+            return Ok(None);
+        }
+        let keys = [r::FRESHNESS_KEY, r::STATUS_KEY];
+        let (before, after) = (r::page_key_values(current), r::page_key_values(written));
+        if keys.iter().all(|key| before.get(key) == after.get(key)) {
+            return Ok(None);
+        }
+        let (rows, state) = {
+            let store = self.store.lock().await;
+            let state = store.reflection_reconcile(domain_id, inner).await?;
+            let Some(state) = state.filter(|state| !state.pact_hash.is_empty()) else {
+                return Ok(None);
+            };
+            (store.list_reflections(domain_id).await?, state)
+        };
+        let hash_with = |text: &str| {
+            r::page_pact_hash(
+                inner,
+                rows.iter()
+                    .filter(|row| row.path != inner)
+                    .map(|row| (row.path.as_str(), row.content.as_str()))
+                    .chain([(inner, text)]),
+            )
+        };
+        let (Some(was), Some(now)) = (hash_with(current), hash_with(written)) else {
+            return Ok(None);
+        };
+        if state.pact_hash != was || now == was {
+            return Ok(None);
+        }
+        // The new text with the old freshness and status: the hash it would
+        // have when nothing but those two keys changed.
+        let only_settings = r::carry_page_keys(written, Some(current), &keys)
+            .ok()
+            .and_then(|text| hash_with(&text))
+            .is_some_and(|hash| hash == was);
+        Ok(only_settings.then_some((state.pact_hash, state.last_reconciled, now)))
+    }
+
     /// The gate of a settings change: curate, a writable domain, and a page
     /// (no pact file).
     async fn page_settings_gate(

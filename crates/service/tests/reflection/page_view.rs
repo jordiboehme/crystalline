@@ -541,3 +541,152 @@ async fn a_settings_change_refuses_what_a_page_cannot_take() {
         .collect();
     assert_eq!(snapshot, after, "nothing was written");
 }
+
+/// The `page_pact_changed` items of `path` in `eng`'s queue.
+async fn pact_items(fx: &Fx, path: &str) -> Vec<Value> {
+    let queue = fx
+        .engine
+        .reflect(
+            &crystalline_service::params::ReflectParams {
+                domains: vec!["eng".into()],
+                ..Default::default()
+            },
+            &agent(),
+        )
+        .await
+        .unwrap();
+    queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["what"] == "page_pact_changed" && i["path"] == path)
+        .cloned()
+        .collect()
+}
+
+/// The feedback items of `path`, as (section, what, diff).
+async fn feedback(fx: &Fx, path: &str) -> Vec<(Value, Value, Value)> {
+    let queue = fx
+        .engine
+        .reflect(&Default::default(), &agent())
+        .await
+        .unwrap();
+    queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "feedback" && i["path"] == path)
+        .map(|i| (i["section"].clone(), i["what"].clone(), i["diff"].clone()))
+        .collect()
+}
+
+async fn reconcile(fx: &Fx, path: &str) {
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                action: Some("reconciled".into()),
+                path: path.into(),
+                outcome: Some("unchanged".into()),
+                ..Default::default()
+            },
+            &person(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn set(fx: &Fx, c: PageSettingsChange) -> Value {
+    fx.engine
+        .set_reflection_page_settings("eng", &c, &person())
+        .await
+        .unwrap()
+}
+
+/// A curator's freshness or status change does not ask for a reconcile:
+/// the stored pact hash follows it in the same commit. A follows change
+/// that brings another pact does, and so does a freshness edited on disk.
+#[tokio::test]
+async fn a_settings_change_through_crystalline_raises_no_pact_item() {
+    let fx = reflecting().await;
+    // The pacts are an agent's, so no person's pact change waits.
+    for (path, text) in [
+        ("PACT.md", "# Pact\n\n## Tone\n\nShort.\n"),
+        ("arch.md", "# Architecture\n"),
+        ("arch.pact.md", "# Pact of arch\n\n## Tone\n\nShorter.\n"),
+    ] {
+        fx.engine
+            .write_reflection(&write(path, text), &agent())
+            .await
+            .unwrap();
+    }
+    put(&fx, "notes.md", "# Notes\n\n## One\n\nText.\n").await;
+    reconcile(&fx, "notes.md").await;
+    assert!(pact_items(&fx, "notes.md").await.is_empty());
+    let before = feedback(&fx, "notes.md").await;
+
+    set(
+        &fx,
+        PageSettingsChange {
+            freshness: Some("1d".into()),
+            ..change("notes.md")
+        },
+    )
+    .await;
+    assert_eq!(
+        pact_items(&fx, "notes.md").await,
+        Vec::<Value>::new(),
+        "freshness"
+    );
+    set(
+        &fx,
+        PageSettingsChange {
+            status: Some("draft".into()),
+            ..change("notes.md")
+        },
+    )
+    .await;
+    assert_eq!(
+        pact_items(&fx, "notes.md").await,
+        Vec::<Value>::new(),
+        "status"
+    );
+    // An editor's save of the page with a new freshness, as a curator's
+    // whole-page write: the same.
+    let text = file(&fx, "notes.md")
+        .unwrap()
+        .replace("freshness: 1d", "freshness: 6h");
+    put(&fx, "notes.md", &text).await;
+    assert_eq!(
+        pact_items(&fx, "notes.md").await,
+        Vec::<Value>::new(),
+        "write"
+    );
+    // No feedback is owed for a settings change either: the page's
+    // feedback items are the ones it had before (a person wrote it).
+    assert_eq!(feedback(&fx, "notes.md").await, before, "feedback");
+
+    // Following another pact is a real change of what the page must say.
+    set(
+        &fx,
+        PageSettingsChange {
+            follows: Some("arch.md".into()),
+            ..change("notes.md")
+        },
+    )
+    .await;
+    let items = pact_items(&fx, "notes.md").await;
+    assert_eq!(items.len(), 1, "follows");
+    assert_eq!(items[0]["pact_hash_changed"], true);
+
+    // A change on disk cannot be told apart: it still asks.
+    reconcile(&fx, "notes.md").await;
+    assert!(pact_items(&fx, "notes.md").await.is_empty());
+    let path = fx.root.join("reflections/notes.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("freshness: 6h", "freshness: 30d");
+    std::fs::write(&path, text).unwrap();
+    fx.engine.sync(None).await.unwrap();
+    assert_eq!(pact_items(&fx, "notes.md").await.len(), 1, "disk");
+}

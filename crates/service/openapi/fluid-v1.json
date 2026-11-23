@@ -7312,7 +7312,7 @@
           "reflection"
         ],
         "summary": "Change a page's freshness, follows or status.",
-        "description": "Needs `curate`. Only the frontmatter keys named change; the page's text, its sections and their sources stay, so nobody owes feedback. A co-editing room open over the page takes the change in, and the editor never shows these keys. A freshness change also changes the pact hash, so the page asks for a reconcile on its next check.",
+        "description": "Needs `curate`. Only the frontmatter keys named (`freshness`, `follows`, `status`) change; the page's text, its sections and their sources stay, so nobody owes feedback. A co-editing room open over the page takes the change in, and the editor never shows these keys. A change of `freshness` or `status` keeps a recorded reconcile current. A `follows` that brings other pacts raises a `page_pact_changed` item, since the page now follows another pact.",
         "operationId": "set_reflection_settings",
         "parameters": [
           {

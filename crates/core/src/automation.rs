@@ -750,6 +750,14 @@ mod tests {
                 "the reconcile step lacks {needle}: {reconcile}"
             );
         }
+        let other = prompt
+            .lines()
+            .find(|line| line.contains("`page_pact_changed`"))
+            .expect("a step for the other page items");
+        assert!(
+            other.contains("`pact_hash_changed`") && other.contains("record `reconciled`"),
+            "a page_pact_changed with no changed pact text is settled with reconciled: {other}"
+        );
         let cap = prompt
             .lines()
             .find(|line| line.starts_with("- Stop after"))

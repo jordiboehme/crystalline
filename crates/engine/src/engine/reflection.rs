@@ -2274,6 +2274,11 @@ impl Engine {
                 .map(|s| s.heading.clone())
                 .collect()
         };
+        // A curator's change of freshness or status keeps a current pact
+        // hash current, in the same commit (read before anything is written): it asks for no reconcile.
+        let rehash = self
+            .settings_rehash(access.domain_id, &p.path, current.as_deref(), &final_text)
+            .await?;
         let removed_with_feedback = removed_with_feedback(stored.as_deref(), &baseline, &sections);
         let threads_abs = access.abs(&r::threads_path(&p.path));
         let mut undo = DiskUndo::default();
@@ -2288,11 +2293,22 @@ impl Engine {
             )?;
         }
         anchor_threads_on_ids(&threads_abs, &final_text);
-        self.index_reflection(
+        let mut ops = vec![super::fence::RowOp::Page {
+            inner: &p.path,
+            text: &final_text,
+            abs: &abs,
+        }];
+        if let Some((seen_hash, seen_at, hash)) = &rehash {
+            ops.push(super::fence::RowOp::RehashReconcile {
+                path: &p.path,
+                seen_hash,
+                seen_at,
+                hash,
+            });
+        }
+        self.commit_reflection_rows(
             access.domain_id,
-            &p.path,
-            &final_text,
-            &abs,
+            &ops,
             OnRefusal {
                 domain: &p.domain,
                 undo,

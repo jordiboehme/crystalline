@@ -2231,6 +2231,7 @@ async fn the_queue_guidance_teaches_the_reconcile_of_a_stale_page() {
         "changed_engrams",
         "owned pages first and the owner last",
         "owned_reconciled",
+        "pact_hash_changed",
     ] {
         assert!(
             guidance.contains(needle),

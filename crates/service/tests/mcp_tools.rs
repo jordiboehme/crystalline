@@ -9595,6 +9595,7 @@ async fn the_reflection_tools_teach_pages_that_keep_themselves_current() {
         "changed_engrams",
         "owned_reconciled",
         "page_pact_changed",
+        "pact_hash_changed",
         "owner_gone",
         "link_retired",
         "link_broken",
