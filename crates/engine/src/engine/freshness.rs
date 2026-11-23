@@ -16,6 +16,7 @@ use crystalline_index::{DomainId, ReadStore, ReflectionStamp};
 
 use super::reconcile::{PageReconcile, page_reconciles};
 use super::*;
+use crate::scope::{ReflectionCaller, ReflectionRight};
 
 /// What the clocks read of one page's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,5 +188,108 @@ impl Engine {
                 .saturating_add(time::saturating_seconds(secs));
             (secs, at.rfc3339_secs_z())
         }))
+    }
+
+    /// Whether a person has the page at `path` of `domain` open in a live
+    /// editor: its update items wait for the room, so a due page shows
+    /// "Waiting: open in the editor" instead of its clock (design 2.2).
+    async fn waits_for_the_room(&self, domain: &str, path: &str) -> bool {
+        match self.collab_rooms() {
+            Some(rooms) => {
+                rooms
+                    .has_live_doc(
+                        domain,
+                        &crate::collab::session::RoomDoc::Reflection(path.to_string()),
+                        None,
+                    )
+                    .await
+            }
+            None => false,
+        }
+    }
+
+    /// The clock of the page at `path` of `domain`'s Reflection for its
+    /// status line, in seconds relative to the automation clock (design
+    /// 2.2): `{path, freshness, last_reconciled, last_checked_secs,
+    /// due_in_secs, stale, overdue_secs, waiting}`. `due_in_secs` is the
+    /// time until a fresh page falls due (null once it is due),
+    /// `overdue_secs` the time since it turned overdue, one whole period
+    /// after it fell due (null before), and `waiting` whether a due page
+    /// waits for a live editor that has it open. Null for a page with no
+    /// freshness, a retired page and a missing one. Needs the right to read
+    /// the Reflection.
+    pub async fn reflection_page_clock(
+        &self,
+        domain: &str,
+        path: &str,
+        caller: &ReflectionCaller,
+    ) -> Result<Value> {
+        self.require_reflection(domain, caller, ReflectionRight::Read)
+            .await?;
+        let Some(clock) = self
+            .page_clocks(domain)
+            .await?
+            .into_iter()
+            .find(|clock| clock.path == path)
+        else {
+            return Ok(Value::Null);
+        };
+        let waiting = clock.timing.stale() && self.waits_for_the_room(domain, path).await;
+        Ok(json!({
+            "path": clock.path,
+            "freshness": clock.freshness.written,
+            "last_reconciled": clock.last_reconciled,
+            "last_checked_secs": clock.timing.last_checked_secs,
+            "due_in_secs": (!clock.timing.stale()).then_some(clock.timing.next_due_in_secs),
+            "stale": clock.timing.stale(),
+            "overdue_secs": clock.timing.overdue_secs,
+            "waiting": waiting,
+        }))
+    }
+
+    /// Every overdue page of the Reflections served here that `caller` may
+    /// read, most overdue first, for the admin banner, the maintenance view
+    /// and `crystalline doctor` (design 2.2): `{pages: [{domain, path,
+    /// freshness, last_checked_secs, overdue_secs, waiting}]}`, the times in
+    /// seconds relative to the automation clock. A domain whose pages cannot
+    /// be read is left out with a warning: this is a report, never a
+    /// failure.
+    pub async fn overdue_reflection_pages(&self, caller: &ReflectionCaller) -> Result<Value> {
+        let mut pages = Vec::new();
+        for domain in self.reflections_here().await? {
+            if self
+                .require_reflection(&domain, caller, ReflectionRight::Read)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let clocks = match self.page_clocks(&domain).await {
+                Ok(clocks) => clocks,
+                Err(e) => {
+                    tracing::warn!("the page clocks of '{domain}' could not be read: {e}");
+                    continue;
+                }
+            };
+            for clock in clocks {
+                let Some(overdue) = clock.timing.overdue_secs else {
+                    continue;
+                };
+                let waiting = self.waits_for_the_room(&domain, &clock.path).await;
+                pages.push((
+                    overdue,
+                    json!({
+                        "domain": domain,
+                        "path": clock.path,
+                        "freshness": clock.freshness.written,
+                        "last_checked_secs": clock.timing.last_checked_secs,
+                        "overdue_secs": overdue,
+                        "waiting": waiting,
+                    }),
+                ));
+            }
+        }
+        pages.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(json!({ "pages": pages.into_iter().map(|(_, page)| page).collect::<Vec<_>>() }))
     }
 }

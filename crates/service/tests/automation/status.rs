@@ -404,3 +404,132 @@ async fn without_a_rolling_page_there_is_no_next_stale_time() {
         }
     }
 }
+
+fn jordi() -> ReflectionCaller {
+    ReflectionCaller::person(Scope::Unrestricted, "jordi")
+}
+
+/// A page's clock on the automation clock, in relative seconds (design
+/// 2.2): fresh with the time until it falls due, due, then overdue one
+/// whole period after it fell due, and only then in the list of overdue
+/// pages with its domain and since when. A reconcile time ahead of the
+/// clock (a host takeover) reads as just checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_is_overdue_one_whole_period_after_it_fell_due() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+    let clock_of = |fx: &Fx| {
+        let engine = fx.engine.clone();
+        async move {
+            engine
+                .reflection_page_clock("eng", "w.md", &jordi())
+                .await
+                .unwrap()
+        }
+    };
+
+    now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
+    let fresh = clock_of(&fx).await;
+    assert_eq!(fresh["freshness"], "1d", "{fresh}");
+    assert_eq!(fresh["last_checked_secs"], 2 * 3600, "{fresh}");
+    assert_eq!(fresh["due_in_secs"], 22 * 3600, "{fresh}");
+    assert_eq!(fresh["stale"], false, "{fresh}");
+    assert_eq!(fresh["overdue_secs"], Value::Null, "{fresh}");
+    assert_eq!(fresh["waiting"], false, "{fresh}");
+
+    now_at(&fx.engine, "2026-10-22T11:00:00+00:00");
+    let due = clock_of(&fx).await;
+    assert_eq!(due["stale"], true, "{due}");
+    assert_eq!(due["due_in_secs"], Value::Null, "{due}");
+    assert_eq!(due["overdue_secs"], Value::Null, "due, not overdue: {due}");
+    let none = fx.engine.overdue_reflection_pages(&jordi()).await.unwrap();
+    assert_eq!(none["pages"], serde_json::json!([]), "{none}");
+
+    now_at(&fx.engine, "2026-10-23T13:00:00+00:00");
+    let late = clock_of(&fx).await;
+    assert_eq!(late["last_checked_secs"], 51 * 3600, "{late}");
+    assert_eq!(late["overdue_secs"], 3 * 3600, "{late}");
+    let overdue = fx.engine.overdue_reflection_pages(&jordi()).await.unwrap();
+    assert_eq!(
+        overdue["pages"],
+        serde_json::json!([{
+            "domain": "eng",
+            "path": "w.md",
+            "freshness": "1d",
+            "last_checked_secs": 51 * 3600,
+            "overdue_secs": 3 * 3600,
+            "waiting": false,
+        }]),
+        "{overdue}"
+    );
+
+    now_at(&fx.engine, "2026-10-21T09:00:00+00:00");
+    let behind = clock_of(&fx).await;
+    assert_eq!(behind["last_checked_secs"], 0, "{behind}");
+    assert_eq!(behind["due_in_secs"], 25 * 3600, "{behind}");
+}
+
+/// A retired page has no clock and is never overdue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_without_a_freshness_has_no_clock() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+    now_at(&fx.engine, "2026-10-25T10:00:00+00:00");
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: "w.md".into(),
+                action: Some("retire".into()),
+                ..Default::default()
+            },
+            &jordi(),
+        )
+        .await
+        .unwrap();
+    let clock = fx
+        .engine
+        .reflection_page_clock("eng", "w.md", &jordi())
+        .await
+        .unwrap();
+    assert_eq!(clock, Value::Null);
+    let overdue = fx.engine.overdue_reflection_pages(&jordi()).await.unwrap();
+    assert_eq!(overdue["pages"], serde_json::json!([]), "{overdue}");
+}
+
+/// `crystalline doctor` reads the page clocks from an index it opened
+/// itself (no daemon): the same clock the engine answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_page_clocks_read_from_a_store_match_the_engine() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+    let now = time::parse_rfc3339("2026-10-23T13:00:00+00:00").unwrap();
+    now_at(&fx.engine, "2026-10-23T13:00:00+00:00");
+    let store = fx.engine.store();
+    let store = store.lock().await;
+    let id = store.domain_id("eng").await.unwrap().unwrap();
+    let clocks =
+        crystalline_service::engine::page_clocks_in(&*store, id, now.stamp().unix_seconds())
+            .await
+            .unwrap();
+    assert_eq!(clocks.len(), 1, "{clocks:?}");
+    assert_eq!(clocks[0].path, "w.md");
+    assert_eq!(clocks[0].freshness.written, "1d");
+    assert_eq!(clocks[0].timing.overdue_secs, Some(3 * 3600));
+    assert_eq!(clocks[0].timing.last_checked_secs, 51 * 3600);
+}
+
+/// The control socket answers the overdue pages to `crystalline doctor` on
+/// the machine owner's behalf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_control_socket_names_the_overdue_pages() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+    now_at(&fx.engine, "2026-10-23T13:00:00+00:00");
+    let answer = crystalline_service::control::answer_for_test(
+        fx.engine.clone(),
+        &serde_json::json!({ "v": 1, "cmd": "reflection_overdue" }),
+    )
+    .await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    let pages = &answer["data"]["pages"];
+    assert_eq!(pages[0]["domain"], "eng", "{answer}");
+    assert_eq!(pages[0]["path"], "w.md", "{answer}");
+    assert_eq!(pages[0]["overdue_secs"], 3 * 3600, "{answer}");
+}

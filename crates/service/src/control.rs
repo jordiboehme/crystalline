@@ -3,7 +3,8 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! file_stamps, collect_orphaned_domains, name_report, fix_local_spellings,
+//! file_stamps, collect_orphaned_domains, reflection_overdue, name_report,
+//! fix_local_spellings,
 //! finish_rename_questions,
 //! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
@@ -347,6 +348,17 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // it runs for links spelled with a name only this machine uses.
         // Served here for the reason `file_stamps` is: this daemon holds the
         // index, and doctor must not have to stop it to ask or to fix.
+        // The overdue Reflection pages `crystalline doctor` warns about:
+        // read here for the reason `file_stamps` is, and through the reader,
+        // so a doctor run never waits for a write.
+        "reflection_overdue" => match shared
+            .engine
+            .overdue_reflection_pages(&crate::ReflectionCaller::owner())
+            .await
+        {
+            Ok(data) => (envelope_ok(data), false),
+            Err(e) => (envelope_err(e.to_string()), false),
+        },
         "name_report" => match shared.engine.name_report().await {
             Ok(data) => (envelope_ok(data), false),
             Err(e) => (envelope_err(e.to_string()), false),
@@ -1132,7 +1144,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "unknown ctl command '{other}'; expected status, sessions, holder, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
                  domain_remove, domain_review, domain_rename, retag, collect_orphaned_domains, \
-                 name_report, fix_local_spellings, finish_rename_questions, configure, \
+                 reflection_overdue, name_report, fix_local_spellings, finish_rename_questions, configure, \
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
                  origin_resolve, provision, domain_register, routing_config, maintenance_stamp, \

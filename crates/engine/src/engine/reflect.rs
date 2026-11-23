@@ -1295,6 +1295,12 @@ impl Engine {
         })
     }
 
+    /// Every registered domain whose Reflection is in effect here, as an
+    /// unnamed queue runs over them.
+    pub(super) async fn reflections_here(&self) -> Result<Vec<String>> {
+        Ok(self.reflect_scope(&[], false).await?.domains)
+    }
+
     /// The `reflect` tool.
     pub async fn reflect(&self, p: &ReflectParams, caller: &ReflectionCaller) -> Result<Value> {
         for kind in &p.kinds {

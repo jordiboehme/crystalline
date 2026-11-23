@@ -86,6 +86,7 @@ async fn every_command_off_the_allow_list_is_refused_remotely() {
         "holder",
         "file_stamps",
         "collect_orphaned_domains",
+        "reflection_overdue",
         "name_report",
         "fix_local_spellings",
         "scaffold_manifest",
