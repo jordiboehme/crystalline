@@ -637,12 +637,13 @@ A remote runner acts as an agent of the loops: an identity of its own for schedu
 docker compose exec crystalline crystalline agents add nightly --display "Nightly Curator" --loops reflect
 ```
 
-On the runner, set the server and the token and nothing else:
+The runner needs the `crystalline` binary and Claude Code (`claude` on `PATH`), the server, the token and an Anthropic credential:
 
 ```bash
 export CRYSTALLINE_REMOTE_URL=https://crystalline.example.com
 export CRYSTALLINE_REMOTE_TOKEN=cag_...
-crystalline reflect run --domain eng --runner k8s
+export ANTHROPIC_API_KEY=sk-ant-...   # or CLAUDE_CODE_OAUTH_TOKEN for a Claude subscription
+crystalline reflect run --domain eng
 ```
 
 `crystalline <loop> run` sends the run's domain and loop to the server with every MCP request (`X-Crystalline-Run-Domain` and `X-Crystalline-Run-Loop`), so a write is noted only in that loop's lease. An agent works only during a run: outside a live lease of its loop it reaches the handshake, the lists, its skills and the eight automation verbs of the ctl route, and nothing else. Inside the run it may do its loop's work only on the domain it holds the lease of. It reaches every domain of the instance for its loops, private ones included. A token lives 90 days by default (`--expires`, up to 365), an agent holds at most two live tokens, and `crystalline agents list` shows when each one expires. An agent token does not work with `crystalline connect`; a runner uses the two variables above. The full rules, the commands and how to move a runner from an account to an agent are in [Who may run a loop](automation.md#who-may-run-a-loop).
