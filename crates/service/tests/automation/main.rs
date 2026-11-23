@@ -11,4 +11,5 @@ mod fixture;
 mod ctl;
 mod engine;
 mod evolve_home;
+mod status;
 mod trigger;

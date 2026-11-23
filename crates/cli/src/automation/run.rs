@@ -63,7 +63,7 @@ pub(super) async fn run_due(
     stop: &watch::Receiver<bool>,
 ) -> anyhow::Result<u8> {
     let named: Vec<String> = domain.map(str::to_string).into_iter().collect();
-    let answer = client.status(lp, &named, opts.force).await?;
+    let answer = client.status(lp, &named, opts.force, true).await?;
     let due: Vec<String> = domains_of(&answer)
         .iter()
         .filter(|d| d["due"] == true)
@@ -951,7 +951,7 @@ pub(super) async fn watch_loop(
             return;
         }
         let status = tokio::select! {
-            status = client.status(lp, domains, false) => status,
+            status = client.status(lp, domains, false, true) => status,
             _ = stop.wait_for(|stopped| *stopped) => return,
         };
         match status {

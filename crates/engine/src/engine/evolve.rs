@@ -1190,18 +1190,16 @@ impl Engine {
                     source,
                 })
             }
-            ContentSource::Virtual => {
-                let store = self.store.lock().await;
-                store
-                    .engram_content(desc.domain_id, &desc.path)
-                    .await?
-                    .ok_or_else(|| {
-                        EngineError::NotFound(format!(
-                            "no content stored for '{}' in domain '{}'",
-                            desc.permalink, desc.domain
-                        ))
-                    })
-            }
+            ContentSource::Virtual => self
+                .reader()
+                .engram_content(desc.domain_id, &desc.path)
+                .await?
+                .ok_or_else(|| {
+                    EngineError::NotFound(format!(
+                        "no content stored for '{}' in domain '{}'",
+                        desc.permalink, desc.domain
+                    ))
+                }),
         }
     }
 
@@ -1257,9 +1255,10 @@ impl Engine {
         // nothing further.
         let view = DomainView::for_read(self, name, &HashSet::new(), scope)?;
         let overlay = view.actor();
-        let store = self.store.lock().await;
-        let base = store.list_engrams(name, None, None).await?;
-        drop(store);
+        // Every read of the sweep goes through the read connections: the
+        // automation status sweeps on every poll, and nothing here decides a
+        // write under the writer.
+        let base = self.reader().list_engrams(name, None, None).await?;
         // The sweep looks at exactly what its caller reads, through the same
         // helper every read verb shadows a listing with: a path this caller is
         // drafting is their own row, a path they have deleted is absent, and a
@@ -1270,8 +1269,7 @@ impl Engine {
         //
         // Shadowed rather than additive, and that is the whole ruling: a
         // finding about a base row its author has already redrafted is a
-        // finding about text they no longer see. The lock is dropped first
-        // because the helper takes it itself.
+        // finding about text they no longer see.
         let descs = view.list_over(base).await?;
         // No engrams means no domain row to query against and nothing to
         // detect. An empty domain is quiet, not an error. Read off the listing
@@ -1339,9 +1337,7 @@ impl Engine {
         // in a draft from orphaning a shared file is `shadowed_asset_refs`'
         // above and is untouched by this.
         let attachments = view.attachments().await?;
-        // Asked before the store lock, like the two above it: the view takes
-        // the lock itself.
-        let store = self.store.lock().await;
+        let store = self.reader();
         // Lead vectors for V301, only with a provider installed: without one
         // the rule stays silent whatever a previous run left embedded, so a
         // sweep on a machine that never embeds never speaks about meaning.
@@ -1378,7 +1374,6 @@ impl Engine {
         } else {
             store.spelled_references(domain_id, &spellings).await?
         };
-        drop(store);
 
         let verify_config = domain_verify_config(&source);
         let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
@@ -1656,9 +1651,7 @@ impl Engine {
         let mut seen_nodes: HashSet<i64> = HashSet::new();
         let mut seen_edges: HashSet<(i64, i64, String, u8)> = HashSet::new();
         for chunk in ids.chunks(NEIGHBOR_CHUNK) {
-            let store = self.store.lock().await;
-            let slice = store.neighbors(chunk, depth, actor).await?;
-            drop(store);
+            let slice = self.reader().neighbors(chunk, depth, actor).await?;
             for node in slice.nodes {
                 if seen_nodes.insert(node.id.0) {
                     graph.nodes.push(node);

@@ -517,7 +517,7 @@ impl Engine {
                     local.insert(name.clone(), resolved.to_string());
                 }
                 let id = match self.checkable_domain(&table, &name) {
-                    Some(local) => self.store.lock().await.domain_id(&local).await?,
+                    Some(local) => self.reader().domain_id(&local).await?,
                     None => None,
                 };
                 let facts = match id {

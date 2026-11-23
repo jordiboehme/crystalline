@@ -708,10 +708,15 @@ impl Engine {
         if !self.store_is_shared().await {
             return Ok(None);
         }
-        let store = self.store.lock().await;
-        let host = match store.domain_id(domain).await? {
-            Some(id) => store.domain_host(id).await?,
-            None => None,
+        // Read first: a domain another live instance holds is named
+        // without the writer, so a status poll never queues for it. Only a
+        // claim below takes the writer.
+        let host = {
+            let reader = self.reader();
+            match reader.domain_id(domain).await? {
+                Some(id) => reader.domain_host(id).await?,
+                None => None,
+            }
         };
         // Another instance's live claim stands. One that sent no heartbeat
         // for the stale threshold is taken over below by a write, with the
@@ -753,6 +758,9 @@ impl Engine {
         if self.is_renaming(domain) {
             return Ok(Some(None));
         }
+        // The store decides the claim under the writer, whatever was read
+        // above.
+        let store = self.store.lock().await;
         match self.claim_file_host(&*store, domain, root, false).await? {
             HostClaim::Acquired { .. } => {
                 drop(store);
@@ -825,9 +833,9 @@ impl Engine {
         if !self.store_is_shared().await {
             return Ok(None);
         }
-        let store = self.store.lock().await;
-        let host = store.domain_host(id).await?;
-        drop(store);
+        // A read: a takeover another instance committed is seen at once,
+        // and nothing is written under the writer with the answer.
+        let host = self.reader().domain_host(id).await?;
         let Some(host) = host.filter(|host| self.foreign_holder(host)) else {
             return Ok(None);
         };
@@ -1485,18 +1493,19 @@ fn stamp_reflected(text: &str, prov: &mut r::Provenance, ids: &[String]) -> Resu
 
 impl Engine {
     /// Every engram of a domain by permalink, with the checksum a section's
-    /// sources are compared against.
+    /// sources are compared against. The stamps and the listing are two
+    /// reads, so a sync between them can leave out an engram for one call.
     pub(crate) async fn engram_facts(
         &self,
         domain_id: DomainId,
         domain: &str,
     ) -> Result<HashMap<String, EngramFact>> {
-        let store = self.store.lock().await;
+        let reader = self.reader();
         #[cfg(any(test, feature = "testing"))]
         self.recorded_path_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let stamps = store.file_stamps(domain_id).await?;
-        let engrams = store.list_engrams(domain, None, None).await?;
+        let stamps = reader.file_stamps(domain_id).await?;
+        let engrams = reader.list_engrams(domain, None, None).await?;
         Ok(engrams
             .into_iter()
             .filter_map(|d| {
@@ -1532,12 +1541,7 @@ impl Engine {
         if wanted.is_empty() {
             return Ok(HashMap::new());
         }
-        let cited = self
-            .store
-            .lock()
-            .await
-            .cited_engrams(domain_id, &wanted)
-            .await?;
+        let cited = self.reader().cited_engrams(domain_id, &wanted).await?;
         Ok(cited
             .into_iter()
             .map(|c| {

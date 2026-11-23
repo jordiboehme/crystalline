@@ -294,7 +294,7 @@ fn question(
 impl Engine {
     /// The confirmations recorded on the Reflection of the domain `id`.
     pub(crate) async fn reflection_disclosures(&self, id: DomainId) -> Result<Disclosures> {
-        let rows = self.store.lock().await.reflection_disclosures(id).await?;
+        let rows = self.reader().reflection_disclosures(id).await?;
         let mut out = HashMap::new();
         for (path, records) in rows {
             // A row this binary cannot read is no confirmation: the section

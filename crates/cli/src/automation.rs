@@ -104,6 +104,11 @@ pub enum LoopCommand {
         /// the loop on.
         #[arg(long)]
         domain: Vec<String>,
+        /// Work out nothing that is due: show only a run that is going, the
+        /// last run and where the loop runs. Cheap enough for a frequent
+        /// poll. Exits 0 unless there is an error.
+        #[arg(long)]
+        no_counts: bool,
     },
     /// Work what is due with a headless Claude Code agent: take the lease,
     /// run the agent with the prompt the server answers, share its changes
@@ -235,14 +240,19 @@ pub async fn run(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<(
 async fn dispatch(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<u8> {
     let client = AutomationClient::from_env().await?;
     match command {
-        LoopCommand::Status { domain } => {
-            let answer = client.status(lp, &domain, false).await?;
+        LoopCommand::Status { domain, no_counts } => {
+            let answer = client.status(lp, &domain, false, !no_counts).await?;
             if json {
                 println!("{answer}");
             } else {
                 print_status(&answer);
             }
-            Ok(if any_due(&answer) { 0 } else { EXIT_NOTHING })
+            // Without counts nothing says whether work is due.
+            Ok(if no_counts || any_due(&answer) {
+                0
+            } else {
+                EXIT_NOTHING
+            })
         }
         LoopCommand::Run {
             domain,
@@ -341,6 +351,8 @@ fn print_status(answer: &Value) {
             )
         } else if d["due"] == true {
             "due".to_string()
+        } else if d["due"].is_null() {
+            "not counted".to_string()
         } else {
             "nothing due".to_string()
         };
