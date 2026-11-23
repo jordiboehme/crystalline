@@ -381,6 +381,131 @@ describe("the agents page", () => {
     );
   });
 
+  it("marks a token by the exact time left, so 13.2 days counts", async () => {
+    const agent = reflector();
+    serve({
+      agents: [
+        {
+          ...agent,
+          tokens: [{ ...agent.tokens[0]!, expires_at: inDays(13.2) }],
+        },
+      ],
+    });
+    renderApp("/admin/agents");
+
+    const card = await cardFor("curator");
+    expect(card).toHaveTextContent("Ends in 14 days.");
+  });
+
+  it("holds the add button back until the list has answered", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () =>
+          meResponse({ user: userFixture({ name: "root", role: "admin" }) }),
+        "/domains": domainsResponse,
+        "/agents": () => new Promise(() => undefined),
+      }),
+    );
+    renderApp("/admin/agents");
+
+    const create = await screen.findByRole("button", { name: "Add agent" });
+    expect(create).toHaveAttribute("aria-disabled", "true");
+    await userEvent.type(screen.getByLabelText("Name"), "early");
+    await userEvent.click(create);
+    expect(sent("/agents", "POST")).toBe(false);
+  });
+
+  it("gives a second token a fresh field with the focus and no old status", async () => {
+    const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+      Promise.resolve(),
+    );
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    serve(
+      {},
+      {
+        "/agents/nightly/tokens": () => ({
+          id: 5,
+          label: "a",
+          expires_at: inDays(90),
+          token: "cag_first",
+        }),
+        "/agents/curator/tokens": () => ({
+          id: 6,
+          label: "b",
+          expires_at: inDays(90),
+          token: "cag_second",
+        }),
+      },
+    );
+    renderApp("/admin/agents");
+
+    await userEvent.click(
+      within(await cardFor("Nightly runner")).getByRole("button", {
+        name: "Issue a token for nightly",
+      }),
+    );
+    const first = await screen.findByRole("group", {
+      name: "Token for nightly",
+    });
+    await userEvent.click(
+      within(first).getByRole("button", { name: "Copy the token" }),
+    );
+    await waitFor(() => {
+      expect(within(first).getByRole("status")).toHaveTextContent("Copied");
+    });
+
+    await userEvent.click(
+      within(await cardFor("curator")).getByRole("button", {
+        name: "Issue a token for curator",
+      }),
+    );
+    const second = await screen.findByRole("group", {
+      name: "Token for curator",
+    });
+    const field = within(second).getByLabelText("Token for curator");
+    expect(field).toHaveValue("cag_second");
+    expect(field).toHaveFocus();
+    expect(within(second).getByRole("status")).toHaveTextContent("");
+  });
+
+  it("shows only the row being revoked as pending", async () => {
+    const agent = nightly();
+    serve(
+      {
+        agents: [
+          {
+            ...agent,
+            tokens: [
+              agent.tokens[0]!,
+              { ...agent.tokens[0]!, id: 7, label: "other" },
+            ],
+          },
+        ],
+      },
+      { "/agents/nightly/tokens/2": () => new Promise(() => undefined) },
+    );
+    renderApp("/admin/agents");
+
+    const card = await cardFor("Nightly runner");
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Revoke soon (token 2)" }),
+    );
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Confirm revoke of token 2" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(card).getByRole("button", { name: "Revoke soon (token 2)" }),
+      ).toHaveAttribute("aria-disabled", "true");
+    });
+    expect(
+      within(card).getByRole("button", { name: "Revoke other (token 7)" }),
+    ).toHaveAttribute("aria-disabled", "false");
+  });
+
   it("holds every change back on a read-only instance", async () => {
     serve({}, {}, true);
     renderApp("/admin/agents");

@@ -98,7 +98,7 @@ export default function AdminInvites() {
         title={title}
         empty={empty}
         invites={rows.filter((invite) => invite.state === state)}
-        revoking={revoke.isPending}
+        revokingId={revoke.isPending ? revoke.variables.id : null}
         readOnlyReason={readOnlyReason}
         onRevoke={(invite) => {
           revoke.mutate(invite);
@@ -117,6 +117,7 @@ export default function AdminInvites() {
 
       {link !== null && (
         <ShownOnce
+          key={link}
           label="Invite link"
           copyLabel="Copy the invite link"
           value={link}
@@ -393,14 +394,15 @@ function InviteList({
   title,
   empty,
   invites,
-  revoking,
+  revokingId,
   readOnlyReason,
   onRevoke,
 }: {
   title: string;
   empty: string;
   invites: Invite[];
-  revoking: boolean;
+  /** The link a revoke is running for, so only its row shows it. */
+  revokingId: number | null;
   readOnlyReason: string | undefined;
   onRevoke: (invite: Invite) => void;
 }) {
@@ -481,7 +483,7 @@ function InviteList({
                         }
                         confirmLabel="Confirm revoke"
                         confirmAriaLabel={`Confirm revoke of link ${invite.id}`}
-                        pending={revoking}
+                        pending={revokingId === invite.id}
                         disabledReason={readOnlyReason}
                         onConfirm={() => {
                           onRevoke(invite);

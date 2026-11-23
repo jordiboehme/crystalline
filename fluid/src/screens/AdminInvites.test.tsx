@@ -293,4 +293,38 @@ describe("the invites page", () => {
       "Revoked for Pia.",
     );
   });
+  it("shows only the link being revoked as pending", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () =>
+          meResponse({ user: userFixture({ name: "root", role: "admin" }) }),
+        "/domains": domains,
+        "/invites": () => ({
+          invites: [
+            invite({ id: 4, label: "a" }),
+            invite({ id: 5, label: "b" }),
+          ],
+          sign_in: "local",
+        }),
+        "/invites/4": () => new Promise(() => undefined),
+      }),
+    );
+    renderApp("/admin/invites");
+
+    const pending = await listFor("Pending");
+    await userEvent.click(
+      within(pending).getByRole("button", { name: "Revoke a (link 4)" }),
+    );
+    await userEvent.click(
+      within(pending).getByRole("button", { name: "Confirm revoke of link 4" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(pending).getByRole("button", { name: "Revoke a (link 4)" }),
+      ).toHaveAttribute("aria-disabled", "true");
+    });
+    expect(
+      within(pending).getByRole("button", { name: "Revoke b (link 5)" }),
+    ).toHaveAttribute("aria-disabled", "false");
+  });
 });

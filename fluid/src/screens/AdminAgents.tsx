@@ -75,10 +75,12 @@ export default function AdminAgents() {
   const [revealed, setRevealed] = useState<Revealed | null>(null);
 
   const agents = useQuery({ queryKey: AGENTS_KEY, queryFn: fetchAgents });
-  const authMcp = agents.data?.auth_mcp ?? true;
+  // Unknown until the list answers, and held back until then, so a fast
+  // press cannot meet the server's refusal the page was about to show.
+  const authMcp = agents.data?.auth_mcp ?? false;
   const createReason = capabilities.readOnly
     ? READ_ONLY_REASON
-    : authMcp
+    : authMcp || agents.data === undefined
       ? undefined
       : NEEDS_AUTH_MCP;
 
@@ -119,6 +121,7 @@ export default function AdminAgents() {
 
       {revealed && (
         <ShownOnce
+          key={revealed.token}
           label={`Token for ${revealed.agent}`}
           copyLabel="Copy the token"
           value={revealed.token}
@@ -137,6 +140,7 @@ export default function AdminAgents() {
       )}
 
       <CreateAgent
+        waiting={agents.data === undefined}
         disabledReason={createReason}
         onCreated={(name, token) => {
           setNotice({ kind: "done", text: `Added ${name}.` });
@@ -197,10 +201,13 @@ export default function AdminAgents() {
 
 /** The form that makes an agent and its first token. */
 function CreateAgent({
+  waiting,
   disabledReason,
   onCreated,
   onProblem,
 }: {
+  /** The list has not answered yet, so whether agents work is unknown. */
+  waiting: boolean;
   disabledReason: string | undefined;
   onCreated: (name: string, token: string) => void;
   onProblem: (error: Error) => void;
@@ -237,7 +244,7 @@ function CreateAgent({
     },
     onError: onProblem,
   });
-  const disabled = disabledReason !== undefined || create.isPending;
+  const disabled = waiting || disabledReason !== undefined || create.isPending;
   return (
     <section
       aria-labelledby={`${ids}-title`}
@@ -358,11 +365,11 @@ function CreateAgent({
   );
 }
 
-/** Whole days from now until `iso`, rounded up; null when it does not parse. */
-function daysLeft(iso: string, now: number): number | null {
+/** Milliseconds from now until `iso`; null when it does not parse. */
+function timeLeft(iso: string, now: number): number | null {
   const at = new Date(iso).getTime();
   if (Number.isNaN(at)) return null;
-  return Math.ceil((at - now) / DAY_MS);
+  return at - now;
 }
 
 /** How a loops value reads. */
@@ -469,9 +476,14 @@ function AgentCard({
             </thead>
             <tbody>
               {agent.tokens.map((token) => {
-                const left = daysLeft(token.expires_at, now);
+                const left = timeLeft(token.expires_at, now);
+                // The exact time decides, so 13.2 days left is marked; the
+                // sentence rounds up to whole days.
                 const soon =
-                  token.state === "live" && left !== null && left < WARN_DAYS;
+                  token.state === "live" &&
+                  left !== null &&
+                  left < WARN_DAYS * DAY_MS;
+                const days = left === null ? 0 : Math.ceil(left / DAY_MS);
                 return (
                   <tr
                     key={token.id}
@@ -483,9 +495,9 @@ function AgentCard({
                       {formatInstant(token.expires_at)}
                       {soon && (
                         <span className="mt-0.5 block text-xs text-amber-800 dark:text-amber-200">
-                          {left <= 1
+                          {days <= 1
                             ? "Ends within a day."
-                            : `Ends in ${left} days.`}
+                            : `Ends in ${days} days.`}
                         </span>
                       )}
                     </td>
@@ -501,7 +513,9 @@ function AgentCard({
                           ariaLabel={`Revoke ${token.label} (token ${token.id})`}
                           confirmLabel="Confirm revoke"
                           confirmAriaLabel={`Confirm revoke of token ${token.id}`}
-                          pending={revoke.isPending}
+                          pending={
+                            revoke.isPending && revoke.variables.id === token.id
+                          }
                           disabledReason={
                             readOnly ? READ_ONLY_REASON : undefined
                           }
