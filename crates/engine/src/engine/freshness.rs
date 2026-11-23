@@ -215,7 +215,7 @@ impl Engine {
         }
         let states = page_reconciles(&stamps, reader.reflection_reconciles(id).await?);
         let runs = if runs {
-            reflect_runs(&*reader, id).await?
+            reflect_runs(reader, id).await?
         } else {
             Vec::new()
         };
@@ -249,7 +249,7 @@ impl Engine {
         )]);
         let stored = reader.reflection_reconcile(id, path).await?;
         let states = page_reconciles(&stamps, stored.into_iter().collect());
-        let runs = reflect_runs(&*reader, id).await?;
+        let runs = reflect_runs(reader, id).await?;
         let now = self.automation_clock().stamp().unix_seconds();
         Ok(clocks(&stamps, &facts, &states, now, &runs).pop())
     }
