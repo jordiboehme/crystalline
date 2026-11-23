@@ -61,13 +61,12 @@ use crate::store::{
     FileStamp, FtsMode, GraphSlice, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery,
     InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, NewReflectionChunk, ObservationVector,
     OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ReflectionCovered,
-    ReflectionReconcile,
-    ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchQuery, SectionVector,
-    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
-    count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
-    page_window, reference_match, referencing_domains_sql, rename_onto_taken_row,
-    reset_spelled_references_sql, resolve_references_to_sql, resolve_spelled_references_sql,
-    spelled_references_sql, spelling_plan,
+    ReflectionReconcile, ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode,
+    SearchQuery, SectionVector, SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary, changed_spellings, count_references_to_sql, domain_url_needles, folder_slash,
+    in_transaction, names_a_domain_url, page_window, reference_match, referencing_domains_sql,
+    rename_onto_taken_row, reset_spelled_references_sql, resolve_references_to_sql,
+    resolve_spelled_references_sql, spelled_references_sql, spelling_plan,
 };
 use crate::store::{AutomationLease, AutomationRun, LeaseClaim, LeaseHolder};
 use crate::sweep::{SpelledRef, UnresolvedRef};

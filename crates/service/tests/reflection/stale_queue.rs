@@ -118,7 +118,13 @@ async fn an_engram_a_rolling_page_dropped_stays_covered_until_it_changes() {
     assert_eq!(unreflected(&fx).await, BTreeSet::new(), "all cited");
 
     // The next week: both pages drop their change, the old page retires.
-    sourced(&fx, "guides/week.md", "This week", &[("Next", &["weekly/d"])]).await;
+    sourced(
+        &fx,
+        "guides/week.md",
+        "This week",
+        &[("Next", &["weekly/d"])],
+    )
+    .await;
     sourced(&fx, "guides/plain.md", "Plain", &[("Other", &["weekly/d"])]).await;
     fx.engine
         .write_reflection(&act("retire", "guides/old.md"), &agent())
@@ -133,7 +139,11 @@ async fn an_engram_a_rolling_page_dropped_stays_covered_until_it_changes() {
     // weekly/a changes: its checksum moves, and nothing cites it now.
     std::fs::write(
         fx.root.join("weekly/a.md"),
-        engram("Change a", "weekly/a", "- [fact] change a landed, then moved"),
+        engram(
+            "Change a",
+            "weekly/a",
+            "- [fact] change a landed, then moved",
+        ),
     )
     .unwrap();
     fx.engine.sync(None).await.unwrap();
@@ -234,9 +244,19 @@ const DAY: i64 = 86_400;
 async fn a_page_whose_freshness_ran_out_is_stale() {
     let fx = weekly().await;
     put(&fx, "PACT.md", "# Pact\n\n## Tone\n\nPlain.\n").await;
-    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# This week\n").await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
     sourced(&fx, "guides/week.md", "This week", &[("A", &["weekly/a"])]).await;
-    put(&fx, "guides/week.pact.md", "# Week pact\n\n## Scope\n\nLast seven days.\n").await;
+    put(
+        &fx,
+        "guides/week.pact.md",
+        "# Week pact\n\n## Scope\n\nLast seven days.\n",
+    )
+    .await;
     put(&fx, "guides/fresh.md", "---\nfreshness: 7d\n---\n# Fresh\n").await;
     put(&fx, "guides/gone.md", "---\nfreshness: 1d\n---\n# Gone\n").await;
     owned(&fx, "guides/week/mon.md", "guides/week.md").await;
@@ -289,7 +309,12 @@ async fn a_page_whose_freshness_ran_out_is_stale() {
             .contains("Last seven days."),
         "{q}"
     );
-    assert!(q["pacts"]["eng"]["PACT.md"].as_str().unwrap().contains("Plain."));
+    assert!(
+        q["pacts"]["eng"]["PACT.md"]
+            .as_str()
+            .unwrap()
+            .contains("Plain.")
+    );
 
     // The same answer twice has the same version: it moves with the
     // period, never with the clock.
@@ -303,8 +328,24 @@ async fn a_page_whose_freshness_ran_out_is_stale() {
 #[tokio::test]
 async fn stale_goes_to_a_run_or_on_request_and_is_no_nudge() {
     let fx = weekly().await;
-    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# This week\n").await;
-    sourced(&fx, "guides/week.md", "This week", &[("A", &["weekly/a"]), ("B", &["weekly/b"]), ("C", &["weekly/c"]), ("D", &["weekly/d"])]).await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
+    sourced(
+        &fx,
+        "guides/week.md",
+        "This week",
+        &[
+            ("A", &["weekly/a"]),
+            ("B", &["weekly/b"]),
+            ("C", &["weekly/c"]),
+            ("D", &["weekly/d"]),
+        ],
+    )
+    .await;
     reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
 
     assert!(paths(&queue(&fx, &eng()).await, "stale").is_empty());
@@ -324,7 +365,10 @@ async fn stale_goes_to_a_run_or_on_request_and_is_no_nudge() {
         .await
         .unwrap();
     assert_eq!(paths(&q, "stale"), vec!["guides/week.md"]);
-    assert_eq!(paths(&queue(&fx, &with_stale()).await, "stale"), vec!["guides/week.md"]);
+    assert_eq!(
+        paths(&queue(&fx, &with_stale()).await, "stale"),
+        vec!["guides/week.md"]
+    );
     let refused = ReflectParams {
         stale: Some(false),
         ..eng()
@@ -356,7 +400,12 @@ async fn the_hint_counts_only_what_the_run_may_read() {
         ],
     )
     .await;
-    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# This week\n").await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
     reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
 
     let hint = |q: &Value| items(q, "stale")[0]["hint"].clone();
@@ -375,7 +424,11 @@ async fn the_hint_counts_only_what_the_run_may_read() {
     // is older than it.
     let harbor = crate::fixture::root_of(&fx, "harbor");
     for (abs, title, permalink) in [
-        (fx.root.join("runbooks/deploy.md"), "Deploy", "runbooks/deploy"),
+        (
+            fx.root.join("runbooks/deploy.md"),
+            "Deploy",
+            "runbooks/deploy",
+        ),
         (harbor.join("team/a.md"), "A", "team/a"),
         (harbor.join("team/b.md"), "B", "team/b"),
     ] {
@@ -393,7 +446,12 @@ async fn the_hint_counts_only_what_the_run_may_read() {
 #[tokio::test]
 async fn stale_ranks_after_feedback_and_takes_the_pages_source_changes() {
     let fx = weekly().await;
-    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# This week\n").await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
     sourced(&fx, "guides/week.md", "This week", &[("A", &["weekly/a"])]).await;
     sourced(&fx, "guides/plain.md", "Plain", &[("B", &["weekly/b"])]).await;
     reconciled_ago(&fx, "guides/week.md", 30 * DAY).await;
@@ -422,7 +480,10 @@ async fn stale_ranks_after_feedback_and_takes_the_pages_source_changes() {
             )
         })
         .collect();
-    let feedback = order.iter().position(|(w, _)| w == "changed").expect("feedback");
+    let feedback = order
+        .iter()
+        .position(|(w, _)| w == "changed")
+        .expect("feedback");
     let stale = order.iter().position(|(w, _)| w == "stale").expect("stale");
     assert!(feedback < stale, "{order:?}");
     assert!(
@@ -443,7 +504,12 @@ async fn stale_ranks_after_feedback_and_takes_the_pages_source_changes() {
 #[tokio::test]
 async fn a_late_reconcile_for_an_older_period_is_refused() {
     let fx = weekly().await;
-    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# This week\n").await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
     put(&fx, "guides/new.md", "---\nfreshness: 1d\n---\n# New\n").await;
     reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
     let version = |q: &Value| {
@@ -498,7 +564,12 @@ async fn a_late_reconcile_for_an_older_period_is_refused() {
 async fn a_changed_pact_raises_page_pact_changed_on_the_pages_that_follow_it() {
     let fx = weekly().await;
     put(&fx, "PACT.md", "# Pact\n\n## Tone\n\nPlain.\n").await;
-    for page in ["guides/week.md", "guides/week/mon.md", "guides/other.md", "guides/old.md"] {
+    for page in [
+        "guides/week.md",
+        "guides/week/mon.md",
+        "guides/other.md",
+        "guides/old.md",
+    ] {
         sourced(&fx, page, "Page", &[("A", &["weekly/a"])]).await;
     }
     // The agent writes the page pact: its baseline is what it wrote.
@@ -529,7 +600,10 @@ async fn a_changed_pact_raises_page_pact_changed_on_the_pages_that_follow_it() {
     );
     let item = items(&q, "page_pact_changed")[0];
     assert_eq!(item["pacts"], serde_json::json!(["guides/week.pact.md"]));
-    assert!(item["diff"].as_str().unwrap().contains("fourteen"), "{item}");
+    assert!(
+        item["diff"].as_str().unwrap().contains("fourteen"),
+        "{item}"
+    );
 
     // Settling the pact file ends the item of the page with no stored hash;
     // the reconciled page waits for its own reconcile.
@@ -593,7 +667,10 @@ async fn a_page_whose_owner_is_gone_or_retired_says_so() {
     assert_eq!(by_path["guides/week/mon.md"]["owner_is"], "missing");
     assert_eq!(by_path["guides/month/june.md"]["owner_is"], "retired");
     let hint = by_path["guides/month/june.md"]["hint"].as_str().unwrap();
-    assert!(hint.contains("retire") && hint.contains("restore"), "{hint}");
+    assert!(
+        hint.contains("retire") && hint.contains("restore"),
+        "{hint}"
+    );
 }
 
 /// A page that links a retired page gets `link_retired`, one that links a
@@ -609,7 +686,12 @@ async fn links_to_a_retired_or_removed_page_are_named() {
         "# Index\n\n## Links\n\n[old](old.md) and [gone](gone.md) and [here](links.md)\n",
     )
     .await;
-    put(&fx, "guides/also.md", "# Also\n\n## See\n\n[gone](gone.md)\n").await;
+    put(
+        &fx,
+        "guides/also.md",
+        "# Also\n\n## See\n\n[gone](gone.md)\n",
+    )
+    .await;
     fx.engine
         .write_reflection(&act("retire", "guides/old.md"), &agent())
         .await
@@ -639,12 +721,7 @@ async fn links_to_a_retired_or_removed_page_are_named() {
 #[tokio::test]
 async fn owned_and_retired_pages_are_exempt() {
     let fx = weekly().await;
-    put(
-        &fx,
-        "PACT.md",
-        "# Pact\n\n## Structure\n\n- guides/*.md\n",
-    )
-    .await;
+    put(&fx, "PACT.md", "# Pact\n\n## Structure\n\n- guides/*.md\n").await;
     put(&fx, "guides/week.md", "# This week\n").await;
     owned(&fx, "guides/week/mon.md", "guides/week.md").await;
     sourced(&fx, "other/old.md", "Old", &[("A", &["weekly/a"])]).await;

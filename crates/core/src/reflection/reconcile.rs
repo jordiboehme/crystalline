@@ -211,8 +211,8 @@ pub fn cover_change(path: &str, before: Option<&str>, after: &str) -> CoverChang
     let provenance = read_provenance(after);
     let now = own_cited(&provenance);
     let (settings, _) = read_page_settings(after, path, &provenance.page);
-    let rolling = !settings.retired()
-        && (settings.freshness.is_some() || provenance.page.owner.is_some());
+    let rolling =
+        !settings.retired() && (settings.freshness.is_some() || provenance.page.owner.is_some());
     CoverChange {
         add: if rolling {
             was.iter()
@@ -222,7 +222,10 @@ pub fn cover_change(path: &str, before: Option<&str>, after: &str) -> CoverChang
         } else {
             Vec::new()
         },
-        remove: now.into_keys().filter(|engram| !was.contains_key(engram)).collect(),
+        remove: now
+            .into_keys()
+            .filter(|engram| !was.contains_key(engram))
+            .collect(),
     }
 }
 

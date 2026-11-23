@@ -182,13 +182,14 @@ pub(super) fn page_items(view: &PageView, inputs: &PageInputs<'_>) -> Vec<Item> 
                 .map(|pact| inputs.pact_changes[pact.as_str()].age_secs)
                 .max()
                 .unwrap_or(age);
-            let basis = item_basis(
-                [fresh, stored.unwrap_or("")].into_iter().chain(
-                    changed
-                        .iter()
-                        .flat_map(|pact| [pact.as_str(), inputs.pact_changes[pact.as_str()].text.as_str()]),
-                ),
-            );
+            let basis = item_basis([fresh, stored.unwrap_or("")].into_iter().chain(
+                changed.iter().flat_map(|pact| {
+                    [
+                        pact.as_str(),
+                        inputs.pact_changes[pact.as_str()].text.as_str(),
+                    ]
+                }),
+            ));
             items.push(item(
                 "page_pact_changed",
                 None,

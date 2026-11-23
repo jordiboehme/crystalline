@@ -442,6 +442,24 @@ async fn a_file_edited_on_disk_with_a_too_wide_source_raises_the_item() {
     assert_eq!(items[0]["section"], "aaaa1111", "{queue}");
 }
 
+/// A retired page is never reconciled, and still names a source too wide
+/// for its readers: it stays inside the check (design 2.4, review I12).
+#[tokio::test]
+async fn a_retired_page_still_raises_source_too_wide() {
+    let (fx, auth) = reach().await;
+    private(&auth, "harbor", &["sam"]).await;
+    std::fs::create_dir_all(fx.root.join("reflections")).unwrap();
+    std::fs::write(
+        fx.root.join("reflections/forged.md"),
+        "---\nstatus: archived\nreflection:\n  aaaa1111:\n    sources:\n    - domain: harbor\n      engram: team/harbor-team\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    let (items, queue) = too_wide(&fx, &agent()).await;
+    assert_eq!(items.len(), 1, "{queue}");
+    assert_eq!(items[0]["path"], "forged.md", "{queue}");
+}
+
 /// The REST page save (what Fluid sends) and the live editor's save take
 /// no sources: a `reflection:` block made up in the text naming a source
 /// is not stored, so neither can carry one onto a page.

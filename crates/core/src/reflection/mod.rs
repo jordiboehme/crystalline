@@ -31,8 +31,7 @@ pub const REFLECTION_NOT_IMPORTED: &str = "under reflections/, which a Reflectio
 pub use anchors::anchor_state;
 pub use assets::{
     AssetTarget, classify_target, engram_attachment_embeds, reflection_asset_refs,
-    reflection_page_refs,
-    refuse_engram_attachments,
+    reflection_page_refs, refuse_engram_attachments,
 };
 pub use baseline::{
     ChangeKind, Relinked, SectionChange, advance_baseline, baseline_ids, feedback_changes,

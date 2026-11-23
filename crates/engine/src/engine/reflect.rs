@@ -1373,8 +1373,15 @@ impl Engine {
             .await?;
         let threads = self.all_threads(&access).await?;
         let items = rank(
-            self.detect_reflection(domain, &access, Detail::Full, &threads, &caller.scope, false)
-                .await?,
+            self.detect_reflection(
+                domain,
+                &access,
+                Detail::Full,
+                &threads,
+                &caller.scope,
+                false,
+            )
+            .await?,
         );
         let mut value = Self::page_json(&items, &[], limit, page, access.engrams_visible);
         value["domain"] = json!(domain);
@@ -1432,8 +1439,15 @@ impl Engine {
             out.into_iter().map(|(_, v)| v).collect()
         };
         let items = rank(
-            self.detect_reflection(domain, &access, Detail::Full, &threads, &caller.scope, false)
-                .await?,
+            self.detect_reflection(
+                domain,
+                &access,
+                Detail::Full,
+                &threads,
+                &caller.scope,
+                false,
+            )
+            .await?,
         );
         let mut queue = Self::page_json(&items, &[], Some(50), Some(1), access.engrams_visible);
         queue["domain"] = json!(domain);
@@ -1515,7 +1529,14 @@ impl Engine {
             .collect();
         open_by_page.sort_by(|a, b| a.0.cmp(b.0));
         let items = self
-            .detect_reflection(domain, &access, Detail::Updates, &threads, &caller.scope, false)
+            .detect_reflection(
+                domain,
+                &access,
+                Detail::Updates,
+                &threads,
+                &caller.scope,
+                false,
+            )
             .await?;
         let shown: Vec<&Item> = items
             .iter()
@@ -1555,7 +1576,14 @@ impl Engine {
             .await?;
         let threads = self.all_threads(&access).await?;
         let items = self
-            .detect_reflection(domain, &access, Detail::Count, &threads, &caller.scope, false)
+            .detect_reflection(
+                domain,
+                &access,
+                Detail::Count,
+                &threads,
+                &caller.scope,
+                false,
+            )
             .await?;
         let rooms = self.collab_rooms();
         let mut out = Vec::new();
