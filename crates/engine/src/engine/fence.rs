@@ -227,6 +227,15 @@ pub(crate) enum RowOp<'a> {
         row: &'a crystalline_index::AttachmentRow,
         seen: Option<&'a crystalline_index::AttachmentRow>,
     },
+    /// A page's reconcile state, as recorded.
+    // Built only by the tests until the `reconciled` action of
+    // `write_reflection` records one.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    Reconcile(&'a crystalline_index::ReflectionReconcile),
+    /// A page's reconcile state goes with it from `from` to `to`. Put it
+    /// before the [`RowOp::DeletePage`] of `from`, which takes the state
+    /// with the row.
+    MoveReconcile { from: &'a str, to: &'a str },
 }
 
 /// Whether `e` is a refusal of the host-lock fence (or of the gate, whose
@@ -317,6 +326,12 @@ impl Engine {
                         store
                             .delete_asset(AssetTable::Reflection, domain_id, path)
                             .await?;
+                    }
+                    RowOp::Reconcile(state) => {
+                        store.set_reflection_reconcile(domain_id, state).await?;
+                    }
+                    RowOp::MoveReconcile { from, to } => {
+                        store.move_reflection_reconcile(domain_id, from, to).await?;
                     }
                     RowOp::HealAsset { row, seen } => {
                         let now = store

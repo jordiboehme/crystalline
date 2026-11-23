@@ -3407,8 +3407,12 @@ impl Engine {
             write_file(abs, text)?;
         }
         // The old rows go and the new ones come in one fenced commit: the
-        // page, its pact and the pages that follow it.
+        // page with its reconcile state, its pact and the pages that follow
+        // it.
+        // The reconcile state moves first: the page row's delete would take
+        // it.
         let mut ops = vec![
+            RowOp::MoveReconcile { from, to },
             RowOp::DeletePage(from),
             RowOp::Page {
                 inner: to,
@@ -3698,6 +3702,7 @@ impl Engine {
         for file in &files[1..] {
             remove_if_there(file)?;
         }
+        // The page row's delete takes its reconcile state in the same commit.
         let mut ops = vec![RowOp::DeletePage(inner)];
         ops.extend(pact.as_deref().map(RowOp::DeletePage));
         self.commit_reflection_rows(access.domain_id, &ops, OnRefusal::put_back(domain, undo))

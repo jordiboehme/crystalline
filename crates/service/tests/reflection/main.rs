@@ -22,6 +22,7 @@ mod page_rights;
 mod queue;
 mod reach;
 mod read_limit;
+mod reconcile_state;
 mod rest;
 mod rights;
 mod search;

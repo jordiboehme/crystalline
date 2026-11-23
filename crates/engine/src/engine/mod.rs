@@ -9666,6 +9666,8 @@ mod names;
 mod origins;
 pub use origins::{READERS_REQUIRED, leave_out_for_non_admin};
 mod read;
+mod reconcile;
+pub use reconcile::{PageReconcile, ReconcileOutcome};
 mod reflect;
 pub use reflect::{REFLECT_GUIDANCE, STRUCTURE_HINT};
 mod reflection;
