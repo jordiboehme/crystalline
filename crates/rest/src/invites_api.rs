@@ -219,9 +219,20 @@ pub(crate) async fn can_invite(state: &RestState, identity: &Identity, domain: &
         return false;
     };
     let admin = user.role == Role::Admin;
-    refuse_unless_open(state, admin).is_ok()
-        && refuse_read_only(state).is_ok()
-        && refuse_link_to(state, identity, admin, domain).await.is_ok()
+    if refuse_unless_open(state, admin).is_err() || refuse_read_only(state).is_err() {
+        return false;
+    }
+    match refuse_link_to(state, identity, admin, domain).await {
+        Ok(()) => true,
+        Err(err) => {
+            // A refusal is the answer; a store that could not be read hides
+            // the control too (fail closed), but leaves a trace.
+            if err.status.is_server_error() {
+                tracing::warn!(domain, detail = %err.detail, "could not tell whether the caller may invite");
+            }
+            false
+        }
+    }
 }
 
 /// The address a token is handed over at: under `service.public_url` when

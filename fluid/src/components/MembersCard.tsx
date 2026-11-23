@@ -273,9 +273,8 @@ export function MembersCard({ domain }: { domain: string }) {
   const disabledReason = capabilities.readOnly ? READ_ONLY_REASON : undefined;
   // The server's own answer to "would POST /invites make a link here for
   // me": false on a shared or governed domain, a read-only instance, and
-  // for a manager while the instance keeps links to admins. Absent from an
-  // older server, which reads as no.
-  const canInvite = (data as { can_invite?: boolean }).can_invite === true;
+  // for a manager while the instance keeps links to admins.
+  const canInvite = data.can_invite === true;
 
   return (
     <section aria-labelledby="domain-members" className="flex flex-col gap-4">

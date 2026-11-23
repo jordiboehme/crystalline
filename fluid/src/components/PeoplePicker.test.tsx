@@ -21,7 +21,7 @@ import {
   renderApp,
   userFixture,
 } from "../test/harness";
-import { unavailableReason } from "./PeoplePicker";
+import { TOO_MANY_SEARCHES, unavailableReason } from "./PeoplePicker";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -233,6 +233,51 @@ describe("the people picker", () => {
     );
   });
 
+  it("says a throttled search in plain words, and keeps the link offer", async () => {
+    serve({
+      "/domains/eng/members": () => membersResponse({ can_invite: true }),
+      "/invites": () => ({ sign_in: "local", invites: [] }),
+      "/accounts/search": () => {
+        throw new ApiProblem(429, "too many requests", "slow down");
+      },
+    });
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    await userEvent.type(
+      within(card).getByRole("combobox", { name: "Account" }),
+      "zed",
+    );
+    expect(await within(card).findByText(TOO_MANY_SEARCHES)).toBeVisible();
+    expect(
+      within(card).getByRole("button", { name: "Invite someone new" }),
+    ).toBeVisible();
+  });
+
+  it("says the server's sentence when a search fails", async () => {
+    serve({
+      "/accounts/search": () => {
+        throw new ApiProblem(
+          500,
+          "internal error",
+          "the accounts are unreadable",
+        );
+      },
+    });
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    await userEvent.type(
+      within(card).getByRole("combobox", { name: "Account" }),
+      "zed",
+    );
+    expect(
+      await within(card).findByText("the accounts are unreadable"),
+    ).toBeVisible();
+    expect(within(card).queryByText("No account matches.")).toBeNull();
+    expect(
+      within(card).queryByRole("button", { name: "Invite someone new" }),
+    ).toBeNull();
+  });
+
   it("transfers ownership to the account picked", async () => {
     serve({
       "/domains/eng/owner": (_path, init) => {
@@ -364,6 +409,7 @@ describe("invite links in the members card", () => {
 
     await waitFor(() => {
       expect(sentBody("/invites", "POST")).toEqual({
+        role: "none",
         domain: "eng",
         level: "editor",
         label: "zed",

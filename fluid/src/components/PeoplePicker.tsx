@@ -26,6 +26,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 
+import { ApiProblem, problemDetail } from "../api/client";
 import {
   SEARCH_MIN_CHARS,
   accountSearchKey,
@@ -40,6 +41,10 @@ export const SEARCH_DELAY_MS = 300;
 
 /** What the picker picks for. */
 export type PickFor = "member" | "owner";
+
+/** What a throttled search says: the route allows 60 a minute per caller. */
+export const TOO_MANY_SEARCHES =
+  "Too many searches. Wait a minute and type again.";
 
 /** No row is active. */
 const NO_ROW = -1;
@@ -133,11 +138,18 @@ export function PeoplePicker({
   const expanded = open && hits.length > 0;
   const index = active === NO_ROW ? NO_ROW : Math.min(active, hits.length - 1);
   const hasActive = expanded && index >= 0;
+  const settledHere = searching && settled === typed;
   const noMatch =
-    searching &&
-    settled === typed &&
-    search.isSuccess &&
-    search.data.results.length === 0;
+    settledHere && search.isSuccess && search.data.results.length === 0;
+  // A refused search says why rather than showing nothing: a 429 from the
+  // rate limit in plain words, anything else in the server's own.
+  const failed = settledHere && search.isError ? search.error : null;
+  const failure =
+    failed === null
+      ? null
+      : failed instanceof ApiProblem && failed.status === 429
+        ? TOO_MANY_SEARCHES
+        : problemDetail(failed);
   const listId = `${id}-people`;
   const optionId = (position: number) => `${id}-person-${String(position)}`;
 
@@ -267,15 +279,15 @@ export function PeoplePicker({
           })}
         </ul>
       )}
-      <div aria-live="polite">
-        {noMatch && (
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            <span className="text-slate-500 dark:text-slate-400">
-              No account matches.
-            </span>
-            {noMatchAction}
-          </div>
-        )}
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        {/*
+          Only the sentence is live, so the action beside it is not read out
+          with it; the region stays mounted so a new sentence is announced.
+        */}
+        <span aria-live="polite" className="text-slate-500 dark:text-slate-400">
+          {failure ?? (noMatch ? "No account matches." : "")}
+        </span>
+        {(noMatch || failure !== null) && noMatchAction}
       </div>
     </div>
   );

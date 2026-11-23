@@ -4,9 +4,11 @@
  *
  * Drawn only where the members read says `can_invite`: an admin, or the
  * owner or a manager while the instance lets them make links, on a private
- * domain GitHub does not govern. The link gives instance role `none` and
- * membership here at the level picked; the server keeps that level within
- * the maker's own.
+ * domain GitHub does not govern. A link from here is a link to this domain:
+ * it sends instance role `none` for every maker, admins included, so the
+ * person sees only the domains they are invited into, and membership here at
+ * the level picked (the server keeps that level within the maker's own). An
+ * admin who wants a wider role makes the link in Administration > Invites.
  *
  * The made link is shown once, with a copy button, and lives only in this
  * component's state. The list under it is the caller's own pending links to
@@ -83,6 +85,7 @@ export function DomainInvites({
     // the mutation cache.
     mutationFn: async () => {
       const made = await createInvite({
+        role: "none",
         domain,
         level,
         label: label.trim() === "" ? null : label.trim(),
@@ -131,7 +134,8 @@ export function DomainInvites({
         Invite links
       </h3>
       <p className="text-sm text-ink-3">
-        For someone without an account here. A link works once.
+        For someone without an account here. A link works once. The person sees
+        only the domains they are invited into.
       </p>
       {problem !== null && (
         <p

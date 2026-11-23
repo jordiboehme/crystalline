@@ -4,6 +4,7 @@
  * presses a button. Each way in the server names gets its own control.
  */
 
+import type { QueryClient } from "@tanstack/react-query";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,6 +27,20 @@ vi.mock("../api/client", async (importOriginal) => {
     api: vi.fn(),
     setCsrfToken: vi.fn(),
     navigateTo: vi.fn(),
+  };
+});
+
+/** Every query client the app made, to look into its caches. */
+const clients: QueryClient[] = [];
+vi.mock("../query/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../query/client")>();
+  return {
+    ...actual,
+    createQueryClient: () => {
+      const client = actual.createQueryClient();
+      clients.push(client);
+      return client;
+    },
   };
 });
 
@@ -154,6 +169,23 @@ describe("the invite page", () => {
       "href",
       "/d/team",
     );
+    // Neither cache keeps the token: no query key, no mutation variables.
+    const client = clients.at(-1);
+    expect(client).toBeDefined();
+    const keys = JSON.stringify(
+      client
+        ?.getQueryCache()
+        .getAll()
+        .map((query) => query.queryKey),
+    );
+    expect(keys).not.toContain(TOKEN);
+    const variables = JSON.stringify(
+      client
+        ?.getMutationCache()
+        .getAll()
+        .map((m) => m.state.variables) ?? [],
+    );
+    expect(variables).not.toContain(TOKEN);
   });
 
   it("signs in to an existing account on the page, then accepts as it", async () => {
