@@ -339,6 +339,44 @@ async fn an_invite_link_never_reaches_a_governed_domain() {
         "{body}"
     );
     assert!(fx.auth.invites(None, None).await.unwrap().is_empty());
+
+    // A link made before the domain's access followed GitHub is not
+    // redeemed: confirm says the one sentence, redeem says why.
+    let issued = fx
+        .auth
+        .create_invite(
+            &crystalline_service::rest::NewInvite {
+                role: Role::Viewer,
+                domain: Some("kb"),
+                level: Some(MemberLevel::Viewer),
+                label: None,
+                local_account: false,
+                created_by: "root",
+                ttl_secs: 3_600,
+            },
+            crystalline_service::rest::InviteLimits {
+                per_creator: 10,
+                max_users: 100,
+            },
+        )
+        .await
+        .unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let confirm = client
+        .post(format!("http://{}/api/v1/invites/confirm", fx.addr))
+        .json(&json!({"token": issued.token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(confirm.status(), 404);
+    let redeem = client
+        .post(format!("http://{}/api/v1/invites/redeem", fx.addr))
+        .json(&json!({"token": issued.token, "login": "nina", "password": "pw12345678"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redeem.status(), 409);
+    assert!(fx.auth.user("nina").await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -131,7 +131,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 16] = [
+const PUBLIC_PATHS: [&str; 18] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -191,6 +191,14 @@ const PUBLIC_PATHS: [&str; 16] = [
     // redirects to the settings page and reads nothing GitHub sent. See
     // `super::github_app_create::setup`.
     super::github_app_create::SETUP_PATH,
+    // The two invite routes a person holding a link reaches before they have
+    // an account here. Confirm reads what a link offers and redeems nothing;
+    // redeem takes it, under the CSRF check below like every POST (a request
+    // with no account has no token to echo, and a signed-in one echoes its
+    // session's). The token in the body is the proof, refused per address on
+    // a throttle. See `super::invite_redeem`.
+    super::invite_redeem::CONFIRM_PATH,
+    super::invite_redeem::REDEEM_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
@@ -230,8 +238,9 @@ pub struct AuthCfg {
     /// `auth.max_users`: the trusted header, the forward-auth headers and
     /// single sign-on all count against the one cap. Only minting a *new*
     /// account is capped; an existing one always resolves, and the
-    /// `crystalline users` CLI is never capped. Every pending invite link
-    /// counts against it too.
+    /// `crystalline users` CLI is never capped. A new invite link is refused
+    /// once the accounts plus the pending links reach it, and redeeming a
+    /// link that makes an account is refused once the accounts reach it.
     pub max_users: usize,
     /// Whether the owner or a manager of a private domain may make invite
     /// links to it, from `auth.invites.managers`. Admins always may.
@@ -1666,6 +1675,14 @@ impl std::fmt::Debug for SetupBody {
 /// "not local" rather than to an error, so it is read as an `Option` and
 /// [`is_local_setup_peer`] fails closed on it.
 pub struct PeerAddr(Option<std::net::SocketAddr>);
+
+impl PeerAddr {
+    /// The peer's IP address, when the router was served with connection
+    /// info.
+    pub(crate) fn ip(&self) -> Option<std::net::IpAddr> {
+        self.0.map(|addr| addr.ip())
+    }
+}
 
 impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
     type Rejection = Infallible;

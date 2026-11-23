@@ -494,6 +494,54 @@ export type ClosedDomain = {
 };
 
 /**
+ * The body of `POST /invites/confirm`.
+ */
+export type ConfirmBody = {
+    /**
+     * The token from the link's fragment.
+     */
+    token: string;
+};
+
+/**
+ * What `POST /invites/confirm` answers with: what the link gives and how to
+ * take it.
+ */
+export type ConfirmResponse = {
+    /**
+     * The private domain the link gives membership of, if any.
+     */
+    domain?: string | null;
+    /**
+     * When the link stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The login name of the person who made the link.
+     */
+    inviter: string;
+    /**
+     * Their display name.
+     */
+    inviter_display: string;
+    level?: MemberLevel | null;
+    /**
+     * Whether the link may make an account with a login name and a
+     * password here.
+     */
+    local_allowed: boolean;
+    /**
+     * The instance role an account this link creates gets. An existing
+     * account keeps its own.
+     */
+    role: Role;
+    /**
+     * The sign-in this instance offers.
+     */
+    sign_in: InviteSignIn;
+};
+
+/**
  * The wire form of a 412: a problem detail carrying the version the server
  * holds now, so a client can show a merge view instead of just failing.
  */
@@ -1416,6 +1464,11 @@ export type Invite = {
      */
     used_by?: string | null;
 };
+
+/**
+ * Which way in a link offers.
+ */
+export type InviteSignIn = 'local' | 'oidc' | 'proxy';
 
 /**
  * Where one invite link stands.
@@ -2522,6 +2575,64 @@ export type ProvisioningView = {
  * (everyone signed in) or `private` (only people with access on GitHub).
  */
 export type Readers = 'shared' | 'private';
+
+/**
+ * The body of `POST /invites/redeem`.
+ */
+export type RedeemBody = {
+    /**
+     * The display name for a new local account. Defaults to the login name
+     * as typed.
+     */
+    display_name?: string | null;
+    /**
+     * The login name for a new local account. Signed in, it may only name
+     * the caller's own account.
+     */
+    login?: string | null;
+    /**
+     * The password for a new local account.
+     */
+    password?: string | null;
+    /**
+     * The token from the link's fragment.
+     */
+    token: string;
+};
+
+/**
+ * What a redeem request came to.
+ */
+export type RedeemOutcome = 'redeemed' | 'sign_in';
+
+/**
+ * What `POST /invites/redeem` answers with.
+ */
+export type RedeemResponse = {
+    /**
+     * Whether the redemption made that account.
+     */
+    created: boolean;
+    /**
+     * The CSRF token of the session this answer signed a new local account
+     * in with.
+     */
+    csrf?: string | null;
+    /**
+     * The domain the account is now a member of, if the link named one.
+     */
+    domain?: string | null;
+    level?: MemberLevel | null;
+    /**
+     * Where to send the browser, for `sign_in`.
+     */
+    location?: string | null;
+    /**
+     * Redeemed, or a sign-in to go through first.
+     */
+    outcome: RedeemOutcome;
+    user?: User | null;
+};
 
 /**
  * Every file of a domain's Reflection.
@@ -8508,6 +8619,112 @@ export type CreateInviteResponses = {
 };
 
 export type CreateInviteResponse = CreateInviteResponses[keyof CreateInviteResponses];
+
+export type ConfirmInviteData = {
+    body: ConfirmBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/invites/confirm';
+};
+
+export type ConfirmInviteErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * The link is not valid any more: one answer for a token that is unknown, used, revoked or expired, or whose maker or domain no longer allows it.
+     */
+    404: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The body is JSON but carries no token.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many tokens were tried from this address.
+     */
+    429: ProblemDetail;
+};
+
+export type ConfirmInviteError = ConfirmInviteErrors[keyof ConfirmInviteErrors];
+
+export type ConfirmInviteResponses = {
+    /**
+     * What the link gives and the sign-in offered.
+     */
+    200: ConfirmResponse;
+};
+
+export type ConfirmInviteResponse = ConfirmInviteResponses[keyof ConfirmInviteResponses];
+
+export type RedeemInviteData = {
+    body: RedeemBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/invites/redeem';
+};
+
+export type RedeemInviteErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * The link is taken through the proxy in front of this instance, and this request carried no identity from it.
+     */
+    401: ProblemDetail;
+    /**
+     * A signed-in caller named another login, this link may not make a local account here, the account is disabled, a new account would pass the account cap, a signed-in caller did not echo the CSRF token, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No invite link has this token.
+     */
+    404: ProblemDetail;
+    /**
+     * The link's maker may no longer give what it gives, its domain is no longer private or follows GitHub, the login name is taken, the link names no domain and the caller has an account, or the sign-on identity belongs to an account already.
+     */
+    409: ProblemDetail;
+    /**
+     * The link was used, revoked or has expired.
+     */
+    410: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * A local account needs a login name and a password, and one was missing, empty or not a login name.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many tokens were tried from this address.
+     */
+    429: ProblemDetail;
+    /**
+     * The sign-on provider could not be reached to start the sign-in.
+     */
+    502: ProblemDetail;
+    /**
+     * Too many sign-ins are in flight, or the wait for a password slot ran out.
+     */
+    503: ProblemDetail;
+};
+
+export type RedeemInviteError = RedeemInviteErrors[keyof RedeemInviteErrors];
+
+export type RedeemInviteResponses = {
+    /**
+     * Redeemed, or (`outcome: sign_in`) where to send the browser to sign in first: the callback redeems the link. A new local account is signed in, with the session cookie set and its CSRF token in `csrf`.
+     */
+    200: RedeemResponse;
+};
+
+export type RedeemInviteResponse = RedeemInviteResponses[keyof RedeemInviteResponses];
 
 export type RevokeInviteData = {
     body?: never;

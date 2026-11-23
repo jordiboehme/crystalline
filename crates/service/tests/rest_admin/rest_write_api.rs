@@ -4853,6 +4853,14 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// what bounds it is the signature over the body under the App's webhook
 /// secret. Its refusals (no secret, no or a wrong signature, a session in
 /// place of one) are pinned by `tests/origins/github_webhook.rs`.
+/// The two invite redemption routes, `POST /api/v1/invites/confirm` and
+/// `POST /api/v1/invites/redeem`, have no role dimension either: a person
+/// holding a link usually has no account yet, so both are public by path,
+/// and what bounds them is the token in the body and a per-address throttle.
+/// Confirm writes nothing. Redeem is under the CSRF rule like every POST (a
+/// signed-in caller echoes its token) and is refused on a read-only instance;
+/// those, the sign-in modes and every refusal are pinned by
+/// `tests/rest_admin/rest_invite_redeem.rs` and `tests/auth/oidc.rs`.
 /// The rename row's admin leg really renames `eng` (see its own comment in
 /// `write_ops()`), so every row that still addresses `eng` by that name has
 /// to run before it - an invariant a comment alone cannot enforce. A row
@@ -4884,6 +4892,8 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/oauth/token",
         "POST /api/v1/oauth/revoke",
         "POST /api/v1/github/webhook",
+        "POST /api/v1/invites/confirm",
+        "POST /api/v1/invites/redeem",
     ];
 
     let mutating: BTreeSet<String> = crate::support::MOUNTED_OPERATIONS

@@ -10615,6 +10615,252 @@
         }
       }
     },
+    "/api/v1/invites/confirm": {
+      "post": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`POST /invites/confirm` - what an invite link gives and how to take it.\nRedeems nothing.",
+        "operationId": "confirm_invite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What the link gives and the sign-in offered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The link is not valid any more: one answer for a token that is unknown, used, revoked or expired, or whose maker or domain no longer allows it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but carries no token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many tokens were tried from this address.",
+            "headers": {
+              "retry-after": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before trying again."
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/invites/redeem": {
+      "post": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`POST /invites/redeem` - take an invite link.",
+        "operationId": "redeem_invite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedeemBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Redeemed, or (`outcome: sign_in`) where to send the browser to sign in first: the callback redeems the link. A new local account is signed in, with the session cookie set and its CSRF token in `csrf`.",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` cookie for a new local account, or the `fluid_oidc_state` cookie for a sign-in to go through."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RedeemResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The link is taken through the proxy in front of this instance, and this request carried no identity from it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A signed-in caller named another login, this link may not make a local account here, the account is disabled, a new account would pass the account cap, a signed-in caller did not echo the CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No invite link has this token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The link's maker may no longer give what it gives, its domain is no longer private or follows GitHub, the login name is taken, the link names no domain and the caller has an account, or the sign-on identity belongs to an account already.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The link was used, revoked or has expired.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A local account needs a login name and a password, and one was missing, empty or not a login name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many tokens were tried from this address.",
+            "headers": {
+              "retry-after": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before trying again."
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The sign-on provider could not be reached to start the sign-in.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many sign-ins are in flight, or the wait for a password slot ran out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/invites/{id}": {
       "delete": {
         "tags": [
@@ -14454,6 +14700,80 @@
           }
         }
       },
+      "ConfirmBody": {
+        "type": "object",
+        "description": "The body of `POST /invites/confirm`.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token from the link's fragment.",
+            "example": "cin_q2V0..."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConfirmResponse": {
+        "type": "object",
+        "description": "What `POST /invites/confirm` answers with: what the link gives and how to\ntake it.",
+        "required": [
+          "inviter",
+          "inviter_display",
+          "role",
+          "expires_at",
+          "sign_in",
+          "local_allowed"
+        ],
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The private domain the link gives membership of, if any.",
+            "example": "team"
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "When the link stops working, RFC 3339."
+          },
+          "inviter": {
+            "type": "string",
+            "description": "The login name of the person who made the link.",
+            "example": "ada"
+          },
+          "inviter_display": {
+            "type": "string",
+            "description": "Their display name.",
+            "example": "Ada Lovelace"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The level there."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "local_allowed": {
+            "type": "boolean",
+            "description": "Whether the link may make an account with a login name and a\npassword here."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The instance role an account this link creates gets. An existing\naccount keeps its own."
+          },
+          "sign_in": {
+            "$ref": "#/components/schemas/InviteSignIn",
+            "description": "The sign-in this instance offers."
+          }
+        }
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -15959,6 +16279,15 @@
           }
         }
       },
+      "InviteSignIn": {
+        "type": "string",
+        "description": "Which way in a link offers.",
+        "enum": [
+          "local",
+          "oidc",
+          "proxy"
+        ]
+      },
       "InviteState": {
         "type": "string",
         "description": "Where one invite link stands.",
@@ -17463,6 +17792,114 @@
           "shared",
           "private"
         ]
+      },
+      "RedeemBody": {
+        "type": "object",
+        "description": "The body of `POST /invites/redeem`.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name for a new local account. Defaults to the login name\nas typed.",
+            "example": "Nina"
+          },
+          "login": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The login name for a new local account. Signed in, it may only name\nthe caller's own account.",
+            "example": "nina"
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The password for a new local account.",
+            "example": "correct horse battery staple"
+          },
+          "token": {
+            "type": "string",
+            "description": "The token from the link's fragment.",
+            "example": "cin_q2V0..."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RedeemOutcome": {
+        "type": "string",
+        "description": "What a redeem request came to.",
+        "enum": [
+          "redeemed",
+          "sign_in"
+        ]
+      },
+      "RedeemResponse": {
+        "type": "object",
+        "description": "What `POST /invites/redeem` answers with.",
+        "required": [
+          "outcome",
+          "created"
+        ],
+        "properties": {
+          "created": {
+            "type": "boolean",
+            "description": "Whether the redemption made that account."
+          },
+          "csrf": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CSRF token of the session this answer signed a new local account\nin with."
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain the account is now a member of, if the link named one."
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The level it holds there now: the link's, or a higher one it held."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where to send the browser, for `sign_in`."
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/RedeemOutcome",
+            "description": "Redeemed, or a sign-in to go through first."
+          },
+          "user": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/User",
+                "description": "The account that redeemed the link, as stored, for `redeemed`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
       },
       "ReflectionAssetsResponse": {
         "type": "object",

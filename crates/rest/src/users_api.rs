@@ -561,15 +561,34 @@ pub(crate) fn account_cap_refusal(err: &anyhow::Error) -> ApiError {
     ApiError::forbidden(crystalline_core::account::NEW_ACCOUNT_CAP_REACHED)
 }
 
+/// What a provisioning made: the account itself, or an invite redeemed with a
+/// new account. [`provision_clear`] reads the account's name from it.
+pub(crate) trait Provisioned {
+    /// The account that was made.
+    fn account(&self) -> &User;
+}
+
+impl Provisioned for User {
+    fn account(&self) -> &User {
+        self
+    }
+}
+
+impl Provisioned for crate::auth_store::RedeemedInvite {
+    fn account(&self) -> &User {
+        &self.user
+    }
+}
+
 /// A first sign-in's provisioning with the same step before it. The store picks
 /// the first free name from `desired`, so the step asks about that name. When
 /// another account took it in between, the store picks a later one, which was not
 /// asked about: that account is taken back out and the person signs in again.
-pub(crate) async fn provision_clear(
+pub(crate) async fn provision_clear<T: Provisioned>(
     state: &RestState,
     desired: &str,
-    provision: impl std::future::Future<Output = anyhow::Result<User>>,
-) -> Result<anyhow::Result<User>, ApiError> {
+    provision: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<anyhow::Result<T>, ApiError> {
     let cleared = match state.auth.free_name_from(desired).await {
         Ok(name) => {
             clear_name_for_new_account(state, &name, false).await?;
@@ -580,7 +599,8 @@ pub(crate) async fn provision_clear(
     match provision.await {
         // Also when the name could not be asked about: an account stands only on a
         // name that was cleared.
-        Ok(user) if cleared.as_deref() != Some(user.name.as_str()) => {
+        Ok(made) if cleared.as_deref() != Some(made.account().name.as_str()) => {
+            let user = made.account();
             // A sign-in that found an account of its own never reaches here: the
             // caller asks for the linked account first.
             if let Err(e) = state.auth.remove_user_force(&user.name).await {

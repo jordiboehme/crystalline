@@ -22,7 +22,7 @@
 //! a refusal by a cap names the setting in the log, never in the answer.
 //!
 //! Redeeming a link is not here: it re-checks the creator's rights at that
-//! moment and lives with the sign-in routes.
+//! moment and lives beside the sign-in routes, in [`super::invite_redeem`].
 
 use axum::Json;
 use axum::extract::State;

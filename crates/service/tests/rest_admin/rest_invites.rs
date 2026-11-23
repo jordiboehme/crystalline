@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GlobalConfig, InvitesConfig, ResponseFormat, ServiceConfig,
+    AuthConfig, DomainEntry, GlobalConfig, InvitesConfig, LoginConfig, ResponseFormat,
+    ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
@@ -18,19 +19,23 @@ use tokio::sync::Mutex;
 
 /// What an invite-test server varies.
 #[derive(Default)]
-struct Options {
+pub(super) struct Options {
     /// `auth.invites.managers`.
-    managers: bool,
-    read_only: bool,
+    pub(super) managers: bool,
+    pub(super) read_only: bool,
     /// `service.public_url`.
-    public_url: Option<&'static str>,
+    pub(super) public_url: Option<&'static str>,
     /// `auth.max_users`.
-    max_users: Option<u32>,
+    pub(super) max_users: Option<u32>,
+    /// `auth.proxy_headers`.
+    pub(super) proxy_headers: bool,
+    /// `auth.login`, which the invite-token throttle shares.
+    pub(super) login: Option<LoginConfig>,
 }
 
-struct Fixture {
-    addr: std::net::SocketAddr,
-    auth: Arc<AuthStore>,
+pub(super) struct Fixture {
+    pub(super) addr: std::net::SocketAddr,
+    pub(super) auth: Arc<AuthStore>,
     _state: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
@@ -47,7 +52,7 @@ fn manifest(name: &str) -> String {
 /// owned by `olga` (an instance viewer) with `mona` its manager and `eve`
 /// an editor there. `root` is the admin, `eddy` an editor and `vera` a
 /// viewer, neither of them in `team`. Every password is `pw12345678`.
-async fn serve(opts: Options) -> Fixture {
+pub(super) async fn serve(opts: Options) -> Fixture {
     let state = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -55,6 +60,8 @@ async fn serve(opts: Options) -> Fixture {
         domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             max_users: opts.max_users,
+            proxy_headers: opts.proxy_headers.then_some(true),
+            login: opts.login,
             invites: opts.managers.then_some(InvitesConfig {
                 managers: Some(true),
             }),
@@ -140,12 +147,12 @@ async fn serve(opts: Options) -> Fixture {
     }
 }
 
-fn client() -> reqwest::Client {
+pub(super) fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 /// Log in, returning (session cookie value, csrf token).
-async fn login(fx: &Fixture, name: &str) -> (String, String) {
+pub(super) async fn login(fx: &Fixture, name: &str) -> (String, String) {
     let resp = client()
         .post(format!("http://{}/api/v1/auth/login", fx.addr))
         .json(&json!({"name": name, "password": "pw12345678"}))
@@ -169,7 +176,7 @@ async fn login(fx: &Fixture, name: &str) -> (String, String) {
 
 /// One request as `session`: the status, the `Cache-Control` header and the
 /// body as JSON (`null` for an empty one).
-async fn call(
+pub(super) async fn call(
     fx: &Fixture,
     session: &(String, String),
     method: Method,
@@ -202,7 +209,7 @@ async fn call(
     (status, cache, value)
 }
 
-async fn create(fx: &Fixture, session: &(String, String), body: Value) -> (u16, Value) {
+pub(super) async fn create(fx: &Fixture, session: &(String, String), body: Value) -> (u16, Value) {
     let (status, _, body) = call(fx, session, Method::POST, "/api/v1/invites", Some(body)).await;
     (status, body)
 }

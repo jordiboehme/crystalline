@@ -50,6 +50,7 @@ pub mod github_webhook;
 mod graph;
 pub mod host_guard;
 mod identity_links;
+mod invite_redeem;
 mod invites_api;
 mod kept;
 mod login_throttle;
@@ -279,6 +280,8 @@ use crate::scope::{DomainAccess, DomainRight};
         invites_api::list,
         invites_api::create,
         invites_api::revoke,
+        invite_redeem::confirm,
+        invite_redeem::redeem,
         mcp_tokens::list,
         mcp_tokens::issue,
         mcp_tokens::rotate,
@@ -402,6 +405,12 @@ use crate::scope::{DomainAccess, DomainRight};
         invites_api::InvitesResponse,
         invites_api::CreateInviteBody,
         invites_api::CreatedInviteResponse,
+        invite_redeem::ConfirmBody,
+        invite_redeem::ConfirmResponse,
+        invite_redeem::InviteSignIn,
+        invite_redeem::RedeemBody,
+        invite_redeem::RedeemOutcome,
+        invite_redeem::RedeemResponse,
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
         github_settings::GithubAccessResponse,
@@ -524,6 +533,10 @@ pub struct RestState {
     /// startup from `auth.login.*` like the rest of the auth settings. See
     /// [`login_throttle`].
     login_throttle: Arc<LoginThrottle>,
+    /// The bound on trying invite tokens at `POST /invites/confirm` and
+    /// `POST /invites/redeem`, keyed by peer address, on the login
+    /// throttle's settings. See [`invite_redeem`].
+    invite_throttle: Arc<LoginThrottle>,
     /// The per-caller budget of `GET /accounts/search`. See [`account_search`].
     search_limiter: Arc<account_search::SearchLimiter>,
     /// The daemon's shutdown signal, which every open event stream ends on:
@@ -608,6 +621,7 @@ impl RestState {
             setup_token: None,
             login_slots: auth::login_slots(),
             login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
+            invite_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
             search_limiter: Arc::default(),
             shutdown: None,
             streams: Arc::new(events::StreamSlots::default()),
@@ -729,6 +743,11 @@ impl RestState {
     /// The login throttle, for the one handler that consults it.
     pub(crate) fn login_throttle(&self) -> &LoginThrottle {
         &self.login_throttle
+    }
+
+    /// The invite-token throttle, for the two redemption handlers.
+    pub(crate) fn invite_throttle(&self) -> &LoginThrottle {
+        &self.invite_throttle
     }
 }
 
@@ -1242,6 +1261,8 @@ fn routes(state: RestState) -> Router {
         // [`invites_api`].
         .route("/invites", get(invites_api::list).post(invites_api::create))
         .route("/invites/{id}", delete(invites_api::revoke))
+        .route(invite_redeem::CONFIRM_PATH, post(invite_redeem::confirm))
+        .route(invite_redeem::REDEEM_PATH, post(invite_redeem::redeem))
         .route("/users/{name}/password", post(users_api::reset_password))
         // Admin only, inside the handler: frees a GitHub account linked to
         // the wrong Crystalline account. See [`github_link`].

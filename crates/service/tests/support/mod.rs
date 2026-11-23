@@ -223,6 +223,8 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/invites",
     "POST /api/v1/invites",
     "DELETE /api/v1/invites/{id}",
+    "POST /api/v1/invites/confirm",
+    "POST /api/v1/invites/redeem",
     "GET /api/v1/settings/github",
     "GET /api/v1/github/access",
     "DELETE /api/v1/settings/github",
