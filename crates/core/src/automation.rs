@@ -716,6 +716,50 @@ mod tests {
         );
     }
 
+    /// A page whose freshness ran out is reconciled with its pacts (design
+    /// 3.5): the chain run, the readable domains searched, only what new
+    /// information requires changed, every source named, owned pages created
+    /// with `owner`, retired and never deleted, and `reconciled` recorded
+    /// with the item's version, owned pages first and the owner last, each
+    /// page one item toward the cap.
+    #[test]
+    fn the_reflect_prompt_reconciles_a_stale_page() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let reconcile = prompt
+            .lines()
+            .find(|line| line.contains("`stale`") && line.contains("freshness ran out"))
+            .expect("a reconcile step for stale items");
+        for needle in [
+            "pacts",
+            "search the domains",
+            "change only what new information requires",
+            "name every source",
+            "`owner`",
+            "retire",
+            "never delete",
+            "`reconciled`",
+            "`version`",
+            "`changed_engrams`",
+            "`unchanged`",
+            "null",
+            "owned pages first and the owner last",
+            "`owned_reconciled`",
+        ] {
+            assert!(
+                reconcile.contains(needle),
+                "the reconcile step lacks {needle}: {reconcile}"
+            );
+        }
+        let cap = prompt
+            .lines()
+            .find(|line| line.starts_with("- Stop after"))
+            .expect("the cap rule");
+        assert!(
+            cap.contains("the owner and each owned page count as one item each"),
+            "{cap}"
+        );
+    }
+
     #[test]
     fn a_reflect_run_refused_an_engram_write_answers_the_feedback_another_way() {
         let prompt = headless_prompt(Loop::Reflect, "work", 7, false);

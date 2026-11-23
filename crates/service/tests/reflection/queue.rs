@@ -2205,3 +2205,36 @@ async fn a_page_never_reflected_stays_feedback_without_a_baseline() {
         "{queue}"
     );
 }
+
+/// The queue's guidance teaches the reconcile of a stale page as the
+/// prompt does: the chain, the domains to search, owned pages with owner,
+/// retire never delete, and reconciled with the item's version, owned
+/// pages first and the owner last.
+#[tokio::test]
+async fn the_queue_guidance_teaches_the_reconcile_of_a_stale_page() {
+    let fx = curated_with_a_feedback_item().await;
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let guidance = queue["guidance"].as_str().unwrap();
+    for needle in [
+        "stale",
+        "search the domains",
+        "change only what new information requires",
+        "owner",
+        "retire",
+        "never delete",
+        "action=reconciled",
+        "version",
+        "changed_engrams",
+        "owned pages first and the owner last",
+        "owned_reconciled",
+    ] {
+        assert!(
+            guidance.contains(needle),
+            "guidance lacks {needle}: {guidance}"
+        );
+    }
+}
