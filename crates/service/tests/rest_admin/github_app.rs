@@ -427,7 +427,7 @@ async fn the_conversion_stores_credentials_and_returns_no_secret() {
 
     let response = ctx.created(&root, CODE, &state).await;
     assert_eq!(response.status(), 303);
-    assert_eq!(location(&response), "/settings/github?app=created");
+    assert_eq!(location(&response), "/admin/github?app=created");
     assert_eq!(github.conversions(), 1);
 
     // Stored through the path `github app set` takes: the slug from GitHub,
@@ -767,7 +767,7 @@ async fn the_setup_landing_goes_to_the_settings_page() {
         )
         .await;
     assert_eq!(response.status(), 303);
-    assert_eq!(location(&response), "/settings/github?app=installed");
+    assert_eq!(location(&response), "/admin/github?app=installed");
 }
 
 /// The environment of an App that comes from the variables.

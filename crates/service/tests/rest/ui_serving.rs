@@ -843,6 +843,7 @@ async fn every_browser_navigation_gets_the_app_shell() {
         "/d/dom/e/a%2Fb",
         "/nonsense",
         "/settings/github",
+        "/admin/github",
         "/graph",
         "/authorize",
     ] {

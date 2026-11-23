@@ -9936,7 +9936,7 @@
           "settings"
         ],
         "summary": "Where GitHub sends the browser back after creating the GitHub App.",
-        "description": "Needs the admin session that asked for the manifest form (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a form this session was handed in the last hour and is spent by this call. Then the code is converted into the App's credentials, which are stored as `crystalline github app set` stores them, and the browser is sent to `/settings/github?app=created`. Refused without converting the code when a GitHub App is already configured. It is a browser landing, so every refusal is an HTML page, never JSON, and no answer carries a secret.",
+        "description": "Needs the admin session that asked for the manifest form (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a form this session was handed in the last hour and is spent by this call. Then the code is converted into the App's credentials, which are stored as `crystalline github app set` stores them, and the browser is sent to `/admin/github?app=created`. Refused without converting the code when a GitHub App is already configured. It is a browser landing, so every refusal is an HTML page, never JSON, and no answer carries a secret.",
         "operationId": "finish_github_app_manifest",
         "parameters": [
           {
@@ -9960,7 +9960,7 @@
         ],
         "responses": {
           "303": {
-            "description": "The App is stored: to `/settings/github?app=created`."
+            "description": "The App is stored: to `/admin/github?app=created`."
           },
           "401": {
             "description": "An HTML page: no signed-in session. The state is not spent.",
@@ -9995,11 +9995,11 @@
           "settings"
         ],
         "summary": "Where GitHub sends the browser after the GitHub App was installed.",
-        "description": "The manifest's `setup_url`. Changes nothing and reads nothing GitHub sent: it sends the browser to `/settings/github?app=installed`.",
+        "description": "The manifest's `setup_url`. Changes nothing and reads nothing GitHub sent: it sends the browser to `/admin/github?app=installed`.",
         "operationId": "github_app_installed",
         "responses": {
           "303": {
-            "description": "To `/settings/github?app=installed`."
+            "description": "To `/admin/github?app=installed`."
           }
         }
       }
