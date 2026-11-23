@@ -92,7 +92,8 @@ use db::{AuthDb, AuthRow};
 pub use invites::{
     INVITE_DEFAULT_TTL_SECS, INVITE_LABEL_MAX_CHARS, INVITE_MAX_TTL_SECS, INVITE_MIN_TTL_SECS,
     INVITE_PENDING_MAX_ADMIN, INVITE_PENDING_MAX_MANAGER, INVITE_TOKEN_PREFIX, Invite,
-    InviteLimits, InviteState, IssuedInvite, NewInvite,
+    InviteLimits, InviteOffer, InviteRedeemer, InviteState, IssuedInvite, NewInvite,
+    RedeemedInvite,
 };
 #[cfg(feature = "postgres")]
 pub use pg::auth_write_lock;
@@ -1255,6 +1256,22 @@ pub enum RefusalKind {
     /// outside what is allowed or a label that is too long or holds a
     /// control character. See [`AuthStore::create_invite`].
     InvalidInvite,
+    /// No invite link has this token. Also what a surface answers for a link
+    /// it will not describe; see [`AuthStore::invite_offer`].
+    InviteUnknown,
+    /// The invite link was redeemed already.
+    InviteUsed,
+    /// The invite link was revoked.
+    InviteRevoked,
+    /// The invite link's time ran out.
+    InviteExpired,
+    /// The account that made the invite link may not give what it gives any
+    /// more: it is gone or disabled, it is no longer an admin where the link
+    /// needs one, or it no longer manages the domain at the link's level.
+    InviteCreatorLapsed,
+    /// The invite link gives no domain, so it can only make a new account,
+    /// and an existing account tried to redeem it.
+    InviteNeedsNewAccount,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store

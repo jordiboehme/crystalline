@@ -21,6 +21,15 @@
 //! at redemption, where the shared namespace of accounts and agents is
 //! checked. A removed account's links go with it, so a name used again
 //! inherits none of them.
+//!
+//! Redemption ([`AuthStore::redeem_invite`]) is one transaction: the link is
+//! marked used only while it is unused, unrevoked and unexpired, the account
+//! is created or resolved, and the membership is written, raised and never
+//! lowered. The link's role applies only to an account the redemption
+//! creates. What the link gives is checked again at that moment against its
+//! creator: still an enabled account, still an admin where the link needs
+//! one, still managing the domain at the link's level, and the domain still
+//! private. An account is never matched by its address.
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -28,8 +37,10 @@ use crystalline_core::time::{self, Stamp};
 use turso::Value;
 
 use super::{
-    AuthRow, AuthStore, MemberLevel, RefusalKind, Role, cell_text, random_bytes, refuse,
-    rfc3339_from_unix, token_hash,
+    AuthRow, AuthStore, LINKED_BY_JIT, MemberLevel, PRINCIPAL_USER, RefusalKind, Role,
+    USER_COLUMNS, User, cell_text, hash_password, identity_value, member_level_from_db,
+    normalize_account_name, normalize_display_name, normalize_new_account_name,
+    provided_display_name, random_bytes, refuse, rfc3339_from_unix, token_hash, user_from_row,
 };
 
 /// Prefix every invite token is minted with, so it is told apart from every
@@ -382,18 +393,22 @@ impl AuthStore {
     }
 
     /// One `COUNT(*)` answer. The caller holds the guard.
+    ///
+    /// An answer that is not a number is an error rather than a zero: both
+    /// callers are caps, and a cap that read nothing as zero would let
+    /// everything through.
     async fn count(&self, sql: &str, params: Vec<Value>) -> Result<i64> {
-        Ok(
-            match self
-                .db
-                .query_first(sql, params)
-                .await?
-                .map(|row| row.get_value(0))
-            {
-                Some(Ok(Value::Integer(n))) => n,
-                _ => 0,
-            },
-        )
+        match self
+            .db
+            .query_first(sql, params)
+            .await?
+            .map(|row| row.get_value(0))
+        {
+            Some(Ok(Value::Integer(n))) => Ok(n),
+            _ => Err(anyhow::anyhow!(
+                "counting for an invite cap gave no number, so the cap cannot be checked"
+            )),
+        }
     }
 
     /// The invite links, newest first: every one, or those `created_by`
@@ -491,5 +506,576 @@ impl AuthStore {
             .await
             .with_context(|| format!("removing the invite links of user '{name}'"))?;
         Ok(())
+    }
+}
+
+/// Who redeems an invite link.
+///
+/// No `Debug`: [`InviteRedeemer::Local`] carries a password.
+pub enum InviteRedeemer<'a> {
+    /// An account that exists already, by login name. It gets the membership
+    /// only, never the link's role.
+    Account(&'a str),
+    /// A new account with a password, named by the person redeeming.
+    Local {
+        /// The login name, folded; refused when an account or an agent holds
+        /// it.
+        name: &'a str,
+        /// The display name; the login name when absent or blank.
+        display: Option<&'a str>,
+        /// The password, hashed before the transaction opens.
+        password: &'a str,
+    },
+    /// A new account for a sign-on identity this instance has not seen,
+    /// linked to it in the same transaction, the way a first sign-on is.
+    Linked {
+        /// The provider (or the proxy) that asserted the identity.
+        issuer: &'a str,
+        /// Its stable identifier for the person.
+        subject: &'a str,
+        /// A naming hint, uniquified with `-2`, `-3` and so on when taken.
+        desired_name: &'a str,
+        /// The provider's display name, written this once.
+        display: Option<&'a str>,
+        /// The provider's address, presentation only.
+        email: Option<&'a str>,
+    },
+}
+
+/// What a redemption did.
+#[derive(Clone, Debug)]
+pub struct RedeemedInvite {
+    /// The link as it now stands: used, by `user`.
+    pub invite: Invite,
+    /// The account that redeemed it, as stored after the redemption.
+    pub user: User,
+    /// Whether the redemption created that account.
+    pub created: bool,
+    /// The level the account holds on the link's domain now: the link's
+    /// level, or a higher one it held before. The domain's owner reads as
+    /// `manager`. `None` when the link names no domain.
+    pub level: Option<MemberLevel>,
+}
+
+/// What a pending link offers, for the page that asks a person to accept it.
+#[derive(Clone, Debug)]
+pub struct InviteOffer {
+    /// The link.
+    pub invite: Invite,
+    /// Its creator's display name.
+    pub inviter_display: String,
+}
+
+/// What a redeemer has become once its input is checked, before the lock.
+enum Prepared {
+    Account(String),
+    Local {
+        name: String,
+        display: String,
+        hash: String,
+    },
+    Linked {
+        issuer: String,
+        subject: String,
+        base: String,
+        display: Option<String>,
+        email: Option<String>,
+    },
+}
+
+/// Membership levels least to most, for the raise-only rule and the
+/// creator's level check.
+fn level_rank(level: MemberLevel) -> u8 {
+    match level {
+        MemberLevel::None => 0,
+        MemberLevel::Viewer => 1,
+        MemberLevel::Editor => 2,
+        MemberLevel::Manager => 3,
+    }
+}
+
+/// The refusal for a link that is not pending, naming which way it ended.
+fn refuse_unless_pending(invite: &Invite) -> Result<()> {
+    match invite.state {
+        InviteState::Pending => Ok(()),
+        InviteState::Used => Err(refuse(
+            RefusalKind::InviteUsed,
+            "this invite link was used already".to_string(),
+        )),
+        InviteState::Revoked => Err(refuse(
+            RefusalKind::InviteRevoked,
+            "this invite link was revoked".to_string(),
+        )),
+        InviteState::Expired => Err(refuse(
+            RefusalKind::InviteExpired,
+            "this invite link has expired".to_string(),
+        )),
+    }
+}
+
+/// The refusal for a link whose creator may no longer give what it gives.
+fn creator_lapsed() -> anyhow::Error {
+    refuse(
+        RefusalKind::InviteCreatorLapsed,
+        "the person who made this invite link may not give what it gives any more: ask them for \
+         a new one"
+            .to_string(),
+    )
+}
+
+impl AuthStore {
+    /// The link a token names, its state as of `now`. The caller holds the
+    /// guard.
+    async fn invite_by_token(&self, token: &str, now: i64) -> Result<Option<Invite>> {
+        Ok(self
+            .db
+            .query_first(
+                &format!("SELECT {INVITE_COLUMNS} FROM invites WHERE token_hash = ?1"),
+                vec![Value::Text(token_hash(token.trim()))],
+            )
+            .await
+            .context("reading an invite link")?
+            .and_then(|row| invite_from_row(&row, now)))
+    }
+
+    /// Check again that the link's creator may give what the link gives, and
+    /// that its domain is still private. Answers the domain's owner when the
+    /// link names a domain. The caller holds the guard.
+    ///
+    /// The creator must be an enabled account. A link that gives a role other
+    /// than `none`, may create a local account or names no domain is one only
+    /// an admin makes, so its creator must still be an admin. A link to a
+    /// domain needs its creator to be an admin, the domain's owner, or a
+    /// manager there whose level is not below the link's.
+    async fn check_invite_creator(&self, invite: &Invite) -> Result<Option<String>> {
+        let row = self
+            .db
+            .query_first(
+                "SELECT role, disabled FROM users WHERE name = ?1",
+                vec![Value::Text(invite.created_by.clone())],
+            )
+            .await
+            .context("reading the maker of an invite link")?;
+        let Some(row) = row else {
+            return Err(creator_lapsed());
+        };
+        if !matches!(row.get_value(1), Ok(Value::Integer(0))) {
+            return Err(creator_lapsed());
+        }
+        let admin = cell_text(&row, 0).and_then(|r| r.parse::<Role>().ok()) == Some(Role::Admin);
+        let needs_admin =
+            invite.role != Role::None || invite.local_account || invite.domain.is_none();
+        if needs_admin && !admin {
+            return Err(creator_lapsed());
+        }
+        let Some(domain) = invite.domain.as_deref() else {
+            return Ok(None);
+        };
+        let Some(acl) = self.acl_of(domain).await? else {
+            return Err(refuse(
+                RefusalKind::NotPrivate,
+                format!(
+                    "domain '{domain}' is not private any more, so this invite link gives nothing"
+                ),
+            ));
+        };
+        if !admin && acl.owner != invite.created_by {
+            let held = self
+                .db
+                .query_first(
+                    "SELECT level FROM domain_member
+                     WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                    vec![
+                        Value::Text(domain.to_string()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(invite.created_by.clone()),
+                    ],
+                )
+                .await
+                .context("reading the maker's membership")?
+                .and_then(|row| cell_text(&row, 0))
+                .map(|raw| member_level_from_db(&raw));
+            let given = invite.level.unwrap_or(MemberLevel::Viewer);
+            match held {
+                Some(level)
+                    if level == MemberLevel::Manager && level_rank(level) >= level_rank(given) => {}
+                _ => return Err(creator_lapsed()),
+            }
+        }
+        Ok(Some(acl.owner))
+    }
+
+    /// What a pending link offers: the link and its creator's display name,
+    /// for the page that asks a person to accept it.
+    ///
+    /// Refused like a redemption is for the link itself
+    /// ([`RefusalKind::InviteUnknown`], [`RefusalKind::InviteUsed`],
+    /// [`RefusalKind::InviteRevoked`], [`RefusalKind::InviteExpired`]) and
+    /// for the re-checks of its creator and domain
+    /// ([`RefusalKind::InviteCreatorLapsed`], [`RefusalKind::NotPrivate`]).
+    /// A surface that must not say which may answer all of them alike.
+    pub async fn invite_offer(&self, token: &str) -> Result<InviteOffer> {
+        let now = time::now().unix_seconds();
+        let _guard = self.lock().await;
+        let Some(invite) = self.invite_by_token(token, now).await? else {
+            return Err(refuse(
+                RefusalKind::InviteUnknown,
+                "no invite link has this token".to_string(),
+            ));
+        };
+        refuse_unless_pending(&invite)?;
+        self.check_invite_creator(&invite).await?;
+        let inviter_display = self
+            .db
+            .query_first(
+                "SELECT display FROM users WHERE name = ?1",
+                vec![Value::Text(invite.created_by.clone())],
+            )
+            .await
+            .context("reading the maker of an invite link")?
+            .and_then(|row| cell_text(&row, 0))
+            .unwrap_or_else(|| invite.created_by.clone());
+        Ok(InviteOffer {
+            invite,
+            inviter_display,
+        })
+    }
+
+    /// Redeem an invite link, in one transaction: mark it used where it is
+    /// unused, unrevoked and unexpired; create or resolve the account; write
+    /// the membership, raised and never lowered.
+    ///
+    /// The link's role applies only to an account this creates; an existing
+    /// account keeps its role and gets the membership only. An account is
+    /// never matched by its address. A new account counts against
+    /// `max_users` (`auth.max_users`), counting the accounts only: this link
+    /// already held one of the pending places.
+    ///
+    /// Refused, and nothing written (the link stays pending unless it was not
+    /// pending already):
+    ///
+    /// * the link is unknown, used, revoked or expired
+    ///   ([`RefusalKind::InviteUnknown`], [`RefusalKind::InviteUsed`],
+    ///   [`RefusalKind::InviteRevoked`], [`RefusalKind::InviteExpired`]);
+    /// * its creator may no longer give what it gives
+    ///   ([`RefusalKind::InviteCreatorLapsed`]), or its domain is no longer
+    ///   private ([`RefusalKind::NotPrivate`]);
+    /// * an existing account is gone or disabled
+    ///   ([`RefusalKind::NoSuchAccount`]), or the link names no domain and so
+    ///   gives an existing account nothing
+    ///   ([`RefusalKind::InviteNeedsNewAccount`]);
+    /// * a new account would pass the cap ([`RefusalKind::CapReached`]), its
+    ///   name cannot be a login ([`RefusalKind::InvalidName`],
+    ///   [`RefusalKind::InvalidDisplayName`]) or is held by an account or an
+    ///   agent ([`RefusalKind::NameTaken`]), or the sign-on identity is linked
+    ///   already ([`RefusalKind::IdentityAlreadyLinked`]).
+    ///
+    /// Whether the domain's access follows GitHub is not known here; the
+    /// caller checks that before.
+    pub async fn redeem_invite(
+        &self,
+        token: &str,
+        redeemer: InviteRedeemer<'_>,
+        max_users: usize,
+    ) -> Result<RedeemedInvite> {
+        self.redeem_invite_at(token, redeemer, max_users, time::now())
+            .await
+    }
+
+    /// [`AuthStore::redeem_invite`] at `now`, the seam the expiry tests use.
+    pub(super) async fn redeem_invite_at(
+        &self,
+        token: &str,
+        redeemer: InviteRedeemer<'_>,
+        max_users: usize,
+        now: Stamp,
+    ) -> Result<RedeemedInvite> {
+        // Everything that needs no table is checked, and the password hashed,
+        // before the lock: argon2 is CPU, not database.
+        let prepared = match redeemer {
+            InviteRedeemer::Account(name) => Prepared::Account(normalize_account_name(name)?),
+            InviteRedeemer::Local {
+                name,
+                display,
+                password,
+            } => {
+                let name = normalize_new_account_name(name)?;
+                let display = normalize_display_name(&name, display)?;
+                let hash = hash_password(password).await?;
+                Prepared::Local {
+                    name,
+                    display,
+                    hash,
+                }
+            }
+            InviteRedeemer::Linked {
+                issuer,
+                subject,
+                desired_name,
+                display,
+                email,
+            } => Prepared::Linked {
+                issuer: identity_value(issuer, "issuer")?,
+                subject: identity_value(subject, "subject")?,
+                base: normalize_new_account_name(desired_name)?,
+                display: display.map(str::to_string),
+                email: email
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            },
+        };
+        let now_unix = now.unix_seconds();
+        let _guard = self.lock().await;
+        self.db
+            .begin_immediate()
+            .await
+            .context("redeeming an invite link")?;
+        let result = async {
+            let Some(invite) = self.invite_by_token(token, now_unix).await? else {
+                return Err(refuse(
+                    RefusalKind::InviteUnknown,
+                    "no invite link has this token".to_string(),
+                ));
+            };
+            refuse_unless_pending(&invite)?;
+            let owner = self.check_invite_creator(&invite).await?;
+            let (name, created) = match prepared {
+                Prepared::Account(name) => {
+                    let live = self
+                        .db
+                        .query_first(
+                            "SELECT disabled FROM users WHERE name = ?1",
+                            vec![Value::Text(name.clone())],
+                        )
+                        .await?
+                        .is_some_and(|row| matches!(row.get_value(0), Ok(Value::Integer(0))));
+                    if !live {
+                        return Err(refuse(
+                            RefusalKind::NoSuchAccount,
+                            format!("account '{name}' is disabled or gone"),
+                        ));
+                    }
+                    if invite.domain.is_none() {
+                        return Err(refuse(
+                            RefusalKind::InviteNeedsNewAccount,
+                            "this invite link makes a new account and gives no domain, so it \
+                             gives an existing account nothing"
+                                .to_string(),
+                        ));
+                    }
+                    (name, false)
+                }
+                Prepared::Local {
+                    name,
+                    display,
+                    hash,
+                } => {
+                    self.refuse_agent_name(&name).await?;
+                    if self
+                        .db
+                        .query_first(
+                            "SELECT 1 FROM users WHERE name = ?1",
+                            vec![Value::Text(name.clone())],
+                        )
+                        .await?
+                        .is_some()
+                    {
+                        return Err(refuse(
+                            RefusalKind::NameTaken,
+                            format!("the login name '{name}' is taken: pick another"),
+                        ));
+                    }
+                    self.refuse_past_cap(max_users).await?;
+                    self.sweep_orphans_of(&name).await?;
+                    self.db
+                        .execute(
+                            "INSERT INTO users
+                                 (name, display, email, role, pass_hash, disabled, created_at)
+                             VALUES (?1, ?2, NULL, ?3, ?4, 0, ?5)",
+                            vec![
+                                Value::Text(name.clone()),
+                                Value::Text(display),
+                                Value::Text(invite.role.as_str().to_string()),
+                                Value::Text(hash),
+                                Value::Text(now.rfc3339()),
+                            ],
+                        )
+                        .await
+                        .with_context(|| format!("adding user '{name}' for an invite link"))?;
+                    (name, true)
+                }
+                Prepared::Linked {
+                    issuer,
+                    subject,
+                    base,
+                    display,
+                    email,
+                } => {
+                    self.refuse_past_cap(max_users).await?;
+                    let name = self.free_account_name(&base).await?;
+                    self.sweep_orphans_of(&name).await?;
+                    self.db
+                        .execute(
+                            "INSERT INTO users
+                                 (name, display, email, role, pass_hash, disabled, created_at)
+                             VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
+                            vec![
+                                Value::Text(name.clone()),
+                                Value::Text(provided_display_name(&name, display.as_deref())),
+                                email.clone().map_or(Value::Null, Value::Text),
+                                Value::Text(invite.role.as_str().to_string()),
+                                Value::Text(now.rfc3339()),
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("provisioning user '{name}' for an invite link")
+                        })?;
+                    self.insert_link(&issuer, &subject, &name, LINKED_BY_JIT)
+                        .await?;
+                    (name, true)
+                }
+            };
+            let level = match (invite.domain.as_deref(), invite.level) {
+                (Some(domain), Some(level)) => Some(
+                    self.raise_membership(
+                        domain,
+                        &name,
+                        level,
+                        owner.as_deref(),
+                        &invite.created_by,
+                        &now,
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
+            let marked = self
+                .db
+                .execute(
+                    "UPDATE invites SET used_at = ?2, used_by = ?3
+                     WHERE id = ?1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?2",
+                    vec![
+                        Value::Integer(invite.id),
+                        Value::Integer(now_unix),
+                        Value::Text(name.clone()),
+                    ],
+                )
+                .await
+                .context("marking an invite link used")?;
+            if marked != 1 {
+                return Err(refuse(
+                    RefusalKind::InviteUsed,
+                    "this invite link was used already".to_string(),
+                ));
+            }
+            let user = self
+                .db
+                .query_first(
+                    &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                    vec![Value::Text(name.clone())],
+                )
+                .await?
+                .map(|row| user_from_row(&row))
+                .ok_or_else(|| anyhow::anyhow!("user '{name}' vanished while redeeming a link"))?;
+            Ok(RedeemedInvite {
+                invite: Invite {
+                    used_at: Some(rfc3339_from_unix(now_unix)),
+                    used_by: Some(name),
+                    state: InviteState::Used,
+                    ..invite
+                },
+                user,
+                created,
+                level,
+            })
+        }
+        .await;
+        self.db.finish(result).await
+    }
+
+    /// Refuse a new account once the accounts reach `cap`. Inside the
+    /// caller's transaction.
+    async fn refuse_past_cap(&self, cap: usize) -> Result<()> {
+        let accounts = self.count("SELECT COUNT(*) FROM users", vec![]).await?;
+        if usize::try_from(accounts).unwrap_or(usize::MAX) >= cap {
+            return Err(refuse(
+                RefusalKind::CapReached,
+                format!(
+                    "refusing to create an account for an invite link: the account cap is \
+                     reached (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Give `account` at least `level` on `domain`, inside the caller's
+    /// transaction, and answer the level it holds now. A higher level it
+    /// already holds is kept, and so is its Reflection level there. The
+    /// domain's `owner` holds every level and gets no row.
+    async fn raise_membership(
+        &self,
+        domain: &str,
+        account: &str,
+        level: MemberLevel,
+        owner: Option<&str>,
+        added_by: &str,
+        now: &Stamp,
+    ) -> Result<MemberLevel> {
+        if owner == Some(account) {
+            return Ok(MemberLevel::Manager);
+        }
+        let key = || {
+            vec![
+                Value::Text(domain.to_string()),
+                Value::Text(PRINCIPAL_USER.to_string()),
+                Value::Text(account.to_string()),
+            ]
+        };
+        let held = self
+            .db
+            .query_first(
+                "SELECT level FROM domain_member
+                 WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                key(),
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0))
+            .map(|raw| member_level_from_db(&raw));
+        if let Some(held) = held
+            && level_rank(held) >= level_rank(level)
+        {
+            return Ok(held);
+        }
+        let reflection = self.member_reflection_in_tx(domain, account).await?;
+        let context = || format!("adding '{account}' to domain '{domain}' for an invite link");
+        self.db
+            .execute(
+                "DELETE FROM domain_member
+                 WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                key(),
+            )
+            .await
+            .with_context(context)?;
+        self.db
+            .execute(
+                "INSERT INTO domain_member
+                     (domain, principal_kind, principal, level, reflection, added_by, added_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                vec![
+                    Value::Text(domain.to_string()),
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                    Value::Text(account.to_string()),
+                    Value::Text(level.as_str().to_string()),
+                    reflection.to_db(),
+                    Value::Text(added_by.to_string()),
+                    Value::Text(now.rfc3339()),
+                ],
+            )
+            .await
+            .with_context(context)?;
+        Ok(level)
     }
 }
