@@ -1266,3 +1266,39 @@ async fn a_page_due_inside_the_cap_is_sent_when_it_ends() {
     assert_eq!(second.json()["counts"]["stale"], 2, "{}", second.json());
     task.stop().await;
 }
+
+/// A due page a person has open in a live editor waits for the room: it is
+/// not due work, so nothing is sent for it, and its page clock says it is
+/// waiting. The look does not spin on it either.
+#[tokio::test(start_paused = true)]
+async fn a_stale_page_open_in_a_live_room_is_not_sent() {
+    use crystalline_service::collab::session::CollabSessions;
+    let mut hook = hook();
+    let fx = reflecting("reflect_trigger: webhook\n", Some(&hook.url)).await;
+    hourly_page(&fx, "w.md", "2026-10-21T08:00:00+00:00").await;
+    let sessions = CollabSessions::new(fx.engine.clone());
+    fx.engine.set_collab_sessions(&sessions);
+    let _joined = sessions
+        .join_reflection("eng", "w.md", "jordi")
+        .await
+        .unwrap();
+    let task = start(&fx.engine, &hook).await;
+    assert!(
+        hook.next(minutes(10)).await.is_none(),
+        "nothing while the page waits for the room"
+    );
+    let status = fx
+        .engine
+        .automation_status(Loop::Reflect, &["eng".to_string()], &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(status["domains"][0]["counts"]["stale"], 0, "{status}");
+    let clock = fx
+        .engine
+        .reflection_page_clock("eng", "w.md", &person())
+        .await
+        .unwrap();
+    assert_eq!(clock["stale"], true, "{clock}");
+    assert_eq!(clock["waiting"], true, "{clock}");
+    task.stop().await;
+}

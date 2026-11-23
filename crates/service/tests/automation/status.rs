@@ -794,3 +794,49 @@ async fn a_cold_page_memo_reads_the_texts_in_one_query() {
     status_with(&fx.engine, Loop::Reflect, false).await;
     assert_eq!(fx.engine.page_text_reads(), before + 2, "one page read");
 }
+
+/// A caller who may not read the Reflection gets no page clock (refused,
+/// as a read of the page is) and no missed page of that domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_caller_who_may_not_read_gets_no_clock() {
+    let fx = hourly_page("2026-10-21T10:00:00+00:00").await;
+    reflect_run(
+        &fx,
+        "2026-10-21T13:00:00+00:00",
+        "2026-10-21T13:05:00+00:00",
+    )
+    .await;
+    now_at(&fx.engine, "2026-10-21T16:05:00+00:00");
+    let auth = Arc::new(
+        AuthStore::open(&fx.tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["keeper", "out"] {
+        auth.add_user(name, name, None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("eng", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine
+        .set_domain_access(Arc::new(DomainAccess::new(auth)));
+    let out = ReflectionCaller::person(
+        Scope::User {
+            account: "out".into(),
+            admin: false,
+        },
+        "out",
+    );
+    assert!(
+        fx.engine
+            .reflection_page_clock("eng", "w.md", &out)
+            .await
+            .is_err()
+    );
+    let pages = fx.engine.overdue_reflection_pages(&out).await.unwrap();
+    assert_eq!(pages["pages"], serde_json::json!([]), "{pages}");
+    // The machine owner still sees it.
+    assert_eq!(missed(&fx).await.as_array().unwrap().len(), 1);
+}
