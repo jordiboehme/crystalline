@@ -76,6 +76,9 @@ const COSTS: Readonly<Record<string, Cost>> = {
   // rounded up; replace with a CI number.
   "quick-format.spec.ts": { root: 37, path: 37 },
   "reflection.spec.ts": { root: 55, path: 60 },
+  // Measured locally on 2026-11-24 (chromium and webkit, 3.6 s together),
+  // rounded up; replace with a CI number.
+  "reflection-settings.spec.ts": { root: 4, path: 4 },
   // Estimated from its five short journeys; replace with a CI number.
   "sidebar.spec.ts": { root: 8, path: 8 },
   "smoke.spec.ts": { root: 66, path: 70 },
