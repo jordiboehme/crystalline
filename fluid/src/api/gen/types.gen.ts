@@ -3444,7 +3444,7 @@ export type DeleteAgentError = DeleteAgentErrors[keyof DeleteAgentErrors];
 
 export type DeleteAgentResponses = {
     /**
-     * The agent and its tokens are gone.
+     * The agent, its tokens, its drafts and the links on them are gone.
      */
     204: void;
 };

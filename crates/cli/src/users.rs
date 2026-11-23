@@ -576,14 +576,17 @@ fn credential_host() -> Option<String> {
 /// the old person gave end, and a GitHub token left under the name goes, with a
 /// running daemon told. Anything that cannot be read or deleted refuses: nothing
 /// may stand on a token the store could not answer about. A name that holds an
-/// account, or that no account can have, is left alone, so the insert answers it.
-async fn clear_name_for_new_account(
+/// account or an agent, or that no account can have, is left alone, so the insert
+/// answers it. `crystalline agents add` takes the same step: an agent drafts under
+/// its name too, so it must not inherit a removed person's drafts either.
+pub(crate) async fn clear_name_for_new_account(
     store: &AuthStore,
     name: &str,
     route: &SecretRoute,
 ) -> Result<()> {
     if crystalline_service::rest::normalize_new_account_name(name).is_err()
         || store.user(name).await?.is_some()
+        || store.agent(name).await?.is_some()
     {
         return Ok(());
     }
@@ -602,7 +605,7 @@ async fn clear_name_for_new_account(
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "the name '{account}' still holds drafts of a removed account: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them with: crystalline users discard-drafts {account}, and add the account again"
+            "the name '{account}' still holds drafts of a removed account or agent: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them with: crystalline users discard-drafts {account}, and add the account again"
         );
     }
     store.end_overlay_grants_of_owner(&account).await?;

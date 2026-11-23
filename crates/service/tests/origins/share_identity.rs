@@ -1607,6 +1607,139 @@ async fn on_a_reviewing_domain_an_agent_shares_its_own_draft() {
     );
 }
 
+/// An admin's request on the agents routes, as `root`.
+async fn as_root(
+    fx: &Case,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, String) {
+    let root = login(fx.addr, "root").await.unwrap();
+    let mut req = with_session(
+        client().request(method, format!("http://{}{path}", fx.addr)),
+        Some(&root),
+    );
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.text().await.unwrap_or_default())
+}
+
+/// A name a removed person left drafts under is refused for an agent over the
+/// JSON API, as it is for an account, and taken once the drafts are ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_json_api_refuses_an_agent_a_name_holding_a_removed_persons_drafts() {
+    let fx = case(App::Ready, None).await;
+    crystalline_core::kept::write(
+        &fx.tmp.path().join(crystalline_core::kept::KEPT_DIR),
+        "kb",
+        Some("ghost"),
+        crystalline_core::kept::KeptKind::Engram,
+        "plan.md",
+        crystalline_core::time::now(),
+        "OLD GHOST TEXT",
+    )
+    .unwrap();
+    let (status, body) = as_root(
+        &fx,
+        reqwest::Method::POST,
+        "/api/v1/agents",
+        Some(json!({ "name": "ghost" })),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("removed account or agent"), "{body}");
+    assert!(fx.auth.agent("ghost").await.unwrap().is_none());
+    let (status, body) = as_root(
+        &fx,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ghost/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = as_root(
+        &fx,
+        reqwest::Method::POST,
+        "/api/v1/agents",
+        Some(json!({ "name": "ghost" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+}
+
+/// The agent `nightly` with a draft on the reviewing `kb` and a live link on
+/// it: the draft's path.
+async fn agent_with_a_draft(fx: &Case) -> String {
+    std::fs::remove_file(fx.tmp.path().join("kb/notes/new.md")).unwrap();
+    fx.eng
+        .set_review_mode(
+            "kb",
+            Some(crystalline_core::config::ReviewMode::Overlay),
+            crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let scope = nightly(fx).await;
+    let written = write_as(
+        fx,
+        "Agent Draft",
+        Some("claude-code/2.0 for agent:nightly"),
+        &scope,
+    )
+    .await;
+    let path = written["path"].as_str().unwrap().to_string();
+    fx.auth
+        .mint_overlay_grant("kb", &path, AGENT, None)
+        .await
+        .unwrap();
+    assert!(fx.tmp.path().join("overlays/kb").join(AGENT).exists());
+    assert!(!fx.eng.account_drafts(AGENT).await.unwrap().is_empty());
+    path
+}
+
+/// After an agent is removed nothing of its drafts is left: no draft, no
+/// folder, no live link, so the name is taken again.
+async fn nothing_of_the_agent_is_left(fx: &Case, path: &str) {
+    assert!(fx.eng.account_drafts(AGENT).await.unwrap().is_empty());
+    assert!(!fx.tmp.path().join("overlays/kb").join(AGENT).exists());
+    assert!(
+        fx.auth
+            .overlay_grants_of(AGENT, "kb", path)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Removing an agent over the JSON API ends its drafts, their folder and their
+/// links, unlike removing a person, and its name can be used again at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_an_agent_over_the_json_api_ends_its_drafts() {
+    let fx = case(App::Ready, None).await;
+    let path = agent_with_a_draft(&fx).await;
+    let (status, body) = as_root(
+        &fx,
+        reqwest::Method::DELETE,
+        &format!("/api/v1/agents/{AGENT}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    nothing_of_the_agent_is_left(&fx, &path).await;
+    let (status, body) = as_root(
+        &fx,
+        reqwest::Method::POST,
+        "/api/v1/agents",
+        Some(json!({ "name": AGENT })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+}
+
 fn leave_owner_token(root: &Path) {
     crystalline_remote::TokenStore::file_fallback_for(
         &crystalline_remote::TokenIdentity::Personal("owner".to_string()),

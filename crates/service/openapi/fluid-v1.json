@@ -329,7 +329,7 @@
         "tags": [
           "agents"
         ],
-        "summary": "`DELETE /agents/{name}` - remove an agent and every token it holds,\nanswering 204.",
+        "summary": "`DELETE /agents/{name}` - remove an agent, every token it holds and every\ndraft it left, answering 204.",
         "operationId": "delete_agent",
         "parameters": [
           {
@@ -344,7 +344,7 @@
         ],
         "responses": {
           "204": {
-            "description": "The agent and its tokens are gone."
+            "description": "The agent, its tokens, its drafts and the links on them are gone."
           },
           "401": {
             "description": "No identity.",

@@ -510,8 +510,9 @@ pub async fn create(
 
 /// The step before an account is made, while the name holds none: see
 /// [`crate::engine::Engine::clear_name_for_new_account`]. A name that holds an
-/// account, or that no account can have, is left alone, so the insert answers it
-/// and nothing saved under the name is touched.
+/// account or an agent, or that no account can have, is left alone, so the insert
+/// answers it and nothing saved under the name is touched. Creating an agent takes
+/// the same step (`agents_api::create`): an agent drafts under its name too.
 ///
 /// `admin_reads` says whether an admin is at the other end: the sentence with the
 /// domains and the command is theirs, and anybody else (a first sign-in through a
@@ -524,7 +525,7 @@ pub(crate) async fn clear_name_for_new_account(
     let Ok(account) = crate::auth_store::normalize_new_account_name(name) else {
         return Ok(());
     };
-    if state.auth.user(&account).await?.is_some() {
+    if state.auth.user(&account).await?.is_some() || state.auth.agent(&account).await?.is_some() {
         return Ok(());
     }
     // The step deletes what is saved under the name, and here that is the bot's

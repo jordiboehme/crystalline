@@ -30,6 +30,14 @@ It is shown only now.";
 /// configuration.
 pub async fn run(command: AgentsCommand, json: bool) -> Result<()> {
     let loaded = crate::cmd::load(None)?;
+    // `add` clears the name first as `users add` does, which may delete a
+    // GitHub token left under it; where that happens is decided up front.
+    let route = match &command {
+        AgentsCommand::Add { .. } => {
+            crystalline_service::route_secret_command(&loaded.effective).await?
+        }
+        _ => crystalline_service::SecretRoute::Local,
+    };
     let store = crystalline_service::open_accounts_for_cli(&loaded.effective).await?;
     match command {
         AgentsCommand::Add {
@@ -41,6 +49,7 @@ pub async fn run(command: AgentsCommand, json: bool) -> Result<()> {
         } => {
             let loops = parse_loops(&loops)?;
             let ttl = parse_expires(&expires)?;
+            crate::users::clear_name_for_new_account(&store, &name, &route).await?;
             let (agent, issued) = store
                 .add_agent(
                     &name,
@@ -108,6 +117,41 @@ pub async fn run(command: AgentsCommand, json: bool) -> Result<()> {
         }
         AgentsCommand::Remove { name } => {
             store.remove_agent(&name).await?;
+            // An agent's drafts go with it, unlike a person's: nobody comes
+            // back for them, and its name would stay refused for a new account
+            // or agent. The same end `users discard-drafts` gives a removed
+            // account's drafts, and the links it gave on them end too.
+            store.end_overlay_grants_of_owner(&name).await?;
+            let report = crystalline_service::client::discard_account_drafts(&folded(&name))
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "the agent was removed, but its drafts could not be ended: {e:#}. End them with: crystalline users discard-drafts {}",
+                        folded(&name)
+                    )
+                })?;
+            let rows = report["domains"].as_array().cloned().unwrap_or_default();
+            let kept: Vec<String> = rows
+                .iter()
+                .filter(|r| {
+                    r.get("error").is_some()
+                        || r["left"].as_array().is_some_and(|l| !l.is_empty())
+                        || r.get("not_hosted").is_some()
+                })
+                .filter_map(|r| r["domain"].as_str().map(str::to_string))
+                .collect();
+            if !kept.is_empty() || report.get("error").is_some() {
+                eprintln!(
+                    "Not every draft of '{}' could be ended ({}). End the rest with: crystalline users discard-drafts {}",
+                    folded(&name),
+                    if kept.is_empty() {
+                        "the kept drafts".to_string()
+                    } else {
+                        kept.join(", ")
+                    },
+                    folded(&name)
+                );
+            }
             if json {
                 crate::print_value(&serde_json::json!({ "removed": folded(&name) }), true);
             } else {

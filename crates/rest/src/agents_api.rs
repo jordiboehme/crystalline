@@ -238,6 +238,9 @@ pub async fn create(
 ) -> Result<(StatusCode, NoStore, Json<CreatedAgentResponse>), ApiError> {
     let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
+    // An agent drafts under its name on a domain that reviews changes, so a
+    // name still holding a removed person's drafts is refused, as for an account.
+    crate::users_api::clear_name_for_new_account(&state, &body.name, true).await?;
     let (agent, issued) = state
         .auth
         .add_agent(
@@ -267,8 +270,8 @@ pub async fn create(
     ))
 }
 
-/// `DELETE /agents/{name}` - remove an agent and every token it holds,
-/// answering 204.
+/// `DELETE /agents/{name}` - remove an agent, every token it holds and every
+/// draft it left, answering 204.
 #[utoipa::path(
     delete,
     path = "/api/v1/agents/{name}",
@@ -276,7 +279,7 @@ pub async fn create(
     operation_id = "delete_agent",
     params(("name" = String, Path, description = "The agent, in any casing.")),
     responses(
-        (status = 204, description = "The agent and its tokens are gone."),
+        (status = 204, description = "The agent, its tokens, its drafts and the links on them are gone."),
         (
             status = 401,
             description = "No identity.",
@@ -308,7 +311,26 @@ pub async fn remove(
     let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
     state.auth.remove_agent(&name).await.map_err(store_error)?;
-    tracing::info!(admin = caller.name(), agent = %normalize_account_name(&name).unwrap_or_default(), "agent removed");
+    let agent = normalize_account_name(&name).unwrap_or_default();
+    // An agent's drafts go with it, unlike a person's: nobody comes back for
+    // them, and its name would stay refused for a new account or agent. The
+    // same end `DELETE /users/{name}/drafts` gives a removed account's drafts,
+    // and the links it gave on them end too.
+    state.auth.end_overlay_grants_of_owner(&agent).await?;
+    let report = state
+        .engine
+        .discard_account_drafts(&agent, caller.name())
+        .await?;
+    if report.get("error").is_some()
+        || report["domains"].as_array().is_some_and(|rows| {
+            rows.iter().any(|r| {
+                r.get("error").is_some() || r["left"].as_array().is_some_and(|l| !l.is_empty())
+            })
+        })
+    {
+        tracing::warn!(agent = %agent, %report, "not every draft of the removed agent could be ended");
+    }
+    tracing::info!(admin = caller.name(), agent = %agent, "agent removed");
     Ok(StatusCode::NO_CONTENT)
 }
 
