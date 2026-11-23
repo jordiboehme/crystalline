@@ -10454,6 +10454,223 @@
         }
       }
     },
+    "/api/v1/invites": {
+      "get": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`GET /invites` - the invite links, newest first: every one for an admin,\nthe caller's own for anyone else. Never carries a token.",
+        "operationId": "list_invites",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Only links in this state.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/InviteState"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The links, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`state` is not pending, used, revoked or expired.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`POST /invites` - make an invite link, answering 201 with it, its token\nand the address to copy, this once.",
+        "operationId": "create_invite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInviteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The link, its token and its address, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedInviteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin and owners and managers may not make links here, or the caller is not the owner or a manager of the domain, asked for a role other than `none`, a level above their own, no domain or a local-account link; a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is shared or its access follows GitHub, the caller holds as many pending links as allowed, or the accounts and the pending links fill this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not a link: an admin role, a level without a domain, a level of `none`, a life outside 1 to 30 days, or a label that is too long or holds a control character.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/invites/{id}": {
+      "delete": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`DELETE /invites/{id}` - revoke an unused link, answering 204: an admin\nany, its maker their own. The link stays listed as revoked.",
+        "operationId": "revoke_invite",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The link's id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The link is revoked."
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No unused, unrevoked link of that id that this caller may revoke.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/me": {
       "patch": {
         "tags": [
@@ -14491,6 +14708,68 @@
           }
         }
       },
+      "CreateInviteBody": {
+        "type": "object",
+        "description": "The body of `POST /invites`.",
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A private domain the link gives membership of. Required for a domain\nowner's or manager's link.",
+            "example": "team"
+          },
+          "expires_in_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The link's life in days, 1 to 30. Defaults to 7.",
+            "example": 7,
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A label for the maker's own list.",
+            "example": "for Bo"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The level on that domain: `viewer`, `editor` or `manager`. Defaults to\n`viewer` when a domain is given; not above the maker's own."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "local_account": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the link may create an account with a password where single\nsign-on or a proxy would otherwise be the only way in. Admins only."
+          },
+          "role": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "The instance role an account this link creates gets: `none`, `viewer`\nor `editor`. Defaults to `viewer` for an admin's link; a domain\nowner's or manager's link is always `none`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "CreatedAgentResponse": {
         "type": "object",
         "description": "What `POST /agents` answers with: the agent as stored and its first token.",
@@ -14506,6 +14785,36 @@
           "token": {
             "$ref": "#/components/schemas/IssuedAgentTokenResponse",
             "description": "Its first token, this once."
+          }
+        }
+      },
+      "CreatedInviteResponse": {
+        "type": "object",
+        "description": "A freshly made invite link. `token` and `link` are shown here and nowhere else, ever: only the token's hash is stored.",
+        "required": [
+          "invite",
+          "token",
+          "link",
+          "relative"
+        ],
+        "properties": {
+          "invite": {
+            "$ref": "#/components/schemas/Invite",
+            "description": "The link as stored."
+          },
+          "link": {
+            "type": "string",
+            "description": "The address to hand over, the token in its fragment. Absolute when\n`service.public_url` is set, else a path under the base path that the\nbrowser completes with its own origin.",
+            "example": "https://kb.example.com/invite#cin_q2V0..."
+          },
+          "relative": {
+            "type": "boolean",
+            "description": "Whether `link` is a path the browser completes rather than a whole\naddress."
+          },
+          "token": {
+            "type": "string",
+            "description": "The token itself, this once.",
+            "example": "cin_q2V0..."
           }
         }
       },
@@ -15553,6 +15862,126 @@
               "$ref": "#/components/schemas/IdentityLink"
             },
             "description": "Every identity this account holds, by issuer."
+          }
+        }
+      },
+      "Invite": {
+        "type": "object",
+        "description": "One invite link, never carrying its token.",
+        "required": [
+          "id",
+          "role",
+          "local_account",
+          "created_by",
+          "created_at",
+          "expires_at",
+          "state"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "When it was made, RFC 3339."
+          },
+          "created_by": {
+            "type": "string",
+            "description": "The account that made it.",
+            "example": "ada"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The private domain the link gives membership of, if any.",
+            "example": "team"
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "When it stops working, RFC 3339."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, which a revoke names.",
+            "example": 3
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What its creator called it.",
+            "example": "for Bo"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The membership level on that domain; set exactly when `domain` is."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "local_account": {
+            "type": "boolean",
+            "description": "Whether it may create a local account with a password where an\nidentity provider would otherwise be the only way in."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was revoked, RFC 3339, or `None`."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The instance role an account this link creates gets."
+          },
+          "state": {
+            "$ref": "#/components/schemas/InviteState",
+            "description": "Pending, used, revoked or expired, as of the read."
+          },
+          "used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was used, RFC 3339, or `None`."
+          },
+          "used_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account that used it, or `None`."
+          }
+        }
+      },
+      "InviteState": {
+        "type": "string",
+        "description": "Where one invite link stands.",
+        "enum": [
+          "pending",
+          "used",
+          "revoked",
+          "expired"
+        ]
+      },
+      "InvitesResponse": {
+        "type": "object",
+        "description": "What `GET /invites` answers with.",
+        "required": [
+          "invites"
+        ],
+        "properties": {
+          "invites": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Invite"
+            },
+            "description": "The links, newest first, never with their tokens."
           }
         }
       },
@@ -18240,6 +18669,10 @@
     {
       "name": "agents",
       "description": "The agents of the loops and their tokens. Admin only."
+    },
+    {
+      "name": "invites",
+      "description": "Invite links: made by admins, and by private domains' owners and managers where the instance allows it."
     },
     {
       "name": "settings",

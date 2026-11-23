@@ -5638,6 +5638,7 @@ async fn no_rest_response_carries_an_operator_setting() {
         "/api/v1/users",
         "/api/v1/accounts/search?q=ad",
         "/api/v1/agents",
+        "/api/v1/invites",
         "/api/v1/settings/github",
         "/api/v1/github/access",
         "/api/v1/github/domain-name?repo=acme/kb",

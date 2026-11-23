@@ -314,6 +314,33 @@ async fn setting_a_member_on_a_governed_domain_is_409() {
     assert_eq!(members[0].principal, "wri");
 }
 
+/// An invite link never reaches a domain GitHub governs, even an admin's:
+/// GitHub decides who is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invite_link_never_reaches_a_governed_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = serve(tmp.path(), &[]).await;
+    old_grants(&fx).await;
+    let root = login(fx.addr, "root").await;
+    let (status, body) = call(
+        &fx,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/invites",
+        Some(json!({"role": "none", "domain": "kb", "level": "viewer"})),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("access to this domain follows GitHub; change it on GitHub"),
+        "{body}"
+    );
+    assert!(fx.auth.invites(None, None).await.unwrap().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_github_maintainer_switches_visibility() {
     let tmp = tempfile::tempdir().unwrap();

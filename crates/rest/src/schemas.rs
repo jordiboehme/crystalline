@@ -680,6 +680,56 @@ pub struct Agent {
     pub tokens: Vec<AgentToken>,
 }
 
+/// Where one invite link stands.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteState {
+    /// Not used, not revoked and not expired: it still opens the way in.
+    Pending,
+    /// Redeemed.
+    Used,
+    /// Revoked before it was used.
+    Revoked,
+    /// Its time ran out before it was used.
+    Expired,
+}
+
+/// One invite link, never carrying its token.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct Invite {
+    /// The row id, which a revoke names.
+    #[schema(example = 3)]
+    pub id: i64,
+    /// The instance role an account this link creates gets.
+    pub role: Role,
+    /// The private domain the link gives membership of, if any.
+    #[schema(example = "team")]
+    pub domain: Option<String>,
+    /// The membership level on that domain; set exactly when `domain` is.
+    pub level: Option<MemberLevel>,
+    /// What its creator called it.
+    #[schema(example = "for Bo")]
+    pub label: Option<String>,
+    /// Whether it may create a local account with a password where an
+    /// identity provider would otherwise be the only way in.
+    pub local_account: bool,
+    /// The account that made it.
+    #[schema(example = "ada")]
+    pub created_by: String,
+    /// When it was made, RFC 3339.
+    pub created_at: String,
+    /// When it stops working, RFC 3339.
+    pub expires_at: String,
+    /// When it was used, RFC 3339, or `None`.
+    pub used_at: Option<String>,
+    /// The account that used it, or `None`.
+    pub used_by: Option<String>,
+    /// When it was revoked, RFC 3339, or `None`.
+    pub revoked_at: Option<String>,
+    /// Pending, used, revoked or expired, as of the read.
+    pub state: InviteState,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::auth_store;
@@ -797,6 +847,33 @@ mod tests {
                 tokens: vec![token],
             }]),
             published::<super::Agent>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::InviteState::Pending,
+                auth_store::InviteState::Used,
+                auth_store::InviteState::Revoked,
+                auth_store::InviteState::Expired
+            ]),
+            published::<super::InviteState>()
+        );
+        assert_eq!(
+            keys([auth_store::Invite {
+                id: 0,
+                role: auth_store::Role::None,
+                domain: None,
+                level: None,
+                label: None,
+                local_account: false,
+                created_by: s(),
+                created_at: s(),
+                expires_at: s(),
+                used_at: None,
+                used_by: None,
+                revoked_at: None,
+                state: auth_store::InviteState::Pending,
+            }]),
+            published::<super::Invite>()
         );
         assert_eq!(
             keys([

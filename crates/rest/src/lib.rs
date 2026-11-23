@@ -50,6 +50,7 @@ pub mod github_webhook;
 mod graph;
 pub mod host_guard;
 mod identity_links;
+mod invites_api;
 mod kept;
 mod login_throttle;
 mod mcp_tokens;
@@ -142,6 +143,7 @@ use crate::scope::{DomainAccess, DomainRight};
         (name = "events", description = "Live changes to the knowledge, as one server-sent event stream per tab."),
         (name = "users", description = "Account management. Admin only."),
         (name = "agents", description = "The agents of the loops and their tokens. Admin only."),
+        (name = "invites", description = "Invite links: made by admins, and by private domains' owners and managers where the instance allows it."),
         (name = "settings", description = "Instance settings. Admin only."),
         (name = "oauth", description = "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."),
     ),
@@ -274,6 +276,9 @@ use crate::scope::{DomainAccess, DomainRight};
         agents_api::remove,
         agents_api::issue_token,
         agents_api::revoke_token,
+        invites_api::list,
+        invites_api::create,
+        invites_api::revoke,
         mcp_tokens::list,
         mcp_tokens::issue,
         mcp_tokens::rotate,
@@ -392,6 +397,11 @@ use crate::scope::{DomainAccess, DomainRight};
         agents_api::CreatedAgentResponse,
         agents_api::IssueAgentTokenBody,
         agents_api::IssuedAgentTokenResponse,
+        schemas::Invite,
+        schemas::InviteState,
+        invites_api::InvitesResponse,
+        invites_api::CreateInviteBody,
+        invites_api::CreatedInviteResponse,
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
         github_settings::GithubAccessResponse,
@@ -1227,6 +1237,11 @@ fn routes(state: RestState) -> Router {
             "/agents/{name}/tokens/{id}",
             delete(agents_api::revoke_token),
         )
+        // Rights decided inside the handlers: admins, and private domains'
+        // owners and managers where the instance allows it; see
+        // [`invites_api`].
+        .route("/invites", get(invites_api::list).post(invites_api::create))
+        .route("/invites/{id}", delete(invites_api::revoke))
         .route("/users/{name}/password", post(users_api::reset_password))
         // Admin only, inside the handler: frees a GitHub account linked to
         // the wrong Crystalline account. See [`github_link`].

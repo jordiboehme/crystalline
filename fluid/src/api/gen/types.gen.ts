@@ -636,6 +636,32 @@ export type CreateEngramBody = {
 };
 
 /**
+ * The body of `POST /invites`.
+ */
+export type CreateInviteBody = {
+    /**
+     * A private domain the link gives membership of. Required for a domain
+     * owner's or manager's link.
+     */
+    domain?: string | null;
+    /**
+     * The link's life in days, 1 to 30. Defaults to 7.
+     */
+    expires_in_days?: number | null;
+    /**
+     * A label for the maker's own list.
+     */
+    label?: string | null;
+    level?: MemberLevel | null;
+    /**
+     * Whether the link may create an account with a password where single
+     * sign-on or a proxy would otherwise be the only way in. Admins only.
+     */
+    local_account?: boolean | null;
+    role?: Role | null;
+};
+
+/**
  * What `POST /agents` answers with: the agent as stored and its first token.
  */
 export type CreatedAgentResponse = {
@@ -647,6 +673,31 @@ export type CreatedAgentResponse = {
      * Its first token, this once.
      */
     token: IssuedAgentTokenResponse;
+};
+
+/**
+ * A freshly made invite link. `token` and `link` are shown here and nowhere else, ever: only the token's hash is stored.
+ */
+export type CreatedInviteResponse = {
+    /**
+     * The link as stored.
+     */
+    invite: Invite;
+    /**
+     * The address to hand over, the token in its fragment. Absolute when
+     * `service.public_url` is set, else a path under the base path that the
+     * browser completes with its own origin.
+     */
+    link: string;
+    /**
+     * Whether `link` is a path the browser completes rather than a whole
+     * address.
+     */
+    relative: boolean;
+    /**
+     * The token itself, this once.
+     */
+    token: string;
 };
 
 /**
@@ -1308,6 +1359,77 @@ export type IdentityLinksResponse = {
      * Every identity this account holds, by issuer.
      */
     links: Array<IdentityLink>;
+};
+
+/**
+ * One invite link, never carrying its token.
+ */
+export type Invite = {
+    /**
+     * When it was made, RFC 3339.
+     */
+    created_at: string;
+    /**
+     * The account that made it.
+     */
+    created_by: string;
+    /**
+     * The private domain the link gives membership of, if any.
+     */
+    domain?: string | null;
+    /**
+     * When it stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The row id, which a revoke names.
+     */
+    id: number;
+    /**
+     * What its creator called it.
+     */
+    label?: string | null;
+    level?: MemberLevel | null;
+    /**
+     * Whether it may create a local account with a password where an
+     * identity provider would otherwise be the only way in.
+     */
+    local_account: boolean;
+    /**
+     * When it was revoked, RFC 3339, or `None`.
+     */
+    revoked_at?: string | null;
+    /**
+     * The instance role an account this link creates gets.
+     */
+    role: Role;
+    /**
+     * Pending, used, revoked or expired, as of the read.
+     */
+    state: InviteState;
+    /**
+     * When it was used, RFC 3339, or `None`.
+     */
+    used_at?: string | null;
+    /**
+     * The account that used it, or `None`.
+     */
+    used_by?: string | null;
+};
+
+/**
+ * Where one invite link stands.
+ */
+export type InviteState = 'pending' | 'used' | 'revoked' | 'expired';
+
+/**
+ * What `GET /invites` answers with.
+ */
+export type InvitesResponse = {
+    /**
+     * The links, newest first, never with their tokens.
+     */
+    invites: Array<Invite>;
 };
 
 /**
@@ -8299,6 +8421,131 @@ export type GetGraphResponses = {
 };
 
 export type GetGraphResponse = GetGraphResponses[keyof GetGraphResponses];
+
+export type ListInvitesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Only links in this state.
+         */
+        state?: InviteState;
+    };
+    url: '/api/v1/invites';
+};
+
+export type ListInvitesErrors = {
+    /**
+     * `state` is not pending, used, revoked or expired.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * The trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type ListInvitesError = ListInvitesErrors[keyof ListInvitesErrors];
+
+export type ListInvitesResponses = {
+    /**
+     * The links, newest first.
+     */
+    200: InvitesResponse;
+};
+
+export type ListInvitesResponse = ListInvitesResponses[keyof ListInvitesResponses];
+
+export type CreateInviteData = {
+    body: CreateInviteBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/invites';
+};
+
+export type CreateInviteErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin and owners and managers may not make links here, or the caller is not the owner or a manager of the domain, asked for a role other than `none`, a level above their own, no domain or a local-account link; a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is shared or its access follows GitHub, the caller holds as many pending links as allowed, or the accounts and the pending links fill this instance.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The body is JSON but not a link: an admin role, a level without a domain, a level of `none`, a life outside 1 to 30 days, or a label that is too long or holds a control character.
+     */
+    422: ProblemDetail;
+};
+
+export type CreateInviteError = CreateInviteErrors[keyof CreateInviteErrors];
+
+export type CreateInviteResponses = {
+    /**
+     * The link, its token and its address, this once.
+     */
+    201: CreatedInviteResponse;
+};
+
+export type CreateInviteResponse = CreateInviteResponses[keyof CreateInviteResponses];
+
+export type RevokeInviteData = {
+    body?: never;
+    path: {
+        /**
+         * The link's id.
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/api/v1/invites/{id}';
+};
+
+export type RevokeInviteErrors = {
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No unused, unrevoked link of that id that this caller may revoke.
+     */
+    404: ProblemDetail;
+};
+
+export type RevokeInviteError = RevokeInviteErrors[keyof RevokeInviteErrors];
+
+export type RevokeInviteResponses = {
+    /**
+     * The link is revoked.
+     */
+    204: void;
+};
+
+export type RevokeInviteResponse = RevokeInviteResponses[keyof RevokeInviteResponses];
 
 export type UpdateMyProfileData = {
     body: MyProfileBody;

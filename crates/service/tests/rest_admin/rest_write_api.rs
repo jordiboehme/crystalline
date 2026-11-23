@@ -3999,6 +3999,24 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // Invite links: with `auth.invites.managers` off (this fixture) only
+        // an admin makes one. Any account revokes its own, so the revoke row
+        // is viewer level: a link that is not the caller's answers 404, past
+        // authorization. A read-only instance refuses both.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/invites",
+            body: Some(serde_json::json!({"role": "viewer"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/invites/1",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/settings/github/connect",
@@ -4611,6 +4629,9 @@ fn canonicalize(path: &str) -> String {
     }
     // The agents routes: one agent name and, for a revoke, a numeric token
     // id the per-segment pass would read as a proposal number.
+    if path.starts_with("/api/v1/invites/") {
+        return "/api/v1/invites/{id}".to_string();
+    }
     if let Some(rest) = path.strip_prefix("/api/v1/agents/") {
         return match rest.split_once('/') {
             None => "/api/v1/agents/{name}".to_string(),
