@@ -507,6 +507,11 @@ pub struct ReflectionClockResponse {
     /// The clock; null for a page on its own with no freshness, a retired
     /// page and a missing one.
     pub clock: Option<ReflectionPageClock>,
+    /// The checksum of the page file as stored, the same as a read's
+    /// `checksum`; null for a missing page. A reconcile writes no file, so
+    /// a client that heard a change compares this with the text it holds
+    /// and reads the page again only when they differ.
+    pub checksum: Option<String>,
 }
 
 /// The query of `GET /domains/{domain}/reflection/clock`.
@@ -562,7 +567,12 @@ pub async fn clock(
         Value::Null => None,
         clock => Some(typed_value(clock, "page clock")?),
     };
-    Ok(Json(ReflectionClockResponse { clock }))
+    let checksum = state
+        .engine
+        .reflection_page_checksum(&domain, &q.path, &caller(&identity))
+        .await
+        .map_err(reflection_error)?;
+    Ok(Json(ReflectionClockResponse { clock, checksum }))
 }
 
 /// A page a reflect run missed.

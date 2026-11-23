@@ -2963,6 +2963,24 @@ impl TreeNode {
 }
 
 impl Engine {
+    /// The checksum of the page file at `inner` as stored, the same sum
+    /// [`Engine::read_reflection`] answers as `checksum`; `None` when there
+    /// is no such file. Beside a page's clock, so a tab that hears a plain
+    /// change (a reconcile writes no file) reads the text again only when
+    /// it moved.
+    pub async fn reflection_page_checksum(
+        &self,
+        domain: &str,
+        inner: &str,
+        caller: &ReflectionCaller,
+    ) -> Result<Option<String>> {
+        let access = self
+            .require_reflection(domain, caller, ReflectionRight::Read)
+            .await?;
+        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        Ok(read_opt(&access.abs(inner))?.map(|text| sha256_hex(text.as_bytes())))
+    }
+
     /// `read_reflection` with a path.
     pub async fn read_reflection(
         &self,

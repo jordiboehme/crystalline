@@ -18707,6 +18707,13 @@
         "type": "object",
         "description": "What `GET /domains/{domain}/reflection/clock` answers.",
         "properties": {
+          "checksum": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The checksum of the page file as stored, the same as a read's\n`checksum`; null for a missing page. A reconcile writes no file, so\na client that heard a change compares this with the text it holds\nand reads the page again only when they differ."
+          },
           "clock": {
             "oneOf": [
               {

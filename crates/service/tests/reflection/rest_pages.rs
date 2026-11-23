@@ -75,7 +75,7 @@ async fn a_curator_sets_retires_and_restores_and_a_reader_sees_the_clock() {
     let (_, none) = ann
         .get("/api/v1/domains/eng/reflection/clock?path=gone.md")
         .await;
-    assert_eq!(none, json!({ "clock": null }));
+    assert_eq!(none, json!({ "clock": null, "checksum": null }));
 
     // Retire and restore: a curator's, and the tree marks the page.
     let (status, err) = ann
@@ -273,4 +273,29 @@ async fn the_automation_route_names_when_the_next_page_falls_due() {
             "{answer}"
         );
     }
+}
+
+/// The clock names the checksum of the page file as stored, the same sum a
+/// read answers, so an open tab that hears a plain change (a reconcile)
+/// refetches only the clock and reads the text again only when it moved.
+/// A page with no clock still has its checksum; a missing page has none.
+#[tokio::test]
+async fn the_clock_names_the_checksum_a_read_answers() {
+    let s = serve().await;
+    let ann = Session::login(s.addr, "ann").await;
+    let (status, doc) = ann
+        .get(&format!("/api/v1/domains/eng/reflections/{PAGE}"))
+        .await;
+    assert_eq!(status, 200, "{doc}");
+    let (status, clock) = ann
+        .get(&format!("/api/v1/domains/eng/reflection/clock?path={PAGE}"))
+        .await;
+    assert_eq!(status, 200, "{clock}");
+    assert_eq!(clock["clock"], Value::Null, "no freshness yet: {clock}");
+    assert_eq!(clock["checksum"], doc["checksum"], "{clock}");
+    assert!(clock["checksum"].as_str().is_some_and(|c| c.len() == 64));
+    let (_, none) = ann
+        .get("/api/v1/domains/eng/reflection/clock?path=gone.md")
+        .await;
+    assert_eq!(none, json!({ "clock": null, "checksum": null }));
 }

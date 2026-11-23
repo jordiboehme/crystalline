@@ -2783,6 +2783,13 @@ export type ReflectionChanged = {
  * What `GET /domains/{domain}/reflection/clock` answers.
  */
 export type ReflectionClockResponse = {
+    /**
+     * The checksum of the page file as stored, the same as a read's
+     * `checksum`; null for a missing page. A reconcile writes no file, so
+     * a client that heard a change compares this with the text it holds
+     * and reads the page again only when they differ.
+     */
+    checksum?: string | null;
     clock?: ReflectionPageClock | null;
 };
 
