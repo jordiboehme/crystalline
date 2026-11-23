@@ -73,6 +73,7 @@ use turso::{Builder, Connection, Database, Value};
 
 mod agents;
 mod db;
+mod invites;
 #[cfg(test)]
 mod lint;
 #[cfg(feature = "postgres")]
@@ -88,6 +89,11 @@ pub use agents::{
     AgentSession, AgentToken, AgentTokenState, IssuedAgentToken, check_agent_token_ttl,
 };
 use db::{AuthDb, AuthRow};
+pub use invites::{
+    INVITE_DEFAULT_TTL_SECS, INVITE_LABEL_MAX_CHARS, INVITE_MAX_TTL_SECS, INVITE_MIN_TTL_SECS,
+    INVITE_PENDING_MAX_ADMIN, INVITE_PENDING_MAX_MANAGER, INVITE_TOKEN_PREFIX, Invite,
+    InviteLimits, InviteState, IssuedInvite, NewInvite,
+};
 #[cfg(feature = "postgres")]
 pub use pg::auth_write_lock;
 #[cfg(feature = "postgres")]
@@ -160,7 +166,7 @@ const PRUNE_AGENT_TOKENS: &str = "DELETE FROM agent_tokens
 /// On Postgres, the orphans of one name, swept before an account or an
 /// agent of that name is created: the hourly prune leaves a window, and an orphan is
 /// exactly what the next account to take the name would inherit.
-const SWEEP_ORPHANS_OF: [&str; 5] = [
+const SWEEP_ORPHANS_OF: [&str; 6] = [
     "DELETE FROM sessions WHERE user_name = ?1
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
     "DELETE FROM mcp_tokens WHERE \"user\" = ?1
@@ -171,6 +177,8 @@ const SWEEP_ORPHANS_OF: [&str; 5] = [
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
     "DELETE FROM agent_tokens WHERE agent = ?1
      AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.name = ?1)",
+    "DELETE FROM invites WHERE created_by = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
 ];
 
 /// How old a `last_seen_at` or `last_used` stamp must be before Postgres
@@ -1239,6 +1247,14 @@ pub enum RefusalKind {
     /// An agent token's life is outside what [`check_agent_token_ttl`]
     /// allows.
     InvalidTokenExpiry,
+    /// The creator already holds as many pending invite links as allowed.
+    /// See [`AuthStore::create_invite`].
+    InviteLimit,
+    /// An invite link whose shape cannot work: an admin role, a domain
+    /// without a level or the other way round, a level of `none`, a life
+    /// outside what is allowed or a label that is too long or holds a
+    /// control character. See [`AuthStore::create_invite`].
+    InvalidInvite,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
@@ -1592,6 +1608,22 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
     revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS agent_tokens_agent ON agent_tokens (agent);
+CREATE TABLE IF NOT EXISTS invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    domain TEXT,
+    level TEXT,
+    label TEXT,
+    local_account INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER,
+    used_by TEXT,
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS invites_created_by ON invites (created_by);
 ";
 
 /// The error [`AuthStore::register_oauth_client_within`] fails with when it
@@ -2601,6 +2633,7 @@ impl AuthStore {
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.delete_overlay_grants_held_by(&name).await?;
+            self.delete_invites_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .db
@@ -2651,6 +2684,7 @@ impl AuthStore {
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.delete_overlay_grants_held_by(&name).await?;
+            self.delete_invites_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .db
@@ -7384,13 +7418,19 @@ fn cell_text(row: &AuthRow, idx: usize) -> Option<String> {
     }
 }
 
-/// `N` bytes from the OS CSPRNG, lowercase hex. The single entropy source
-/// behind every random value this file mints, so an audit of "where does the
-/// randomness come from" reads one function rather than one per family.
+/// `N` bytes from [`random_bytes`], lowercase hex, so an audit of "where does
+/// the randomness come from" reads one function rather than one per family.
 fn random_hex_bytes<const N: usize>() -> String {
+    crystalline_index::hex_lower(&random_bytes::<N>())
+}
+
+/// `N` bytes from the OS CSPRNG: the single entropy source behind every
+/// random value this store mints, hex ([`random_hex_bytes`]) or otherwise
+/// (an invite token's base64).
+fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
-    crystalline_index::hex_lower(&bytes)
+    bytes
 }
 
 /// 32 bytes, 64 hex characters: the random half of every credential here - a

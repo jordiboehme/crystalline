@@ -2048,12 +2048,12 @@ fn users_refused_when_auth_ledger_behind_and_owned() {
     let env = Env::new("acbehind").on_postgres(&pg);
     let mut serve = Serve::start(&env, None);
     serve.wait_ready();
-    assert_eq!(auth_ledger(&pg), "2");
+    assert_eq!(auth_ledger(&pg), "3");
     assert!(pg.sql(&format!("DELETE FROM {}.auth_schema_migration", pg.schema)));
     let (ok, out, err) = env.run_full(&["users", "list"]);
     assert!(!ok, "{out}{err}");
     assert!(
-        err.contains("the accounts tables are at version 0, this binary needs 2, and only the instance that owns the database migrates them: the database")
+        err.contains("the accounts tables are at version 0, this binary needs 3, and only the instance that owns the database migrates them: the database")
             && err.contains("is owned by the active instance")
             && err.matches("Run the command there").count() == 1,
         "{err}"
@@ -2076,7 +2076,7 @@ fn users_migrates_when_auth_ledger_behind_and_free() {
     };
     let env = Env::new("acfree").on_postgres(&pg);
     users_add(&env, "ada", "ada-password");
-    assert_eq!(auth_ledger(&pg), "2");
+    assert_eq!(auth_ledger(&pg), "3");
     let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
     assert_eq!(
         pg.text(&format!(
@@ -2094,7 +2094,7 @@ fn users_migrates_when_auth_ledger_behind_and_free() {
     env.setup_domain("eng");
     assert!(pg.sql(&format!("DELETE FROM {}.auth_schema_migration", pg.schema)));
     users_add(&env, "bob", "bob-password");
-    assert_eq!(auth_ledger(&pg), "2");
+    assert_eq!(auth_ledger(&pg), "3");
     assert_eq!(owner_command(&pg), "crystalline users add|true");
 }
 

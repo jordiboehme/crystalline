@@ -7219,7 +7219,7 @@ mod postgres {
         let loc = AccountsLocation::Postgres(scratch.config());
         let opts = PgSessionOptions::default();
         match AuthStore::open_at_no_migrate(&loc, &opts).await {
-            Err(AuthOpenError::Behind { found: 0, need: 2 }) => {}
+            Err(AuthOpenError::Behind { found: 0, need: 3 }) => {}
             Err(other) => panic!("{other}"),
             Ok(_) => panic!("an unmigrated schema opened"),
         }
@@ -7236,7 +7236,7 @@ mod postgres {
         match AuthStore::open_at_no_migrate(&loc, &opts).await {
             Err(AuthOpenError::TooNew {
                 found: 99,
-                known: 2,
+                known: 3,
             }) => {}
             Err(other) => panic!("{other}"),
             Ok(_) => panic!("a newer schema opened"),
@@ -7741,4 +7741,266 @@ fn agent_loops_parse() {
     assert_eq!(AgentLoops::parse("reflect,nap"), None);
     assert!(AgentLoops::Both.reflect() && AgentLoops::Both.evolve());
     assert!(!AgentLoops::Reflect.evolve() && !AgentLoops::Evolve.reflect());
+}
+
+/// What an admin's link to a domain is made of, for the invite tests.
+fn domain_invite<'a>(created_by: &'a str) -> NewInvite<'a> {
+    NewInvite {
+        role: Role::Viewer,
+        domain: Some("team"),
+        level: Some(MemberLevel::Editor),
+        label: Some("  for Bo  "),
+        local_account: false,
+        created_by,
+        ttl_secs: INVITE_DEFAULT_TTL_SECS,
+    }
+}
+
+const ROOMY: InviteLimits = InviteLimits {
+    per_creator: INVITE_PENDING_MAX_ADMIN,
+    max_users: 100,
+};
+
+/// A link is answered with its token once, listed without it, filtered by
+/// state and creator, revoked by its creator or an admin but by nobody else,
+/// and a revoked link stays listed.
+#[tokio::test]
+async fn invite_lifecycle() {
+    let (store, _guard) = test_store().await;
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    assert!(issued.token.starts_with(INVITE_TOKEN_PREFIX));
+    assert_eq!(issued.token.len(), INVITE_TOKEN_PREFIX.len() + 43);
+    assert!(
+        issued.token[4..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "URL-safe base64: {}",
+        issued.token
+    );
+    assert!(!format!("{issued:?}").contains(&issued.token[4..]));
+    let invite = &issued.invite;
+    assert_eq!(invite.role, Role::Viewer);
+    assert_eq!(invite.domain.as_deref(), Some("team"));
+    assert_eq!(invite.level, Some(MemberLevel::Editor));
+    assert_eq!(invite.label.as_deref(), Some("for Bo"));
+    assert_eq!(invite.created_by, "ada");
+    assert_eq!(invite.state, InviteState::Pending);
+    let other = store
+        .create_invite(
+            &NewInvite {
+                role: Role::None,
+                domain: None,
+                level: None,
+                label: None,
+                local_account: true,
+                created_by: "mia",
+                ttl_secs: INVITE_MIN_TTL_SECS,
+            },
+            ROOMY,
+        )
+        .await
+        .unwrap();
+    assert_ne!(other.token, issued.token);
+
+    let all = store.invites(None, None).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, other.invite.id, "newest first");
+    assert!(all[0].local_account && all[0].label.is_none());
+    let stored = &all[1];
+    assert_eq!(stored.id, invite.id);
+    assert_eq!(stored.expires_at, invite.expires_at);
+    assert_eq!(stored.created_at, invite.created_at);
+    let of_ada = store.invites(Some("ada"), None).await.unwrap();
+    assert_eq!(of_ada.len(), 1);
+    assert_eq!(of_ada[0].id, invite.id);
+
+    assert!(
+        !store.revoke_invite(invite.id, Some("mia")).await.unwrap(),
+        "not hers"
+    );
+    assert!(store.revoke_invite(invite.id, Some("ada")).await.unwrap());
+    assert!(
+        !store.revoke_invite(invite.id, None).await.unwrap(),
+        "already revoked"
+    );
+    assert!(store.revoke_invite(other.invite.id, None).await.unwrap());
+    assert!(!store.revoke_invite(9_999, None).await.unwrap());
+    let revoked = store
+        .invites(None, Some(InviteState::Revoked))
+        .await
+        .unwrap();
+    assert_eq!(revoked.len(), 2);
+    assert!(revoked.iter().all(|i| i.revoked_at.is_some()));
+    assert!(
+        store
+            .invites(None, Some(InviteState::Pending))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A link whose shape cannot work is refused before anything is written.
+#[tokio::test]
+async fn an_invite_that_cannot_work_is_refused() {
+    let (store, _guard) = test_store().await;
+    let long = "x".repeat(INVITE_LABEL_MAX_CHARS + 1);
+    let bad: Vec<NewInvite> = vec![
+        NewInvite {
+            role: Role::Admin,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            level: None,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            domain: None,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            level: Some(MemberLevel::None),
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            ttl_secs: INVITE_MIN_TTL_SECS - 1,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            ttl_secs: INVITE_MAX_TTL_SECS + 1,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            label: Some(&long),
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            label: Some("two\nlines"),
+            ..domain_invite("ada")
+        },
+    ];
+    for new in bad {
+        let err = store.create_invite(&new, ROOMY).await.unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::InvalidInvite),
+            "{new:?}: {err:#}"
+        );
+    }
+    assert!(store.invites(None, None).await.unwrap().is_empty());
+}
+
+/// A creator holds at most `per_creator` pending links, and the accounts
+/// plus every pending link stay below `max_users`. Revoked and expired links
+/// count for neither.
+#[tokio::test]
+async fn pending_invites_are_capped() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("ada", "Ada", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let two = InviteLimits {
+        per_creator: 2,
+        max_users: 100,
+    };
+    let first = store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .unwrap();
+    store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .unwrap();
+    let err = store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::InviteLimit));
+    assert!(!format!("{err}").contains("auth."), "{err}");
+    store
+        .create_invite(&domain_invite("mia"), two)
+        .await
+        .expect("another creator has her own slots");
+    assert!(store.revoke_invite(first.invite.id, None).await.unwrap());
+    store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .expect("a revoked link frees its slot");
+
+    // One account and three pending links: a cap of 4 is full.
+    let full = InviteLimits {
+        per_creator: 50,
+        max_users: 4,
+    };
+    let err = store
+        .create_invite(&domain_invite("bo"), full)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::CapReached));
+    store
+        .create_invite(
+            &domain_invite("bo"),
+            InviteLimits {
+                max_users: 5,
+                ..full
+            },
+        )
+        .await
+        .expect("one place left");
+
+    // A link that has expired holds no place.
+    let long_ago = crystalline_core::time::Stamp::from_unix(1_700_000_000, 0).unwrap();
+    let (store, _guard) = test_store().await;
+    let old = store
+        .create_invite_at(&domain_invite("ada"), ROOMY, long_ago)
+        .await
+        .unwrap();
+    assert_eq!(old.invite.state, InviteState::Pending);
+    let listed = store.invites(None, None).await.unwrap();
+    assert_eq!(listed[0].state, InviteState::Expired);
+    store
+        .create_invite(
+            &domain_invite("ada"),
+            InviteLimits {
+                per_creator: 1,
+                max_users: 1,
+            },
+        )
+        .await
+        .expect("the expired link counts for neither cap");
+}
+
+/// A removed account's links go with it, so a name used again inherits none.
+#[tokio::test]
+async fn a_removed_accounts_invites_go_with_it() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("ada", "Ada", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .add_user("mia", "Mia", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .create_invite(&domain_invite("mia"), ROOMY)
+        .await
+        .unwrap();
+    store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    store.remove_user("mia").await.unwrap();
+    let left = store.invites(None, None).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].created_by, "ada");
+    store
+        .add_user("mia", "Mia", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    assert!(store.invites(Some("mia"), None).await.unwrap().is_empty());
 }

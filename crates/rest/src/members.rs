@@ -290,7 +290,9 @@ fn store_error(e: anyhow::Error) -> ApiError {
             | RefusalKind::NameTaken
             | RefusalKind::NoSuchAgent
             | RefusalKind::AgentTokenLimit
-            | RefusalKind::InvalidTokenExpiry,
+            | RefusalKind::InvalidTokenExpiry
+            | RefusalKind::InviteLimit
+            | RefusalKind::InvalidInvite,
         )
         | None => ApiError::internal(format!("{e:#}")),
     }
