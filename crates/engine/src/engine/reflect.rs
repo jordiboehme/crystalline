@@ -245,35 +245,43 @@ enum Detail {
 }
 
 impl Engine {
-    /// The modification times (seconds since the epoch) of every engram in
-    /// the domains `scope` may read here, sorted: what a `stale` item's hint
-    /// counts from. The read limit of an unattended run hides the domains
-    /// it may not read, and a domain a connected server replaces is left
-    /// out. A domain whose files are not stamped (a virtual one) counts
-    /// nothing.
-    async fn engram_change_times(&self, scope: &Scope) -> Result<Vec<i64>> {
-        let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
-        hidden.extend(self.shadowed_domains());
+    /// The times (seconds since the epoch) every engram in the domains
+    /// `scope` may read here last changed, as the index records them for
+    /// each base row (a file's modification time, a virtual write's time),
+    /// sorted: what a `stale` item's `changed_engrams` counts from. The read
+    /// limit of an unattended run hides the domains it may not read. `None`
+    /// when a domain it may read cannot be counted here: one a connected
+    /// server replaces, or a file domain with no index row yet. A count left out is
+    /// unknown, never 0, which would say that nothing changed.
+    async fn engram_change_times(&self, scope: &Scope) -> Result<Option<Vec<i64>>> {
+        let hidden = self.hidden_domains(scope).await?.unwrap_or_default();
+        let shadowed = self.shadowed_domains();
         let reader = self.reader();
         let mut times = Vec::new();
         for name in self.known_domain_names() {
             if hidden.contains(&name) {
                 continue;
             }
+            if shadowed.contains(&name) {
+                return Ok(None);
+            }
             let Some(id) = reader.domain_id(&name).await? else {
-                continue;
+                // A virtual domain gets its row with its first engram, so
+                // without one it holds none; a file domain not yet walked
+                // is unknown.
+                if matches!(self.read_source(&name), ContentSource::Virtual) {
+                    continue;
+                }
+                return Ok(None);
             };
             for (path, stamp) in reader.file_stamps(id).await? {
-                if path.ends_with(".md")
-                    && !r::is_under_reflections(&path)
-                    && !path.eq_ignore_ascii_case("MANIFEST.md")
-                {
+                if !r::is_under_reflections(&path) && !path.eq_ignore_ascii_case("MANIFEST.md") {
                     times.push(stamp.mtime);
                 }
             }
         }
         times.sort_unstable();
-        Ok(times)
+        Ok(Some(times))
     }
 
     /// The files under `reflections/assets/` (by path inside
@@ -598,14 +606,8 @@ impl Engine {
             } else {
                 r::feedback_changes(&row.content, &baseline)
             };
-            if let Some(ids) = Some(
-                changes
-                    .iter()
-                    .filter_map(|c| c.id.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .filter(|ids| !ids.is_empty())
-            {
+            let ids: Vec<String> = changes.iter().filter_map(|c| c.id.clone()).collect();
+            if !ids.is_empty() {
                 unsettled.insert(row.path.clone(), ids);
             }
             for change in changes {
@@ -1026,8 +1028,13 @@ impl Engine {
                 };
                 for (item, since) in &mut found {
                     if let Some(changed) = &changed {
-                        let unchanged = changed.partition_point(|mtime| mtime <= since);
-                        item.extra["hint"] = json!(changed.len() - unchanged);
+                        item.extra["changed_engrams"] = match changed {
+                            Some(times) => {
+                                let unchanged = times.partition_point(|mtime| mtime <= since);
+                                json!(times.len() - unchanged)
+                            }
+                            None => Value::Null,
+                        };
                     }
                     // The page's own source changes are part of its
                     // reconcile: they fold into its stale item.
@@ -1182,7 +1189,7 @@ impl Engine {
                     obj.remove("sections");
                     // How many engrams changed, and the sources a stale
                     // item took in from its page.
-                    obj.remove("hint");
+                    obj.remove("changed_engrams");
                     obj.remove("source_changed");
                 }
                 row

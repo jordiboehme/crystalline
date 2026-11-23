@@ -226,6 +226,21 @@ impl Engine {
                 "'{inner}' is retired, and a retired page is never reconciled; restore it first"
             )));
         }
+        // Without a version a late call cannot be told from a current one:
+        // while the page has a stale item open, its version is required.
+        if version.is_empty() {
+            let record = r::read_provenance(&text).page;
+            let (settings, _) = r::read_page_settings(&text, inner, &record);
+            if let Some(freshness) = settings.freshness
+                && let Some(state) = self.reflection_reconcile(domain, inner).await?
+                && let Some(at) = time::parse_rfc3339(&state.last_reconciled)
+                && time::now().unix_seconds() - at.stamp().unix_seconds() >= freshness.seconds
+            {
+                return Err(EngineError::Invalid(format!(
+                    "'{inner}' has a stale item in the reflect queue: send its version with reconciled, so a late call for an older period can be told apart"
+                )));
+            }
+        }
         // A late call for an older period: the `stale` item it answers was
         // handed out before the reconcile recorded now, so another run (or
         // this one, again) already brought the page in line. A version that

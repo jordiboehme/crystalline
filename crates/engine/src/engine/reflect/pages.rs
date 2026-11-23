@@ -292,7 +292,7 @@ pub(crate) fn stale_base(version: &str) -> Option<i64> {
 }
 
 /// One page's `stale` item, when its freshness ran out at `now` (seconds
-/// since the epoch): the hint is filled in later, from the engrams changed
+/// since the epoch): `changed_engrams` is filled in later, from the engrams changed
 /// since `last_reconciled`, which the item keeps in `since`.
 pub(super) fn stale_item(
     view: &PageView,

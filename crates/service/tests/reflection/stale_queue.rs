@@ -289,7 +289,10 @@ async fn a_page_whose_freshness_ran_out_is_stale() {
         .unwrap()
         .unwrap();
     assert_eq!(item["last_reconciled"], state.last_reconciled.as_str());
-    assert_eq!(item["hint"], 4, "the four engrams changed since: {item}");
+    assert_eq!(
+        item["changed_engrams"], 4,
+        "the four engrams changed since: {item}"
+    );
     assert_eq!(
         item["pacts"],
         serde_json::json!(["PACT.md", "guides/week.pact.md"])
@@ -412,7 +415,7 @@ async fn the_hint_counts_only_what_the_run_may_read() {
     .await;
     reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
 
-    let hint = |q: &Value| items(q, "stale")[0]["hint"].clone();
+    let hint = |q: &Value| items(q, "stale")[0]["changed_engrams"].clone();
     assert_eq!(hint(&queue(&fx, &with_stale()).await), 3, "eng 1, harbor 2");
     let run = Limit {
         hidden: HashSet::from(["harbor".to_string()]),
@@ -564,10 +567,18 @@ async fn a_late_reconcile_for_an_older_period_is_refused() {
 
     // A page reconciled for the first time: its seeded item's version is
     // never older than a recorded reconcile.
+    let seeded = format!("0:1:{}", "0".repeat(64));
     fx.engine
-        .write_reflection(&reconciled("guides/new.md", "updated", "0:1:abc"), &agent())
+        .write_reflection(&reconciled("guides/new.md", "updated", &seeded), &agent())
         .await
         .unwrap();
+    // Once a reconcile is recorded, the seeded item is the older one.
+    let late = fx
+        .engine
+        .write_reflection(&reconciled("guides/new.md", "updated", &seeded), &agent())
+        .await
+        .unwrap_err();
+    assert!(matches!(late, EngineError::Conflict(_)), "{late}");
     // A version that is no stale version (another item's) is taken as sent.
     fx.engine
         .write_reflection(&reconciled("guides/new.md", "unchanged", "v1"), &agent())
@@ -775,4 +786,208 @@ fn an_unset_stale_is_left_out_of_a_forwarded_call() {
     })
     .unwrap();
     assert_eq!(asked["stale"], true);
+}
+
+/// A caller who may not see engrams gets no count of changed engrams on a
+/// stale item and no sources it took in, and still every instruction: the
+/// structure hint and what to do with a page whose owner is gone.
+#[tokio::test]
+async fn a_caller_who_cannot_see_engrams_gets_no_count_and_every_instruction() {
+    use crystalline_service::rest::{AuthStore, MemberLevel, ReflectionLevel, Role};
+    let fx = weekly().await;
+    let auth = std::sync::Arc::new(
+        AuthStore::open(&fx.tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["keeper", "ann"] {
+        auth.add_user(name, name, None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("eng", true, "keeper")
+        .await
+        .unwrap();
+    auth.upsert_domain_member(
+        "eng",
+        "ann",
+        MemberLevel::None,
+        Some(ReflectionLevel::Contributor),
+        "keeper",
+    )
+    .await
+    .unwrap();
+    fx.engine
+        .set_domain_access(std::sync::Arc::new(crystalline_service::DomainAccess::new(
+            auth,
+        )));
+    let ann = crystalline_service::Scope::User {
+        account: "ann".into(),
+        admin: false,
+    };
+    put(&fx, "PACT.md", "# Pact\n\n## Structure\n\n- nowhere/*.md\n").await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
+    put(&fx, "guides/month.md", "# This month\n").await;
+    owned(&fx, "guides/month/june.md", "guides/month.md").await;
+    fx.engine
+        .write_reflection(&act("retire", "guides/month.md"), &agent())
+        .await
+        .unwrap();
+    reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
+
+    let ann = crystalline_service::ReflectionCaller::agent(ann, "claude-code", false);
+    let q = fx.engine.reflect(&with_stale(), &ann).await.unwrap();
+    let stale = items(&q, "stale");
+    assert_eq!(stale.len(), 1, "{q}");
+    assert!(stale[0].get("changed_engrams").is_none(), "{q}");
+    let off = items(&q, "off_structure");
+    assert!(!off.is_empty(), "{q}");
+    assert!(off.iter().all(|i| i["hint"].is_string()), "{q}");
+    let gone = items(&q, "owner_gone");
+    assert_eq!(gone.len(), 1, "{q}");
+    assert!(gone[0]["hint"].is_string(), "{q}");
+
+    // The curator sees the count.
+    let q = queue(&fx, &with_stale()).await;
+    assert!(items(&q, "stale")[0]["changed_engrams"].is_u64(), "{q}");
+}
+
+/// Rule A keeps the engram's checksum when the page drops it: an engram
+/// that changed while the page cited it, and that the reconcile then drops
+/// as last week's, stays covered until it changes again.
+#[tokio::test]
+async fn an_engram_that_changed_before_the_drop_stays_covered() {
+    let fx = weekly().await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 7d\n---\n# This week\n",
+    )
+    .await;
+    sourced(
+        &fx,
+        "guides/week.md",
+        "This week",
+        &[("A", &["weekly/a"]), ("D", &["weekly/d"])],
+    )
+    .await;
+    sourced(
+        &fx,
+        "guides/keep.md",
+        "Keep",
+        &[("B", &["weekly/b"]), ("C", &["weekly/c"])],
+    )
+    .await;
+    let change = |body: &str| {
+        std::fs::write(
+            fx.root.join("weekly/a.md"),
+            engram("Change a", "weekly/a", body),
+        )
+        .unwrap();
+    };
+    change("- [fact] change a moved");
+    fx.engine.sync(None).await.unwrap();
+    // The reconcile looks at the change and drops it as last week's.
+    sourced(&fx, "guides/week.md", "This week", &[("D", &["weekly/d"])]).await;
+    assert_eq!(
+        unreflected(&fx).await,
+        BTreeSet::new(),
+        "covered at its new checksum"
+    );
+
+    change("- [fact] change a moved again");
+    fx.engine.sync(None).await.unwrap();
+    assert_eq!(
+        unreflected(&fx).await,
+        BTreeSet::from(["weekly/a".to_string()]),
+        "a change after the drop makes it unreflected"
+    );
+}
+
+/// The count of changed engrams comes from the index, so an engram written
+/// to a virtual domain counts too.
+#[tokio::test]
+async fn a_virtual_domain_counts_in_the_changed_engrams() {
+    let fx = crate::fixture::fixture_with(
+        &[("MANIFEST.md", &manifest("reflection: on\n"))],
+        |cfg, _| {
+            cfg.domains.insert(
+                "notes".to_string(),
+                crystalline_core::config::DomainEntry::virtual_domain(),
+            );
+        },
+    )
+    .await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
+    reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
+    let count = |q: &Value| items(q, "stale")[0]["changed_engrams"].clone();
+    let before = count(&queue(&fx, &with_stale()).await);
+    fx.engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
+            domain: "notes".to_string(),
+            title: "First note".to_string(),
+            content: Some("the body".to_string()),
+            folder: None,
+            engram_type: None,
+            tags: Vec::new(),
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    let after = count(&queue(&fx, &with_stale()).await);
+    assert_eq!(after, before.as_u64().unwrap() + 1, "{before} then {after}");
+}
+
+/// A `reconciled` without a version on a page whose stale item is open is
+/// refused: a late call could not be told apart from a current one.
+#[tokio::test]
+async fn a_reconcile_without_a_version_is_refused_while_the_page_is_stale() {
+    let fx = weekly().await;
+    put(
+        &fx,
+        "guides/week.md",
+        "---\nfreshness: 1d\n---\n# This week\n",
+    )
+    .await;
+    reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
+    let refused = fx
+        .engine
+        .write_reflection(&reconciled("guides/week.md", "updated", ""), &agent())
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Invalid(_)), "{refused}");
+    assert!(refused.to_string().contains("version"), "{refused}");
+    let missing = WriteReflectionParams {
+        outcome: Some("updated".into()),
+        ..act("reconciled", "guides/week.md")
+    };
+    assert!(
+        fx.engine
+            .write_reflection(&missing, &agent())
+            .await
+            .is_err()
+    );
+    // A page that is not due takes a reconcile without one.
+    put(&fx, "guides/fresh.md", "---\nfreshness: 1d\n---\n# Fresh\n").await;
+    fx.engine
+        .write_reflection(&reconciled("guides/fresh.md", "updated", ""), &agent())
+        .await
+        .unwrap();
 }
