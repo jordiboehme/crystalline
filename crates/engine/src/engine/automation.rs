@@ -1819,6 +1819,23 @@ impl Engine {
         Ok(!self.run_domains(scope).await?.is_empty())
     }
 
+    /// Whether the Reflection caller `caller` is unattended, so nobody
+    /// watches what it removes: an agent of the loops (never anybody's
+    /// interactive session), a request inside a read limit (a session its
+    /// registration or a run header marks unattended, or one whose caller
+    /// holds a live lease: [`crate::read_limit`]), or a caller that holds a
+    /// live loop lease on any surface ([`Engine::run_domains`]; for the
+    /// machine owner any lease held with no account, since the owner and the
+    /// owner's own run look alike). A person in Fluid or in an attended MCP
+    /// session is not. Leases that cannot be read are an error, never an
+    /// answer.
+    pub(crate) async fn is_unattended(&self, caller: &ReflectionCaller) -> Result<bool> {
+        if matches!(caller.scope, Scope::Agent { .. }) || crate::read_limit::current().is_some() {
+            return Ok(true);
+        }
+        Ok(!self.run_domains(&caller.scope).await?.is_empty())
+    }
+
     /// The domains `scope` holds a live lease of either loop on: what a run
     /// as `scope` works on now. For the machine owner, the leases held with
     /// no account. Sorted.

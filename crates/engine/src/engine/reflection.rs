@@ -1146,6 +1146,19 @@ fn now() -> String {
     time::now().rfc3339_secs_z()
 }
 
+/// The refusal of a delete by an unattended session ([`Engine::is_unattended`]).
+pub(crate) fn unattended_delete_refusal(inner: &str) -> String {
+    if r::pact_page_of(inner).is_some() {
+        format!(
+            "an unattended session never deletes a page pact; '{inner}' stays, and a curator deletes it in Fluid or in an attended session"
+        )
+    } else {
+        format!(
+            "an unattended session never deletes a Reflection page; retire '{inner}' instead (write_reflection with action retire), and a person deletes it in Fluid or in an attended session"
+        )
+    }
+}
+
 /// A page without its `reflection:` frontmatter block, which names the
 /// source engrams: what a reader who cannot read engrams is answered, what
 /// the search looks at and what a live room holds. The rest of the
@@ -3690,6 +3703,12 @@ impl Engine {
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
         r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        // An unattended session answers people it has never met and nobody
+        // watches what it removes: it retires a page and never deletes one
+        // (spec 2.4), here for every surface that reaches this verb.
+        if self.is_unattended(caller).await? {
+            return Err(EngineError::Forbidden(unattended_delete_refusal(inner)));
+        }
         // A page's pact goes with it, so deleting a page that has one is a
         // curator's, as deleting the pact alone is.
         let pact = (!r::is_pact_file(inner))
