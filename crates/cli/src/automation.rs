@@ -320,6 +320,17 @@ fn delivery_line(delivery: &Value) -> Option<String> {
     })
 }
 
+/// When the next page of a reflect entry falls due, on the server's
+/// clock; `None` when no page keeps itself current (and for evolve).
+fn next_stale_line(entry: &Value) -> Option<String> {
+    let at = entry["next_stale_at"].as_str()?;
+    let secs = entry["next_stale_in_secs"].as_u64().unwrap_or(0);
+    Some(format!(
+        "next page due: {at} (in {})",
+        crate::cmd::humanize_duration(secs)
+    ))
+}
+
 fn count_line(counts: &Value) -> String {
     let Some(map) = counts.as_object() else {
         return String::new();
@@ -366,6 +377,9 @@ fn print_status(answer: &Value) {
         if left > 0 {
             println!("  left for a person: {left}");
         }
+        if let Some(line) = next_stale_line(d) {
+            println!("  {line}");
+        }
         if let Some(line) = delivery_line(&d["delivery"]) {
             println!("  {line}");
         }
@@ -384,6 +398,24 @@ fn print_status(answer: &Value) {
 mod tests {
     use super::delivery_line;
     use serde_json::json;
+
+    /// The status names when the next page falls due, also without
+    /// counts; nothing when no page keeps itself current.
+    #[test]
+    fn the_next_stale_line_says_when_the_next_page_falls_due() {
+        assert_eq!(
+            super::next_stale_line(&json!({"next_stale_at": null})),
+            None
+        );
+        assert_eq!(
+            super::next_stale_line(&json!({
+                "next_stale_at": "2026-10-22T10:00:00Z",
+                "next_stale_in_secs": 22 * 3600,
+            }))
+            .as_deref(),
+            Some("next page due: 2026-10-22T10:00:00Z (in 22h)")
+        );
+    }
 
     #[test]
     fn the_delivery_line_says_what_the_trigger_did() {
