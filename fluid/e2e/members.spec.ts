@@ -180,9 +180,14 @@ test("an invitation is what makes a private domain visible", async ({
   ).toBeVisible();
   const members = owner.getByRole("region", { name: "Members" });
   await expect(members).toBeVisible();
-  await members.getByLabel("Account").fill(PEER);
+  // The people picker finds the peer from its first two letters.
+  const account = members.getByRole("combobox", { name: "Account" });
+  await account.fill(PEER.slice(0, 2));
+  const found = members.getByRole("listbox", { name: "People found" });
+  await found.getByRole("option", { name: new RegExp(PEER) }).click();
+  await expect(account).toHaveValue(PEER);
   await members.getByLabel("Level").selectOption("viewer");
-  await members.getByRole("button", { name: "Invite" }).click();
+  await members.getByRole("button", { name: "Invite", exact: true }).click();
   await expect(members.getByText(PEER, { exact: true })).toBeVisible();
 
   // The member's next listing has it, badged the same way the owner's is.

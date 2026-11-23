@@ -60,6 +60,9 @@ const COSTS: Readonly<Record<string, Cost>> = {
   "diagram-widget.spec.ts": { root: 83, path: 83 },
   "diagrams.spec.ts": { root: 11, path: 11 },
   "hidden-marks.spec.ts": { root: 126, path: 126 },
+  // Measured locally on 2026-11-23 (chromium, 5.9 s), rounded up; replace
+  // with a CI number.
+  "invite-redeem.spec.ts": { root: 6, path: 6 },
   "invites.spec.ts": { root: 2, path: 2 },
   "kept.spec.ts": { root: 4, path: 4 },
   "mcp-tokens.spec.ts": { root: 2, path: 2 },
