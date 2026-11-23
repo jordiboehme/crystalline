@@ -43,7 +43,7 @@ A scheduler reads every code that is not 0 as a failed job. The Kubernetes and G
 
 To work out what is due, the status sweeps each domain: the reflect queue reads every page and its threads, the evolve sweep reads every engram. That is fine once a minute, but too much for a dashboard that polls every second. Send `"counts": false` with `automation_status` (`crystalline <loop> status --no-counts`): the answer still says per domain whether a run is going (`running`), the last run, where the loop runs (`runs_on`), the backoff (`reason`) and the webhook state, but `due`, `counts` and `left_for_person` are `null`. Without `counts`, or with `true`, the answer is the full one.
 
-The status reads through the store's read connections, so a poll never waits for a write in progress, and a lease taken or a run recorded is seen by the next status.
+The status reads through the store's read connections, so a poll does not wait for a write in progress. It uses the writer only in rare cases: once after a start to load the virtual domains, for a domain the index does not hold yet, and on a shared database to claim a domain whose host lock no live instance holds. A lease taken or a run recorded is seen by the next status.
 
 ### Local or remote
 

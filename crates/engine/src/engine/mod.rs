@@ -3958,8 +3958,8 @@ impl Engine {
     /// base rows under `reflections/` in any letter case. Never the whole
     /// stamp map: up to [`UNDER_REFLECTIONS_PROBE`] rows are read, and only a
     /// domain with that many engrams under the folder (a pending switch,
-    /// whose refusal names them all) reads the rest. The store lock is held
-    /// for these reads only.
+    /// whose refusal names them all) reads the rest, through the read
+    /// connections.
     ///
     /// Remembered per domain (R83, [`PendingEntry`]): an entry filled under
     /// the domain's current generation, its `root` and its MANIFEST's stamp
@@ -3972,9 +3972,12 @@ impl Engine {
         if let Some(recorded) = self.remembered_paths(domain, generation, root, manifest) {
             return Ok(recorded);
         }
-        let (recorded, shared, domain_id) = {
-            let store = self.store.lock().await;
-            let shared = store.shares_database();
+        // Reads only, through the read connections: an automation status
+        // asks this on every poll once the entry expired, and the answer is
+        // only remembered, never written.
+        let shared = self.store_is_shared().await;
+        let (recorded, domain_id) = {
+            let store = self.reader();
             let Some(id) = store.domain_id(domain).await? else {
                 return Ok(RecordedPaths::default());
             };
@@ -3995,7 +3998,6 @@ impl Engine {
                     any,
                     under_reflections,
                 },
-                shared,
                 id,
             )
         };
@@ -4087,6 +4089,14 @@ impl Engine {
     /// without an announce of that domain calls it itself (a removal, the
     /// orphan collector). The number only grows, so an entry filled before
     /// a bump never matches again, however the fills and bumps interleave.
+    /// Forget what the Reflection gate remembers of every domain, as a
+    /// shared database's entries expire after
+    /// [`crate::changes::VISIBILITY_TTL`]: the next gate reads the store.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn forget_remembered_gates(&self) {
+        self.pending_cache.lock().unwrap().clear();
+    }
+
     pub(crate) fn bump_reflection_generation(&self, domain: &str) {
         *self
             .reflection_generations

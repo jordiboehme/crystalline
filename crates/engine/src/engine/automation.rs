@@ -1575,7 +1575,9 @@ impl Engine {
         let runs_on = self.loop_runs(lp, domain, scope).await;
         // Every read of a status goes through the read connections: a poll
         // never queues for the writer. A lease take or a run record has
-        // committed before it answered, so the next status sees it.
+        // committed before it answered, so the next status sees it. The
+        // lease and the runs are two reads, so a run recorded between them
+        // can show for one poll as running and as the last run.
         let reader = self.reader();
         let id = reader.domain_id(domain).await?;
         let (lease, runs) = match id {

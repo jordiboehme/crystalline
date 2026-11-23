@@ -708,10 +708,15 @@ impl Engine {
         if !self.store_is_shared().await {
             return Ok(None);
         }
-        let store = self.store.lock().await;
-        let host = match store.domain_id(domain).await? {
-            Some(id) => store.domain_host(id).await?,
-            None => None,
+        // Read first: a domain another live instance holds is named
+        // without the writer, so a status poll never queues for it. Only a
+        // claim below takes the writer.
+        let host = {
+            let reader = self.reader();
+            match reader.domain_id(domain).await? {
+                Some(id) => reader.domain_host(id).await?,
+                None => None,
+            }
         };
         // Another instance's live claim stands. One that sent no heartbeat
         // for the stale threshold is taken over below by a write, with the
@@ -753,6 +758,9 @@ impl Engine {
         if self.is_renaming(domain) {
             return Ok(Some(None));
         }
+        // The store decides the claim under the writer, whatever was read
+        // above.
+        let store = self.store.lock().await;
         match self.claim_file_host(&*store, domain, root, false).await? {
             HostClaim::Acquired { .. } => {
                 drop(store);
@@ -1485,7 +1493,8 @@ fn stamp_reflected(text: &str, prov: &mut r::Provenance, ids: &[String]) -> Resu
 
 impl Engine {
     /// Every engram of a domain by permalink, with the checksum a section's
-    /// sources are compared against.
+    /// sources are compared against. The stamps and the listing are two
+    /// reads, so a sync between them can leave out an engram for one call.
     pub(crate) async fn engram_facts(
         &self,
         domain_id: DomainId,

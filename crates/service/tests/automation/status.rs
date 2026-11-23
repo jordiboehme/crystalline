@@ -128,8 +128,44 @@ async fn a_status_answers_while_the_writer_lock_is_held_on_turso() {
     answers_under_the_held_lock(&fx).await;
 }
 
-/// On Postgres the read pool answers, also for an instance that holds the
-/// domain's host lock on a shared database.
+/// Status of `lp` on `domain` with counts and without: the answer before
+/// the gate's entries expire, and the same answers while a test holds the
+/// writer lock after they expired.
+async fn same_under_the_held_lock(engine: &Engine, lp: Loop, domain: &str) -> Value {
+    let ask = |counts: bool| async move {
+        engine
+            .automation_status_with(
+                lp,
+                &[domain.to_string()],
+                &Scope::Unrestricted,
+                false,
+                counts,
+            )
+            .await
+            .unwrap()
+    };
+    let full = ask(true).await;
+    let cheap = ask(false).await;
+    engine.forget_remembered_gates();
+    let store = engine.store();
+    let held = store.lock().await;
+    for (counts, before) in [(true, &full), (false, &cheap)] {
+        let during = tokio::time::timeout(PATIENCE, ask(counts))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{lp:?} status of '{domain}' (counts {counts}) waited for the writer lock")
+            });
+        assert_eq!(&during, before, "{lp:?} '{domain}' counts {counts}");
+    }
+    drop(held);
+    full
+}
+
+/// On Postgres the read pool answers: on the instance that holds the
+/// domain's host lock once the gate's remembered entry expired (it lasts
+/// `VISIBILITY_TTL` on a shared database), on an instance another one hosts
+/// the domain for, and for the evolve status of a virtual domain, whose
+/// MANIFEST is a stored row.
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_status_answers_while_the_writer_lock_is_held_on_postgres() {
@@ -138,14 +174,29 @@ async fn a_status_answers_while_the_writer_lock_is_held_on_postgres() {
     let Some(scratch) = scratch_schema() else {
         return;
     };
-    let store = crystalline_index::PostgresStore::open_in_schema(scratch.url(), scratch.name())
-        .await
-        .expect("open the postgres test schema");
+    let open = || async {
+        let store = crystalline_index::PostgresStore::open_in_schema(scratch.url(), scratch.name())
+            .await
+            .expect("open the postgres test schema");
+        Arc::new(Mutex::new(store)) as Arc<Mutex<dyn Store>>
+    };
     let files = files();
     let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, b)| (*p, b.as_str())).collect();
-    let fx = instance_on(Arc::new(Mutex::new(store)), "alpha", &borrowed).await;
-    prepare(&fx).await;
-    answers_under_the_held_lock(&fx).await;
+    let alpha = instance_on(open().await, "alpha", &borrowed).await;
+    prepare(&alpha).await;
+    let beta = instance_on(open().await, "beta", &borrowed).await;
+    beta.engine.set_automation_now(Some(
+        time::parse_rfc3339("2026-10-21T10:00:00+00:00").unwrap(),
+    ));
+    alpha.engine.domain_add_virtual("vnotes").await.unwrap();
+
+    answers_under_the_held_lock(&alpha).await;
+    let reflect = same_under_the_held_lock(&alpha.engine, Loop::Reflect, "eng").await;
+    assert_eq!(reflect["domains"][0]["due"], true, "{reflect}");
+    same_under_the_held_lock(&alpha.engine, Loop::Evolve, "eng").await;
+    same_under_the_held_lock(&alpha.engine, Loop::Evolve, "vnotes").await;
+    let elsewhere = same_under_the_held_lock(&beta.engine, Loop::Reflect, "eng").await;
+    assert_eq!(elsewhere["domains"][0]["runs_on"], "alpha", "{elsewhere}");
 }
 
 /// `counts: false` answers the lease, the last run and where the loop runs,
