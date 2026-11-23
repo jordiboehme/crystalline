@@ -23,9 +23,10 @@
 //!   kept server side in the sign-in's pending record (never in a URL) and
 //!   the callback redeems it. See [`crate::oidc`].
 //! * `proxy`: the forwarded identity is the account. The proxy mode makes the
-//!   account on the first request it sees, before any redemption runs, at
-//!   `auth.oidc.default_role`, so in this mode a link gives the membership
-//!   only and its role never applies.
+//!   account on the first request it sees, before any redemption runs: the
+//!   forward-auth headers at `auth.oidc.default_role`, `auth.trusted_header`
+//!   always at viewer. So in this mode a link gives the membership only and
+//!   its role never applies.
 //!
 //! A signed-in person always redeems for their own account (membership
 //! only); a different login in the body is refused.
