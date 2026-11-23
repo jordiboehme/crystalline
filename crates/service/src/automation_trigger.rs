@@ -322,6 +322,7 @@ impl Triggers {
     }
 
     async fn evolve_tick(&mut self, deliveries: &mut JoinSet<Outcome>) {
+        let _pass = crystalline_engine::timing::Pass::start("evolve tick");
         for domain in self.evolve_domains.clone() {
             self.look(&domain, Loop::Evolve, false, deliveries).await;
         }

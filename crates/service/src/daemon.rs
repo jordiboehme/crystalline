@@ -3777,6 +3777,7 @@ async fn run_reflect_count_tick(
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
+                let _pass = crystalline_engine::timing::Pass::start("reflect count tick");
                 if let Err(e) = engine.record_reflect_counts().await {
                     tracing::debug!("reflect counts not recorded: {e}");
                 }
@@ -3830,6 +3831,7 @@ pub async fn run_embed_tick(
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
+                let _pass = crystalline_engine::timing::Pass::start("embed tick");
                 // Every tick, whatever the backlog: a model nobody used for
                 // ten minutes, or one the setting no longer names, goes.
                 engine.drop_idle_scorer();
