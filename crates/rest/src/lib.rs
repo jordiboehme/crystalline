@@ -473,6 +473,7 @@ use crate::scope::{DomainAccess, DomainRight};
         reflection_pages::ReflectionPageFinding,
         reflection_pages::ReflectionRetirement,
         reflection_pages::ReflectionPageView,
+        reflections::ReflectionDoc,
         reflection_pages::ReflectionSettingsBody,
         reflection_pages::ReflectionSettingsReceipt,
         reflection_pages::RetireReflectionBody,

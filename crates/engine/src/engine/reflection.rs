@@ -3240,15 +3240,12 @@ impl Engine {
         );
         // A hit on a retired page says so: search still finds it, shown
         // faded (design 2.4).
-        let retired: BTreeSet<&str> = hits
-            .items
+        let hit_pages: BTreeSet<&str> = hits.items.iter().map(|hit| hit.path.as_str()).collect();
+        let retired: BTreeSet<&str> = rows
             .iter()
-            .map(|hit| hit.path.as_str())
-            .filter(|path| {
-                rows.iter()
-                    .find(|row| row.path == *path)
-                    .is_some_and(|row| super::page_life::is_retired(&row.content, path))
-            })
+            .filter(|row| hit_pages.contains(row.path.as_str()))
+            .filter(|row| super::page_life::is_retired(&row.content, &row.path))
+            .map(|row| row.path.as_str())
             .collect();
         let items: Vec<Value> = hits
             .items

@@ -2807,6 +2807,53 @@ export type ReflectionCollaboratorsResponse = {
 };
 
 /**
+ * The answer of `GET /domains/{domain}/reflections/{path}`, as a schema:
+ * the route passes the engine's answer through unchanged, and this names
+ * its shape for the generated client.
+ */
+export type ReflectionDoc = {
+    /**
+     * The checksum of the stored file.
+     */
+    checksum: string;
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * Who has the page open in a co-editing room, while one is open.
+     */
+    live?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * The text answered (see the response description).
+     */
+    markdown: string;
+    page?: ReflectionPageView | null;
+    /**
+     * The reflection's path inside reflections/.
+     */
+    path: string;
+    /**
+     * The `##` sections with their ids, lines, change marks and sources.
+     */
+    sections: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * The open threads.
+     */
+    threads: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * Its title.
+     */
+    title: string;
+};
+
+/**
  * One per-domain Reflection collaborator: an account given the Reflection
  * reader or contributor level on one domain. A grant only raises the
  * Reflection right and never opens an engram.
@@ -2994,8 +3041,10 @@ export type ReflectionPageView = {
     pacts: Array<string>;
     retired?: ReflectionRetirement | null;
     /**
-     * The page's `status`, as written. A retired word (`archived`) means
-     * the page is retired.
+     * The page's `status`, as written. Any word of the retired set, as an
+     * engram's (`archived`, which a retire writes, `superseded`,
+     * `deprecated`, `legacy`; case folded), means the page is retired, and
+     * `retired` is set.
      */
     status?: string | null;
 };
@@ -3019,18 +3068,19 @@ export type ReflectionPartOf = {
  */
 export type ReflectionRetirement = {
     /**
-     * When, RFC 3339.
+     * When, RFC 3339; null for a page retired only by a retired word in
+     * its status.
      */
-    at: string;
+    at?: string | null;
     /**
-     * Who retired it: a person's or an agent's name.
+     * Who retired it: a person's or an agent's name; null as `at` is.
      */
-    by: string;
+    by?: string | null;
     was_owned_by?: ReflectionPageRef | null;
 };
 
 /**
- * A page's settings, the frontmatter keys only a curator changes. A key left out keeps its value, an empty value takes the key off the page, any other value sets it. At least one key.
+ * A page's settings, the frontmatter keys only a curator changes. A key left out, or sent as null, keeps its value; an empty string ("") takes the key off the page; any other value sets it. At least one key.
  */
 export type ReflectionSettingsBody = {
     /**
@@ -7874,9 +7924,7 @@ export type GetReflectionResponses = {
     /**
      * ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.
      */
-    200: {
-        [key: string]: unknown;
-    };
+    200: ReflectionDoc;
 };
 
 export type GetReflectionResponse = GetReflectionResponses[keyof GetReflectionResponses];

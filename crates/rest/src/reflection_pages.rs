@@ -73,12 +73,13 @@ pub struct ReflectionPageFinding {
 /// How and when a page was retired.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReflectionRetirement {
-    /// When, RFC 3339.
+    /// When, RFC 3339; null for a page retired only by a retired word in
+    /// its status.
     #[schema(example = "2026-11-20T09:00:00Z")]
-    pub at: String,
-    /// Who retired it: a person's or an agent's name.
+    pub at: Option<String>,
+    /// Who retired it: a person's or an agent's name; null as `at` is.
     #[schema(example = "claude-code")]
-    pub by: String,
+    pub by: Option<String>,
     /// The page that owned it then; a restore can put it back under that
     /// page.
     pub was_owned_by: Option<ReflectionPageRef>,
@@ -98,13 +99,16 @@ pub struct ReflectionPageView {
     /// The page whose pact this page follows, as written; null when the
     /// page follows its owner or its folder parent.
     pub follows: Option<String>,
-    /// The page's `status`, as written. A retired word (`archived`) means
-    /// the page is retired.
+    /// The page's `status`, as written. Any word of the retired set, as an
+    /// engram's (`archived`, which a retire writes, `superseded`,
+    /// `deprecated`, `legacy`; case folded), means the page is retired, and
+    /// `retired` is set.
     pub status: Option<String>,
     /// The page that owns this one: reconciling it keeps this page current.
     pub owner: Option<ReflectionPageRef>,
-    /// Set when the page is retired: hidden in the navigation, never
-    /// reconciled, still found by search and by link.
+    /// Set when the page is retired (as the tree's `retired` says): hidden
+    /// in the navigation, never reconciled, still found by search and by
+    /// link, and restorable.
     pub retired: Option<ReflectionRetirement>,
     /// The pages this page follows, from the top down; the last one is the
     /// page it follows directly. Empty when it follows only `PACT.md`.
@@ -123,9 +127,10 @@ pub struct ReflectionPageView {
 /// What `PATCH /domains/{domain}/reflection/settings` takes.
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(description = "A page's settings, the frontmatter keys only a \
-                        curator changes. A key left out keeps its value, an \
-                        empty value takes the key off the page, any other \
-                        value sets it. At least one key.")]
+                        curator changes. A key left out, or sent as null, \
+                        keeps its value; an empty string (\"\") takes the \
+                        key off the page; any other value sets it. At least \
+                        one key.")]
 pub struct ReflectionSettingsBody {
     /// The page's path inside reflections/.
     #[schema(example = "arch/overview.md")]

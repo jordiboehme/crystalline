@@ -7951,7 +7951,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/ReflectionDoc"
                 },
                 "example": {
                   "checksum": "9f2c...",
@@ -18749,6 +18749,73 @@
           }
         }
       },
+      "ReflectionDoc": {
+        "type": "object",
+        "description": "The answer of `GET /domains/{domain}/reflections/{path}`, as a schema:\nthe route passes the engine's answer through unchanged, and this names\nits shape for the generated client.",
+        "required": [
+          "domain",
+          "path",
+          "title",
+          "markdown",
+          "checksum",
+          "sections",
+          "threads"
+        ],
+        "properties": {
+          "checksum": {
+            "type": "string",
+            "description": "The checksum of the stored file."
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain."
+          },
+          "live": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Who has the page open in a co-editing room, while one is open."
+          },
+          "markdown": {
+            "type": "string",
+            "description": "The text answered (see the response description)."
+          },
+          "page": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionPageView",
+                "description": "What the page says about itself beside its text; absent for\n`PACT.md` and a page pact."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "The reflection's path inside reflections/."
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "The `##` sections with their ids, lines, change marks and sources."
+          },
+          "threads": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "The open threads."
+          },
+          "title": {
+            "type": "string",
+            "description": "Its title."
+          }
+        }
+      },
       "ReflectionGrant": {
         "type": "object",
         "description": "One per-domain Reflection collaborator: an account given the Reflection\nreader or contributor level on one domain. A grant only raises the\nReflection right and never opens an engram.",
@@ -19027,7 +19094,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ReflectionRetirement",
-                "description": "Set when the page is retired: hidden in the navigation, never\nreconciled, still found by search and by link."
+                "description": "Set when the page is retired (as the tree's `retired` says): hidden\nin the navigation, never reconciled, still found by search and by\nlink, and restorable."
               },
               {
                 "type": "null"
@@ -19039,7 +19106,7 @@
               "string",
               "null"
             ],
-            "description": "The page's `status`, as written. A retired word (`archived`) means\nthe page is retired."
+            "description": "The page's `status`, as written. Any word of the retired set, as an\nengram's (`archived`, which a retire writes, `superseded`,\n`deprecated`, `legacy`; case folded), means the page is retired, and\n`retired` is set."
           }
         }
       },
@@ -19066,19 +19133,21 @@
       "ReflectionRetirement": {
         "type": "object",
         "description": "How and when a page was retired.",
-        "required": [
-          "at",
-          "by"
-        ],
         "properties": {
           "at": {
-            "type": "string",
-            "description": "When, RFC 3339.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When, RFC 3339; null for a page retired only by a retired word in\nits status.",
             "example": "2026-11-20T09:00:00Z"
           },
           "by": {
-            "type": "string",
-            "description": "Who retired it: a person's or an agent's name.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who retired it: a person's or an agent's name; null as `at` is.",
             "example": "claude-code"
           },
           "was_owned_by": {
@@ -19096,7 +19165,7 @@
       },
       "ReflectionSettingsBody": {
         "type": "object",
-        "description": "A page's settings, the frontmatter keys only a curator changes. A key left out keeps its value, an empty value takes the key off the page, any other value sets it. At least one key.",
+        "description": "A page's settings, the frontmatter keys only a curator changes. A key left out, or sent as null, keeps its value; an empty string (\"\") takes the key off the page; any other value sets it. At least one key.",
         "required": [
           "path"
         ],

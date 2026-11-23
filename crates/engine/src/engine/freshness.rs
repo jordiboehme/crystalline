@@ -394,6 +394,10 @@ impl Engine {
         let Some(row) = reader.get_reflection(id, path).await? else {
             return Ok(None);
         };
+        // A retired page is never reconciled, whatever its record says.
+        if PageFacts::read(path, &row.content).retired {
+            return Ok(None);
+        }
         let Some(owner) = owner_of(&row.content) else {
             return Ok(None);
         };

@@ -365,6 +365,35 @@ pub async fn tree(
         .map_err(reflection_error)
 }
 
+/// The answer of `GET /domains/{domain}/reflections/{path}`, as a schema:
+/// the route passes the engine's answer through unchanged, and this names
+/// its shape for the generated client.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReflectionDoc {
+    /// The domain.
+    domain: String,
+    /// The reflection's path inside reflections/.
+    path: String,
+    /// Its title.
+    title: String,
+    /// The text answered (see the response description).
+    markdown: String,
+    /// The checksum of the stored file.
+    checksum: String,
+    /// The `##` sections with their ids, lines, change marks and sources.
+    #[schema(value_type = Vec<Object>)]
+    sections: Vec<Value>,
+    /// The open threads.
+    #[schema(value_type = Vec<Object>)]
+    threads: Vec<Value>,
+    /// Who has the page open in a co-editing room, while one is open.
+    #[schema(value_type = Option<Object>)]
+    live: Option<Value>,
+    /// What the page says about itself beside its text; absent for
+    /// `PACT.md` and a page pact.
+    page: Option<super::reflection_pages::ReflectionPageView>,
+}
+
 /// `GET /domains/{domain}/reflections/{*path}`
 #[utoipa::path(
     get,
@@ -406,7 +435,7 @@ pub async fn tree(
                            in order, its own `pact` file and `findings` for \
                            what did not read; its clock is \
                            `GET /domains/{domain}/reflection/clock`.",
-            body = Object,
+            body = ReflectionDoc,
             example = json!({ "domain": "eng", "path": "guides/deploying.md",
                 "title": "Deploying", "markdown": "# Deploying\n...",
                 "checksum": "9f2c...", "sections": [ { "id": "7f3a9c2e",

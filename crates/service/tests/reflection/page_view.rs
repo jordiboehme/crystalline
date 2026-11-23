@@ -325,6 +325,10 @@ async fn an_owned_pages_clock_is_its_owners() {
 
     // A page on its own without a freshness keeps no clock.
     assert_eq!(clock("plain.md").await, Value::Null);
+    // Nor does an owned page retired by a status written by hand: its
+    // record still names the owner, and it is never reconciled.
+    put(&fx, "plain/p.md", "---\nstatus: archived\n---\n# Part P\n").await;
+    assert_eq!(clock("plain/p.md").await, Value::Null);
 }
 
 fn change(path: &str) -> PageSettingsChange {
@@ -432,6 +436,18 @@ async fn a_settings_change_refuses_what_a_page_cannot_take() {
         )
         .await
         .unwrap();
+    // notes.md follows arch.md; arch.md following notes.md closes a cycle.
+    fx.engine
+        .set_reflection_page_settings(
+            "eng",
+            &PageSettingsChange {
+                follows: Some("arch.md".into()),
+                ..change("notes.md")
+            },
+            &curator,
+        )
+        .await
+        .unwrap();
     let before = |path: &str| file(&fx, path);
     let snapshot: Vec<Option<String>> = ["arch.md", "notes.md", "old.md", "arch/a.md"]
         .iter()
@@ -488,6 +504,19 @@ async fn a_settings_change_refuses_what_a_page_cannot_take() {
     )
     .await;
     says(&e, "gone.md");
+    let e = refused(change("notes.md"), curator.clone()).await;
+    assert!(matches!(e, EngineError::Invalid(_)), "{e}");
+    says(&e, "at least one");
+    let e = refused(
+        PageSettingsChange {
+            follows: Some("notes.md".into()),
+            ..change("arch.md")
+        },
+        curator.clone(),
+    )
+    .await;
+    assert!(matches!(e, EngineError::Invalid(_)), "{e}");
+    says(&e, "cycle");
     let e = refused(
         PageSettingsChange {
             status: Some("Archived".into()),
@@ -689,4 +718,23 @@ async fn a_settings_change_through_crystalline_raises_no_pact_item() {
     std::fs::write(&path, text).unwrap();
     fx.engine.sync(None).await.unwrap();
     assert_eq!(pact_items(&fx, "notes.md").await.len(), 1, "disk");
+}
+
+/// A page retired only by a retired word in its status (an engram page
+/// from before retire existed) reads as retired too, as the tree hides it,
+/// with no time, author or owner to name.
+#[tokio::test]
+async fn a_page_retired_by_its_status_word_reads_as_retired() {
+    let fx = reflecting().await;
+    put(&fx, "old.md", "---\nstatus: superseded\n---\n# Old\n").await;
+    let page = page_of(&fx, "old.md").await;
+    assert_eq!(page["status"], "superseded", "{page}");
+    assert_eq!(
+        page["retired"],
+        json!({ "at": null, "by": null, "was_owned_by": null }),
+        "{page}"
+    );
+    // Restored, it reads as a page again.
+    act(&fx, "restore", "old.md").await;
+    assert_eq!(page_of(&fx, "old.md").await["retired"], Value::Null);
 }

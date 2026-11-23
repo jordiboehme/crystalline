@@ -43,7 +43,8 @@ impl Engine {
     /// - `follows` and `status`: as written, or null.
     /// - `owner`: `{path, title, exists}` of the page that owns this one.
     /// - `retired`: `{at, by, was_owned_by}` of a retired page, the former
-    ///   owner named as `owner` is.
+    ///   owner named as `owner` is; all three null for a page retired only
+    ///   by a retired word in its status.
     /// - `chain`: the pages it follows, `{path, title}` from the top down,
     ///   the last the one it follows directly.
     /// - `pacts`: the pact files that apply, in order: `PACT.md`, then each
@@ -96,13 +97,20 @@ impl Engine {
         };
         findings.extend(chain.findings.iter().cloned());
         let own_pact = r::page_pact_path(inner);
-        let retired = record.retired.as_ref().map(|retired| {
-            json!({
+        // Retired by the record a retire writes, or only by a retired word
+        // in the status (a page from before retire, or one written by
+        // hand): then there is no time, author or owner to name.
+        let retired = match &record.retired {
+            Some(retired) => Some(json!({
                 "at": retired.at,
                 "by": retired.by,
                 "was_owned_by": retired.was_owned_by.as_deref().map(|was| page_ref(was, &titles)),
-            })
-        });
+            })),
+            None if settings.retired() => {
+                Some(json!({ "at": null, "by": null, "was_owned_by": null }))
+            }
+            None => None,
+        };
         Ok(json!({
             "freshness": settings.freshness.as_ref().map(|f| f.written.clone()),
             "follows": settings.follows,
