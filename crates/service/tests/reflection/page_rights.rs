@@ -411,3 +411,188 @@ async fn a_follows_that_names_no_page_or_closes_a_cycle_is_refused() {
         assert!(err.contains(says), "{target}: {err}");
     }
 }
+
+fn exists(fx: &Fx, rel: &str) -> bool {
+    fx.root.join("reflections").join(rel).exists()
+}
+
+/// A page with a page pact moves only with a curator, and its pact moves
+/// with it: the pact, its baseline and its threads, and the index rows.
+#[tokio::test]
+async fn a_page_moves_with_its_pact_and_only_by_a_curator() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/a.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/a.pact.md", PACT, &curator).await.unwrap();
+    std::fs::write(
+        fx.root.join("reflections/guides/a.pact.threads.md"),
+        "# Threads\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fx.root.join("reflections/.reflected/guides")).unwrap();
+    std::fs::write(fx.root.join("reflections/.reflected/guides/a.pact.md"), "").unwrap();
+    let err = fx
+        .engine
+        .move_reflection("eng", "guides/a.md", "docs/a.md", &ann)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("curate") && err.contains("guides/a.pact.md"),
+        "{err}"
+    );
+    assert!(exists(&fx, "guides/a.md") && exists(&fx, "guides/a.pact.md"));
+
+    let moved = fx
+        .engine
+        .move_reflection("eng", "guides/a.md", "docs/a.md", &curator)
+        .await
+        .unwrap();
+    assert_eq!(moved["pact_moved"], true, "{moved}");
+    for gone in [
+        "guides/a.md",
+        "guides/a.pact.md",
+        "guides/a.pact.threads.md",
+        ".reflected/guides/a.pact.md",
+    ] {
+        assert!(!exists(&fx, gone), "{gone}");
+    }
+    for there in [
+        "docs/a.md",
+        "docs/a.pact.md",
+        "docs/a.pact.threads.md",
+        ".reflected/docs/a.pact.md",
+    ] {
+        assert!(exists(&fx, there), "{there}");
+    }
+    let read = fx
+        .engine
+        .read_reflection("eng", "docs/a.pact.md", &ann)
+        .await
+        .unwrap();
+    assert!(read.to_string().contains("Short."), "{read}");
+    assert!(
+        fx.engine
+            .read_reflection("eng", "guides/a.pact.md", &ann)
+            .await
+            .is_err()
+    );
+}
+
+/// A move onto a path that becomes the folder parent of pages already
+/// there changes the pact those pages follow: a curator's move.
+#[tokio::test]
+async fn a_move_onto_a_folder_parent_needs_curate() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/x/one.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    let err = fx
+        .engine
+        .move_reflection("eng", "guides/b.md", "guides/x.md", &ann)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("curate") && err.contains("folder parent"),
+        "{err}"
+    );
+    fx.engine
+        .move_reflection("eng", "guides/b.md", "guides/y.md", &ann)
+        .await
+        .unwrap();
+    fx.engine
+        .move_reflection("eng", "guides/y.md", "guides/x.md", &curator)
+        .await
+        .unwrap();
+    assert!(exists(&fx, "guides/x.md"));
+}
+
+/// The pages that follow a moved page follow it to its new path, in the
+/// same move.
+#[tokio::test]
+async fn a_follows_names_the_new_path_of_a_moved_page() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    put(
+        &fx,
+        "notes/c.md",
+        "---\ntitle: C\nfollows: guides/b.md\n---\n\n# C\n",
+        &curator,
+    )
+    .await
+    .unwrap();
+    let moved = fx
+        .engine
+        .move_reflection("eng", "guides/b.md", "guides/d.md", &ann)
+        .await
+        .unwrap();
+    assert_eq!(moved["follows_rewritten"], 1, "{moved}");
+    assert_eq!(settings(&fx, "notes/c.md"), "follows=guides/d.md");
+    // The index row was rewritten in the same move.
+    let read = fx
+        .engine
+        .read_reflection("eng", "notes/c.md", &curator)
+        .await
+        .unwrap();
+    assert!(read.to_string().contains("follows: guides/d.md"), "{read}");
+}
+
+/// A loose page pact at the target is no file a move adopts.
+#[tokio::test]
+async fn a_move_does_not_adopt_a_loose_page_pact() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/z.pact.md", PACT, &curator).await.unwrap();
+    let err = fx
+        .engine
+        .move_reflection("eng", "guides/b.md", "guides/z.md", &ann)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("guides/z.pact.md"), "{err}");
+    assert!(exists(&fx, "guides/b.md"));
+}
+
+/// A page with a page pact is deleted by a curator only, and its pact goes
+/// with it: the pact, its baseline and its threads.
+#[tokio::test]
+async fn a_page_is_deleted_with_its_pact_and_only_by_a_curator() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/a.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/a.pact.md", PACT, &curator).await.unwrap();
+    std::fs::write(
+        fx.root.join("reflections/guides/a.pact.threads.md"),
+        "# Threads\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fx.root.join("reflections/.reflected/guides")).unwrap();
+    std::fs::write(fx.root.join("reflections/.reflected/guides/a.pact.md"), "").unwrap();
+    let err = fx
+        .engine
+        .delete_reflection("eng", "guides/a.md", &ann)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("curate") && err.contains("guides/a.pact.md"),
+        "{err}"
+    );
+    assert!(exists(&fx, "guides/a.md"));
+    fx.engine
+        .delete_reflection("eng", "guides/a.md", &curator)
+        .await
+        .unwrap();
+    for gone in [
+        "guides/a.md",
+        "guides/a.pact.md",
+        "guides/a.pact.threads.md",
+        ".reflected/guides/a.pact.md",
+    ] {
+        assert!(!exists(&fx, gone), "{gone}");
+    }
+    assert!(
+        fx.engine
+            .read_reflection("eng", "guides/a.pact.md", &curator)
+            .await
+            .is_err()
+    );
+}
