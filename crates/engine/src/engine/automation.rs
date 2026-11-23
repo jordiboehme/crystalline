@@ -22,10 +22,10 @@ use crate::scope::{ReflectionCaller, ReflectionRight, Scope};
 /// The MANIFEST's path in a domain, as the share and the run's writes name it.
 const MANIFEST_FILE: &str = "MANIFEST.md";
 
-/// Why a domain whose loop can run nowhere here is not due.
 /// How the key of a due `stale` item starts (`stale:<page>#:`).
 const STALE_KEY: &str = "stale:";
 
+/// Why a domain whose loop can run nowhere here is not due.
 const NOT_HOSTED_HERE: &str = "not hosted here";
 
 /// The refusal of a take while another run holds a fresh lease.
