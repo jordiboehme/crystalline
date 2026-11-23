@@ -512,48 +512,7 @@ enum Command {
     /// the full stack in-process. HTTP is served by the daemon, not this command,
     /// and a daemon this command starts opens it at 127.0.0.1:7411 by default,
     /// web UI included (service.http=false turns that off).
-    Mcp {
-        /// Run the full stack in-process instead of attaching to a daemon.
-        #[arg(long)]
-        embedded: bool,
-        /// Serve the content API read-only. Applies when this command runs the
-        /// stack in-process or spawns a new daemon; attaching to an
-        /// already-running daemon uses that daemon's mode instead.
-        #[arg(long)]
-        read_only: bool,
-        /// Which harness spawned this server, as `crystalline install` wrote
-        /// it into the MCP registration (claude-code, codex, copilot). Used
-        /// with this machine's install receipt to decide whether that harness
-        /// already has the shipped skills on disk, in which case they are not
-        /// served a second time. Omit it and the whole surface is served.
-        ///
-        /// A plain string rather than a value enum on purpose: a value this
-        /// binary does not recognize (a downgrade meeting a newer
-        /// registration) must serve the surface with a warning, never fail to
-        /// start the server.
-        #[arg(long)]
-        harness: Option<String>,
-        /// Mark this session unattended: nobody is behind it to answer a
-        /// question, so it is never asked to share Reflection text from a
-        /// domain fewer people may read. The MCP config of a headless loop
-        /// run (`crystalline reflect run`, `crystalline evolve run`) passes it.
-        #[arg(long, hide = true)]
-        unattended: bool,
-        /// The domain an unattended run started this session for: its reads
-        /// are limited to what every reader of that domain may read. Implies
-        /// --unattended. `crystalline reflect run` and `evolve run` pass it.
-        #[arg(long, hide = true)]
-        domain: Option<String>,
-        /// The loop an unattended run started this session for, reflect or
-        /// evolve: only that loop's leases count, and a write is noted only
-        /// in that loop's lease. Implies --unattended. `crystalline reflect
-        /// run` and `evolve run` pass it.
-        #[arg(long = "loop", hide = true)]
-        run_loop: Option<crystalline_core::automation::Loop>,
-        /// Load the global config from this file instead of the default path.
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
+    Mcp(McpArgs),
     /// Send a control command to a running daemon.
     Ctl {
         #[command(subcommand)]
@@ -930,6 +889,54 @@ enum Command {
         #[command(subcommand)]
         event: HookEvent,
     },
+}
+
+/// The arguments of `crystalline mcp`, in a struct of their own so that
+/// clap parses them in a frame of their own: the derived parser of the
+/// whole command enum otherwise grows past a test thread's stack in an
+/// unoptimized build.
+#[derive(clap::Args, Debug)]
+struct McpArgs {
+    /// Run the full stack in-process instead of attaching to a daemon.
+    #[arg(long)]
+    embedded: bool,
+    /// Serve the content API read-only. Applies when this command runs the
+    /// stack in-process or spawns a new daemon; attaching to an
+    /// already-running daemon uses that daemon's mode instead.
+    #[arg(long)]
+    read_only: bool,
+    /// Which harness spawned this server, as `crystalline install` wrote
+    /// it into the MCP registration (claude-code, codex, copilot). Used
+    /// with this machine's install receipt to decide whether that harness
+    /// already has the shipped skills on disk, in which case they are not
+    /// served a second time. Omit it and the whole surface is served.
+    ///
+    /// A plain string rather than a value enum on purpose: a value this
+    /// binary does not recognize (a downgrade meeting a newer
+    /// registration) must serve the surface with a warning, never fail to
+    /// start the server.
+    #[arg(long)]
+    harness: Option<String>,
+    /// Mark this session unattended: nobody is behind it to answer a
+    /// question, so it is never asked to share Reflection text from a
+    /// domain fewer people may read. The MCP config of a headless loop
+    /// run (`crystalline reflect run`, `crystalline evolve run`) passes it.
+    #[arg(long, hide = true)]
+    unattended: bool,
+    /// The domain an unattended run started this session for: its reads
+    /// are limited to what every reader of that domain may read. Implies
+    /// --unattended. `crystalline reflect run` and `evolve run` pass it.
+    #[arg(long, hide = true)]
+    domain: Option<String>,
+    /// The loop an unattended run started this session for, reflect or
+    /// evolve: only that loop's leases count, and a write is noted only
+    /// in that loop's lease. Implies --unattended. `crystalline reflect
+    /// run` and `evolve run` pass it.
+    #[arg(long = "loop", hide = true)]
+    run_loop: Option<String>,
+    /// Load the global config from this file instead of the default path.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// Which harness lifecycle event a `hook` invocation answers: `Stop` at the
@@ -2722,7 +2729,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Command::Mcp {
+        Some(Command::Mcp(McpArgs {
             embedded,
             read_only,
             harness,
@@ -2730,7 +2737,7 @@ fn run() -> anyhow::Result<()> {
             domain,
             run_loop,
             config,
-        }) => on_runtime(move || {
+        })) => on_runtime(move || {
             mcp_dispatch(
                 embedded, read_only, harness, unattended, domain, run_loop, config, cli.db,
             )
@@ -2821,7 +2828,7 @@ fn hints_after(command: Option<&Command>, json: bool) -> bool {
                     | Command::DesktopBundle { .. }
                     | Command::DaemonTask { .. }
                     | Command::Serve { .. }
-                    | Command::Mcp { .. }
+                    | Command::Mcp(_)
                     | Command::Ctl { .. }
                     | Command::Hook { .. }
             )
@@ -5572,10 +5579,14 @@ async fn mcp_dispatch(
     harness: Option<String>,
     unattended: bool,
     domain: Option<String>,
-    run_loop: Option<crystalline_core::automation::Loop>,
+    run_loop: Option<String>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let run_loop = run_loop
+        .map(|lp| lp.parse::<crystalline_core::automation::Loop>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--loop: {e}"))?;
     crystalline_service::run_mcp(
         embedded,
         db.as_deref(),
@@ -6247,7 +6258,7 @@ fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
 fn init_cli_tracing(command: Option<&Command>) {
     use tracing_subscriber::EnvFilter;
     let filter = match command {
-        Some(Command::Serve { .. } | Command::Mcp { .. }) => return,
+        Some(Command::Serve { .. } | Command::Mcp(_)) => return,
         Some(Command::Hook { .. }) => match EnvFilter::try_from_default_env() {
             Ok(filter) => filter,
             Err(_) => return,
@@ -7611,6 +7622,27 @@ mod tests {
         assert_eq!(name.as_deref(), Some("eng"));
         assert_eq!(path, None);
         assert_eq!(path_flag, None);
+    }
+
+    /// A run's local MCP entry names its domain and its loop.
+    #[test]
+    fn mcp_parses_the_runs_domain_and_loop() {
+        let cli = Cli::try_parse_from([
+            "crystalline",
+            "mcp",
+            "--unattended",
+            "--domain",
+            "eng",
+            "--loop",
+            "evolve",
+        ])
+        .unwrap();
+        let Some(Command::Mcp(args)) = cli.command else {
+            panic!("expected `mcp`");
+        };
+        assert!(args.unattended);
+        assert_eq!(args.domain.as_deref(), Some("eng"));
+        assert_eq!(args.run_loop.as_deref(), Some("evolve"));
     }
 
     /// With no name, `--path` names the folder the name is worked out from.
