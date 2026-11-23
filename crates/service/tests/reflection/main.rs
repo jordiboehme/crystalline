@@ -18,6 +18,7 @@ mod kept;
 mod mode_change;
 mod nudges;
 mod own_writes;
+mod page_rights;
 mod queue;
 mod reach;
 mod read_limit;

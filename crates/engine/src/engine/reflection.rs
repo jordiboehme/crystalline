@@ -1681,9 +1681,9 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        // PACT.md is written by curators; everyone else proposes a
-        // change through a thread on it.
-        let need = if p.sources.is_empty() && p.path != r::PACT_FILE {
+        // A pact file (PACT.md or a page pact) is written by curators;
+        // everyone else proposes a change through a thread on it.
+        let need = if p.sources.is_empty() && !r::is_pact_file(&p.path) {
             ReflectionRight::Edit
         } else {
             ReflectionRight::Curate
@@ -2562,8 +2562,8 @@ impl Engine {
         Ok(receipt(&final_text))
     }
 
-    /// The right to be in a reflection's room: edit, curate for `PACT.md`
-    /// (as its `PUT` takes). Public because `require_reflection` is
+    /// The right to be in a reflection's room: edit, curate for a pact file
+    /// (`PACT.md` or a page pact, as its `PUT` takes). Public because `require_reflection` is
     /// engine-private. A room is opened to write, so this is the write gate:
     /// a host lock whose holder went stale is taken over for a signed-in
     /// caller with the right, as a page write takes it.
@@ -2573,7 +2573,7 @@ impl Engine {
         path: &str,
         caller: &ReflectionCaller,
     ) -> Result<()> {
-        let need = if path == r::PACT_FILE {
+        let need = if r::is_pact_file(path) {
             ReflectionRight::Curate
         } else {
             ReflectionRight::Edit
@@ -2984,6 +2984,11 @@ impl Engine {
                 "PACT.md is the domain's agreement; edit it instead of moving it".into(),
             ));
         }
+        if let Some(page) = [from, to].into_iter().find_map(r::pact_page_of) {
+            return Err(EngineError::Invalid(format!(
+                "a page pact moves with its page and never on its own; move '{page}' instead"
+            )));
+        }
         // Every other page whose links the move rewrites waits: a rewrite
         // under an open room would race its next save. Screened from the
         // text on disk before anything moves, and relinked from this list
@@ -3269,8 +3274,14 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // A page pact alone is a curator's to delete, as to write.
+        let need = if r::is_pact_file(inner) {
+            ReflectionRight::Curate
+        } else {
+            ReflectionRight::Edit
+        };
         let access = self
-            .require_reflection_to_write(domain, caller, ReflectionRight::Edit)
+            .require_reflection_to_write(domain, caller, need)
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
