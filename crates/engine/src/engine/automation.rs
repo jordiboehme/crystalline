@@ -38,10 +38,10 @@ const RUNNER_MAX_BYTES: usize = 128;
 /// [`AGENT_TAKE_WINDOW`]: a run takes one lease per domain it works on, so
 /// this is room for a sweep of thirty domains, and a loop of takes is held
 /// back.
-pub const AGENT_TAKE_BUDGET: usize = 30;
+pub(crate) const AGENT_TAKE_BUDGET: usize = 30;
 
 /// The window [`AGENT_TAKE_BUDGET`] counts in: ten minutes.
-pub const AGENT_TAKE_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const AGENT_TAKE_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The lease takes each agent of the loops tried in the last
 /// [`AGENT_TAKE_WINDOW`], refused ones included, as a sliding window per
@@ -451,8 +451,8 @@ impl Engine {
     }
 
     /// [`Engine::automation_lease_take`], and for an agent of the loops
-    /// ([`Scope::Agent`]) the three guards of an agent's take: at most
-    /// [`AGENT_TAKE_BUDGET`] tries in [`AGENT_TAKE_WINDOW`], a loop the agent
+    /// ([`Scope::Agent`]) the three guards of an agent's take: at most 30
+    /// tries in ten minutes (`AGENT_TAKE_BUDGET`, `AGENT_TAKE_WINDOW`), a loop the agent
     /// runs only, and only while something is due for the loop on the domain.
     /// `force` lifts the wait after failed runs and nothing else, as
     /// `automation_status` with `force` does. Any other caller takes as
