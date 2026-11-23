@@ -1284,7 +1284,12 @@ pub(super) fn compose_reflection(
                 .collect()
         })
         .unwrap_or_default();
-    let mut prov = r::Provenance::new();
+    // The page's own record is the engine's, never the writer's: it stays
+    // as it was stored, whatever the text did to the sections.
+    let mut prov = r::Provenance {
+        sections: Default::default(),
+        page: stored.page.clone(),
+    };
     // How many sections under each heading text got their id in this
     // compose so far, for the key into `new_by_heading`. Only the minted
     // ones count, in page order: they are the sections the room saw without
@@ -1478,7 +1483,7 @@ fn stamp_reflected(text: &str, prov: &mut r::Provenance, ids: &[String]) -> Resu
             continue;
         };
         let hash = r::section_hash(&section.text);
-        let record = prov.entry(id.clone()).or_default();
+        let record = prov.sections.entry(id.clone()).or_default();
         if record.reflected.as_deref() != Some(hash.as_str()) {
             record.reflected = Some(hash);
             rehashed = true;
@@ -1971,7 +1976,7 @@ impl Engine {
                     refs.push(src);
                 }
             }
-            let record = prov.entry(id.clone()).or_default();
+            let record = prov.sections.entry(id.clone()).or_default();
             // A write never drops what the writer could not see: the
             // section's sources in a domain hidden from them stay as they
             // were. A source the writer sees is theirs to keep or leave out,
@@ -2042,7 +2047,7 @@ impl Engine {
                 {
                     continue;
                 }
-                let record = prov.entry(id.clone()).or_default();
+                let record = prov.sections.entry(id.clone()).or_default();
                 record.changed_by.clear();
                 record.changed_at = None;
                 record.answered_by = None;
@@ -3401,7 +3406,7 @@ impl Engine {
                 .iter()
                 .find(|s| s.id.as_deref() == Some(id.as_str()))
             {
-                let record = prov.entry(id.clone()).or_default();
+                let record = prov.sections.entry(id.clone()).or_default();
                 record.reflected = Some(r::section_hash(&section.text));
                 record.changed_by.clear();
                 record.changed_at = None;
@@ -3685,6 +3690,35 @@ mod tests {
             "{text}"
         );
         assert!(prov["cccc3333"].changed_by.is_empty(), "{prov:?}");
+    }
+
+    /// The page's own record survives a save that rewrites the sections: it
+    /// is the engine's, so the text a person or an agent sends neither
+    /// carries it nor can change it.
+    #[test]
+    fn a_save_keeps_the_page_record() {
+        let current = "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page:\n    owner: arch/overview.md\n---\n\n# A\n\n## One\n<!-- r:aaaa1111 -->\n\nFirst.\n";
+        let incoming = "---\nreflection:\n  _page:\n    owner: someone/else.md\n---\n\n# A\n\n## One\n<!-- r:aaaa1111 -->\n\nChanged.\n\n## Two\n\nNew.\n";
+        let Composed { text, prov, .. } = compose_reflection(
+            Some(current),
+            "",
+            incoming,
+            &SectionAuthors::plain(vec!["ada".into()]),
+            true,
+            "2026-11-20T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            prov.page.owner.as_deref(),
+            Some("arch/overview.md"),
+            "{prov:?}"
+        );
+        let stored = r::write_provenance(&text, &prov).unwrap();
+        assert_eq!(
+            r::read_provenance(&stored).page.owner.as_deref(),
+            Some("arch/overview.md"),
+            "{stored}"
+        );
     }
 
     #[test]

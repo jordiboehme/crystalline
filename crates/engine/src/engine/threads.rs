@@ -328,7 +328,8 @@ impl Engine {
                         ))
                     })?;
                     let mut prov = r::read_provenance(&page);
-                    prov.entry(id.to_string()).or_default().answered_by = Some(thread.id.clone());
+                    prov.sections.entry(id.to_string()).or_default().answered_by =
+                        Some(thread.id.clone());
                     Some(r::write_provenance(&page, &prov).map_err(EngineError::Invalid)?)
                 } else {
                     None
