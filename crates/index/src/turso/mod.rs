@@ -60,9 +60,9 @@ use crate::store::{
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FtsMode, GraphSlice, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery,
     InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, NewReflectionChunk, ObservationVector,
-    OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ReflectionRow,
-    ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchQuery, SectionVector, SpellingPlan,
-    Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
+    OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ReflectionReconcile,
+    ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchQuery, SectionVector,
+    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
     count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
     page_window, reference_match, referencing_domains_sql, rename_onto_taken_row,
     reset_spelled_references_sql, resolve_references_to_sql, resolve_spelled_references_sql,
@@ -1220,6 +1220,21 @@ fn domain_host_of(r: &Row) -> DomainHost {
 
 /// The read of one automation lease row, in [`automation_lease_of`]'s column
 /// order.
+/// The columns [`reconcile_of`] reads, in its order.
+const RECONCILE_SELECT: &str = "SELECT path, last_reconciled, outcome, pact_hash, version \
+     FROM reflection_reconcile";
+
+/// A [`RECONCILE_SELECT`] row.
+fn reconcile_of(row: &Row) -> Option<ReflectionReconcile> {
+    Some(ReflectionReconcile {
+        path: cell_text(row, 0)?,
+        last_reconciled: cell_text(row, 1)?,
+        outcome: cell_text(row, 2)?,
+        pact_hash: cell_text(row, 3)?,
+        version: cell_text(row, 4)?,
+    })
+}
+
 const AUTOMATION_LEASE_SQL: &str = "SELECT instance_id, account, runner, token, taken_at, renewed_at, unshared_at_start, due_at_start, pr_url, written FROM automation_lease WHERE domain_id=?1 AND loop_kind=?2";
 
 /// An [`AutomationLease`] from a row read by [`AUTOMATION_LEASE_SQL`]'s
@@ -3460,6 +3475,30 @@ impl ReadStore for TursoStore {
         row.map(|r| automation_lease_of(&r)).transpose()
     }
 
+    async fn reflection_reconcile(
+        &self,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<ReflectionReconcile>> {
+        let row = query_first(
+            &self.conn,
+            &format!("{RECONCILE_SELECT} WHERE domain_id=?1 AND path=?2"),
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.as_ref().and_then(reconcile_of))
+    }
+
+    async fn reflection_reconciles(&self, domain: DomainId) -> Result<Vec<ReflectionReconcile>> {
+        let rows = query_all(
+            &self.conn,
+            &format!("{RECONCILE_SELECT} WHERE domain_id=?1 ORDER BY path"),
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().filter_map(reconcile_of).collect())
+    }
+
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
         let rows = query_all(
             &self.conn,
@@ -3948,6 +3987,7 @@ impl Store for TursoStore {
                 "DELETE FROM automation_lease WHERE domain_id=?1",
                 "DELETE FROM automation_run WHERE domain_id=?1",
                 "DELETE FROM reflection_disclosure WHERE domain_id=?1",
+                "DELETE FROM reflection_reconcile WHERE domain_id=?1",
                 "DELETE FROM relation WHERE domain_id=?1",
                 "DELETE FROM link WHERE domain_id=?1",
                 "DELETE FROM domain WHERE id=?1",
@@ -5115,6 +5155,71 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn set_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        state: &ReflectionReconcile,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO reflection_reconcile \
+                 (domain_id, path, last_reconciled, outcome, pact_hash, version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(domain_id, path) DO UPDATE SET \
+                 last_reconciled=excluded.last_reconciled, outcome=excluded.outcome, \
+                 pact_hash=excluded.pact_hash, version=excluded.version",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(state.path.clone()),
+                    Value::Text(state.last_reconciled.clone()),
+                    Value::Text(state.outcome.clone()),
+                    Value::Text(state.pact_hash.clone()),
+                    Value::Text(state.version.clone()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn move_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let moving = vec![Value::Integer(domain.0), Value::Text(from.to_string())];
+        if query_first(
+            &self.conn,
+            "SELECT 1 FROM reflection_reconcile WHERE domain_id=?1 AND path=?2",
+            moving,
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "DELETE FROM reflection_reconcile WHERE domain_id=?1 AND path=?2",
+                vec![Value::Integer(domain.0), Value::Text(to.to_string())],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE reflection_reconcile SET path=?3 WHERE domain_id=?1 AND path=?2",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(from.to_string()),
+                    Value::Text(to.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn set_reflection_disclosures(
         &self,
         domain: DomainId,
@@ -5283,6 +5388,12 @@ impl Store for TursoStore {
         self.conn
             .execute(
                 "DELETE FROM reflection_chunk WHERE domain_id=?1 AND path=?2",
+                key.clone(),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM reflection_reconcile WHERE domain_id=?1 AND path=?2",
                 key.clone(),
             )
             .await?;

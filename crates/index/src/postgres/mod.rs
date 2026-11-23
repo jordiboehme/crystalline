@@ -130,12 +130,13 @@ use crate::store::{
     FileStamp, FtsMode, GraphSlice, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery,
     InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, NewReflectionChunk,
     OBSERVATION_VECTOR_CHUNK, ObservationVector, OutboundRef, Page, RebuildKind, RecentFilter,
-    ReferenceCandidates, ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode,
-    SearchQuery, SectionVector, SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, changed_spellings, count_references_to_sql, domain_url_needles, folder_slash,
-    in_transaction, names_a_domain_url, page_window, reference_match, referencing_domains_sql,
-    rename_onto_taken_row, reset_spelled_references_sql, resolve_references_to_sql,
-    resolve_spelled_references_sql, spelled_references_sql, spelling_plan,
+    ReferenceCandidates, ReflectionReconcile, ReflectionRow, ReflectionStamp, ScoredPair,
+    SearchHit, SearchMode, SearchQuery, SectionVector, SpellingPlan, Store, StoreInfo,
+    StoredEngram, Vocabulary, build_vocabulary, changed_spellings, count_references_to_sql,
+    domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
+    reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
+    resolve_references_to_sql, resolve_spelled_references_sql, spelled_references_sql,
+    spelling_plan,
 };
 use crate::store::{AutomationLease, AutomationRun, LeaseClaim, LeaseHolder};
 use crate::sweep::{SpelledRef, UnresolvedRef};
@@ -1947,6 +1948,22 @@ pub fn lead_vectors_sql(actor_screen: &str) -> String {
     )
 }
 
+/// A `reflection_reconcile` row: path, last reconciled, outcome, pact hash
+/// and version.
+type ReconcileTuple = (String, String, String, String, String);
+
+fn reconcile_of(
+    (path, last_reconciled, outcome, pact_hash, version): ReconcileTuple,
+) -> ReflectionReconcile {
+    ReflectionReconcile {
+        path,
+        last_reconciled,
+        outcome,
+        pact_hash,
+        version,
+    }
+}
+
 #[async_trait]
 impl ReadStore for PostgresStore {
     async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>> {
@@ -3625,6 +3642,37 @@ impl ReadStore for PostgresStore {
         row.map(|r| automation_lease_of(&r)).transpose()
     }
 
+    async fn reflection_reconcile(
+        &self,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<ReflectionReconcile>> {
+        let mut conn = self.acquire().await?;
+        let row: Option<ReconcileTuple> = sqlx::query_as(
+            "SELECT path, last_reconciled, outcome, pact_hash, version \
+             FROM reflection_reconcile WHERE domain_id=$1 AND path=$2",
+        )
+        .bind(domain.0)
+        .bind(path)
+        .fetch_optional(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(row.map(reconcile_of))
+    }
+
+    async fn reflection_reconciles(&self, domain: DomainId) -> Result<Vec<ReflectionReconcile>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<ReconcileTuple> = sqlx::query_as(
+            "SELECT path, last_reconciled, outcome, pact_hash, version \
+             FROM reflection_reconcile WHERE domain_id=$1 ORDER BY path COLLATE \"C\"",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows.into_iter().map(reconcile_of).collect())
+    }
+
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
         let mut conn = self.acquire().await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
@@ -4118,8 +4166,8 @@ impl Store for PostgresStore {
             let Some((id,)) = id else {
                 return Ok(false);
             };
-            // `domain_lock`, the two automation tables, `reflection_disclosure`
-            // and `tag_alias` name the row without a cascade, and `relation`
+            // `domain_lock`, the two automation tables, `reflection_disclosure`,
+            // `reflection_reconcile` and `tag_alias` name the row without a cascade, and `relation`
             // and `link` carry its id with no key at all, so each is cleared
             // before the row itself.
             for sql in [
@@ -4132,6 +4180,7 @@ impl Store for PostgresStore {
                 "DELETE FROM automation_lease WHERE domain_id=$1",
                 "DELETE FROM automation_run WHERE domain_id=$1",
                 "DELETE FROM reflection_disclosure WHERE domain_id=$1",
+                "DELETE FROM reflection_reconcile WHERE domain_id=$1",
                 "DELETE FROM relation WHERE domain_id=$1",
                 "DELETE FROM link WHERE domain_id=$1",
                 "DELETE FROM domain WHERE id=$1",
@@ -5337,6 +5386,69 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn set_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        state: &ReflectionReconcile,
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(
+            "INSERT INTO reflection_reconcile \
+             (domain_id, path, last_reconciled, outcome, pact_hash, version) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (domain_id, path) DO UPDATE SET \
+             last_reconciled=excluded.last_reconciled, outcome=excluded.outcome, \
+             pact_hash=excluded.pact_hash, version=excluded.version",
+        )
+        .bind(domain.0)
+        .bind(&state.path)
+        .bind(&state.last_reconciled)
+        .bind(&state.outcome)
+        .bind(&state.pact_hash)
+        .bind(&state.version)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn move_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        let there: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM reflection_reconcile WHERE domain_id=$1 AND path=$2")
+                .bind(domain.0)
+                .bind(from)
+                .fetch_optional(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+        if there.is_none() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM reflection_reconcile WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(to)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("UPDATE reflection_reconcile SET path=$3 WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(from)
+            .bind(to)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
     async fn set_reflection_disclosures(
         &self,
         domain: DomainId,
@@ -5526,6 +5638,12 @@ impl Store for PostgresStore {
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         sqlx::query("DELETE FROM reflection_chunk WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(path)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM reflection_reconcile WHERE domain_id=$1 AND path=$2")
             .bind(domain.0)
             .bind(path)
             .execute(&mut *c)

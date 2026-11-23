@@ -2654,6 +2654,27 @@ pub struct ReflectionStamp {
     pub modified: String,
 }
 
+/// The reconcile state of one Reflection page:
+/// [`ReadStore::reflection_reconcile`] and [`Store::set_reflection_reconcile`].
+/// Kept in the index beside the page row and never in the file, so a check
+/// that changes nothing makes no file change. The engine reads `outcome`;
+/// this crate keeps it as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectionReconcile {
+    /// The page's path inside `reflections/`.
+    pub path: String,
+    /// When the page was last reconciled, RFC 3339.
+    pub last_reconciled: String,
+    /// What that reconcile did to the page (`updated` or `unchanged`).
+    pub outcome: String,
+    /// The hash of the page's resolved pact chain and its page settings as
+    /// that reconcile saw them, so a change made on disk or by a pull is
+    /// seen later.
+    pub pact_hash: String,
+    /// The version of the queue item that reconcile settled.
+    pub version: String,
+}
+
 /// Which table a domain's files are kept in. Each table keeps its own rows;
 /// one body of code reads and writes them all, the table chosen here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3539,6 +3560,18 @@ pub trait ReadStore: Send + Sync {
     /// [`Store::set_reflection_disclosures`] stored. Sorted by path.
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>>;
 
+    /// The reconcile state of the page at `path` of `domain`'s Reflection,
+    /// or `None` when it has none.
+    async fn reflection_reconcile(
+        &self,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<ReflectionReconcile>>;
+
+    /// The reconcile state of every page of `domain`'s Reflection that has
+    /// one, sorted by path in byte order.
+    async fn reflection_reconciles(&self, domain: DomainId) -> Result<Vec<ReflectionReconcile>>;
+
     /// The lease of `loop_kind` on `domain` as stored, a stale one included.
     async fn automation_lease(
         &self,
@@ -4155,8 +4188,8 @@ pub trait Store: ReadStore {
     /// Insert or replace one reflection's row, keyed by `(domain, path)`.
     async fn upsert_reflection(&self, domain: DomainId, row: &ReflectionRow) -> Result<()>;
 
-    /// Remove one reflection's row and its chunks. `false` when there was no
-    /// row.
+    /// Remove one reflection's row, its chunks and its reconcile state.
+    /// `false` when there was no row.
     async fn delete_reflection(&self, domain: DomainId, path: &str) -> Result<bool>;
 
     /// Replace one page's chunk rows with a freshly computed set, carrying over
@@ -4303,6 +4336,23 @@ pub trait Store: ReadStore {
         path: &str,
         records: Option<&str>,
     ) -> Result<()>;
+
+    /// Replace the reconcile state of the page `state.path` of `domain`'s
+    /// Reflection with `state`. The state goes with the page row
+    /// ([`Store::delete_reflection`]) and with the domain row, and stays
+    /// through [`Store::clear_domain`], so a full reindex keeps it.
+    async fn set_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        state: &ReflectionReconcile,
+    ) -> Result<()>;
+
+    /// Carry the reconcile state of the page at `from` to `to`, for a page
+    /// move: a state at `to` is replaced, and a page with none at `from`
+    /// leaves `to` as it is. Two statements, so run it inside the caller's
+    /// transaction, with the page rows it moves beside.
+    async fn move_reflection_reconcile(&self, domain: DomainId, from: &str, to: &str)
+    -> Result<()>;
 
     /// Record one run of `loop_kind` on `domain`, then keep only the newest
     /// `keep` runs of that domain and loop.

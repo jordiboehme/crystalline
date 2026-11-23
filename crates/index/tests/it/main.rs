@@ -19,6 +19,7 @@ mod perf_meta;
 mod pg;
 mod plans;
 mod read_connections;
+mod reconcile;
 mod recovery;
 mod reflection_search;
 mod reindex;

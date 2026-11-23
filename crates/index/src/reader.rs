@@ -183,6 +183,8 @@ macro_rules! read_store_methods {
             fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>>;
             fn domain_host_held(&self, domain: DomainId) -> Result<Option<DomainHost>>;
             fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>>;
+            fn reflection_reconcile(&self, domain: DomainId, path: &str) -> Result<Option<ReflectionReconcile>>;
+            fn reflection_reconciles(&self, domain: DomainId) -> Result<Vec<ReflectionReconcile>>;
             fn automation_lease(&self, domain: DomainId, loop_kind: &str) -> Result<Option<AutomationLease>>;
             fn automation_runs(&self, domain: DomainId, loop_kind: &str, limit: usize) -> Result<Vec<AutomationRun>>;
             fn host_move_text(&self, domain: DomainId) -> Result<Option<String>>;
