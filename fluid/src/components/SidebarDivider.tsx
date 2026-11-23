@@ -8,21 +8,18 @@
  * same handlers serve a mouse, a pen and a finger.
  */
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import type { PointerEvent, ReactElement } from "react";
 
 import { NAV_WIDTH_MAX, NAV_WIDTH_MIN, clampNavWidth } from "../navWidth";
 
 export function SidebarDivider({
   width,
-  onDrag,
   onSettle,
   onReset,
 }: {
   /** The sidebar's width now. */
   width: number;
-  /** While dragging: the width the pointer asks for, already in range. */
-  onDrag: (width: number) => void;
   /** On release: the width the pointer asked for, not yet in range. */
   onSettle: (raw: number) => void;
   /** Double click: back to the default. */
@@ -30,13 +27,33 @@ export function SidebarDivider({
 }): ReactElement {
   const drag = useRef<{ x: number; width: number; raw: number } | null>(null);
 
+  // No text on the page may be picked up while the divider is dragged.
+  useEffect(
+    () => () => {
+      document.body.style.userSelect = "";
+    },
+    [],
+  );
+
+  // While dragging, the column and this divider are moved in the DOM and
+  // nothing else: the frame re-renders once, on release, with the settled
+  // width.
+  const show = (divider: HTMLElement, shown: number) => {
+    divider.setAttribute("aria-valuenow", String(shown));
+    const column = divider.parentElement;
+    if (column !== null) {
+      column.style.width = `${String(shown)}px`;
+      column.style.boxShadow = `-${String(shown)}px 0 0 var(--chrome)`;
+    }
+  };
+
   const move = (event: PointerEvent<HTMLDivElement>) => {
     const start = drag.current;
     if (start === null) {
       return;
     }
     start.raw = start.width + event.clientX - start.x;
-    onDrag(clampNavWidth(start.raw));
+    show(event.currentTarget, clampNavWidth(start.raw));
   };
   const end = (event: PointerEvent<HTMLDivElement>, settle: boolean) => {
     const start = drag.current;
@@ -44,6 +61,7 @@ export function SidebarDivider({
     if (start === null) {
       return;
     }
+    document.body.style.userSelect = "";
     try {
       event.currentTarget.releasePointerCapture(event.pointerId);
     } catch {
@@ -52,7 +70,7 @@ export function SidebarDivider({
     if (settle) {
       onSettle(start.raw);
     } else {
-      onDrag(start.width);
+      show(event.currentTarget, start.width);
     }
   };
 
@@ -71,6 +89,7 @@ export function SidebarDivider({
         }
         event.preventDefault();
         drag.current = { x: event.clientX, width, raw: width };
+        document.body.style.userSelect = "none";
         try {
           event.currentTarget.setPointerCapture(event.pointerId);
         } catch {
@@ -82,6 +101,9 @@ export function SidebarDivider({
         end(event, true);
       }}
       onPointerCancel={(event) => {
+        end(event, false);
+      }}
+      onLostPointerCapture={(event) => {
         end(event, false);
       }}
       onDoubleClick={onReset}

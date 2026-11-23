@@ -59,6 +59,10 @@ async function drag(page: Page, dx: number): Promise<void> {
   await page.mouse.up();
 }
 
+async function selectedText(page: Page): Promise<string> {
+  return page.evaluate(() => window.getSelection()?.toString() ?? "");
+}
+
 test.beforeEach(async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   await signIn(page);
@@ -71,6 +75,7 @@ test("the divider drags within its limits, remembers the width and resets", asyn
   const start = await widthOf(page);
 
   await drag(page, 100);
+  expect(await selectedText(page)).toBe("");
   await expect(divider(page)).toHaveAttribute("aria-valuenow", "356");
   expect(await widthOf(page)).toBe(start + 100);
 

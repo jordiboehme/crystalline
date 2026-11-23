@@ -966,7 +966,6 @@ export function Layout() {
                       open={navOpen}
                       rail={rail && wide}
                       width={navWidth}
-                      onDragWidth={setNavWidth}
                       onSettleWidth={settleNav}
                       onResetWidth={resetNavWidth}
                       onToggleRail={toggleRail}
@@ -1434,7 +1433,6 @@ function DomainSidebar({
   open,
   rail,
   width,
-  onDragWidth,
   onSettleWidth,
   onResetWidth,
   onToggleRail,
@@ -1446,7 +1444,6 @@ function DomainSidebar({
   rail: boolean;
   /** The column's width in pixels while it is expanded. */
   width: number;
-  onDragWidth: (width: number) => void;
   onSettleWidth: (raw: number) => void;
   onResetWidth: () => void;
   onToggleRail: () => void;
@@ -1676,7 +1673,6 @@ function DomainSidebar({
       {!rail && (
         <SidebarDivider
           width={width}
-          onDrag={onDragWidth}
           onSettle={onSettleWidth}
           onReset={onResetWidth}
         />
