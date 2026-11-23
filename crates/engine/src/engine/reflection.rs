@@ -3721,6 +3721,48 @@ mod tests {
         );
     }
 
+    /// A page record that does not read survives a save and a relink as it
+    /// was written: it is never dropped, whatever the text did.
+    #[test]
+    fn a_save_and_a_relink_keep_a_page_record_that_does_not_read() {
+        let record = "  _page:\n    owner: arch/overview.md\n    retired:\n      by: ada\n";
+        let body = "# A\n\n## One\n<!-- r:aaaa1111 -->\n\nSee [b](b.md).\n";
+        // The section reads as reflected, so the relink carries its hash and
+        // rewrites the block.
+        let reflected = r::section_hash(&r::split_sections(body)[1].text);
+        let current = format!(
+            "---\nreflection:\n  aaaa1111:\n    reflected: {reflected}\n{record}---\n\n{body}"
+        );
+        let incoming = "# A\n\n## One\n<!-- r:aaaa1111 -->\n\nChanged.\n";
+        let Composed { text, prov, .. } = compose_reflection(
+            Some(&current),
+            "",
+            incoming,
+            &SectionAuthors::plain(vec!["ada".into()]),
+            true,
+            "2026-11-20T00:00:00Z",
+        )
+        .unwrap();
+        let saved = r::write_provenance(&text, &prov).unwrap();
+        assert!(saved.contains(record), "{saved}");
+        assert_eq!(prov.page.unreadable, ["retired"]);
+        let rewrite = |s: &str| {
+            let n = s.matches("](b.md)").count();
+            (s.replace("](b.md)", "](c.md)"), n)
+        };
+        let relinked = r::relink(&current, "", &rewrite).unwrap();
+        assert_eq!(relinked.links, 1);
+        assert!(relinked.page.contains(record), "{}", relinked.page);
+        assert!(relinked.page.contains("](c.md)"), "{}", relinked.page);
+        assert_ne!(
+            r::read_provenance(&relinked.page)["aaaa1111"]
+                .reflected
+                .as_deref(),
+            Some(reflected.as_str()),
+            "the block was rewritten"
+        );
+    }
+
     #[test]
     fn the_starter_pact_says_how_structure_is_read() {
         let pact = pact_starter("eng");

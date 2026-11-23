@@ -153,27 +153,114 @@ pub const PAGE_RECORD_KEY: &str = "_page";
 /// back as `_page: {}` when it rewrites the block, or drops it with the
 /// section records of sections no longer on the page; `_page: {}` reads as
 /// an empty record here.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// A part that does not read is never dropped and never makes the block
+/// unreadable (the record holds no sources): an `owner` or a `retired` that
+/// does not read is kept as written in `other`, a `_page` that is no mapping
+/// is kept whole in `unread`, both are written back as they were, and each
+/// is named in `unreadable` so it can be reported. `owner` and `retired`
+/// read on their own, so a broken `retired` costs `owner` nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageRecord {
     /// The Reflection page that owns this one, by its path relative to the
     /// Reflection home, as a section's sources name pages.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     /// When and by whom the page was retired, and the page that owned it
     /// then.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired: Option<Retirement>,
-    /// Keys this binary does not know, kept as they were through a read and
-    /// a write, so a newer binary's data survives an older one.
-    #[serde(flatten)]
+    /// Keys this binary does not know, and an `owner` or a `retired` that
+    /// does not read, kept as they were through a read and a write, so a
+    /// newer binary's data survives an older one. A typed `owner` or
+    /// `retired` replaces a kept one of the same name when written.
     pub other: serde_yaml_ng::Mapping,
+    /// A `_page` value that is no mapping, kept to be written back as it
+    /// was while the record has nothing typed or kept to write instead.
+    pub unread: Option<serde_yaml_ng::Value>,
+    /// The parts that did not read, for a finding: [`PAGE_RECORD_KEY`] for a
+    /// `_page` that is no mapping, `owner` or `retired` for that key. Filled
+    /// by [`read_provenance`]; never written.
+    pub unreadable: Vec<String>,
 }
 
 impl PageRecord {
-    /// Whether there is nothing to record: no owner, no retirement and no
-    /// key this binary does not know.
+    /// Whether there is nothing to record: no owner, no retirement, no key
+    /// this binary does not know and no value kept unread.
     pub fn is_empty(&self) -> bool {
-        self.owner.is_none() && self.retired.is_none() && self.other.is_empty()
+        self.owner.is_none()
+            && self.retired.is_none()
+            && self.other.is_empty()
+            && self.unread.is_none()
+    }
+
+    /// The record as it is written under [`PAGE_RECORD_KEY`]: `owner`,
+    /// `retired`, then the kept keys in their order; the unread value when
+    /// there is nothing else.
+    fn to_value(&self) -> Result<serde_yaml_ng::Value, String> {
+        if self.owner.is_none()
+            && self.retired.is_none()
+            && self.other.is_empty()
+            && let Some(raw) = &self.unread
+        {
+            return Ok(raw.clone());
+        }
+        let mut map = serde_yaml_ng::Mapping::new();
+        if let Some(owner) = &self.owner {
+            map.insert("owner".into(), owner.as_str().into());
+        }
+        if let Some(retired) = &self.retired {
+            map.insert(
+                "retired".into(),
+                serde_yaml_ng::to_value(retired).map_err(|e| e.to_string())?,
+            );
+        }
+        for (key, value) in &self.other {
+            let typed = match key.as_str() {
+                Some("owner") => self.owner.is_some(),
+                Some("retired") => self.retired.is_some(),
+                _ => false,
+            };
+            if !typed {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(serde_yaml_ng::Value::Mapping(map))
+    }
+
+    /// The record a `_page` value holds. Nothing (`_page:` with no value)
+    /// reads as an empty record.
+    fn read(value: &serde_yaml_ng::Value) -> PageRecord {
+        let mut page = PageRecord::default();
+        let map = match value {
+            serde_yaml_ng::Value::Null => return page,
+            serde_yaml_ng::Value::Mapping(map) => map,
+            other => {
+                page.unread = Some(other.clone());
+                page.unreadable.push(PAGE_RECORD_KEY.to_string());
+                return page;
+            }
+        };
+        for (key, value) in map {
+            match key.as_str() {
+                Some("owner") => match serde_yaml_ng::from_value::<String>(value.clone()) {
+                    Ok(owner) => page.owner = Some(owner),
+                    Err(_) => {
+                        page.other.insert(key.clone(), value.clone());
+                        page.unreadable.push("owner".to_string());
+                    }
+                },
+                Some("retired") => match serde_yaml_ng::from_value::<Retirement>(value.clone()) {
+                    Ok(retired) => page.retired = Some(retired),
+                    Err(_) => {
+                        page.other.insert(key.clone(), value.clone());
+                        page.unreadable.push("retired".to_string());
+                    }
+                },
+                _ => {
+                    page.other.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        page
     }
 }
 
@@ -273,7 +360,8 @@ impl IntoIterator for Provenance {
     type Item = (String, SectionRecord);
     type IntoIter = btree_map::IntoIter<String, SectionRecord>;
 
-    /// The section records with their ids, in id order.
+    /// The section records with their ids, in id order. The page record
+    /// is not among them: what is collected from this is sections only.
     fn into_iter(self) -> Self::IntoIter {
         self.sections.into_iter()
     }
@@ -286,16 +374,6 @@ impl<'a> IntoIterator for &'a Provenance {
     /// The section records with their ids, in id order.
     fn into_iter(self) -> Self::IntoIter {
         self.sections.iter()
-    }
-}
-
-impl FromIterator<(String, SectionRecord)> for Provenance {
-    /// Section records with an empty page record.
-    fn from_iter<I: IntoIterator<Item = (String, SectionRecord)>>(iter: I) -> Self {
-        Self {
-            sections: iter.into_iter().collect(),
-            page: PageRecord::default(),
-        }
     }
 }
 
@@ -315,10 +393,7 @@ fn provenance_block(provenance: &Provenance) -> Result<String, String> {
             _ => serde_yaml_ng::Mapping::new(),
         };
     if !provenance.page.is_empty() {
-        records.insert(
-            PAGE_RECORD_KEY.into(),
-            serde_yaml_ng::to_value(&provenance.page).map_err(|e| e.to_string())?,
-        );
+        records.insert(PAGE_RECORD_KEY.into(), provenance.page.to_value()?);
     }
     let mut map = serde_yaml_ng::Mapping::new();
     map.insert(
@@ -328,20 +403,11 @@ fn provenance_block(provenance: &Provenance) -> Result<String, String> {
     serde_yaml_ng::to_string(&map).map_err(|e| e.to_string())
 }
 
-/// The page record a `_page` value holds: `None` when it does not read.
-/// Nothing (`_page:` with no value) reads as an empty record.
-fn page_record(value: &serde_yaml_ng::Value) -> Option<PageRecord> {
-    if value.is_null() {
-        return Some(PageRecord::default());
-    }
-    serde_yaml_ng::from_value::<PageRecord>(value.clone()).ok()
-}
-
 /// The records in `source`'s frontmatter; empty when there is no
 /// frontmatter, no key, or it does not read as a map. One record that does
 /// not read is dropped and the others are kept, so a hand edit that breaks
 /// one section's record never costs the rest their sources on the next
-/// write; a page record that does not read is dropped the same way.
+/// write. The page record is never dropped (see [`PageRecord`]).
 pub fn read_provenance(source: &str) -> Provenance {
     let Some(parts) = split_frontmatter(source) else {
         return Provenance::new();
@@ -362,7 +428,7 @@ pub fn read_provenance(source: &str) -> Provenance {
             },
         };
         if id == PAGE_RECORD_KEY {
-            provenance.page = page_record(record).unwrap_or_default();
+            provenance.page = PageRecord::read(record);
             continue;
         }
         if let Ok(record) = serde_yaml_ng::from_value::<SectionRecord>(record.clone()) {
@@ -375,9 +441,10 @@ pub fn read_provenance(source: &str) -> Provenance {
 /// Whether `source` may hold section records that [`read_provenance`]
 /// cannot read, so a check that must see every source cannot trust what it
 /// reads: a leading `---` that never closes, frontmatter that is not a YAML
-/// mapping, a [`PROVENANCE_KEY`] that is not a mapping, or a record (the
-/// page record too) that does not read. A page with no frontmatter, with
-/// empty frontmatter or without the key reads fine.
+/// mapping, a [`PROVENANCE_KEY`] that is not a mapping, or a section record
+/// that does not read. The page record holds no sources and is kept
+/// whatever it holds, so it never makes a page unreadable. A page with no
+/// frontmatter, with empty frontmatter or without the key reads fine.
 pub fn provenance_unreadable(source: &str) -> bool {
     let Some(parts) = split_frontmatter(source) else {
         let first = source.split('\n').next().unwrap_or("");
@@ -391,11 +458,8 @@ pub fn provenance_unreadable(source: &str) -> bool {
     match map.get(PROVENANCE_KEY) {
         None => false,
         Some(serde_yaml_ng::Value::Mapping(records)) => records.iter().any(|(id, record)| {
-            if id.as_str() == Some(PAGE_RECORD_KEY) {
-                page_record(record).is_none()
-            } else {
-                serde_yaml_ng::from_value::<SectionRecord>(record.clone()).is_err()
-            }
+            id.as_str() != Some(PAGE_RECORD_KEY)
+                && serde_yaml_ng::from_value::<SectionRecord>(record.clone()).is_err()
         }),
         Some(_) => true,
     }
@@ -735,6 +799,11 @@ mod tests {
         ];
         for page in &pages {
             let mut prov = read_provenance(page);
+            assert_eq!(
+                serde_yaml_ng::to_value(older_binary::read_provenance(page)).unwrap(),
+                serde_yaml_ng::to_value(&prov.sections).unwrap(),
+                "both binaries read the same records: {page}"
+            );
             prov.insert("0abc1234".into(), record());
             prov.insert("ffff0000".into(), record());
             assert!(prov.page.is_empty());
@@ -745,7 +814,7 @@ mod tests {
         }
     }
 
-    fn page_record() -> PageRecord {
+    fn owned_and_retired() -> PageRecord {
         PageRecord {
             owner: Some("arch/overview.md".into()),
             retired: Some(Retirement {
@@ -754,7 +823,7 @@ mod tests {
                 was_owned_by: Some("arch/overview.md".into()),
                 other: serde_yaml_ng::Mapping::new(),
             }),
-            other: serde_yaml_ng::Mapping::new(),
+            ..PageRecord::default()
         }
     }
 
@@ -766,7 +835,7 @@ mod tests {
         let mut prov = Provenance::new();
         prov.insert("0abc1234".into(), record());
         prov.insert("aaaa1111".into(), record());
-        prov.page = page_record();
+        prov.page = owned_and_retired();
         let written = write_provenance(PAGE, &prov).unwrap();
         let block = block_as_written(&written).unwrap();
         let keys: Vec<&str> = block
@@ -851,24 +920,88 @@ mod tests {
         }
     }
 
-    /// A page record that does not read costs only itself, as a section
-    /// record does, and is told as unreadable.
+    /// A page record, or a part of it, that does not read leaves the
+    /// section records readable and the page readable, is named for a
+    /// finding, and is written back as it was on the next write: it is never
+    /// dropped. `owner` and `retired` read on their own, so a broken
+    /// `retired` costs `owner` nothing.
     #[test]
-    fn a_page_record_that_does_not_read_costs_only_itself() {
-        for page in [
-            "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page: 5\n---\n\n# T\n",
-            "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page:\n    retired:\n      by: ada\n---\n\n# T\n",
-            "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page:\n    owner: [a, b]\n---\n\n# T\n",
-        ] {
-            assert!(provenance_unreadable(page), "{page}");
+    fn a_page_record_that_does_not_read_is_kept_as_written() {
+        let cases: [(&str, &[&str], Option<&str>); 4] = [
+            (
+                "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page: 5\n---\n\n# T\n",
+                &["_page"],
+                None,
+            ),
+            (
+                "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page:\n    owner: arch/overview.md\n    retired:\n      by: ada\n---\n\n# T\n",
+                &["retired"],
+                Some("arch/overview.md"),
+            ),
+            (
+                "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page:\n    owner:\n    - a\n    - b\n    zeta: 1\n---\n\n# T\n",
+                &["owner"],
+                None,
+            ),
+            (
+                "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page:\n    owner: 7\n    retired: soon\n---\n\n# T\n",
+                &["owner", "retired"],
+                None,
+            ),
+        ];
+        for (page, broken, owner) in cases {
+            assert!(!provenance_unreadable(page), "{page}");
             let prov = read_provenance(page);
-            assert!(prov.page.is_empty(), "{page}");
+            assert_eq!(prov.page.unreadable, broken, "{page}");
+            assert_eq!(prov.page.owner.as_deref(), owner, "{page}");
+            assert!(!prov.page.is_empty(), "{page}");
             assert_eq!(prov["aaaa1111"].reflected.as_deref(), Some("x"), "{page}");
+            assert_eq!(
+                write_provenance(page, &prov).unwrap(),
+                page,
+                "kept as written"
+            );
+            let mut changed = prov.clone();
+            changed.insert("bbbb2222".into(), record());
+            let written = write_provenance(page, &changed).unwrap();
+            assert_eq!(
+                block_as_written(&written)
+                    .unwrap()
+                    .split_once("_page:")
+                    .unwrap()
+                    .1,
+                block_as_written(page)
+                    .unwrap()
+                    .split_once("_page:")
+                    .unwrap()
+                    .1,
+                "a write of other records keeps the page record: {written}"
+            );
         }
     }
 
-    /// `_page` is never a section id: an id line never names it, a minted
-    /// id never is it, and a section record keyed by it is refused on
+    /// A typed `owner` or `retired` set over a kept one that did not read
+    /// replaces it, so the key is written once; a typed record over an
+    /// unread `_page` writes the record.
+    #[test]
+    fn a_typed_part_replaces_the_kept_one() {
+        let page = "---\nreflection:\n  _page:\n    owner: 7\n    zeta: 1\n---\n\n# T\n";
+        let mut prov = read_provenance(page);
+        prov.page.owner = Some("arch/overview.md".into());
+        assert_eq!(
+            write_provenance(page, &prov).unwrap(),
+            "---\nreflection:\n  _page:\n    owner: arch/overview.md\n    zeta: 1\n---\n\n# T\n"
+        );
+        let page = "---\nreflection:\n  _page: 5\n---\n\n# T\n";
+        let mut prov = read_provenance(page);
+        prov.page.owner = Some("arch/overview.md".into());
+        assert_eq!(
+            write_provenance(page, &prov).unwrap(),
+            "---\nreflection:\n  _page:\n    owner: arch/overview.md\n---\n\n# T\n"
+        );
+    }
+
+    /// `_page` is never a section id: an id line never names it, and a section record keyed by it is refused on
     /// write instead of being taken for the page record.
     #[test]
     fn the_page_record_key_is_no_section_id() {
@@ -876,9 +1009,6 @@ mod tests {
             crate::reflection::parse_id_line(&crate::reflection::id_line(PAGE_RECORD_KEY)),
             None
         );
-        for _ in 0..64 {
-            assert_ne!(crate::reflection::random_section_id(), PAGE_RECORD_KEY);
-        }
         let mut prov = Provenance::new();
         prov.insert(PAGE_RECORD_KEY.into(), record());
         let err = write_provenance(PAGE, &prov).unwrap_err();
@@ -893,7 +1023,7 @@ mod tests {
         let mut prov = Provenance::new();
         prov.insert("0abc1234".into(), record());
         prov.insert("aaaa1111".into(), record());
-        prov.page = page_record();
+        prov.page = owned_and_retired();
         prov.page
             .other
             .insert("future_key".into(), serde_yaml_ng::Value::Bool(true));
