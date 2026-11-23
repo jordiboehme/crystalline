@@ -2,6 +2,7 @@
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
+use super::page::{PAGE_PACT_SUFFIX, pact_page_of};
 use crate::parse::{body_lines, parse_heading};
 
 /// The folder under a domain root that holds the Reflection.
@@ -98,6 +99,11 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
     if is_pact(path) && path != PACT_FILE {
         return Err(format!("'{path}' names the pact; spell it {PACT_FILE}"));
     }
+    if path.ends_with(PAGE_PACT_SUFFIX) && pact_page_of(path).is_none() {
+        return Err(format!(
+            "'{path}' ends in {PAGE_PACT_SUFFIX}, which holds a page's pact, and names no page that could have one"
+        ));
+    }
     Ok(())
 }
 
@@ -138,6 +144,12 @@ pub enum ReflectionFile {
     Page(String),
     /// `PACT.md` at the folder root.
     Pact,
+    /// The page pact of the page at `of` (`<page>.pact.md` beside it):
+    /// extra instructions for that page and the pages that follow it. Told
+    /// by its path alone, as a threads file is, so whether the page exists
+    /// is asked where the pages are known
+    /// ([`is_loose_pact`](super::is_loose_pact)).
+    PagePact { of: String },
     /// The threads of the reflection at `of`.
     Threads { of: String },
     /// The baseline of the reflection at `of`.
@@ -162,7 +174,10 @@ fn threads_of(path: &str) -> Option<String> {
 /// ASCII case folded, as the folder is. The baseline prefix is read first,
 /// so a baseline of a page or of a threads file is a baseline. A threads
 /// file or a baseline whose page could not be a reflection (hidden, reserved,
-/// climbing out) is `Other`, like any stray file.
+/// climbing out) is `Other`, like any stray file. A path ending in
+/// [`PAGE_PACT_SUFFIX`] is the page pact of the page beside it, by its path
+/// alone; one whose page could not be a page (`PACT.pact.md`, a pact of a
+/// pact or of a threads file, a reserved or hidden name) is `Other`.
 pub fn classify(path: &str) -> ReflectionFile {
     // Nothing under assets/ is a reflection: an allowlisted file is the
     // Reflection's own attachment, everything else there is nobody's.
@@ -188,6 +203,12 @@ pub fn classify(path: &str) -> ReflectionFile {
         return match threads_of(path) {
             Some(of) => ReflectionFile::Threads { of },
             None => ReflectionFile::Other,
+        };
+    }
+    if path.ends_with(PAGE_PACT_SUFFIX) {
+        return match pact_page_of(path) {
+            Some(of) if validate_reflection_path(path).is_ok() => ReflectionFile::PagePact { of },
+            _ => ReflectionFile::Other,
         };
     }
     if validate_reflection_path(path).is_ok() {

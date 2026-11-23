@@ -4238,7 +4238,7 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
     // most one pass that finds an ordinary engram, as before, or nothing.
     let layout = crystalline_core::DomainLayout::bare(crystalline_core::ReflectionMode::Effective);
     let class = layout.classify(&rel);
-    // A Reflection's pages, the pact, threads and files are indexed, so a
+    // A Reflection's pages, the pact, page pacts, threads and files are indexed, so a
     // change to one wakes a targeted pass, present or gone. The hidden
     // baseline and anything else in the folder are no rows; a vanished
     // `Other` path may have been a folder, so it escalates as every other
@@ -4251,6 +4251,7 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
         return match file {
             ReflectionFile::Page(_)
             | ReflectionFile::Pact
+            | ReflectionFile::PagePact { .. }
             | ReflectionFile::Threads { .. }
             | ReflectionFile::Asset(_) => DirtyKind::Path(rel),
             ReflectionFile::Baseline { .. } => DirtyKind::Ignore,
