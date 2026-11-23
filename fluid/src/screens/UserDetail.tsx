@@ -1,14 +1,18 @@
 /**
  * One account and every lever an admin has on it: display name, role,
- * Reflection level, state, password reset, GitHub link and delete.
+ * Reflection level, state, write list, password reset, GitHub link and
+ * delete, and what it holds in drafts.
  *
  * It has its own address, `/admin/users/<name>`, so it can be linked and the
  * back button closes it. Beside the table at wide widths, the whole page at
  * narrow ones; the list screen decides which.
  *
- * There is no route that reads one account, so the panel finds it with a
- * search by its name (see `fetchUser`). The row the table already holds is
- * shown while that read runs, so opening a row draws at once.
+ * The panel reads the account with `GET /users/{name}`. The row the table
+ * already holds is shown while that read runs, so opening a row draws at
+ * once; the write list and drafts follow when the read answers.
+ *
+ * Opened from the list, the panel takes the focus on its heading; the list
+ * hands it back to the row when the panel closes.
  *
  * Nothing here asks the server whether an action is allowed before offering
  * it; the server decides and its sentence comes back through `onNotice`. The
@@ -18,18 +22,19 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
-import type { PatchUserBody, Role, User } from "../api/model";
-import type { UsersPage } from "../api/users";
+import type { DraftCount, PatchUserBody, Role, User } from "../api/model";
+import type { AccountDetail, UsersPage } from "../api/users";
 import {
   USERS_QUERY_KEY,
   deleteUser,
   fetchUser,
   patchUser,
   resetPassword,
+  setUserWrites,
   unlinkUserGithub,
   userKey,
 } from "../api/users";
@@ -56,6 +61,7 @@ export function UserDetail({
   fromList,
   isSelf,
   listTo,
+  focusOnOpen,
   onNotice,
 }: {
   name: string;
@@ -64,6 +70,12 @@ export function UserDetail({
   isSelf: boolean;
   /** The list's address, with its search, filters and page. */
   listTo: string;
+  /**
+   * Whether to put the focus on the heading once it is drawn: true when the
+   * panel was opened from the list, false for an address opened directly.
+   * Read once; the list mounts one panel per account.
+   */
+  focusOnOpen: boolean;
   onNotice: (notice: Notice | null) => void;
 }) {
   const queryClient = useQueryClient();
@@ -71,8 +83,19 @@ export function UserDetail({
   const account = useQuery({
     queryKey: userKey(name),
     queryFn: () => fetchUser(name),
-    placeholderData: () => fromList,
+    placeholderData: (): AccountDetail | undefined =>
+      fromList && { user: fromList, writes: null, drafts: null, loaded: false },
   });
+
+  // The heading takes the focus the first time it is drawn, whichever of
+  // the two headings that is.
+  const wantsFocus = useRef(focusOnOpen);
+  const heading = useCallback((node: HTMLHeadingElement | null) => {
+    if (node && wantsFocus.current) {
+      wantsFocus.current = false;
+      node.focus();
+    }
+  }, []);
 
   const invalidate = () =>
     refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY });
@@ -83,13 +106,16 @@ export function UserDetail({
     // and to every cached page, roll back on refusal, resettle from the server.
     onMutate: async (body) => {
       await queryClient.cancelQueries({ queryKey: USERS_QUERY_KEY });
-      const one = queryClient.getQueryData<User | null>(userKey(name));
+      const one = queryClient.getQueryData<AccountDetail | null>(userKey(name));
       const pages = queryClient.getQueriesData<UsersPage>({
         queryKey: [...USERS_QUERY_KEY, "page"],
       });
       const current = one ?? account.data;
       if (current) {
-        queryClient.setQueryData(userKey(name), withPatch(current, body));
+        queryClient.setQueryData<AccountDetail>(userKey(name), {
+          ...current,
+          user: withPatch(current.user, body),
+        });
       }
       queryClient.setQueriesData<UsersPage>(
         { queryKey: [...USERS_QUERY_KEY, "page"] },
@@ -152,6 +178,29 @@ export function UserDetail({
     },
   });
 
+  const writes = useMutation({
+    mutationFn: (list: string[] | null) => setUserWrites(name, list),
+    onMutate: () => {
+      onNotice(null);
+    },
+    onSuccess: (stored) => {
+      queryClient.setQueryData<AccountDetail | null>(
+        userKey(name),
+        (old) => old && { ...old, writes: stored },
+      );
+      onNotice({
+        kind: "done",
+        text:
+          stored === null
+            ? `Removed the write list of ${name}.`
+            : `Saved the write list of ${name}.`,
+      });
+    },
+    onError: (error: Error) => {
+      onNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+
   const remove = useMutation({
     mutationFn: () => deleteUser(name),
     onSuccess: () => {
@@ -197,7 +246,12 @@ export function UserDetail({
 
       {shown === null && (
         <>
-          <h2 id="user-detail-heading" className="text-lg font-semibold">
+          <h2
+            id="user-detail-heading"
+            ref={heading}
+            tabIndex={-1}
+            className="text-lg font-semibold focus:outline-none"
+          >
             No such account
           </h2>
           <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -208,8 +262,9 @@ export function UserDetail({
 
       {shown && (
         <AccountFields
-          key={shown.name}
-          account={shown}
+          key={shown.user.name}
+          detail={shown}
+          heading={heading}
           isSelf={isSelf}
           onPatch={(body) => {
             patch.mutate(body);
@@ -221,6 +276,10 @@ export function UserDetail({
             unlink.mutate();
           }}
           unlinking={unlink.isPending}
+          onWrites={(list) => {
+            writes.mutate(list);
+          }}
+          savingWrites={writes.isPending}
           onDelete={() => {
             remove.mutate();
           }}
@@ -231,23 +290,37 @@ export function UserDetail({
 }
 
 function AccountFields({
-  account,
+  detail,
+  heading,
   isSelf,
   onPatch,
   onReset,
   onUnlink,
   unlinking,
+  onWrites,
+  savingWrites,
   onDelete,
 }: {
-  account: User;
+  detail: AccountDetail;
+  heading: (node: HTMLHeadingElement | null) => void;
   isSelf: boolean;
   onPatch: (body: PatchUserBody) => void;
   onReset: (password: string) => void;
   onUnlink: () => void;
   unlinking: boolean;
+  onWrites: (list: string[] | null) => void;
+  savingWrites: boolean;
   onDelete: () => void;
 }) {
+  const account = detail.user;
+  // The field follows a change made elsewhere (another tab, a refresh) as
+  // long as nothing was typed into it; typed text is never overwritten.
   const [display, setDisplay] = useState(account.display);
+  const [displayBase, setDisplayBase] = useState(account.display);
+  if (account.display !== displayBase) {
+    setDisplayBase(account.display);
+    if (display === displayBase) setDisplay(account.display);
+  }
   const [password, setPassword] = useState("");
   const [resetting, setResetting] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -263,7 +336,12 @@ function AccountFields({
   return (
     <>
       <header>
-        <h2 id="user-detail-heading" className="text-lg font-semibold">
+        <h2
+          id="user-detail-heading"
+          ref={heading}
+          tabIndex={-1}
+          className="text-lg font-semibold focus:outline-none"
+        >
           {account.display}
         </h2>
         <p className="font-mono text-sm text-slate-500 dark:text-slate-400">
@@ -448,25 +526,15 @@ function AccountFields({
         </div>
       </div>
 
-      <div className="flex flex-col gap-1 text-sm">
-        <span className={TERM}>Write list</span>
-        <p className="text-slate-600 dark:text-slate-300">
-          The domains this account may write to are set on the server with{" "}
-          <code className="font-mono">
-            crystalline users writes {account.name}
-          </code>
-          .
-        </p>
-      </div>
+      <WriteList
+        name={account.name}
+        loaded={detail.loaded}
+        stored={detail.writes}
+        saving={savingWrites}
+        onSave={onWrites}
+      />
 
-      <div className="flex flex-col gap-1 text-sm">
-        <span className={TERM}>Drafts</span>
-        <p className="text-slate-600 dark:text-slate-300">
-          A delete keeps the account&apos;s drafts under its name. End them
-          afterwards under &ldquo;End a removed account&apos;s drafts&rdquo; on
-          the list.
-        </p>
-      </div>
+      <Drafts loaded={detail.loaded} drafts={detail.drafts} />
 
       {/*
         Two steps rather than a browser confirm: a dialog the browser owns
@@ -531,6 +599,147 @@ function AccountFields({
         )}
       </div>
     </>
+  );
+}
+
+/** The entries typed into the write list field, split at commas. */
+function writeEntries(text: string): string[] {
+  return text
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+}
+
+/**
+ * The domains the account may write to. No list means it writes wherever its
+ * role and memberships allow; a list only lowers that. Typed as entries
+ * separated by commas, each a domain name or a name prefix ending in `*`;
+ * the server checks them as `crystalline users writes` does.
+ */
+function WriteList({
+  name,
+  loaded,
+  stored,
+  saving,
+  onSave,
+}: {
+  name: string;
+  loaded: boolean;
+  stored: string[] | null;
+  saving: boolean;
+  onSave: (list: string[] | null) => void;
+}) {
+  const storedText = (stored ?? []).join(", ");
+  const [text, setText] = useState(storedText);
+  const [base, setBase] = useState(storedText);
+  // A list changed elsewhere replaces the field while nothing is typed in
+  // it, and a save shows the list as stored (sorted, repeats gone).
+  if (storedText !== base) {
+    setBase(storedText);
+    const typed = [...new Set(writeEntries(text))].sort().join(", ");
+    if (text === base || typed === [...(stored ?? [])].sort().join(", ")) {
+      setText(storedText);
+    }
+  }
+  const entries = writeEntries(text);
+  const unchanged =
+    [...new Set(entries)].sort().join(", ") ===
+    [...(stored ?? [])].sort().join(", ");
+
+  return (
+    <form
+      className="flex flex-col gap-1"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSave(entries.length === 0 ? null : entries);
+      }}
+    >
+      <span className={TERM}>Write list</span>
+      {!loaded ? (
+        <p className="text-sm text-slate-500 dark:text-slate-400">Loading...</p>
+      ) : (
+        <>
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            {stored === null
+              ? "No list: it writes wherever its role and memberships allow."
+              : "It writes only to these domains."}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              aria-label={`Write list for ${name}`}
+              value={text}
+              autoComplete="off"
+              placeholder="eng, agents-*"
+              onChange={(event) => {
+                setText(event.target.value);
+              }}
+              className={`min-w-0 flex-1 font-mono ${FIELD}`}
+            />
+            <button
+              type="submit"
+              aria-label={`Save write list for ${name}`}
+              disabled={saving || unchanged}
+              className={SECONDARY}
+            >
+              Save
+            </button>
+            {stored !== null && (
+              <button
+                type="button"
+                aria-label={`Remove the write list of ${name}`}
+                disabled={saving}
+                onClick={() => {
+                  onSave(null);
+                }}
+                className={SECONDARY}
+              >
+                Remove
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </form>
+  );
+}
+
+/**
+ * What the account holds in drafts, counted per domain. Read only: the
+ * drafts are the person's own.
+ */
+function Drafts({
+  loaded,
+  drafts,
+}: {
+  loaded: boolean;
+  drafts: DraftCount[] | null;
+}) {
+  return (
+    <div className="flex flex-col gap-1 text-sm">
+      <span className={TERM}>Drafts</span>
+      {!loaded ? (
+        <p className="text-slate-500 dark:text-slate-400">Loading...</p>
+      ) : drafts === null ? (
+        <p className="text-slate-600 dark:text-slate-300">
+          The drafts could not be read.
+        </p>
+      ) : drafts.length === 0 ? (
+        <p className="text-slate-600 dark:text-slate-300">No drafts.</p>
+      ) : (
+        <ul className="flex flex-col gap-0.5">
+          {drafts.map((row) => (
+            <li key={row.domain}>
+              <span className="font-mono">{row.domain}</span>:{" "}
+              {row.count === 1 ? "1 draft" : `${String(row.count)} drafts`}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-slate-500 dark:text-slate-400">
+        Drafts belong to the person, so they are only counted here. A delete
+        keeps them under the name; end them afterwards on the list.
+      </p>
+    </div>
   );
 }
 

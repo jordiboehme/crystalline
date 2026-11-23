@@ -3,11 +3,12 @@
  * server refuses everyone else, and the screen never renders for them.
  */
 
-import { api, encodeSegment } from "./client";
+import { ApiProblem, api, encodeSegment } from "./client";
 import type {
   BulkBody,
   BulkResult,
   CreateUserBody,
+  DraftCount,
   GithubUnlinkResponse,
   KindFilter,
   MyProfileBody,
@@ -17,8 +18,10 @@ import type {
   SortDir,
   StateFilter,
   User,
+  UserDetailResponse,
   UserResponse,
   UsersResponse,
+  WritesResponse,
 } from "./model";
 
 /** The cache key of the account list. */
@@ -43,10 +46,34 @@ export interface UsersPageRequest {
   size: number;
 }
 
-/** One page of accounts and how many match in all. */
+/** One page of accounts, how many match in all, and which page it is. */
 export interface UsersPage {
   users: User[];
   total: number;
+  /** The page and page size this answer is for. */
+  page: number;
+  size: number;
+}
+
+/**
+ * One account as its detail panel shows it. `loaded` is false while the
+ * panel shows the table's row and its own read has not answered yet, so the
+ * write list and drafts are not known.
+ */
+export interface AccountDetail {
+  user: User;
+  /** The write list, or `null` when the account has none. */
+  writes: string[] | null;
+  /** Drafts per domain, or `null` when they could not be read. */
+  drafts: DraftCount[] | null;
+  loaded: boolean;
+}
+
+/** The day after a `YYYY-MM-DD` day, in the same form. */
+function nextDay(day: string): string {
+  const at = new Date(`${day}T00:00:00Z`);
+  at.setUTCDate(at.getUTCDate() + 1);
+  return at.toISOString().slice(0, 10);
 }
 
 /** The cache key of one page, under the list's own key so a refresh reaches both. */
@@ -72,30 +99,57 @@ export async function fetchUsersPage(
   if (request.seenAfter) {
     params.set("seen_after", `${request.seenAfter}T00:00:00Z`);
   }
+  // "Seen until" a day includes that day: up to the start of the next one.
   if (request.seenBefore) {
-    params.set("seen_before", `${request.seenBefore}T00:00:00Z`);
+    params.set("seen_before", `${nextDay(request.seenBefore)}T00:00:00Z`);
   }
   params.set("sort", request.sort);
   params.set("dir", request.dir);
   params.set("page", String(request.page));
   params.set("limit", String(request.size));
   const listing = await api<UsersResponse>(`/users?${params.toString()}`);
-  return { users: listing.users, total: listing.total };
+  return {
+    users: listing.users,
+    total: listing.total,
+    page: request.page,
+    size: request.size,
+  };
 }
 
 /**
- * One account by its login name, or `null` when there is none. There is no
- * route for a single account, so this searches by the name and keeps the exact
- * match: a search for `eddy` also finds `eddy2`.
+ * One account by its login name with its write list and drafts, or `null`
+ * when there is no such account.
  */
-export async function fetchUser(name: string): Promise<User | null> {
-  const params = new URLSearchParams({ q: name });
-  const listing = await api<UsersResponse>(`/users?${params.toString()}`);
-  const wanted = name.toLowerCase();
-  return (
-    listing.users.find((account) => account.name.toLowerCase() === wanted) ??
-    null
+export async function fetchUser(name: string): Promise<AccountDetail | null> {
+  try {
+    const answer = await api<UserDetailResponse>(
+      `/users/${encodeSegment(name)}`,
+    );
+    return {
+      user: answer.user,
+      writes: answer.writes ?? null,
+      drafts: answer.drafts ?? null,
+      loaded: true,
+    };
+  } catch (error) {
+    if (error instanceof ApiProblem && error.status === 404) return null;
+    throw error;
+  }
+}
+
+/**
+ * Replace an account's write list, or remove it with `null`. Answers the
+ * list as stored.
+ */
+export async function setUserWrites(
+  name: string,
+  writes: string[] | null,
+): Promise<string[] | null> {
+  const answer = await api<WritesResponse>(
+    `/users/${encodeSegment(name)}/writes`,
+    { method: "PUT", body: JSON.stringify({ writes }) },
   );
+  return answer.writes ?? null;
 }
 
 /** Every account, by name. */

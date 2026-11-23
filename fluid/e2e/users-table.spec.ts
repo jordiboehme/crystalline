@@ -85,6 +85,8 @@ test("search, sort and the open account live in the address", async ({
   await expect(
     page.getByRole("combobox", { name: `Role for ${USER}` }),
   ).toHaveValue("admin");
+  // Opened from the list, the panel has the focus on its heading.
+  await expect(page.locator("#user-detail-heading")).toBeFocused();
 
   // The back button closes the account and keeps the list as it was.
   await page.goBack();
@@ -96,6 +98,8 @@ test("search, sort and the open account live in the address", async ({
   await expect(page.getByRole("link", { name: "Back to users" })).toHaveCount(
     0,
   );
+  // And the focus is back on the row the account was opened from.
+  await expect(table.getByRole("link", { name: USER })).toBeFocused();
 });
 
 test("a selection is deactivated and reactivated in bulk", async ({ page }) => {
@@ -131,6 +135,25 @@ test("a selection is deactivated and reactivated in bulk", async ({ page }) => {
   await bar.getByRole("button", { name: "Reactivate 2 accounts" }).click();
   await expect(results).toContainText("Reactivate: 2 done.");
   await expect(table.getByText("Active")).toHaveCount(2);
+
+  // One account gets a write list, saved and read back.
+  const [first] = names;
+  if (first === undefined) throw new Error("no account");
+  await page.goto(`admin/users/${first}`);
+  await page
+    .getByRole("textbox", { name: `Write list for ${first}` })
+    .fill("eng, agents-*");
+  await page
+    .getByRole("button", { name: `Save write list for ${first}` })
+    .click();
+  await expect(
+    page.getByText(`Saved the write list of ${first}.`),
+  ).toBeVisible();
+  await page.reload();
+  await expect(
+    page.getByRole("textbox", { name: `Write list for ${first}` }),
+  ).toHaveValue("agents-*, eng");
+  await expect(page.getByText("No drafts.")).toBeVisible();
 
   for (const name of names) {
     await deleteAccount(page, name);

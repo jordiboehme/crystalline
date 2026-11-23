@@ -38,11 +38,14 @@ export type {
   BulkAction,
   BulkBody,
   BulkResult,
+  DraftCount,
   KindFilter,
   SignInKind,
   SortColumn,
   SortDir,
   StateFilter,
+  UserDetailResponse,
+  WritesResponse,
 } from "./gen";
 
 /** What `POST /users` takes. */

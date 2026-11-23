@@ -94,11 +94,38 @@ function listingFor(path: string, rows: User[] = accounts()) {
   return { users, total: users.length };
 }
 
-/** The app, signed in as `root` in the given role, with the listing served. */
+/** What `GET /users/{name}` answers for a fixture account. */
+function detailOf(name: string, extra: Record<string, unknown> = {}) {
+  return { user: account(name), writes: null, drafts: [], ...extra };
+}
+
+/**
+ * The app, signed in as `root` in the given role, with the listing served.
+ *
+ * Every fixture account answers `GET /users/{name}` with its detail, or with
+ * what `reads` gives for its name; a route in `routes` for the same address
+ * answers its writes.
+ */
 function serveAs(
   role: "admin" | "editor",
   routes: Record<string, Answer> = {},
+  reads: Record<string, Answer> = {},
 ) {
+  const perAccount = Object.fromEntries(
+    accounts().map(({ name }): [string, Answer] => [
+      `/users/${name}`,
+      (path, init) => {
+        if ((init?.method ?? "GET") === "GET") {
+          const read = reads[name];
+          return read ? read(path, init) : detailOf(name);
+        }
+        const write = routes[`/users/${name}`];
+        if (!write)
+          throw new ApiProblem(404, "not found", `no stub for ${path}`);
+        return write(path, init);
+      },
+    ]),
+  );
   apiMock.mockImplementation(
     answersFor({
       "/auth/me": () =>
@@ -106,6 +133,7 @@ function serveAs(
       "/domains": domainsResponse,
       "/users": (path) => listingFor(path),
       ...routes,
+      ...perAccount,
     }),
   );
 }
@@ -371,9 +399,10 @@ describe("the users table", () => {
       "token_only",
     );
     await user.selectOptions(within(find).getByLabelText("GitHub"), "false");
-    await user.type(within(find).getByLabelText("Seen before"), "2026-05-06");
+    await user.type(within(find).getByLabelText("Seen until"), "2026-05-06");
+    // Until a day includes the day: up to the start of the next one.
     await waitFor(() => {
-      expect(lastListing().get("seen_before")).toBe("2026-05-06T00:00:00Z");
+      expect(lastListing().get("seen_before")).toBe("2026-05-07T00:00:00Z");
     });
     const sent = lastListing();
     expect(sent.get("state")).toBe("active");
@@ -520,18 +549,19 @@ describe("an account's detail panel", () => {
     ).toHaveTextContent("Users");
   });
 
-  it("finds a linked account by its exact name", async () => {
-    const eddy2 = { ...account("eddy"), name: "eddy2", display: "Eddy Two" };
-    serveAs("admin", {
-      "/users": (path) => listingFor(path, [eddy2, ...accounts()]),
-    });
+  it("reads a linked account from its own address", async () => {
+    serveAs("admin");
     renderApp("/admin/users/eddy");
 
     const panel = await panelFor("eddy");
     expect(
       within(panel).getByRole("heading", { name: "Eddy" }),
     ).toBeInTheDocument();
-    expect(apiMock).toHaveBeenCalledWith("/users?q=eddy");
+    expect(apiMock).toHaveBeenCalledWith("/users/eddy");
+    // Opened directly, the panel leaves the focus where the page put it.
+    expect(
+      within(panel).getByRole("heading", { name: "Eddy" }),
+    ).not.toHaveFocus();
   });
 
   it("says when there is no such account", async () => {
@@ -638,20 +668,20 @@ describe("an account's detail panel", () => {
   });
 
   it("takes a refused change back even before the panel has read the account", async () => {
-    serveAs("admin", {
-      // The panel's own read never answers, so it shows the table's row.
-      "/users": (path) =>
-        path.includes("limit=")
-          ? listingFor(path)
-          : new Promise(() => undefined),
-      "/users/root": () => {
-        throw new ApiProblem(
-          409,
-          "conflict",
-          "add or enable another admin first",
-        );
+    serveAs(
+      "admin",
+      {
+        "/users/root": () => {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "add or enable another admin first",
+          );
+        },
       },
-    });
+      // The panel's own read never answers, so it shows the table's row.
+      { root: () => new Promise(() => undefined) },
+    );
     renderApp("/admin/users/root");
 
     const panel = await panelFor("root");
@@ -799,20 +829,196 @@ describe("an account's detail panel", () => {
     expect(within(panel).queryByRole("button", { name: /unlink/i })).toBeNull();
   });
 
-  it("names how to set the write list", async () => {
-    serveAs("admin");
+  it("shows that an account has no write list, and saves a typed one", async () => {
+    const saved = vi.fn(() => ({ name: "nora", writes: ["agents-*", "eng"] }));
+    serveAs("admin", { "/users/nora/writes": () => saved() });
     renderApp("/admin/users/nora");
     const panel = await panelFor("nora");
     expect(
-      within(panel).getByText("crystalline users writes nora"),
+      await within(panel).findByText(/No list: it writes wherever/),
     ).toBeInTheDocument();
+    const save = within(panel).getByRole("button", {
+      name: "Save write list for nora",
+    });
+    expect(save).toBeDisabled();
+    expect(
+      within(panel).queryByRole("button", { name: /remove the write list/i }),
+    ).toBeNull();
+
+    await userEvent.type(
+      within(panel).getByRole("textbox", { name: "Write list for nora" }),
+      "eng, agents-*, ",
+    );
+    await userEvent.click(save);
+    await waitFor(() => {
+      expect(sentBody("/users/nora/writes", "PUT")).toEqual({
+        writes: ["eng", "agents-*"],
+      });
+    });
+    expect(
+      await screen.findByText("Saved the write list of nora."),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).getByRole("textbox", { name: "Write list for nora" }),
+    ).toHaveValue("agents-*, eng");
+    expect(
+      within(panel).getByText("It writes only to these domains."),
+    ).toBeVisible();
+  });
+
+  it("removes a write list, and shows a refused one in the server's words", async () => {
+    let refuse = true;
+    serveAs(
+      "admin",
+      {
+        "/users/eddy/writes": () => {
+          if (refuse) {
+            refuse = false;
+            throw new ApiProblem(
+              422,
+              "unprocessable",
+              "'a/b' is not a domain name or a name prefix with one * at the end",
+            );
+          }
+          return { name: "eddy", writes: null };
+        },
+      },
+      { eddy: () => detailOf("eddy", { writes: ["eng"] }) },
+    );
+    renderApp("/admin/users/eddy");
+    const panel = await panelFor("eddy");
+    const field = await within(panel).findByRole("textbox", {
+      name: "Write list for eddy",
+    });
+    expect(field).toHaveValue("eng");
+
+    await userEvent.clear(field);
+    await userEvent.type(field, "a/b");
+    await userEvent.click(
+      within(panel).getByRole("button", { name: "Save write list for eddy" }),
+    );
+    expect(
+      await screen.findByText(/'a\/b' is not a domain name/),
+    ).toHaveAttribute("role", "alert");
+
+    await userEvent.click(
+      within(panel).getByRole("button", {
+        name: "Remove the write list of eddy",
+      }),
+    );
+    await waitFor(() => {
+      expect(
+        apiMock.mock.calls.filter(
+          ([path, init]) =>
+            path === "/users/eddy/writes" &&
+            init?.body === JSON.stringify({ writes: null }),
+        ),
+      ).toHaveLength(1);
+    });
+    expect(
+      await screen.findByText("Removed the write list of eddy."),
+    ).toBeInTheDocument();
+  });
+
+  it("counts the drafts an account holds, and changes none of them", async () => {
+    serveAs(
+      "admin",
+      {},
+      {
+        eddy: () =>
+          detailOf("eddy", {
+            drafts: [
+              { domain: "eng", count: 2 },
+              { domain: "ops", count: 1 },
+            ],
+          }),
+        nora: () => detailOf("nora", { drafts: null }),
+      },
+    );
+    renderApp("/admin/users/eddy");
+    const eddy = await panelFor("eddy");
+    const items = (await within(eddy).findAllByRole("listitem")).map(
+      (item) => item.textContent,
+    );
+    expect(items).toEqual(["eng: 2 drafts", "ops: 1 draft"]);
+    expect(within(eddy).getByText(/Drafts belong to the person/)).toBeVisible();
+
+    const nora = await openFromRow("nora");
+    expect(
+      await within(nora).findByText("The drafts could not be read."),
+    ).toBeInTheDocument();
+    const root = await openFromRow("root");
+    expect(await within(root).findByText("No drafts.")).toBeInTheDocument();
+  });
+
+  it("follows a display name changed elsewhere, but never over typed text", async () => {
+    let display = "Eddy";
+    serveAs(
+      "admin",
+      { "/users/eddy": () => ({ user: account("eddy") }) },
+      {
+        eddy: () => detailOf("eddy", { user: { ...account("eddy"), display } }),
+      },
+    );
+    renderApp("/admin/users/eddy");
+    const panel = await panelFor("eddy");
+    const field = within(panel).getByRole("textbox", {
+      name: "Display name for eddy",
+    });
+    expect(field).toHaveValue("Eddy");
+
+    // Somebody else renames it; the next read brings the new name.
+    display = "Edwin";
+    await userEvent.selectOptions(
+      within(panel).getByRole("combobox", { name: "Role for eddy" }),
+      "viewer",
+    );
+    await waitFor(() => {
+      expect(field).toHaveValue("Edwin");
+    });
+    expect(
+      within(panel).getByRole("button", { name: "Save display for eddy" }),
+    ).toBeDisabled();
+
+    await userEvent.clear(field);
+    await userEvent.type(field, "Ed");
+    display = "Edmund";
+    await userEvent.selectOptions(
+      within(panel).getByRole("combobox", { name: "Role for eddy" }),
+      "editor",
+    );
+    await waitFor(() => {
+      expect(
+        within(panel).getByRole("heading", { name: "Edmund" }),
+      ).toBeInTheDocument();
+    });
+    expect(field).toHaveValue("Ed");
+  });
+
+  it("puts the focus on the panel it opens, and back on the row when it closes", async () => {
+    serveAs("admin");
+    renderApp("/admin/users");
+    const panel = await openFromRow("eddy");
+    await waitFor(() => {
+      expect(
+        within(panel).getByRole("heading", { name: "Eddy" }),
+      ).toHaveFocus();
+    });
+
+    await userEvent.click(
+      within(panel).getByRole("link", { name: "Back to users" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(screen.getByRole("table")).getByRole("link", { name: "eddy" }),
+      ).toHaveFocus();
+    });
   });
 
   it("asks twice before deleting, then goes back to the list", async () => {
     const deleted = vi.fn(() => undefined);
     serveAs("admin", {
-      "/users/eddy": (_path, init) =>
-        init?.method === "DELETE" ? deleted() : undefined,
+      "/users/eddy": () => deleted(),
     });
     renderApp("/admin/users/eddy?role=editor");
     const panel = await panelFor("eddy");
@@ -861,7 +1067,12 @@ describe("bulk changes", () => {
     serveAs("admin");
     renderApp("/admin/users");
     const root = await rowFor("root");
-    expect(within(root).queryByRole("checkbox")).toBeNull();
+    // The caller's own row says why it cannot be ticked.
+    expect(
+      within(root).getByRole("checkbox", {
+        name: "Your own account cannot be selected",
+      }),
+    ).toBeDisabled();
 
     await user.click(
       screen.getByRole("checkbox", {
@@ -918,6 +1129,10 @@ describe("bulk changes", () => {
     });
     const results = await screen.findByRole("alert", {
       name: "Bulk results",
+    });
+    // The answer to the confirm takes the focus the confirm had.
+    await waitFor(() => {
+      expect(results).toHaveFocus();
     });
     expect(
       within(results).getByText("Deactivate: 1 done, 1 refused."),
@@ -1008,6 +1223,8 @@ describe("bulk changes", () => {
     // The first page is still drawn while the second loads; a tick there
     // belongs to no row of the page that arrives.
     await user.click(screen.getByRole("checkbox", { name: "Select nora" }));
+    // The range still names the rows on screen, not the page on its way.
+    expect(screen.getByText("1 to 3 of 120")).toBeInTheDocument();
     act(() => {
       later.answer();
     });
@@ -1065,7 +1282,7 @@ describe("adding accounts and ending drafts", () => {
     });
     expect(await screen.findByText("Added bob.")).toBeInTheDocument();
     await waitFor(() => {
-      expect(apiMock).toHaveBeenCalledWith("/users?q=bob");
+      expect(apiMock).toHaveBeenCalledWith("/users/bob");
     });
   });
 

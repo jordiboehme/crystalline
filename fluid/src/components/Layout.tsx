@@ -1052,7 +1052,12 @@ function RouteFocus({ target }: { target: RefObject<HTMLElement | null> }) {
   // when the bare address shows the engrams: the first filter or folder
   // written there moves the address to `/engrams` without a new screen
   // (0.28.1), and the reader's focus stays on the control they used.
-  const pathname = location.pathname.replace(/^(\/d\/[^/]+)\/engrams$/, "$1");
+  // The users list and one account in it are one screen too: the account
+  // opens as a panel of the list, and the list screen moves the focus to the
+  // panel and back to the row itself (0.35.0).
+  const pathname = location.pathname
+    .replace(/^(\/d\/[^/]+)\/engrams$/, "$1")
+    .replace(/^\/admin\/users\/[^/]+\/?$/, "/admin/users");
   const first = useRef(true);
   // A screen reached by an action (a move, a delete) asks to focus its own
   // heading once it has drawn it (`useHeadingFocusRequest`); the frame stays

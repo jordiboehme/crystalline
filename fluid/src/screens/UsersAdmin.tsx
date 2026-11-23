@@ -24,6 +24,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp } from "lucide-react";
+import type { RefObject } from "react";
 import { useEffect, useId, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
@@ -77,6 +78,9 @@ import {
 const SECONDARY = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
 const DANGER_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.destructive}`;
 const LABEL = "text-xs text-slate-500 dark:text-slate-400";
+
+/** Where the focus goes after the detail panel opened or closed. */
+type FocusTarget = { kind: "panel" } | { kind: "row"; name: string };
 
 /** How long typing in the search waits before the list follows it. */
 export const SEARCH_DELAY_MS = 300;
@@ -236,10 +240,46 @@ function UsersScreen() {
   const listTo = usersAddress(searchParams);
   const open = openName !== undefined;
 
+  // Focus follows the panel: opened from the list, its heading takes it
+  // (`UserDetail`); closed, it goes back to the row of the account that was
+  // open, or to the page heading when that row is not on the page. The frame
+  // leaves these address changes to this screen (`RouteFocus`). An address
+  // opened directly moves nothing.
+  const [shownName, setShownName] = useState(openName);
+  const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null);
+  if (openName !== shownName) {
+    setShownName(openName);
+    setFocusTarget(
+      openName !== undefined
+        ? { kind: "panel" }
+        : shownName !== undefined
+          ? { kind: "row", name: shownName }
+          : null,
+    );
+  }
+  const pageHeading = useRef<HTMLHeadingElement>(null);
+  const tableBox = useRef<HTMLDivElement>(null);
+  const focused = useRef<FocusTarget | null>(null);
+  useEffect(() => {
+    if (focusTarget?.kind !== "row" || focused.current === focusTarget) return;
+    focused.current = focusTarget;
+    const link = [
+      ...(tableBox.current?.querySelectorAll<HTMLElement>("[data-account]") ??
+        []),
+    ].find((element) => element.dataset.account === focusTarget.name);
+    (link ?? pageHeading.current)?.focus();
+  }, [focusTarget]);
+
   return (
     <div className="flex flex-col gap-6">
       <header>
-        <h1 className="text-display">Users</h1>
+        <h1
+          ref={pageHeading}
+          tabIndex={-1}
+          className="text-display focus:outline-none"
+        >
+          Users
+        </h1>
         <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
           Who may sign in to this instance, and what each of them may do. The
           server decides every change; what it refuses is said here in its own
@@ -327,6 +367,7 @@ function UsersScreen() {
 
           {accounts.length > 0 && (
             <AccountsTable
+              box={tableBox}
               accounts={accounts}
               request={request}
               self={user?.name}
@@ -373,6 +414,8 @@ function UsersScreen() {
               request={request}
               total={total}
               shown={accounts.length}
+              shownPage={listing.data.page}
+              shownSize={listing.data.size}
               lastPage={lastPage}
               onPage={(page) => {
                 setRequest((current) => ({ ...current, page }));
@@ -396,7 +439,9 @@ function UsersScreen() {
 
         {open && (
           <UserDetail
+            key={openName}
             name={openName}
+            focusOnOpen={focusTarget?.kind === "panel"}
             fromList={accounts.find((account) => account.name === openName)}
             isSelf={openName === user?.name}
             listTo={listTo}
@@ -473,7 +518,9 @@ function SearchAndFilters({
         className="flex flex-col gap-1"
         onSubmit={(event) => {
           event.preventDefault();
-          apply(text, false);
+          // Already in the address (the pause ran out first): nothing to add
+          // to the history.
+          if (text !== applied) apply(text, false);
         }}
       >
         <label htmlFor={ids.q} className={LABEL}>
@@ -573,7 +620,7 @@ function SearchAndFilters({
         </div>
         <div className="flex flex-col gap-1">
           <label htmlFor={ids.after} className={LABEL}>
-            Seen after
+            Seen from
           </label>
           <input
             id={ids.after}
@@ -588,7 +635,7 @@ function SearchAndFilters({
         </div>
         <div className="flex flex-col gap-1">
           <label htmlFor={ids.before} className={LABEL}>
-            Seen before
+            Seen until
           </label>
           <input
             id={ids.before}
@@ -644,7 +691,9 @@ function AccountsTable({
   onSort,
   onSelect,
   onSelectAll,
+  box,
 }: {
+  box: RefObject<HTMLDivElement | null>;
   accounts: User[];
   request: UsersPageRequest;
   self: string | undefined;
@@ -663,7 +712,7 @@ function AccountsTable({
   }, [some]);
 
   return (
-    <div className="overflow-x-auto">
+    <div ref={box} className="overflow-x-auto">
       <table className="w-full text-left text-sm">
         <caption className="sr-only">Accounts on this page</caption>
         <thead className="text-caption font-semibold text-slate-500 dark:text-slate-400">
@@ -724,7 +773,16 @@ function AccountsTable({
                 className={here ? "bg-accent-tint" : undefined}
               >
                 <td className="px-2 py-2">
-                  {account.name !== self && (
+                  {account.name === self ? (
+                    // Shown, and never selectable: a bulk change is refused
+                    // for the caller's own account, so it is not offered.
+                    <input
+                      type="checkbox"
+                      disabled
+                      aria-label="Your own account cannot be selected"
+                      title="Your own account cannot be selected"
+                    />
+                  ) : (
                     <input
                       type="checkbox"
                       aria-label={`Select ${account.name}`}
@@ -738,6 +796,7 @@ function AccountsTable({
                 <th scope="row" className="px-2 py-2 font-normal">
                   <Link
                     to={linkTo(account.name)}
+                    data-account={account.name}
                     aria-current={here ? "page" : undefined}
                     className={`rounded font-mono break-all text-link underline-offset-2 hover:underline ${FOCUS_RING}`}
                   >
@@ -775,6 +834,8 @@ function Pager({
   request,
   total,
   shown,
+  shownPage,
+  shownSize,
   lastPage,
   onPage,
   onSize,
@@ -782,12 +843,15 @@ function Pager({
   request: UsersPageRequest;
   total: number;
   shown: number;
+  /** The page and size of the rows on screen, which lag the address while the next page loads. */
+  shownPage: number;
+  shownSize: number;
   lastPage: number;
   onPage: (page: number) => void;
   onSize: (size: number) => void;
 }) {
   const sizeId = useId();
-  const first = (request.page - 1) * request.size + 1;
+  const first = (shownPage - 1) * shownSize + 1;
   const last = first + shown - 1;
   return (
     <nav
@@ -977,6 +1041,9 @@ function BulkBar({
             autoFocus
             disabled={pending}
             onClick={() => {
+              // The confirm goes away: the focus waits on the bar's first
+              // button until the results take it.
+              firstStep.current?.querySelector("button")?.focus();
               onRun(asking, role);
               setAsking(null);
             }}
@@ -1005,8 +1072,15 @@ function BulkResults({
 }) {
   const refused = rows.filter((row) => !row.done);
   const done = rows.filter((row) => row.done);
+  const box = useRef<HTMLElement>(null);
+  // The answer to what was just confirmed: the focus goes to it.
+  useEffect(() => {
+    box.current?.focus();
+  }, []);
   return (
     <section
+      ref={box}
+      tabIndex={-1}
       aria-label="Bulk results"
       role={refused.length > 0 ? "alert" : "status"}
       className={`flex flex-col gap-2 rounded border px-3 py-2 text-sm ${
