@@ -265,6 +265,81 @@ describe("the change stream in one tab", () => {
     expect(invalidatedKeys()).toContain(JSON.stringify(["reflection", "eng"]));
   });
 
+  describe("a plain change of one page leaves that page's text to its clock", () => {
+    const change = (kind: string, path = "guides/a.md") => ({
+      domain: "eng",
+      path,
+      kind,
+      from: null,
+      actor: null,
+    });
+    /** Whether the flush's filter for the Reflection prefix refetches `key`. */
+    function refetches(key: readonly unknown[]): boolean {
+      const filter = filters().find(
+        (f) =>
+          JSON.stringify(f?.queryKey) === JSON.stringify(["reflection", "eng"]),
+      );
+      if (filter === undefined) return false;
+      const predicate = filter.predicate;
+      return predicate === undefined || predicate({ queryKey: key } as Query);
+    }
+    const DOC_A = ["reflection", "eng", "doc", "guides/a.md"];
+    const DOC_B = ["reflection", "eng", "doc", "guides/b.md"];
+    const CLOCK_A = ["reflection", "eng", "clock", "guides/a.md"];
+
+    it("a changed page refetches its clock and the rest, never its text", async () => {
+      // A reconcile writes no file and announces a plain change: the page's
+      // clock says whether the text moved (its checksum), so the text is
+      // read again only then, not in every open tab on every check.
+      await mount(client);
+      act(() => {
+        theSource().emit("reflection", change("changed"), "1:1");
+        vi.advanceTimersByTime(250);
+      });
+      expect(refetches(DOC_A)).toBe(false);
+      expect(refetches(CLOCK_A)).toBe(true);
+      expect(refetches(DOC_B)).toBe(true);
+      expect(refetches(["reflection", "eng", "tree"])).toBe(true);
+    });
+
+    it("threads, a move or a change of many pages still refetch the text", async () => {
+      await mount(client);
+      for (const [i, frame] of [
+        change("threads"),
+        change("moved"),
+        change("changed", ""),
+      ].entries()) {
+        invalidate.mockClear();
+        act(() => {
+          theSource().emit("reflection", frame, `1:${String(i + 1)}`);
+          vi.advanceTimersByTime(250);
+        });
+        expect(refetches(DOC_A)).toBe(true);
+      }
+    });
+
+    it("a change and a thread in one window refetch the text", async () => {
+      await mount(client);
+      act(() => {
+        theSource().emit("reflection", change("changed"), "1:1");
+        theSource().emit("reflection", change("threads"), "1:2");
+        vi.advanceTimersByTime(250);
+      });
+      expect(refetches(DOC_A)).toBe(true);
+    });
+
+    it("changes of two pages in one window refetch both texts", async () => {
+      await mount(client);
+      act(() => {
+        theSource().emit("reflection", change("changed"), "1:1");
+        theSource().emit("reflection", change("changed", "guides/b.md"), "1:2");
+        vi.advanceTimersByTime(250);
+      });
+      expect(refetches(DOC_A)).toBe(true);
+      expect(refetches(DOC_B)).toBe(true);
+    });
+  });
+
   it("a reset flushes the pending set and invalidates everything at once", async () => {
     await mount(client);
     const source = theSource();

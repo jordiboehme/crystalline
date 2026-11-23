@@ -22,12 +22,12 @@ import {
   readUploaded,
 } from "./files";
 import { asArray, asNumber, asObject, asString, asStrings } from "./json";
-import { reflectionKey } from "./reflectionDomains";
+import { reflectionDocKey, reflectionKey } from "./reflectionDomains";
 import type { PageView } from "./reflectionPage";
 import { readPageView } from "./reflectionPage";
 import { reflectionTargetOf, relativeTo } from "../reflectionAssets";
 
-export { reflectionKey };
+export { reflectionDocKey, reflectionKey };
 
 export type SourceState =
   "current" | "changed" | "retired" | "missing" | "unavailable";
@@ -528,12 +528,6 @@ export function readSearch(payload: unknown): ReflectionSearch {
 
 export function reflectionTreeKey(domain: string): readonly unknown[] {
   return [...reflectionKey(domain), "tree"];
-}
-export function reflectionDocKey(
-  domain: string,
-  path: string,
-): readonly unknown[] {
-  return [...reflectionKey(domain), "doc", path];
 }
 export function reflectionThreadsKey(
   domain: string,

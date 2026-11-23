@@ -110,6 +110,9 @@ describe("reflection status", () => {
   it("leaves PACT.md to curators", () => {
     expect(mayEditPage("edit", "guides/a.md")).toBe(true);
     expect(mayEditPage("edit", "PACT.md")).toBe(false);
+    // A page's own pact is curated like PACT.md.
+    expect(mayEditPage("edit", "arch/overview.pact.md")).toBe(false);
+    expect(mayEditPage("curate", "arch/overview.pact.md")).toBe(true);
     expect(mayEditPage("curate", "PACT.md")).toBe(true);
     expect(mayEditPage("read", "guides/a.md")).toBe(false);
   });
