@@ -1574,8 +1574,19 @@ pub(crate) struct Caller {
 
 impl Caller {
     /// The actor a write records ([`compose_actor`]).
+    ///
+    /// An agent of the loops is named by its key, `agent:<name>`
+    /// ([`crate::scope::agent_key`]), read off the scope rather than
+    /// `account`: `<client>-for-agent:<name>`. A person's half is the login,
+    /// and no login may start with `agent:`, so an agent's writes never read
+    /// as a person's, even after its name is given to a person.
     pub(crate) fn actor(&self) -> Option<String> {
-        compose_actor(self.account.as_deref(), self.client.as_deref())
+        match &self.scope {
+            Scope::Agent { name, .. } => {
+                compose_actor(Some(&crate::scope::agent_key(name)), self.client.as_deref())
+            }
+            _ => compose_actor(self.account.as_deref(), self.client.as_deref()),
+        }
     }
 
     /// The chip a room draws for this call ([`peer_for`]).
@@ -7328,6 +7339,55 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// A caller of `scope` with `account` and `client` as a door resolves
+    /// them.
+    fn caller_of(scope: Scope, account: Option<&str>, client: Option<&str>) -> Caller {
+        Caller {
+            scope,
+            account: account.map(str::to_string),
+            client: client.map(str::to_string),
+            holder: None,
+            base: crate::web_url::WebBase::Unresolved,
+        }
+    }
+
+    /// An agent of the loops writes as `<client> for agent:<name>` (on disk
+    /// `<client>-for-agent:<name>`, once the engine folds the spaces), from its
+    /// scope whatever `account` says, and a client cannot write that shape
+    /// for a person: the join word goes from the client half, and no person
+    /// may hold a login that starts with `agent:`.
+    #[test]
+    fn an_agent_writes_under_its_key() {
+        let agent = Scope::Agent {
+            name: "nightly".to_string(),
+            loops: crate::rest::AgentLoops::Both,
+            token_id: 1,
+            token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(
+            caller_of(agent.clone(), None, Some("claude-code/2.0")).actor(),
+            Some("claude-code/2.0 for agent:nightly".to_string())
+        );
+        assert_eq!(
+            caller_of(agent.clone(), Some("nightly"), None).actor(),
+            Some("agent for agent:nightly".to_string())
+        );
+        let person = Scope::User {
+            account: "nightly".to_string(),
+            admin: false,
+        };
+        assert_eq!(
+            caller_of(person.clone(), Some("nightly"), Some("claude-code/2.0")).actor(),
+            Some("claude-code/2.0 for nightly".to_string())
+        );
+        // A client naming itself the agent's shape still writes as the person.
+        let forged = caller_of(person, Some("ada"), Some("x for agent:nightly")).actor();
+        assert_eq!(forged, Some("x-agent:nightly for ada".to_string()));
+        assert!(
+            crystalline_identity::auth_store::normalize_new_account_name("agent:nightly").is_err()
+        );
+    }
 
     /// A headless run may split, so both files of a split are noted for the
     /// run's pull request: the source it edited and the engram it created.
