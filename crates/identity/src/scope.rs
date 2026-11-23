@@ -101,6 +101,11 @@ pub enum Scope {
         name: String,
         /// The loops it runs.
         loops: AgentLoops,
+        /// The id of the token the request presented.
+        token_id: i64,
+        /// When that token stops working, RFC 3339, for the surfaces that
+        /// show an agent its own expiry.
+        token_expires_at: String,
     },
 }
 

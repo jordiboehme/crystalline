@@ -200,6 +200,8 @@ pub struct AgentSession {
     pub loops: AgentLoops,
     /// The id of the token that was presented.
     pub token_id: i64,
+    /// When that token stops working, RFC 3339.
+    pub token_expires_at: String,
 }
 
 impl AgentSession {
@@ -208,6 +210,8 @@ impl AgentSession {
         Scope::Agent {
             name: self.name.clone(),
             loops: self.loops,
+            token_id: self.token_id,
+            token_expires_at: self.token_expires_at.clone(),
         }
     }
 }
@@ -712,7 +716,7 @@ impl AuthStore {
         let Some(row) = self
             .db
             .query_first(
-                "SELECT a.name, a.display, a.loops, a.disabled, t.id
+                "SELECT a.name, a.display, a.loops, a.disabled, t.id, t.expires_at
                  FROM agent_tokens t JOIN agents a ON a.name = t.agent
                  WHERE t.token_hash = ?1 AND t.revoked_at IS NULL AND t.expires_at > ?2",
                 vec![Value::Text(hash), Value::Integer(now.unix_seconds())],
@@ -730,6 +734,9 @@ impl AuthStore {
         let Ok(Value::Integer(token_id)) = row.get_value(4) else {
             return Ok(None);
         };
+        let Ok(Value::Integer(expires)) = row.get_value(5) else {
+            return Ok(None);
+        };
         self.stamp_used("agent_tokens", token_id)
             .await
             .context("stamping an agent token's last_used")?;
@@ -738,6 +745,7 @@ impl AuthStore {
             display: cell_text(&row, 1).unwrap_or_default(),
             loops,
             token_id,
+            token_expires_at: rfc3339_from_unix(expires),
         }))
     }
 }

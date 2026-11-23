@@ -793,6 +793,35 @@ async fn an_agent_token_is_refused_at_the_mcp_door_and_on_the_json_api() {
     }
 }
 
+/// With `auth.oauth` on too, a live agent token gets the OAuth refusal a
+/// missing header gets, challenge header and body alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_token_gets_the_oauth_refusal_byte_for_byte() {
+    let (addr, _guard, store) = serve_with_oauth().await;
+    let (_, live) = store
+        .add_agent(
+            "nightly",
+            None,
+            crystalline_service::rest::AgentLoops::Both,
+            "root",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    let baseline = post_initialize(&addr, None).await;
+    let agent = post_initialize(&addr, Some(&format!("Bearer {}", live.token))).await;
+    assert_eq!(agent.status(), 401);
+    assert_eq!(agent.status(), baseline.status());
+    let challenge = agent.headers()["www-authenticate"].clone();
+    assert!(
+        challenge.to_str().unwrap().contains("resource_metadata"),
+        "{challenge:?}"
+    );
+    assert_eq!(challenge, baseline.headers()["www-authenticate"]);
+    assert_eq!(agent.text().await.unwrap(), baseline.text().await.unwrap());
+}
+
 /// The gate wraps the transport, not the router: the health probe an
 /// orchestrator polls and the JSON API's own auth rules are untouched by
 /// `auth.mcp`. If the gate ever migrates up to the router, this is what fails.

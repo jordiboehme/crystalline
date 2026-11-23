@@ -7517,8 +7517,11 @@ async fn agent_token_lifecycle() {
         crate::scope::Scope::Agent {
             name: "nightly".to_string(),
             loops: AgentLoops::Evolve,
+            token_id: issued.id,
+            token_expires_at: issued.expires_at.clone(),
         }
     );
+    assert_eq!(session.token_expires_at, issued.expires_at);
     // Never resolved as an account's token, nor an account's as an agent's.
     assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
 

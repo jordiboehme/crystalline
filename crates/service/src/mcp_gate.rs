@@ -714,6 +714,8 @@ mod tests {
                     Scope::Agent {
                         name: "nightly".to_string(),
                         loops: crate::rest::AgentLoops::Both,
+                        token_id: issued.id,
+                        token_expires_at: issued.expires_at.clone(),
                     }
                 );
                 assert_eq!(refused.status(), axum::http::StatusCode::UNAUTHORIZED);
