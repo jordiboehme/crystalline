@@ -842,6 +842,12 @@ pub struct ReflectParams {
     /// One-based page number. Defaults to 1.
     #[serde(default)]
     pub page: Option<usize>,
+    /// Whether to hand out `stale` items: pages whose freshness ran out and
+    /// that a reconcile brings in line with their pacts again. Omit for the
+    /// default: a run (an unattended session or one holding a loop's
+    /// lease) gets them, an interactive session does not.
+    #[serde(default)]
+    pub stale: Option<bool>,
     /// Screen the named `domains` the way an unnamed queue screens every
     /// domain: one that is read-only, replaced by a connected server, not
     /// registered, or not in effect, or that the caller cannot work, is

@@ -112,6 +112,44 @@ pub fn reflection_asset_refs(source: &str, reflection_path: &str) -> Vec<String>
     out
 }
 
+/// The distinct pages of the Reflection a reflection (or a part of one, a
+/// section's text) links with a relative link, by path inside
+/// `reflections/`, in order of first appearance: a link that lands on a
+/// `.md` file under `reflections/` that is a page (not `PACT.md`, no page
+/// pact, nothing under `assets/`). Whether the page exists is not asked.
+/// Web links, addresses, rooted links, fragments and fenced code never count.
+pub fn reflection_page_refs(source: &str, reflection_path: &str) -> Vec<String> {
+    use crate::reflection::layout::{ReflectionFile, classify, is_pact_file};
+    let mut out: Vec<String> = Vec::new();
+    for target in link_targets(source) {
+        if target.is_empty() || target.starts_with(SCHEME) || has_url_scheme(&target) {
+            continue;
+        }
+        let target = target.replace('\\', "/");
+        if target.starts_with('/') {
+            continue;
+        }
+        let Some(landed) = resolve(&domain_rel(reflection_path), &target) else {
+            continue;
+        };
+        if !is_under_reflections(&landed) {
+            continue;
+        }
+        let inner = landed.split_once('/').map(|(_, rest)| rest).unwrap_or("");
+        if !inner.ends_with(".md")
+            || is_under_assets(inner)
+            || is_pact_file(inner)
+            || !matches!(classify(inner), ReflectionFile::Page(_))
+        {
+            continue;
+        }
+        if !out.iter().any(|seen| seen == inner) {
+            out.push(inner.to_string());
+        }
+    }
+    out
+}
+
 /// The distinct link targets of a reflection that reach an engram
 /// attachment, as written (percent-decoded), in order.
 pub fn engram_attachment_embeds(source: &str, reflection_path: &str) -> Vec<String> {
@@ -140,6 +178,15 @@ pub fn refuse_engram_attachments(source: &str, reflection_path: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_links_resolve_from_the_pages_own_folder() {
+        let page = "# A\n\n[peer](peer.md) [up](../top.md#part) [deep](sub/deep.md \"T\")\n[again](./peer.md) [pact](../PACT.md) [rules](peer.pact.md)\n[engram](../../runbooks/deploy.md) [web](https://x.test/a.md) [file](../assets/a.md) [top](#top)\n\n```\n[fenced](fenced.md)\n```\n";
+        assert_eq!(
+            reflection_page_refs(page, "guides/a.md"),
+            ["guides/peer.md", "top.md", "guides/sub/deep.md"]
+        );
+    }
 
     #[test]
     fn references_resolve_from_the_reflections_own_folder() {
