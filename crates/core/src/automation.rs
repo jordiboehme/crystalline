@@ -726,9 +726,9 @@ mod tests {
         // The first way stays for a run that may write the engrams.
         assert!(line.contains("Take it into the engrams"), "{line}");
         assert!(
-            line.contains("no evolve lease on `work`")
+            line.contains("When an engram write is refused in this run")
                 && line.contains("answer the feedback in a thread or settle it as kept")
-                && line.contains("say so in the summary"),
+                && line.contains("say so in your summary"),
             "{line}"
         );
     }
