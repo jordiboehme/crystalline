@@ -3389,6 +3389,154 @@ async fn a_read_only_instance_refuses_user_mutations() {
     );
 }
 
+/// The agents routes: an admin creates an agent and sees its token once,
+/// lists it without the token, gets one more token and is refused a third,
+/// revokes one, and removes the agent. An account's name is refused for an
+/// agent and an agent's name for an account (409 both ways); an editor gets
+/// 403 and a read-only instance refuses every change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admins_manage_agents_and_their_tokens() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let req = |method: reqwest::Method, path: &str| as_session(fx.addr, method, path, &admin);
+
+    let resp = req(reqwest::Method::POST, "/api/v1/agents")
+        .json(&serde_json::json!({"name": "Nightly", "display": "Nightly runner", "loops": "evolve", "expires_days": 30}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["agent"]["name"], "nightly");
+    assert_eq!(created["agent"]["loops"], "evolve");
+    assert_eq!(created["agent"]["created_by"], "root");
+    let token = created["token"]["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("cag_"));
+    assert!(fx.auth.agent_for_token(&token).await.unwrap().is_some());
+
+    let listed: serde_json::Value = req(reqwest::Method::GET, "/api/v1/agents")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["agents"][0]["name"], "nightly");
+    assert_eq!(listed["agents"][0]["tokens"][0]["state"], "live");
+    assert!(
+        !listed.to_string().contains(&token),
+        "never the token again"
+    );
+
+    // One namespace, both ways.
+    let resp = req(reqwest::Method::POST, "/api/v1/agents")
+        .json(&serde_json::json!({"name": "eddy"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let resp = req(reqwest::Method::POST, "/api/v1/users")
+        .json(&serde_json::json!({"name": "nightly", "role": "viewer", "password": "pw12345678"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(resp.text().await.unwrap().contains("belongs to an agent"));
+
+    // Two live tokens at most.
+    let second = req(reqwest::Method::POST, "/api/v1/agents/nightly/tokens")
+        .json(&serde_json::json!({"label": "rollover"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 201);
+    let second: serde_json::Value = second.json().await.unwrap();
+    let third = req(reqwest::Method::POST, "/api/v1/agents/nightly/tokens")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(third.status(), 409);
+    let bad = req(reqwest::Method::POST, "/api/v1/agents/nightly/tokens")
+        .json(&serde_json::json!({"expires_days": 400}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 422);
+    let ghost = req(reqwest::Method::POST, "/api/v1/agents/ghost/tokens")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ghost.status(), 404);
+
+    let id = created["token"]["id"].as_i64().unwrap();
+    let revoke = req(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/agents/nightly/tokens/{id}"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(revoke.status(), 204);
+    assert!(fx.auth.agent_for_token(&token).await.unwrap().is_none());
+    let again = req(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/agents/nightly/tokens/{id}"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(again.status(), 404);
+
+    // An editor is no admin.
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/agents", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let removed = req(reqwest::Method::DELETE, "/api/v1/agents/nightly")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 204);
+    let second_token = second["token"].as_str().unwrap();
+    assert!(
+        fx.auth
+            .agent_for_token(second_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let gone = req(reqwest::Method::DELETE, "/api/v1/agents/nightly")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    let resp = as_session(ro.addr, reqwest::Method::POST, "/api/v1/agents", &admin)
+        .json(&serde_json::json!({"name": "nightly"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(ro.auth.agents().await.unwrap().is_empty());
+    let resp = as_session(ro.addr, reqwest::Method::GET, "/api/v1/agents", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "read-only refuses writes, not reads");
+}
+
 /// One write operation as the matrix drives it.
 struct WriteOp {
     method: reqwest::Method,
@@ -3806,6 +3954,38 @@ fn write_ops() -> Vec<WriteOp> {
         WriteOp {
             method: Method::DELETE,
             path: "/api/v1/users/tina",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // The agents of the loops: admin only, and refused on a read-only
+        // instance like the account rows above. Created, given a second
+        // token, one revoked, then removed, so each allowed leg has
+        // something to act on.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/agents",
+            body: Some(serde_json::json!({"name": "matrix-bot"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/agents/matrix-bot/tokens",
+            body: Some(serde_json::json!({})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/agents/matrix-bot/tokens/1",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/agents/matrix-bot",
             body: None,
             min_role: Role::Admin,
             read_only_exempt: false,
@@ -4414,6 +4594,15 @@ fn canonicalize(path: &str) -> String {
     // for the same reason the token ids above are.
     if path.starts_with("/api/v1/me/identity-links/") {
         return "/api/v1/me/identity-links/{issuer}".to_string();
+    }
+    // The agents routes: one agent name and, for a revoke, a numeric token
+    // id the per-segment pass would read as a proposal number.
+    if let Some(rest) = path.strip_prefix("/api/v1/agents/") {
+        return match rest.split_once('/') {
+            None => "/api/v1/agents/{name}".to_string(),
+            Some((_, "tokens")) => "/api/v1/agents/{name}/tokens".to_string(),
+            Some(_) => "/api/v1/agents/{name}/tokens/{id}".to_string(),
+        };
     }
     path.split('/')
         .map(|segment| match segment {

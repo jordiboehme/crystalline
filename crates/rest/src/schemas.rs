@@ -613,6 +613,73 @@ pub struct DraftResolveReceipt {
     pub draft_warning: Option<String>,
 }
 
+/// Which loops an agent runs. Chosen per agent; both by default.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoops {
+    /// Only the reflect loop, which curates the Reflection.
+    Reflect,
+    /// Only the evolve loop, which writes engrams.
+    Evolve,
+    /// Both loops.
+    Both,
+}
+
+/// Where one agent token stands.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTokenState {
+    /// Not revoked and not expired: it opens what the agent may reach.
+    Live,
+    /// Its time ran out.
+    Expired,
+    /// Revoked by an admin.
+    Revoked,
+}
+
+/// One token of an agent, never carrying the token itself.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AgentToken {
+    /// The row id, which `agents revoke` names.
+    #[schema(example = 4)]
+    pub id: i64,
+    /// What the admin called it.
+    #[schema(example = "issued 2026-11-22")]
+    pub label: String,
+    /// When it was issued, RFC 3339.
+    pub created_at: String,
+    /// When it stops working, RFC 3339.
+    pub expires_at: String,
+    /// When it was last presented, RFC 3339, or `None` when never.
+    pub last_used: Option<String>,
+    /// When it was revoked, RFC 3339, or `None`.
+    pub revoked_at: Option<String>,
+    /// Live, expired or revoked, as of the read.
+    pub state: AgentTokenState,
+}
+
+/// One agent with its tokens, newest first.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct Agent {
+    /// The unique name, folded like a login name. This is what a commit, a
+    /// lease and `generated.by` carry.
+    #[schema(example = "nightly")]
+    pub name: String,
+    /// The name shown to people.
+    #[schema(example = "Nightly runner")]
+    pub display: String,
+    /// The loops it runs.
+    pub loops: AgentLoops,
+    /// When it was created, RFC 3339.
+    pub created_at: String,
+    /// Who created it: the admin's account, or `cli` for `crystalline agents`.
+    pub created_by: String,
+    /// A disabled agent keeps its rows, and none of its tokens opens anything.
+    pub disabled: bool,
+    /// Its tokens, live or not, newest first.
+    pub tokens: Vec<AgentToken>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::auth_store;
@@ -692,6 +759,44 @@ mod tests {
                 github_linked: Some(false),
             }]),
             published::<super::User>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::AgentLoops::Reflect,
+                auth_store::AgentLoops::Evolve,
+                auth_store::AgentLoops::Both
+            ]),
+            published::<super::AgentLoops>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::AgentTokenState::Live,
+                auth_store::AgentTokenState::Expired,
+                auth_store::AgentTokenState::Revoked
+            ]),
+            published::<super::AgentTokenState>()
+        );
+        let token = auth_store::AgentToken {
+            id: 0,
+            label: s(),
+            created_at: s(),
+            expires_at: s(),
+            last_used: None,
+            revoked_at: None,
+            state: auth_store::AgentTokenState::Live,
+        };
+        assert_eq!(keys([token.clone()]), published::<super::AgentToken>());
+        assert_eq!(
+            keys([auth_store::Agent {
+                name: s(),
+                display: s(),
+                loops: auth_store::AgentLoops::Both,
+                created_at: s(),
+                created_by: s(),
+                disabled: false,
+                tokens: vec![token],
+            }]),
+            published::<super::Agent>()
         );
         assert_eq!(
             keys([

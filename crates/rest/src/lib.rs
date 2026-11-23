@@ -31,6 +31,7 @@ mod automation;
 mod schemas;
 use crystalline_identity::auth_store;
 mod account_search;
+mod agents_api;
 mod discovery;
 mod domain_path;
 mod domains;
@@ -140,6 +141,7 @@ use crate::scope::{DomainAccess, DomainRight};
         (name = "reflection", description = "A domain's Reflection: documents for people, their threads and the reflect queue."),
         (name = "events", description = "Live changes to the knowledge, as one server-sent event stream per tab."),
         (name = "users", description = "Account management. Admin only."),
+        (name = "agents", description = "The agents of the loops and their tokens. Admin only."),
         (name = "settings", description = "Instance settings. Admin only."),
         (name = "oauth", description = "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."),
     ),
@@ -267,6 +269,11 @@ use crate::scope::{DomainAccess, DomainRight};
         github_link::unlink,
         github_webhook::receive,
         users_api::unlink_github,
+        agents_api::list,
+        agents_api::create,
+        agents_api::remove,
+        agents_api::issue_token,
+        agents_api::revoke_token,
         mcp_tokens::list,
         mcp_tokens::issue,
         mcp_tokens::rotate,
@@ -376,6 +383,15 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::KindFilter,
         users_api::SortColumn,
         users_api::SortDir,
+        schemas::Agent,
+        schemas::AgentLoops,
+        schemas::AgentToken,
+        schemas::AgentTokenState,
+        agents_api::AgentsResponse,
+        agents_api::CreateAgentBody,
+        agents_api::CreatedAgentResponse,
+        agents_api::IssueAgentTokenBody,
+        agents_api::IssuedAgentTokenResponse,
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
         github_settings::GithubAccessResponse,
@@ -1202,6 +1218,15 @@ fn routes(state: RestState) -> Router {
             patch(users_api::update).delete(users_api::remove),
         )
         .route("/users/{name}/drafts", delete(users_api::discard_drafts))
+        // Admin only, inside the handlers, like the users routes; see
+        // [`agents_api`].
+        .route("/agents", get(agents_api::list).post(agents_api::create))
+        .route("/agents/{name}", delete(agents_api::remove))
+        .route("/agents/{name}/tokens", post(agents_api::issue_token))
+        .route(
+            "/agents/{name}/tokens/{id}",
+            delete(agents_api::revoke_token),
+        )
         .route("/users/{name}/password", post(users_api::reset_password))
         // Admin only, inside the handler: frees a GitHub account linked to
         // the wrong Crystalline account. See [`github_link`].

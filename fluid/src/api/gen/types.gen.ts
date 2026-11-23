@@ -127,6 +127,95 @@ export type AckBody = {
 };
 
 /**
+ * One agent with its tokens, newest first.
+ */
+export type Agent = {
+    /**
+     * When it was created, RFC 3339.
+     */
+    created_at: string;
+    /**
+     * Who created it: the admin's account, or `cli` for `crystalline agents`.
+     */
+    created_by: string;
+    /**
+     * A disabled agent keeps its rows, and none of its tokens opens anything.
+     */
+    disabled: boolean;
+    /**
+     * The name shown to people.
+     */
+    display: string;
+    /**
+     * The loops it runs.
+     */
+    loops: AgentLoops;
+    /**
+     * The unique name, folded like a login name. This is what a commit, a
+     * lease and `generated.by` carry.
+     */
+    name: string;
+    /**
+     * Its tokens, live or not, newest first.
+     */
+    tokens: Array<AgentToken>;
+};
+
+/**
+ * Which loops an agent runs. Chosen per agent; both by default.
+ */
+export type AgentLoops = 'reflect' | 'evolve' | 'both';
+
+/**
+ * One token of an agent, never carrying the token itself.
+ */
+export type AgentToken = {
+    /**
+     * When it was issued, RFC 3339.
+     */
+    created_at: string;
+    /**
+     * When it stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The row id, which `agents revoke` names.
+     */
+    id: number;
+    /**
+     * What the admin called it.
+     */
+    label: string;
+    /**
+     * When it was last presented, RFC 3339, or `None` when never.
+     */
+    last_used?: string | null;
+    /**
+     * When it was revoked, RFC 3339, or `None`.
+     */
+    revoked_at?: string | null;
+    /**
+     * Live, expired or revoked, as of the read.
+     */
+    state: AgentTokenState;
+};
+
+/**
+ * Where one agent token stands.
+ */
+export type AgentTokenState = 'live' | 'expired' | 'revoked';
+
+/**
+ * What `GET /agents` answers with.
+ */
+export type AgentsResponse = {
+    /**
+     * Every agent with its tokens, by name.
+     */
+    agents: Array<Agent>;
+};
+
+/**
  * One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`.
  */
 export type ArchiveEntryReport = {
@@ -424,6 +513,30 @@ export type ConflictDetail = {
 };
 
 /**
+ * The body of `POST /agents`.
+ */
+export type CreateAgentBody = {
+    /**
+     * The name shown to people. Defaults to the name.
+     */
+    display?: string | null;
+    /**
+     * The first token's life in days, 1 to 365. Defaults to 90.
+     */
+    expires_days?: number | null;
+    /**
+     * The first token's label. Defaults to the day it was issued.
+     */
+    label?: string | null;
+    loops?: AgentLoops | null;
+    /**
+     * The unique name, folded like a login name. It may not be taken by an
+     * account or another agent.
+     */
+    name: string;
+};
+
+/**
  * A new account. `display` defaults to `name` as typed, and `email` is optional and never used for login.
  */
 export type CreateBody = {
@@ -520,6 +633,20 @@ export type CreateEngramBody = {
      * are guidance.
      */
     type?: string | null;
+};
+
+/**
+ * What `POST /agents` answers with: the agent as stored and its first token.
+ */
+export type CreatedAgentResponse = {
+    /**
+     * The agent as stored.
+     */
+    agent: Agent;
+    /**
+     * Its first token, this once.
+     */
+    token: IssuedAgentTokenResponse;
 };
 
 /**
@@ -1184,6 +1311,20 @@ export type IdentityLinksResponse = {
 };
 
 /**
+ * The body of `POST /agents/{name}/tokens`.
+ */
+export type IssueAgentTokenBody = {
+    /**
+     * The token's life in days, 1 to 365. Defaults to 90.
+     */
+    expires_days?: number | null;
+    /**
+     * Its label. Defaults to the day it was issued.
+     */
+    label?: string | null;
+};
+
+/**
  * A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again.
  */
 export type IssueBody = {
@@ -1192,6 +1333,28 @@ export type IssueBody = {
      * one nobody dares revoke.
      */
     label: string;
+};
+
+/**
+ * A freshly issued agent token. `token` is shown here and nowhere else, ever: only its hash is stored. The agent sends it as `Authorization: Bearer <token>`.
+ */
+export type IssuedAgentTokenResponse = {
+    /**
+     * When it stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The row id, which a revoke names.
+     */
+    id: number;
+    /**
+     * Its label.
+     */
+    label: string;
+    /**
+     * The token itself, this once.
+     */
+    token: string;
 };
 
 /**
@@ -3163,6 +3326,214 @@ export type GetActivityResponses = {
 };
 
 export type GetActivityResponse = GetActivityResponses[keyof GetActivityResponses];
+
+export type ListAgentsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/agents';
+};
+
+export type ListAgentsErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type ListAgentsError = ListAgentsErrors[keyof ListAgentsErrors];
+
+export type ListAgentsResponses = {
+    /**
+     * Every agent, by name.
+     */
+    200: AgentsResponse;
+};
+
+export type ListAgentsResponse = ListAgentsResponses[keyof ListAgentsResponses];
+
+export type CreateAgentData = {
+    body: CreateAgentBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/agents';
+};
+
+export type CreateAgentErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * An account or another agent holds the name.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The body is JSON but not an agent, the name or display name is not allowed, or the life is not 1 to 365 days.
+     */
+    422: ProblemDetail;
+};
+
+export type CreateAgentError = CreateAgentErrors[keyof CreateAgentErrors];
+
+export type CreateAgentResponses = {
+    /**
+     * The agent and its first token, this once.
+     */
+    201: CreatedAgentResponse;
+};
+
+export type CreateAgentResponse = CreateAgentResponses[keyof CreateAgentResponses];
+
+export type DeleteAgentData = {
+    body?: never;
+    path: {
+        /**
+         * The agent, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/agents/{name}';
+};
+
+export type DeleteAgentErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such agent.
+     */
+    404: ProblemDetail;
+};
+
+export type DeleteAgentError = DeleteAgentErrors[keyof DeleteAgentErrors];
+
+export type DeleteAgentResponses = {
+    /**
+     * The agent and its tokens are gone.
+     */
+    204: void;
+};
+
+export type DeleteAgentResponse = DeleteAgentResponses[keyof DeleteAgentResponses];
+
+export type IssueAgentTokenData = {
+    body: IssueAgentTokenBody;
+    path: {
+        /**
+         * The agent, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/agents/{name}/tokens';
+};
+
+export type IssueAgentTokenErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such agent.
+     */
+    404: ProblemDetail;
+    /**
+     * The agent already holds two live tokens.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The life is not 1 to 365 days.
+     */
+    422: ProblemDetail;
+};
+
+export type IssueAgentTokenError = IssueAgentTokenErrors[keyof IssueAgentTokenErrors];
+
+export type IssueAgentTokenResponses = {
+    /**
+     * The token, this once.
+     */
+    201: IssuedAgentTokenResponse;
+};
+
+export type IssueAgentTokenResponse = IssueAgentTokenResponses[keyof IssueAgentTokenResponses];
+
+export type RevokeAgentTokenData = {
+    body?: never;
+    path: {
+        /**
+         * The agent, in any casing.
+         */
+        name: string;
+        /**
+         * The token's id.
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/api/v1/agents/{name}/tokens/{id}';
+};
+
+export type RevokeAgentTokenErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No live token of that id for this agent.
+     */
+    404: ProblemDetail;
+};
+
+export type RevokeAgentTokenError = RevokeAgentTokenErrors[keyof RevokeAgentTokenErrors];
+
+export type RevokeAgentTokenResponses = {
+    /**
+     * The token is revoked.
+     */
+    204: void;
+};
+
+export type RevokeAgentTokenResponse = RevokeAgentTokenResponses[keyof RevokeAgentTokenResponses];
 
 export type LoginData = {
     body: LoginBody;

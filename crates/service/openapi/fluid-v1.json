@@ -194,6 +194,368 @@
         }
       }
     },
+    "/api/v1/agents": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`GET /agents` - every agent with its tokens, by name. Never carries a\ntoken: only hashes are stored.",
+        "operationId": "list_agents",
+        "responses": {
+          "200": {
+            "description": "Every agent, by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`POST /agents` - create an agent and issue its first token, answering 201\nwith both. The token is shown this once.",
+        "operationId": "create_agent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAgentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The agent and its first token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedAgentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "An account or another agent holds the name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not an agent, the name or display name is not allowed, or the life is not 1 to 365 days.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{name}": {
+      "delete": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`DELETE /agents/{name}` - remove an agent and every token it holds,\nanswering 204.",
+        "operationId": "delete_agent",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The agent, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The agent and its tokens are gone."
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{name}/tokens": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`POST /agents/{name}/tokens` - issue another token, answering 201 with it,\nthis once. Refused while the agent holds two live tokens.",
+        "operationId": "issue_agent_token",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The agent, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueAgentTokenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedAgentTokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The agent already holds two live tokens.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The life is not 1 to 365 days.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{name}/tokens/{id}": {
+      "delete": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`DELETE /agents/{name}/tokens/{id}` - revoke one token, answering 204. The\ntoken stays listed as revoked.",
+        "operationId": "revoke_agent_token",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The agent, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The token's id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The token is revoked."
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live token of that id for this agent.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/login": {
       "post": {
         "tags": [
@@ -13329,6 +13691,138 @@
           }
         }
       },
+      "Agent": {
+        "type": "object",
+        "description": "One agent with its tokens, newest first.",
+        "required": [
+          "name",
+          "display",
+          "loops",
+          "created_at",
+          "created_by",
+          "disabled",
+          "tokens"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "When it was created, RFC 3339."
+          },
+          "created_by": {
+            "type": "string",
+            "description": "Who created it: the admin's account, or `cli` for `crystalline agents`."
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "A disabled agent keeps its rows, and none of its tokens opens anything."
+          },
+          "display": {
+            "type": "string",
+            "description": "The name shown to people.",
+            "example": "Nightly runner"
+          },
+          "loops": {
+            "$ref": "#/components/schemas/AgentLoops",
+            "description": "The loops it runs."
+          },
+          "name": {
+            "type": "string",
+            "description": "The unique name, folded like a login name. This is what a commit, a\nlease and `generated.by` carry.",
+            "example": "nightly"
+          },
+          "tokens": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgentToken"
+            },
+            "description": "Its tokens, live or not, newest first."
+          }
+        }
+      },
+      "AgentLoops": {
+        "type": "string",
+        "description": "Which loops an agent runs. Chosen per agent; both by default.",
+        "enum": [
+          "reflect",
+          "evolve",
+          "both"
+        ]
+      },
+      "AgentToken": {
+        "type": "object",
+        "description": "One token of an agent, never carrying the token itself.",
+        "required": [
+          "id",
+          "label",
+          "created_at",
+          "expires_at",
+          "state"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "When it was issued, RFC 3339."
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "When it stops working, RFC 3339."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, which `agents revoke` names.",
+            "example": 4
+          },
+          "label": {
+            "type": "string",
+            "description": "What the admin called it.",
+            "example": "issued 2026-11-22"
+          },
+          "last_used": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was last presented, RFC 3339, or `None` when never."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was revoked, RFC 3339, or `None`."
+          },
+          "state": {
+            "$ref": "#/components/schemas/AgentTokenState",
+            "description": "Live, expired or revoked, as of the read."
+          }
+        }
+      },
+      "AgentTokenState": {
+        "type": "string",
+        "description": "Where one agent token stands.",
+        "enum": [
+          "live",
+          "expired",
+          "revoked"
+        ]
+      },
+      "AgentsResponse": {
+        "type": "object",
+        "description": "What `GET /agents` answers with.",
+        "required": [
+          "agents"
+        ],
+        "properties": {
+          "agents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Agent"
+            },
+            "description": "Every agent with its tokens, by name."
+          }
+        }
+      },
       "ArchiveEntryReport": {
         "type": "object",
         "description": "One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`.",
@@ -13779,6 +14273,57 @@
           }
         }
       },
+      "CreateAgentBody": {
+        "type": "object",
+        "description": "The body of `POST /agents`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name shown to people. Defaults to the name.",
+            "example": "Nightly runner"
+          },
+          "expires_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The first token's life in days, 1 to 365. Defaults to 90.",
+            "example": 90,
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first token's label. Defaults to the day it was issued."
+          },
+          "loops": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AgentLoops",
+                "description": "The loops it runs. Defaults to both."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "The unique name, folded like a login name. It may not be taken by an\naccount or another agent.",
+            "example": "nightly"
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateBody": {
         "type": "object",
         "description": "A new account. `display` defaults to `name` as typed, and `email` is optional and never used for login.",
@@ -13943,6 +14488,24 @@
             ],
             "description": "The engram `type`. Defaults to `engram`. Free form; recommended values\nare guidance.",
             "example": "decision"
+          }
+        }
+      },
+      "CreatedAgentResponse": {
+        "type": "object",
+        "description": "What `POST /agents` answers with: the agent as stored and its first token.",
+        "required": [
+          "agent",
+          "token"
+        ],
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/Agent",
+            "description": "The agent as stored."
+          },
+          "token": {
+            "$ref": "#/components/schemas/IssuedAgentTokenResponse",
+            "description": "Its first token, this once."
           }
         }
       },
@@ -14993,6 +15556,30 @@
           }
         }
       },
+      "IssueAgentTokenBody": {
+        "type": "object",
+        "description": "The body of `POST /agents/{name}/tokens`.",
+        "properties": {
+          "expires_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The token's life in days, 1 to 365. Defaults to 90.",
+            "example": 90,
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its label. Defaults to the day it was issued."
+          }
+        },
+        "additionalProperties": false
+      },
       "IssueBody": {
         "type": "object",
         "description": "A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again.",
@@ -15004,6 +15591,39 @@
             "type": "string",
             "description": "What this token is for. Required and non-empty: an unlabeled row is\none nobody dares revoke.",
             "example": "laptop"
+          }
+        }
+      },
+      "IssuedAgentTokenResponse": {
+        "type": "object",
+        "description": "A freshly issued agent token. `token` is shown here and nowhere else, ever: only its hash is stored. The agent sends it as `Authorization: Bearer <token>`.",
+        "required": [
+          "id",
+          "token",
+          "label",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "description": "When it stops working, RFC 3339.",
+            "example": "2027-02-20T09:00:00Z"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, which a revoke names.",
+            "example": 4
+          },
+          "label": {
+            "type": "string",
+            "description": "Its label.",
+            "example": "issued 2026-11-22"
+          },
+          "token": {
+            "type": "string",
+            "description": "The token itself, this once.",
+            "example": "cag_1f3c..."
           }
         }
       },
@@ -17600,6 +18220,10 @@
     {
       "name": "users",
       "description": "Account management. Admin only."
+    },
+    {
+      "name": "agents",
+      "description": "The agents of the loops and their tokens. Admin only."
     },
     {
       "name": "settings",
