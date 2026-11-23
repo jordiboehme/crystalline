@@ -2,8 +2,8 @@
 #
 # It runs `crystalline reflect run` or `crystalline evolve run` against a
 # team server in remote mode (CRYSTALLINE_REMOTE_URL and
-# CRYSTALLINE_REMOTE_TOKEN). This is an example, not a published image. See
-# docs/automation.md.
+# CRYSTALLINE_REMOTE_TOKEN, the cag_ token of an agent of the loops). This is
+# an example, not a published image. See docs/automation.md.
 #
 # The published Crystalline image is distroless and has no shell and no
 # Node, so Claude Code cannot be installed on top of it. The crystalline

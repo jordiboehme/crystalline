@@ -8,7 +8,7 @@
 # reflect-cronjob.yaml describes:
 #
 #   kubectl create secret generic crystalline-runner \
-#     --from-literal=remote-token=cmt_... \
+#     --from-literal=remote-token=cag_... \
 #     --from-literal=anthropic-api-key=sk-ant-...
 #
 # `watch` checks the status every --interval seconds (default 60) and runs

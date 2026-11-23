@@ -3,7 +3,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Send text to Crystalline\n\nPOST JSON `{\"text\": \"...\", \"domain\": \"optional\"}` to this workflow's webhook. An agent writes it as one engram with `write_engram`. See docs/automation.md in the Crystalline repository.\n\n1. Create a Header Auth credential **Capture webhook key** (for example the header `X-Capture-Key` and a long random value) and pick it on **Text in**. Every caller sends that header.\n2. Create a Bearer Auth credential **Crystalline token** with the `cmt_` token of an agent account that may write the domain, and pick it on **Crystalline MCP**.\n3. Create an Anthropic credential and pick a model on **Claude**.\n4. Edit **Settings**: the server address and the default domain.",
+        "content": "## Send text to Crystalline\n\nPOST JSON `{\"text\": \"...\", \"domain\": \"optional\"}` to this workflow's webhook. An agent writes it as one engram with `write_engram`. See docs/automation.md in the Crystalline repository.\n\n1. Create a Header Auth credential **Capture webhook key** (for example the header `X-Capture-Key` and a long random value) and pick it on **Text in**. Every caller sends that header.\n2. Create a Bearer Auth credential **Crystalline token** with the `cmt_` token of an account that may write the domain (for example `crystalline users add capture-bot --role editor --mcp-token n8n`), and pick it on **Crystalline MCP**. Not the token of an agent of the loops: this workflow is no loop run, and an agent token works only during a run.\n3. Create an Anthropic credential and pick a model on **Claude**.\n4. Edit **Settings**: the server address and the default domain.",
         "height": 400,
         "width": 560
       },
