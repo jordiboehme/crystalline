@@ -3385,7 +3385,7 @@ export type CreateAgentErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, `auth.mcp` is off (an agent token would open nothing), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**

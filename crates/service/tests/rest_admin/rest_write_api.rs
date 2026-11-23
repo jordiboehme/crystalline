@@ -29,6 +29,8 @@ struct Options {
     /// This machine's own index, configuration and state directory as the
     /// daemon would name them, when a test sets one.
     machine_owner: Option<MachineOwner>,
+    /// `auth.mcp` on (and `auth.oauth` off), which agents of the loops need.
+    agents: bool,
 }
 
 /// Which machine owner a test gives the engine: one naming another index
@@ -71,8 +73,8 @@ async fn serve(opts: Options) -> Fixture {
             trusted_header: opts.trusted_header.map(str::to_string),
             proxy_headers: None,
             anonymous: Some(opts.anonymous),
-            mcp: None,
-            oauth: None,
+            mcp: opts.agents.then_some(true),
+            oauth: opts.agents.then_some(false),
             max_users: None,
             oidc: None,
             login: None,
@@ -3396,7 +3398,11 @@ async fn a_read_only_instance_refuses_user_mutations() {
 /// 403 and a read-only instance refuses every change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admins_manage_agents_and_their_tokens() {
-    let fx = serve(Options::default()).await;
+    let fx = serve(Options {
+        agents: true,
+        ..Options::default()
+    })
+    .await;
     let admin = login(fx.addr, "root", "rootpw").await;
     let req = |method: reqwest::Method, path: &str| as_session(fx.addr, method, path, &admin);
 
@@ -3519,6 +3525,7 @@ async fn admins_manage_agents_and_their_tokens() {
 
     let ro = serve(Options {
         read_only: true,
+        agents: true,
         ..Options::default()
     })
     .await;
@@ -4382,8 +4389,13 @@ async fn the_write_matrix_holds_on_every_route() {
     // Serialized against every other test here that writes the shared
     // maintenance state file. See `crate::support::maintenance_guard`.
     let _serialized = crate::support::maintenance_guard().await;
-    // Plain instance: role and CSRF rows.
-    let fx = serve(Options::default()).await;
+    // Plain instance: role and CSRF rows. `auth.mcp` is on, so the agents
+    // routes serve an admin.
+    let fx = serve(Options {
+        agents: true,
+        ..Options::default()
+    })
+    .await;
     let admin = login(fx.addr, "root", "rootpw").await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let viewer = login(fx.addr, "vera", "verapw").await;
@@ -5328,4 +5340,26 @@ async fn creating_a_domain_whose_name_differs_only_in_case_is_a_conflict() {
         );
     }
     assert!(!fx.engine.config().domains.contains_key("ENG"));
+}
+
+/// **No agent is made while `auth.mcp` is off**: an agent token would open
+/// nothing, so `POST /agents` answers `403` with the sentence that says why
+/// and how to turn it on, and no agent is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_is_refused_while_auth_mcp_is_off() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/agents", &admin)
+        .json(&serde_json::json!({"name": "nightly"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["detail"],
+        crystalline_service::rest::AGENTS_NEED_AUTH_MCP,
+        "{body}"
+    );
+    assert!(fx.auth.agents().await.unwrap().is_empty());
 }

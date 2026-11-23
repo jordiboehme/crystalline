@@ -204,8 +204,9 @@ pub async fn list(
             status = 403,
             description = "The caller is not an admin, a cookie session did \
                            not echo its CSRF token, this instance is \
-                           read-only, or the trusted-header identity names a \
-                           disabled account.",
+                           read-only, `auth.mcp` is off (an agent token \
+                           would open nothing), or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -238,6 +239,11 @@ pub async fn create(
 ) -> Result<(StatusCode, NoStore, Json<CreatedAgentResponse>), ApiError> {
     let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
+    // An agent token opens nothing while `auth.mcp` is off, so no agent is
+    // made then: the admin is told why, and how to turn it on.
+    if !state.engine.auth_mcp() {
+        return Err(ApiError::forbidden(crate::AGENTS_NEED_AUTH_MCP));
+    }
     // An agent drafts under its name on a domain that reviews changes, so a
     // name still holding a removed person's drafts is refused, as for an account.
     crate::users_api::clear_name_for_new_account(&state, &body.name, true).await?;

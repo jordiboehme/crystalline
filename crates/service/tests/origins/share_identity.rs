@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::github_app::{
-    Forge, INSTANCE_TOKEN, PEM, bearer, connect, engram, repo_with_manifest, spawn_forge,
+    Forge, INSTANCE_TOKEN, PEM, bearer, connect, engram, files, manifest, repo_with_manifest,
+    spawn_forge,
 };
 use super::github_governed::{PASSWORD, client, login, with_session};
 
@@ -79,6 +80,13 @@ async fn case(app: App, key: Option<&str>) -> Case {
     .await
 }
 
+/// [`case`] with `auth.mcp` on, which an agent of the loops needs: the JSON
+/// API makes no agent while it is off.
+async fn case_for_agents(app: App, key: Option<&str>) -> Case {
+    let now = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    case_full(app, key, now, None, Some(true), true).await
+}
+
 async fn case_with_clock(
     app: App,
     key: Option<&str>,
@@ -107,7 +115,7 @@ async fn case_full(
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (forge, url) = spawn_forge(
-        &[("acme/kb", repo_with_manifest(""))],
+        &[("acme/kb", kb_repo())],
         &[("acme/kb", 1)],
         &[(1, "ghs_test")],
     )
@@ -600,6 +608,35 @@ fn stored(token: &str) -> crystalline_remote::StoredToken {
         expires_at: None,
         refresh_expires_at: None,
     }
+}
+
+/// The team's `kb`: its MANIFEST and a summary pair that never says it is
+/// summarized (V103, a mechanical finding), so the evolve loop is due there
+/// and an agent of the loops may take its lease. Both are shared, so neither
+/// is a person's unshared work.
+fn kb_repo() -> Arc<crate::support::MockProvider> {
+    let mock = Arc::new(crate::support::MockProvider::new());
+    let head = mock.add_commit(files(&[
+        ("MANIFEST.md", manifest("")),
+        (
+            "summary-doc.md",
+            engram(
+                "Summary doc",
+                "summary-doc",
+                "The distilled version of the migration write-up.\n\n- summarizes [[Full text doc]]\n- [context] written after the migration closed",
+            ),
+        ),
+        (
+            "full-text-doc.md",
+            engram(
+                "Full text doc",
+                "full-text-doc",
+                "The full migration write-up with the shard tables.\n\n- [context] the source the summary was cut from\n- [lesson] keep the tables out of the summary",
+            ),
+        ),
+    ]));
+    mock.set_branch("main", &head);
+    mock
 }
 
 fn change(fx: &Case, name: &str) {
@@ -1631,7 +1668,7 @@ async fn as_root(
 /// JSON API, as it is for an account, and taken once the drafts are ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_json_api_refuses_an_agent_a_name_holding_a_removed_persons_drafts() {
-    let fx = case(App::Ready, None).await;
+    let fx = case_for_agents(App::Ready, None).await;
     crystalline_core::kept::write(
         &fx.tmp.path().join(crystalline_core::kept::KEPT_DIR),
         "kb",
@@ -1719,7 +1756,7 @@ async fn nothing_of_the_agent_is_left(fx: &Case, path: &str) {
 /// links, unlike removing a person, and its name can be used again at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removing_an_agent_over_the_json_api_ends_its_drafts() {
-    let fx = case(App::Ready, None).await;
+    let fx = case_for_agents(App::Ready, None).await;
     let path = agent_with_a_draft(&fx).await;
     let (status, body) = as_root(
         &fx,
