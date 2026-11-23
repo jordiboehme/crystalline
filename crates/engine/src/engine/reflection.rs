@@ -2105,8 +2105,8 @@ impl Engine {
         confirmed.dedup();
         // The `##` sections this write created or changed that leave it with
         // no source in their record: provenance alone, whatever else counts
-        // a section as reflected. The pact is no page.
-        let unsourced_sections: Vec<String> = if p.path == r::PACT_FILE {
+        // a section as reflected. A pact file is no page.
+        let unsourced_sections: Vec<String> = if r::is_pact_file(&p.path) {
             Vec::new()
         } else {
             sections
@@ -2212,7 +2212,7 @@ impl Engine {
                 .await?
                 .into_iter()
                 .map(|row| row.path)
-                .filter(|path| path != r::PACT_FILE)
+                .filter(|path| !r::is_pact_file(path))
                 .collect();
             let findings = r::structure_findings(&final_text, &pages);
             if !findings.is_empty() {
@@ -2618,6 +2618,10 @@ impl Engine {
         for row in &rows {
             if row.path == r::PACT_FILE {
                 pact = json!({ "path": r::PACT_FILE, "title": row.title, "exists": true, "open_threads": open_threads(r::PACT_FILE) });
+                continue;
+            }
+            // A page pact is no page of the tree; its page shows it.
+            if r::is_pact_file(&row.path) {
                 continue;
             }
             let sections = r::split_sections(&row.content).len().saturating_sub(1);

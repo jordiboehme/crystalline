@@ -309,7 +309,8 @@ pub fn pact_chain(
 /// cycle: the walk up from `target`, with that `follows` in place, comes
 /// back to `page`. A `target` that would not be taken (it names no existing
 /// page) closes none. What a write that sets `follows` asks before it is
-/// accepted.
+/// accepted. `pages` must hold `page` itself: a write that creates the page
+/// inserts it first, or a loop back through a folder parent is not seen.
 pub fn would_cycle(page: &str, target: &str, pages: &BTreeMap<String, PageLinks>) -> bool {
     if target == page {
         return true;
@@ -405,7 +406,7 @@ fn folder_parent(page: &str, pages: &BTreeMap<String, PageLinks>) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reflection::{ReflectionFile, classify};
+    use crate::reflection::{ReflectionFile, classify, is_pact_file};
 
     fn pages(list: &[(&str, Option<&str>, Option<&str>)]) -> BTreeMap<String, PageLinks> {
         list.iter()
@@ -501,6 +502,22 @@ mod tests {
             }
         }
         assert!(validate_reflection_path("arch/overview.pact.md").is_ok());
+    }
+
+    #[test]
+    fn pact_files_are_no_pages() {
+        for pact in ["PACT.md", "arch/overview.pact.md", "a.pact.md"] {
+            assert!(is_pact_file(pact), "{pact}");
+        }
+        for not in [
+            "a.md",
+            "guides/pact.md",
+            "a.pact.threads.md",
+            ".reflected/a.pact.md",
+            "PACT.pact.md",
+        ] {
+            assert!(!is_pact_file(not), "{not}");
+        }
     }
 
     #[test]

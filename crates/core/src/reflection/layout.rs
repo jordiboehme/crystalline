@@ -218,6 +218,18 @@ pub fn classify(path: &str) -> ReflectionFile {
     }
 }
 
+/// Whether `path` (inside `reflections/`) is a pact file: `PACT.md` or a
+/// page pact. Neither is a page: a walk over the pages (the navigation
+/// tree, the queue's page items, the pages a structure glob is checked
+/// against) leaves both out, while the sync, the backup and an export keep
+/// them as files.
+pub fn is_pact_file(path: &str) -> bool {
+    matches!(
+        classify(path),
+        ReflectionFile::Pact | ReflectionFile::PagePact { .. }
+    )
+}
+
 /// One line of a pact's `## Structure` section that is a bullet: its text
 /// with backticks stripped at both ends, and whether it sits at column 0
 /// (the only bullets read as globs).

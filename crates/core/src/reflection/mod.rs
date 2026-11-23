@@ -39,8 +39,8 @@ pub use baseline::{
 pub use layout::{
     BASELINE_DIR, MATCHES_NO_PAGE, NESTED_NOT_READ, NOT_A_VALID_GLOB, PACT_FILE,
     READS_AS_A_SENTENCE, REFLECTIONS_DIR, ReflectionFile, Structure, StructureFinding,
-    THREADS_SUFFIX, baseline_path, classify, domain_rel, fits_structure, is_under_reflections,
-    reflection_folders, structure_findings, structure_globs, threads_path,
+    THREADS_SUFFIX, baseline_path, classify, domain_rel, fits_structure, is_pact_file,
+    is_under_reflections, reflection_folders, structure_findings, structure_globs, threads_path,
     validate_new_reflection_path, validate_reflection_path,
 };
 pub use links::{rebase_links, relative_to, rewrite_asset_links, rewrite_links_to};

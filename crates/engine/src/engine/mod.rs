@@ -13544,6 +13544,15 @@ mod lock_tests {
             timeframe_cutoff(&format!("{}h", i64::MAX)).as_deref(),
             Some(earliest.as_str())
         );
+        // A unit with no number does not read, and falls back to a week.
+        let week = time::today_utc().saturating_sub_days(7).ymd();
+        for spec in ["h", "w", "m", "y"] {
+            assert_eq!(
+                timeframe_cutoff(spec).as_deref(),
+                Some(week.as_str()),
+                "{spec}"
+            );
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("eng");

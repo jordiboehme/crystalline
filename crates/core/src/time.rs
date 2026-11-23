@@ -883,6 +883,10 @@ fn day_from_parts(parts: Parts) -> Option<Day> {
 
 #[cfg(test)]
 mod tests {
+    use super::corpus::{CORPUS, Expect};
+    use super::serde::{offset_stamp_json, stamp_json};
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
 
     #[test]
     fn a_timeframe_spells_a_span_in_seconds() {
@@ -912,10 +916,6 @@ mod tests {
             assert_eq!(timeframe_seconds(spec), None, "{spec:?}");
         }
     }
-    use super::corpus::{CORPUS, Expect};
-    use super::serde::{offset_stamp_json, stamp_json};
-    use super::*;
-    use std::collections::hash_map::DefaultHasher;
 
     /// 2026-01-05T10:17:19Z.
     const BASE_SECS: i64 = 1_767_608_239;

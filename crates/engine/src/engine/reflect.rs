@@ -426,7 +426,7 @@ impl Engine {
         let no_glob_fits = !pact_globs.is_empty()
             && !rows
                 .iter()
-                .any(|row| row.path != r::PACT_FILE && structure.fits(&row.path));
+                .any(|row| !r::is_pact_file(&row.path) && structure.fits(&row.path));
         let mut cited: HashSet<String> = HashSet::new();
         // Whether this domain's pages may cite each other domain, asked
         // once per domain for the whole scan.
@@ -486,6 +486,11 @@ impl Engine {
                         basis: item_basis([row.content.as_str()]),
                     });
                 }
+                continue;
+            }
+            // A page pact is no page: no page item (feedback, sources,
+            // off_structure) is raised for it.
+            if r::is_pact_file(&row.path) {
                 continue;
             }
             let changes = if no_feedback || !feedback {
