@@ -12,6 +12,11 @@
  * two controls like the engram tree's: the chevron button opens and shuts
  * the folder in the sidebar; there is no folder page to link to.
  *
+ * A retired page is left out, and a folder it leaves empty with it, unless
+ * the reader turns on "Show retired pages" (remembered in this browser, see
+ * `retiredPages.ts`); the page the reader is on stays, so the tree still
+ * says where they are. The switch is offered only while a page is retired.
+ *
  * Depth is the Reflection's own business (the pact says how deep the tree
  * goes), so nothing here caps it. What is capped is the indentation: six
  * levels of it, then rows stop moving right, so a page twelve folders down
@@ -45,7 +50,8 @@ import {
   reflectionRoute,
 } from "../paths";
 import { useReflectionStatus } from "./ReflectionModeSwitch";
-import { SIDE } from "./primitives";
+import { useRetiredPagesShown } from "../retiredPages";
+import { FOCUS_RING, SIDE } from "./primitives";
 import { useFolderOpen, useSidebarState } from "./sidebarState";
 import { WritePact } from "./WritePact";
 
@@ -53,6 +59,24 @@ const INDENT_LEVELS = 6;
 
 const ROW = SIDE.row;
 const CURRENT = SIDE.current;
+
+/** Whether any page under `nodes` is retired. */
+function anyRetired(nodes: TreeNode[]): boolean {
+  return nodes.some((node) =>
+    node.kind === "folder" ? anyRetired(node.children) : node.retired,
+  );
+}
+
+/** `nodes` without retired pages (but `keep`) and the folders left empty. */
+function withoutRetired(nodes: TreeNode[], keep: string): TreeNode[] {
+  return nodes.flatMap((node): TreeNode[] => {
+    if (node.kind === "reflection") {
+      return node.retired && node.path !== keep ? [] : [node];
+    }
+    const children = withoutRetired(node.children, keep);
+    return children.length === 0 ? [] : [{ ...node, children }];
+  });
+}
 
 /** Whether `folder` is `path` or one of its ancestors. */
 function holds(folder: string, path: string): boolean {
@@ -81,6 +105,14 @@ export function ReflectionNav({
   const sidebar = useSidebarState();
   const pact = tree.data?.pact;
   const threads = tree.data === undefined ? 0 : openThreadCount(tree.data);
+  const [showRetired, setShowRetired] = useRetiredPagesShown();
+  const retiredHere = tree.data !== undefined && anyRetired(tree.data.nodes);
+  const nodes =
+    tree.data === undefined
+      ? []
+      : showRetired
+        ? tree.data.nodes
+        : withoutRetired(tree.data.nodes, path);
   return (
     <nav
       aria-label={`Reflection of ${domain}`}
@@ -160,7 +192,7 @@ export function ReflectionNav({
       )}
       {tree.data && (
         <ul className="flex flex-col gap-0.5">
-          {tree.data.nodes.map((node) => (
+          {nodes.map((node) => (
             <Node
               key={node.path}
               domain={domain}
@@ -170,6 +202,33 @@ export function ReflectionNav({
             />
           ))}
         </ul>
+      )}
+      {retiredHere && (
+        <button
+          type="button"
+          role="switch"
+          aria-checked={showRetired}
+          onClick={() => {
+            setShowRetired(!showRetired);
+          }}
+          className={`mt-1 inline-flex items-center gap-2 self-start rounded px-2.5 py-1 text-[12.5px] whitespace-nowrap text-slate-600 hover:text-ink-3 dark:text-muted ${FOCUS_RING}`}
+        >
+          <span
+            aria-hidden
+            className={`relative h-[15px] w-[26px] shrink-0 rounded-full transition-colors motion-reduce:transition-none ${
+              showRetired
+                ? "bg-accent-600 dark:bg-accent-400"
+                : "bg-slate-500 dark:bg-faint"
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 size-[11px] rounded-full bg-white shadow-sm transition-transform motion-reduce:transition-none ${
+                showRetired ? "translate-x-[11px]" : ""
+              }`}
+            />
+          </span>
+          Show retired pages
+        </button>
       )}
       {mayEdit && (
         <button
@@ -226,7 +285,9 @@ function Node({
           to={reflectionPageRoute(domain, node.path)}
           aria-current={current ? "page" : undefined}
           title={node.title}
-          className={`${ROW} flex-1 ${current ? CURRENT : ""}`}
+          className={`${ROW} flex-1 ${current ? CURRENT : ""} ${
+            node.retired ? SIDE.retired : ""
+          }`}
         >
           <span className="truncate">{node.title}</span>
           {/* Drawn inside the row and not spoken there, so the link's name

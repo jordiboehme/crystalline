@@ -372,3 +372,87 @@ describe("the reflection tree", () => {
     ).toBeVisible();
   });
 });
+
+describe("retired pages in the tree", () => {
+  const tree = () => ({
+    domain: "eng",
+    pact: { path: "PACT.md", title: "How we write", exists: true },
+    nodes: [
+      {
+        kind: "folder",
+        name: "old",
+        path: "old",
+        children: [
+          {
+            kind: "reflection",
+            name: "gone.md",
+            path: "old/gone.md",
+            title: "Gone page",
+            retired: true,
+          },
+        ],
+      },
+      {
+        kind: "reflection",
+        name: "kept.md",
+        path: "kept.md",
+        title: "Kept page",
+      },
+      {
+        kind: "reflection",
+        name: "past.md",
+        path: "past.md",
+        title: "Past page",
+        retired: true,
+      },
+    ],
+  });
+
+  beforeEach(() => {
+    localStorage.removeItem("fluid.reflection.retired");
+  });
+
+  it("hides retired pages and a folder they leave empty, until the switch shows them", async () => {
+    serve({ "/domains/eng/reflection/tree": tree });
+    renderApp("/d/eng/reflection");
+    const nav = await screen.findByRole("navigation", {
+      name: "Reflection of eng",
+    });
+    await within(nav).findByRole("link", { name: "Kept page" });
+    expect(within(nav).queryByRole("link", { name: "Past page" })).toBeNull();
+    expect(within(nav).queryByRole("button", { name: /old$/ })).toBeNull();
+    const toggle = within(nav).getByRole("switch", {
+      name: "Show retired pages",
+    });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    await userEvent.click(toggle);
+    const past = within(nav).getByRole("link", { name: "Past page" });
+    expect(past.className).toContain("italic");
+    expect(
+      within(nav).getByRole("button", { name: "Expand old" }),
+    ).toBeVisible();
+    // Remembered in this browser.
+    expect(localStorage.getItem("fluid.reflection.retired")).toBe("shown");
+  });
+
+  it("keeps the retired page the reader is on", async () => {
+    serve({ "/domains/eng/reflection/tree": tree });
+    renderApp("/d/eng/reflection/past.md");
+    const nav = await screen.findByRole("navigation", {
+      name: "Reflection of eng",
+    });
+    expect(
+      await within(nav).findByRole("link", { name: "Past page" }),
+    ).toHaveAttribute("aria-current", "page");
+  });
+
+  it("offers no switch while no page is retired", async () => {
+    serve();
+    renderApp("/d/eng/reflection");
+    const nav = await screen.findByRole("navigation", {
+      name: "Reflection of eng",
+    });
+    await within(nav).findByRole("link", { name: "Top page" });
+    expect(within(nav).queryByRole("switch")).toBeNull();
+  });
+});

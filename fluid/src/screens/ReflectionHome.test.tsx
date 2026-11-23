@@ -764,6 +764,43 @@ describe("the Reflection home", () => {
     });
   });
 
+  it("finds a retired page and draws it faded, with the word", async () => {
+    asEditor({
+      "/domains/eng/reflection/search": () => ({
+        domain: "eng",
+        query: "night",
+        mode: "hybrid",
+        total: 2,
+        page: 1,
+        limit: 20,
+        count: 2,
+        hits: [
+          {
+            path: "old.md",
+            title: "Old",
+            section: "_top",
+            heading: "",
+            snippet: "x",
+            retired: true,
+          },
+          {
+            path: "new.md",
+            title: "New",
+            section: "_top",
+            heading: "",
+            snippet: "y",
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/reflection?q=night");
+    const old = await screen.findByRole("link", { name: "Old" });
+    expect(old.closest("li")?.className).toContain("opacity-60");
+    expect(old.closest("li")).toHaveTextContent("retired");
+    const fresh = screen.getByRole("link", { name: "New" });
+    expect(fresh.closest("li")?.className ?? "").not.toContain("opacity-60");
+  });
+
   it("says once where a Reflection that lives elsewhere is", async () => {
     asEditor({
       "/domains/eng/reflection": () =>
