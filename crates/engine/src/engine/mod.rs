@@ -1078,6 +1078,9 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    /// `auth.mcp` as the HTTP MCP door read it when the daemon started, or
+    /// `None` for an engine with no door (the CLI, tests that never pin it).
+    auth_mcp_pinned: Option<bool>,
     // A test seam: when armed, the next source edit fails on its far side,
     // once. See `Engine::fail_next_source_edit`.
     // Compiled only into a test build (`cfg(test)` for this crate's unit tests,
@@ -2665,6 +2668,7 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            auth_mcp_pinned: None,
             #[cfg(any(test, feature = "testing"))]
             prune_statements: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -4725,6 +4729,16 @@ impl Engine {
         self.read_only
     }
 
+    /// Pin `auth.mcp` to the value the daemon starts with. The HTTP MCP door
+    /// reads the setting once, when it is built, and the open tier, the agent
+    /// checks and the ctl route must answer as that door does: a `config set
+    /// auth.mcp` on a running daemon changes the file and applies at the next
+    /// start, for every reader at once.
+    pub fn with_auth_mcp_pinned(mut self, auth_mcp: bool) -> Engine {
+        self.auth_mcp_pinned = Some(auth_mcp);
+        self
+    }
+
     /// Install the environment overlay and recompute the effective config from
     /// the file config plus this overlay. The daemon and the standalone loader
     /// call this with the overlay parsed at startup; every existing call site
@@ -5255,8 +5269,15 @@ impl Engine {
     /// way as [`Engine::github_enabled`]. This is the setting that creates the
     /// legacy open tier, and a write gate reads it once per write, so it must
     /// not clone the whole config to get at one bool.
+    ///
+    /// A daemon pins the value it started with ([`Engine::with_auth_mcp_pinned`]),
+    /// so a runtime change waits for the restart, as the door does. An engine
+    /// with no pin reads the live config.
     pub fn auth_mcp(&self) -> bool {
-        self.config.read().unwrap().auth_mcp()
+        match self.auth_mcp_pinned {
+            Some(pinned) => pinned,
+            None => self.config.read().unwrap().auth_mcp(),
+        }
     }
 
     /// Whose GitHub identity a share on this instance runs as, read live:

@@ -660,6 +660,7 @@ pub async fn run_serve(
         .with_embed_channel(embed_tx)
         .with_contradiction_channel(contradiction_tx)
         .with_read_only(read_only)
+        .with_auth_mcp_pinned(loaded.effective.auth_mcp())
         .with_instance_id(instance_id)
         .with_env_overlay(loaded.overlay.clone())
         .with_machine_owner_lookup(crate::client::machine_owner_for_engine());
@@ -3014,7 +3015,7 @@ fn http_router_inner(
         // declared routes and the transport behind them.
         let config = engine.config();
         let api = config.api_enabled();
-        let mcp_auth = config.auth_mcp().then(|| auth.clone());
+        let mcp_auth = engine.auth_mcp().then(|| auth.clone());
         let base_path = crate::settings::base_path(&config);
         let (router, service) = http_base(
             engine,
@@ -3052,9 +3053,11 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // error).
     let config = engine.config();
     let (api, ui) = (config.api_enabled(), config.ui_enabled());
-    // Read here with the other two, and for the same reason: the `auth.*` keys
-    // are startup-effective, so a running daemon serves the tier it started in.
-    let mcp_auth = config.auth_mcp().then(|| auth.clone());
+    // The `auth.*` keys are startup-effective, so a running daemon serves the
+    // tier it started in. Read through the engine, which the daemon pins to
+    // its start value, so the door, the open tier and the agent checks are one
+    // value by construction.
+    let mcp_auth = engine.auth_mcp().then(|| auth.clone());
     let base_path = crate::settings::base_path(&config);
     if ui
         && let Some(index) = E::get("index.html")

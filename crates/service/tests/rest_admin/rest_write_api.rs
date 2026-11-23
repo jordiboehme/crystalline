@@ -127,6 +127,9 @@ async fn serve(opts: Options) -> Fixture {
         Some(config_path.clone()),
     )
     .with_read_only(opts.read_only)
+    // Pinned the way the daemon pins it, so the door, the open tier and the
+    // agent routes read one value until a restart.
+    .with_auth_mcp_pinned(opts.agents)
     .with_token_store_dir(root.join("tokens"))
     .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
     // Where a rename keeps its journal; every other write route in
@@ -5609,4 +5612,31 @@ async fn an_agent_is_refused_while_auth_mcp_is_off() {
             .unwrap();
     assert_eq!(listed["auth_mcp"], false, "{listed}");
     assert_eq!(listed["agents"], serde_json::json!([]), "{listed}");
+
+    // Turned on while the server runs: the file changes, and the agent routes
+    // keep answering as the running MCP door does until the restart.
+    fx.engine
+        .configure_as_operator(&crystalline_service::engine::ConfigureAction::Set {
+            key: "auth.mcp".into(),
+            value: "true".into(),
+        })
+        .await
+        .unwrap();
+    assert!(fx.engine.config().auth_mcp(), "the setting is saved");
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/agents", &admin)
+        .json(&serde_json::json!({"name": "nightly"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "still refused until the restart");
+    let listed: serde_json::Value =
+        as_session(fx.addr, reqwest::Method::GET, "/api/v1/agents", &admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(listed["auth_mcp"], false, "{listed}");
+    assert!(fx.auth.agents().await.unwrap().is_empty());
 }
