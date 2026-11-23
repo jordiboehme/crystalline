@@ -99,12 +99,12 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
     if is_pact(path) && path != PACT_FILE {
         return Err(format!("'{path}' names the pact; spell it {PACT_FILE}"));
     }
-    if let Some(stem) = strip_pact_suffix(path) {
-        if !path.ends_with(PAGE_PACT_SUFFIX) {
-            return Err(format!(
-                "'{path}' names a page pact; spell it {stem}{PAGE_PACT_SUFFIX}"
-            ));
-        }
+    if let Some(stem) = strip_pact_suffix(path)
+        && !path.ends_with(PAGE_PACT_SUFFIX)
+    {
+        return Err(format!(
+            "'{path}' names a page pact; spell it {stem}{PAGE_PACT_SUFFIX}"
+        ));
     }
     if strip_pact_suffix(path).is_some() && pact_page_of(path).is_none() {
         return Err(format!(
