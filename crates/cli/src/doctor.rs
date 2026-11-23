@@ -1951,6 +1951,12 @@ pub struct DoctorReport {
     /// somebody's work, and only a person drops one (`crystalline kept
     /// drop`). One older than [`crate::kept::STALE_DAYS`] days is a warning.
     pub kept: Vec<KeptDoctor>,
+    /// The agents of the loops this instance holds while `auth.mcp` is off,
+    /// by name: their tokens open nothing until it is on. Empty when
+    /// `auth.mcp` is on, when there are none, or when the accounts could not
+    /// be read. A warning, never a counted problem.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents_need_auth_mcp: Vec<String>,
 }
 
 /// The update section of the `doctor` report: the facts as `status`
@@ -2580,6 +2586,7 @@ pub async fn run(
 
     let kept = check_kept(crate::kept::scan_here(), domain_filter, time::now());
     let case_twins = check_case_twins(cfg);
+    let agents_need_auth_mcp = check_agents(cfg).await;
 
     // Only an active daemon answers the file-stamp request (a standby
     // refuses ctl commands), so a daemon route means an active one.
@@ -2627,7 +2634,44 @@ pub async fn run(
         kept,
         case_twins,
         update,
+        agents_need_auth_mcp,
     })
+}
+
+/// The agents of the loops this instance holds while `auth.mcp` is off (see
+/// [`DoctorReport::agents_need_auth_mcp`]). Reads the accounts only when the
+/// setting is off and they exist; a file that is not there is not made.
+async fn check_agents(cfg: &GlobalConfig) -> Vec<String> {
+    if cfg.auth_mcp() {
+        return Vec::new();
+    }
+    let store = match crystalline_service::existing_accounts_for_cli(cfg).await {
+        Ok(Some(store)) => store,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            tracing::debug!("the agents check could not read the accounts: {e:#}");
+            return Vec::new();
+        }
+    };
+    match store.agents().await {
+        Ok(agents) => agents.into_iter().map(|agent| agent.name).collect(),
+        Err(e) => {
+            tracing::debug!("the agents check could not read the agents: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// The warning for agents of the loops on an instance with `auth.mcp` off.
+fn agents_line(names: &[String]) -> String {
+    let (count, them) = match names.len() {
+        1 => ("1 agent".to_string(), "its token opens"),
+        n => (format!("{n} agents"), "their tokens open"),
+    };
+    format!(
+        "[warning] this instance has {count} of the loops ({}) and auth.mcp is off, so {them} nothing: turn it on with 'crystalline config set auth.mcp true' (or CRYSTALLINE_AUTH_MCP=true) and restart the server",
+        names.join(", ")
+    )
 }
 
 /// The rename journal waiting in this machine's state directory, compared
@@ -6465,6 +6509,11 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     render_kept(&mut out, &report.kept);
 
+    if !report.agents_need_auth_mcp.is_empty() {
+        let _ = writeln!(out, "agents:");
+        let _ = writeln!(out, "  {}", agents_line(&report.agents_need_auth_mcp));
+    }
+
     // Advisory tag hygiene: near-duplicate clusters, never a counted problem.
     if let Some(t) = &report.tags
         && !t.clusters.is_empty()
@@ -6828,6 +6877,24 @@ fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agents_warning_names_them_and_the_remedy() {
+        let one = agents_line(&["nightly".to_string()]);
+        assert!(
+            one.starts_with("[warning] this instance has 1 agent of the loops (nightly)")
+                && one.contains("its token opens nothing")
+                && one.contains("crystalline config set auth.mcp true"),
+            "{one}"
+        );
+        let two = agents_line(&["nightly".to_string(), "curator".to_string()]);
+        assert!(
+            two.contains("2 agents of the loops (nightly, curator)")
+                && two.contains("their tokens open nothing"),
+            "{two}"
+        );
+        assert!(!two.contains('\u{2014}') && !two.contains('\u{2013}'));
+    }
     use crystalline_core::config::EvolveConfig;
     use crystalline_index::{TursoStore, sync_domain};
 

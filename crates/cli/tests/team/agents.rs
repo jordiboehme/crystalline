@@ -7,8 +7,22 @@ use crate::common::isolate;
 
 /// Run `crystalline <args>` in the isolated home: success, stdout, stderr.
 fn run(home: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    run_with_mcp_auth(home, args, stdin, true)
+}
+
+/// [`run`] with `auth.mcp` as `mcp_auth` says: agents need it on.
+fn run_with_mcp_auth(
+    home: &std::path::Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    mcp_auth: bool,
+) -> (bool, String, String) {
     let mut cmd: Command = crate::common::crystalline();
     isolate(&mut cmd, home);
+    cmd.env(
+        "CRYSTALLINE_AUTH_MCP",
+        if mcp_auth { "true" } else { "false" },
+    );
     cmd.args(args);
     if let Some(input) = stdin {
         cmd.write_stdin(input.to_string());
@@ -123,4 +137,49 @@ fn agents_add_list_token_revoke_remove() {
     assert!(err.contains("no such agent"), "{err}");
     let (_, out, _) = run(home, &["agents", "list"], None);
     assert!(out.contains("No agents"), "{out}");
+}
+
+/// With `auth.mcp` off `agents add` makes no agent and says why: an agent
+/// token would open nothing on this instance.
+#[test]
+fn agents_add_is_refused_while_auth_mcp_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let (ok, _, err) = run_with_mcp_auth(home, &["agents", "add", "nightly"], None, false);
+    assert!(!ok);
+    assert!(
+        err.contains("Agents need auth.mcp on")
+            && err.contains("crystalline config set auth.mcp true"),
+        "{err}"
+    );
+    let (ok, out, err) = run(home, &["agents", "list"], None);
+    assert!(ok, "{err}");
+    assert!(!out.contains("nightly"), "{out}");
+}
+
+/// Doctor warns when this instance holds agents and `auth.mcp` is off, and
+/// says nothing about them once it is on.
+#[test]
+fn doctor_warns_about_agents_while_auth_mcp_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let (ok, _, err) = run(home, &["agents", "add", "nightly"], None);
+    assert!(ok, "{err}");
+    let (_, out, err) = run_with_mcp_auth(home, &["--json", "doctor"], None, false);
+    let report: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}{err}"));
+    assert_eq!(
+        report["agents_need_auth_mcp"],
+        serde_json::json!(["nightly"]),
+        "{out}"
+    );
+    let (_, out, _) = run_with_mcp_auth(home, &["doctor"], None, false);
+    assert!(
+        out.contains("1 agent of the loops (nightly) and auth.mcp is off"),
+        "{out}"
+    );
+    let (_, out, err) = run(home, &["--json", "doctor"], None);
+    let report: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}{err}"));
+    assert!(report.get("agents_need_auth_mcp").is_none(), "{out}");
 }

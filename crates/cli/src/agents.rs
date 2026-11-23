@@ -47,6 +47,10 @@ pub async fn run(command: AgentsCommand, json: bool) -> Result<()> {
             expires,
             label,
         } => {
+            // An agent token opens nothing while `auth.mcp` is off.
+            if !loaded.effective.auth_mcp() {
+                bail!("{}", crystalline_service::rest::AGENTS_NEED_AUTH_MCP);
+            }
             let loops = parse_loops(&loops)?;
             let ttl = parse_expires(&expires)?;
             crate::users::clear_name_for_new_account(&store, &name, &route).await?;

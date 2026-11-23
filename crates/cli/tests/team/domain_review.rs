@@ -78,6 +78,8 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> std::process::Output {
         let mut cmd = bin();
         isolate(&mut cmd, self.home.path());
+        // Agents need `auth.mcp` on.
+        cmd.env("CRYSTALLINE_AUTH_MCP", "true");
         cmd.args(args);
         cmd.output().unwrap()
     }

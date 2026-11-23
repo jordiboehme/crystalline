@@ -1986,13 +1986,16 @@ fn users_add_while_daemon_owns_is_seen_at_once() {
 
 /// `agents` writes the accounts database beside a daemon that owns it, like
 /// `users`: the agent lands in the database, no accounts file appears, the
-/// owner row stays the daemon's, and its token is refused at the ctl route.
+/// owner row stays the daemon's, and its token reaches only the automation
+/// verbs at the ctl route. `auth.mcp` is on, which agents need.
 #[test]
 fn agents_add_while_daemon_owns_lands_in_the_database() {
     let Some(pg) = PgScratch::new("agowned") else {
         return;
     };
-    let env = Env::new("agowned").on_postgres(&pg);
+    let env = Env::new("agowned")
+        .on_postgres(&pg)
+        .with_var("CRYSTALLINE_AUTH_MCP", "true");
     let mut serve = Serve::start(&env, None);
     serve.wait_ready();
     let (ok, out, err) = env.run_full(&["--json", "agents", "add", "nightly"]);
@@ -2013,7 +2016,7 @@ fn agents_add_while_daemon_owns_lands_in_the_database() {
         !env.state_dir().join("web-auth.db").exists(),
         "an accounts file was made"
     );
-    let status = reqwest::blocking::Client::builder()
+    let reply = reqwest::blocking::Client::builder()
         .no_proxy()
         .build()
         .unwrap()
@@ -2022,10 +2025,16 @@ fn agents_add_while_daemon_owns_lands_in_the_database() {
         .json(&serde_json::json!({ "v": 1, "cmd": "status" }))
         .timeout(Duration::from_secs(10))
         .send()
-        .unwrap()
-        .status()
-        .as_u16();
-    assert_eq!(status, 401, "no ctl command is open to an agent yet");
+        .unwrap();
+    assert_eq!(reply.status().as_u16(), 200);
+    let reply: serde_json::Value = reply.json().unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("only the automation verbs")),
+        "{reply}"
+    );
 }
 
 /// Only an owner migrates the accounts tables: with the ledger stamped
