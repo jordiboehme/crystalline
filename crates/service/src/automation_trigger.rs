@@ -15,6 +15,10 @@
 //! - Reflect, page updates only: after [`SOURCE_QUIET`] without a source
 //!   change on the domain (an engram event there, or a move of its update
 //!   count).
+//! - Reflect, a page whose freshness ran out (`stale`, counted on its own):
+//!   at the first look that sees it, without the quiet rule. Every look arms
+//!   the next at the time the status names for the next page that falls
+//!   due (`next_stale_in_secs`), so a page falls due with no event at all.
 //! - Evolve: on the [`EVOLVE_TICK`], when the mechanical count reaches
 //!   `automation.evolve_threshold` (once per crossing, not on every tick it
 //!   stays above it).
@@ -423,6 +427,14 @@ impl Triggers {
             }
         };
         let entry = &status["domains"][0];
+        // The next page that falls due arms a look of its own, whatever this
+        // look decides: nothing else may come to wake the slot then. The
+        // status names a time ahead of its clock, never now.
+        if let Some(secs) = entry["next_stale_in_secs"].as_u64()
+            && let Some(at) = Instant::now().checked_add(Duration::from_secs(secs.max(1)))
+        {
+            self.slot(domain, lp).arm(at);
+        }
         // The loop backs off after failed runs: nothing is sent while it
         // waits, and nothing new may come to wake the slot when it ends, so
         // the slot looks again on its own, keeping a send it was owed.
@@ -468,8 +480,11 @@ impl Triggers {
         let send = match lp {
             Loop::Reflect => {
                 let people = count("waiting_for_the_agent") + count("feedback");
+                // A page whose freshness ran out does not wait for quiet
+                // sources: its time is its own.
+                let stale = count("stale");
                 let quiet_until = slot.quiet_since.unwrap_or(now) + SOURCE_QUIET;
-                if people > 0 || urgent || now >= quiet_until {
+                if people > 0 || stale > 0 || urgent || now >= quiet_until {
                     true
                 } else {
                     slot.arm(quiet_until);
