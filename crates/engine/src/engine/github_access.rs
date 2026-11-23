@@ -1927,10 +1927,18 @@ impl super::Engine {
         access: &DomainAccess,
         scope: &Scope,
     ) -> anyhow::Result<DomainVisibility> {
-        match self.open_tier_agent(scope) {
+        if let Some(kept) = super::visibility_memo::recall(scope) {
+            return Ok(kept);
+        }
+        #[cfg(any(test, feature = "testing"))]
+        self.visibility_folds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let visibility = match self.open_tier_agent(scope) {
             Some(agent) => access.open_tier_visibility(&agent).await,
             None => access.visibility(scope).await,
-        }
+        }?;
+        super::visibility_memo::keep(scope, &visibility);
+        Ok(visibility)
     }
 
     /// Since when a connected repository's lookups have been failing while

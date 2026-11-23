@@ -380,10 +380,10 @@ impl Engine {
         let full = detail == Detail::Full;
         let feedback = detail != Detail::Updates;
         let (rows, host_move) = {
-            let store = self.store.lock().await;
+            let reader = self.reader();
             (
-                store.list_reflections(access.domain_id).await?,
-                store.host_move(access.domain_id).await?,
+                reader.list_reflections(access.domain_id).await?,
+                reader.host_move(access.domain_id).await?,
             )
         };
         // The domain's own engrams are scanned once (the unreflected items

@@ -1031,6 +1031,14 @@ pub struct Engine {
     // rows `Engine::all_threads` reads. See `Engine::reflection_text_loads`.
     #[cfg(any(test, feature = "testing"))]
     reflection_text_loads: std::sync::atomic::AtomicU64,
+    // How many times an automation status or run worked out what is due
+    // (`Engine::loop_work`). See `Engine::due_detections`.
+    #[cfg(any(test, feature = "testing"))]
+    due_detections: std::sync::atomic::AtomicU64,
+    // How many times a caller's visibility was folded rather than recalled
+    // from the call's memo. See `Engine::visibility_folds`.
+    #[cfg(any(test, feature = "testing"))]
+    visibility_folds: std::sync::atomic::AtomicU64,
     // Per domain, a number every announced change of its base engram rows
     // (an `engram` event that is no draft, a `domain` event) and every
     // registration change moves on. Never reset or removed, so an entry
@@ -2606,6 +2614,12 @@ impl Engine {
         let file_config = config.clone();
         let skills_serve = config.skills_serve();
         let reader = reader_for(&store);
+        // Read while nothing holds the lock, so a gate that only needs it
+        // never queues for the writer; a lock held anyway asks on first use.
+        let shared_database = std::sync::OnceLock::new();
+        if let Ok(guard) = store.try_lock() {
+            let _ = shared_database.set(guard.shares_database());
+        }
         Engine {
             store,
             reader,
@@ -2635,6 +2649,10 @@ impl Engine {
             recorded_path_loads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             reflection_text_loads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            due_detections: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            visibility_folds: std::sync::atomic::AtomicU64::new(0),
             reflection_generations: std::sync::Mutex::default(),
             pending_cache: std::sync::Mutex::default(),
             contradiction_facts_cache: std::sync::Mutex::default(),
@@ -2698,7 +2716,7 @@ impl Engine {
             label: String::new(),
             resolved_label: std::sync::Mutex::new(None),
             hosted: std::sync::RwLock::new(HashMap::new()),
-            shared_database: std::sync::OnceLock::new(),
+            shared_database,
             one_shot: false,
             taken: std::sync::Mutex::new(HashSet::new()),
             leases: std::sync::Mutex::new(HashMap::new()),
@@ -4172,6 +4190,25 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many times the due work of a loop on a domain was worked out
+    /// (the reflect queue or the evolve sweep a status, a lease take or a
+    /// run record counts) since this engine was built. A status asked with
+    /// `counts` false does not move it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn due_detections(&self) -> u64 {
+        self.due_detections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many times a caller's visibility was folded since this engine was
+    /// built. A call that runs within the visibility memo folds once per
+    /// scope, however many rights checks it makes.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn visibility_folds(&self) -> u64 {
+        self.visibility_folds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether the domain's Reflection is in effect.
     pub async fn reflection_effective(&self, domain: &str) -> Result<bool> {
         Ok(self.reflection_mode(domain).await? == crystalline_core::ReflectionMode::Effective)
@@ -4310,8 +4347,9 @@ impl Engine {
     }
 
     /// Whether the store is shared with other instances
-    /// ([`Store::shares_database`]). The store lock is taken only on the
-    /// first call: the answer is the backend's and never changes.
+    /// ([`Store::shares_database`]). Read when the engine is built, or under
+    /// the store lock on the first call when something held it then: the
+    /// answer is the backend's and never changes.
     pub(crate) async fn store_is_shared(&self) -> bool {
         if let Some(shared) = self.shared_database.get() {
             return *shared;
@@ -5005,12 +5043,12 @@ impl Engine {
     /// disk has. A move that could not be read counts as unresolved, so
     /// what waits on it waits for the next try.
     async fn host_move_unresolved(&self, domain: &str) -> bool {
-        let store = self.store.lock().await;
-        if !store.shares_database() {
+        if !self.store_is_shared().await {
             return false;
         }
-        match store.domain_id(domain).await {
-            Ok(Some(id)) => !matches!(store.host_move(id).await, Ok(None)),
+        let reader = self.reader();
+        match reader.domain_id(domain).await {
+            Ok(Some(id)) => !matches!(reader.host_move(id).await, Ok(None)),
             Ok(None) => false,
             Err(_) => true,
         }
@@ -9395,8 +9433,12 @@ impl Engine {
         match source {
             ContentSource::File { root } => read_engram_file(root, rel),
             ContentSource::Virtual => {
-                let store = self.store.lock().await;
-                let content = store.engram_content(domain_id, rel).await.ok().flatten()?;
+                let content = self
+                    .reader()
+                    .engram_content(domain_id, rel)
+                    .await
+                    .ok()
+                    .flatten()?;
                 parse_engram(&content).ok()
             }
         }
@@ -9620,6 +9662,7 @@ mod threads;
 mod transfer;
 mod uploads;
 mod validate;
+mod visibility_memo;
 mod write;
 mod write_block;
 

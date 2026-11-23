@@ -2064,7 +2064,7 @@ impl Engine {
             max_line_pairs: MAX_LINE_PAIRS_PER_ENGRAM_PAIR,
         };
         let (rows, now) = {
-            let store = self.store.lock().await;
+            let store = self.reader();
             let rows = store
                 .contradictions(
                     domain_id,

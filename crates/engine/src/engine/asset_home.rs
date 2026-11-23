@@ -155,9 +155,17 @@ impl Engine {
         home: AssetHome,
         domain: &str,
     ) -> Result<Vec<AttachmentRow>> {
-        let (domain_id, _) = self.domain_source(domain).await?;
-        let store = self.store.lock().await;
-        Ok(store.list_assets(home.table(), domain_id).await?)
+        // A listing reads through the read connections; only a domain with
+        // no index row yet goes through the writer, which creates it.
+        let indexed = match self.content_source(domain) {
+            Ok(_) if !self.is_renaming(domain) => self.reader().domain_id(domain).await?,
+            _ => None,
+        };
+        let domain_id = match indexed {
+            Some(id) => id,
+            None => self.domain_source(domain).await?.0,
+        };
+        Ok(self.reader().list_assets(home.table(), domain_id).await?)
     }
 
     /// One file of `home`: its bytes and its metadata row.

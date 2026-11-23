@@ -568,12 +568,7 @@ impl Engine {
         #[cfg(any(test, feature = "testing"))]
         self.reflection_text_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rows = self
-            .store
-            .lock()
-            .await
-            .list_reflections(access.domain_id)
-            .await?;
+        let rows = self.reader().list_reflections(access.domain_id).await?;
         let pages: Vec<(PathBuf, String, String)> = rows
             .into_iter()
             .map(|row| {

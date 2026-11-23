@@ -264,25 +264,57 @@ impl Engine {
         scope: &Scope,
         force: bool,
     ) -> Result<Value> {
+        self.automation_status_with(lp, domains, scope, force, true)
+            .await
+    }
+
+    /// [`Engine::automation_status_forced`], and with `counts` false the due
+    /// work (a sweep of each domain) is skipped altogether: each entry still
+    /// says whether a run is going, the last run, where the loop runs, the
+    /// backoff and the delivery, with `due`, `counts` and `left_for_person`
+    /// null. What a frequent poll asks.
+    ///
+    /// Every store read goes through the read connections ([`Engine::reader`]),
+    /// never the writer lock, and the caller's visibility is folded once for
+    /// the whole call.
+    pub async fn automation_status_with(
+        &self,
+        lp: Loop,
+        domains: &[String],
+        scope: &Scope,
+        force: bool,
+        counts: bool,
+    ) -> Result<Value> {
         let started = tokio::time::Instant::now();
-        let named: Vec<String> = if domains.is_empty() {
-            self.loop_domains(lp, scope).await?
-        } else {
-            let mut once: Vec<String> = Vec::new();
-            for name in domains {
-                self.require_loop_right(lp, name, scope).await?;
-                if !once.contains(name) {
-                    once.push(name.clone());
+        let answer = super::visibility_memo::within(async {
+            let named: Vec<String> = if domains.is_empty() {
+                self.loop_domains(lp, scope).await?
+            } else {
+                let mut once: Vec<String> = Vec::new();
+                for name in domains {
+                    self.require_loop_right(lp, name, scope).await?;
+                    if !once.contains(name) {
+                        once.push(name.clone());
+                    }
                 }
+                once
+            };
+            let mut out = Vec::with_capacity(named.len());
+            for domain in &named {
+                let mut entry = self.loop_status(lp, domain, scope, counts, force).await?;
+                if !counts && let Some(obj) = entry.as_object_mut() {
+                    for key in ["due", "counts", "left_for_person"] {
+                        obj.insert(key.to_string(), Value::Null);
+                    }
+                }
+                out.push(entry);
             }
-            once
-        };
-        let mut out = Vec::with_capacity(named.len());
-        for domain in &named {
-            out.push(self.loop_status(lp, domain, scope, true, force).await?);
-        }
-        crate::log_elapsed!(started, "loop" = ?lp, domains = named.len(), "automation_status answered");
-        Ok(json!({ "loop": lp, "domains": out }))
+            Ok::<_, EngineError>(out)
+        })
+        .await;
+        let named = answer.as_ref().map_or(0, Vec::len);
+        crate::log_elapsed!(started, "loop" = ?lp, domains = named, counts, ok = answer.is_ok(), "automation_status answered");
+        Ok(json!({ "loop": lp, "domains": answer? }))
     }
 
     /// What a runner that starts its own agent sets up a run of `lp` on
@@ -334,43 +366,47 @@ impl Engine {
         counts: bool,
     ) -> Result<Value> {
         let started = tokio::time::Instant::now();
-        self.require_domain(domain, scope).await?;
-        let manager = !matches!(scope, Scope::Anonymous)
-            && self.domain_right(scope, domain).await? >= crate::scope::DomainRight::Manage;
-        let mut out = serde_json::Map::new();
-        for lp in [Loop::Reflect, Loop::Evolve] {
-            if only.is_some_and(|only| only != lp) {
-                continue;
-            }
-            let may_run = match self.require_loop_right(lp, domain, scope).await {
-                Ok(()) => true,
-                Err(EngineError::Forbidden(_) | EngineError::DomainReadOnly(_)) => false,
-                Err(e) => return Err(e),
-            };
-            let counted = may_run && counts;
-            let mut entry = self.loop_status(lp, domain, scope, counted, false).await?;
-            if let Some(obj) = entry.as_object_mut() {
-                if !may_run {
-                    for key in ["last_run", "running"] {
-                        if let Some(inner) = obj.get_mut(key).and_then(Value::as_object_mut) {
-                            for secret in ["account", "agent", "summary", "pr_url"] {
-                                inner.remove(secret);
+        let answer = super::visibility_memo::within(async {
+            self.require_domain(domain, scope).await?;
+            let manager = !matches!(scope, Scope::Anonymous)
+                && self.domain_right(scope, domain).await? >= crate::scope::DomainRight::Manage;
+            let mut out = serde_json::Map::new();
+            for lp in [Loop::Reflect, Loop::Evolve] {
+                if only.is_some_and(|only| only != lp) {
+                    continue;
+                }
+                let may_run = match self.require_loop_right(lp, domain, scope).await {
+                    Ok(()) => true,
+                    Err(EngineError::Forbidden(_) | EngineError::DomainReadOnly(_)) => false,
+                    Err(e) => return Err(e),
+                };
+                let counted = may_run && counts;
+                let mut entry = self.loop_status(lp, domain, scope, counted, false).await?;
+                if let Some(obj) = entry.as_object_mut() {
+                    if !may_run {
+                        for key in ["last_run", "running"] {
+                            if let Some(inner) = obj.get_mut(key).and_then(Value::as_object_mut) {
+                                for secret in ["account", "agent", "summary", "pr_url"] {
+                                    inner.remove(secret);
+                                }
                             }
                         }
                     }
+                    if !counted {
+                        obj.insert("left_for_person".to_string(), Value::Null);
+                        obj.insert("counts".to_string(), Value::Null);
+                    }
+                    if !manager {
+                        obj.insert("delivery".to_string(), Value::Null);
+                    }
                 }
-                if !counted {
-                    obj.insert("left_for_person".to_string(), Value::Null);
-                    obj.insert("counts".to_string(), Value::Null);
-                }
-                if !manager {
-                    obj.insert("delivery".to_string(), Value::Null);
-                }
+                out.insert(lp.as_str().to_string(), entry);
             }
-            out.insert(lp.as_str().to_string(), entry);
-        }
-        crate::log_elapsed!(started, ?domain, "loop" = ?only, counts, "automation_overview answered");
-        Ok(Value::Object(out))
+            Ok::<_, EngineError>(Value::Object(out))
+        })
+        .await;
+        crate::log_elapsed!(started, ?domain, "loop" = ?only, counts, ok = answer.is_ok(), "automation_overview answered");
+        answer
     }
 
     /// Take the lease of `lp` on `domain` for `runner`: `{token,
@@ -1158,13 +1194,14 @@ impl Engine {
                 if !self.store_is_shared().await {
                     return Runs::Here;
                 }
-                let store = self.store.lock().await;
-                let host = match store.domain_id(domain).await {
-                    Ok(Some(id)) => store.domain_host(id).await,
+                // A read: the status asks it on every poll, and the lease
+                // take decides nothing under the writer with it.
+                let reader = self.reader();
+                let host = match reader.domain_id(domain).await {
+                    Ok(Some(id)) => reader.domain_host(id).await,
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 };
-                drop(store);
                 match host {
                     Ok(Some(host))
                         if !host.instance_id.is_empty() && host.instance_id != self.instance_id =>
@@ -1435,6 +1472,9 @@ impl Engine {
 
     /// What `lp` would work on `domain` now, every item with its version.
     async fn loop_work(&self, lp: Loop, domain: &str, scope: &Scope) -> Result<Work> {
+        #[cfg(any(test, feature = "testing"))]
+        self.due_detections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match lp {
             Loop::Reflect => {
                 let items = self.reflect_due_items(domain, &loop_caller(scope)).await?;
@@ -1499,10 +1539,10 @@ impl Engine {
     /// [`RUNS_KEPT`] left for a person at the same version.
     async fn loop_due(&self, lp: Loop, domain: &str, id: DomainId, scope: &Scope) -> Result<Due> {
         let work = self.loop_work(lp, domain, scope).await?;
-        let runs = {
-            let store = self.store.lock().await;
-            store.automation_runs(id, lp.as_str(), RUNS_KEPT).await?
-        };
+        let runs = self
+            .reader()
+            .automation_runs(id, lp.as_str(), RUNS_KEPT)
+            .await?;
         let left: Vec<&DueKey> = runs.iter().flat_map(|run| run.left_items.iter()).collect();
         let total = work.items.len();
         let items: Vec<(DueKey, String)> = work
@@ -1533,18 +1573,16 @@ impl Engine {
         force: bool,
     ) -> Result<Value> {
         let runs_on = self.loop_runs(lp, domain, scope).await;
-        let id = {
-            let store = self.store.lock().await;
-            store.domain_id(domain).await?
-        };
+        // Every read of a status goes through the read connections: a poll
+        // never queues for the writer. A lease take or a run record has
+        // committed before it answered, so the next status sees it.
+        let reader = self.reader();
+        let id = reader.domain_id(domain).await?;
         let (lease, runs) = match id {
-            Some(id) => {
-                let store = self.store.lock().await;
-                (
-                    store.automation_lease(id, lp.as_str()).await?,
-                    store.automation_runs(id, lp.as_str(), RUNS_KEPT).await?,
-                )
-            }
+            Some(id) => (
+                reader.automation_lease(id, lp.as_str()).await?,
+                reader.automation_runs(id, lp.as_str(), RUNS_KEPT).await?,
+            ),
             None => (None, Vec::new()),
         };
         let last_run = runs.first();

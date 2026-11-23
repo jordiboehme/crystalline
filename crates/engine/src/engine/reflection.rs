@@ -825,9 +825,9 @@ impl Engine {
         if !self.store_is_shared().await {
             return Ok(None);
         }
-        let store = self.store.lock().await;
-        let host = store.domain_host(id).await?;
-        drop(store);
+        // A read: a takeover another instance committed is seen at once,
+        // and nothing is written under the writer with the answer.
+        let host = self.reader().domain_host(id).await?;
         let Some(host) = host.filter(|host| self.foreign_holder(host)) else {
             return Ok(None);
         };
@@ -1491,12 +1491,12 @@ impl Engine {
         domain_id: DomainId,
         domain: &str,
     ) -> Result<HashMap<String, EngramFact>> {
-        let store = self.store.lock().await;
+        let reader = self.reader();
         #[cfg(any(test, feature = "testing"))]
         self.recorded_path_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let stamps = store.file_stamps(domain_id).await?;
-        let engrams = store.list_engrams(domain, None, None).await?;
+        let stamps = reader.file_stamps(domain_id).await?;
+        let engrams = reader.list_engrams(domain, None, None).await?;
         Ok(engrams
             .into_iter()
             .filter_map(|d| {
@@ -1532,12 +1532,7 @@ impl Engine {
         if wanted.is_empty() {
             return Ok(HashMap::new());
         }
-        let cited = self
-            .store
-            .lock()
-            .await
-            .cited_engrams(domain_id, &wanted)
-            .await?;
+        let cited = self.reader().cited_engrams(domain_id, &wanted).await?;
         Ok(cited
             .into_iter()
             .map(|c| {

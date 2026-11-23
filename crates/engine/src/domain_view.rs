@@ -2101,9 +2101,11 @@ impl<'a> DomainView<'a> {
         let Some(actor) = self.actor.as_deref() else {
             return Ok(Vec::new());
         };
-        let store = self.engine.store();
-        let store = store.lock().await;
-        Ok(store.overlay_entries(domain_id, actor).await?)
+        Ok(self
+            .engine
+            .reader()
+            .overlay_entries(domain_id, actor)
+            .await?)
     }
 
     /// The document this actor holds at each path they are drafting at, which
