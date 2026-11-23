@@ -289,7 +289,7 @@ impl Engine {
                 ));
             }
         }
-        pages.sort_by(|a, b| b.0.cmp(&a.0));
+        pages.sort_by_key(|page| std::cmp::Reverse(page.0));
         Ok(json!({ "pages": pages.into_iter().map(|(_, page)| page).collect::<Vec<_>>() }))
     }
 }

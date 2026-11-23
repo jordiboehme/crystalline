@@ -2040,7 +2040,7 @@ async fn check_overdue(
             }
         }
     }
-    out.sort_by(|a, b| b.overdue_secs.cmp(&a.overdue_secs));
+    out.sort_by_key(|page| std::cmp::Reverse(page.overdue_secs));
     out
 }
 
