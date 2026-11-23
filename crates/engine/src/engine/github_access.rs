@@ -29,7 +29,10 @@
 //!
 //! **Five minutes fresh, one hour stale.** A snapshot is used for
 //! [`FRESH_FOR`] (a "no access" answer too: it is part of the listing).
-//! After that the next question asks GitHub again. When GitHub cannot
+//! The first question in its last [`REFRESH_AHEAD`] is still answered from
+//! it and asks GitHub again in the background; when nobody asked in that
+//! window, the next question after it asks GitHub and waits for the answer
+//! (at most [`FETCH_TIMEOUT`]). When GitHub cannot
 //! answer, the last snapshot keeps serving until [`STALE_FOR`] past its
 //! expiry; after that every answer on the repository is no access. A
 //! question with no snapshot at all is no access as well: the governor
@@ -63,6 +66,12 @@ use crate::scope::{DomainAccess, DomainVisibility, GithubKnowledge, KnowledgeGov
 /// How long one snapshot of a repository is used before GitHub is asked
 /// again.
 pub const FRESH_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// How long before [`FRESH_FOR`] ends the next lookup starts: the first
+/// question in this window is answered from the snapshot it has and starts
+/// the lookup in the background, so no question waits for GitHub while a
+/// usable answer exists.
+pub const REFRESH_AHEAD: Duration = Duration::from_secs(30);
 
 /// How long past [`FRESH_FOR`] the last snapshot keeps serving while GitHub
 /// cannot be asked. After that every answer on the repository is no access.
@@ -939,6 +948,12 @@ impl GithubGovernor {
     /// The snapshot to answer from for `repo`: the fresh one, else a new
     /// lookup, else the stale one inside the window, else `None`.
     ///
+    /// A fresh snapshot inside the last [`REFRESH_AHEAD`] of its
+    /// [`FRESH_FOR`] still answers at once, and the first such question
+    /// starts the next lookup as a task of its own, so no question waits for
+    /// GitHub while a usable answer exists. An answer is still never older
+    /// than [`FRESH_FOR`] plus one lookup.
+    ///
     /// One lookup per repository at a time. A caller that finds one in
     /// flight answers from a snapshot inside the window when there is one,
     /// and waits for the lookup only when there is none. No caller waits
@@ -946,7 +961,10 @@ impl GithubGovernor {
     /// and stores its answer whenever it comes.
     async fn snapshot(&self, source: &Arc<dyn GithubSource>, repo: &str) -> Option<Arc<Snapshot>> {
         let key = repo_key(repo);
-        if let Some(snapshot) = self.fresh(&key, Instant::now()) {
+        if let Some((snapshot, due)) = self.fresh_and_due(&key, Instant::now()) {
+            if due {
+                self.refresh_ahead(source, repo, &key);
+            }
             return Some(snapshot);
         }
         let gate = lock(&self.fetching).entry(key.clone()).or_default().clone();
@@ -968,37 +986,11 @@ impl GithubGovernor {
         if let Some(snapshot) = self.fresh(&key, started) {
             return Some(snapshot);
         }
-        let generation = {
-            let mut state = lock(&self.state);
-            if state.not_installed.contains_key(&key) || state.moved.contains_key(&key) {
-                return None;
-            }
-            if state
-                .mismatched
-                .get(&key)
-                .is_some_and(|(_, next)| started < *next)
-            {
-                return None;
-            }
-            if let Some(Failing {
-                last: Some(last), ..
-            }) = state.failing.get(&key).copied()
-                && started < last + RETRY_AFTER_FAILURE
-            {
-                return Self::stale(&mut state, &key, started);
-            }
-            state.generation(&key)
+        let generation = match self.lookup_generation(&key, started) {
+            Ok(generation) => generation,
+            Err(answer) => return answer,
         };
-        let me = self.me.upgrade()?;
-        let source = source.clone();
-        let repo_owned = repo.to_string();
-        let lookup = tokio::spawn(async move {
-            // The gate stays held until the answer is stored.
-            let _held = held;
-            let result = fetch(source.as_ref(), &repo_owned).await;
-            me.settle(source.as_ref(), &repo_owned, result, started, generation)
-                .await
-        });
+        let lookup = self.start_lookup(source, repo, held, started, generation)?;
         match tokio::time::timeout(FETCH_TIMEOUT, lookup).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(e)) => {
@@ -1014,6 +1006,100 @@ impl GithubGovernor {
                 Self::stale(&mut lock(&self.state), &key, Instant::now())
             }
         }
+    }
+
+    /// The fresh snapshot of `key`, if there is one, and whether it is in
+    /// the last [`REFRESH_AHEAD`] of its [`FRESH_FOR`].
+    fn fresh_and_due(&self, key: &str, now: Instant) -> Option<(Arc<Snapshot>, bool)> {
+        lock(&self.state)
+            .entries
+            .get(key)
+            .filter(|entry| now < entry.fetched_at + FRESH_FOR)
+            .map(|entry| {
+                let due = now + REFRESH_AHEAD >= entry.fetched_at + FRESH_FOR;
+                (entry.snapshot.clone(), due)
+            })
+    }
+
+    /// Starts the next lookup of `repo` in the background while its fresh
+    /// snapshot still answers, unless one is in flight already or the rules
+    /// for a lookup (the closed sets, the pause after a failure) say not
+    /// now. Never waits for the lookup.
+    fn refresh_ahead(&self, source: &Arc<dyn GithubSource>, repo: &str, key: &str) {
+        let gate = lock(&self.fetching)
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        let Ok(held) = gate.try_lock_owned() else {
+            return;
+        };
+        // A lookup may have stored a new snapshot since the question looked.
+        let started = Instant::now();
+        if !self.fresh_and_due(key, started).is_some_and(|(_, due)| due) {
+            return;
+        }
+        if let Ok(generation) = self.lookup_generation(key, started) {
+            // Detached: the lookup stores its answer for later questions.
+            let _ = self.start_lookup(source, repo, held, started, generation);
+        }
+    }
+
+    /// The generation a lookup of `key` starting at `started` runs under,
+    /// or, when no lookup may start now, the answer to give instead: `None`
+    /// for a closed repository, what is known inside the pause after a
+    /// failure.
+    fn lookup_generation(
+        &self,
+        key: &str,
+        started: Instant,
+    ) -> Result<Generation, Option<Arc<Snapshot>>> {
+        let mut state = lock(&self.state);
+        if state.not_installed.contains_key(key) || state.moved.contains_key(key) {
+            return Err(None);
+        }
+        if state
+            .mismatched
+            .get(key)
+            .is_some_and(|(_, next)| started < *next)
+        {
+            return Err(None);
+        }
+        if let Some(Failing {
+            last: Some(last), ..
+        }) = state.failing.get(key).copied()
+            && started < last + RETRY_AFTER_FAILURE
+        {
+            return Err(Self::stale(&mut state, key, started));
+        }
+        Ok(state.generation(key))
+    }
+
+    /// Spawns one lookup of `repo`, holding the repository's gate `held`
+    /// until its answer is stored. `None` when the governor is going away.
+    fn start_lookup(
+        &self,
+        source: &Arc<dyn GithubSource>,
+        repo: &str,
+        held: tokio::sync::OwnedMutexGuard<()>,
+        started: Instant,
+        generation: Generation,
+    ) -> Option<tokio::task::JoinHandle<Option<Arc<Snapshot>>>> {
+        let me = self.me.upgrade()?;
+        let source = source.clone();
+        let repo = repo.to_string();
+        Some(tokio::spawn(async move {
+            // The gate stays held until the answer is stored.
+            let _held = held;
+            let asked = Instant::now();
+            let result = fetch(source.as_ref(), &repo).await;
+            let outcome = match &result {
+                Ok(_) => "answered".to_string(),
+                Err(e) => e.to_string(),
+            };
+            crate::log_elapsed!(asked, ?repo, ?outcome, "GitHub access lookup finished");
+            me.settle(source.as_ref(), &repo, result, started, generation)
+                .await
+        }))
     }
 
     /// Stores what one lookup of `repo` found (only when no invalidation
@@ -3266,15 +3352,25 @@ mod tests {
         assert_eq!(level_for(RepoRole::None), MemberLevel::None);
     }
 
+    /// The last second before the refresh window: 4:59 used to be the
+    /// last cached second, but a question there now starts the next lookup
+    /// in the background (see the refresh-ahead tests below), so the cache
+    /// is pinned one second before [`REFRESH_AHEAD`].
+    const LAST_CACHED: Duration =
+        Duration::from_secs(FRESH_FOR.as_secs() - REFRESH_AHEAD.as_secs() - 1);
+
     #[tokio::test(start_paused = true)]
     async fn a_role_is_cached_for_five_minutes() {
         let rig = rig().await;
         rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
-        tokio::time::advance(4 * MIN + Duration::from_secs(59)).await;
+        tokio::time::advance(LAST_CACHED).await;
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        settle().await;
         assert_eq!(rig.github.listings(), 1);
-        tokio::time::advance(Duration::from_secs(2)).await;
+        // Nobody asked in the refresh window: the first question past five
+        // minutes asks GitHub, as before.
+        tokio::time::advance(FRESH_FOR - LAST_CACHED + Duration::from_secs(1)).await;
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
         assert_eq!(rig.github.listings(), 2);
     }
@@ -3283,9 +3379,102 @@ mod tests {
     async fn a_none_answer_is_cached_too() {
         let rig = rig().await;
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
-        tokio::time::advance(4 * MIN + Duration::from_secs(59)).await;
+        tokio::time::advance(LAST_CACHED).await;
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        settle().await;
         assert_eq!(rig.github.listings(), 1);
+    }
+
+    /// The first question in the last [`REFRESH_AHEAD`] of a snapshot is
+    /// answered from it at once and starts the next lookup; a second one is
+    /// answered at once too and starts none.
+    #[tokio::test(start_paused = true)]
+    async fn an_asker_in_the_refresh_window_is_answered_at_once_and_a_lookup_runs() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        tokio::time::advance(FRESH_FOR - REFRESH_AHEAD).await;
+        let gate = rig.github.park();
+        let before = Instant::now();
+        let answer = tokio::time::timeout(Duration::from_secs(1), rig.knowledge("alice"))
+            .await
+            .expect("answered without waiting for GitHub");
+        assert_eq!(answer, level(MemberLevel::Editor));
+        assert_eq!(Instant::now(), before);
+        rig.github.parked(1).await;
+        assert_eq!(rig.github.listings(), 2);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let before = Instant::now();
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert_eq!(Instant::now(), before);
+        settle().await;
+        assert_eq!(rig.github.listings(), 2);
+        *lock(&rig.github.gate) = None;
+        gate.notify_one();
+        settle().await;
+        // The answer is stamped when its lookup started, so it is fresh for
+        // five minutes from there.
+        tokio::time::advance(FRESH_FOR - REFRESH_AHEAD - Duration::from_secs(6)).await;
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        settle().await;
+        assert_eq!(rig.github.listings(), 2);
+    }
+
+    /// A level GitHub took away is seen once the lookup a question in the
+    /// refresh window started has stored its answer, before the old
+    /// snapshot ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_revoked_level_is_seen_after_the_lookup_the_refresh_window_started() {
+        let rig = rig().await;
+        let start = Instant::now();
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        tokio::time::advance(FRESH_FOR - REFRESH_AHEAD + Duration::from_secs(10)).await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::None);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        settle().await;
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert_eq!(rig.github.listings(), 2);
+        assert!(Instant::now() < start + FRESH_FOR);
+    }
+
+    /// GitHub never answers the lookup the refresh window started: every
+    /// question through the window is answered at once from the snapshot,
+    /// and past five minutes from it inside the stale window, as any
+    /// question that finds a lookup in flight.
+    #[tokio::test(start_paused = true)]
+    async fn no_asker_waits_on_github_inside_the_refresh_window() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        tokio::time::advance(FRESH_FOR - REFRESH_AHEAD).await;
+        let _gate = rig.github.park();
+        for _ in 0..REFRESH_AHEAD.as_secs() + 5 {
+            let before = Instant::now();
+            assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+            assert_eq!(Instant::now(), before);
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(rig.github.listings(), 2);
+    }
+
+    /// A failed lookup in the refresh window is not repeated for every
+    /// question: the pause after a failure holds there too.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_refresh_ahead_is_not_repeated_for_every_question() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        tokio::time::advance(FRESH_FOR - REFRESH_AHEAD).await;
+        rig.github
+            .with(REPO, |r| r.down = Some(|| RemoteError::Offline));
+        for _ in 0..5 {
+            assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+            settle().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(rig.github.listings(), 2);
+        assert!(rig.governor.degraded_since().is_some());
     }
 
     #[tokio::test(start_paused = true)]
