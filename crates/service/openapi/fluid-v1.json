@@ -2125,7 +2125,7 @@
           "domains"
         ],
         "summary": "When the reflect and evolve loops last ran on this domain.",
-        "description": "Reading needs the right to read the domain, and each caller sees its own share. Every reader gets the last run (when, which runner, the outcome and the counts) and the runner working now. A caller who may run the loop also gets the run's summary, pull request and account (or, for a run by an agent of the loops, the agent's name and display name), and, with `counts` on, how many items wait for a person. Only a domain manager or an instance admin gets `delivery`, the state of the loop's webhook trigger where the MANIFEST turns it on. Never the items a run left.",
+        "description": "Reading needs the right to read the domain, and each caller sees its own share. Every reader gets the last run (when, which runner, the outcome and the counts) and the runner working now. A caller who may run the loop also gets the run's summary, pull request and account (or, for a run by an agent of the loops, the agent's name and display name), and, with `counts` on, how many items wait for a person. Every reader gets `next_stale_at` and `next_stale_in_secs` for reflect, also with `counts` off. Only a domain manager or an instance admin gets `delivery`, the state of the loop's webhook trigger where the MANIFEST turns it on. Never the items a run left.",
         "operationId": "read_automation",
         "parameters": [
           {
@@ -17424,6 +17424,23 @@
             "description": "Items a finished run left for a person that have not changed since.\n`null` unless the caller may run the loop and asked for counts.",
             "example": 3,
             "minimum": 0
+          },
+          "next_stale_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the next Reflection page falls due (its freshness runs out) or\na due page enters its next period, RFC 3339 on the server's\nautomation clock; also with `counts` off. `null` for evolve, for a\nloop that runs on another instance and when no page keeps itself\ncurrent.",
+            "example": "2026-10-21T11:00:00Z"
+          },
+          "next_stale_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The same instant in seconds from now, at least 1: a client with a\nskewed clock counts from this one.",
+            "example": 2400
           },
           "running": {
             "oneOf": [

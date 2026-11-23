@@ -1829,6 +1829,19 @@ export type LoopState = {
      * `null` unless the caller may run the loop and asked for counts.
      */
     left_for_person?: number | null;
+    /**
+     * When the next Reflection page falls due (its freshness runs out) or
+     * a due page enters its next period, RFC 3339 on the server's
+     * automation clock; also with `counts` off. `null` for evolve, for a
+     * loop that runs on another instance and when no page keeps itself
+     * current.
+     */
+    next_stale_at?: string | null;
+    /**
+     * The same instant in seconds from now, at least 1: a client with a
+     * skewed clock counts from this one.
+     */
+    next_stale_in_secs?: number | null;
     running?: LoopRunning | null;
 };
 

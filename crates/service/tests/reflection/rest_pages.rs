@@ -210,3 +210,67 @@ async fn the_missed_list_names_a_page_a_run_left_to_its_readers() {
     assert_eq!(status, 200, "{missed}");
     assert_eq!(missed, json!({ "pages": [] }), "nora may not read eng");
 }
+
+/// The automation route names when the next page falls due, with counts
+/// and without (the cheap poll), from the automation clock; evolve never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_automation_route_names_when_the_next_page_falls_due() {
+    let s = serve().await;
+    let ed = Session::login(s.addr, "ed").await;
+    let engine = &s.fx.engine;
+    let at = |t: &str| crystalline_core::time::parse_rfc3339(t).unwrap();
+    let (_, before) = ed.get("/api/v1/domains/eng/automation").await;
+    assert_eq!(before["reflect"]["next_stale_at"], Value::Null, "{before}");
+    engine
+        .set_reflection_page_settings(
+            "eng",
+            &crystalline_service::params::PageSettingsChange {
+                path: PAGE.into(),
+                freshness: Some("1h".into()),
+                ..Default::default()
+            },
+            &crystalline_service::ReflectionCaller::owner(),
+        )
+        .await
+        .unwrap();
+    {
+        let store = engine.store();
+        let store = store.lock().await;
+        let id = store.domain_id("eng").await.unwrap().unwrap();
+        store
+            .set_reflection_reconcile(
+                id,
+                &crystalline_index::ReflectionReconcile {
+                    path: PAGE.to_string(),
+                    last_reconciled: "2026-10-21T10:00:00+00:00".to_string(),
+                    outcome: "unchanged".to_string(),
+                    pact_hash: String::new(),
+                    version: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    engine.set_automation_now(Some(at("2026-10-21T10:20:00+00:00")));
+    for query in ["", "?counts=false"] {
+        let (status, answer) = ed
+            .get(&format!("/api/v1/domains/eng/automation{query}"))
+            .await;
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(
+            answer["reflect"]["next_stale_in_secs"],
+            40 * 60,
+            "{query}: {answer}"
+        );
+        assert_eq!(
+            answer["reflect"]["next_stale_at"], "2026-10-21T11:00:00Z",
+            "{query}: {answer}"
+        );
+        assert_eq!(answer["evolve"]["next_stale_at"], Value::Null, "{answer}");
+        assert_eq!(
+            answer["evolve"]["next_stale_in_secs"],
+            Value::Null,
+            "{answer}"
+        );
+    }
+}

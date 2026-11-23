@@ -104,6 +104,17 @@ pub struct LoopState {
     /// trigger on and the caller manages the domain or administers the
     /// instance.
     pub delivery: Option<LoopDelivery>,
+    /// When the next Reflection page falls due (its freshness runs out) or
+    /// a due page enters its next period, RFC 3339 on the server's
+    /// automation clock; also with `counts` off. `null` for evolve, for a
+    /// loop that runs on another instance and when no page keeps itself
+    /// current.
+    #[schema(example = "2026-10-21T11:00:00Z")]
+    pub next_stale_at: Option<String>,
+    /// The same instant in seconds from now, at least 1: a client with a
+    /// skewed clock counts from this one.
+    #[schema(example = 2400)]
+    pub next_stale_in_secs: Option<i64>,
 }
 
 /// What `GET /domains/{domain}/automation` answers. A loop the request did
@@ -151,6 +162,8 @@ fn state(entry: &Value) -> Result<Option<LoopState>, ApiError> {
         left_for_person: parse(entry, "left_for_person")?,
         judgment_waiting: entry.pointer("/counts/judgment").and_then(Value::as_u64),
         delivery: parse(entry, "delivery")?,
+        next_stale_at: parse(entry, "next_stale_at")?,
+        next_stale_in_secs: parse(entry, "next_stale_in_secs")?,
     }))
 }
 
@@ -168,7 +181,9 @@ fn state(entry: &Value) -> Result<Option<LoopState>, ApiError> {
                    gets the run's summary, pull request and account (or, \
                    for a run by an agent of the loops, the agent's name \
                    and display name), and, \
-                   with `counts` on, how many items wait for a person. Only a \
+                   with `counts` on, how many items wait for a person. Every \
+                   reader gets `next_stale_at` and `next_stale_in_secs` for \
+                   reflect, also with `counts` off. Only a \
                    domain manager or an instance admin gets `delivery`, the \
                    state of the loop's webhook trigger where the MANIFEST \
                    turns it on. Never the items a run left.",
