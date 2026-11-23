@@ -280,6 +280,8 @@ impl Engine {
             .await
             .list_reflections(access.domain_id)
             .await?;
+        self.refuse_owner_before_owned(domain, inner, &text, &rows)
+            .await?;
         // The page as it is on disk, which its row follows.
         let files = rows
             .iter()
@@ -313,6 +315,78 @@ impl Engine {
             "pact_hash": state.pact_hash,
             "version": state.version,
         }))
+    }
+
+    /// Refuse the `reconciled` of the page at `inner` (its text `text`, the
+    /// Reflection's rows `rows`) while it is due and a page it owns (its
+    /// owned pages' owned pages included, a retired one left out) has no
+    /// reconcile recorded since the owner's last one: owned pages first,
+    /// the owner last, so a run that stops at its cap never leaves owned
+    /// pages behind for a whole period (design 3.5). An owner that is not
+    /// due is reconciled whatever its owned pages are.
+    async fn refuse_owner_before_owned(
+        &self,
+        domain: &str,
+        inner: &str,
+        text: &str,
+        rows: &[crystalline_index::ReflectionRow],
+    ) -> Result<()> {
+        let record = r::read_provenance(text).page;
+        let (settings, _) = r::read_page_settings(text, inner, &record);
+        let Some(freshness) = settings.freshness else {
+            return Ok(());
+        };
+        let states = self.reflection_reconciles(domain).await?;
+        let Some(since) = states
+            .get(inner)
+            .and_then(|state| time::parse_rfc3339(&state.last_reconciled))
+            .map(|at| at.stamp())
+        else {
+            return Ok(());
+        };
+        let now = self.automation_clock().stamp().unix_seconds();
+        if !freshness.timing(since.unix_seconds(), now, &[]).stale() {
+            return Ok(());
+        }
+        let texts: BTreeMap<&str, &str> = rows
+            .iter()
+            .map(|row| (row.path.as_str(), row.content.as_str()))
+            .collect();
+        let owned = r::owned_pages(texts.iter().map(|(p, t)| (*p, *t)));
+        let mut waiting: Vec<String> = Vec::new();
+        let mut next = vec![inner.to_string()];
+        let mut seen: Vec<String> = vec![inner.to_string()];
+        while let Some(owner) = next.pop() {
+            for child in owned.get(&owner).into_iter().flatten() {
+                if seen.contains(child) {
+                    continue;
+                }
+                seen.push(child.clone());
+                next.push(child.clone());
+                if texts
+                    .get(child.as_str())
+                    .is_some_and(|text| super::page_life::is_retired(text, child))
+                {
+                    continue;
+                }
+                let done = states.get(child).is_some_and(|state| {
+                    state.outcome.is_some()
+                        && time::parse_rfc3339(&state.last_reconciled)
+                            .is_some_and(|at| at.stamp() > since)
+                });
+                if !done {
+                    waiting.push(child.clone());
+                }
+            }
+        }
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        waiting.sort();
+        Err(EngineError::Invalid(format!(
+            "'{inner}' is due and owns pages not reconciled in this period: {}. Reconcile each of them first (write_reflection action=reconciled), then '{inner}'",
+            waiting.join(", ")
+        )))
     }
 
     /// Record a reconcile of the page at `page` now, behind the host-lock

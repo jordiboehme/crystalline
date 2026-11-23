@@ -1027,3 +1027,60 @@ async fn a_stale_owner_names_the_owned_pages_already_reconciled() {
         "{item}"
     );
 }
+
+/// While an owner is due, its `reconciled` waits for its owned pages: one
+/// that is not retired and has no reconcile recorded since the owner's
+/// refuses the owner's, naming it, so a run that stops at its cap never
+/// leaves owned pages behind for a whole period. Owned pages first, the
+/// owner last; an owner that is not due is reconciled as before.
+#[tokio::test]
+async fn a_due_owner_is_reconciled_after_its_owned_pages() {
+    let fx = weekly().await;
+    put(&fx, "guides/week.md", "---\nfreshness: 1d\n---\n# Week\n").await;
+    owned(&fx, "guides/week/mon.md", "guides/week.md").await;
+    owned(&fx, "guides/week/tue.md", "guides/week.md").await;
+    owned(&fx, "guides/week/old.md", "guides/week.md").await;
+    fx.engine
+        .write_reflection(&act("retire", "guides/week/old.md"), &agent())
+        .await
+        .unwrap();
+    reconciled_ago(&fx, "guides/week.md", 2 * DAY).await;
+    let version = items(&queue(&fx, &with_stale()).await, "stale")[0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.engine
+        .write_reflection(&reconciled("guides/week/mon.md", "updated", ""), &agent())
+        .await
+        .unwrap();
+
+    let refused = fx
+        .engine
+        .write_reflection(&reconciled("guides/week.md", "updated", &version), &agent())
+        .await
+        .unwrap_err();
+    let text = refused.to_string();
+    assert!(
+        text.contains("guides/week/tue.md") && !text.contains("guides/week/mon.md"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("old.md"),
+        "a retired page is never waited for: {text}"
+    );
+
+    fx.engine
+        .write_reflection(&reconciled("guides/week/tue.md", "unchanged", ""), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&reconciled("guides/week.md", "updated", &version), &agent())
+        .await
+        .unwrap();
+
+    // Not due: the owner is reconciled whatever its owned pages are.
+    fx.engine
+        .write_reflection(&reconciled("guides/week.md", "unchanged", ""), &agent())
+        .await
+        .unwrap();
+}
