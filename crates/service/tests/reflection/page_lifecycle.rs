@@ -1019,3 +1019,44 @@ async fn an_owned_page_keeps_its_pact_hash_when_its_owner_moves() {
         assert_ne!(stored, before, "{page}: the rebased pact is the pact now");
     }
 }
+
+/// An agent of the reflect loop, resolved from its token through the
+/// accounts store, curates: it creates an owned page, retires one and
+/// records a reconcile.
+#[tokio::test]
+async fn an_agent_of_the_reflect_loop_owns_retires_and_reconciles() {
+    use crystalline_service::engine::ReconcileOutcome;
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    let curator = curator_agent(&fx).await;
+
+    let receipt = fx
+        .engine
+        .write_reflection(&owned("arch/one.md", "arch.md", PAGE), &curator)
+        .await
+        .unwrap();
+    assert_eq!(receipt["owner"], "arch.md", "{receipt}");
+    fx.engine
+        .write_reflection(&owned("arch/two.md", "arch.md", PAGE), &curator)
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&act("retire", "arch/two.md"), &curator)
+        .await
+        .unwrap();
+    for page in ["arch.md", "arch/one.md"] {
+        fx.engine
+            .write_reflection(&reconciled(page, "updated", "v1"), &curator)
+            .await
+            .unwrap();
+        let state = fx
+            .engine
+            .reflection_reconcile("eng", page)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.outcome, Some(ReconcileOutcome::Updated), "{page}");
+    }
+    let set = fx.engine.reflection_owned_pages("eng").await.unwrap();
+    assert_eq!(set.get("arch.md"), Some(&vec!["arch/one.md".to_string()]));
+}
