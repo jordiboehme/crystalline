@@ -846,7 +846,9 @@ pub struct ReflectParams {
     /// that a reconcile brings in line with their pacts again. Omit for the
     /// default: a run (an unattended session or one holding a loop's
     /// lease) gets them, an interactive session does not.
-    #[serde(default)]
+    // Left out when unset, so a call forwarded to an older server, which
+    // refuses a key it does not know, carries it only when it was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale: Option<bool>,
     /// Screen the named `domains` the way an unnamed queue screens every
     /// domain: one that is read-only, replaced by a connected server, not

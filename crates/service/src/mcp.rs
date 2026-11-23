@@ -1079,11 +1079,13 @@ impl<'de> serde::Deserialize<'de> for ReflectArgs {
 }
 
 /// Every key [`ReflectParams`] reads, `skip_unavailable` included (kept out
-/// of the schema, still taken): it serializes them all once the flag is set.
-/// A test holds the list against the schema's properties.
+/// of the schema, still taken): it serializes them all once the flag is set
+/// and `stale` holds a value. A test holds the list against the schema's
+/// properties.
 fn reflect_keys() -> Vec<String> {
     match serde_json::to_value(ReflectParams {
         skip_unavailable: true,
+        stale: Some(false),
         ..ReflectParams::default()
     }) {
         Ok(Value::Object(map)) => map.into_iter().map(|(key, _)| key).collect(),

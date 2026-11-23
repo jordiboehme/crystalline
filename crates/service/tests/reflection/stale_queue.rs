@@ -533,14 +533,30 @@ async fn a_late_reconcile_for_an_older_period_is_refused() {
     assert!(matches!(late, EngineError::Conflict(_)), "{late}");
     assert!(late.to_string().contains("older period"), "{late}");
 
-    // The next period's item goes through.
+    // The next period's item goes through, also when a period boundary
+    // passed while the run worked (same reconcile, an earlier period index):
+    // only a reconcile recorded after the item was handed out makes it older.
     backdate(&fx, "guides/week.md", 2 * DAY).await;
     let next = version(&queue(&fx, &with_stale()).await);
     assert_ne!(next, first);
+    let mut parts = next.splitn(3, ':');
+    let (base, period) = (parts.next().unwrap(), parts.next().unwrap());
+    let ticked = format!(
+        "{base}:{}:{}",
+        period.parse::<u64>().unwrap() - 1,
+        "0".repeat(64)
+    );
     fx.engine
-        .write_reflection(&reconciled("guides/week.md", "updated", &next), &agent())
+        .write_reflection(&reconciled("guides/week.md", "updated", &ticked), &agent())
         .await
         .unwrap();
+    // And the item handed out with it is late now.
+    let late = fx
+        .engine
+        .write_reflection(&reconciled("guides/week.md", "updated", &next), &agent())
+        .await
+        .unwrap_err();
+    assert!(matches!(late, EngineError::Conflict(_)), "{late}");
 
     // A page reconciled for the first time: its seeded item's version is
     // never older than a recorded reconcile.
@@ -740,4 +756,19 @@ async fn owned_and_retired_pages_are_exempt() {
     let q = queue(&fx, &eng()).await;
     assert_eq!(paths(&q, "off_structure"), vec!["other/loose.md"], "{q}");
     assert!(paths(&q, "source_changed").is_empty(), "{q}");
+}
+
+/// A `reflect` call that does not ask about stale items sends no `stale`
+/// key, so a call forwarded to an older server, which refuses a key it does
+/// not know, goes through as before.
+#[test]
+fn an_unset_stale_is_left_out_of_a_forwarded_call() {
+    let sent = serde_json::to_value(ReflectParams::default()).unwrap();
+    assert!(sent.get("stale").is_none(), "{sent}");
+    let asked = serde_json::to_value(ReflectParams {
+        stale: Some(true),
+        ..ReflectParams::default()
+    })
+    .unwrap();
+    assert_eq!(asked["stale"], true);
 }
