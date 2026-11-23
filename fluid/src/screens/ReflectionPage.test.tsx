@@ -962,9 +962,11 @@ describe("the reflection page header", () => {
     const line = await screen.findByText(
       "1 section \u00b7 Built from 1 engram",
     );
-    expect(h1.nextElementSibling).toBe(line);
+    // The note under the title holds the line (and the page's status
+    // lines, when it has a page view), outside the text.
+    const note = line.closest("[data-anchor-skip]");
+    expect(h1.nextElementSibling).toBe(note);
     expect(line.closest("article")).not.toBeNull();
-    expect(line).toHaveAttribute("data-anchor-skip");
     // Said once: the header does not draw it a second time.
     expect(screen.getAllByText(/1 section/)).toHaveLength(1);
   });

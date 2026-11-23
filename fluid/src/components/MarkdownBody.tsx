@@ -418,7 +418,7 @@ function stampFence(code: HastNode, source: string): void {
  * changed line cannot remount what the document drew (images, diagrams, an
  * open full window, a selection in progress).
  */
-const TitleNoteContext = createContext<string | undefined>(undefined);
+const TitleNoteContext = createContext<ReactNode>(undefined);
 
 /** The marker the first level-one heading carries for `titleNote`. */
 const FIRST_TITLE = "dataFirstTitle";
@@ -1539,12 +1539,12 @@ function heading(
     // quote code passes over).
     const note =
       titleNote !== undefined && rest[FIRST_TITLE_PROP] === "true" ? (
-        <p
+        <div
           data-anchor-skip=""
           className="-mt-1 mb-4 text-sm text-ink-3 select-none"
         >
           {titleNote}
-        </p>
+        </div>
       ) : null;
     // Marked in the page too, so the print sheet can fold a title the
     // printed title block already carries.
@@ -1766,11 +1766,12 @@ export default function MarkdownBody({
    */
   headingAside?: HeadingAside;
   /**
-   * One line of text drawn straight under the document's first level-one
-   * heading and counted as no part of it: unstamped, unselectable, passed
-   * over by the comment anchoring. Absent, nothing is drawn.
+   * What is drawn straight under the document's first level-one heading and
+   * counted as no part of it: unstamped, unselectable, passed over by the
+   * comment anchoring. A line of text, or a few (a Reflection page's status
+   * lines, with their links). Absent, nothing is drawn.
    */
-  titleNote?: string;
+  titleNote?: ReactNode;
   wikilinks?: WikilinkResolver;
   foldTitle?: string;
   /**

@@ -17,7 +17,7 @@
 import { usePageTitle } from "../usePageTitle";
 import type { QueryClient } from "@tanstack/react-query";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { KeyboardEvent, ReactElement } from "react";
+import type { KeyboardEvent, ReactElement, ReactNode } from "react";
 import {
   useCallback,
   useEffect,
@@ -53,9 +53,14 @@ import {
   atLeast,
   fetchReflectionStatus,
   invalidateReflection,
+  isPactFile,
   mayEditPage,
   reflectionStatusKey,
 } from "../api/reflectionDomains";
+import {
+  fetchReflectionClock,
+  reflectionClockKey,
+} from "../api/reflectionPage";
 import { useAuth } from "../auth/AuthContext";
 import { AttachmentsSection } from "../components/AttachmentsSection";
 import { DestructiveAction } from "../components/DestructiveAction";
@@ -65,6 +70,11 @@ import type { HeadingAside } from "../components/MarkdownBody";
 import { useReflectionStatus } from "../components/ReflectionModeSwitch";
 import { ReflectionStateNotice } from "../components/ReflectionStateNotice";
 import { ReflectionThreads } from "../components/ReflectionThreads";
+import {
+  ReflectionPageDetails,
+  RetiredBanner,
+} from "../components/ReflectionPageDetails";
+import { ReflectionPageStatus } from "../components/ReflectionPageStatus";
 import { SourceRow } from "../components/SourceRow";
 import {
   ActionItem,
@@ -318,6 +328,49 @@ function PageBody({
   const { hash } = useLocation();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  /*
+   * The page clock: when the page was last checked and when it is due, and
+   * the checksum of the file as stored. A reconcile writes no file, and the
+   * change stream leaves this page's text alone on a plain change
+   * (`events/invalidation.ts`, `sparedBy`), refetching the clock instead:
+   * the text is read again below only when the checksum moved. Pacts have
+   * no clock.
+   */
+  const clock = useQuery({
+    queryKey: reflectionClockKey(domain, path),
+    queryFn: () => fetchReflectionClock(domain, path),
+    enabled: !deleted && !isPactFile(path),
+  });
+  const clockChecksum = clock.data?.checksum ?? null;
+  const docChecksum = doc.data?.checksum ?? null;
+  const clockNewer = clock.dataUpdatedAt > doc.dataUpdatedAt;
+  useEffect(() => {
+    if (
+      clockNewer &&
+      clockChecksum !== null &&
+      docChecksum !== null &&
+      clockChecksum !== docChecksum
+    ) {
+      void queryClient.invalidateQueries({
+        queryKey: reflectionDocKey(domain, path),
+      });
+    }
+  }, [clockNewer, clockChecksum, docChecksum, queryClient, domain, path]);
+  // The clock's seconds are relative to its read: a minute tick ages them,
+  // and asks nothing of the server.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => {
+      setNow(Date.now());
+    }, 60_000);
+    return () => {
+      clearInterval(id);
+    };
+  }, []);
+  const elapsed =
+    clock.dataUpdatedAt === 0
+      ? 0
+      : Math.max(0, Math.floor((now - clock.dataUpdatedAt) / 1000));
   useHeadingFocusRequest(doc.data !== undefined);
   usePageTitle(doc.error ? null : doc.data?.title);
   const remove = useMutation({
@@ -538,6 +591,31 @@ function PageBody({
   // curator's own included.
   const curate = atLeast(right, "curate");
   const metaLine = reflectionMetaLine(page, engramsVisible);
+  // Changes beside the text are a curator's, on an instance and a domain
+  // that take writes.
+  const settingsLocked =
+    capabilities.readOnly || domainLocked
+      ? "You can read this page but not change it"
+      : !lockKnown
+        ? CHECKING_LOCK
+        : undefined;
+  const status: ReactNode =
+    page.page === null ? null : (
+      <ReflectionPageStatus
+        domain={domain}
+        page={page.page}
+        clock={clock.data?.clock ?? null}
+        elapsed={elapsed}
+        curator={curate}
+      />
+    );
+  const titleNote: ReactNode =
+    metaLine === "" && status === null ? undefined : (
+      <>
+        {metaLine !== "" && <p>{metaLine}</p>}
+        {status}
+      </>
+    );
   const movable = atLeast(right, "edit") && path !== PACT_PATH;
   // A Reflection page has no `crystalline://` name: on paper it is known by
   // its page in this app.
@@ -662,6 +740,7 @@ function PageBody({
           {!ownTitle && metaLine !== "" && (
             <p className="text-sm text-ink-3">{metaLine}</p>
           )}
+          {!ownTitle && status}
           {page.livePresent.length > 0 && (
             <p
               role="status"
@@ -671,6 +750,18 @@ function PageBody({
             </p>
           )}
         </header>
+        {page.page !== null && (
+          <RetiredBanner
+            domain={domain}
+            path={path}
+            page={page.page}
+            curator={curate && settingsLocked === undefined}
+            onDelete={() => {
+              remove.mutate();
+            }}
+            deleting={remove.isPending}
+          />
+        )}
         {tickProblem !== null && (
           <p
             role="alert"
@@ -692,11 +783,7 @@ function PageBody({
               index={index}
               // The meta line goes under the body's own title when it has
               // one; without one the header draws title and line itself.
-              titleNote={
-                index === 0 && ownTitle && metaLine !== ""
-                  ? metaLine
-                  : undefined
-              }
+              titleNote={index === 0 && ownTitle ? titleNote : undefined}
               section={section}
               // The intro has a heading of its own only when the page
               // carries its own title; every other section starts with one.
@@ -736,17 +823,36 @@ function PageBody({
         <PrintNotes notes={notes} />
       </div>
       {/*
-          The column beside the page from `xl` up, a pill and a sheet below
-          it: the threads draw their own frame for either.
+          The column beside the page from `xl` up: the page details first,
+          like the engram page's details column, then the threads. Below
+          `xl` the details stand under the page and the threads are a pill
+          and a sheet: the threads draw their own frame for either.
         */}
-      <ReflectionThreads
-        domain={domain}
-        path={path}
-        doc={page}
-        sections={sections}
-        right={right}
-        articleRef={articleRef}
-      />
+      <div className="flex min-w-0 flex-col gap-6">
+        {page.page !== null && (
+          <ReflectionPageDetails
+            key={`details:${domain}/${path}`}
+            domain={domain}
+            path={path}
+            title={page.title}
+            page={page.page}
+            curator={curate}
+            lockedReason={settingsLocked}
+            onDelete={() => {
+              remove.mutate();
+            }}
+            deleting={remove.isPending}
+          />
+        )}
+        <ReflectionThreads
+          domain={domain}
+          path={path}
+          doc={page}
+          sections={sections}
+          right={right}
+          articleRef={articleRef}
+        />
+      </div>
     </div>
   );
 }
@@ -769,8 +875,8 @@ function PageSection({
   canTick: boolean | string;
   /** Whether the section's text starts with a heading to carry its sources. */
   headed: boolean;
-  /** A line under the section's first `# Title`, outside its text. */
-  titleNote?: string | undefined;
+  /** Lines under the section's first `# Title`, outside its text. */
+  titleNote?: ReactNode;
   /** For the source links only; the rendered body takes no domain (see above). */
   domain: string;
   /** The Reflection's own files: images, file links and refused engram files. */
