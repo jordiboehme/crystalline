@@ -23,6 +23,8 @@ import {
 } from "./files";
 import { asArray, asNumber, asObject, asString, asStrings } from "./json";
 import { reflectionKey } from "./reflectionDomains";
+import type { PageView } from "./reflectionPage";
+import { readPageView } from "./reflectionPage";
 import { reflectionTargetOf, relativeTo } from "../reflectionAssets";
 
 export { reflectionKey };
@@ -49,6 +51,10 @@ export type TreeNode =
       title: string;
       openThreads: number;
       sections: number;
+      /** Retired: hidden in the navigation unless asked for, faded where listed. */
+      retired: boolean;
+      /** The page that owns it, by path; null for a page on its own. */
+      owner: string | null;
     };
 
 export interface ReflectionTree {
@@ -106,6 +112,11 @@ export interface ReflectionDoc {
   threads: ThreadView[];
   /** Who is in the live room right now; empty when no room is open. */
   livePresent: string[];
+  /**
+   * The page's settings, owner, retirement and the pacts it follows; null
+   * for `PACT.md` and a pact file, which are no pages.
+   */
+  page: PageView | null;
 }
 
 export interface QueueItem {
@@ -179,6 +190,8 @@ export interface SearchHit {
   section: string | null;
   heading: string;
   snippet: string;
+  /** A retired page: still found, drawn faded. */
+  retired: boolean;
 }
 
 /** The modes the Reflection's search runs (engram search's `title` is not one of them). */
@@ -273,6 +286,8 @@ function readNode(value: unknown): TreeNode | null {
       title: asString(record.title) ?? name,
       openThreads: asNumber(record.open_threads) ?? 0,
       sections: asNumber(record.sections) ?? 0,
+      retired: record.retired === true,
+      owner: asString(record.owner),
     };
   }
   return null;
@@ -382,6 +397,7 @@ export function readDoc(payload: unknown): ReflectionDoc {
     }),
     threads: readThreads(record?.threads),
     livePresent: asStrings(asObject(record?.live)?.present),
+    page: readPageView(record?.page),
   };
 }
 
@@ -493,6 +509,7 @@ export function readSearch(payload: unknown): ReflectionSearch {
             section: asString(r?.section),
             heading: asString(r?.heading) ?? "",
             snippet: asString(r?.snippet) ?? "",
+            retired: r?.retired === true,
           },
         ];
   });

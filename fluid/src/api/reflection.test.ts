@@ -317,6 +317,7 @@ describe("calls", () => {
       section: "_top",
       heading: "",
       snippet: "Short intro.",
+      retired: false,
     });
     // The default mode and the first page are left out of the address.
     await searchReflections("eng", { query: "night" });
