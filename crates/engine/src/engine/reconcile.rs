@@ -249,6 +249,7 @@ impl Engine {
                     .timing(
                         at.stamp().unix_seconds(),
                         self.automation_clock().stamp().unix_seconds(),
+                        &[],
                     )
                     .stale()
             {

@@ -129,14 +129,31 @@ pub struct PageTiming {
     /// item's version moves with it.
     pub period: i64,
     /// Seconds until the next span ends: when a fresh page falls due, or
-    /// when a due page enters its next period (and, one span after it fell
-    /// due, turns overdue). Always more than 0.
+    /// when a due page enters its next period. Always more than 0.
     pub next_due_in_secs: i64,
     /// Seconds since the page turned overdue, when it is: one whole span
-    /// after it fell due, so a page reconciled once per run of a slower
-    /// schedule is due between runs and overdue only when a run missed it
-    /// (design 2.2).
+    /// after it fell due (design 2.2). Shown on the page, so a person sees
+    /// that the reflect loop runs less often than the page's freshness.
     pub overdue_secs: Option<i64>,
+    /// Seconds since a reflect run left the page, when one did: a run of its
+    /// domain started after it fell due and ended without reconciling it,
+    /// counted from the end of the first such run (Jordi, 2026-11-23). Only
+    /// this means the loop failed the page, so only this is warned about
+    /// (doctor, the admin banner). With no run at all it is `None`.
+    pub missed_secs: Option<i64>,
+    /// The page is overdue, runs are known, and none of them left it: the
+    /// loop simply runs less often than the page's freshness.
+    pub loop_slower_than_freshness: bool,
+}
+
+/// One finished reflect run of a page's domain, in seconds since the epoch:
+/// what [`Freshness::timing`] reads overdue from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSpan {
+    /// When the run started.
+    pub started: i64,
+    /// When it ended.
+    pub ended: i64,
 }
 
 impl PageTiming {
@@ -148,9 +165,11 @@ impl PageTiming {
 
 impl Freshness {
     /// Where a page with this freshness stands at `now`, last reconciled at
-    /// `last_reconciled` (both seconds since the epoch). Saturates rather
-    /// than overflows.
-    pub fn timing(&self, last_reconciled: i64, now: i64) -> PageTiming {
+    /// `last_reconciled` (both seconds since the epoch), with the finished
+    /// reflect `runs` of its domain in any order (only `missed_secs` and
+    /// `loop_slower_than_freshness` read them).
+    /// Saturates rather than overflows.
+    pub fn timing(&self, last_reconciled: i64, now: i64, runs: &[RunSpan]) -> PageTiming {
         let span = self.seconds.max(1);
         let elapsed = now.saturating_sub(last_reconciled);
         if elapsed < 0 {
@@ -159,15 +178,34 @@ impl Freshness {
                 period: 0,
                 next_due_in_secs: span.saturating_sub(elapsed).max(1),
                 overdue_secs: None,
+                missed_secs: None,
+                loop_slower_than_freshness: false,
             };
         }
         let period = elapsed / span;
         let next = period.saturating_add(1).saturating_mul(span);
+        let overdue_secs = (period >= 2).then(|| elapsed - 2 * span);
+        // A run that started once the page was due and has ended: it did
+        // not reconcile the page, or the last reconcile would be later.
+        let due_at = last_reconciled.saturating_add(span);
+        let missed_secs = (period > 0)
+            .then(|| {
+                runs.iter()
+                    .filter(|run| run.started >= due_at)
+                    .map(|run| run.ended)
+                    .min()
+            })
+            .flatten()
+            .map(|ended| now.saturating_sub(ended).max(0));
         PageTiming {
             last_checked_secs: elapsed,
             period,
             next_due_in_secs: next.saturating_sub(elapsed).max(1),
-            overdue_secs: (period >= 2).then(|| elapsed - 2 * span),
+            overdue_secs,
+            missed_secs,
+            loop_slower_than_freshness: overdue_secs.is_some()
+                && missed_secs.is_none()
+                && !runs.is_empty(),
         }
     }
 }
@@ -746,13 +784,18 @@ mod tests {
         parse_freshness("1h").unwrap()
     }
 
-    /// Fresh for one span, due (stale) from its end, overdue only once one
+    fn run(started: i64, ended: i64) -> RunSpan {
+        RunSpan { started, ended }
+    }
+
+    /// Fresh for one span, due from its end, overdue on the page once one
     /// whole further span was missed (design 2.2): a 1h page last checked 5
-    /// hours ago is overdue since 3 hours.
+    /// hours ago is overdue since 3 hours. With no run known nothing missed
+    /// it and there is no hint about the loop.
     #[test]
     fn a_page_is_due_after_one_span_and_overdue_after_two() {
         let at = 1_000_000;
-        let fresh = hourly().timing(at, at + 30 * 60);
+        let fresh = hourly().timing(at, at + 30 * 60, &[]);
         assert_eq!(fresh.period, 0);
         assert!(!fresh.stale());
         assert_eq!(fresh.last_checked_secs, 30 * 60);
@@ -763,20 +806,67 @@ mod tests {
         );
         assert_eq!(fresh.overdue_secs, None);
 
-        let due = hourly().timing(at, at + H + 10);
+        let due = hourly().timing(at, at + H + 10, &[]);
         assert!(due.stale());
         assert_eq!(due.period, 1);
         assert_eq!(due.next_due_in_secs, H - 10, "the next period starts then");
         assert_eq!(due.overdue_secs, None, "one span late is due, not overdue");
 
-        let edge = hourly().timing(at, at + 2 * H);
+        let edge = hourly().timing(at, at + 2 * H, &[]);
         assert_eq!(edge.period, 2);
         assert_eq!(edge.overdue_secs, Some(0), "overdue from two spans on");
         assert_eq!(edge.next_due_in_secs, H, "never now: strictly ahead");
 
-        let late = hourly().timing(at, at + 5 * H);
+        let late = hourly().timing(at, at + 5 * H, &[]);
         assert_eq!(late.last_checked_secs, 5 * H);
         assert_eq!(late.overdue_secs, Some(3 * H), "overdue since 3 hours");
+        assert_eq!(late.missed_secs, None, "no run, nothing missed it");
+        assert!(!late.loop_slower_than_freshness, "no run known, no hint");
+    }
+
+    const D: i64 = 86_400;
+
+    /// A 1h page under a daily run that reconciles it: overdue on the page
+    /// with the hint that the loop runs less often than the freshness, and
+    /// never missed by a run.
+    #[test]
+    fn a_daily_run_that_reconciles_an_hourly_page_never_misses_it() {
+        let at = 1_000_000;
+        // The run that reconciled it, and older ones.
+        let runs = [run(at - 60, at + 30), run(at - D, at - D + 60)];
+        let t = hourly().timing(at, at + 23 * H, &runs);
+        assert!(t.stale());
+        assert_eq!(t.overdue_secs, Some(21 * H), "{t:?}");
+        assert_eq!(t.missed_secs, None, "{t:?}");
+        assert!(t.loop_slower_than_freshness, "{t:?}");
+    }
+
+    /// A run that started after the page fell due and ended without
+    /// reconciling it (it stopped at its cap or failed) missed it, from
+    /// that run's end; the first such run counts, and there is no hint.
+    #[test]
+    fn a_run_that_skipped_the_due_page_missed_it_from_its_end() {
+        let at = 1_000_000;
+        let due_at = at + H;
+        let runs = [
+            run(due_at + 2 * H, due_at + 2 * H + 600),
+            run(due_at + 5 * 60, due_at + 20 * 60),
+        ];
+        let now = due_at + 3 * H;
+        let t = hourly().timing(at, now, &runs);
+        assert_eq!(t.missed_secs, Some(now - (due_at + 20 * 60)), "{t:?}");
+        assert!(t.overdue_secs.is_some());
+        assert!(!t.loop_slower_than_freshness, "{t:?}");
+        // A run that started before the page fell due does not count, even
+        // when it ended after.
+        let t = hourly().timing(at, now, &[run(due_at - 60, due_at + 600)]);
+        assert_eq!(t.missed_secs, None, "{t:?}");
+        // A run's end ahead of the clock reads as missed just now.
+        let t = hourly().timing(at, due_at + 100, &[run(due_at + 10, due_at + 900)]);
+        assert_eq!(t.missed_secs, Some(0), "{t:?}");
+        // A fresh page is never missed, whatever ran.
+        let t = hourly().timing(at, at + 600, &[run(at + 60, at + 120)]);
+        assert_eq!(t.missed_secs, None, "{t:?}");
     }
 
     /// A reconcile time ahead of the clock (a host takeover by a machine
@@ -785,7 +875,7 @@ mod tests {
     #[test]
     fn a_reconcile_ahead_of_the_clock_is_clamped() {
         let at = 1_000_000;
-        let ahead = hourly().timing(at, at - 600);
+        let ahead = hourly().timing(at, at - 600, &[]);
         assert_eq!(ahead.last_checked_secs, 0);
         assert_eq!(ahead.period, 0);
         assert_eq!(ahead.overdue_secs, None);
@@ -796,9 +886,9 @@ mod tests {
     #[test]
     fn long_spans_saturate() {
         let ages = parse_freshness("100y").unwrap();
-        let t = ages.timing(i64::MIN / 2, i64::MAX / 2);
+        let t = ages.timing(i64::MIN / 2, i64::MAX / 2, &[run(0, 1)]);
         assert!(t.next_due_in_secs > 0);
-        let t = ages.timing(i64::MAX / 2, i64::MIN / 2);
+        let t = ages.timing(i64::MAX / 2, i64::MIN / 2, &[]);
         assert!(t.next_due_in_secs > 0);
         assert_eq!(t.last_checked_secs, 0);
     }

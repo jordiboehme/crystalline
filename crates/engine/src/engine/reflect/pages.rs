@@ -313,7 +313,7 @@ pub(super) fn stale_item(
     let freshness = settings.freshness.as_ref()?;
     let state = inputs.states.get(path)?;
     let at = crystalline_core::time::parse_rfc3339(&state.last_reconciled)?.stamp();
-    let timing = freshness.timing(at.unix_seconds(), now);
+    let timing = freshness.timing(at.unix_seconds(), now, &[]);
     if !timing.stale() {
         return None;
     }

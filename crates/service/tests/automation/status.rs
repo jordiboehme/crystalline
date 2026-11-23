@@ -283,6 +283,11 @@ async fn rolling_page(at: &str) -> Fx {
 
 /// [`rolling_page`] on `store`.
 async fn rolling_page_on(store: Arc<Mutex<dyn Store>>, at: &str) -> Fx {
+    rolling_page_every(store, "1d", at).await
+}
+
+/// [`rolling_page_on`] with the freshness `every`.
+async fn rolling_page_every(store: Arc<Mutex<dyn Store>>, every: &str, at: &str) -> Fx {
     let files = files();
     let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, b)| (*p, b.as_str())).collect();
     let fx = fixture_on(store, &borrowed, |_, _| {}, None, None, None).await;
@@ -291,7 +296,9 @@ async fn rolling_page_on(store: Arc<Mutex<dyn Store>>, at: &str) -> Fx {
             &WriteReflectionParams {
                 domain: "eng".into(),
                 path: "w.md".into(),
-                markdown: Some("---\nfreshness: 1d\n---\n# Week\n\n## Now\n\nText.\n".into()),
+                markdown: Some(format!(
+                    "---\nfreshness: {every}\n---\n# Week\n\n## Now\n\nText.\n"
+                )),
                 sources: std::collections::BTreeMap::from([
                     ("_top".to_string(), Vec::new()),
                     ("Now".to_string(), vec!["notes/deploys".to_string()]),
@@ -407,22 +414,14 @@ fn jordi() -> ReflectionCaller {
 }
 
 /// A page's clock on the automation clock, in relative seconds (design
-/// 2.2): fresh with the time until it falls due, due, then overdue one
-/// whole period after it fell due, and only then in the list of overdue
-/// pages with its domain and since when. A reconcile time ahead of the
-/// clock (a host takeover) reads as just checked.
+/// 2.2): fresh with the time until it falls due, due, then overdue on the
+/// page one whole period after it fell due. With no run known nothing
+/// missed it: it is in no list of missed pages, and there is no hint about
+/// the loop. A reconcile time ahead of the clock (a host takeover) reads as
+/// just checked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_page_is_overdue_one_whole_period_after_it_fell_due() {
     let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
-    let clock_of = |fx: &Fx| {
-        let engine = fx.engine.clone();
-        async move {
-            engine
-                .reflection_page_clock("eng", "w.md", &jordi())
-                .await
-                .unwrap()
-        }
-    };
 
     now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
     let fresh = clock_of(&fx).await;
@@ -438,26 +437,14 @@ async fn a_page_is_overdue_one_whole_period_after_it_fell_due() {
     assert_eq!(due["stale"], true, "{due}");
     assert_eq!(due["due_in_secs"], Value::Null, "{due}");
     assert_eq!(due["overdue_secs"], Value::Null, "due, not overdue: {due}");
-    let none = fx.engine.overdue_reflection_pages(&jordi()).await.unwrap();
-    assert_eq!(none["pages"], serde_json::json!([]), "{none}");
 
     now_at(&fx.engine, "2026-10-23T13:00:00+00:00");
     let late = clock_of(&fx).await;
     assert_eq!(late["last_checked_secs"], 51 * 3600, "{late}");
     assert_eq!(late["overdue_secs"], 3 * 3600, "{late}");
-    let overdue = fx.engine.overdue_reflection_pages(&jordi()).await.unwrap();
-    assert_eq!(
-        overdue["pages"],
-        serde_json::json!([{
-            "domain": "eng",
-            "path": "w.md",
-            "freshness": "1d",
-            "last_checked_secs": 51 * 3600,
-            "overdue_secs": 3 * 3600,
-            "waiting": false,
-        }]),
-        "{overdue}"
-    );
+    assert_eq!(late["missed_secs"], Value::Null, "no run: {late}");
+    assert_eq!(late["loop_slower_than_freshness"], false, "{late}");
+    assert_eq!(missed(&fx).await, serde_json::json!([]));
 
     now_at(&fx.engine, "2026-10-21T09:00:00+00:00");
     let behind = clock_of(&fx).await;
@@ -465,11 +452,146 @@ async fn a_page_is_overdue_one_whole_period_after_it_fell_due() {
     assert_eq!(behind["due_in_secs"], 25 * 3600, "{behind}");
 }
 
-/// A retired page has no clock and is never overdue.
+async fn clock_of(fx: &Fx) -> Value {
+    fx.engine
+        .reflection_page_clock("eng", "w.md", &jordi())
+        .await
+        .unwrap()
+}
+
+/// The pages a reflect run missed, as the admin banner and doctor read them.
+async fn missed(fx: &Fx) -> Value {
+    fx.engine.overdue_reflection_pages(&jordi()).await.unwrap()["pages"].clone()
+}
+
+/// A reflect run of `eng` from `from` to `to` on the automation clock that
+/// stopped at its cap.
+async fn reflect_run(fx: &Fx, from: &str, to: &str) {
+    now_at(&fx.engine, from);
+    let taken = fx
+        .engine
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    now_at(&fx.engine, to);
+    fx.engine
+        .automation_run_record(
+            Loop::Reflect,
+            "eng",
+            taken["token"].as_str().unwrap(),
+            &crystalline_core::automation::RunReport {
+                started_at: String::new(),
+                outcome: crystalline_core::automation::RunOutcome::StoppedAtCap,
+                done: 20,
+                summary: "capped".into(),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+}
+
+async fn hourly_page(at: &str) -> Fx {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    rolling_page_every(Arc::new(Mutex::new(store)), "1h", at).await
+}
+
+/// A 1h page under a daily run that reconciles it is overdue on its page,
+/// with the hint that the loop runs less often than its freshness, and a
+/// run never missed it: it is in no list of missed pages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_page_without_a_freshness_has_no_clock() {
-    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+async fn a_daily_run_that_reconciles_an_hourly_page_only_hints_at_the_loop() {
+    let fx = hourly_page("2026-10-21T10:00:30+00:00").await;
+    reflect_run(
+        &fx,
+        "2026-10-21T10:00:00+00:00",
+        "2026-10-21T10:01:00+00:00",
+    )
+    .await;
+    now_at(&fx.engine, "2026-10-21T23:00:00+00:00");
+    let clock = clock_of(&fx).await;
+    assert_eq!(clock["overdue_secs"], 11 * 3600 - 30, "{clock}");
+    assert_eq!(clock["missed_secs"], Value::Null, "{clock}");
+    assert_eq!(clock["loop_slower_than_freshness"], true, "{clock}");
+    assert_eq!(missed(&fx).await, serde_json::json!([]));
+
+    // The next day's run reconciles it again.
+    reflect_run(
+        &fx,
+        "2026-10-22T10:00:00+00:00",
+        "2026-10-22T10:01:00+00:00",
+    )
+    .await;
+    reconciled_at(&fx, "w.md", "2026-10-22T10:00:30+00:00").await;
+    now_at(&fx.engine, "2026-10-22T20:00:00+00:00");
+    let clock = clock_of(&fx).await;
+    assert_eq!(clock["loop_slower_than_freshness"], true, "{clock}");
+    assert_eq!(clock["missed_secs"], Value::Null, "{clock}");
+    assert_eq!(missed(&fx).await, serde_json::json!([]));
+}
+
+/// A run that started after the page fell due and ended without
+/// reconciling it (it stopped at its cap) missed the page from that run's
+/// end: in the list with its domain and since when, without the hint. A
+/// run still going does not count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_skipped_a_due_page_missed_it_from_its_end() {
+    let fx = hourly_page("2026-10-21T10:00:00+00:00").await;
+    // A run going now, past the time the page fell due: not missed yet.
+    now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
+    let taken = fx
+        .engine
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    now_at(&fx.engine, "2026-10-21T12:00:30+00:00");
+    assert_eq!(missed(&fx).await, serde_json::json!([]), "a running run");
+    fx.engine
+        .automation_lease_release(
+            Loop::Reflect,
+            "eng",
+            taken["token"].as_str().unwrap(),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    reflect_run(
+        &fx,
+        "2026-10-21T13:00:00+00:00",
+        "2026-10-21T13:05:00+00:00",
+    )
+    .await;
+    now_at(&fx.engine, "2026-10-21T16:05:00+00:00");
+    let clock = clock_of(&fx).await;
+    assert_eq!(clock["missed_secs"], 3 * 3600, "{clock}");
+    assert_eq!(clock["overdue_secs"], 4 * 3600 + 300, "{clock}");
+    assert_eq!(clock["loop_slower_than_freshness"], false, "{clock}");
+    assert_eq!(
+        missed(&fx).await,
+        serde_json::json!([{
+            "domain": "eng",
+            "path": "w.md",
+            "freshness": "1h",
+            "last_checked_secs": 6 * 3600 + 300,
+            "missed_secs": 3 * 3600,
+            "waiting": false,
+        }])
+    );
+}
+
+/// A retired page has no clock and is never in the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_page_has_no_clock() {
+    let fx = hourly_page("2026-10-21T10:00:00+00:00").await;
+    reflect_run(
+        &fx,
+        "2026-10-21T13:00:00+00:00",
+        "2026-10-21T13:05:00+00:00",
+    )
+    .await;
     now_at(&fx.engine, "2026-10-25T10:00:00+00:00");
+    assert!(missed(&fx).await.as_array().unwrap().len() == 1);
     fx.engine
         .write_reflection(
             &WriteReflectionParams {
@@ -482,14 +604,51 @@ async fn a_page_without_a_freshness_has_no_clock() {
         )
         .await
         .unwrap();
+    assert_eq!(clock_of(&fx).await, Value::Null);
+    assert_eq!(missed(&fx).await, serde_json::json!([]));
+}
+
+/// A page without a freshness has no clock and is never in the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_without_a_freshness_has_no_clock() {
+    let fx = hourly_page("2026-10-21T10:00:00+00:00").await;
+    let text = "# Plain\n\n## Now\n\nText.\n";
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: "plain.md".into(),
+                markdown: Some(text.into()),
+                sources: std::collections::BTreeMap::from([("_top".to_string(), Vec::new())]),
+                ..Default::default()
+            },
+            &ReflectionCaller::agent(Scope::Unrestricted, "claude-code", false),
+        )
+        .await
+        .unwrap();
+    reconciled_at(&fx, "plain.md", "2026-10-21T10:00:00+00:00").await;
+    reflect_run(
+        &fx,
+        "2026-10-21T13:00:00+00:00",
+        "2026-10-21T13:05:00+00:00",
+    )
+    .await;
+    now_at(&fx.engine, "2026-10-25T10:00:00+00:00");
     let clock = fx
         .engine
-        .reflection_page_clock("eng", "w.md", &jordi())
+        .reflection_page_clock("eng", "plain.md", &jordi())
         .await
         .unwrap();
     assert_eq!(clock, Value::Null);
-    let overdue = fx.engine.overdue_reflection_pages(&jordi()).await.unwrap();
-    assert_eq!(overdue["pages"], serde_json::json!([]), "{overdue}");
+    let pages = missed(&fx).await;
+    assert!(
+        pages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["path"] != "plain.md"),
+        "{pages}"
+    );
 }
 
 /// `crystalline doctor` reads the page clocks from an index it opened
@@ -510,15 +669,22 @@ async fn the_page_clocks_read_from_a_store_match_the_engine() {
     assert_eq!(clocks[0].path, "w.md");
     assert_eq!(clocks[0].freshness.written, "1d");
     assert_eq!(clocks[0].timing.overdue_secs, Some(3 * 3600));
+    assert_eq!(clocks[0].timing.missed_secs, None, "no run");
     assert_eq!(clocks[0].timing.last_checked_secs, 51 * 3600);
 }
 
-/// The control socket answers the overdue pages to `crystalline doctor` on
-/// the machine owner's behalf.
+/// The control socket answers the pages a reflect run missed to
+/// `crystalline doctor` on the machine owner's behalf.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_control_socket_names_the_overdue_pages() {
-    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
-    now_at(&fx.engine, "2026-10-23T13:00:00+00:00");
+    let fx = hourly_page("2026-10-21T10:00:00+00:00").await;
+    reflect_run(
+        &fx,
+        "2026-10-21T13:00:00+00:00",
+        "2026-10-21T13:05:00+00:00",
+    )
+    .await;
+    now_at(&fx.engine, "2026-10-21T16:05:00+00:00");
     let answer = crystalline_service::control::answer_for_test(
         fx.engine.clone(),
         &serde_json::json!({ "v": 1, "cmd": "reflection_overdue" }),
@@ -528,7 +694,7 @@ async fn the_control_socket_names_the_overdue_pages() {
     let pages = &answer["data"]["pages"];
     assert_eq!(pages[0]["domain"], "eng", "{answer}");
     assert_eq!(pages[0]["path"], "w.md", "{answer}");
-    assert_eq!(pages[0]["overdue_secs"], 3 * 3600, "{answer}");
+    assert_eq!(pages[0]["missed_secs"], 3 * 3600, "{answer}");
 }
 
 /// The `reconciled` action reads the same clock as the queue: a page due on
