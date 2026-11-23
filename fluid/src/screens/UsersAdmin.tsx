@@ -741,8 +741,13 @@ function AccountsTable({
                         : "descending"
                       : undefined
                   }
-                  className="px-2 py-2 whitespace-nowrap"
+                  className="px-2 py-2"
                 >
+                  {/*
+                    Headers may wrap ("Display name", "Last seen"): beside
+                    the Administration navigation at 1024 px every pixel of
+                    the column goes to the rows.
+                  */}
                   <button
                     type="button"
                     onClick={() => {
@@ -803,14 +808,17 @@ function AccountsTable({
                     {account.name}
                   </Link>
                 </th>
-                <td className="px-2 py-2 break-words">{account.display}</td>
+                {/*
+                  `wrap-anywhere`, not `break-words`: only the first lowers
+                  a table cell's minimum width, so a long display name with
+                  no space wraps instead of widening the table.
+                */}
+                <td className="px-2 py-2 wrap-anywhere">{account.display}</td>
                 <td className="px-2 py-2">{account.role}</td>
                 <td className="px-2 py-2">
                   {account.disabled ? "Disabled" : "Active"}
                 </td>
-                <td className="px-2 py-2 whitespace-nowrap">
-                  {signInWords(account.sign_in)}
-                </td>
+                <td className="px-2 py-2">{signInWords(account.sign_in)}</td>
                 <td className="px-2 py-2 whitespace-nowrap tabular-nums">
                   {lastSeen === null ? (
                     <span className="text-slate-500 dark:text-slate-400">

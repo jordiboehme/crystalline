@@ -30,9 +30,14 @@ async function signIn(page: Page): Promise<void> {
 }
 
 /** Add an account through the form, then come back to the list. */
-async function addAccount(page: Page, name: string): Promise<void> {
+async function addAccount(
+  page: Page,
+  name: string,
+  role = "viewer",
+): Promise<void> {
   const add = page.getByRole("region", { name: "Add an account" });
   await add.getByLabel("Login name").fill(name);
+  await add.getByLabel("Role", { exact: true }).selectOption(role);
   await add.getByLabel("Password", { exact: true }).fill("a-long-enough-pass");
   await add.getByRole("button", { name: "Add user" }).click();
   await expect(page).toHaveURL(
@@ -163,10 +168,35 @@ test("a selection is deactivated and reactivated in bulk", async ({ page }) => {
 test("the table fits the Administration column at a laptop's width", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 1024, height: 768 });
+  // Every role and the longest state on one page, so the widest words of
+  // each column are there whatever else the daemon holds.
+  const stem = `wide${String(Date.now())}`;
+  const roles = ["none", "viewer", "editor", "admin"];
+  const names = roles.map((role) => `${stem}-${role}`);
   await signIn(page);
   await page.goto("admin/users");
-  await expect(page.getByRole("table")).toBeVisible();
+  for (const [index, role] of roles.entries()) {
+    await addAccount(page, names[index] ?? "", role);
+  }
+  const off = `${stem}-viewer`;
+  await page.goto(`admin/users/${off}`);
+  await page.getByRole("button", { name: `Deactivate ${off}` }).click();
+  await expect(
+    page.getByRole("button", { name: `Reactivate ${off}` }),
+  ).toBeVisible();
+
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await page.goto(`admin/users?q=${stem}`);
+  const rows = page.getByRole("table").getByRole("row");
+  await expect(rows).toHaveCount(roles.length + 1);
+  for (const role of roles) {
+    await expect(
+      page.getByRole("table").getByRole("cell", { name: role, exact: true }),
+    ).toBeVisible();
+  }
+  await expect(
+    page.getByRole("table").getByRole("cell", { name: "Disabled" }),
+  ).toBeVisible();
 
   // The page itself never scrolls sideways.
   expect(await pageOverflow(page)).toBeLessThanOrEqual(0);
@@ -177,6 +207,10 @@ test("the table fits the Administration column at a laptop's width", async ({
     return box ? box.scrollWidth - box.clientWidth : 0;
   });
   expect(tableOverflow).toBeLessThanOrEqual(0);
+
+  for (const name of names) {
+    await deleteAccount(page, name);
+  }
 });
 
 /** How far the page itself scrolls sideways; zero or less is none. */
