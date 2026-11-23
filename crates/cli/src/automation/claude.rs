@@ -206,7 +206,13 @@ mod tests {
     #[test]
     fn the_skills_file_is_private_and_goes_away_with_the_config() {
         use std::os::unix::fs::PermissionsExt as _;
-        let config = PrivateConfig::write(&remote_mcp_config("https://x", "cmt_t", "eng")).unwrap();
+        let config = PrivateConfig::write(&remote_mcp_config(
+            "https://x",
+            "cmt_t",
+            "eng",
+            Loop::Evolve,
+        ))
+        .unwrap();
         let skills = config.write_skills("skill text").unwrap();
         assert_eq!(skills.parent(), config.path.parent());
         assert_eq!(std::fs::read_to_string(&skills).unwrap(), "skill text");
@@ -278,7 +284,13 @@ mod tests {
     #[test]
     fn the_mcp_config_is_private_and_goes_away() {
         use std::os::unix::fs::PermissionsExt as _;
-        let config = PrivateConfig::write(&remote_mcp_config("https://x", "cmt_t", "eng")).unwrap();
+        let config = PrivateConfig::write(&remote_mcp_config(
+            "https://x",
+            "cmt_t",
+            "eng",
+            Loop::Evolve,
+        ))
+        .unwrap();
         let path = config.path.clone();
         let dir = path.parent().unwrap().to_path_buf();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;

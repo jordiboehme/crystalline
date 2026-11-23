@@ -164,7 +164,7 @@ pub(super) async fn run_one(
     let take = client.verb(
         "automation_lease_take",
         lp,
-        json!({ "domain": domain, "runner": args.runner }),
+        take_request(domain, &args.runner, opts.force),
     );
     let Some(take) = unless_stopped(take, stop).await else {
         return Ok(Ran::Busy);
@@ -211,7 +211,7 @@ pub(super) async fn run_one(
         Err(e) => return lease.fail_and_err(&started, e, stop.clone()).await,
     };
     let config = match client
-        .mcp_config(domain)
+        .mcp_config(domain, lp)
         .await
         .and_then(|c| PrivateConfig::write(&c))
     {

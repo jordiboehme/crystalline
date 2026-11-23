@@ -544,6 +544,12 @@ enum Command {
         /// --unattended. `crystalline reflect run` and `evolve run` pass it.
         #[arg(long, hide = true)]
         domain: Option<String>,
+        /// The loop an unattended run started this session for, reflect or
+        /// evolve: only that loop's leases count, and a write is noted only
+        /// in that loop's lease. Implies --unattended. `crystalline reflect
+        /// run` and `evolve run` pass it.
+        #[arg(long = "loop", hide = true)]
+        run_loop: Option<crystalline_core::automation::Loop>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -2722,10 +2728,11 @@ fn run() -> anyhow::Result<()> {
             harness,
             unattended,
             domain,
+            run_loop,
             config,
         }) => on_runtime(move || {
             mcp_dispatch(
-                embedded, read_only, harness, unattended, domain, config, cli.db,
+                embedded, read_only, harness, unattended, domain, run_loop, config, cli.db,
             )
         }),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
@@ -5558,12 +5565,14 @@ async fn delete_dispatch(
 /// in-process, and serve MCP over stdio. The server starts cleanly with no
 /// domains registered; domains are created at runtime through the `add_domain`
 /// tool, so nothing is pre-seeded here.
+#[allow(clippy::too_many_arguments)]
 async fn mcp_dispatch(
     embedded: bool,
     read_only: bool,
     harness: Option<String>,
     unattended: bool,
     domain: Option<String>,
+    run_loop: Option<crystalline_core::automation::Loop>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -5575,6 +5584,7 @@ async fn mcp_dispatch(
         harness.as_deref(),
         unattended,
         domain.as_deref(),
+        run_loop,
     )
     .await
 }

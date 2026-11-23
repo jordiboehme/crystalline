@@ -102,15 +102,20 @@ impl AutomationClient {
 
     /// The MCP config the agent connects with. The remote one holds the
     /// bearer, so it is only ever written to [`PrivateConfig`].
-    pub(super) async fn mcp_config(&self, domain: &str) -> anyhow::Result<Value> {
+    pub(super) async fn mcp_config(&self, domain: &str, lp: Loop) -> anyhow::Result<Value> {
         match self {
             AutomationClient::Local(_) => {
                 let exe = std::env::current_exe()?;
-                Ok(local_mcp_config(&exe, domain))
+                Ok(local_mcp_config(&exe, domain, lp))
             }
             AutomationClient::Remote(connection) => {
                 let token = connection.bearer().await.map_err(anyhow::Error::new)?;
-                Ok(remote_mcp_config(&connection.source().url, &token, domain))
+                Ok(remote_mcp_config(
+                    &connection.source().url,
+                    &token,
+                    domain,
+                    lp,
+                ))
             }
         }
     }
@@ -143,12 +148,12 @@ pub(super) fn is_refusal(e: &anyhow::Error) -> bool {
 /// its list, since that harness reads the skills from disk. A headless run
 /// loads no settings, hooks or skills from disk (`--setting-sources ""`), and
 /// its prompt starts with the `skills` tool, so it needs the served surface.
-pub(super) fn local_mcp_config(exe: &Path, domain: &str) -> Value {
+pub(super) fn local_mcp_config(exe: &Path, domain: &str, lp: Loop) -> Value {
     json!({
         "mcpServers": {
             "crystalline": {
                 "command": exe.to_string_lossy(),
-                "args": ["mcp", "--unattended", "--domain", domain],
+                "args": ["mcp", "--unattended", "--domain", domain, "--loop", lp.as_str()],
             }
         }
     })
@@ -158,7 +163,7 @@ pub(super) fn local_mcp_config(exe: &Path, domain: &str) -> Value {
 /// transport answers there, under any base path), with the bearer header and
 /// the run's domain, which the server believes only while the bearer's
 /// account holds the run's lease there.
-pub(super) fn remote_mcp_config(url: &str, token: &str, domain: &str) -> Value {
+pub(super) fn remote_mcp_config(url: &str, token: &str, domain: &str, lp: Loop) -> Value {
     json!({
         "mcpServers": {
             "crystalline": {
@@ -167,10 +172,22 @@ pub(super) fn remote_mcp_config(url: &str, token: &str, domain: &str) -> Value {
                 "headers": {
                     "Authorization": format!("Bearer {token}"),
                     crystalline_service::mcp::RUN_DOMAIN_HEADER: domain,
+                    crystalline_service::mcp::RUN_LOOP_HEADER: lp.as_str(),
                 },
             }
         }
     })
+}
+
+/// The `automation_lease_take` request of a run on `domain` by `runner`. With
+/// `force` (`run --force`) an agent's take is not held back by the wait after
+/// failed runs, as the status was not.
+pub(super) fn take_request(domain: &str, runner: &str, force: bool) -> Value {
+    let mut request = json!({ "domain": domain, "runner": runner });
+    if force {
+        request["force"] = json!(true);
+    }
+    request
 }
 
 #[cfg(test)]
@@ -180,19 +197,37 @@ mod tests {
     #[test]
     fn the_mcp_configs_have_their_pinned_shapes() {
         assert_eq!(
-            local_mcp_config(Path::new("/opt/bin/crystalline"), "eng"),
+            local_mcp_config(Path::new("/opt/bin/crystalline"), "eng", Loop::Reflect),
             json!({ "mcpServers": { "crystalline": {
                 "command": "/opt/bin/crystalline",
-                "args": ["mcp", "--unattended", "--domain", "eng"] } } })
+                "args": ["mcp", "--unattended", "--domain", "eng", "--loop", "reflect"] } } })
         );
         assert_eq!(
-            remote_mcp_config("https://team.example.com/base/", "cmt_secret", "eng"),
+            remote_mcp_config(
+                "https://team.example.com/base/",
+                "cmt_secret",
+                "eng",
+                Loop::Evolve
+            ),
             json!({ "mcpServers": { "crystalline": {
                 "type": "http",
                 "url": "https://team.example.com/base/",
                 "headers": {
                     "Authorization": "Bearer cmt_secret",
-                    "X-Crystalline-Run-Domain": "eng" } } } })
+                    "X-Crystalline-Run-Domain": "eng",
+                    "X-Crystalline-Run-Loop": "evolve" } } } })
+        );
+    }
+
+    #[test]
+    fn a_forced_run_asks_for_its_lease_with_force() {
+        assert_eq!(
+            take_request("eng", "cli", false),
+            json!({ "domain": "eng", "runner": "cli" })
+        );
+        assert_eq!(
+            take_request("eng", "cli", true),
+            json!({ "domain": "eng", "runner": "cli", "force": true })
         );
     }
 }
