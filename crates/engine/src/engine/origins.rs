@@ -680,6 +680,7 @@ impl Engine {
         let set_by = match scope {
             crate::scope::Scope::User { account, .. }
             | crate::scope::Scope::OpenTierIdentity { account } => account.as_str(),
+            crate::scope::Scope::Agent { name, .. } => name.as_str(),
             crate::scope::Scope::Unrestricted | crate::scope::Scope::Anonymous => {
                 crate::scope::OWNER_IDENTITY_NAME
             }
@@ -1629,9 +1630,9 @@ impl Engine {
         let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
-            crate::scope::Scope::Anonymous | crate::scope::Scope::OpenTierIdentity { .. } => {
-                ShareActor::HttpAgent
-            }
+            crate::scope::Scope::Anonymous
+            | crate::scope::Scope::OpenTierIdentity { .. }
+            | crate::scope::Scope::Agent { .. } => ShareActor::HttpAgent,
         };
         // A refusal is recorded per login, so the status reads it under the
         // login this caller's shares go out on. Resolved once, outside every

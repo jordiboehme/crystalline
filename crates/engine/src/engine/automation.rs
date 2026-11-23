@@ -73,6 +73,8 @@ fn loop_caller(scope: &Scope) -> ReflectionCaller {
         Scope::Anonymous | Scope::OpenTierIdentity { .. } => {
             ReflectionCaller::person(Scope::Anonymous, "anonymous")
         }
+        // Decided under its own scope, which grants it nothing yet.
+        Scope::Agent { name, .. } => ReflectionCaller::person(scope.clone(), name),
     }
 }
 
@@ -81,7 +83,11 @@ fn share_actor(scope: &Scope) -> ShareActor {
     match scope {
         Scope::Unrestricted => ShareActor::Machine,
         Scope::User { account, .. } => ShareActor::Account(account.clone()),
-        Scope::Anonymous | Scope::OpenTierIdentity { .. } => ShareActor::HttpAgent,
+        // An agent shares like the open tier until it has its own share
+        // rules; no agent reaches a run today.
+        Scope::Anonymous | Scope::OpenTierIdentity { .. } | Scope::Agent { .. } => {
+            ShareActor::HttpAgent
+        }
     }
 }
 
@@ -1609,7 +1615,9 @@ impl Engine {
                         lease.holder.account.as_deref() == Some(account.as_str())
                     }
                     Scope::Unrestricted => lease.holder.account.is_none(),
-                    Scope::Anonymous | Scope::OpenTierIdentity { .. } => false,
+                    Scope::Anonymous | Scope::OpenTierIdentity { .. } | Scope::Agent { .. } => {
+                        false
+                    }
                 };
                 if held {
                     out.push((lp, domain.clone()));

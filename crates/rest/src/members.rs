@@ -286,7 +286,11 @@ fn store_error(e: anyhow::Error) -> ApiError {
             | RefusalKind::NoSuchToken
             | RefusalKind::CapReached
             | RefusalKind::GithubIdTaken
-            | RefusalKind::InvalidDisplayName,
+            | RefusalKind::InvalidDisplayName
+            | RefusalKind::NameTaken
+            | RefusalKind::NoSuchAgent
+            | RefusalKind::AgentTokenLimit
+            | RefusalKind::InvalidTokenExpiry,
         )
         | None => ApiError::internal(format!("{e:#}")),
     }

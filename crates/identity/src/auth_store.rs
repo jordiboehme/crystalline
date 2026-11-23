@@ -71,6 +71,7 @@ use crystalline_core::time::{self, Stamp};
 use sha2::{Digest, Sha256};
 use turso::{Builder, Connection, Database, Value};
 
+mod agents;
 mod db;
 #[cfg(test)]
 mod lint;
@@ -81,6 +82,11 @@ mod pg_migrations;
 #[cfg(test)]
 mod tests;
 
+pub use agents::{
+    AGENT_LIVE_TOKENS_MAX, AGENT_TOKEN_DEFAULT_TTL_SECS, AGENT_TOKEN_MAX_TTL_SECS,
+    AGENT_TOKEN_MIN_TTL_SECS, AGENT_TOKEN_PREFIX, Agent, AgentLoops, AgentSession, AgentToken,
+    AgentTokenState, IssuedAgentToken, check_agent_token_ttl,
+};
 use db::{AuthDb, AuthRow};
 #[cfg(feature = "postgres")]
 pub use pg::auth_write_lock;
@@ -133,9 +139,9 @@ impl From<anyhow::Error> for AuthOpenError {
     }
 }
 
-/// The orphan prunes of the four credential lookups: a row whose account no
+/// The orphan prunes of the credential lookups: a row whose account no
 /// longer exists (and, for sessions, an expired one). Turso runs each on
-/// every lookup; Postgres runs all four at open and then hourly
+/// every lookup; Postgres runs all of them at open and then hourly
 /// ([`AuthStore::prune_orphans_if_due`]).
 const PRUNE_SESSIONS: &str = "DELETE FROM sessions
                  WHERE expires_at <= ?1
@@ -146,11 +152,15 @@ const PRUNE_IDENTITY_LINKS: &str = "DELETE FROM identity_link
                  WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.\"user\")";
 const PRUNE_OAUTH_GRANTS: &str = "DELETE FROM oauth_grants
                  WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.\"user\")";
+/// The agent tokens whose agent no longer exists: the same orphan prune,
+/// for the agents' own credential table.
+const PRUNE_AGENT_TOKENS: &str = "DELETE FROM agent_tokens
+                 WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.name = agent_tokens.agent)";
 
-/// On Postgres, the orphans of one name, swept before an account of that
-/// name is created: the hourly prune leaves a window, and an orphan is
+/// On Postgres, the orphans of one name, swept before an account or an
+/// agent of that name is created: the hourly prune leaves a window, and an orphan is
 /// exactly what the next account to take the name would inherit.
-const SWEEP_ORPHANS_OF: [&str; 4] = [
+const SWEEP_ORPHANS_OF: [&str; 5] = [
     "DELETE FROM sessions WHERE user_name = ?1
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
     "DELETE FROM mcp_tokens WHERE \"user\" = ?1
@@ -159,6 +169,8 @@ const SWEEP_ORPHANS_OF: [&str; 4] = [
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
     "DELETE FROM oauth_grants WHERE \"user\" = ?1
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM agent_tokens WHERE agent = ?1
+     AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.name = ?1)",
 ];
 
 /// How old a `last_seen_at` or `last_used` stamp must be before Postgres
@@ -1205,6 +1217,18 @@ pub enum RefusalKind {
     /// The display name given is too long or holds a control or invisible
     /// character. See [`normalize_display_name`].
     InvalidDisplayName,
+    /// The name is taken by the other kind of identity: an account was asked
+    /// for under an agent's name, or an agent under an account's. Accounts
+    /// and agents share one namespace (see the `agents` module).
+    NameTaken,
+    /// No agent of that name. See [`AuthStore::remove_agent`].
+    NoSuchAgent,
+    /// The agent already holds [`AGENT_LIVE_TOKENS_MAX`] live tokens, so no
+    /// further one is issued until one is revoked or expires.
+    AgentTokenLimit,
+    /// An agent token's life is outside what [`check_agent_token_ttl`]
+    /// allows.
+    InvalidTokenExpiry,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
@@ -1401,6 +1425,9 @@ pub struct AuthStore {
 /// an older binary still opens the file, and hold placeholders (see
 /// `AuthStore::move_oauth_tokens`). `oauth_grant_ended` records why a grant
 /// ended, for the Connected clients card ([`AuthStore::list_ended_oauth_grants`]).
+/// `agents` and `agent_tokens` (0.35.0) hold the agents of the loops and their
+/// tokens, apart from `users` so no sign-in path can reach an agent
+/// (see the `agents` module); an older binary never reads them.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY,
@@ -1536,6 +1563,25 @@ CREATE TABLE IF NOT EXISTS domain_reflection_grant (
     domain TEXT NOT NULL, account TEXT NOT NULL, level TEXT NOT NULL,
     added_by TEXT NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (domain, account));
 CREATE TABLE IF NOT EXISTS github_delivery (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS agents (
+    name TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
+    loops TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    disabled INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    last_used TEXT,
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS agent_tokens_agent ON agent_tokens (agent);
 ";
 
 /// The error [`AuthStore::register_oauth_client_within`] fails with when it
@@ -2129,17 +2175,17 @@ impl AuthStore {
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.lock().await;
-        // On Postgres the insert takes the write lock, so it cannot slip past
-        // `add_first_admin`'s empty-table check, and it sweeps the name's
-        // orphans first. Turso's single writer needs neither.
-        let pg = self.db.is_postgres();
-        if pg {
-            self.db
-                .begin_immediate()
-                .await
-                .with_context(|| format!("adding user '{name}'"))?;
-        }
+        // One transaction on both backends: the agent check and the insert
+        // must see the same names (accounts and agents share one namespace).
+        // On Postgres the insert also takes the write lock, so it cannot slip
+        // past `add_first_admin`'s empty-table check, and it sweeps the name's
+        // orphans first.
+        self.db
+            .begin_immediate()
+            .await
+            .with_context(|| format!("adding user '{name}'"))?;
         let result = async {
+            self.refuse_agent_name(&name).await?;
             self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
@@ -2164,11 +2210,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        if pg {
-            self.db.finish(result).await
-        } else {
-            result
-        }
+        self.db.finish(result).await
     }
 
     /// How many accounts exist. Zero is what opens the first-run setup path,
@@ -2215,6 +2257,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("creating the first admin '{name}'"))?;
         let result = async {
+            self.refuse_agent_name(&name).await?;
             self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
@@ -2751,6 +2794,7 @@ impl AuthStore {
                 .await?
                 .is_some();
             if !exists {
+                self.refuse_agent_name(&name).await?;
                 let count = match self
                     .db
                     .query_first("SELECT COUNT(*) FROM users", vec![])
@@ -3740,6 +3784,10 @@ impl AuthStore {
                 "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
                 vec![Value::Integer(id), Value::Text(now.rfc3339())],
             ),
+            ("agent_tokens", false) => (
+                "UPDATE agent_tokens SET last_used = ?2 WHERE id = ?1",
+                vec![Value::Integer(id), Value::Text(now.rfc3339())],
+            ),
             ("mcp_tokens", true) => (
                 "UPDATE mcp_tokens SET last_used = ?2
                  WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
@@ -3758,13 +3806,22 @@ impl AuthStore {
                     Value::Text(stamp_cutoff(now)),
                 ],
             ),
+            ("agent_tokens", true) => (
+                "UPDATE agent_tokens SET last_used = ?2
+                 WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
+                vec![
+                    Value::Integer(id),
+                    Value::Text(now.rfc3339()),
+                    Value::Text(stamp_cutoff(now)),
+                ],
+            ),
             _ => bail!("no last_used stamp on {table}"),
         };
         self.db.execute(sql, params).await?;
         Ok(())
     }
 
-    /// The Postgres orphan prune: the four lookup prunes at once, at open
+    /// The Postgres orphan prune: every lookup prune at once, at open
     /// and then at most hourly. The caller holds `guard`.
     async fn prune_orphans_if_due(&self) -> Result<()> {
         if !self.db.prune_due() {
@@ -3787,6 +3844,10 @@ impl AuthStore {
             .execute(PRUNE_OAUTH_GRANTS, vec![])
             .await
             .context("pruning orphaned oauth grants")?;
+        self.db
+            .execute(PRUNE_AGENT_TOKENS, vec![])
+            .await
+            .context("pruning orphaned agent tokens")?;
         self.db.prune_done();
         Ok(())
     }
@@ -4018,6 +4079,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("adding user '{name}'"))?;
         let result = async {
+            self.refuse_agent_name(&name).await?;
             self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
@@ -7075,8 +7137,9 @@ impl AuthStore {
     }
 
     /// The first free account name from `base`, `base-2`, `base-3` and so on.
-    /// Called inside a transaction, so the name it found is still free when
-    /// the insert beside it runs.
+    /// A name an agent holds is not free: accounts and agents share one
+    /// namespace. Called inside a transaction, so the name it found is still
+    /// free when the insert beside it runs.
     async fn free_account_name(&self, base: &str) -> Result<String> {
         for attempt in 1..=MAX_NAME_ATTEMPTS {
             let candidate = if attempt == 1 {
@@ -7087,7 +7150,8 @@ impl AuthStore {
             if self
                 .db
                 .query_first(
-                    "SELECT 1 FROM users WHERE name = ?1",
+                    "SELECT 1 WHERE EXISTS (SELECT 1 FROM users WHERE name = ?1)
+                        OR EXISTS (SELECT 1 FROM agents WHERE name = ?1)",
                     vec![Value::Text(candidate.clone())],
                 )
                 .await?

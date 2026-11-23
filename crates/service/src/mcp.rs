@@ -2207,6 +2207,8 @@ impl McpServer {
             // Never resolved at the edge (see `Scope::OpenTierIdentity`), and at most an
             // editor where it is: not an admin.
             Scope::OpenTierIdentity { .. } => false,
+            // An agent of the loops never holds the instance admin role.
+            Scope::Agent { .. } => false,
         }
     }
 
@@ -4229,7 +4231,7 @@ impl McpServer {
             }
             // The agent identity stands in for the open tier on one governed
             // domain only; it is not the person behind this session.
-            Scope::Anonymous | Scope::OpenTierIdentity { .. } => {
+            Scope::Anonymous | Scope::OpenTierIdentity { .. } | Scope::Agent { .. } => {
                 return ok(json!({
                     "connected": false,
                     "url": Value::Null,

@@ -42,7 +42,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::auth_store::{AuthStore, DomainAcl, GithubLink, MemberLevel, ReflectionLevel, Role};
+use crate::auth_store::{
+    AgentLoops, AuthStore, DomainAcl, GithubLink, MemberLevel, ReflectionLevel, Role,
+};
 
 /// The fixed identity name the machine owner's personal credential is stored
 /// under - the CLI and stdio MCP have no account to be, so they share one local
@@ -89,6 +91,17 @@ pub enum Scope {
         /// The login name, as the auth store keys it.
         account: String,
     },
+    /// An agent of the loops, resolved from its token
+    /// ([`crate::auth_store::AuthStore::agent_for_token`]). An identity of
+    /// its own, never an account: it holds no membership, no instance role
+    /// and no draft, and until its rights are spelled out every check here
+    /// gives it nothing.
+    Agent {
+        /// The agent's unique name, as the auth store keys it.
+        name: String,
+        /// The loops it runs.
+        loops: AgentLoops,
+    },
 }
 
 /// Whose draft overlay a caller acts in on a domain that reviews changes
@@ -116,6 +129,8 @@ pub fn overlay_actor(scope: &Scope) -> Option<String> {
         // The open tier's writes run as anonymous; the agent stand-in only
         // answers rights questions, so it holds no draft.
         Scope::Anonymous | Scope::OpenTierIdentity { .. } => None,
+        // An agent drafts nothing until its rights say otherwise.
+        Scope::Agent { .. } => None,
     }
 }
 
@@ -308,6 +323,9 @@ enum Principal {
     },
     /// Nobody in particular.
     Anonymous,
+    /// An agent of the loops ([`Scope::Agent`]). It gets nothing on any
+    /// domain until its rights are spelled out in each decision below.
+    Agent,
 }
 
 /// The whole policy, as a pure function of one caller and one domain.
@@ -348,6 +366,7 @@ fn decide(
             Some(_) => DomainRight::None,
             None => DomainRight::Read,
         },
+        Principal::Agent => DomainRight::None,
         Principal::Account { name, role, .. } => {
             if *role == Role::Admin {
                 return DomainRight::Own;
@@ -411,11 +430,14 @@ fn decide_governed(principal: &Principal, private: bool, governed: Governed) -> 
             Principal::Account {
                 role: Role::Admin, ..
             } => DomainRight::Own,
-            Principal::Account { .. } | Principal::Anonymous => DomainRight::None,
+            Principal::Account { .. } | Principal::Anonymous | Principal::Agent => {
+                DomainRight::None
+            }
         };
     }
     match principal {
         Principal::Unrestricted => DomainRight::Own,
+        Principal::Agent => DomainRight::None,
         Principal::Anonymous => {
             if !private && governed.public {
                 DomainRight::Read
@@ -449,6 +471,7 @@ fn instance_cap(principal: &Principal) -> DomainRight {
     match principal {
         Principal::Unrestricted => DomainRight::Own,
         Principal::Anonymous => DomainRight::Read,
+        Principal::Agent => DomainRight::None,
         Principal::Account { role, .. } => match role {
             // It never writes an engram. `Read`, not `None`, so a write gate
             // refuses it as forbidden on a private domain it reads instead of
@@ -505,6 +528,7 @@ fn decide_reflection(
     let knowledge = decide(principal, acl, level, github);
     let reflection = match principal {
         Principal::Unrestricted => return ReflectionRight::Curate,
+        Principal::Agent => return ReflectionRight::None,
         Principal::Anonymous => {
             return if knowledge >= DomainRight::Read {
                 ReflectionRight::Read
@@ -2185,6 +2209,7 @@ impl DomainAccess {
         match scope {
             Scope::Unrestricted => Ok(Principal::Unrestricted),
             Scope::Anonymous => Ok(Principal::Anonymous),
+            Scope::Agent { .. } => Ok(Principal::Agent),
             Scope::User { account, admin } => {
                 let Some(user) = self.auth.user(account).await? else {
                     return Ok(Principal::Anonymous);

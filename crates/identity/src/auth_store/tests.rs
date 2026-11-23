@@ -7219,7 +7219,7 @@ mod postgres {
         let loc = AccountsLocation::Postgres(scratch.config());
         let opts = PgSessionOptions::default();
         match AuthStore::open_at_no_migrate(&loc, &opts).await {
-            Err(AuthOpenError::Behind { found: 0, need: 1 }) => {}
+            Err(AuthOpenError::Behind { found: 0, need: 2 }) => {}
             Err(other) => panic!("{other}"),
             Ok(_) => panic!("an unmigrated schema opened"),
         }
@@ -7236,7 +7236,7 @@ mod postgres {
         match AuthStore::open_at_no_migrate(&loc, &opts).await {
             Err(AuthOpenError::TooNew {
                 found: 99,
-                known: 1,
+                known: 2,
             }) => {}
             Err(other) => panic!("{other}"),
             Ok(_) => panic!("a newer schema opened"),
@@ -7380,4 +7380,362 @@ async fn a_user_read_carries_the_sign_in_kind_and_the_github_link() {
     let session = store.create_session("pw", 60).await.unwrap();
     let (read, _csrf) = store.session_user(&session.token).await.unwrap().unwrap();
     assert_eq!((read.sign_in, read.github_linked), (None, None));
+}
+
+/// An agent with the default token life, created by `ada`.
+async fn add_test_agent(store: &AuthStore, name: &str) -> IssuedAgentToken {
+    store
+        .add_agent(
+            name,
+            None,
+            AgentLoops::Both,
+            "ada",
+            "",
+            AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap()
+        .1
+}
+
+/// Accounts and agents share one namespace: every account insert refuses an
+/// agent's name, and an agent is refused under an account's name, both with
+/// [`RefusalKind::NameTaken`].
+#[tokio::test]
+async fn accounts_and_agents_share_one_namespace() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("ada", "Ada", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    add_test_agent(&store, "Nightly").await;
+
+    let taken = |e: anyhow::Error| StoreRefusal::kind_of(&e) == Some(RefusalKind::NameTaken);
+    // Account first, agent second.
+    assert!(taken(
+        store
+            .add_agent("ADA", None, AgentLoops::Both, "ada", "", 86_400)
+            .await
+            .unwrap_err()
+    ));
+    // Agent first, every account path second.
+    assert!(taken(
+        store
+            .add_user("nightly", "N", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap_err()
+    ));
+    assert!(taken(
+        store
+            .add_token_only_user("nightly", "N", None, Role::Viewer, "t")
+            .await
+            .unwrap_err()
+    ));
+    assert!(taken(
+        store
+            .ensure_user_created("nightly", Role::Viewer, usize::MAX)
+            .await
+            .unwrap_err()
+    ));
+    // A single sign-on wanting the name gets the next free one instead.
+    let provisioned = store
+        .provision_linked_user(
+            "https://idp.test",
+            "sub-1",
+            "nightly",
+            None,
+            None,
+            Role::Viewer,
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.name, "nightly-2");
+    assert_eq!(store.free_name_from("nightly").await.unwrap(), "nightly-3");
+    // Another agent of the same name.
+    assert!(taken(
+        store
+            .add_agent("nightly", None, AgentLoops::Reflect, "ada", "", 86_400)
+            .await
+            .unwrap_err()
+    ));
+    // No agent shows up as an account.
+    assert!(store.user("nightly").await.unwrap().is_none());
+    assert!(
+        !store
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .any(|u| u.name == "nightly")
+    );
+}
+
+/// On a fresh instance the first admin cannot take an agent's name either.
+#[tokio::test]
+async fn the_first_admin_cannot_take_an_agents_name() {
+    let (store, _guard) = test_store().await;
+    add_test_agent(&store, "nightly").await;
+    let err = store
+        .add_first_admin("nightly", "N", "pw12345678")
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NameTaken));
+    assert_eq!(store.user_count().await.unwrap(), 0);
+}
+
+/// A token is shown once, resolves to its agent and loops, stamps
+/// `last_used`, stops resolving once revoked, and a revoked token stays
+/// listed. Removing the agent removes its tokens.
+#[tokio::test]
+async fn agent_token_lifecycle() {
+    let (store, _guard) = test_store().await;
+    let (agent, issued) = store
+        .add_agent(
+            "Nightly",
+            Some("Nightly runner"),
+            AgentLoops::Evolve,
+            "ada",
+            "first",
+            AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(agent.name, "nightly");
+    assert_eq!(agent.display, "Nightly runner");
+    assert_eq!(agent.loops, AgentLoops::Evolve);
+    assert_eq!(agent.created_by, "ada");
+    assert!(issued.token.starts_with(AGENT_TOKEN_PREFIX));
+    assert_eq!(issued.token.len(), AGENT_TOKEN_PREFIX.len() + 64);
+    assert!(!format!("{issued:?}").contains(&issued.token[4..]));
+
+    let session = store.agent_for_token(&issued.token).await.unwrap().unwrap();
+    assert_eq!(session.name, "nightly");
+    assert_eq!(session.loops, AgentLoops::Evolve);
+    assert_eq!(
+        session.scope(),
+        crate::scope::Scope::Agent {
+            name: "nightly".to_string(),
+            loops: AgentLoops::Evolve,
+        }
+    );
+    // Never resolved as an account's token, nor an account's as an agent's.
+    assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+
+    let listed = store.agent("NIGHTLY").await.unwrap().unwrap();
+    assert_eq!(listed.tokens.len(), 1);
+    assert_eq!(listed.tokens[0].label, "first");
+    assert_eq!(listed.tokens[0].state, AgentTokenState::Live);
+    assert!(
+        listed.tokens[0].last_used.is_some(),
+        "the lookup stamped it"
+    );
+
+    assert!(
+        store
+            .revoke_agent_token("nightly", issued.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .revoke_agent_token("nightly", issued.id)
+            .await
+            .unwrap(),
+        "already revoked"
+    );
+    assert!(!store.revoke_agent_token("other", issued.id).await.unwrap());
+    assert!(
+        store
+            .agent_for_token(&issued.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let listed = store.agent("nightly").await.unwrap().unwrap();
+    assert_eq!(listed.tokens[0].state, AgentTokenState::Revoked);
+    assert!(listed.tokens[0].revoked_at.is_some());
+
+    let second = store
+        .issue_agent_token("nightly", "second", 86_400)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .agent_for_token(&second.token)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store.remove_agent("nightly").await.unwrap();
+    assert!(
+        store
+            .agent_for_token(&second.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.agents().await.unwrap().is_empty());
+    let err = store.remove_agent("nightly").await.unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NoSuchAgent));
+    let err = store
+        .issue_agent_token("nightly", "", 86_400)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NoSuchAgent));
+}
+
+/// A token stops resolving when its time is up, and the listing says so.
+/// The life is checked: one day to a year.
+#[tokio::test]
+async fn agent_tokens_expire() {
+    let (store, _guard) = test_store().await;
+    let long_ago = crystalline_core::time::Stamp::from_unix(1_700_000_000, 0).unwrap();
+    let (_, old) = store
+        .add_agent_at(
+            "nightly",
+            None,
+            AgentLoops::Both,
+            "ada",
+            "",
+            AGENT_TOKEN_DEFAULT_TTL_SECS,
+            long_ago,
+        )
+        .await
+        .unwrap();
+    assert!(old.label.starts_with("issued 2023-11-14"), "{}", old.label);
+    assert!(
+        store
+            .agent_for_token_at(&old.token, long_ago)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.agent_for_token(&old.token).await.unwrap().is_none());
+    let listed = store.agent("nightly").await.unwrap().unwrap();
+    assert_eq!(listed.tokens[0].state, AgentTokenState::Expired);
+
+    for bad in [0, 3_600, AGENT_TOKEN_MAX_TTL_SECS + 1] {
+        let err = store
+            .issue_agent_token("nightly", "", bad)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::InvalidTokenExpiry),
+            "{bad}"
+        );
+    }
+    assert!(
+        store
+            .issue_agent_token("nightly", "", AGENT_TOKEN_MAX_TTL_SECS)
+            .await
+            .is_ok()
+    );
+}
+
+/// At most two live tokens at once; an expired or revoked one does not
+/// count.
+#[tokio::test]
+async fn an_agent_holds_at_most_two_live_tokens() {
+    let (store, _guard) = test_store().await;
+    let first = add_test_agent(&store, "nightly").await;
+    let second = store
+        .issue_agent_token("nightly", "b", 86_400)
+        .await
+        .unwrap();
+    let err = store
+        .issue_agent_token("nightly", "c", 86_400)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::AgentTokenLimit)
+    );
+    assert!(format!("{err}").contains("crystalline agents revoke nightly"));
+    assert!(store.revoke_agent_token("nightly", first.id).await.unwrap());
+    store
+        .issue_agent_token("nightly", "c", 86_400)
+        .await
+        .unwrap();
+    // Two days on, the one-day tokens have expired and no longer count.
+    let later = crystalline_core::time::Stamp::from_unix(
+        crystalline_core::time::now().unix_seconds() + 2 * 86_400,
+        0,
+    )
+    .unwrap();
+    store
+        .issue_agent_token_at("nightly", "d", 86_400, later)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .agent_for_token(&second.token)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A disabled agent's tokens open nothing.
+#[tokio::test]
+async fn a_disabled_agents_token_resolves_to_nobody() {
+    let (store, _guard) = test_store().await;
+    let issued = add_test_agent(&store, "nightly").await;
+    store
+        .db
+        .execute(
+            "UPDATE agents SET disabled = 1 WHERE name = ?1",
+            vec![Value::Text("nightly".to_string())],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .agent_for_token(&issued.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.agent("nightly").await.unwrap().unwrap().disabled);
+}
+
+/// The orphan sweep covers agents: a token row whose agent is gone is
+/// pruned, so an agent made later under that name inherits nothing.
+#[tokio::test]
+async fn an_agent_made_again_inherits_no_orphaned_token() {
+    let (store, _guard) = test_store().await;
+    let issued = add_test_agent(&store, "nightly").await;
+    // The agent row vanishes other than through `remove_agent`.
+    store
+        .db
+        .execute(
+            "DELETE FROM agents WHERE name = ?1",
+            vec![Value::Text("nightly".to_string())],
+        )
+        .await
+        .unwrap();
+    add_test_agent(&store, "nightly").await;
+    assert!(
+        store
+            .agent_for_token(&issued.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let listed = store.agent("nightly").await.unwrap().unwrap();
+    assert_eq!(listed.tokens.len(), 1, "only the new agent's own token");
+}
+
+/// The loops are read from a list in either order.
+#[test]
+fn agent_loops_parse() {
+    assert_eq!(AgentLoops::parse("reflect"), Some(AgentLoops::Reflect));
+    assert_eq!(AgentLoops::parse("evolve"), Some(AgentLoops::Evolve));
+    assert_eq!(AgentLoops::parse("evolve, reflect"), Some(AgentLoops::Both));
+    assert_eq!(AgentLoops::parse("both"), Some(AgentLoops::Both));
+    assert_eq!(AgentLoops::parse(""), None);
+    assert_eq!(AgentLoops::parse("reflect,nap"), None);
+    assert!(AgentLoops::Both.reflect() && AgentLoops::Both.evolve());
+    assert!(!AgentLoops::Reflect.evolve() && !AgentLoops::Evolve.reflect());
 }

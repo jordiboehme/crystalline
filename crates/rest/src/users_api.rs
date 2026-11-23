@@ -1489,6 +1489,16 @@ fn store_error(e: anyhow::Error, subject: &str) -> ApiError {
                 .unwrap_or_else(|| format!("{e:#}")),
         );
     }
+    // The name belongs to an agent: accounts and agents share one
+    // namespace. The store's sentence names the name and the rule only.
+    if StoreRefusal::kind_of(&e) == Some(RefusalKind::NameTaken) {
+        return ApiError::conflict(
+            e.chain()
+                .find_map(|cause| cause.downcast_ref::<StoreRefusal>())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("{e:#}")),
+        );
+    }
     let detail = format!("{e:#}");
     if detail.contains("UNIQUE constraint") {
         // The store's message here is the database's, and it names a column.
@@ -1576,6 +1586,26 @@ mod tests {
         let api = store_error(removed, "ada");
         assert_eq!(api.status, StatusCode::CONFLICT);
         assert!(api.detail.contains("last admin"), "{}", api.detail);
+
+        // An agent's name is taken for an account: a 409 in the store's words.
+        store
+            .add_agent(
+                "nightly",
+                None,
+                crate::auth_store::AgentLoops::Both,
+                "ada",
+                "",
+                crate::auth_store::AGENT_TOKEN_DEFAULT_TTL_SECS,
+            )
+            .await
+            .unwrap();
+        let taken = store
+            .add_user("nightly", "N", None, Role::Viewer, "s3cret")
+            .await
+            .expect_err("an agent holds the name");
+        let api = store_error(taken, "nightly");
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert!(api.detail.contains("belongs to an agent"), "{}", api.detail);
 
         let missing = store
             .set_password("ghost", "s3cret")

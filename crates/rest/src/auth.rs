@@ -625,7 +625,10 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
                 // store's sentence cannot turn this into a 500.
                 match StoreRefusal::kind_of(&e) {
                     Some(RefusalKind::CapReached) => super::users_api::account_cap_refusal(&e),
-                    Some(RefusalKind::InvalidName) => ApiError::forbidden(format!("{e:#}")),
+                    // The header names an agent: no sign-in path reaches one.
+                    Some(RefusalKind::InvalidName | RefusalKind::NameTaken) => {
+                        ApiError::forbidden(format!("{e:#}"))
+                    }
                     _ => ApiError::internal(format!("{e:#}")),
                 }
             })?;

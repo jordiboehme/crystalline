@@ -259,7 +259,10 @@ impl StreamSlots {
     fn acquire(self: &Arc<Self>, scope: &Scope) -> Option<StreamSlot> {
         let account = match scope {
             Scope::User { account, .. } => Some(account.trim().to_lowercase()),
-            Scope::Unrestricted | Scope::Anonymous | Scope::OpenTierIdentity { .. } => None,
+            Scope::Unrestricted
+            | Scope::Anonymous
+            | Scope::OpenTierIdentity { .. }
+            | Scope::Agent { .. } => None,
         };
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         if open.total >= self.total {
@@ -719,6 +722,9 @@ impl Subscriber {
 /// that was shared with everyone.
 fn audience_admits(audience: &DomainAudience, scope: &Scope) -> bool {
     match (audience, scope) {
+        // No request on this surface resolves to an agent; were one to, it
+        // reads nothing until its rights are spelled out.
+        (_, Scope::Agent { .. }) => false,
         (DomainAudience::Everyone, _) | (_, Scope::Unrestricted) => true,
         (DomainAudience::Accounts(accounts), Scope::User { account, admin }) => {
             *admin || accounts.contains(&account.trim().to_lowercase())
