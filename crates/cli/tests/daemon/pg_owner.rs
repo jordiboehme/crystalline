@@ -1984,6 +1984,50 @@ fn users_add_while_daemon_owns_is_seen_at_once() {
     );
 }
 
+/// `agents` writes the accounts database beside a daemon that owns it, like
+/// `users`: the agent lands in the database, no accounts file appears, the
+/// owner row stays the daemon's, and its token is refused at the ctl route.
+#[test]
+fn agents_add_while_daemon_owns_lands_in_the_database() {
+    let Some(pg) = PgScratch::new("agowned") else {
+        return;
+    };
+    let env = Env::new("agowned").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["--json", "agents", "add", "nightly"]);
+    assert!(ok, "{out}{err}");
+    let added: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let token = added["token"]["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        pg.text(&format!(
+            "SELECT count(*)::text FROM {}.agents WHERE name = 'nightly'",
+            pg.schema
+        )),
+        "1"
+    );
+    let (ok, out, err) = env.run_full(&["agents", "list"]);
+    assert!(ok && out.contains("nightly"), "{out}{err}");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+    assert!(
+        !env.state_dir().join("web-auth.db").exists(),
+        "an accounts file was made"
+    );
+    let status = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{}/api/v1/ctl", serve.addr))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "v": 1, "cmd": "status" }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 401, "no ctl command is open to an agent yet");
+}
+
 /// Only an owner migrates the accounts tables: with the ledger stamped
 /// below this binary while a daemon owns the database, `users` is refused
 /// naming both versions and where to run it, and migrates nothing.

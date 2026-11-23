@@ -16,6 +16,7 @@ use crystalline_core::config;
 use crystalline_core::text::plural;
 use crystalline_core::verify::{self, VerifyOptions};
 
+mod agents;
 mod automation;
 mod cmd;
 mod desktop_bundle;
@@ -562,6 +563,14 @@ enum Command {
     Users {
         #[command(subcommand)]
         command: UsersCommand,
+    },
+    /// Manage the agents of the loops: identities of their own for scheduled
+    /// reflect and evolve runs, never accounts, each with tokens that expire.
+    /// Writes the accounts store directly, like `crystalline users`, so it
+    /// works with or without a running daemon.
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
     },
     /// Find and handle the texts this machine's server kept when a
     /// co-editing room could not save: the last person left and the final
@@ -1130,6 +1139,55 @@ enum KeptCommand {
         /// Skip the confirmation prompt and delete.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCommand {
+    /// Create an agent and print its first token, once. The name is folded
+    /// like a login name and may not be taken by an account or another agent.
+    Add {
+        /// The agent's unique name.
+        name: String,
+        /// The name shown to people. Defaults to the name.
+        #[arg(long, value_name = "TEXT")]
+        display: Option<String>,
+        /// The loops it runs: reflect, evolve, or both as `reflect,evolve`.
+        #[arg(long, value_name = "LOOPS", default_value = "reflect,evolve")]
+        loops: String,
+        /// How long the token lives, in days: `90d` or `90`, 1 to 365.
+        #[arg(long, value_name = "DAYS", default_value = "90d")]
+        expires: String,
+        /// The token's label. Defaults to the day it was issued.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List the agents with their tokens: id, state, expiry and last use.
+    /// Never a token: only its hash is stored.
+    List,
+    /// Issue another token for an agent and print it, once. An agent holds at
+    /// most two live tokens: revoke one first when it has two.
+    Token {
+        /// The agent.
+        name: String,
+        /// How long the token lives, in days: `90d` or `90`, 1 to 365.
+        #[arg(long, value_name = "DAYS", default_value = "90d")]
+        expires: String,
+        /// The token's label. Defaults to the day it was issued.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Revoke one token of an agent by its id (see `agents list`).
+    Revoke {
+        /// The agent.
+        name: String,
+        /// The token's id.
+        token_id: i64,
+    },
+    /// Remove an agent and every token it holds.
+    Remove {
+        /// The agent.
+        name: String,
     },
 }
 
@@ -2672,6 +2730,7 @@ fn run() -> anyhow::Result<()> {
         }),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
+        Some(Command::Agents { command }) => on_runtime(move || agents::run(command, cli.json)),
         Some(Command::Kept { command }) => kept::run(command, cli.json),
         Some(Command::Reflect { command }) => on_runtime(move || {
             automation::run(
@@ -2778,6 +2837,7 @@ fn packaged_setup_step(command: &Command) -> Option<&'static str> {
             action: DaemonTaskAction::Register { .. },
         } => Some("daemon-task register"),
         Command::Users { .. } => Some("users"),
+        Command::Agents { .. } => Some("agents"),
         Command::Github {
             command:
                 GithubCommand::App {

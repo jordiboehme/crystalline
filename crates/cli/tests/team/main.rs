@@ -17,6 +17,7 @@ mod forge;
 #[path = "../common/remote_server.rs"]
 mod remote_server;
 
+mod agents;
 mod connect;
 mod connect_app;
 mod domain_members;
