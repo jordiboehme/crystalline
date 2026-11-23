@@ -2655,6 +2655,14 @@ impl Engine {
         current: Option<&str>,
         incoming: &str,
     ) -> Result<String> {
+        // A page key written twice reads as either value to one reader and
+        // as no frontmatter to another: it is never written.
+        if let Some(key) = r::repeated_page_keys(incoming).first() {
+            return Err(EngineError::Invalid(format!(
+                "{key} is written more than once in the frontmatter of '{}'; write it once",
+                p.path
+            )));
+        }
         let sent = r::page_key_values(incoming);
         let stored = current.map(r::page_key_values).unwrap_or_default();
         if sent.is_empty() && stored.is_empty() {

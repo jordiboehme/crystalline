@@ -79,14 +79,23 @@ pub fn page_pact_path(page: &str) -> String {
     format!("{stem}{PAGE_PACT_SUFFIX}")
 }
 
+/// `path` without its [`PAGE_PACT_SUFFIX`], matched with ASCII case folded
+/// as `PACT.md` is: on a case-folding filesystem `a.Pact.md` is the same
+/// file as `a.pact.md`, so it is the same pact (and needs the same right).
+pub(crate) fn strip_pact_suffix(path: &str) -> Option<&str> {
+    let at = path.len().checked_sub(PAGE_PACT_SUFFIX.len())?;
+    (path.is_char_boundary(at) && path[at..].eq_ignore_ascii_case(PAGE_PACT_SUFFIX))
+        .then(|| &path[..at])
+}
+
 /// The page whose page pact `path` would be, when `path` ends in
-/// [`PAGE_PACT_SUFFIX`] and that page could be a page: a valid reflection
-/// path that is neither `PACT.md` (which has no page pact) nor a pact file
-/// itself. Whether the page exists is not asked.
+/// [`PAGE_PACT_SUFFIX`] (in any letter case) and that page could be a page:
+/// a valid reflection path that is neither `PACT.md` (which has no page
+/// pact) nor a pact file itself. Whether the page exists is not asked.
 pub fn pact_page_of(path: &str) -> Option<String> {
-    let stem = path.strip_suffix(PAGE_PACT_SUFFIX)?;
+    let stem = strip_pact_suffix(path)?;
     let of = format!("{stem}.md");
-    if of.ends_with(PAGE_PACT_SUFFIX) || of.eq_ignore_ascii_case(PACT_FILE) {
+    if strip_pact_suffix(&of).is_some() || of.eq_ignore_ascii_case(PACT_FILE) {
         return None;
     }
     validate_reflection_path(&of).is_ok().then_some(of)
@@ -385,7 +394,7 @@ fn follows_target(target: &str) -> Result<(), &'static str> {
     }
     let a_page = validate_reflection_path(target).is_ok()
         && !target.eq_ignore_ascii_case(PACT_FILE)
-        && !target.ends_with(PAGE_PACT_SUFFIX)
+        && strip_pact_suffix(target).is_none()
         && !super::layout::is_under_reflections(target);
     if a_page { Ok(()) } else { Err(FOLLOWS_NO_PAGE) }
 }
@@ -409,18 +418,45 @@ fn folder_parent(page: &str, pages: &BTreeMap<String, PageLinks>) -> Option<Stri
 pub const PAGE_KEYS: [&str; 3] = [FRESHNESS_KEY, FOLLOWS_KEY, STATUS_KEY];
 
 /// The [`PAGE_KEYS`] `source`'s frontmatter holds, with their values as
-/// parsed (a key with no value is there with `Null`). Empty when there is no
-/// frontmatter or it is no mapping.
+/// parsed (a key with no value is there with `Null`). Read key block by key
+/// block, so a frontmatter that is no valid mapping as a whole (a key written
+/// twice somewhere else) still shows the page keys it holds; a page key
+/// written twice keeps its first value here, and [`repeated_page_keys`]
+/// names it. Empty when there is no frontmatter; a frontmatter that cannot
+/// be cut key by key is read whole.
 pub fn page_key_values(source: &str) -> BTreeMap<&'static str, serde_yaml_ng::Value> {
     let Some(parts) = split_frontmatter(source) else {
         return BTreeMap::new();
     };
-    let Ok(serde_yaml_ng::Value::Mapping(map)) = serde_yaml_ng::from_str(parts.yaml) else {
-        return BTreeMap::new();
+    let Some(cut) = crate::frontmatter::key_blocks(parts.yaml) else {
+        let Ok(serde_yaml_ng::Value::Mapping(map)) = serde_yaml_ng::from_str(parts.yaml) else {
+            return BTreeMap::new();
+        };
+        return PAGE_KEYS
+            .iter()
+            .filter_map(|key| map.get(*key).map(|value| (*key, value.clone())))
+            .collect();
+    };
+    let mut values = BTreeMap::new();
+    for block in &cut.blocks {
+        if let Some(key) = PAGE_KEYS.iter().find(|key| **key == block.key) {
+            values.entry(*key).or_insert_with(|| block.value.clone());
+        }
+    }
+    values
+}
+
+/// The [`PAGE_KEYS`] `source`'s frontmatter writes more than once.
+pub fn repeated_page_keys(source: &str) -> Vec<&'static str> {
+    let Some(cut) =
+        split_frontmatter(source).and_then(|parts| crate::frontmatter::key_blocks(parts.yaml))
+    else {
+        return Vec::new();
     };
     PAGE_KEYS
         .iter()
-        .filter_map(|key| map.get(*key).map(|value| (*key, value.clone())))
+        .filter(|key| cut.blocks.iter().filter(|b| b.key == **key).count() > 1)
+        .copied()
         .collect()
 }
 
@@ -700,11 +736,26 @@ mod tests {
             ReflectionFile::Page("guides/pact.md".into()),
             "a page named pact is no page pact"
         );
+        // The suffix in another letter case is the same file on a
+        // case-folding disk, so it is the pact; the path rules refuse the
+        // spelling.
+        for spelled in ["a.Pact.md", "guides/A.PACT.MD", "a.pact.MD"] {
+            assert!(
+                matches!(classify(spelled), ReflectionFile::PagePact { .. }),
+                "{spelled}"
+            );
+            assert!(is_pact_file(spelled), "{spelled}");
+            let err = crate::reflection::validate_reflection_path(spelled).unwrap_err();
+            assert!(
+                err.contains("spell it") || err.contains("must end in .md"),
+                "{spelled}: {err}"
+            );
+        }
         assert_eq!(
-            classify("a.Pact.md"),
-            ReflectionFile::Page("a.Pact.md".into()),
-            "the suffix is matched as spelled, as the threads suffix is"
+            pact_page_of("guides/A.PACT.MD").as_deref(),
+            Some("guides/A.md")
         );
+        assert_eq!(pact_page_of("a.Pact.pact.md"), None);
         for stray in [
             "PACT.pact.md",
             "a.pact.pact.md",
@@ -1232,5 +1283,17 @@ mod tests {
             );
         }
         assert!(follows_refusal("a.md", &serde_yaml_ng::Value::Bool(true), &all).is_some());
+    }
+
+    /// A page key is read even when the frontmatter as a whole is no valid
+    /// mapping (a key written twice), and a page key written twice is named.
+    #[test]
+    fn page_keys_are_read_block_by_block() {
+        let text = "---\ntitle: A\ntitle: B\nfreshness: 1h\n---\n\n# A\n";
+        assert_eq!(page_key_values(text)[FRESHNESS_KEY].as_str(), Some("1h"));
+        assert!(repeated_page_keys(text).is_empty());
+        let twice = "---\nstatus: current\nstatus: archived\n---\n# A\n";
+        assert_eq!(page_key_values(twice)[STATUS_KEY].as_str(), Some("current"));
+        assert_eq!(repeated_page_keys(twice), [STATUS_KEY]);
     }
 }

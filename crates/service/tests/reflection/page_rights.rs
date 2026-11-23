@@ -604,3 +604,58 @@ async fn a_page_is_deleted_with_its_pact_and_only_by_a_curator() {
             .is_err()
     );
 }
+
+/// A page pact spelled in another letter case is the same file on a
+/// case-folding disk: an editor neither writes, opens nor deletes it under
+/// that spelling.
+#[tokio::test]
+async fn a_page_pact_in_another_letter_case_is_still_the_curators() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/a.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/a.pact.md", PACT, &curator).await.unwrap();
+    let pact = file(&fx, "guides/a.pact.md");
+    for spelled in ["guides/a.Pact.md", "guides/a.PACT.md", "guides/A.PACT.MD"] {
+        let err = put_err(&fx, spelled, "# Mine\n", &ann).await;
+        assert!(
+            err.contains("curate is needed") || err.contains("spell it"),
+            "{spelled}: {err}"
+        );
+        assert!(
+            fx.engine
+                .require_reflection_edit("eng", spelled, &ann)
+                .await
+                .is_err(),
+            "{spelled}: the room"
+        );
+        let err = fx
+            .engine
+            .delete_reflection("eng", spelled, &ann)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("curate is needed") || err.contains("spell it"),
+            "{spelled}: {err}"
+        );
+    }
+    assert_eq!(file(&fx, "guides/a.pact.md"), pact, "untouched");
+}
+
+/// A frontmatter that is no valid mapping as a whole (a key written twice)
+/// does not hide the page keys from the gate, and a page key written twice
+/// is refused.
+#[tokio::test]
+async fn a_duplicate_key_does_not_hide_the_settings_from_the_gate() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    let planted = "---\ntitle: A\ntitle: B\nfreshness: 1h\n---\n\n# A\n";
+    let err = put_err(&fx, "guides/n.md", planted, &ann).await;
+    assert!(err.contains("freshness") && err.contains("curate"), "{err}");
+    put(&fx, "guides/a.md", PAGE, &curator).await.unwrap();
+    let err = put_err(&fx, "guides/a.md", planted, &ann).await;
+    assert!(err.contains("freshness") && err.contains("curate"), "{err}");
+    let twice = "---\nstatus: current\nstatus: archived\n---\n\n# A\n";
+    for who in [&ann, &curator] {
+        let err = put_err(&fx, "guides/a.md", twice, who).await;
+        assert!(err.contains("more than once"), "{err}");
+    }
+}

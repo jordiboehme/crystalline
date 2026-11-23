@@ -2,7 +2,7 @@
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
-use super::page::{PAGE_PACT_SUFFIX, pact_page_of};
+use super::page::{PAGE_PACT_SUFFIX, pact_page_of, strip_pact_suffix};
 use crate::parse::{body_lines, parse_heading};
 
 /// The folder under a domain root that holds the Reflection.
@@ -99,7 +99,14 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
     if is_pact(path) && path != PACT_FILE {
         return Err(format!("'{path}' names the pact; spell it {PACT_FILE}"));
     }
-    if path.ends_with(PAGE_PACT_SUFFIX) && pact_page_of(path).is_none() {
+    if let Some(stem) = strip_pact_suffix(path) {
+        if !path.ends_with(PAGE_PACT_SUFFIX) {
+            return Err(format!(
+                "'{path}' names a page pact; spell it {stem}{PAGE_PACT_SUFFIX}"
+            ));
+        }
+    }
+    if strip_pact_suffix(path).is_some() && pact_page_of(path).is_none() {
         return Err(format!(
             "'{path}' ends in {PAGE_PACT_SUFFIX}, which holds a page's pact, and names no page that could have one"
         ));
@@ -205,9 +212,14 @@ pub fn classify(path: &str) -> ReflectionFile {
             None => ReflectionFile::Other,
         };
     }
-    if path.ends_with(PAGE_PACT_SUFFIX) {
+    // The suffix in any letter case, as the pact's name: a spelling the
+    // path rules refuse (`a.Pact.md`) still names the pact on a case-folding
+    // disk, so every gate that asks is told it is one.
+    if strip_pact_suffix(path).is_some() {
         return match pact_page_of(path) {
-            Some(of) if validate_reflection_path(path).is_ok() => ReflectionFile::PagePact { of },
+            Some(of) if validate_reflection_path(&super::page::page_pact_path(&of)).is_ok() => {
+                ReflectionFile::PagePact { of }
+            }
             _ => ReflectionFile::Other,
         };
     }
