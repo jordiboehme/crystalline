@@ -17,6 +17,7 @@ pub mod layout;
 pub mod links;
 pub mod page;
 pub mod provenance;
+pub mod reconcile;
 pub mod sections;
 pub mod state;
 
@@ -57,6 +58,9 @@ pub use provenance::{
     PAGE_RECORD_KEY, PROVENANCE_KEY, PageRecord, Provenance, Retirement, SectionRecord, SourceName,
     SourceRef, block_as_written, parse_source_name, provenance_unreadable, read_provenance,
     respell_source_domains, source_domains_named, text_changed, title_of, write_provenance,
+};
+pub use reconcile::{
+    owned_pages, owner_refusal, pact_hash, pact_hashes, page_pact_hash, rewrite_owner,
 };
 pub use sections::{
     Section, SectionKeyMiss, TOP_SECTION, WrittenIds, assign_ids, drop_written_ids, edit_section,
