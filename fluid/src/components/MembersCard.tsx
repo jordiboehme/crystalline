@@ -15,6 +15,10 @@
  * things it already has - `owner` and the caller's own row in `members`, both
  * off the one read every render makes anyway, and the admin flag off
  * `/auth/me` - rather than hand-writing a `my_level` shape or waiting for one.
+ * The one exception is `can_invite`: whether an invite link can be made
+ * here turns on an instance setting this side cannot see, so the server
+ * says it, from the same gates `POST /invites` applies.
+ *
  * Every control it draws from that derivation is still refused by the server
  * if the derivation is ever wrong, and a refusal renders in the server's own
  * words rather than vanishing the control that earned it - this card asks
@@ -72,7 +76,9 @@ import type { DomainMember, MemberLevel, ReflectionLevel } from "../api/model";
 import { useAuth } from "../auth/AuthContext";
 import { formatDay } from "../format";
 import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
+import { DomainInvites } from "./DomainInvites";
 import { GovernedMembers } from "./GovernedMembers";
+import { PeoplePicker } from "./PeoplePicker";
 import { BUTTON, FIELD, Field } from "./primitives";
 import { ReflectionCollaborators } from "./ReflectionCollaborators";
 import { ReflectionLevelSelect } from "./ReflectionLevelSelect";
@@ -122,6 +128,7 @@ export function MembersCard({ domain }: { domain: string }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [problem, setProblem] = useState<string | null>(null);
+  const [inviteFormOpen, setInviteFormOpen] = useState(false);
 
   const query = useQuery({
     queryKey: membersKey(domain),
@@ -264,6 +271,11 @@ export function MembersCard({ domain }: { domain: string }) {
   // see the constant's own doc for why that earns a different treatment
   // (disabled and explained, never simply offered and left to be refused).
   const disabledReason = capabilities.readOnly ? READ_ONLY_REASON : undefined;
+  // The server's own answer to "would POST /invites make a link here for
+  // me": false on a shared or governed domain, a read-only instance, and
+  // for a manager while the instance keeps links to admins. Absent from an
+  // older server, which reads as no.
+  const canInvite = (data as { can_invite?: boolean }).can_invite === true;
 
   return (
     <section aria-labelledby="domain-members" className="flex flex-col gap-4">
@@ -303,6 +315,7 @@ export function MembersCard({ domain }: { domain: string }) {
       ) : isPrivate ? (
         <>
           <OwnerRow
+            domain={domain}
             owner={owner}
             standing={standing}
             pending={transfer.isPending}
@@ -332,6 +345,12 @@ export function MembersCard({ domain }: { domain: string }) {
           />
           {standing.manage && (
             <InviteForm
+              domain={domain}
+              owner={owner}
+              canInvite={canInvite}
+              onInviteNew={() => {
+                setInviteFormOpen(true);
+              }}
               ownerless={owner === null}
               isAdmin={capabilities.canAdminister}
               pending={invite.isPending}
@@ -340,6 +359,15 @@ export function MembersCard({ domain }: { domain: string }) {
                 setProblem(null);
                 return invite.mutateAsync({ principal, level, reflection });
               }}
+            />
+          )}
+          {canInvite && (
+            <DomainInvites
+              domain={domain}
+              myName={user?.name ?? null}
+              formOpen={inviteFormOpen}
+              onFormOpenChange={setInviteFormOpen}
+              disabledReason={disabledReason}
             />
           )}
         </>
@@ -361,12 +389,14 @@ export function MembersCard({ domain }: { domain: string }) {
 
 /** The account that owns this domain, honestly - including when there is none. */
 function OwnerRow({
+  domain,
   owner,
   standing,
   pending,
   disabledReason,
   onTransfer,
 }: {
+  domain: string;
   owner: string | null;
   standing: MyStanding;
   pending: boolean;
@@ -393,6 +423,8 @@ function OwnerRow({
       */}
       {standing.own && (
         <TransferOwnership
+          domain={domain}
+          owner={owner}
           pending={pending}
           disabledReason={disabledReason}
           onTransfer={onTransfer}
@@ -402,12 +434,16 @@ function OwnerRow({
   );
 }
 
-/** Hand the domain to a different account, by typing its login name and confirming. */
+/** Hand the domain to a different account, found with the people picker, and confirm. */
 function TransferOwnership({
+  domain,
+  owner,
   pending,
   disabledReason,
   onTransfer,
 }: {
+  domain: string;
+  owner: string | null;
   pending: boolean;
   disabledReason?: string | undefined;
   onTransfer: (owner: string) => void;
@@ -429,17 +465,15 @@ function TransferOwnership({
           <label htmlFor={fieldId} className="sr-only">
             New owner
           </label>
-          <input
+          <PeoplePicker
             id={fieldId}
+            domain={domain}
+            owner={owner}
+            pickFor="owner"
             autoFocus
-            required
-            autoComplete="off"
-            placeholder="login name"
             value={value}
-            onChange={(event) => {
-              setValue(event.target.value);
-            }}
-            className={`w-40 ${FIELD}`}
+            onChange={setValue}
+            className={`w-48 ${FIELD}`}
           />
         </>
       )}
@@ -652,12 +686,21 @@ function MemberRow({
 
 /** Invite an account at a level, or - on an ownerless domain, for an admin - assign it a manager. */
 function InviteForm({
+  domain,
+  owner,
+  canInvite,
+  onInviteNew,
   ownerless,
   isAdmin,
   pending,
   disabledReason,
   onInvite,
 }: {
+  domain: string;
+  owner: string | null;
+  /** Whether "Invite someone new" may follow a search that found nobody. */
+  canInvite: boolean;
+  onInviteNew: () => void;
   ownerless: boolean;
   isAdmin: boolean;
   pending: boolean;
@@ -714,23 +757,32 @@ function InviteForm({
         </p>
       )}
       <Field id={nameField} label="Account">
-        <input
+        <PeoplePicker
           id={nameField}
-          required
-          autoComplete="off"
-          placeholder="login name"
+          domain={domain}
+          owner={owner}
+          pickFor="member"
           value={principal}
+          onChange={setPrincipal}
           // Read-only rather than disabled: there is no press to guard here,
           // and a native `readOnly` input refuses edits on its own while
           // staying in the tab order and announcing the reason - unlike
           // `disabled`, which would also take it out of the tab order for no
-          // reason this field needs.
+          // reason this field needs. A read-only picker does not search.
           readOnly={disabledReason !== undefined}
-          aria-describedby={disabledReason !== undefined ? reasonId : undefined}
-          onChange={(event) => {
-            setPrincipal(event.target.value);
-          }}
-          className={`w-40 ${FIELD} read-only:cursor-default read-only:opacity-50`}
+          describedBy={disabledReason !== undefined ? reasonId : undefined}
+          noMatchAction={
+            canInvite ? (
+              <button
+                type="button"
+                onClick={onInviteNew}
+                className={BUTTON.secondary}
+              >
+                Invite someone new
+              </button>
+            ) : undefined
+          }
+          className={`w-48 ${FIELD} read-only:cursor-default read-only:opacity-50`}
         />
       </Field>
       <Field id={levelField} label="Level">

@@ -264,3 +264,13 @@ export type {
   InviteState,
   InvitesResponse,
 } from "./gen";
+
+/** What opening an invite link shows, and what taking it sends and answers. */
+export type {
+  ConfirmResponse as InviteOffer,
+  RedeemBody,
+  RedeemResponse,
+} from "./gen";
+
+/** One account the people picker found, and the search answer around it. */
+export type { AccountHit, AccountSearchResponse } from "./gen";

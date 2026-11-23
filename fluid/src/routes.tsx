@@ -124,6 +124,13 @@ const UsersAdmin = lazyChunk(() => import("./screens/UsersAdmin"));
 const Profile = lazyChunk(() => import("./screens/Profile"));
 
 /**
+ * And the page an invite link opens, lazy because only a person holding a
+ * link ever sees it. It sits outside the sign-in gate: the person may have
+ * no account yet.
+ */
+const InviteRedeem = lazyChunk(() => import("./screens/InviteRedeem"));
+
+/**
  * Where a draft share-link lands. Lazy for the reason the two admin screens
  * are: almost nobody ever opens it, and the app shell is paid for by
  * everybody. It carries no editor and no graph engine of its own - a granted
@@ -377,6 +384,14 @@ export function AppRoutes() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route
+        path="/invite"
+        element={
+          <LazyBoundary fallback={null}>
+            <InviteRedeem />
+          </LazyBoundary>
+        }
+      />
       <Route element={<RequireAuth />}>
         {/*
           The look demo, full screen and so outside `Layout`. In a
