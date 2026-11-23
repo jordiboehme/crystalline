@@ -206,10 +206,12 @@ pub(crate) async fn dispatch_agent(engine: &Arc<Engine>, request: &Value, scope:
     };
     let typed = request.get("domain").and_then(Value::as_str).unwrap_or("");
     let allowed = crate::automation_ctl::AUTOMATION_COMMANDS.contains(&cmd);
+    // Debug-formatted: the values come from the client, and a newline in
+    // them must not start a log line of its own.
     tracing::info!(
-        agent = %agent,
-        command = %cmd,
-        domain = %typed,
+        agent = ?agent,
+        command = ?cmd,
+        domain = ?typed,
         refused = !allowed,
         "agent ctl call"
     );

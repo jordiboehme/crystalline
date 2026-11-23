@@ -1874,28 +1874,58 @@ impl Engine {
         run_domain: Option<&str>,
         run_loop: Option<Loop>,
     ) -> Option<crate::read_limit::Limit> {
+        let leases = self.run_leases(scope).await;
+        if let Err(e) = &leases {
+            tracing::warn!("the loop leases were not read; reading nothing: {e}");
+        }
+        self.read_limit_from_leases(leases.as_deref().ok(), marked, run_domain, run_loop)
+            .await
+    }
+
+    /// [`Engine::read_limit_for_loop`] from leases already read
+    /// ([`Engine::run_leases`]), so one call decides everything from one
+    /// snapshot; `None` is leases that could not be read, which hides every
+    /// domain and allows no write.
+    ///
+    /// The loop only ever narrows: a session bound to a loop it holds no
+    /// lease of, while it holds a lease of the other loop, still reads like
+    /// that lease's run and writes nowhere.
+    pub async fn read_limit_from_leases(
+        &self,
+        leases: Option<&[(Loop, String)]>,
+        marked: bool,
+        run_domain: Option<&str>,
+        run_loop: Option<Loop>,
+    ) -> Option<crate::read_limit::Limit> {
         let all: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
-        let leases = self.run_leases(scope).await.map(|leases| {
+        let Some(leases) = leases else {
+            return Some(crate::read_limit::Limit {
+                hidden: all.into_iter().collect(),
+                writes: Some(Vec::new()),
+            });
+        };
+        let domains_of = |only: Option<Loop>| {
             let mut domains: Vec<String> = leases
-                .into_iter()
-                .filter(|(lp, _)| run_loop.is_none_or(|only| only == *lp))
-                .map(|(_, domain)| domain)
+                .iter()
+                .filter(|(lp, _)| only.is_none_or(|only| only == *lp))
+                .map(|(_, domain)| domain.clone())
                 .collect();
+            domains.sort();
             domains.dedup();
             domains
-        });
-        let works_on = match leases {
-            Ok(domains) => domains,
-            Err(e) => {
-                tracing::warn!("the loop leases were not read; reading nothing: {e}");
-                return Some(crate::read_limit::Limit {
-                    hidden: all.into_iter().collect(),
-                    writes: Some(Vec::new()),
-                });
-            }
         };
-        if works_on.is_empty() && !marked && run_domain.is_none() {
+        let held = domains_of(None);
+        let works_on = domains_of(run_loop);
+        if held.is_empty() && !marked && run_domain.is_none() {
             return None;
+        }
+        // Bound to a loop it holds no lease of: it reads like the leases it
+        // holds and writes nowhere.
+        if works_on.is_empty() && !held.is_empty() {
+            return Some(crate::read_limit::Limit {
+                hidden: self.hidden_beside(&all, &held).await,
+                writes: Some(Vec::new()),
+            });
         }
         // What the run works on, and so may write into. Without a lease it
         // may write wherever its rights allow: what it reads every reader of
@@ -1907,9 +1937,17 @@ impl Engine {
             _ if !works_on.is_empty() => (works_on.clone(), Some(works_on)),
             _ => (all.clone(), None),
         };
+        let hidden = self.hidden_beside(&all, &targets).await;
+        Some(crate::read_limit::Limit { hidden, writes })
+    }
+
+    /// The domains of `all` a run working on `targets` may not read: those
+    /// not every reader of each target may read. Fails safe: a domain whose
+    /// readers cannot be compared is hidden.
+    async fn hidden_beside(&self, all: &[String], targets: &[String]) -> HashSet<String> {
         let mut hidden = HashSet::new();
-        for source in &all {
-            for target in &targets {
+        for source in all {
+            for target in targets {
                 if target == source {
                     continue;
                 }
@@ -1922,7 +1960,7 @@ impl Engine {
                 }
             }
         }
-        Some(crate::read_limit::Limit { hidden, writes })
+        hidden
     }
 
     /// The name this instance shows people: the label its host locks carry,

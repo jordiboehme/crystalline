@@ -1224,6 +1224,10 @@ fn header_text(ctx: &RequestContext<RoleServer>, name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The live loop leases of a request's caller, read once per call
+/// ([`McpServer::leases_of`]); `None` when they could not be read.
+type Leases = Option<Vec<(crystalline_core::automation::Loop, String)>>;
+
 /// Where an agent's call stands with its run, decided per call
 /// ([`McpServer::agent_call`]).
 enum AgentCall {
@@ -5630,20 +5634,38 @@ impl McpServer {
         }
     }
 
+    /// The live loop leases this request's caller holds, read once per call
+    /// ([`Engine::run_leases`]) so that whether an agent is inside its run,
+    /// what it may do there and the read limit all come from one snapshot.
+    /// `None` when they could not be read, which refuses an agent and hides
+    /// every domain from anybody else.
+    async fn leases_of(&self, ctx: &RequestContext<RoleServer>) -> Leases {
+        match self.engine.run_leases(&self.scope_of(ctx)).await {
+            Ok(leases) => Some(leases),
+            Err(e) => {
+                tracing::warn!("the loop leases were not read: {e}");
+                None
+            }
+        }
+    }
+
     /// The refusal of a tool call by an agent of the loops, or `None` when it
     /// may go ahead (or the caller is no agent). Outside a run only the
-    /// `skills` tool; inside one everything but what a run's prompt forbids
-    /// ([`crate::agent_gate::refused_in_run`]). Every agent tool call is
-    /// logged at INFO with the agent, the tool, the domain it names and
-    /// whether it was refused.
+    /// `skills` tool. Inside one, never what a run's prompt forbids
+    /// ([`crate::agent_gate::refused_in_run`]), and a loop's work (a write,
+    /// or `evolve_engrams` / `reflect`) only on a domain where the agent holds
+    /// a live lease of that loop ([`crate::agent_gate::loop_work`]). Every
+    /// agent tool call is logged at INFO with the agent, the tool, the domain
+    /// it names and whether it was refused.
     async fn agent_tool_refusal(
         &self,
         request: &rmcp::model::CallToolRequestParams,
         ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
     ) -> Option<String> {
         let tool = request.name.as_ref();
         let args = request.arguments.as_ref();
-        let (name, refusal) = match self.agent_call(ctx).await {
+        let (name, refusal) = match self.agent_call(ctx, leases) {
             AgentCall::NotAnAgent => return None,
             AgentCall::Refused(refusal) => (None, Some(refusal)),
             AgentCall::Outside(name) => {
@@ -5651,7 +5673,13 @@ impl McpServer {
                     .then(|| crate::agent_gate::AGENT_OUTSIDE_A_RUN.to_string());
                 (Some(name), refusal)
             }
-            AgentCall::Inside(name) => (Some(name), crate::agent_gate::refused_in_run(tool, args)),
+            AgentCall::Inside(name) => {
+                let refusal = match crate::agent_gate::refused_in_run(tool, args) {
+                    Some(refusal) => Some(refusal),
+                    None => self.agent_work_refusal(tool, args, ctx, leases).await,
+                };
+                (Some(name), refusal)
+            }
         };
         let agent = match (name, mcp_agent(ctx)) {
             (Some(name), _) | (None, Some(Scope::Agent { name, .. })) => name,
@@ -5661,20 +5689,61 @@ impl McpServer {
             .and_then(|args| args.get("domain"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        // Debug-formatted: the values come from the client, and a newline in
+        // them must not start a log line of its own.
         tracing::info!(
-            agent = %agent,
-            tool = %tool,
-            domain = %domain,
+            agent = ?agent,
+            tool = ?tool,
+            domain = ?domain,
             refused = refusal.is_some(),
             "agent tool call"
         );
         refusal
     }
 
+    /// The refusal of a loop's work by an agent inside a run, when the call
+    /// is that work ([`crate::agent_gate::loop_work`]) and the agent does not
+    /// hold a live lease of that loop on every domain it names, or its
+    /// session is bound to the other loop.
+    async fn agent_work_refusal(
+        &self,
+        tool: &str,
+        args: Option<&serde_json::Map<String, Value>>,
+        ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
+    ) -> Option<String> {
+        let (lp, domains) = crate::agent_gate::loop_work(tool, args)?;
+        if let Ok(Some(bound)) = self.bound_loop(ctx)
+            && bound != lp
+        {
+            return Some(crate::agent_gate::other_loop(tool, lp, bound));
+        }
+        if domains.is_empty() {
+            return Some(crate::agent_gate::names_no_domain(tool, lp));
+        }
+        let held = leases.as_deref().unwrap_or_default();
+        let scope = self.scope_of(ctx);
+        let hidden = match self.engine.hidden_for(&scope).await {
+            Ok(hidden) => hidden,
+            Err(e) => return Some(to_error(e).message.to_string()),
+        };
+        for typed in domains {
+            let local = self.engine.localize_visible(&typed, &hidden).await;
+            if !held.iter().any(|(l, d)| *l == lp && *d == local) {
+                return Some(crate::agent_gate::no_lease_there(tool, lp, &typed));
+            }
+        }
+        None
+    }
+
     /// The refusal of a read that is no tool call (a resource other than a
     /// skill, a prompt) by an agent of the loops outside a run of its loop.
-    async fn agent_read_refusal(&self, ctx: &RequestContext<RoleServer>) -> Result<(), ErrorData> {
-        match self.agent_call(ctx).await {
+    fn agent_read_refusal(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
+    ) -> Result<(), ErrorData> {
+        match self.agent_call(ctx, leases) {
             AgentCall::NotAnAgent | AgentCall::Inside(_) => Ok(()),
             AgentCall::Refused(refusal) => Err(ErrorData::invalid_request(refusal, None)),
             AgentCall::Outside(_) => Err(ErrorData::invalid_request(
@@ -5684,11 +5753,13 @@ impl McpServer {
         }
     }
 
-    /// Where an agent's call stands with its run: outside or inside a live
-    /// lease of the loop its session is bound to (either loop when it is
-    /// unbound). Read again on every call, never kept for the session, so a
-    /// lease released or gone stale ends what the agent may call at once.
-    async fn agent_call(&self, ctx: &RequestContext<RoleServer>) -> AgentCall {
+    /// Where an agent's call stands with its run, from this call's lease
+    /// snapshot: outside or inside a live lease of the loop its session is
+    /// bound to (either loop when it is unbound). Read again on every call,
+    /// never kept for the session, so a lease released or gone stale ends
+    /// what the agent may call at once. Which domain a loop's work may touch
+    /// is decided per call by [`McpServer::agent_work_refusal`].
+    fn agent_call(&self, ctx: &RequestContext<RoleServer>, leases: &Leases) -> AgentCall {
         let Some(Scope::Agent { name, .. }) = mcp_agent(ctx) else {
             return AgentCall::NotAnAgent;
         };
@@ -5696,29 +5767,28 @@ impl McpServer {
             Ok(bound) => bound,
             Err(refusal) => return AgentCall::Refused(refusal),
         };
-        match self.engine.run_leases(&self.scope_of(ctx)).await {
-            Ok(leases) if leases.iter().any(|(lp, _)| bound.is_none_or(|b| b == *lp)) => {
+        match leases {
+            Some(leases) if leases.iter().any(|(lp, _)| bound.is_none_or(|b| b == *lp)) => {
                 AgentCall::Inside(name)
             }
-            Ok(_) => AgentCall::Outside(name),
-            Err(e) => {
-                tracing::warn!("the loop leases of agent {name} were not read: {e}");
-                AgentCall::Refused(
-                    "The leases of this agent's runs could not be read, so this call is refused. Try again."
-                        .to_string(),
-                )
-            }
+            Some(_) => AgentCall::Outside(name),
+            None => AgentCall::Refused(
+                "The leases of this agent's runs could not be read, so this call is refused. Try again."
+                    .to_string(),
+            ),
         }
     }
 
     /// What this request may not read because its session is unattended
     /// ([`Engine::read_limit_for`]): marked by its registration, by the run
-    /// domain an HTTP run names, or by a live loop lease its caller holds.
+    /// domain or loop an HTTP run names, or by a live loop lease its caller
+    /// holds.
     async fn read_limit(
         &self,
         ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
     ) -> Option<crystalline_engine::read_limit::Limit> {
-        self.read_limit_marked(ctx).await.0
+        self.read_limit_marked(ctx, leases).await.0
     }
 
     /// [`McpServer::read_limit`], and whether the session itself said it is
@@ -5728,21 +5798,28 @@ impl McpServer {
     async fn read_limit_marked(
         &self,
         ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
     ) -> (Option<crystalline_engine::read_limit::Limit>, bool) {
-        let header = match self.transport {
-            Transport::Http => header_text(ctx, RUN_DOMAIN_HEADER),
-            Transport::Stdio => None,
+        let (header, loop_header) = match self.transport {
+            Transport::Http => (
+                header_text(ctx, RUN_DOMAIN_HEADER),
+                header_text(ctx, RUN_LOOP_HEADER),
+            ),
+            Transport::Stdio => (None, None),
         };
         let run_domain = header.as_deref().or(self.gate.run_domain.as_deref());
-        // An agent of the loops is never anybody's interactive session.
+        // Either run header marks the session, as the stdio twin does, so a
+        // header only ever narrows. An agent of the loops is never anybody's
+        // interactive session.
         let marked = self.gate.unattended
             || header.is_some()
+            || loop_header.is_some()
             || run_domain.is_some()
             || mcp_agent(ctx).is_some();
         let run_loop = self.bound_loop(ctx).ok().flatten();
         let limit = self
             .engine
-            .read_limit_for_loop(&self.scope_of(ctx), marked, run_domain, run_loop)
+            .read_limit_from_leases(leases.as_deref(), marked, run_domain, run_loop)
             .await;
         (limit, marked)
     }
@@ -5889,13 +5966,14 @@ impl ServerHandler for McpServer {
         // An agent of the loops works only during a run of its loop, and
         // inside one never calls what a run's prompt forbids. Decided first,
         // before any argument is read.
-        if let Some(refusal) = self.agent_tool_refusal(&request, &context).await {
+        let leases = self.leases_of(&context).await;
+        if let Some(refusal) = self.agent_tool_refusal(&request, &context, &leases).await {
             return refuse(refusal).map(rmcp::model::CallToolResponse::from);
         }
         // An unattended session reads only what every reader of its run's
         // domain may read (`crystalline_engine::read_limit`), for the whole
         // call, whichever tool it is.
-        let (limit, marked) = self.read_limit_marked(&context).await;
+        let (limit, marked) = self.read_limit_marked(&context, &leases).await;
         // An interactive session limited by its owner's run says so, once
         // per answer, in plain words.
         let note = if limit.is_some() && !marked {
@@ -6110,7 +6188,8 @@ impl ServerHandler for McpServer {
 
         // A limited session is onboarded to the domains it may read only:
         // the stdio block `get_info` renders names every domain.
-        if let Some(limit) = self.read_limit(&context).await {
+        let leases = self.leases_of(&context).await;
+        if let Some(limit) = self.read_limit(&context, &leases).await {
             let scope = self.scope_of(&context);
             let mut info = crystalline_engine::read_limit::within(
                 Some(limit),
@@ -6209,7 +6288,8 @@ impl ServerHandler for McpServer {
     ) -> Result<DiscoverResult, ErrorData> {
         self.engine.refresh_routing_cache().await;
         // A limited session is onboarded to the domains it may read only.
-        let limit = self.read_limit(&context).await;
+        let leases = self.leases_of(&context).await;
+        let limit = self.read_limit(&context, &leases).await;
         let info = crystalline_engine::read_limit::within(
             limit,
             self.arrival_info_scoped(&self.scope_of(&context)),
@@ -6497,12 +6577,13 @@ impl ServerHandler for McpServer {
     ) -> Result<ReadResourceResponse, ErrorData> {
         // An agent reads a skill at any time and anything else only during
         // a run of its loop.
+        let leases = self.leases_of(&context).await;
         if skill_for_uri(&request.uri).is_none() {
-            self.agent_read_refusal(&context).await?;
+            self.agent_read_refusal(&context, &leases)?;
         }
         // An engram's attachment is engram content: an unattended session
         // reads it within its read limit, as it does every tool.
-        let limit = self.read_limit(&context).await;
+        let limit = self.read_limit(&context, &leases).await;
         crystalline_engine::engine::as_mcp_call(crystalline_engine::read_limit::within(
             limit,
             self.read_resource_limited(request, context),
@@ -6534,11 +6615,13 @@ impl ServerHandler for McpServer {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        // The onboarding prompt carries the routing block: an agent gets it
-        // only during a run, and a limited session is shown the domains it
-        // may read only.
-        self.agent_read_refusal(&context).await?;
-        let limit = self.read_limit(&context).await;
+        // A prompt is an instruction to act on the domains, and an agent
+        // acts only during a run: outside one it has the handshake's routing
+        // block (cut to what every reader may read) and its skills, and no
+        // prompt. A limited session is shown the domains it may read only.
+        let leases = self.leases_of(&context).await;
+        self.agent_read_refusal(&context, &leases)?;
+        let limit = self.read_limit(&context, &leases).await;
         crystalline_engine::read_limit::within(
             limit,
             Self::prompt_router().get_prompt(PromptContext::new(

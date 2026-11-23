@@ -441,6 +441,8 @@ pub(crate) enum Bearer {
     /// (only during a run), the ctl route serves it the automation verbs
     /// alone.
     Agent {
+        /// The agent's name, as its scope carries it.
+        name: String,
         /// The agent's scope.
         scope: Scope,
     },
@@ -483,6 +485,7 @@ pub(crate) async fn resolve_bearer(
         return match auth.agent_for_token(token).await {
             Ok(Some(agent)) => Bearer::Agent {
                 scope: agent.scope(),
+                name: agent.name,
             },
             Ok(None) => Bearer::Refused(refusal(challenge())),
             Err(error) => {
@@ -564,12 +567,9 @@ where
                     Bearer::Account(identity) => (identity, None),
                     // An agent passes the door under its key; what it may call
                     // is decided per call by the MCP server (only during a run).
-                    Bearer::Agent { scope, .. } => {
-                        let Scope::Agent { name, .. } = &scope else {
-                            unreachable!("an agent token resolves to an agent's scope")
-                        };
+                    Bearer::Agent { name, scope } => {
                         let identity = McpIdentity {
-                            name: crate::scope::agent_key(name),
+                            name: crate::scope::agent_key(&name),
                             admin: false,
                         };
                         (identity, Some(McpAgent { scope }))
@@ -761,7 +761,10 @@ mod tests {
         };
         let headers = request_with(Some(&format!("Bearer {}", issued.token)));
         match resolve_bearer(&store, None, headers.headers()).await {
-            Bearer::Agent { scope } => assert_eq!(scope, expected),
+            Bearer::Agent { name, scope } => {
+                assert_eq!(name, "nightly");
+                assert_eq!(scope, expected);
+            }
             _ => panic!("a live agent token resolves to the agent"),
         }
 

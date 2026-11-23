@@ -64,6 +64,91 @@ pub(crate) fn refused_in_run(tool: &str, args: Option<&Map<String, Value>>) -> O
     None
 }
 
+/// The work of one loop a tool call does, and the domains it does it on, as
+/// the arguments name them: `None` for a call that is no loop's work (a
+/// read). An engram write is evolve's work (`write_engram`, `edit_engram`,
+/// `move_engram` with both ends, `split_engram`, `delete_engram`), and so is
+/// `evolve_engrams`; a Reflection write is reflect's (`write_reflection`,
+/// `discuss`), and so is `reflect`. An agent may do it only on a domain
+/// where it holds a live lease of that loop. An empty list is a call that
+/// names no domain, which an agent may not make.
+pub(crate) fn loop_work(
+    tool: &str,
+    args: Option<&Map<String, Value>>,
+) -> Option<(Loop, Vec<String>)> {
+    let lp = match tool {
+        "write_engram"
+        | "edit_engram"
+        | "move_engram"
+        | "split_engram"
+        | "delete_engram"
+        | crate::EVOLVE_TOOL_NAME => Loop::Evolve,
+        "write_reflection" | "discuss" | "reflect" => Loop::Reflect,
+        _ => return None,
+    };
+    let text = |key: &str| {
+        args.and_then(|a| a.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+    };
+    let mut domains: Vec<String> = Vec::new();
+    match tool {
+        crate::EVOLVE_TOOL_NAME | "reflect" => {
+            if let Some(list) = args
+                .and_then(|a| a.get("domains"))
+                .and_then(Value::as_array)
+            {
+                for item in list {
+                    match item.as_str().map(str::trim).filter(|d| !d.is_empty()) {
+                        Some(d) => domains.push(d.to_string()),
+                        // A name that is no name: the call names no domain
+                        // an agent may work on.
+                        None => return Some((lp, Vec::new())),
+                    }
+                }
+            }
+        }
+        _ => {
+            domains.extend(text("domain"));
+            if tool == "move_engram"
+                && let Some(other) = text("destination_domain")
+            {
+                if domains.is_empty() {
+                    return Some((lp, Vec::new()));
+                }
+                domains.push(other);
+            }
+        }
+    }
+    domains.dedup();
+    Some((lp, domains))
+}
+
+/// What an agent is told when a call of one loop's work names no domain.
+pub(crate) fn names_no_domain(tool: &str, lp: Loop) -> String {
+    format!(
+        "An agent names the domain of its run: {tool} is {lp} work, and it may do it only on a domain where it holds the {lp} lease. Pass that domain."
+    )
+}
+
+/// What an agent is told when it does one loop's work on a domain where it
+/// holds no live lease of that loop.
+pub(crate) fn no_lease_there(tool: &str, lp: Loop, domain: &str) -> String {
+    format!(
+        "An agent does a loop's work only during that loop's run on that domain: {tool} is {lp} work, and this agent holds no live {lp} lease on '{domain}'. Its runner takes that lease first, when the {lp} loop is due there."
+    )
+}
+
+/// What an agent is told when its session is bound to one loop and it calls
+/// the other loop's work.
+pub(crate) fn other_loop(tool: &str, lp: Loop, bound: Loop) -> String {
+    format!(
+        "This session is bound to the {bound} loop, and {tool} is {lp} work. Do it in a session of the {lp} run."
+    )
+}
+
 /// The loop an agent's session is bound to, from the run-loop header it sent
 /// (`named`, the header's text) and the loops it runs:
 ///
@@ -191,6 +276,69 @@ mod tests {
             AGENT_OUTSIDE_A_RUN,
             AGENT_READS_ONLY_IN_A_RUN,
             AGENT_CTL_AUTOMATION_ONLY,
+        ] {
+            assert!(!sentence.contains('\u{2014}') && !sentence.contains('\u{2013}'));
+        }
+    }
+
+    #[test]
+    fn a_write_or_a_loop_tool_is_the_work_of_one_loop_on_the_domains_it_names() {
+        let a = |v: Value| args(v);
+        assert_eq!(
+            loop_work("write_engram", Some(&a(json!({"domain": "eng"})))),
+            Some((Loop::Evolve, vec!["eng".to_string()]))
+        );
+        assert_eq!(
+            loop_work(
+                "move_engram",
+                Some(&a(json!({"domain": "eng", "destination_domain": "ops"})))
+            ),
+            Some((Loop::Evolve, vec!["eng".to_string(), "ops".to_string()]))
+        );
+        assert_eq!(
+            loop_work("write_reflection", Some(&a(json!({"domain": "eng"})))),
+            Some((Loop::Reflect, vec!["eng".to_string()]))
+        );
+        assert_eq!(
+            loop_work("discuss", Some(&a(json!({"domain": " eng "})))),
+            Some((Loop::Reflect, vec!["eng".to_string()]))
+        );
+        assert_eq!(
+            loop_work("reflect", Some(&a(json!({"domains": ["eng", "ops"]})))),
+            Some((Loop::Reflect, vec!["eng".to_string(), "ops".to_string()]))
+        );
+        assert_eq!(
+            loop_work(crate::EVOLVE_TOOL_NAME, Some(&a(json!({})))),
+            Some((Loop::Evolve, Vec::new()))
+        );
+        assert_eq!(
+            loop_work(
+                crate::EVOLVE_TOOL_NAME,
+                Some(&a(json!({"domains": ["eng", ""]})))
+            ),
+            Some((Loop::Evolve, Vec::new()))
+        );
+        assert_eq!(
+            loop_work("write_engram", None),
+            Some((Loop::Evolve, Vec::new()))
+        );
+        for read in [
+            "read_engram",
+            "search_engrams",
+            "read_reflection",
+            "skills",
+            "build_context",
+        ] {
+            assert_eq!(
+                loop_work(read, Some(&a(json!({"domain": "eng"})))),
+                None,
+                "{read}"
+            );
+        }
+        for sentence in [
+            names_no_domain("write_engram", Loop::Evolve),
+            no_lease_there("write_engram", Loop::Evolve, "eng"),
+            other_loop("write_engram", Loop::Evolve, Loop::Reflect),
         ] {
             assert!(!sentence.contains('\u{2014}') && !sentence.contains('\u{2013}'));
         }

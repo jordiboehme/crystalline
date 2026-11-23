@@ -35,8 +35,14 @@ async fn agent(server: &RemoteServer, name: &str, loops: AgentLoops) -> String {
 /// Give `open` work for both loops: a mechanical evolve finding (V103) and a
 /// Reflection thread waiting for the agent.
 async fn work_for_both_loops(server: &RemoteServer) {
+    evolve_work(server, "open").await;
+    reflect_work(server, "open").await;
+}
+
+/// Give `domain` a mechanical evolve finding (V103), so evolve is due there.
+async fn evolve_work(server: &RemoteServer, domain: &str) {
     std::fs::write(
-        server.file("open", "summary-doc.md"),
+        server.file(domain, "summary-doc.md"),
         engram(
             "Summary doc",
             "summary-doc",
@@ -45,7 +51,7 @@ async fn work_for_both_loops(server: &RemoteServer) {
     )
     .unwrap();
     std::fs::write(
-        server.file("open", "full-text-doc.md"),
+        server.file(domain, "full-text-doc.md"),
         engram(
             "Full text doc",
             "full-text-doc",
@@ -53,7 +59,13 @@ async fn work_for_both_loops(server: &RemoteServer) {
         ),
     )
     .unwrap();
-    let manifest = server.file("open", "MANIFEST.md");
+    server.engine.sync(None).await.unwrap();
+}
+
+/// Turn `domain`'s Reflection on with a page and a thread waiting for the
+/// agent, so reflect is due there.
+async fn reflect_work(server: &RemoteServer, domain: &str) {
+    let manifest = server.file(domain, "MANIFEST.md");
     let text = std::fs::read_to_string(&manifest).unwrap();
     std::fs::write(
         &manifest,
@@ -65,7 +77,7 @@ async fn work_for_both_loops(server: &RemoteServer) {
         .engine
         .write_reflection(
             &WriteReflectionParams {
-                domain: "open".into(),
+                domain: domain.into(),
                 path: "d.md".into(),
                 markdown: Some(PAGE.into()),
                 ..Default::default()
@@ -78,7 +90,7 @@ async fn work_for_both_loops(server: &RemoteServer) {
         .engine
         .discuss(
             &DiscussParams {
-                domain: "open".into(),
+                domain: domain.into(),
                 action: Some("open".into()),
                 path: Some("d.md".into()),
                 section: Some("aaaa1111".into()),
@@ -94,10 +106,15 @@ async fn work_for_both_loops(server: &RemoteServer) {
 /// Take the lease of `lp` on `open` with the agent token `token`, over the
 /// ctl route as a runner does: the lease token.
 async fn take(server: &RemoteServer, token: &str, lp: &str) -> String {
+    take_on(server, token, lp, "open").await
+}
+
+/// [`take`] on `domain`.
+async fn take_on(server: &RemoteServer, token: &str, lp: &str, domain: &str) -> String {
     let (code, reply) = server
         .ctl(
             Some(token),
-            json!({ "v": 1, "cmd": "automation_lease_take", "loop": lp, "domain": "open", "runner": "cron" }),
+            json!({ "v": 1, "cmd": "automation_lease_take", "loop": lp, "domain": domain, "runner": "cron" }),
         )
         .await;
     assert_eq!(code, 200, "{reply}");
@@ -594,9 +611,9 @@ async fn every_agent_call_is_logged_with_the_agent_the_tool_and_the_domain() {
     assert_eq!(calls.len(), 2, "{lines:#?}");
     for (line, refused) in calls.iter().zip([true, false]) {
         assert!(
-            line.contains("agent=writer")
-                && line.contains("tool=read_engram")
-                && line.contains("domain=open")
+            line.contains("agent=\"writer\"")
+                && line.contains("tool=\"read_engram\"")
+                && line.contains("domain=\"open\"")
                 && line.contains(&format!("refused={refused}")),
             "{line}"
         );
@@ -604,9 +621,281 @@ async fn every_agent_call_is_logged_with_the_agent_the_tool_and_the_domain() {
     assert!(
         lines.iter().any(|l| l.starts_with("INFO")
             && l.contains("agent ctl call")
-            && l.contains("agent=writer")
-            && l.contains("command=automation_lease_take")
-            && l.contains("domain=open")),
+            && l.contains("agent=\"writer\"")
+            && l.contains("command=\"automation_lease_take\"")
+            && l.contains("domain=\"open\"")),
         "{lines:#?}"
     );
+}
+
+/// **A loop's work needs that loop's lease on that domain** (Important 1 of
+/// the review, the controller's ruling). An agent with both loops and no
+/// header is refused, with a sentence that says why:
+/// (a) a Reflection write while it holds only the evolve lease;
+/// (b) an engram write while it holds only the reflect lease;
+/// (c) an engram write on B while it holds evolve on A and reflect on B.
+/// Nothing is written, and the lease it holds notes nothing.
+#[tokio::test]
+async fn a_loops_work_needs_that_loops_lease_on_that_domain() {
+    let server = RemoteServer::start_with(Options::TOKENS, &["beta"]).await;
+    let nightly = agent(&server, "nightly", AgentLoops::Both).await;
+    evolve_work(&server, "open").await;
+    reflect_work(&server, "open").await;
+    reflect_work(&server, "beta").await;
+
+    // (a) only the evolve lease on open.
+    let evolve = take_on(&server, &nightly, "evolve", "open").await;
+    let refused = call(
+        &server,
+        &nightly,
+        "write_reflection",
+        json!({ "domain": "open", "action": "write_asset", "path": "assets/flow.svg", "content": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>" }),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("write_reflection is reflect work")
+            && refused.contains("no live reflect lease on 'open'"),
+        "{refused}"
+    );
+    assert!(!server.file("open", "reflections/assets/flow.svg").exists());
+    let refused = call(
+        &server,
+        &nightly,
+        "discuss",
+        json!({ "domain": "open", "action": "list" }),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("no live reflect lease on 'open'"),
+        "{refused}"
+    );
+    assert!(noted(&server, "evolve").await.is_empty());
+    let (_, released) = server
+        .ctl(
+            Some(&nightly),
+            json!({ "v": 1, "cmd": "automation_lease_release", "loop": "evolve", "domain": "open", "token": evolve }),
+        )
+        .await;
+    assert_eq!(released["ok"], true, "{released}");
+
+    // (b) only the reflect lease on open: evolve's work skips no rule.
+    take_on(&server, &nightly, "reflect", "open").await;
+    let refused = call(
+        &server,
+        &nightly,
+        "write_engram",
+        json!({ "domain": "open", "title": "Reflect Fix", "content": "- [fact] no" }),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("write_engram is evolve work")
+            && refused.contains("no live evolve lease on 'open'"),
+        "{refused}"
+    );
+    assert!(!server.file("open", "reflect-fix.md").exists());
+    let refused = call(
+        &server,
+        &nightly,
+        "evolve_engrams",
+        json!({ "domains": ["open"] }),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("no live evolve lease on 'open'"),
+        "{refused}"
+    );
+    assert!(noted(&server, "reflect").await.is_empty());
+
+    // (c) evolve on beta's neighbour and reflect on beta: no engram write on
+    // beta. Beta has no evolve work, so evolve is taken on open.
+    evolve_work(&server, "open").await;
+    take_on(&server, &nightly, "evolve", "open").await;
+    take_on(&server, &nightly, "reflect", "beta").await;
+    let refused = call(
+        &server,
+        &nightly,
+        "write_engram",
+        json!({ "domain": "beta", "title": "Beta Fix", "content": "- [fact] no" }),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("no live evolve lease on 'beta'"),
+        "{refused}"
+    );
+    assert!(!server.file("beta", "beta-fix.md").exists());
+    // On the domain it holds evolve on, the same write goes through.
+    call(
+        &server,
+        &nightly,
+        "write_engram",
+        json!({ "domain": "open", "title": "Open Fix", "content": "- [fact] fixed" }),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(noted(&server, "evolve").await, ["open-fix.md"]);
+}
+
+/// **A lease on one domain opens no work on another** of the same loop: an
+/// evolve lease on `open` refuses an engram write, an edit and an
+/// `evolve_engrams` sweep naming `beta`, and a sweep that names no domain.
+/// A read of `beta` is a read, within the run's read limit.
+#[tokio::test]
+async fn a_lease_on_one_domain_opens_no_work_on_another() {
+    let server = RemoteServer::start_with(Options::TOKENS, &["beta"]).await;
+    let writer = agent(&server, "writer", AgentLoops::Evolve).await;
+    evolve_work(&server, "open").await;
+    take(&server, &writer, "evolve").await;
+    for (tool, args) in [
+        (
+            "write_engram",
+            json!({ "domain": "beta", "title": "Beta Fix", "content": "- [fact] no" }),
+        ),
+        (
+            "edit_engram",
+            json!({ "domain": "beta", "identifier": "beta-note", "operation": "append", "content": "- [fact] no" }),
+        ),
+        ("evolve_engrams", json!({ "domains": ["beta"] })),
+    ] {
+        let refused = call(&server, &writer, tool, args, None).await.unwrap_err();
+        assert!(
+            refused.contains("no live evolve lease on 'beta'"),
+            "{tool}: {refused}"
+        );
+    }
+    let refused = call(&server, &writer, "evolve_engrams", json!({}), None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("An agent names the domain of its run"),
+        "{refused}"
+    );
+    assert!(server.file("open", "open-note.md").exists());
+    assert!(
+        call(
+            &server,
+            &writer,
+            "evolve_engrams",
+            json!({ "domains": ["open"] }),
+            None
+        )
+        .await
+        .is_ok()
+    );
+    let read = call(
+        &server,
+        &writer,
+        "read_engram",
+        json!({ "domain": "beta", "identifier": "beta-note" }),
+        None,
+    )
+    .await;
+    assert!(read.is_ok(), "{read:?}");
+}
+
+/// **The ungated lists show an agent outside a run no knowledge**: the
+/// resource list holds the skills, the templates are the two address
+/// shapes, the prompt list names prompts. No engram name or content, no
+/// domain, no Reflection page.
+#[tokio::test]
+async fn the_lists_an_agent_reaches_outside_a_run_hold_no_knowledge() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let token = agent(&server, "writer", AgentLoops::Evolve).await;
+    for method in ["resources/list", "resources/templates/list", "prompts/list"] {
+        let raw = mcp(&server, method, json!({}), &token, None).await;
+        let answer = payload(&raw);
+        assert!(answer["result"].is_object(), "{method}: {answer}");
+        let text = answer["result"].to_string();
+        for knowledge in [
+            "open-note",
+            "vent",
+            "lab-note",
+            "Open Note",
+            "\"lab\"",
+            "platform",
+        ] {
+            assert!(
+                !text.contains(knowledge),
+                "{method} shows {knowledge}: {text}"
+            );
+        }
+    }
+    let resources = payload(&mcp(&server, "resources/list", json!({}), &token, None).await);
+    assert!(
+        resources["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["uri"].as_str().is_some_and(|u| u.starts_with("skill://"))),
+        "{resources}"
+    );
+}
+
+/// **For an account the run-loop header only ever narrows** (Important 2 of
+/// the review). An account holding only an evolve lease on `open` is limited
+/// to that run (writes into `open`, no private `lab`); with
+/// `X-Crystalline-Run-Loop: reflect` it holds no lease of its loop, so it
+/// still reads like its run and writes nowhere, where before the fix it had
+/// no limit at all.
+#[tokio::test]
+async fn for_an_account_the_loop_header_only_narrows() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let keeper = Scope::User {
+        account: "keeper".into(),
+        admin: false,
+    };
+    server
+        .engine
+        .automation_lease_take(
+            crystalline_core::automation::Loop::Evolve,
+            "open",
+            "k8s",
+            &keeper,
+        )
+        .await
+        .unwrap();
+    let token = server.token_for("keeper").await;
+    let listed = |run_loop: Option<&'static str>| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            call(server, &token, "list_domains", json!({}), run_loop)
+                .await
+                .unwrap()
+        }
+    };
+    for run_loop in [None, Some("evolve"), Some("reflect")] {
+        let listed = listed(run_loop).await;
+        assert!(listed.contains("\"open\""), "{run_loop:?}: {listed}");
+        assert!(!listed.contains("\"lab\""), "{run_loop:?}: {listed}");
+    }
+    let refused = call(
+        &server,
+        &token,
+        "write_engram",
+        json!({ "domain": "open", "title": "Reflect Bound", "content": "- [fact] no" }),
+        Some("reflect"),
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(!server.file("open", "reflect-bound.md").exists());
+    call(
+        &server,
+        &token,
+        "write_engram",
+        json!({ "domain": "open", "title": "Evolve Bound", "content": "- [fact] yes" }),
+        Some("evolve"),
+    )
+    .await
+    .unwrap();
 }
