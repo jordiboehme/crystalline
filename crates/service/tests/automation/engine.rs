@@ -1302,6 +1302,9 @@ async fn an_agent_takes_a_lease_only_for_its_own_loops() {
     use crystalline_service::rest::AgentLoops;
     let fx = reflecting().await;
     open_thread(&fx, "aaaa1111", "Still true?").await;
+    // Evolve has work too: an agent takes no lease where nothing is due.
+    write_summary_pair(&fx.root);
+    fx.engine.sync(None).await.unwrap();
     with_agents(&fx).await;
 
     let curator = agent_scope("curator", AgentLoops::Reflect);
@@ -1506,11 +1509,23 @@ async fn an_agent_sees_the_loops_as_the_machines_run_does() {
                 .map(|a| by_domain(&a))
                 .map_err(|e| e.to_string());
             assert_eq!(agent, machine, "{lp} on {domain}");
+            let due = machine
+                .as_ref()
+                .is_ok_and(|rows| rows.iter().all(|(_, due, _)| due == true));
             // The take: the agent's first, released again, then the
-            // machine's, with the same answer.
+            // machine's, with the same answer, except that an agent takes
+            // no lease where nothing is due.
             let agent = take_and_release(&fx.engine, lp, domain, &nightly).await;
             let machine = take_and_release(&fx.engine, lp, domain, &Scope::Unrestricted).await;
-            assert_eq!(agent, machine, "{lp} on {domain}");
+            if machine.is_ok() && !due {
+                let refused = agent.unwrap_err();
+                assert!(
+                    refused.contains("Nothing is due"),
+                    "{lp} on {domain}: {refused}"
+                );
+            } else {
+                assert_eq!(agent, machine, "{lp} on {domain}");
+            }
         }
     }
 }
@@ -1593,4 +1608,105 @@ async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
     assert!(text.contains("runbooks/deploy"), "{text}");
     let pact_text = std::fs::read_to_string(fx.root.join("reflections/PACT.md")).unwrap();
     assert!(pact_text.contains("Keep it short."), "{pact_text}");
+}
+
+/// An agent takes a lease only where its loop has work: nothing due is
+/// refused, the wait after failed runs is refused too, and `force` lifts the
+/// wait and nothing else. The machine's own run takes as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agents_take_needs_due_work_and_force_lifts_only_the_wait() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = reflecting().await;
+    with_agents(&fx).await;
+    let nightly = agent_scope("nightly", AgentLoops::Both);
+    let take_as = |force: bool, lp: Loop| {
+        let engine = fx.engine.clone();
+        let nightly = nightly.clone();
+        async move {
+            engine
+                .automation_lease_take_forced(lp, "eng", "cron", &nightly, force)
+                .await
+                .map(|taken| taken["token"].as_str().unwrap().to_string())
+                .map_err(|e| e.to_string())
+        }
+    };
+
+    // Nothing is due: refused, with force too.
+    for force in [false, true] {
+        let refused = take_as(force, Loop::Reflect).await.unwrap_err();
+        assert!(
+            refused.contains("Nothing is due for the reflect loop on 'eng'"),
+            "{refused}"
+        );
+    }
+
+    // Work, then a failed run: the loop waits, and the agent with it.
+    open_thread(&fx, "aaaa1111", "Still true?").await;
+    run_at(&fx, start(), RunOutcome::Failed).await;
+    let refused = take_as(false, Loop::Reflect).await.unwrap_err();
+    assert!(
+        refused.contains("backing off after 1 failed run") && refused.contains("force"),
+        "{refused}"
+    );
+    assert!(!refused.contains('\u{2014}') && !refused.contains('\u{2013}'));
+
+    // Force lifts the wait.
+    let token = take_as(true, Loop::Reflect).await.unwrap();
+    fx.engine
+        .automation_lease_release(Loop::Reflect, "eng", &token, &nightly)
+        .await
+        .unwrap();
+
+    // Evolve still has nothing due, force or not.
+    let refused = take_as(true, Loop::Evolve).await.unwrap_err();
+    assert!(
+        refused.contains("Nothing is due for the evolve loop"),
+        "{refused}"
+    );
+
+    // The machine's run is not an agent: it takes where nothing is due.
+    take(&fx.engine, Loop::Evolve, "eng", "cli").await;
+}
+
+/// Every take an agent tries counts, refused ones included, and the
+/// thirty-first in ten minutes is refused with how long to wait. Another
+/// agent has a budget of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_takes_at_most_thirty_leases_in_ten_minutes() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = reflecting().await;
+    with_agents(&fx).await;
+    let nightly = agent_scope("nightly", AgentLoops::Both);
+    for _ in 0..30 {
+        let refused = fx
+            .engine
+            .automation_lease_take(Loop::Reflect, "eng", "cron", &nightly)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("Nothing is due"), "{refused}");
+    }
+    let limited = fx
+        .engine
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &nightly)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        limited.contains("tried to take 30 leases in the last 10 minutes")
+            && limited.contains("Try again in"),
+        "{limited}"
+    );
+    let other = fx
+        .engine
+        .automation_lease_take(
+            Loop::Reflect,
+            "eng",
+            "cron",
+            &agent_scope("curator", AgentLoops::Reflect),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(other.contains("Nothing is due"), "{other}");
 }

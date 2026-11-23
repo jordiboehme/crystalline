@@ -391,22 +391,37 @@ async fn lease_carries_written_and_pr_url(store: &dyn Store) {
     let paths = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     assert_eq!(
         store
-            .note_automation_written(d, "ada", &paths(&["b.md", "a.md"]))
+            .note_automation_written(d, "ada", None, &paths(&["b.md", "a.md"]))
             .await
             .unwrap(),
         1
     );
     store
-        .note_automation_written(d, "ada", &paths(&["a.md", "c.md"]))
+        .note_automation_written(d, "ada", None, &paths(&["a.md", "c.md"]))
         .await
         .unwrap();
     // Another account notes nothing.
     assert_eq!(
         store
-            .note_automation_written(d, "bob", &paths(&["x.md"]))
+            .note_automation_written(d, "bob", None, &paths(&["x.md"]))
             .await
             .unwrap(),
         0
+    );
+    // A note for the other loop lands on no evolve lease.
+    assert_eq!(
+        store
+            .note_automation_written(d, "ada", Some("reflect"), &paths(&["r.md"]))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .note_automation_written(d, "ada", Some("evolve"), &paths(&["c.md"]))
+            .await
+            .unwrap(),
+        1
     );
     assert!(
         store

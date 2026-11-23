@@ -4975,6 +4975,7 @@ impl Store for TursoStore {
         &self,
         domain: DomainId,
         account: &str,
+        only: Option<&str>,
         paths: &[String],
     ) -> Result<u64> {
         // One process owns a Turso database and the engine serializes its
@@ -4982,6 +4983,9 @@ impl Store for TursoStore {
         // cannot interleave with another note.
         let mut noted = 0;
         for loop_kind in ["reflect", "evolve"] {
+            if only.is_some_and(|only| only != loop_kind) {
+                continue;
+            }
             let Some(lease) = self.automation_lease(domain, loop_kind).await? else {
                 continue;
             };

@@ -1158,6 +1158,10 @@ pub struct Engine {
     automation_deliveries: std::sync::Mutex<
         HashMap<(String, crystalline_core::automation::Loop), automation::DeliveryRecord>,
     >,
+    // The lease takes of each agent of the loops in the last window, so an
+    // agent cannot take leases faster than a run needs them. In memory: a
+    // restart forgets it. See `automation::AgentTakes`.
+    agent_takes: automation::AgentTakes,
     // A seam that is a gate rather than a stopwatch: when armed, the next move
     // or delete of a Reflection signals `entered` after its live-room screen,
     // then waits for `release` before it takes the page lock. See
@@ -2678,6 +2682,7 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             automation_now: std::sync::Mutex::new(None),
             automation_deliveries: std::sync::Mutex::new(HashMap::new()),
+            agent_takes: automation::AgentTakes::default(),
             #[cfg(any(test, feature = "testing"))]
             hold_next_room_screen: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]

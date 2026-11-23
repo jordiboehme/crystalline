@@ -4285,16 +4285,18 @@ pub trait Store: ReadStore {
         pr_url: &str,
     ) -> Result<bool>;
 
-    /// Add `paths` to the written paths of every lease on `domain` (either
-    /// loop) that `account` holds, whatever its age: a lease that went stale
-    /// and that nobody took over is still its token's, so what its runner
-    /// wrote meanwhile is kept. A path already noted is kept once. One
-    /// statement per lease, so two writers on a shared database never lose
-    /// each other's paths. Answers how many leases noted them.
+    /// Add `paths` to the written paths of every lease on `domain` that
+    /// `account` holds, of the loop `loop_kind` names or of either loop when
+    /// it names none, whatever its age: a lease that went stale and that
+    /// nobody took over is still its token's, so what its runner wrote
+    /// meanwhile is kept. A path already noted is kept once. One statement
+    /// per lease, so two writers on a shared database never lose each
+    /// other's paths. Answers how many leases noted them.
     async fn note_automation_written(
         &self,
         domain: DomainId,
         account: &str,
+        loop_kind: Option<&str>,
         paths: &[String],
     ) -> Result<u64>;
 

@@ -34,6 +34,54 @@ pub const WEBHOOK_NO_SECRET: &str = "no webhook secret is set on this instance, 
 /// The longest runner label a lease keeps.
 const RUNNER_MAX_BYTES: usize = 128;
 
+/// How many leases one agent of the loops may try to take in
+/// [`AGENT_TAKE_WINDOW`]: a run takes one lease per domain it works on, so
+/// this is room for a sweep of thirty domains, and a loop of takes is held
+/// back.
+pub const AGENT_TAKE_BUDGET: usize = 30;
+
+/// The window [`AGENT_TAKE_BUDGET`] counts in: ten minutes.
+pub const AGENT_TAKE_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The lease takes each agent of the loops tried in the last
+/// [`AGENT_TAKE_WINDOW`], refused ones included, as a sliding window per
+/// agent name.
+#[derive(Default)]
+pub(crate) struct AgentTakes {
+    agents: std::sync::Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>,
+}
+
+impl AgentTakes {
+    /// Count a take by `agent` at `now`, or answer how many seconds until the
+    /// next one is allowed (never zero).
+    pub(crate) fn admit(
+        &self,
+        agent: &str,
+        now: std::time::Instant,
+    ) -> std::result::Result<(), u64> {
+        let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+        agents.retain(|_, window| {
+            window
+                .back()
+                .is_some_and(|last| now.duration_since(*last) < AGENT_TAKE_WINDOW)
+        });
+        let window = agents.entry(agent.to_string()).or_default();
+        while window
+            .front()
+            .is_some_and(|oldest| now.duration_since(*oldest) >= AGENT_TAKE_WINDOW)
+        {
+            window.pop_front();
+        }
+        if window.len() >= AGENT_TAKE_BUDGET {
+            let oldest = *window.front().expect("the budget is never zero");
+            let left = AGENT_TAKE_WINDOW.saturating_sub(now.duration_since(oldest));
+            return Err(left.as_secs().max(1));
+        }
+        window.push_back(now);
+        Ok(())
+    }
+}
+
 /// The summary an expired run is recorded with.
 const EXPIRED_SUMMARY: &str = "The runner stopped renewing its lease.";
 
@@ -398,10 +446,37 @@ impl Engine {
         runner: &str,
         scope: &Scope,
     ) -> Result<Value> {
+        self.automation_lease_take_forced(lp, domain, runner, scope, false)
+            .await
+    }
+
+    /// [`Engine::automation_lease_take`], and for an agent of the loops
+    /// ([`Scope::Agent`]) the three guards of an agent's take: at most
+    /// [`AGENT_TAKE_BUDGET`] tries in [`AGENT_TAKE_WINDOW`], a loop the agent
+    /// runs only, and only while something is due for the loop on the domain.
+    /// `force` lifts the wait after failed runs and nothing else, as
+    /// `automation_status` with `force` does. Any other caller takes as
+    /// before, and `force` changes nothing for it.
+    pub async fn automation_lease_take_forced(
+        &self,
+        lp: Loop,
+        domain: &str,
+        runner: &str,
+        scope: &Scope,
+        force: bool,
+    ) -> Result<Value> {
         let runner = runner.trim();
         if runner.is_empty() || runner.len() > RUNNER_MAX_BYTES {
             return Err(EngineError::Invalid(format!(
                 "runner must be a label of 1 to {RUNNER_MAX_BYTES} bytes"
+            )));
+        }
+        if let Scope::Agent { name, .. } = scope
+            && let Err(wait) = self.agent_takes.admit(name, std::time::Instant::now())
+        {
+            return Err(EngineError::Refused(format!(
+                "This agent tried to take {AGENT_TAKE_BUDGET} leases in the last {} minutes, which is as many as a run needs. Try again in {wait} seconds.",
+                AGENT_TAKE_WINDOW.as_secs() / 60
             )));
         }
         self.require_loop_right(lp, domain, scope).await?;
@@ -412,6 +487,10 @@ impl Engine {
         }
         let id = self.loop_domain_id(domain).await?;
         let due = self.loop_due(lp, domain, id, scope).await?;
+        if matches!(scope, Scope::Agent { .. }) {
+            self.agent_take_refusal(lp, domain, id, due.items.is_empty(), force)
+                .await?;
+        }
         let mut unshared_at_start = self.unshared_now(domain, scope).await?;
         // A claim of the evolve home an earlier run wrote and never shared
         // (it failed, was stopped or ran with --no-share) rides with this
@@ -470,6 +549,56 @@ impl Engine {
             }
         }
         Ok(taken)
+    }
+
+    /// Why an agent of the loops may not take the lease of `lp` on `domain`
+    /// now, when it may not: nothing is due (`nothing_due`), or the loop
+    /// waits after failed runs and `force` does not lift it. A lease another
+    /// run holds is left to the take, which refuses it as for anybody.
+    async fn agent_take_refusal(
+        &self,
+        lp: Loop,
+        domain: &str,
+        id: DomainId,
+        nothing_due: bool,
+        force: bool,
+    ) -> Result<()> {
+        if nothing_due {
+            return Err(EngineError::Refused(format!(
+                "Nothing is due for the {lp} loop on '{domain}', so an agent takes no lease there. Ask automation_status which domains are due."
+            )));
+        }
+        if force {
+            return Ok(());
+        }
+        let runs = {
+            let store = self.store.lock().await;
+            store.automation_runs(id, lp.as_str(), RUNS_KEPT).await?
+        };
+        if let Some(failed) = self.backing_off(&runs) {
+            return Err(EngineError::Refused(format!(
+                "The {lp} loop on '{domain}' is {}, so an agent takes no lease there yet. A person who starts the run by hand passes force to start it anyway.",
+                backoff_reason(failed)
+            )));
+        }
+        Ok(())
+    }
+
+    /// How many runs failed in a row while the loop still waits after them,
+    /// or `None` when it does not wait (any more). `runs` is newest first.
+    fn backing_off(&self, runs: &[AutomationRun]) -> Option<u32> {
+        match failed_in_a_row(runs) {
+            (failed, Some(ended)) if failed > 0 => {
+                let now = self.automation_clock();
+                // A failure "later" than now (the clock went back) starts no
+                // wait, so a wait never outlasts its own length.
+                time::parse_rfc3339(ended)
+                    .filter(|ended| *ended <= now)
+                    .filter(|ended| now < *ended + time::seconds(backoff_secs(failed)))
+                    .map(|_| failed)
+            }
+            _ => None,
+        }
     }
 
     /// The store half of [`Engine::automation_lease_take`]: claim the lease
@@ -653,12 +782,25 @@ impl Engine {
     /// lapsed loses none of its writes. A domain where the account holds no
     /// lease notes nothing.
     ///
-    /// The engine cannot tell which run made an MCP write, so the note lands
-    /// in every lease the account holds on the domain, the reflect and the
-    /// evolve lease alike. A reflect runner and an evolve runner that work
-    /// one domain at the same time take separate accounts, or each pull
-    /// request carries the other run's writes.
+    /// Here the loop is not known, so the note lands in every lease the
+    /// account holds on the domain, the reflect and the evolve lease alike.
+    /// A session that names its loop (the run-loop header, or an agent of
+    /// one loop) notes through [`Engine::note_written_in`] instead, so a
+    /// reflect run and an evolve run of one account on one domain each
+    /// share only their own writes.
     pub async fn note_written(&self, domain: &str, account: &str, paths: &[String]) -> Result<()> {
+        self.note_written_in(domain, account, None, paths).await
+    }
+
+    /// [`Engine::note_written`] into the lease of `lp` only, or of either
+    /// loop when it is `None`.
+    pub async fn note_written_in(
+        &self,
+        domain: &str,
+        account: &str,
+        lp: Option<Loop>,
+        paths: &[String],
+    ) -> Result<()> {
         if paths.is_empty() || account.is_empty() {
             return Ok(());
         }
@@ -666,7 +808,9 @@ impl Engine {
         let Some(id) = store.domain_id(domain).await? else {
             return Ok(());
         };
-        store.note_automation_written(id, account, paths).await?;
+        store
+            .note_automation_written(id, account, lp.map(Loop::as_str), paths)
+            .await?;
         Ok(())
     }
 
@@ -1401,18 +1545,7 @@ impl Engine {
         };
         let last_run = runs.first();
         // The wait after failed runs in a row, while it lasts.
-        let backing_off = match failed_in_a_row(&runs) {
-            (failed, Some(ended)) if failed > 0 => {
-                let now = self.automation_clock();
-                // A failure "later" than now (the clock went back) starts no
-                // wait, so a wait never outlasts its own length.
-                time::parse_rfc3339(ended)
-                    .filter(|ended| *ended <= now)
-                    .filter(|ended| now < *ended + time::seconds(backoff_secs(failed)))
-                    .map(|_| failed)
-            }
-            _ => None,
-        };
+        let backing_off = self.backing_off(&runs);
         let (_, stale_before) = self.automation_window();
         let running = lease.filter(|lease| lease.renewed_at.as_str() >= stale_before.as_str());
         let due = match (&runs_on, id) {
@@ -1726,8 +1859,32 @@ impl Engine {
         marked: bool,
         run_domain: Option<&str>,
     ) -> Option<crate::read_limit::Limit> {
+        self.read_limit_for_loop(scope, marked, run_domain, None)
+            .await
+    }
+
+    /// [`Engine::read_limit_for`] for a session bound to the loop `run_loop`
+    /// (the run-loop header, or an agent of one loop): only the leases of
+    /// that loop count as what it works on. `None` counts the leases of
+    /// both loops.
+    pub async fn read_limit_for_loop(
+        &self,
+        scope: &Scope,
+        marked: bool,
+        run_domain: Option<&str>,
+        run_loop: Option<Loop>,
+    ) -> Option<crate::read_limit::Limit> {
         let all: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
-        let works_on = match self.run_domains(scope).await {
+        let leases = self.run_leases(scope).await.map(|leases| {
+            let mut domains: Vec<String> = leases
+                .into_iter()
+                .filter(|(lp, _)| run_loop.is_none_or(|only| only == *lp))
+                .map(|(_, domain)| domain)
+                .collect();
+            domains.dedup();
+            domains
+        });
+        let works_on = match leases {
             Ok(domains) => domains,
             Err(e) => {
                 tracing::warn!("the loop leases were not read; reading nothing: {e}");

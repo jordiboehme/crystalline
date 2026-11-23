@@ -5229,6 +5229,7 @@ impl Store for PostgresStore {
         &self,
         domain: DomainId,
         account: &str,
+        only: Option<&str>,
         paths: &[String],
     ) -> Result<u64> {
         // One statement: the union of what the row holds and `paths`, so two
@@ -5238,11 +5239,12 @@ impl Store for PostgresStore {
             "UPDATE automation_lease SET written = ( \
              SELECT COALESCE(jsonb_agg(p ORDER BY p), '[]'::jsonb)::text FROM ( \
              SELECT DISTINCT p FROM jsonb_array_elements_text(written::jsonb || $3::jsonb) AS p) AS u) \
-             WHERE domain_id=$1 AND account=$2",
+             WHERE domain_id=$1 AND account=$2 AND ($4::text IS NULL OR loop_kind=$4)",
         )
         .bind(domain.0)
         .bind(account)
         .bind(serde_json::to_string(paths)?)
+        .bind(only)
         .execute(conn.as_mut())
         .await
         .map_err(IndexError::from)?;
