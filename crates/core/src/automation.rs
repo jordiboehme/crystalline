@@ -717,6 +717,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reflect_run_refused_an_engram_write_answers_the_feedback_another_way() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let line = prompt
+            .lines()
+            .find(|line| line.starts_with("2. Feedback"))
+            .expect("the feedback step");
+        // The first way stays for a run that may write the engrams.
+        assert!(line.contains("Take it into the engrams"), "{line}");
+        assert!(
+            line.contains("no evolve lease on `work`")
+                && line.contains("answer the feedback in a thread or settle it as kept")
+                && line.contains("say so in the summary"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn the_evolve_prompt_asks_for_mechanical_findings_only() {
         let prompt = headless_prompt(Loop::Evolve, "work", 7, false);
         for needle in [
