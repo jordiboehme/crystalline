@@ -26,6 +26,7 @@ mod reach;
 mod read_limit;
 mod reconcile_state;
 mod rest;
+mod rest_pages;
 mod rights;
 mod search;
 mod sources;

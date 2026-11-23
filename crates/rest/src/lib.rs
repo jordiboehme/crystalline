@@ -60,6 +60,7 @@ mod oauth;
 mod oauth_grants;
 mod oidc;
 use crystalline_engine::pending;
+mod reflection_pages;
 mod reflections;
 mod users_api;
 
@@ -243,6 +244,11 @@ use crate::scope::{DomainAccess, DomainRight};
         reflections::asset_write,
         reflections::asset_remove,
         reflections::asset_move,
+        reflection_pages::settings,
+        reflection_pages::retire,
+        reflection_pages::restore,
+        reflection_pages::clock,
+        reflection_pages::missed,
         events::stream_events,
         account_search::search,
         users_api::list,
@@ -461,6 +467,23 @@ use crate::scope::{DomainAccess, DomainRight};
         kept::KeptTextResponse,
         reflections::UploadedReflectionAsset,
         reflections::MoveReflectionAssetBody,
+        reflection_pages::ReflectionPageRef,
+        reflection_pages::ReflectionChainPage,
+        reflection_pages::ReflectionPactFile,
+        reflection_pages::ReflectionPageFinding,
+        reflection_pages::ReflectionRetirement,
+        reflection_pages::ReflectionPageView,
+        reflection_pages::ReflectionSettingsBody,
+        reflection_pages::ReflectionSettingsReceipt,
+        reflection_pages::RetireReflectionBody,
+        reflection_pages::RetiredReflection,
+        reflection_pages::RestoreReflectionBody,
+        reflection_pages::RestoredReflection,
+        reflection_pages::ReflectionPartOf,
+        reflection_pages::ReflectionPageClock,
+        reflection_pages::ReflectionClockResponse,
+        reflection_pages::MissedReflectionPage,
+        reflection_pages::MissedReflectionPages,
         schemas::EngramChanged,
         schemas::DomainChanged,
         schemas::ChangeKind,
@@ -1186,6 +1209,7 @@ fn routes(state: RestState) -> Router {
         // The Reflection: a domain's documents for people. Rights are the
         // Reflection's own, decided in the engine; see `reflections`.
         .route("/reflection/domains", get(reflections::domains))
+        .route("/reflection/missed", get(reflection_pages::missed))
         .route("/domains/{domain}/reflection", get(reflections::status))
         .route("/domains/{domain}/reflection/tree", get(reflections::tree))
         .route(
@@ -1195,6 +1219,25 @@ fn routes(state: RestState) -> Router {
         .route(
             "/domains/{domain}/reflection/disclose",
             post(reflections::disclose),
+        )
+        // A page's settings, retirement and clock: static routes with the
+        // page in the body or the query, since nothing may follow the
+        // page wildcard.
+        .route(
+            "/domains/{domain}/reflection/settings",
+            patch(reflection_pages::settings),
+        )
+        .route(
+            "/domains/{domain}/reflection/retire",
+            post(reflection_pages::retire),
+        )
+        .route(
+            "/domains/{domain}/reflection/restore",
+            post(reflection_pages::restore),
+        )
+        .route(
+            "/domains/{domain}/reflection/clock",
+            get(reflection_pages::clock),
         )
         .route(
             "/domains/{domain}/reflection/threads",

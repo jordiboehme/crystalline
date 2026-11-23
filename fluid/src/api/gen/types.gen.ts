@@ -2193,6 +2193,47 @@ export type MintedLinkResponse = {
 };
 
 /**
+ * A page a reflect run missed.
+ */
+export type MissedReflectionPage = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * Its freshness, as written.
+     */
+    freshness: string;
+    /**
+     * Seconds since it was last reconciled.
+     */
+    last_checked_secs: number;
+    /**
+     * Seconds since the end of the first reflect run that started after
+     * the page fell due and left it.
+     */
+    missed_secs: number;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * A co-editing room has the page open: it waits for the room.
+     */
+    waiting: boolean;
+};
+
+/**
+ * What `GET /reflection/missed` answers.
+ */
+export type MissedReflectionPages = {
+    /**
+     * Longest missed first.
+     */
+    pages: Array<MissedReflectionPage>;
+};
+
+/**
  * Move an engram to a new path, a new permalink or into another registered domain. Every reference to it that the caller can see follows it to the new address.
  */
 export type MoveBody = {
@@ -2681,6 +2722,20 @@ export type ReflectionAssetsResponse = {
 };
 
 /**
+ * A page a page follows, on the way up its pact chain.
+ */
+export type ReflectionChainPage = {
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Its title.
+     */
+    title: string;
+};
+
+/**
  * What happened in a domain's Reflection, as the `reflection` event says it.
  */
 export type ReflectionChangeKind = 'changed' | 'moved' | 'deleted' | 'threads' | 'files' | 'switched';
@@ -2709,6 +2764,13 @@ export type ReflectionChanged = {
      * Reflection, then).
      */
     path: string;
+};
+
+/**
+ * What `GET /domains/{domain}/reflection/clock` answers.
+ */
+export type ReflectionClockResponse = {
+    clock?: ReflectionPageClock | null;
 };
 
 /**
@@ -2763,6 +2825,253 @@ export type ReflectionGrant = {
  * curator: curating follows from writing the engrams.
  */
 export type ReflectionLevel = 'default' | 'reader' | 'contributor';
+
+/**
+ * A page's own page pact file.
+ */
+export type ReflectionPactFile = {
+    /**
+     * Whether it exists. A curator creates it with a `PUT` of that path.
+     */
+    exists: boolean;
+    /**
+     * Its path inside reflections/: the page's path with `.pact.md`.
+     */
+    path: string;
+};
+
+/**
+ * One page's freshness clock, in seconds relative to the server's
+ * automation clock (design 2.2 and 2.3).
+ */
+export type ReflectionPageClock = {
+    /**
+     * The page whose freshness keeps this one current: the page itself,
+     * or for an owned page the first page up its owners that has a
+     * freshness; null when none has.
+     */
+    clock_of?: string | null;
+    /**
+     * Seconds until a fresh page falls due; null once it is due, and for
+     * an owned page.
+     */
+    due_in_secs?: number | null;
+    /**
+     * The freshness that keeps the page current, as written: its own, or
+     * for an owned page that of `clock_of`; null when none does.
+     */
+    freshness?: string | null;
+    /**
+     * Seconds since then, never negative.
+     */
+    last_checked_secs?: number | null;
+    /**
+     * When the page (or `clock_of`) was last reconciled, RFC 3339; the
+     * page's change time when no reconcile is recorded.
+     */
+    last_reconciled?: string | null;
+    /**
+     * The page is overdue, reflect runs are known and none left it: the
+     * loop runs less often than the page's freshness.
+     */
+    loop_slower_than_freshness: boolean;
+    /**
+     * Seconds since a reflect run of the domain that started after the
+     * page fell due ended without reconciling it; null while no run left
+     * it. Only this is warned about (the missed list, doctor).
+     */
+    missed_secs?: number | null;
+    /**
+     * Seconds since the page turned overdue, one whole period after it
+     * fell due; null before. Show it on the page ("Overdue since ...").
+     */
+    overdue_secs?: number | null;
+    part_of?: ReflectionPartOf | null;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Whether the page is due: its freshness ran out.
+     */
+    stale: boolean;
+    /**
+     * A due page that a co-editing room has open: it waits for the room.
+     */
+    waiting: boolean;
+};
+
+/**
+ * A page setting or link that did not read, and why.
+ */
+export type ReflectionPageFinding = {
+    /**
+     * `freshness`, `follows`, `owner` or `folder parent`.
+     */
+    key: string;
+    /**
+     * The page it is about: this page, or a page up its chain.
+     */
+    page: string;
+    /**
+     * One sentence saying why it is ignored.
+     */
+    reason: string;
+    /**
+     * The value as written.
+     */
+    value: string;
+};
+
+/**
+ * A page as another page names it.
+ */
+export type ReflectionPageRef = {
+    /**
+     * Whether the page exists.
+     */
+    exists: boolean;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Its title; its path when the page does not exist.
+     */
+    title: string;
+};
+
+/**
+ * What a page says about itself beside its text: the `page` member of
+ * `GET /domains/{domain}/reflections/{path}` for a page (never for
+ * `PACT.md` or a page pact), and of a settings change's receipt.
+ */
+export type ReflectionPageView = {
+    /**
+     * The pages this page follows, from the top down; the last one is the
+     * page it follows directly. Empty when it follows only `PACT.md`.
+     */
+    chain: Array<ReflectionChainPage>;
+    /**
+     * What did not read, on this page or up its chain.
+     */
+    findings: Array<ReflectionPageFinding>;
+    /**
+     * The page whose pact this page follows, as written; null when the
+     * page follows its owner or its folder parent.
+     */
+    follows?: string | null;
+    /**
+     * How often the page is brought in line with its pacts, as written
+     * (`6h`, `1d`); null when it has none, when it does not read or is
+     * under an hour (then named in `findings`), or the page is owned (it
+     * is reconciled with its owner).
+     */
+    freshness?: string | null;
+    owner?: ReflectionPageRef | null;
+    /**
+     * The page's own page pact file.
+     */
+    pact: ReflectionPactFile;
+    /**
+     * The pact files that apply, in order: `PACT.md` (when it exists),
+     * then the page pact of each followed page that has one, then the
+     * page's own.
+     */
+    pacts: Array<string>;
+    retired?: ReflectionRetirement | null;
+    /**
+     * The page's `status`, as written. A retired word (`archived`) means
+     * the page is retired.
+     */
+    status?: string | null;
+};
+
+/**
+ * The page an owned page is part of.
+ */
+export type ReflectionPartOf = {
+    /**
+     * The owner's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Its title.
+     */
+    title: string;
+};
+
+/**
+ * How and when a page was retired.
+ */
+export type ReflectionRetirement = {
+    /**
+     * When, RFC 3339.
+     */
+    at: string;
+    /**
+     * Who retired it: a person's or an agent's name.
+     */
+    by: string;
+    was_owned_by?: ReflectionPageRef | null;
+};
+
+/**
+ * A page's settings, the frontmatter keys only a curator changes. A key left out keeps its value, an empty value takes the key off the page, any other value sets it. At least one key.
+ */
+export type ReflectionSettingsBody = {
+    /**
+     * The page of this Reflection whose pact this page follows.
+     */
+    follows?: string | null;
+    /**
+     * How often the page is brought in line with its pacts: `1h`, `6h`,
+     * `1d`, `7d`, `30d` or any span of an hour or more (`h`, `d`, `w`, `m`
+     * for months of 30 days, `y`). Refused on an owned page.
+     */
+    freshness?: string | null;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * The page's status. A retired word is refused: retire the page with
+     * `POST /domains/{domain}/reflection/retire`.
+     */
+    status?: string | null;
+};
+
+/**
+ * What a settings change answers: the write's receipt with the page as it
+ * stands now.
+ */
+export type ReflectionSettingsReceipt = {
+    /**
+     * The checksum of the file as written.
+     */
+    checksum: string;
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * While a co-editing room is open over the page: `live` when the room
+     * took the change in, `file` when it is on disk only.
+     */
+    landed?: string | null;
+    /**
+     * The page's settings, chain, owner and retirement now.
+     */
+    page: ReflectionPageView;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * With `landed: file`: what the people in the room meet.
+     */
+    room_note?: string | null;
+};
 
 /**
  * RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored.
@@ -2889,6 +3198,43 @@ export type ResolveBody = {
 };
 
 /**
+ * What `POST /domains/{domain}/reflection/restore` takes.
+ */
+export type RestoreReflectionBody = {
+    /**
+     * The page it was owned by, to put it back under that page; leave it
+     * out to restore it as a page of its own.
+     */
+    owner?: string | null;
+    /**
+     * The retired page's path inside reflections/.
+     */
+    path: string;
+};
+
+/**
+ * What a restore answers.
+ */
+export type RestoredReflection = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * The page that owns it again; null when it stands on its own.
+     */
+    owner?: string | null;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Always true.
+     */
+    restored: boolean;
+};
+
+/**
  * Guided retirement of one engram: a `status` from a fixed set, an optional close-out date, and, for `superseded`, the successor that wires the reciprocal relation pair.
  */
 export type RetireBody = {
@@ -2909,6 +3255,38 @@ export type RetireBody = {
      * The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown.
      */
     valid_to?: string | null;
+};
+
+/**
+ * What `POST /domains/{domain}/reflection/retire` takes.
+ */
+export type RetireReflectionBody = {
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+};
+
+/**
+ * What a retire answers.
+ */
+export type RetiredReflection = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Always true.
+     */
+    retired: boolean;
+    /**
+     * The page that owned it, kept so a restore can put it back.
+     */
+    was_owned_by?: string | null;
 };
 
 /**
@@ -6718,6 +7096,45 @@ export type WriteReflectionAssetResponses = {
 
 export type WriteReflectionAssetResponse = WriteReflectionAssetResponses[keyof WriteReflectionAssetResponses];
 
+export type GetReflectionClockData = {
+    body?: never;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query: {
+        /**
+         * The page's path inside reflections/.
+         */
+        path: string;
+    };
+    url: '/api/v1/domains/{domain}/reflection/clock';
+};
+
+export type GetReflectionClockErrors = {
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The Reflection is not here.
+     */
+    409: ProblemDetail;
+};
+
+export type GetReflectionClockError = GetReflectionClockErrors[keyof GetReflectionClockErrors];
+
+export type GetReflectionClockResponses = {
+    /**
+     * The page's clock.
+     */
+    200: ReflectionClockResponse;
+};
+
+export type GetReflectionClockResponse = GetReflectionClockResponses[keyof GetReflectionClockResponses];
+
 export type DiscloseReflectionSectionData = {
     body: DiscloseReflectionBody;
     path: {
@@ -6784,7 +7201,7 @@ export type MoveReflectionErrors = {
      */
     401: ProblemDetail;
     /**
-     * Below edit access, or this instance is read-only.
+     * Below edit access; below curate for a page that has a page pact or a move onto a path that becomes the folder parent of a page already there; or this instance is read-only.
      */
     403: ProblemDetail;
     /**
@@ -6796,7 +7213,7 @@ export type MoveReflectionErrors = {
      */
     409: ProblemDetail;
     /**
-     * A bad path, or `PACT.md`, which is edited and never moved.
+     * A bad path, `PACT.md`, which is edited and never moved, or a page pact, which moves only with its page.
      */
     422: ProblemDetail;
 };
@@ -6805,7 +7222,7 @@ export type MoveReflectionError = MoveReflectionErrors[keyof MoveReflectionError
 
 export type MoveReflectionResponses = {
     /**
-     * Moved with its threads and baseline; links to it rewritten: `{ from, to, links_rewritten, threads_moved }`. `links_failed`, `[{ domain, path, reason }]`, appears only when a page that links it could not be rewritten after the move.
+     * Moved with its threads and baseline, and its page pact when it has one; links to it rewritten: `{ from, to, links_rewritten, threads_moved, pact_moved, follows_rewritten, owners_rewritten }`. `links_rewritten` counts the links rewritten, in the pact files rewritten with the move and in the pages after it. `pact_moved` says whether its page pact moved with it. `follows_rewritten` counts the `follows` of other pages that now name the new path, and `owners_rewritten` the owners and former owners in other pages' records that do. `links_failed`, `[{ domain, path, reason }]`, appears only when a page that links it could not be rewritten after the move.
      */
     200: {
         [key: string]: unknown;
@@ -6898,7 +7315,7 @@ export type GetReflectQueueError = GetReflectQueueErrors[keyof GetReflectQueueEr
 
 export type GetReflectQueueResponses = {
     /**
-     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact.
+     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact. A `page_pact_changed` item (a page pact on the page's chain changed, or its stored pact hash no longer matches) carries `pacts`, `chain`, `pact_hash_changed` and `diff`; an `owner_gone` item carries `owner`, `owner_is` (`missing` or `retired`) and `hint`; `link_retired` and `link_broken` (per section) carry `links`, the pages it links that are retired or gone. `stale` items (a page whose freshness ran out) are a run's and never in this queue.
      */
     200: {
         [key: string]: unknown;
@@ -6906,6 +7323,98 @@ export type GetReflectQueueResponses = {
 };
 
 export type GetReflectQueueResponse = GetReflectQueueResponses[keyof GetReflectQueueResponses];
+
+export type RestoreReflectionData = {
+    body: RestoreReflectionBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/restore';
+};
+
+export type RestoreReflectionErrors = {
+    /**
+     * The anonymous viewer of a domain it reads.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access, the domain is off the caller's write list, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or page, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The Reflection is not here.
+     */
+    409: ProblemDetail;
+    /**
+     * A page that is not retired, a pact file, an empty `owner`, an `owner` that is not the page it was owned by, or an owner that is gone, retired or would close a cycle.
+     */
+    422: ProblemDetail;
+};
+
+export type RestoreReflectionError = RestoreReflectionErrors[keyof RestoreReflectionErrors];
+
+export type RestoreReflectionResponses = {
+    /**
+     * Restored.
+     */
+    200: RestoredReflection;
+};
+
+export type RestoreReflectionResponse = RestoreReflectionResponses[keyof RestoreReflectionResponses];
+
+export type RetireReflectionData = {
+    body: RetireReflectionBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/retire';
+};
+
+export type RetireReflectionErrors = {
+    /**
+     * The anonymous viewer of a domain it reads.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access, the domain is off the caller's write list, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or page, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The Reflection is not here.
+     */
+    409: ProblemDetail;
+    /**
+     * A pact file, which is no page, or a page already retired.
+     */
+    422: ProblemDetail;
+};
+
+export type RetireReflectionError = RetireReflectionErrors[keyof RetireReflectionErrors];
+
+export type RetireReflectionResponses = {
+    /**
+     * Retired.
+     */
+    200: RetiredReflection;
+};
+
+export type RetireReflectionResponse = RetireReflectionResponses[keyof RetireReflectionResponses];
 
 export type GetReflectionReviewData = {
     body?: never;
@@ -6993,7 +7502,7 @@ export type SearchReflectionsError = SearchReflectionsErrors[keyof SearchReflect
 
 export type SearchReflectionsResponses = {
     /**
-     * `{ domain, query, mode, total, page, limit, count, hits: [{ path, title, section, heading, snippet }] }`, best first. `mode` is the search that ran (hybrid, text or semantic), not a score; no hit carries one. `total` counts every hit, `count` this page's. `section` is the section id, `_top` for the text before the first heading, or `null` for a heading with no id yet.
+     * `{ domain, query, mode, total, page, limit, count, hits: [{ path, title, section, heading, snippet, retired }] }`, best first. `retired` marks a hit on a retired page, shown faded. `mode` is the search that ran (hybrid, text or semantic), not a score; no hit carries one. `total` counts every hit, `count` this page's. `section` is the section id, `_top` for the text before the first heading, or `null` for a heading with no id yet.
      */
     200: {
         [key: string]: unknown;
@@ -7001,6 +7510,52 @@ export type SearchReflectionsResponses = {
 };
 
 export type SearchReflectionsResponse = SearchReflectionsResponses[keyof SearchReflectionsResponses];
+
+export type SetReflectionSettingsData = {
+    body: ReflectionSettingsBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/settings';
+};
+
+export type SetReflectionSettingsErrors = {
+    /**
+     * The anonymous viewer of a domain it reads: it reads the Reflection and never changes it.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access (the detail names the right held and the right needed), the domain is off the caller's write list, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or page, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The page changed while it was written (read it again and repeat), or the Reflection is not here.
+     */
+    409: ProblemDetail;
+    /**
+     * No key to change; a pact file; a freshness that does not read, is under an hour, or is set on an owned page; a follows that names no page of this Reflection or closes a cycle; a retired word in status (retire the page instead); a status change on a retired page (restore it instead).
+     */
+    422: ProblemDetail;
+};
+
+export type SetReflectionSettingsError = SetReflectionSettingsErrors[keyof SetReflectionSettingsErrors];
+
+export type SetReflectionSettingsResponses = {
+    /**
+     * Changed.
+     */
+    200: ReflectionSettingsReceipt;
+};
+
+export type SetReflectionSettingsResponse = SetReflectionSettingsResponses[keyof SetReflectionSettingsResponses];
 
 export type GetReflectionSummaryData = {
     body?: never;
@@ -7214,7 +7769,7 @@ export type GetReflectionTreeError = GetReflectionTreeErrors[keyof GetReflection
 
 export type GetReflectionTreeResponses = {
     /**
-     * ReflectionTree: folders first, then reflections, each level sorted by name in byte order. `PACT.md` is only under `pact`, never in `nodes`.
+     * ReflectionTree: folders first, then reflections, each level sorted by name in byte order. `PACT.md` is only under `pact`, never in `nodes`, and a page pact (`<page>.pact.md`) is in neither: its page's read names it. A reflection carries `retired` (a retired page: hide it behind a switch) and `owner`, the path of the page that owns it, or null.
      */
     200: {
         [key: string]: unknown;
@@ -7245,7 +7800,7 @@ export type DeleteReflectionErrors = {
      */
     401: ProblemDetail;
     /**
-     * Below edit access, or this instance is read-only.
+     * Below edit access (curate for a page pact or a page that has one), or this instance is read-only.
      */
     403: ProblemDetail;
     /**
@@ -7266,7 +7821,7 @@ export type DeleteReflectionError = DeleteReflectionErrors[keyof DeleteReflectio
 
 export type DeleteReflectionResponses = {
     /**
-     * Deleted with its threads and baseline.
+     * Deleted with its threads and baseline, and its page pact when it has one.
      */
     204: void;
 };
@@ -7304,7 +7859,7 @@ export type GetReflectionError = GetReflectionErrors[keyof GetReflectionErrors];
 
 export type GetReflectionResponses = {
     /**
-     * ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open.
+     * ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.
      */
     200: {
         [key: string]: unknown;
@@ -7335,7 +7890,7 @@ export type SaveReflectionErrors = {
      */
     401: ProblemDetail;
     /**
-     * Below edit access (curate for PACT.md), with a detail naming the right held and the right needed; the domain is off the caller's write list; or this instance is read-only.
+     * Below edit access (curate for a pact file), with a detail naming the right held and the right needed; a page setting changed below curate (the detail names the key and says to leave it out or send it as stored); a new page beside a waiting page pact below curate; the domain is off the caller's write list; or this instance is read-only.
      */
     403: ProblemDetail;
     /**
@@ -9740,6 +10295,22 @@ export type ListReflectionDomainsResponses = {
 };
 
 export type ListReflectionDomainsResponse = ListReflectionDomainsResponses[keyof ListReflectionDomainsResponses];
+
+export type ListMissedReflectionPagesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/reflection/missed';
+};
+
+export type ListMissedReflectionPagesResponses = {
+    /**
+     * The missed pages.
+     */
+    200: MissedReflectionPages;
+};
+
+export type ListMissedReflectionPagesResponse = ListMissedReflectionPagesResponses[keyof ListMissedReflectionPagesResponses];
 
 export type SearchData = {
     body?: never;

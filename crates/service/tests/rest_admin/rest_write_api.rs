@@ -4078,6 +4078,27 @@ fn write_ops() -> Vec<WriteOp> {
             read_only_exempt: false,
         },
         WriteOp {
+            method: Method::PATCH,
+            path: "/api/v1/domains/eng/reflection/settings",
+            body: Some(serde_json::json!({"path": "guides/a.md", "freshness": "1d"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/retire",
+            body: Some(serde_json::json!({"path": "guides/a.md"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/restore",
+            body: Some(serde_json::json!({"path": "guides/a.md"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/reflection/threads",
             body: Some(serde_json::json!({"path": "guides/a.md", "section": "A", "text": "Why?"})),
