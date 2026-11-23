@@ -1834,6 +1834,20 @@ impl Engine {
         }
         if current.is_none() {
             r::validate_new_reflection_path(&p.path).map_err(EngineError::Invalid)?;
+            // A new page takes the page pact waiting beside it as its own, so
+            // below curate it is refused, as a move onto it is.
+            let waiting = r::page_pact_path(&p.path);
+            if !r::is_pact_file(&p.path)
+                && access.right < ReflectionRight::Curate
+                && access.abs(&waiting).exists()
+            {
+                return Err(EngineError::Forbidden(format!(
+                    "a page pact '{waiting}' waits for a page at '{}', and creating the page gives it that pact, which a curator does; your access to the Reflection of '{}' is {} and curate is needed",
+                    p.path,
+                    p.domain,
+                    reflection_right_word(access.right)
+                )));
+            }
             self.refuse_only_elsewhere(&p.domain, access.domain_id, ElsewhereRow::Page(&p.path))
                 .await?;
         }
@@ -3287,6 +3301,13 @@ impl Engine {
         })?;
         self.refuse_taken_page_target(domain, &access, from, to)
             .await?;
+        // A pact that appeared after the screen was not weighed by the
+        // rights check: the move waits.
+        if !has_pact && pact_src.exists() {
+            return Err(EngineError::Conflict(format!(
+                "'{pact_from}' was written while this move was on its way; try the move again"
+            )));
+        }
         // The pact's own relative links follow the move as the page's do.
         let pact_baseline = read_opt(&access.abs(&r::baseline_path(&pact_from)))?;
         let pact = match read_opt(&pact_src)? {

@@ -558,6 +558,14 @@ async fn a_move_does_not_adopt_a_loose_page_pact() {
         .to_string();
     assert!(err.contains("guides/z.pact.md"), "{err}");
     assert!(exists(&fx, "guides/b.md"));
+    // Nor does an editor's new page there take it; a curator's does.
+    let err = put_err(&fx, "guides/z.md", PAGE, &ann).await;
+    assert!(
+        err.contains("guides/z.pact.md") && err.contains("curate"),
+        "{err}"
+    );
+    assert!(!exists(&fx, "guides/z.md"));
+    put(&fx, "guides/z.md", PAGE, &curator).await.unwrap();
 }
 
 /// A page with a page pact is deleted by a curator only, and its pact goes
