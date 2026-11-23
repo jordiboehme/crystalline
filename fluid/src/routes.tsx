@@ -104,7 +104,7 @@ const EngramPage = lazyChunk(() => import("./screens/EngramPage"));
  * And the Administration area, lazy for a different reason: its pages weigh
  * little each, but only an admin ever opens them, and the app shell is paid
  * for by everybody who opens the app at all. The frame and its small pages
- * (General and the two placeholders) share one chunk; the accounts table and
+ * (General) share one chunk; the accounts table, the agents, the invites and
  * the GitHub connection keep a chunk each, the accounts table being the
  * largest and taking the most off the eager path.
  */
@@ -112,12 +112,8 @@ const AdminArea = lazyChunk(() => import("./screens/AdminArea"));
 const AdminGeneral = lazyChunk(() =>
   import("./screens/AdminArea").then((m) => ({ default: m.AdminGeneral })),
 );
-const AdminAgents = lazyChunk(() =>
-  import("./screens/AdminArea").then((m) => ({ default: m.AdminAgents })),
-);
-const AdminInvites = lazyChunk(() =>
-  import("./screens/AdminArea").then((m) => ({ default: m.AdminInvites })),
-);
+const AdminAgents = lazyChunk(() => import("./screens/AdminAgents"));
+const AdminInvites = lazyChunk(() => import("./screens/AdminInvites"));
 const GithubSettings = lazyChunk(() => import("./screens/GithubSettings"));
 const UsersAdmin = lazyChunk(() => import("./screens/UsersAdmin"));
 

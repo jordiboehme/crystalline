@@ -1,7 +1,6 @@
 /**
  * The Administration area at `/admin`: the frame around every page an admin
- * uses to look after this instance, and the small pages that have no screen
- * of their own yet.
+ * uses to look after this instance, and its General page.
  *
  * A side navigation of links beside the page at wide widths, and a select
  * above it at drawer width, the way a domain's settings index its sections.
@@ -34,6 +33,7 @@ import {
 } from "../paths";
 import { PREFETCH } from "../prefetch";
 import { usePageTitle } from "../usePageTitle";
+import { PageHeader } from "./AdminParts";
 import NotFound from "./NotFound";
 
 /** One page of the area, in the order the navigation lists them. */
@@ -143,22 +143,6 @@ function AdminFrame() {
   );
 }
 
-/** A page heading with the one line under it that says what the page is for. */
-function PageHeader({
-  title,
-  children,
-}: {
-  title: string;
-  children: ReactNode;
-}) {
-  return (
-    <header>
-      <h1 className="text-display">{title}</h1>
-      <p className="mt-1 text-sm text-muted">{children}</p>
-    </header>
-  );
-}
-
 /** One fact on the General page: a term and what it is on this instance. */
 function Fact({ term, children }: { term: string; children: ReactNode }) {
   return (
@@ -246,26 +230,5 @@ export function AdminGeneral() {
         </Fact>
       </dl>
     </div>
-  );
-}
-
-/** The agents page, a placeholder until its screen lands later in this release. */
-export function AdminAgents() {
-  usePageTitle("Agents");
-  return (
-    <PageHeader title="Agents">
-      The agents of this instance get their page here later in this release.
-    </PageHeader>
-  );
-}
-
-/** The invites page, a placeholder until its screen lands later in this release. */
-export function AdminInvites() {
-  usePageTitle("Invites");
-  return (
-    <PageHeader title="Invites">
-      The invite links of this instance get their page here later in this
-      release.
-    </PageHeader>
   );
 }

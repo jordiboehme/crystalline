@@ -241,3 +241,26 @@ export type {
   LoopRun,
   LoopState,
 } from "./gen";
+
+/** An agent of the loops with its tokens, what `GET /agents` lists and whether `auth.mcp` is on. */
+export type {
+  Agent,
+  AgentLoops,
+  AgentToken,
+  AgentTokenState,
+  AgentsResponse,
+  CreateAgentBody,
+  CreatedAgentResponse,
+  IssueAgentTokenBody,
+  IssuedAgentTokenResponse,
+} from "./gen";
+
+/** An invite link, what `GET /invites` lists and the way in it offers, and what making one takes and answers. */
+export type {
+  CreateInviteBody,
+  CreatedInviteResponse,
+  Invite,
+  InviteSignIn,
+  InviteState,
+  InvitesResponse,
+} from "./gen";
