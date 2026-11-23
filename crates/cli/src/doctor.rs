@@ -1957,6 +1957,118 @@ pub struct DoctorReport {
     /// be read. A warning, never a counted problem.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents_need_auth_mcp: Vec<String>,
+    /// The Reflection pages overdue one whole period after they fell due
+    /// (design 2.2), most overdue first: the daemon's answer when it holds
+    /// the index, else read from the index this run opened. A warning,
+    /// never a counted problem.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reflection_overdue: Vec<OverdueDoctor>,
+}
+
+/// One overdue Reflection page in the `doctor` report. The times are
+/// seconds before this run, on the clock of whoever answered.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OverdueDoctor {
+    /// The domain whose Reflection holds the page.
+    pub domain: String,
+    /// The page's path inside `reflections/`.
+    pub path: String,
+    /// Its freshness as written.
+    pub freshness: String,
+    /// Seconds since it was last reconciled.
+    pub last_checked_secs: i64,
+    /// Seconds since it turned overdue.
+    pub overdue_secs: i64,
+    /// A person has it open in an editor, and its updates wait for the room.
+    #[serde(default)]
+    pub waiting: bool,
+}
+
+/// The overdue pages of an answer shaped like the `reflection_overdue`
+/// control command's, only those of `only` when it names domains.
+fn overdue_from(answer: &serde_json::Value, only: Option<&[String]>) -> Vec<OverdueDoctor> {
+    let pages: Vec<OverdueDoctor> =
+        serde_json::from_value(answer["pages"].clone()).unwrap_or_default();
+    pages
+        .into_iter()
+        .filter(|page| only.is_none_or(|only| only.contains(&page.domain)))
+        .collect()
+}
+
+/// The overdue Reflection pages of the domains this run checks: from the
+/// daemon when it holds the index, else from `store`. Nothing when neither
+/// answers; a domain whose pages cannot be read is left out.
+async fn check_overdue(
+    daemon: bool,
+    store: Option<&dyn Store>,
+    targets: &[(String, DomainEntry)],
+) -> Vec<OverdueDoctor> {
+    let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+    if daemon {
+        let answer = crystalline_service::ctl_routed(
+            serde_json::json!({ "v": 1, "cmd": "reflection_overdue" }),
+        )
+        .await
+        .ok()
+        .flatten();
+        return answer
+            .map(|answer| overdue_from(&answer, Some(&names)))
+            .unwrap_or_default();
+    }
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    let now = time::now().unix_seconds();
+    let mut out = Vec::new();
+    for name in &names {
+        let Ok(Some(id)) = store.domain_id(name).await else {
+            continue;
+        };
+        let Ok(clocks) = crystalline_service::engine::page_clocks_in(store, id, now).await else {
+            continue;
+        };
+        for clock in clocks {
+            if let Some(overdue) = clock.timing.overdue_secs {
+                out.push(OverdueDoctor {
+                    domain: name.clone(),
+                    path: clock.path,
+                    freshness: clock.freshness.written,
+                    last_checked_secs: clock.timing.last_checked_secs,
+                    overdue_secs: overdue,
+                    waiting: false,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.overdue_secs.cmp(&a.overdue_secs));
+    out
+}
+
+/// The overdue pages section of the human report.
+fn render_overdue(out: &mut String, pages: &[OverdueDoctor]) {
+    use std::fmt::Write as _;
+    if pages.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "reflection pages:");
+    for page in pages {
+        let since = crate::cmd::humanize_duration(page.overdue_secs.max(0).unsigned_abs());
+        let checked = crate::cmd::humanize_duration(page.last_checked_secs.max(0).unsigned_abs());
+        let waiting = if page.waiting {
+            "; open in the editor, it waits for the room"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "  [warning] {}: {} is overdue since {since} (freshness {}, last checked {checked} ago){waiting}",
+            page.domain, page.path, page.freshness
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  the reflect loop brings them current: crystalline reflect run (or check that its schedule still runs)"
+    );
 }
 
 /// The update section of the `doctor` report: the facts as `status`
@@ -2587,6 +2699,8 @@ pub async fn run(
     let kept = check_kept(crate::kept::scan_here(), domain_filter, time::now());
     let case_twins = check_case_twins(cfg);
     let agents_need_auth_mcp = check_agents(cfg).await;
+    let reflection_overdue =
+        check_overdue(matches!(index, IndexAccess::Daemon), store_ref, &targets).await;
 
     // Only an active daemon answers the file-stamp request (a standby
     // refuses ctl commands), so a daemon route means an active one.
@@ -2635,6 +2749,7 @@ pub async fn run(
         case_twins,
         update,
         agents_need_auth_mcp,
+        reflection_overdue,
     })
 }
 
@@ -6509,6 +6624,8 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     render_kept(&mut out, &report.kept);
 
+    render_overdue(&mut out, &report.reflection_overdue);
+
     if !report.agents_need_auth_mcp.is_empty() {
         let _ = writeln!(out, "agents:");
         let _ = writeln!(out, "  {}", agents_line(&report.agents_need_auth_mcp));
@@ -7444,6 +7561,45 @@ mod tests {
             out.contains("  hosted by 3f2a-alpha (last heartbeat"),
             "{out}"
         );
+    }
+
+    /// Overdue Reflection pages are warnings with their domain and since
+    /// when, never a counted problem; the daemon's answer is read for the
+    /// domains this run checks only, and a page open in an editor says it
+    /// waits for the room.
+    #[test]
+    fn overdue_pages_warn_with_their_domain_and_since_when() {
+        let answer = serde_json::json!({ "pages": [
+            { "domain": "eng", "path": "guides/week.md", "freshness": "1d",
+              "last_checked_secs": 51 * 3600, "overdue_secs": 3 * 3600, "waiting": false },
+            { "domain": "ops", "path": "a.md", "freshness": "1h",
+              "last_checked_secs": 3 * 86_400, "overdue_secs": 2 * 86_400, "waiting": true },
+        ]});
+        let all = overdue_from(&answer, None);
+        assert_eq!(all.len(), 2);
+        let eng = overdue_from(&answer, Some(&["eng".to_string()]));
+        assert_eq!(eng.len(), 1);
+        assert_eq!(eng[0].path, "guides/week.md");
+        let report = DoctorReport {
+            reflection_overdue: all,
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "[warning] eng: guides/week.md is overdue since 3h (freshness 1d, last checked 2d ago)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("ops: a.md is overdue since 2d (freshness 1h, last checked 3d ago); open in the editor, it waits for the room"),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["reflection_overdue"][0]["overdue_secs"], 3 * 3600);
+        let none = serde_json::to_value(DoctorReport::default()).unwrap();
+        assert!(none.get("reflection_overdue").is_none(), "{none}");
     }
 
     /// A `--domain` run lists that domain's kept texts only; one kept more
