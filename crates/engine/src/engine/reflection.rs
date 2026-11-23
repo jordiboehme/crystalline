@@ -3154,6 +3154,68 @@ impl Engine {
     }
 }
 
+/// One page move inside a Reflection: the page, its pact and where both go,
+/// as every step of [`Engine::move_reflection`] needs them.
+struct PageMove<'a> {
+    domain: &'a str,
+    access: &'a ReflectionAccess,
+    from: &'a str,
+    to: &'a str,
+    pact_from: String,
+    pact_to: String,
+    /// Whether the page has a page pact, which moves with it (spec 2.1).
+    has_pact: bool,
+}
+
+impl PageMove<'_> {
+    /// `text`, the reflection at `inner`, with its links to the moved page
+    /// and to its pact following the move, and how many changed.
+    fn relink_moved(&self, text: &str, inner: &str) -> (String, usize) {
+        let (text, links) = r::rewrite_links_to(text, inner, self.from, self.to);
+        if !self.has_pact {
+            return (text, links);
+        }
+        let (text, more) = r::rewrite_links_to(&text, inner, &self.pact_from, &self.pact_to);
+        (text, links + more)
+    }
+
+    /// Whether `path` is a file the move leaves where it is: neither the
+    /// page nor its pact, on either side of the move.
+    fn is_other(&self, path: &str) -> bool {
+        ![
+            self.from,
+            self.to,
+            self.pact_from.as_str(),
+            self.pact_to.as_str(),
+        ]
+        .contains(&path)
+    }
+}
+
+/// What a move's screen found before it took any lock.
+struct MoveScreen {
+    /// Every other file of the Reflection, whose links may follow the move
+    /// once it has landed.
+    others: Vec<String>,
+    /// The pages whose frontmatter names the moved page and is rewritten in
+    /// the move's own commit.
+    followers: Vec<String>,
+}
+
+/// What a move writes, read and rewritten under its locks.
+struct StagedMove {
+    /// The moved page's text, its links rebased.
+    page: String,
+    /// Its baseline with the same rewrite, when it has one.
+    baseline: Option<String>,
+    /// The page pact's text and, when it has one, its baseline, both
+    /// rebased; `None` when the page has no pact.
+    pact: Option<(String, Option<String>)>,
+    /// Each follower whose frontmatter changes: its path, its file and its
+    /// new text.
+    refollowed: Vec<(String, PathBuf, String)>,
+}
+
 impl Engine {
     pub async fn move_reflection(
         &self,
@@ -3182,88 +3244,17 @@ impl Engine {
                 "a page pact moves with its page and never on its own; move '{page}' instead"
             )));
         }
-        // Every other page whose links the move rewrites waits: a rewrite
-        // under an open room would race its next save. Screened from the
-        // text on disk before anything moves, and relinked from this list
-        // below. The moved page's own room is not a refusal: it is closed
-        // below, once every screen has passed.
-        let rows = self
-            .store
-            .lock()
-            .await
-            .list_reflection_stamps(access.domain_id)
-            .await?;
-        // The page pact beside the page moves with it (spec 2.1).
         let pact_from = r::page_pact_path(from);
-        let pact_to = r::page_pact_path(to);
-        let has_pact = access.abs(&pact_from).exists();
-        // A move that changes what a curator set is a curator's: the page
-        // takes its pact along, or its new path becomes the folder parent
-        // whose pact the pages under it then follow.
-        if access.right < ReflectionRight::Curate {
-            let because = if has_pact {
-                Some(format!("it takes its page pact '{pact_from}' along"))
-            } else {
-                becomes_folder_parent(rows.iter().map(|row| row.path.as_str()), from, to).map(
-                    |child| {
-                        format!(
-                            "'{to}' becomes the folder parent of '{child}', which then follows its pact"
-                        )
-                    },
-                )
-            };
-            if let Some(because) = because {
-                return Err(EngineError::Forbidden(format!(
-                    "moving '{from}' to '{to}' is a curator's move because {because}; your access to the Reflection of '{domain}' is {} and curate is needed",
-                    reflection_right_word(access.right)
-                )));
-            }
-        }
-        // The links that reach the page, and its pact's.
-        let relink_moved = |text: &str, inner: &str| {
-            let (text, links) = r::rewrite_links_to(text, inner, from, to);
-            if !has_pact {
-                return (text, links);
-            }
-            let (text, more) = r::rewrite_links_to(&text, inner, &pact_from, &pact_to);
-            (text, links + more)
+        let mv = PageMove {
+            domain,
+            access: &access,
+            from,
+            to,
+            has_pact: access.abs(&pact_from).exists(),
+            pact_from,
+            pact_to: r::page_pact_path(to),
         };
-        let others = || {
-            rows.iter()
-                .map(|row| row.path.as_str())
-                .filter(|path| ![from, to, pact_from.as_str(), pact_to.as_str()].contains(path))
-        };
-        let mut linking = rooms_to_rewrite(&access, others(), &|text, inner| {
-            relink_moved(text, inner).1
-        });
-        // The pages that follow the moved page follow it to its new path, in
-        // this move: they wait for an open room like a link rewrite.
-        let followers = rooms_to_rewrite(&access, others(), &|text, _| {
-            r::rewrite_follows(text, from, to).1
-        });
-        linking.extend(
-            followers
-                .iter()
-                .filter(|f| !linking.contains(f))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        if has_pact {
-            linking.push(pact_from.clone());
-        }
-        self.refuse_under_live_pages(domain, &linking).await?;
-        let src = access.abs(from);
-        let dst = access.abs(to);
-        // Every check that can refuse the move runs here first, as a screen,
-        // so a refused move leaves an open room over the page alone; they
-        // run again under the locks below, where they decide.
-        if !src.exists() {
-            return Err(EngineError::NotFound(format!(
-                "no reflection '{from}' in domain '{domain}'"
-            )));
-        }
-        self.refuse_taken_page_target(domain, &access, from, to)
-            .await?;
+        let screen = self.screen_reflection_move(&mv).await?;
         // The room over the page saves its text and ends; no room opens over
         // the old path until the move is done (the fence). Its sockets are
         // told where the page went once the move has committed, and
@@ -3290,122 +3281,17 @@ impl Engine {
         // Both pages' locks, in lock-key order, so two crossing moves cannot
         // wait on each other; two spellings of one file take its lock once.
         // Held until the moved page is indexed.
-        let pact_src = access.abs(&pact_from);
-        let pact_dst = access.abs(&pact_to);
-        let follower_abs: Vec<PathBuf> = followers.iter().map(|f| access.abs(f)).collect();
+        let (src, dst) = (access.abs(from), access.abs(to));
+        let pact_src = access.abs(&mv.pact_from);
+        let pact_dst = access.abs(&mv.pact_to);
+        let follower_abs: Vec<PathBuf> = screen.followers.iter().map(|f| access.abs(f)).collect();
         let mut lock_paths: Vec<&Path> = vec![&src, &dst, &pact_src, &pact_dst];
         lock_paths.extend(follower_abs.iter().map(PathBuf::as_path));
         let _locks = self.lock_files(&lock_paths).await;
-        let text = read_opt(&src)?.ok_or_else(|| {
-            EngineError::NotFound(format!("no reflection '{from}' in domain '{domain}'"))
-        })?;
-        self.refuse_taken_page_target(domain, &access, from, to)
+        let staged = self
+            .stage_reflection_move(&mv, &screen.followers, &follower_abs)
             .await?;
-        // A pact that appeared after the screen was not weighed by the
-        // rights check: the move waits.
-        if !has_pact && pact_src.exists() {
-            return Err(EngineError::Conflict(format!(
-                "'{pact_from}' was written while this move was on its way; try the move again"
-            )));
-        }
-        // The pact's own relative links follow the move as the page's do.
-        let pact_baseline = read_opt(&access.abs(&r::baseline_path(&pact_from)))?;
-        let pact = match read_opt(&pact_src)? {
-            Some(pact) if has_pact => Some(
-                r::relink(&pact, pact_baseline.as_deref().unwrap_or(""), &|s| {
-                    r::rebase_links(s, &pact_from, &pact_to)
-                })
-                .map_err(EngineError::Invalid)?,
-            ),
-            _ => None,
-        };
-        let pact_text = pact
-            .as_ref()
-            .map(|moved| crystalline_core::to_lf(&moved.page).into_owned());
-        // Each follower names the new path; only its frontmatter changes,
-        // which no section and no baseline holds.
-        let mut refollowed: Vec<(&str, &Path, String)> = Vec::new();
-        for (inner, abs) in followers.iter().zip(&follower_abs) {
-            if let Some(text) = read_opt(abs)? {
-                let (text, n) = r::rewrite_follows(&text, from, to);
-                if n > 0 {
-                    refollowed.push((inner, abs, crystalline_core::to_lf(&text).into_owned()));
-                }
-            }
-        }
-        // The page's own relative links follow the move, and its
-        // baseline gets the same rewrite with the `reflected` hashes carried,
-        // so a move owes no feedback.
-        let old_baseline = read_opt(&access.abs(&r::baseline_path(from)))?;
-        let moved = r::relink(&text, old_baseline.as_deref().unwrap_or(""), &|s| {
-            r::rebase_links(s, from, to)
-        })
-        .map_err(EngineError::Invalid)?;
-        // The row is built from the text as written, so it matches the file.
-        let page = crystalline_core::to_lf(&moved.page).into_owned();
-        let mut undo = DiskUndo::default();
-        let mut renames = vec![
-            (from.to_string(), to.to_string()),
-            (r::baseline_path(from), r::baseline_path(to)),
-            (r::threads_path(from), r::threads_path(to)),
-        ];
-        if pact.is_some() {
-            renames.extend([
-                (pact_from.clone(), pact_to.clone()),
-                (r::baseline_path(&pact_from), r::baseline_path(&pact_to)),
-                (r::threads_path(&pact_from), r::threads_path(&pact_to)),
-            ]);
-        }
-        for (old_rel, new_rel) in renames {
-            let (old, new) = (access.abs(&old_rel), access.abs(&new_rel));
-            if is_case_only_rename(&old, &new, &old_rel, &new_rel) {
-                undo.record_case_rename(&old, &new)?;
-            } else {
-                undo.record(&old)?;
-                undo.record(&new)?;
-            }
-        }
-        for (_, abs, _) in &refollowed {
-            undo.record(abs)?;
-        }
-        let replace = |old_rel: &str, new_rel: &str, text: &str| {
-            let (old, new) = (access.abs(old_rel), access.abs(new_rel));
-            let case_only = is_case_only_rename(&old, &new, old_rel, new_rel);
-            replace_file_with(&old, &new, case_only, |p| write_file(p, text))
-        };
-        replace(from, to, &page)?;
-        if old_baseline.is_some() {
-            replace(
-                &r::baseline_path(from),
-                &r::baseline_path(to),
-                &moved.baseline,
-            )?;
-        }
-        let mut threads_moved = false;
-        if let Some(body) = read_opt(&access.abs(&r::threads_path(from)))? {
-            replace(&r::threads_path(from), &r::threads_path(to), &body)?;
-            threads_moved = true;
-        }
-        if let (Some(moved), Some(pact_text)) = (&pact, &pact_text) {
-            replace(&pact_from, &pact_to, pact_text)?;
-            if pact_baseline.is_some() {
-                replace(
-                    &r::baseline_path(&pact_from),
-                    &r::baseline_path(&pact_to),
-                    &moved.baseline,
-                )?;
-            }
-            if let Some(body) = read_opt(&access.abs(&r::threads_path(&pact_from)))? {
-                replace(
-                    &r::threads_path(&pact_from),
-                    &r::threads_path(&pact_to),
-                    &body,
-                )?;
-            }
-        }
-        for (_, abs, text) in &refollowed {
-            write_file(abs, text)?;
-        }
+        let (undo, threads_moved) = write_reflection_move(&mv, &staged)?;
         // The old rows go and the new ones come in one fenced commit: the
         // page with its reconcile state, its pact and the pages that follow
         // it.
@@ -3416,26 +3302,26 @@ impl Engine {
             RowOp::DeletePage(from),
             RowOp::Page {
                 inner: to,
-                text: &page,
+                text: &staged.page,
                 abs: &dst,
             },
         ];
-        if let Some(pact_text) = &pact_text {
-            ops.push(RowOp::DeletePage(&pact_from));
+        if let Some((pact_text, _)) = &staged.pact {
+            ops.push(RowOp::DeletePage(&mv.pact_from));
             ops.push(RowOp::Page {
-                inner: &pact_to,
+                inner: &mv.pact_to,
                 text: pact_text,
                 abs: &pact_dst,
             });
         }
-        for (inner, abs, text) in &refollowed {
+        for (inner, abs, text) in &staged.refollowed {
             ops.push(RowOp::Page { inner, text, abs });
         }
         self.commit_reflection_rows(access.domain_id, &ops, OnRefusal::put_back(domain, undo))
             .await?;
         self.move_disclosures(access.domain_id, from, to).await?;
-        if pact.is_some() {
-            self.move_disclosures(access.domain_id, &pact_from, &pact_to)
+        if staged.pact.is_some() {
+            self.move_disclosures(access.domain_id, &mv.pact_from, &mv.pact_to)
                 .await?;
         }
         drop(_locks);
@@ -3451,39 +3337,199 @@ impl Engine {
             Some(from),
             change_label(&caller.scope),
         );
-        if pact.is_some() {
+        if staged.pact.is_some() {
             self.announce_reflection(
                 domain,
-                &pact_to,
+                &mv.pact_to,
                 ReflectionChangeKind::Moved,
-                Some(&pact_from),
+                Some(&mv.pact_from),
                 change_label(&caller.scope),
             );
         }
         // A follows that followed the move: nobody's change.
-        for (inner, _, _) in &refollowed {
+        for (inner, _, _) in &staged.refollowed {
             self.announce_reflection(domain, inner, ReflectionChangeKind::Changed, None, None);
         }
-        // Every other page that links the moved one, PACT.md included: a link
-        // that follows a move is no change of the agreement, and a move needs
-        // only edit access. Each page under its own lock. The move has
-        // landed by now, so a page that cannot be relinked is named in the
-        // receipt (and the log) instead of failing a move that happened.
-        let mut failed: Vec<Value> = Vec::new();
-        let mut note_failure = |path: &str, e: EngineError| {
-            tracing::warn!(
-                domain,
-                from,
-                to,
-                page = path,
-                "a link to the moved reflection could not be rewritten: {e}"
-            );
-            super::move_::note_link_failure(&mut failed, domain, path, &e);
+        let (links, failed) = self.relink_after_move(&mv, &screen.others).await;
+        // The move and every page it relinked.
+        self.mark_reflection_dirty(domain, BackupCause::Settled);
+        let mut receipt = json!({
+            "from": from,
+            "to": to,
+            "links_rewritten": links,
+            "threads_moved": threads_moved,
+            "pact_moved": staged.pact.is_some(),
+            "follows_rewritten": staged.refollowed.len(),
+        });
+        if !failed.is_empty() {
+            receipt["links_failed"] = json!(failed);
+        }
+        Ok(receipt)
+    }
+
+    /// Every check that can refuse the move `mv`, run before any lock, so a
+    /// refused move leaves an open room over the page alone: the curator's
+    /// moves, open rooms over the pages it rewrites, a missing page and a
+    /// taken target. The last two run again under the locks
+    /// ([`Engine::stage_reflection_move`]), where they decide.
+    async fn screen_reflection_move(&self, mv: &PageMove<'_>) -> Result<MoveScreen> {
+        let (domain, access, from, to) = (mv.domain, mv.access, mv.from, mv.to);
+        // Every other page whose links the move rewrites waits: a rewrite
+        // under an open room would race its next save. Screened from the
+        // text on disk before anything moves, and relinked from this list
+        // once the move has landed. The moved page's own room is not a
+        // refusal: it is closed once every screen has passed.
+        let rows = self
+            .store
+            .lock()
+            .await
+            .list_reflection_stamps(access.domain_id)
+            .await?;
+        // A move that changes what a curator set is a curator's: the page
+        // takes its pact along, or its new path becomes the folder parent
+        // whose pact the pages under it then follow.
+        if access.right < ReflectionRight::Curate {
+            let because = if mv.has_pact {
+                Some(format!("it takes its page pact '{}' along", mv.pact_from))
+            } else {
+                becomes_folder_parent(rows.iter().map(|row| row.path.as_str()), from, to).map(
+                    |child| {
+                        format!(
+                            "'{to}' becomes the folder parent of '{child}', which then follows its pact"
+                        )
+                    },
+                )
+            };
+            if let Some(because) = because {
+                return Err(EngineError::Forbidden(format!(
+                    "moving '{from}' to '{to}' is a curator's move because {because}; your access to the Reflection of '{domain}' is {} and curate is needed",
+                    reflection_right_word(access.right)
+                )));
+            }
+        }
+        let others: Vec<String> = rows
+            .into_iter()
+            .map(|row| row.path)
+            .filter(|path| mv.is_other(path))
+            .collect();
+        let mut linking =
+            rooms_to_rewrite(access, others.iter().map(String::as_str), &|text, inner| {
+                mv.relink_moved(text, inner).1
+            });
+        // The pages that follow the moved page follow it to its new path, in
+        // this move: they wait for an open room like a link rewrite.
+        let followers = rooms_to_rewrite(access, others.iter().map(String::as_str), &|text, _| {
+            r::rewrite_follows(text, from, to).1
+        });
+        linking.extend(
+            followers
+                .iter()
+                .filter(|f| !linking.contains(f))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        if mv.has_pact {
+            linking.push(mv.pact_from.clone());
+        }
+        self.refuse_under_live_pages(domain, &linking).await?;
+        if !access.abs(from).exists() {
+            return Err(EngineError::NotFound(format!(
+                "no reflection '{from}' in domain '{domain}'"
+            )));
+        }
+        self.refuse_taken_page_target(domain, access, from, to)
+            .await?;
+        Ok(MoveScreen { others, followers })
+    }
+
+    /// Read what the move `mv` writes and rewrite it, under the move's
+    /// locks: the page and its pact with their links rebased, and each of
+    /// `followers` (at `follower_abs`) naming the new path. Refuses what the
+    /// screen let through and changed since: a page gone, a target taken, a
+    /// pact written meanwhile.
+    async fn stage_reflection_move(
+        &self,
+        mv: &PageMove<'_>,
+        followers: &[String],
+        follower_abs: &[PathBuf],
+    ) -> Result<StagedMove> {
+        let (domain, access, from, to) = (mv.domain, mv.access, mv.from, mv.to);
+        let text = read_opt(&access.abs(from))?.ok_or_else(|| {
+            EngineError::NotFound(format!("no reflection '{from}' in domain '{domain}'"))
+        })?;
+        self.refuse_taken_page_target(domain, access, from, to)
+            .await?;
+        // A pact that appeared after the screen was not weighed by the
+        // rights check: the move waits.
+        let pact_src = access.abs(&mv.pact_from);
+        if !mv.has_pact && pact_src.exists() {
+            return Err(EngineError::Conflict(format!(
+                "'{}' was written while this move was on its way; try the move again",
+                mv.pact_from
+            )));
+        }
+        // The pact's own relative links follow the move as the page's do.
+        let pact_baseline = read_opt(&access.abs(&r::baseline_path(&mv.pact_from)))?;
+        let pact = match read_opt(&pact_src)? {
+            Some(pact) if mv.has_pact => {
+                let moved = r::relink(&pact, pact_baseline.as_deref().unwrap_or(""), &|s| {
+                    r::rebase_links(s, &mv.pact_from, &mv.pact_to)
+                })
+                .map_err(EngineError::Invalid)?;
+                Some((
+                    crystalline_core::to_lf(&moved.page).into_owned(),
+                    pact_baseline.is_some().then_some(moved.baseline),
+                ))
+            }
+            _ => None,
         };
+        // Each follower names the new path; only its frontmatter changes,
+        // which no section and no baseline holds.
+        let mut refollowed = Vec::new();
+        for (inner, abs) in followers.iter().zip(follower_abs) {
+            if let Some(text) = read_opt(abs)? {
+                let (text, n) = r::rewrite_follows(&text, from, to);
+                if n > 0 {
+                    refollowed.push((
+                        inner.clone(),
+                        abs.clone(),
+                        crystalline_core::to_lf(&text).into_owned(),
+                    ));
+                }
+            }
+        }
+        // The page's own relative links follow the move, and its
+        // baseline gets the same rewrite with the `reflected` hashes carried,
+        // so a move owes no feedback.
+        let old_baseline = read_opt(&access.abs(&r::baseline_path(from)))?;
+        let moved = r::relink(&text, old_baseline.as_deref().unwrap_or(""), &|s| {
+            r::rebase_links(s, from, to)
+        })
+        .map_err(EngineError::Invalid)?;
+        Ok(StagedMove {
+            // The row is built from the text as written, so it matches the
+            // file.
+            page: crystalline_core::to_lf(&moved.page).into_owned(),
+            baseline: old_baseline.is_some().then_some(moved.baseline),
+            pact,
+            refollowed,
+        })
+    }
+
+    /// Rewrite the links of every page of `others` that reach the page `mv`
+    /// moved (or its pact), each under its own lock, once the move has
+    /// landed: `PACT.md` included, since a link that follows a move is no
+    /// change of the agreement and a move needs only edit access. A page that
+    /// cannot be relinked is named (and logged) instead of failing a move
+    /// that happened. Answers how many links changed and the pages that
+    /// failed.
+    async fn relink_after_move(&self, mv: &PageMove<'_>, others: &[String]) -> (usize, Vec<Value>) {
+        let (domain, from, to) = (mv.domain, mv.from, mv.to);
+        let mut failed: Vec<Value> = Vec::new();
         let mut links = 0;
-        for inner in others() {
+        for inner in others {
             match self
-                .relink_reflection(domain, &access, inner, &|s| relink_moved(s, inner))
+                .relink_reflection(domain, mv.access, inner, &|s| mv.relink_moved(s, inner))
                 .await
             {
                 Ok(n) => {
@@ -3499,23 +3545,19 @@ impl Engine {
                         );
                     }
                 }
-                Err(e) => note_failure(inner, e),
+                Err(e) => {
+                    tracing::warn!(
+                        domain,
+                        from,
+                        to,
+                        page = inner.as_str(),
+                        "a link to the moved reflection could not be rewritten: {e}"
+                    );
+                    super::move_::note_link_failure(&mut failed, domain, inner, &e);
+                }
             }
         }
-        // The move and every page it relinked.
-        self.mark_reflection_dirty(domain, BackupCause::Settled);
-        let mut receipt = json!({
-            "from": from,
-            "to": to,
-            "links_rewritten": links,
-            "threads_moved": threads_moved,
-            "pact_moved": pact.is_some(),
-            "follows_rewritten": refollowed.len(),
-        });
-        if !failed.is_empty() {
-            receipt["links_failed"] = json!(failed);
-        }
-        Ok(receipt)
+        (links, failed)
     }
 
     /// Refuse a page move whose target is taken (the error ends with
@@ -3865,6 +3907,75 @@ impl Engine {
         );
         Ok(json!({ "domain": domain, "path": inner, "settled": ids, "outcome": outcome }))
     }
+}
+
+/// Put what `staged` holds for the move `mv` on disk: the page, its
+/// baseline, threads and pact under their new paths, and each follower's new
+/// text. Answers the undo that puts every file back, and whether a threads
+/// file moved.
+fn write_reflection_move(mv: &PageMove<'_>, staged: &StagedMove) -> Result<(DiskUndo, bool)> {
+    let (access, from, to) = (mv.access, mv.from, mv.to);
+    let (pact_from, pact_to) = (mv.pact_from.as_str(), mv.pact_to.as_str());
+    let mut undo = DiskUndo::default();
+    let mut renames = vec![
+        (from.to_string(), to.to_string()),
+        (r::baseline_path(from), r::baseline_path(to)),
+        (r::threads_path(from), r::threads_path(to)),
+    ];
+    if staged.pact.is_some() {
+        renames.extend([
+            (pact_from.to_string(), pact_to.to_string()),
+            (r::baseline_path(pact_from), r::baseline_path(pact_to)),
+            (r::threads_path(pact_from), r::threads_path(pact_to)),
+        ]);
+    }
+    for (old_rel, new_rel) in renames {
+        let (old, new) = (access.abs(&old_rel), access.abs(&new_rel));
+        if is_case_only_rename(&old, &new, &old_rel, &new_rel) {
+            undo.record_case_rename(&old, &new)?;
+        } else {
+            undo.record(&old)?;
+            undo.record(&new)?;
+        }
+    }
+    for (_, abs, _) in &staged.refollowed {
+        undo.record(abs)?;
+    }
+    let replace = |old_rel: &str, new_rel: &str, text: &str| {
+        let (old, new) = (access.abs(old_rel), access.abs(new_rel));
+        let case_only = is_case_only_rename(&old, &new, old_rel, new_rel);
+        replace_file_with(&old, &new, case_only, |p| write_file(p, text))
+    };
+    replace(from, to, &staged.page)?;
+    if let Some(baseline) = &staged.baseline {
+        replace(&r::baseline_path(from), &r::baseline_path(to), baseline)?;
+    }
+    let mut threads_moved = false;
+    if let Some(body) = read_opt(&access.abs(&r::threads_path(from)))? {
+        replace(&r::threads_path(from), &r::threads_path(to), &body)?;
+        threads_moved = true;
+    }
+    if let Some((pact_text, pact_baseline)) = &staged.pact {
+        replace(pact_from, pact_to, pact_text)?;
+        if let Some(baseline) = pact_baseline {
+            replace(
+                &r::baseline_path(pact_from),
+                &r::baseline_path(pact_to),
+                baseline,
+            )?;
+        }
+        if let Some(body) = read_opt(&access.abs(&r::threads_path(pact_from)))? {
+            replace(
+                &r::threads_path(pact_from),
+                &r::threads_path(pact_to),
+                &body,
+            )?;
+        }
+    }
+    for (_, abs, text) in &staged.refollowed {
+        write_file(abs, text)?;
+    }
+    Ok((undo, threads_moved))
 }
 
 /// Write `text` at `new` and remove `old`. For a case-only rename (see
