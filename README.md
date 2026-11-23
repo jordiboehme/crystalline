@@ -165,7 +165,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [MCP clients over OAuth](docs/deployment.md#mcp-clients-over-oauth) | A hosted client such as Claude.ai signs the person in and consents once; no token is pasted |
 | [A local Crystalline with domains from shared servers](docs/deployment.md#a-local-crystalline-with-domains-from-shared-servers) | `crystalline connect` adds a server as a source; your agent sees your local domains and every server's at once, through one registration |
 | [Under a path](docs/deployment.md#under-a-path) | Share a host name: `https://example.com/crystalline` behind nginx or Caddy, with the proxy stripping the path or passing it through |
-| [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in, and an invite link is taken by signing on |
+| [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in, and an invite link is taken by signing in |
 | [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet; an invite link gives that person the membership it offers |
 
 ## Go deeper

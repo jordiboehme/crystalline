@@ -22,7 +22,8 @@
 #   crystalline agents add gha-evolve --loops evolve
 #
 # One agent with both loops (--loops reflect,evolve) works too: each run
-# names its loop to the server. A token expires after 90 days by default;
+# names its loop to the server. Put its token into both secrets, or issue a
+# second token for it with `crystalline agents token <name>`. A token expires after 90 days by default;
 # issue a new one with `crystalline agents token <name>`, update the secret,
 # then revoke the old one with `crystalline agents revoke`. A secret that
 # still holds the cmt_ token of an account keeps working.
