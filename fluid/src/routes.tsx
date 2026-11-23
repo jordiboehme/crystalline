@@ -24,6 +24,7 @@ import {
   useSearchParams,
 } from "react-router";
 
+import { useAuth } from "./auth/AuthContext";
 import LoginPage from "./auth/LoginPage";
 import { RequireAuth } from "./auth/RequireAuth";
 import { Layout } from "./components/Layout";
@@ -35,7 +36,13 @@ import {
   opensOnReflection,
   useReflectionStatus,
 } from "./components/ReflectionModeSwitch";
-import { engramsRoute, reflectionRoute } from "./paths";
+import {
+  adminGeneralRoute,
+  engramsRoute,
+  githubSettingsRoute,
+  reflectionRoute,
+  usersRoute,
+} from "./paths";
 import Home from "./screens/Home";
 import NotFound from "./screens/NotFound";
 import OauthConsent from "./screens/OauthConsent";
@@ -94,11 +101,23 @@ const ManifestEditor = lazyChunk(() => import("./screens/ManifestEditor"));
 const EngramPage = lazyChunk(() => import("./screens/EngramPage"));
 
 /**
- * And the two admin screens, which are lazy for a different reason: they weigh
- * almost nothing each, but they are screens only an admin ever opens, and the
- * app shell is paid for by everybody who opens the app at all. The accounts
- * table is the larger of the two and takes the most off the eager path.
+ * And the Administration area, lazy for a different reason: its pages weigh
+ * little each, but only an admin ever opens them, and the app shell is paid
+ * for by everybody who opens the app at all. The frame and its small pages
+ * (General and the two placeholders) share one chunk; the accounts table and
+ * the GitHub connection keep a chunk each, the accounts table being the
+ * largest and taking the most off the eager path.
  */
+const AdminArea = lazyChunk(() => import("./screens/AdminArea"));
+const AdminGeneral = lazyChunk(() =>
+  import("./screens/AdminArea").then((m) => ({ default: m.AdminGeneral })),
+);
+const AdminAgents = lazyChunk(() =>
+  import("./screens/AdminArea").then((m) => ({ default: m.AdminAgents })),
+);
+const AdminInvites = lazyChunk(() =>
+  import("./screens/AdminArea").then((m) => ({ default: m.AdminInvites })),
+);
 const GithubSettings = lazyChunk(() => import("./screens/GithubSettings"));
 const UsersAdmin = lazyChunk(() => import("./screens/UsersAdmin"));
 
@@ -184,6 +203,24 @@ const SoundBoard = import.meta.env.DEV
 function ManifestRedirect() {
   const { domain = "" } = useParams();
   return <Navigate to={engramsRoute(domain)} replace />;
+}
+
+/**
+ * An address an admin page had before the Administration area (0.35.0):
+ * `/users` and `/settings/github`. For an admin it goes on to the page's new
+ * address with its query and fragment, so a bookmark or the link back from
+ * GitHub (`?app=created`) still lands with what it carried; the router's
+ * basename keeps the base path. Anyone else gets the not-found screen in
+ * place, the answer both addresses always gave them, so the old address says
+ * no more than a mistyped one does.
+ */
+function MovedAdminPage({ to }: { to: string }) {
+  const { capabilities } = useAuth();
+  const location = useLocation();
+  if (!capabilities.canAdminister) {
+    return <NotFound />;
+  }
+  return <Navigate to={`${to}${location.search}${location.hash}`} replace />;
 }
 
 /**
@@ -274,6 +311,10 @@ const SETTINGS_FALLBACK = (
 
 const USERS_FALLBACK = (
   <Loading label="Loading accounts" subject="the accounts" />
+);
+
+const ADMIN_FALLBACK = (
+  <Loading label="Loading administration" subject="the administration" />
 );
 
 const PROFILE_FALLBACK = (
@@ -440,7 +481,7 @@ export function AppRoutes() {
             redirect, kept so a link somebody saved still lands where the
             MANIFEST is read now, the domain page; the editor rides its own
             lazy chunk, gated to admins by the screen itself the same way
-            `/users` is.
+            the Administration area is.
           */}
           <Route path="/d/:domain/manifest" element={<ManifestRedirect />} />
           <Route
@@ -554,38 +595,81 @@ export function AppRoutes() {
             }
           />
           {/*
-            Routed for everybody and rendered for admins only: the screen
-            itself answers with the not-found screen for anyone else, so the
-            address says exactly as much as a mistyped one does. Lazy for the
-            same reason the settings screen is - nobody but an admin ever
-            loads it - and the chunk carries the refusal too, which is what
-            keeps the address from saying more than a mistyped one.
+            The Administration area. Routed for everybody and rendered for
+            admins only: the frame answers every address under it with the
+            not-found screen for anyone else, so the area says exactly as
+            much as a mistyped address does, and its pages never mount for
+            them. `/admin` itself opens General. Maintenance is not in here:
+            every role may open it, so it stays at `/maintenance` and the
+            area only links to it.
           */}
           <Route
-            path="/users"
+            path="/admin"
             element={
-              <LazyBoundary fallback={USERS_FALLBACK}>
-                <UsersAdmin />
+              <LazyBoundary fallback={ADMIN_FALLBACK}>
+                <AdminArea />
               </LazyBoundary>
             }
-          />
+          >
+            <Route
+              index
+              element={<Navigate to={adminGeneralRoute()} replace />}
+            />
+            <Route
+              path="general"
+              element={
+                <LazyBoundary fallback={ADMIN_FALLBACK}>
+                  <AdminGeneral />
+                </LazyBoundary>
+              }
+            />
+            <Route
+              path="users"
+              element={
+                <LazyBoundary fallback={USERS_FALLBACK}>
+                  <UsersAdmin />
+                </LazyBoundary>
+              }
+            />
+            <Route
+              path="agents"
+              element={
+                <LazyBoundary fallback={ADMIN_FALLBACK}>
+                  <AdminAgents />
+                </LazyBoundary>
+              }
+            />
+            <Route
+              path="invites"
+              element={
+                <LazyBoundary fallback={ADMIN_FALLBACK}>
+                  <AdminInvites />
+                </LazyBoundary>
+              }
+            />
+            <Route
+              path="github"
+              element={
+                <LazyBoundary fallback={SETTINGS_FALLBACK}>
+                  <GithubSettings />
+                </LazyBoundary>
+              }
+            />
+            <Route path="*" element={<NotFound />} />
+          </Route>
           {/*
-            The same arrangement, one screen along: routed for everybody,
-            rendered for admins only, and lazy because nobody else will ever
-            load it.
+            The two addresses admin pages had before the area: they move on
+            with their query, or answer not-found for a non-admin.
           */}
+          <Route path="/users" element={<MovedAdminPage to={usersRoute()} />} />
           <Route
             path="/settings/github"
-            element={
-              <LazyBoundary fallback={SETTINGS_FALLBACK}>
-                <GithubSettings />
-              </LazyBoundary>
-            }
+            element={<MovedAdminPage to={githubSettingsRoute()} />}
           />
           {/*
             Routed for everybody and rendered for an account: an anonymous
             session has no profile, and the screen says so with the not-found
-            screen the way the two admin ones do.
+            screen the way the admin pages do.
           */}
           <Route
             path="/profile"

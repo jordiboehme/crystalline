@@ -94,10 +94,12 @@ import {
 import type { EngramsOrder, EngramsOrderChoice } from "../engramsOrder";
 import { HANDBOOK_URL } from "../handbook";
 import {
+  adminRoute,
   domainRoute,
   githubSettingsRoute,
   reflectionPathOf,
   searchRoute,
+  usersRoute,
 } from "../paths";
 import { PREFETCH } from "../prefetch";
 import { useWide } from "../useWide";
@@ -775,6 +777,20 @@ export function Layout() {
         title: "Create domain",
         run: () => {
           setCreatingDomain(true);
+        },
+      });
+      frame.push({
+        id: "administration",
+        title: "Administration",
+        run: () => {
+          void navigate(adminRoute());
+        },
+      });
+      frame.push({
+        id: "users",
+        title: "Users",
+        run: () => {
+          void navigate(usersRoute());
         },
       });
       frame.push({

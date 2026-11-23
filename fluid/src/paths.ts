@@ -218,14 +218,41 @@ export function graphRoute(
 }
 
 /**
- * The account administration screen.
+ * The Administration area, which opens on its General page.
+ *
+ * Every page an admin uses to look after the instance lives under it:
+ * General, Users, Agents, Invites and the GitHub connection. Maintenance is
+ * not one of them, since every role may open it; the area only links to it.
+ */
+export function adminRoute(): string {
+  return "/admin";
+}
+
+/** The Administration area's first page: the version, updates and address. */
+export function adminGeneralRoute(): string {
+  return "/admin/general";
+}
+
+/**
+ * The account administration page.
  *
  * A constant rather than a literal at each call site for the reason every
  * builder here exists: the pattern in `routes.tsx` and the links pointing at
- * it are one fact, kept in one place.
+ * it are one fact, kept in one place. It was `/users` before 0.35.0, and that
+ * address still leads here.
  */
 export function usersRoute(): string {
-  return "/users";
+  return "/admin/users";
+}
+
+/** The agents page of the Administration area. */
+export function adminAgentsRoute(): string {
+  return "/admin/agents";
+}
+
+/** The invites page of the Administration area. */
+export function adminInvitesRoute(): string {
+  return "/admin/invites";
 }
 
 /**
@@ -241,20 +268,19 @@ export function maintenanceRoute(): string {
 }
 
 /**
- * The GitHub settings screen.
+ * The GitHub connection page of the Administration area.
  *
- * Under `/settings/` even though it is the only section there: the address
- * says what kind of screen it is, and the next section will not need every
- * link that points here rewritten.
+ * It was `/settings/github` before 0.35.0, and that address still leads
+ * here, with its query, so a link GitHub or a person kept keeps working.
  */
 export function githubSettingsRoute(): string {
-  return "/settings/github";
+  return "/admin/github";
 }
 
 /**
  * Your own profile: who this session is, and the GitHub identity it shares as.
  *
- * Not under `/settings/`, which is where this instance's own settings live and
+ * Not under `/admin/`, which is where this instance's own settings live and
  * where only an admin goes. This screen is about the person rather than about
  * the machine, and everybody who can share has one.
  */

@@ -120,7 +120,7 @@ describe("the user admin screen", () => {
         domains: [{ domain: "team", discarded: 2, left: [] }],
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     const end = await screen.findByRole("button", { name: "End these drafts" });
     expect(end).toBeDisabled();
 
@@ -159,7 +159,7 @@ describe("the user admin screen", () => {
         ],
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await user.type(
       await screen.findByLabelText("Removed account's name"),
       "ada",
@@ -181,7 +181,7 @@ describe("the user admin screen", () => {
         error: "the kept texts of domain 'team' could not be read",
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await user.type(
       await screen.findByLabelText("Removed account's name"),
       "gone",
@@ -200,7 +200,7 @@ describe("the user admin screen", () => {
         throw new ApiProblem(409, "conflict", "'eddy' is an account");
       },
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await user.type(
       await screen.findByLabelText("Removed account's name"),
       "eddy",
@@ -212,7 +212,7 @@ describe("the user admin screen", () => {
 
   it("sets the Reflection level beside the role, and shows curator for editors", async () => {
     serveAs("admin");
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const nora = await rowFor("nora");
     expect(
@@ -241,7 +241,7 @@ describe("the user admin screen", () => {
           ? { user: { ...usersListing().users[2], reflection: "reader" } }
           : usersListing(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const nora = await rowFor("nora");
     await userEvent.selectOptions(
@@ -259,7 +259,7 @@ describe("the user admin screen", () => {
     serveAs("admin", {
       "/users/eddy": () => ({ user: usersListing().users[1] }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const eddy = await rowFor("eddy");
     await userEvent.selectOptions(
@@ -281,7 +281,7 @@ describe("the user admin screen", () => {
           ? { user: usersListing().users[1] }
           : usersListing(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     await rowFor("nora");
     await userEvent.type(screen.getByLabelText("Login name"), "kim");
@@ -309,7 +309,7 @@ describe("the user admin screen", () => {
           ? { user: usersListing().users[2] }
           : usersListing(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     await rowFor("nora");
     await userEvent.type(screen.getByLabelText("Login name"), "kim");
@@ -329,7 +329,7 @@ describe("the user admin screen", () => {
 
   it("lists accounts with role, state and last seen", async () => {
     serveAs("admin");
-    renderApp("/users");
+    renderApp("/admin/users");
 
     expect(
       await screen.findByRole("heading", { name: /users/i }),
@@ -342,7 +342,7 @@ describe("the user admin screen", () => {
 
   it("is not there for a non-admin", async () => {
     serveAs("editor");
-    renderApp("/users");
+    renderApp("/admin/users");
 
     await waitFor(() => {
       expect(
@@ -365,7 +365,7 @@ describe("the user admin screen", () => {
 
   it("offers the nav entry to an admin", async () => {
     serveAs("admin");
-    renderApp("/users");
+    renderApp("/admin/users");
 
     // Inside the identity menu rather than on an icon of its own: who you are
     // and the accounts only you may administer are one subject, and the frame
@@ -375,12 +375,12 @@ describe("the user admin screen", () => {
     );
     expect(
       await screen.findByRole("menuitem", { name: "Users" }),
-    ).toHaveAttribute("href", "/users");
+    ).toHaveAttribute("href", "/admin/users");
   });
 
   it("teaches what to do when no account is listed", async () => {
     serveAs("admin", { "/users": () => ({ users: [] }) });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     expect(await screen.findByText(/no accounts yet/i)).toBeInTheDocument();
   });
@@ -398,7 +398,7 @@ describe("the user admin screen", () => {
         return usersListing();
       },
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const row = await rowFor("root");
     const roleSelect = within(row).getByLabelText(/role/i);
@@ -439,7 +439,7 @@ describe("the user admin screen", () => {
         return usersListing();
       },
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const row = await rowFor("eddy");
     const roleSelect = within(row).getByLabelText(/role/i);
@@ -464,7 +464,7 @@ describe("the user admin screen", () => {
       "/users": (_path, init) =>
         init?.method === "POST" ? created() : usersListing(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await rowFor("root");
 
     await userEvent.type(screen.getByLabelText(/login name/i), "bob");
@@ -494,7 +494,7 @@ describe("the user admin screen", () => {
         return usersListing();
       },
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await rowFor("root");
 
     const nameField = screen.getByLabelText(/login name/i);
@@ -513,7 +513,7 @@ describe("the user admin screen", () => {
       "/users/eddy": (_path, init) =>
         init?.method === "DELETE" ? deleted() : usersListing(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await rowFor("eddy");
 
     await userEvent.click(screen.getByRole("button", { name: /delete eddy/i }));
@@ -529,7 +529,7 @@ describe("the user admin screen", () => {
 
   it("takes back the confirmation on escape, with the focus", async () => {
     serveAs("admin");
-    renderApp("/users");
+    renderApp("/admin/users");
     await rowFor("eddy");
 
     const trigger = screen.getByRole("button", { name: /delete eddy/i });
@@ -561,7 +561,7 @@ describe("the user admin screen", () => {
             }
           : usersListing(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await rowFor("eddy");
 
     // The caller cannot lock themselves out from here: the server refuses it,
@@ -590,7 +590,7 @@ describe("the user admin screen", () => {
       },
     }));
     serveAs("admin", { "/users/eddy/password": () => reset() });
-    renderApp("/users");
+    renderApp("/admin/users");
     const row = await rowFor("eddy");
 
     await userEvent.click(
@@ -626,7 +626,7 @@ describe("the user admin screen", () => {
             }
           : usersListing(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     const row = await rowFor("eddy");
 
     const display = within(row).getByLabelText(/display name for eddy/i);

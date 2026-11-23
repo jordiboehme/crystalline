@@ -43,6 +43,9 @@ interface Cost {
  * longer than the others; a stale number only costs balance, never coverage.
  */
 const COSTS: Readonly<Record<string, Cost>> = {
+  // Measured locally on 2026-11-23 (chromium, 4.1 s), rounded up;
+  // replace with a CI number.
+  "admin.spec.ts": { root: 5, path: 5 },
   "diagram-editing.spec.ts": { root: 119, path: 119 },
   "diagram-hold.spec.ts": { root: 17, path: 17 },
   "diagram-keys.spec.ts": { root: 135, path: 135 },

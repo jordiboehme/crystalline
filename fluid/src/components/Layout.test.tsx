@@ -576,7 +576,7 @@ describe("the layout", () => {
     // Then the two screens this session may reach, then the way out.
     expect(
       await screen.findByRole("menuitem", { name: "Users" }),
-    ).toHaveAttribute("href", "/users");
+    ).toHaveAttribute("href", "/admin/users");
     // Under a heading of its own, so it reads as the instance's settings
     // rather than the signed-in person's.
     expect(
@@ -584,7 +584,7 @@ describe("the layout", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("menuitem", { name: "GitHub connection" }),
-    ).toHaveAttribute("href", "/settings/github");
+    ).toHaveAttribute("href", "/admin/github");
     expect(screen.getByRole("menuitem", { name: "Log out" })).toBeVisible();
   });
 

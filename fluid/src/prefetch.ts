@@ -67,8 +67,19 @@ const SCREENS = {
   domainSettings: () => import("./screens/DomainSettings"),
   graph: () => import("./screens/GraphView"),
   maintenance: () => import("./screens/Maintenance"),
-  users: () => import("./screens/UsersAdmin"),
-  github: () => import("./screens/GithubSettings"),
+  // The two admin pages open inside the Administration area's frame, so a
+  // link to either warms the frame's chunk as well as its own.
+  admin: () => import("./screens/AdminArea"),
+  users: () =>
+    Promise.all([
+      import("./screens/AdminArea"),
+      import("./screens/UsersAdmin"),
+    ]),
+  github: () =>
+    Promise.all([
+      import("./screens/AdminArea"),
+      import("./screens/GithubSettings"),
+    ]),
   profile: () => import("./screens/Profile"),
   reflection: () => import("./screens/ReflectionHome"),
 } as const;
