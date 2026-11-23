@@ -84,8 +84,8 @@ mod tests;
 
 pub use agents::{
     AGENT_LIVE_TOKENS_MAX, AGENT_TOKEN_DEFAULT_TTL_SECS, AGENT_TOKEN_MAX_TTL_SECS,
-    AGENT_TOKEN_MIN_TTL_SECS, AGENT_TOKEN_PREFIX, Agent, AgentLoops, AgentSession, AgentToken,
-    AgentTokenState, IssuedAgentToken, check_agent_token_ttl,
+    AGENT_TOKEN_MIN_TTL_SECS, AGENT_TOKEN_PREFIX, AGENTS_NEED_AUTH_MCP, Agent, AgentLoops,
+    AgentSession, AgentToken, AgentTokenState, IssuedAgentToken, check_agent_token_ttl,
 };
 use db::{AuthDb, AuthRow};
 #[cfg(feature = "postgres")]

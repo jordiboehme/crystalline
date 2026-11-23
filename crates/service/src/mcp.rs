@@ -1203,6 +1203,40 @@ fn mcp_identity(ctx: &RequestContext<RoleServer>) -> Option<crate::mcp_gate::Mcp
         .cloned()
 }
 
+/// The agent of the loops the gate resolved for this request
+/// ([`crate::mcp_gate::McpAgent`]), as its scope before any loop binding.
+/// `None` for anybody else, and always on stdio.
+fn mcp_agent(ctx: &RequestContext<RoleServer>) -> Option<Scope> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    parts
+        .extensions
+        .get::<crate::mcp_gate::McpAgent>()
+        .map(|agent| agent.scope.clone())
+}
+
+/// The text of the request header `name`, trimmed, when it has any.
+fn header_text(ctx: &RequestContext<RoleServer>, name: &str) -> Option<String> {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Where an agent's call stands with its run, decided per call
+/// ([`McpServer::agent_call`]).
+enum AgentCall {
+    /// Not an agent of the loops: nothing here applies.
+    NotAnAgent,
+    /// The session's binding is refused, with the sentence why.
+    Refused(String),
+    /// The agent holds no live lease of its bound loop.
+    Outside(String),
+    /// The agent holds a live lease of its bound loop.
+    Inside(String),
+}
+
 /// What stands in for the client half when a client declared no usable name.
 ///
 /// The composed actor is always two halves, so a bare account name never
@@ -1570,6 +1604,9 @@ pub(crate) struct Caller {
     pub(crate) holder: Option<crate::join::Holder>,
     /// Where this caller opens a page.
     pub(crate) base: crate::web_url::WebBase,
+    /// The loop the session is bound to (the run-loop header), `None` when
+    /// it names none: a run's write is noted only in that loop's lease.
+    pub(crate) run_loop: Option<crystalline_core::automation::Loop>,
 }
 
 impl Caller {
@@ -1832,6 +1869,7 @@ impl McpServer {
     /// reads about who asked.
     fn caller(&self, ctx: &RequestContext<RoleServer>) -> Caller {
         Caller {
+            run_loop: self.bound_loop(ctx).ok().flatten(),
             scope: self.scope_of(ctx),
             account: mcp_account(ctx),
             client: client_actor(ctx),
@@ -1970,12 +2008,21 @@ impl McpServer {
     pub fn with_onboarded_harness(self, onboarded: bool) -> McpServer {
         let unattended = self.gate.unattended;
         let run_domain = self.gate.run_domain.clone();
+        let run_loop = self.gate.run_loop;
         self.with_harness_gate(HarnessGate {
+            run_loop,
             hook_installed: onboarded,
             onboarding_verified: onboarded,
             unattended,
             run_domain,
         })
+    }
+
+    /// Bind this session to the loop an unattended run started it for
+    /// (see [`HarnessGate::run_loop`]).
+    pub fn with_run_loop(mut self, lp: crystalline_core::automation::Loop) -> McpServer {
+        self.gate.run_loop = Some(lp);
+        self
     }
 
     /// Bind this session to the domain an unattended run started it for
@@ -2018,6 +2065,13 @@ impl McpServer {
     ///   made anything private is byte-identical to its old self, and one that
     ///   did keeps it out of an unauthenticated agent's reach.
     fn scope_of(&self, ctx: &RequestContext<RoleServer>) -> Scope {
+        if let Some(agent) = mcp_agent(ctx) {
+            // A session bound to one loop has that loop's rights only. A
+            // binding that is refused binds nothing here: every call of such
+            // a session is refused before it reads its scope.
+            let bound = self.bound_loop(ctx).ok().flatten();
+            return crate::agent_gate::narrowed(agent, bound);
+        }
         match self.transport {
             Transport::Stdio => Scope::Unrestricted,
             Transport::Http => match mcp_identity(ctx) {
@@ -2266,9 +2320,11 @@ impl McpServer {
     fn share_actor(&self, ctx: &RequestContext<RoleServer>) -> ShareActor {
         match self.transport {
             Transport::Stdio => ShareActor::Owner,
-            Transport::Http => match mcp_account(ctx) {
-                Some(account) => ShareActor::Account(account),
-                None => ShareActor::HttpAgent,
+            Transport::Http => match (mcp_agent(ctx), mcp_account(ctx)) {
+                // An agent of the loops shares as the machine's run does.
+                (Some(Scope::Agent { name, .. }), _) => ShareActor::Agent(name),
+                (_, Some(account)) => ShareActor::Account(account),
+                (_, None) => ShareActor::HttpAgent,
             },
         }
     }
@@ -2686,16 +2742,52 @@ impl McpServer {
     /// never reaches it. A caller with no account notes nothing.
     /// A failed note is logged and never fails the write.
     async fn note_run_writes(&self, caller: &Caller, receipt: &Value) {
-        let Scope::User { account, .. } = &caller.scope else {
-            return;
+        // The holder a lease names: an account by its name, an agent by its
+        // key. The loop is the one this session is bound to; an agent with
+        // both loops and no binding notes each write in the loop it belongs
+        // to, never in both.
+        let (holder, bound, agent) = match &caller.scope {
+            Scope::User { account, .. } => (account.clone(), caller.run_loop, false),
+            Scope::Agent { name, loops, .. } => {
+                let bound = match loops {
+                    crate::rest::AgentLoops::Reflect => {
+                        Some(crystalline_core::automation::Loop::Reflect)
+                    }
+                    crate::rest::AgentLoops::Evolve => {
+                        Some(crystalline_core::automation::Loop::Evolve)
+                    }
+                    crate::rest::AgentLoops::Both => None,
+                };
+                (crate::scope::agent_key(name), bound, true)
+            }
+            _ => return,
         };
         // An upload of the bytes the path already held is noted too: it may
         // be the retry of an upload that landed but was never noted (its
         // handler cancelled by a timeout), and the run's pull request must
         // still carry the file.
         for (domain, paths) in written_paths(receipt) {
-            if let Err(e) = self.engine.note_written(&domain, account, &paths).await {
-                tracing::warn!("noting a run's writes in '{domain}': {e}");
+            let mut by_loop: Vec<(Option<crystalline_core::automation::Loop>, Vec<String>)> =
+                Vec::new();
+            for path in paths {
+                let lp = if agent {
+                    Some(crate::agent_gate::loop_of_write(bound, &path))
+                } else {
+                    bound
+                };
+                match by_loop.iter_mut().find(|(l, _)| *l == lp) {
+                    Some((_, group)) => group.push(path),
+                    None => by_loop.push((lp, vec![path])),
+                }
+            }
+            for (lp, paths) in by_loop {
+                if let Err(e) = self
+                    .engine
+                    .note_written_in(&domain, &holder, lp, &paths)
+                    .await
+                {
+                    tracing::warn!("noting a run's writes in '{domain}': {e}");
+                }
             }
         }
     }
@@ -5507,7 +5599,118 @@ fn run_writes_limited() -> bool {
 /// loop lease on that domain, so it can only narrow what the session reads.
 pub const RUN_DOMAIN_HEADER: &str = "X-Crystalline-Run-Domain";
 
+/// The header a remote loop run sends beside [`RUN_DOMAIN_HEADER`]: the loop
+/// it started this session for, `reflect` or `evolve`. Believed like the run
+/// domain, so it can only narrow: the session counts only that loop's leases
+/// as what it works on, and a write is noted only in that loop's lease. An
+/// agent of the loops that runs one loop is bound to it without the header.
+pub const RUN_LOOP_HEADER: &str = "X-Crystalline-Run-Loop";
+
 impl McpServer {
+    /// The loop this session is bound to.
+    ///
+    /// For an agent of the loops ([`crate::agent_gate::agent_loop`]): the
+    /// loop its header names, else its only loop, else none; a header naming
+    /// no loop, or one the agent does not run, is refused with the sentence
+    /// why. For anybody else the header's loop when it names one, and none
+    /// otherwise: a word that is no loop narrows nothing.
+    fn bound_loop(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<Option<crystalline_core::automation::Loop>, String> {
+        let named = match self.transport {
+            Transport::Http => header_text(ctx, RUN_LOOP_HEADER),
+            Transport::Stdio => self.gate.run_loop.map(|lp| lp.as_str().to_string()),
+        };
+        match mcp_agent(ctx) {
+            Some(Scope::Agent { loops, .. }) => {
+                crate::agent_gate::agent_loop(loops, named.as_deref())
+            }
+            _ => Ok(named.and_then(|named| named.parse().ok())),
+        }
+    }
+
+    /// The refusal of a tool call by an agent of the loops, or `None` when it
+    /// may go ahead (or the caller is no agent). Outside a run only the
+    /// `skills` tool; inside one everything but what a run's prompt forbids
+    /// ([`crate::agent_gate::refused_in_run`]). Every agent tool call is
+    /// logged at INFO with the agent, the tool, the domain it names and
+    /// whether it was refused.
+    async fn agent_tool_refusal(
+        &self,
+        request: &rmcp::model::CallToolRequestParams,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Option<String> {
+        let tool = request.name.as_ref();
+        let args = request.arguments.as_ref();
+        let (name, refusal) = match self.agent_call(ctx).await {
+            AgentCall::NotAnAgent => return None,
+            AgentCall::Refused(refusal) => (None, Some(refusal)),
+            AgentCall::Outside(name) => {
+                let refusal = (tool != crate::agent_gate::OPEN_OUTSIDE_A_RUN)
+                    .then(|| crate::agent_gate::AGENT_OUTSIDE_A_RUN.to_string());
+                (Some(name), refusal)
+            }
+            AgentCall::Inside(name) => (Some(name), crate::agent_gate::refused_in_run(tool, args)),
+        };
+        let agent = match (name, mcp_agent(ctx)) {
+            (Some(name), _) | (None, Some(Scope::Agent { name, .. })) => name,
+            _ => String::new(),
+        };
+        let domain = args
+            .and_then(|args| args.get("domain"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        tracing::info!(
+            agent = %agent,
+            tool = %tool,
+            domain = %domain,
+            refused = refusal.is_some(),
+            "agent tool call"
+        );
+        refusal
+    }
+
+    /// The refusal of a read that is no tool call (a resource other than a
+    /// skill, a prompt) by an agent of the loops outside a run of its loop.
+    async fn agent_read_refusal(&self, ctx: &RequestContext<RoleServer>) -> Result<(), ErrorData> {
+        match self.agent_call(ctx).await {
+            AgentCall::NotAnAgent | AgentCall::Inside(_) => Ok(()),
+            AgentCall::Refused(refusal) => Err(ErrorData::invalid_request(refusal, None)),
+            AgentCall::Outside(_) => Err(ErrorData::invalid_request(
+                crate::agent_gate::AGENT_READS_ONLY_IN_A_RUN,
+                None,
+            )),
+        }
+    }
+
+    /// Where an agent's call stands with its run: outside or inside a live
+    /// lease of the loop its session is bound to (either loop when it is
+    /// unbound). Read again on every call, never kept for the session, so a
+    /// lease released or gone stale ends what the agent may call at once.
+    async fn agent_call(&self, ctx: &RequestContext<RoleServer>) -> AgentCall {
+        let Some(Scope::Agent { name, .. }) = mcp_agent(ctx) else {
+            return AgentCall::NotAnAgent;
+        };
+        let bound = match self.bound_loop(ctx) {
+            Ok(bound) => bound,
+            Err(refusal) => return AgentCall::Refused(refusal),
+        };
+        match self.engine.run_leases(&self.scope_of(ctx)).await {
+            Ok(leases) if leases.iter().any(|(lp, _)| bound.is_none_or(|b| b == *lp)) => {
+                AgentCall::Inside(name)
+            }
+            Ok(_) => AgentCall::Outside(name),
+            Err(e) => {
+                tracing::warn!("the loop leases of agent {name} were not read: {e}");
+                AgentCall::Refused(
+                    "The leases of this agent's runs could not be read, so this call is refused. Try again."
+                        .to_string(),
+                )
+            }
+        }
+    }
+
     /// What this request may not read because its session is unattended
     /// ([`Engine::read_limit_for`]): marked by its registration, by the run
     /// domain an HTTP run names, or by a live loop lease its caller holds.
@@ -5527,20 +5730,19 @@ impl McpServer {
         ctx: &RequestContext<RoleServer>,
     ) -> (Option<crystalline_engine::read_limit::Limit>, bool) {
         let header = match self.transport {
-            Transport::Http => ctx
-                .extensions
-                .get::<axum::http::request::Parts>()
-                .and_then(|parts| parts.headers.get(RUN_DOMAIN_HEADER))
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            Transport::Http => header_text(ctx, RUN_DOMAIN_HEADER),
             Transport::Stdio => None,
         };
         let run_domain = header.as_deref().or(self.gate.run_domain.as_deref());
-        let marked = self.gate.unattended || header.is_some() || run_domain.is_some();
+        // An agent of the loops is never anybody's interactive session.
+        let marked = self.gate.unattended
+            || header.is_some()
+            || run_domain.is_some()
+            || mcp_agent(ctx).is_some();
+        let run_loop = self.bound_loop(ctx).ok().flatten();
         let limit = self
             .engine
-            .read_limit_for(&self.scope_of(ctx), marked, run_domain)
+            .read_limit_for_loop(&self.scope_of(ctx), marked, run_domain, run_loop)
             .await;
         (limit, marked)
     }
@@ -5684,6 +5886,12 @@ impl ServerHandler for McpServer {
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        // An agent of the loops works only during a run of its loop, and
+        // inside one never calls what a run's prompt forbids. Decided first,
+        // before any argument is read.
+        if let Some(refusal) = self.agent_tool_refusal(&request, &context).await {
+            return refuse(refusal).map(rmcp::model::CallToolResponse::from);
+        }
         // An unattended session reads only what every reader of its run's
         // domain may read (`crystalline_engine::read_limit`), for the whole
         // call, whichever tool it is.
@@ -6287,6 +6495,11 @@ impl ServerHandler for McpServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        // An agent reads a skill at any time and anything else only during
+        // a run of its loop.
+        if skill_for_uri(&request.uri).is_none() {
+            self.agent_read_refusal(&context).await?;
+        }
         // An engram's attachment is engram content: an unattended session
         // reads it within its read limit, as it does every tool.
         let limit = self.read_limit(&context).await;
@@ -6321,8 +6534,10 @@ impl ServerHandler for McpServer {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        // The onboarding prompt carries the routing block: a limited session
-        // is shown the domains it may read only.
+        // The onboarding prompt carries the routing block: an agent gets it
+        // only during a run, and a limited session is shown the domains it
+        // may read only.
+        self.agent_read_refusal(&context).await?;
         let limit = self.read_limit(&context).await;
         crystalline_engine::read_limit::within(
             limit,
@@ -7344,6 +7559,7 @@ mod tests {
     /// them.
     fn caller_of(scope: Scope, account: Option<&str>, client: Option<&str>) -> Caller {
         Caller {
+            run_loop: None,
             scope,
             account: account.map(str::to_string),
             client: client.map(str::to_string),
@@ -8244,18 +8460,21 @@ mod tests {
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         },
     ];
 

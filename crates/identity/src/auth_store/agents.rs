@@ -34,6 +34,12 @@ use crate::scope::Scope;
 /// gates before any lookup.
 pub const AGENT_TOKEN_PREFIX: &str = "cag_";
 
+/// What an agent and the admin making one are told while `auth.mcp` is off:
+/// the open tier reads no token, so an agent token would open nothing. Said
+/// by `crystalline agents add`, `POST /api/v1/agents`, the MCP door and the
+/// ctl route.
+pub const AGENTS_NEED_AUTH_MCP: &str = "Agents need auth.mcp on, and it is off on this instance, so an agent token opens nothing here. An admin turns it on with 'crystalline config set auth.mcp true' (or CRYSTALLINE_AUTH_MCP=true) and restarts the server.";
+
 /// How long an agent token lives when nobody asks otherwise: 90 days.
 pub const AGENT_TOKEN_DEFAULT_TTL_SECS: i64 = 90 * 86_400;
 

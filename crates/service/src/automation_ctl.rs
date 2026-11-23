@@ -4,7 +4,8 @@
 //! and `automation_runs`.
 //!
 //! The control socket (the machine owner, [`Scope::Unrestricted`]) and the
-//! remote ctl route (a token's account, [`Scope::User`]) share this one
+//! remote ctl route (a token's account, [`Scope::User`], or an agent of the
+//! loops, [`Scope::Agent`]) share this one
 //! translation from a request to the engine call, so the two doors cannot
 //! drift. Each door names its own scope and localizes `domain` its own way.
 
@@ -130,8 +131,15 @@ async fn run(
     let answer = match cmd {
         "automation_lease_take" => {
             let runner = text(request, "runner")?;
+            // `force` lifts an agent's wait after failed runs, for a run a
+            // person starts by hand; it changes nothing for anybody else.
+            let force = match request.get("force") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(force)) => *force,
+                Some(_) => return Err(Failure::invalid("force must be true or false")),
+            };
             engine
-                .automation_lease_take(lp, domain, runner, scope)
+                .automation_lease_take_forced(lp, domain, runner, scope, force)
                 .await?
         }
         "automation_lease_renew" => {

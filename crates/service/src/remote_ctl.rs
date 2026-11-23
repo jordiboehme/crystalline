@@ -10,8 +10,10 @@
 //!   `auth.mcp` says. There is no anonymous ctl: the open tier is a promise
 //!   about MCP, and nothing here is MCP. The check is
 //!   `crate::mcp_gate::resolve_bearer`, the one the MCP gate runs.
-//! - **It runs as the token's account** ([`Scope::User`]), never as the
-//!   machine owner. The control socket's handler ([`crate::control`]) is
+//! - **It runs as the token's account** ([`Scope::User`]), or as the agent
+//!   of the loops an agent token names ([`Scope::Agent`], which gets the
+//!   automation verbs and nothing else, and only while `auth.mcp` is on),
+//!   never as the machine owner. The control socket's handler ([`crate::control`]) is
 //!   `Scope::Unrestricted` and `ShareActor::Owner` in every arm, which is
 //!   right for a process on this machine and wrong for anybody else, so this
 //!   route has a dispatcher of its own and never calls that one.
@@ -161,16 +163,14 @@ async fn handle(State(state): State<CtlState>, headers: HeaderMap, body: Body) -
     if let Err(refused) = state.origin_rule.origin(&headers) {
         return refused.into_response();
     }
-    let identity = match resolve_bearer(&state.auth, state.oauth.as_ref(), &headers).await {
-        Bearer::Account(identity) => identity,
-        // No ctl command is open to an agent yet.
-        Bearer::Agent { scope, refused } => {
-            tracing::debug!(
-                ?scope,
-                "an agent token at the ctl route, which agents cannot pass yet"
-            );
-            return refused;
-        }
+    // Agents need `auth.mcp` on. With it off an agent token is told so from
+    // its prefix alone, before any lookup, as at the MCP door.
+    if !state.engine.auth_mcp() && crate::mcp_gate::presents_agent_token(&headers) {
+        return crate::mcp_gate::agents_need_auth_mcp();
+    }
+    let caller = match resolve_bearer(&state.auth, state.oauth.as_ref(), &headers).await {
+        Bearer::Account(identity) => Ok(identity),
+        Bearer::Agent { scope, .. } => Err(scope),
         Bearer::Refused(response) | Bearer::Unavailable(response) => return response,
     };
     let body = match axum::body::to_bytes(body, crate::rest::MAX_TOOL_BODY_BYTES).await {
@@ -181,8 +181,64 @@ async fn handle(State(state): State<CtlState>, headers: HeaderMap, body: Body) -
         Ok(request) => request,
         Err(e) => return axum::Json(envelope_err(format!("invalid json: {e}"))).into_response(),
     };
-    let base = state.engine.request_web_base(&headers);
-    axum::Json(dispatch(&state.engine, &request, &identity, &base).await).into_response()
+    match caller {
+        Ok(identity) => {
+            let base = state.engine.request_web_base(&headers);
+            axum::Json(dispatch(&state.engine, &request, &identity, &base).await).into_response()
+        }
+        Err(agent) => {
+            axum::Json(dispatch_agent(&state.engine, &request, &agent).await).into_response()
+        }
+    }
+}
+
+/// Answer one request of an agent of the loops ([`Scope::Agent`]): the eight
+/// automation verbs ([`crate::automation_ctl::AUTOMATION_COMMANDS`]) and
+/// nothing else, so `tool` and `file` are refused with a sentence that says
+/// where tool calls go. The engine decides each verb under the agent's scope
+/// (its loops, its leases, the lease rules of an agent). Every request is
+/// logged at INFO with the agent, the verb and the domain it names.
+pub(crate) async fn dispatch_agent(engine: &Arc<Engine>, request: &Value, scope: &Scope) -> Value {
+    let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or("");
+    let agent = match scope {
+        Scope::Agent { name, .. } => name.as_str(),
+        _ => "",
+    };
+    let typed = request.get("domain").and_then(Value::as_str).unwrap_or("");
+    let allowed = crate::automation_ctl::AUTOMATION_COMMANDS.contains(&cmd);
+    tracing::info!(
+        agent = %agent,
+        command = %cmd,
+        domain = %typed,
+        refused = !allowed,
+        "agent ctl call"
+    );
+    if !allowed {
+        return envelope_err(format!(
+            "'{cmd}' is refused for an agent token. {}",
+            crate::agent_gate::AGENT_CTL_AUTOMATION_ONLY
+        ));
+    }
+    let mut request = request.clone();
+    if !typed.is_empty() {
+        match localized(engine, typed, scope).await {
+            Ok(local) => request["domain"] = Value::String(local),
+            Err(message) => return envelope_err(message),
+        }
+    }
+    let answer = crate::automation_ctl::answer(engine, cmd, &request, scope).await;
+    plain_envelope(answer)
+}
+
+/// An envelope whose error is told in plain words, as a token that is no
+/// admin's reads it ([`reader_message`]).
+fn plain_envelope(mut envelope: Value) -> Value {
+    if let Some(message) = envelope.get("error").and_then(Value::as_str)
+        && let Some(plain) = crate::engine::plain_refusal_text(message)
+    {
+        envelope["error"] = Value::String(plain);
+    }
+    envelope
 }
 
 /// Answer one remote request as `identity`.
@@ -499,6 +555,7 @@ fn remote_caller(
     base: &WebBase,
 ) -> crate::mcp::Caller {
     crate::mcp::Caller {
+        run_loop: None,
         scope: scope.clone(),
         account: Some(identity.name.clone()),
         client: Some(forwarded_client(request)),

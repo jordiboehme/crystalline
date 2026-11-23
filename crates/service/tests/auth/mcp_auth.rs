@@ -712,14 +712,14 @@ async fn every_rejected_credential_gets_the_identical_refusal() {
     assert_eq!(ok.status(), 200);
 }
 
-/// **An agent token is resolved and refused at the MCP door, and is no
-/// identity on the JSON API.** No door opens to an agent yet: a live agent
-/// token gets the bytes a missing header gets, on the handshake and on the
-/// stateless modern-era path, and on `/api/v1` it is answered exactly like a
-/// request with no credential at all (the JSON API takes no bearer). The door
-/// that admits agents has to change this test on purpose.
+/// **A live agent token opens the MCP door, and is no identity on the JSON
+/// API.** The door lets a live agent token in (what it may call is decided per
+/// call, see `tests/remote/agents.rs`), on the handshake and on the stateless
+/// modern-era path. A revoked or unknown agent token gets the bytes a missing
+/// header gets. On `/api/v1` an agent token is answered exactly like a
+/// request with no credential at all: the JSON API takes no bearer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_agent_token_is_refused_at_the_mcp_door_and_on_the_json_api() {
+async fn an_agent_token_opens_the_mcp_door_and_is_no_identity_on_the_json_api() {
     let (addr, _guard, store) = serve_with_mcp_auth(true).await;
     let (_, live) = store
         .add_agent(
@@ -748,23 +748,16 @@ async fn an_agent_token_is_refused_at_the_mcp_door_and_on_the_json_api() {
     let baseline = post_initialize(&addr, None).await;
     assert_eq!(baseline.status(), 401);
     let baseline = baseline.text().await.unwrap();
-    for token in [
-        live.token.clone(),
-        revoked.token.clone(),
-        format!("cag_{}", "0".repeat(64)),
-    ] {
+    for token in [revoked.token.clone(), format!("cag_{}", "0".repeat(64))] {
         let resp = post_initialize(&addr, Some(&format!("Bearer {token}"))).await;
         assert_eq!(resp.status(), 401);
         assert_eq!(resp.headers()["www-authenticate"], "Bearer");
         assert_eq!(resp.text().await.unwrap(), baseline);
     }
+    let opened = post_initialize(&addr, Some(&format!("Bearer {}", live.token))).await;
+    assert_eq!(opened.status(), 200);
     let stateless = post_stateless_tools_list(&addr, Some(&live.token)).await;
-    assert_eq!(stateless.status(), 401);
-    let nobody = post_stateless_tools_list(&addr, None).await;
-    assert_eq!(
-        stateless.text().await.unwrap(),
-        nobody.text().await.unwrap()
-    );
+    assert_eq!(stateless.status(), 200);
 
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     for path in ["/api/v1/agents", "/api/v1/domains", "/api/v1/auth/me"] {
@@ -793,10 +786,11 @@ async fn an_agent_token_is_refused_at_the_mcp_door_and_on_the_json_api() {
     }
 }
 
-/// With `auth.oauth` on too, a live agent token gets the OAuth refusal a
-/// missing header gets, challenge header and body alike.
+/// With `auth.oauth` on too, a live agent token opens the door, and an agent
+/// token nobody issued gets the OAuth refusal a missing header gets,
+/// challenge header and body alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_agent_token_gets_the_oauth_refusal_byte_for_byte() {
+async fn an_unknown_agent_token_gets_the_oauth_refusal_byte_for_byte() {
     let (addr, _guard, store) = serve_with_oauth().await;
     let (_, live) = store
         .add_agent(
@@ -809,8 +803,10 @@ async fn an_agent_token_gets_the_oauth_refusal_byte_for_byte() {
         )
         .await
         .unwrap();
+    let opened = post_initialize(&addr, Some(&format!("Bearer {}", live.token))).await;
+    assert_eq!(opened.status(), 200);
     let baseline = post_initialize(&addr, None).await;
-    let agent = post_initialize(&addr, Some(&format!("Bearer {}", live.token))).await;
+    let agent = post_initialize(&addr, Some(&format!("Bearer cag_{}", "0".repeat(64)))).await;
     assert_eq!(agent.status(), 401);
     assert_eq!(agent.status(), baseline.status());
     let challenge = agent.headers()["www-authenticate"].clone();

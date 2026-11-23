@@ -512,12 +512,13 @@ async fn a_hidden_domain_is_refused_like_an_unknown_one() {
     assert_eq!(texts[0], texts[1], "{texts:?}");
 }
 
-/// **A live agent token is resolved and refused at the ctl route**, with the
-/// answer a token nobody issued gets, for `status` and for every automation
-/// verb alike. No ctl command is open to an agent yet; the change that opens
-/// the automation verbs has to change this test on purpose.
+/// **An agent token reaches the automation verbs at the ctl route and
+/// nothing else.** `status`, `tool`, `file` and every other command are
+/// refused with a sentence that says where tool calls go; an automation verb
+/// is answered under the agent's scope. An agent token nobody issued gets the
+/// one refusal, `401`.
 #[tokio::test]
-async fn an_agent_token_is_refused_at_the_ctl_route() {
+async fn an_agent_token_reaches_only_the_automation_verbs_at_the_ctl_route() {
     let server = RemoteServer::start(Options::TOKENS).await;
     let (_, issued) = server
         .auth
@@ -531,23 +532,43 @@ async fn an_agent_token_is_refused_at_the_ctl_route() {
         )
         .await
         .unwrap();
-    assert!(
-        server
-            .auth
-            .agent_for_token(&issued.token)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    let unknown = format!("cag_{}", "0".repeat(64));
     for cmd in [
         status(),
-        json!({ "v": 1, "cmd": "automation_status" }),
         json!({ "v": 1, "cmd": "tool", "tool": "list_domains", "args": {} }),
+        json!({ "v": 1, "cmd": "file", "domain": "open", "path": "assets/shot.png" }),
+        json!({ "v": 1, "cmd": "routing_bullets" }),
+        json!({ "v": 1, "cmd": "origin_status" }),
     ] {
         let (code, reply) = server.ctl(Some(&issued.token), cmd.clone()).await;
-        let (unknown_code, unknown_reply) = server.ctl(Some(&unknown), cmd.clone()).await;
-        assert_eq!(code, 401, "{cmd}: {reply}");
-        assert_eq!((code, &reply), (unknown_code, &unknown_reply), "{cmd}");
+        assert_eq!(code, 200, "{cmd}: {reply}");
+        assert_eq!(reply["ok"], false, "{cmd}: {reply}");
+        let error = reply["error"].as_str().unwrap();
+        assert!(
+            error.contains("is refused for an agent token")
+                && error.contains("only the automation verbs"),
+            "{cmd}: {error}"
+        );
     }
+    let (code, reply) = server
+        .ctl(
+            Some(&issued.token),
+            json!({ "v": 1, "cmd": "automation_status", "loop": "evolve" }),
+        )
+        .await;
+    assert_eq!(code, 200, "{reply}");
+    assert_eq!(reply["ok"], true, "{reply}");
+    let names: Vec<&str> = reply["data"]["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["domain"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"lab"),
+        "every domain, a private one too: {names:?}"
+    );
+
+    let unknown = format!("cag_{}", "0".repeat(64));
+    let (code, _) = server.ctl(Some(&unknown), status()).await;
+    assert_eq!(code, 401);
 }

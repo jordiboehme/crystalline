@@ -650,12 +650,14 @@ async fn an_installed_but_unverified_hook_gets_the_conditional_block() {
         onboarding_verified: false,
         unattended: false,
         run_domain: None,
+        run_loop: None,
     };
     let verified = HarnessGate {
         hook_installed: true,
         onboarding_verified: true,
         unattended: false,
         run_domain: None,
+        run_loop: None,
     };
 
     let (client, _server) = h.connect_gated(unverified.clone()).await;
@@ -1091,6 +1093,7 @@ async fn the_full_block_points_at_the_skills_tool_by_every_path() {
         onboarding_verified: verified,
         unattended: false,
         run_domain: None,
+        run_loop: None,
     };
     for verified in [true, false] {
         let (client, _server) = h.connect_gated(hooked(verified)).await;

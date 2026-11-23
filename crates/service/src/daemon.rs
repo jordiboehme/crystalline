@@ -1803,12 +1803,18 @@ fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
         .find_map(|o| o.strip_prefix(crate::instance::RUN_DOMAIN_OPTION))
         .filter(|d| !d.is_empty())
         .map(str::to_string);
+    // A word that is no loop binds nothing: the loop only ever narrows.
+    let run_loop = options
+        .iter()
+        .find_map(|o| o.strip_prefix(crate::instance::RUN_LOOP_OPTION))
+        .and_then(|lp| lp.parse().ok());
     if options.contains(&SKILLS_OFF_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
             unattended,
             run_domain,
+            run_loop,
         }
     } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
         HarnessGate {
@@ -1816,11 +1822,13 @@ fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
             onboarding_verified: false,
             unattended,
             run_domain,
+            run_loop,
         }
     } else {
         HarnessGate {
             unattended,
             run_domain,
+            run_loop,
             ..HarnessGate::default()
         }
     }
@@ -4947,12 +4955,14 @@ mod tests {
             onboarding_verified: true,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         };
         let conditional = HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         };
         assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
         assert_eq!(
@@ -4976,6 +4986,16 @@ mod tests {
         assert_eq!(
             harness_gate_from_options(&["unattended", "domain=eng"]).run_domain,
             Some("eng".to_string())
+        );
+        // The loop travels beside the domain, and a word that is no loop
+        // binds nothing.
+        assert_eq!(
+            harness_gate_from_options(&["unattended", "domain=eng", "loop=evolve"]).run_loop,
+            Some(crystalline_core::automation::Loop::Evolve)
+        );
+        assert_eq!(
+            harness_gate_from_options(&["unattended", "loop=both"]).run_loop,
+            None
         );
     }
 

@@ -528,6 +528,7 @@ async fn an_installed_but_unverified_hook_keeps_the_whole_surface() {
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         })
         .await;
     let peer = client.peer();

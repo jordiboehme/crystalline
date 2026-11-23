@@ -5,7 +5,9 @@
 //! refused before the transport sees a byte of it. With the setting off the
 //! gate is a pass-through and the endpoint serves the legacy open tier exactly
 //! as it did before this existed - which is what makes the default install
-//! byte-identical to its old self.
+//! byte-identical to its old self. The one exception is an agent token
+//! (`cag_`): agents need `auth.mcp` on, so with it off such a token is told
+//! so, from its prefix alone, and never looked up.
 //!
 //! # Why the refusal is an HTTP status rather than a JSON-RPC error
 //!
@@ -83,7 +85,8 @@ use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 
 use crate::rest::{
-    AGENT_TOKEN_PREFIX, AuthStore, MCP_TOKEN_PREFIX, OAUTH_ACCESS_PREFIX, OriginRule, Role,
+    AGENT_TOKEN_PREFIX, AGENTS_NEED_AUTH_MCP, AuthStore, MCP_TOKEN_PREFIX, OAUTH_ACCESS_PREFIX,
+    OriginRule, Role,
 };
 use crate::scope::Scope;
 
@@ -103,6 +106,18 @@ pub struct McpIdentity {
     pub name: String,
     /// Whether that account is an admin.
     pub admin: bool,
+}
+
+/// The agent of the loops a request authenticated as, inserted beside its
+/// [`McpIdentity`] when the bearer was an agent token. The identity then names
+/// the agent by its key (`agent:<name>`, [`crate::scope::agent_key`]), which no
+/// account may take, so a session an agent opened is never one an account can
+/// reuse and the other way round; this carries the scope the MCP server acts
+/// as ([`Scope::Agent`]).
+#[derive(Clone, Debug)]
+pub struct McpAgent {
+    /// The agent's scope, as the token resolved it.
+    pub scope: Scope,
 }
 
 /// The teaching text both refusals share, as a macro rather than a constant
@@ -321,6 +336,25 @@ fn presented_token(headers: &axum::http::HeaderMap, oauth: bool) -> Option<Prese
     None
 }
 
+/// Whether `headers` present an agent token, by its prefix alone. What the
+/// MCP door and the ctl route ask while `auth.mcp` is off, where no token is
+/// looked up.
+pub(crate) fn presents_agent_token(headers: &axum::http::HeaderMap) -> bool {
+    matches!(presented_token(headers, false), Some(Presented::Agent(_)))
+}
+
+/// What an agent token is answered while `auth.mcp` is off: `403` with the
+/// teaching sentence ([`AGENTS_NEED_AUTH_MCP`]) and no `WWW-Authenticate`, so
+/// no client goes looking for a better credential. Nothing is wrong with the
+/// token; the instance has to change.
+pub(crate) fn agents_need_auth_mcp() -> Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": AGENTS_NEED_AUTH_MCP })),
+    )
+        .into_response()
+}
+
 /// The one refusal, built fresh per request so nothing about it can be
 /// accidentally shared with a response that carries a body.
 ///
@@ -402,14 +436,13 @@ pub(crate) enum Bearer {
     /// A live credential of this account.
     Account(McpIdentity),
     /// A live agent token, resolved to the agent's scope
-    /// ([`Scope::Agent`]). No door opens to an agent yet: each one answers
-    /// `refused`, which is the very refusal an unknown token gets, so a
-    /// door that is to admit agents has to take this arm on purpose.
+    /// ([`Scope::Agent`]). Each door takes this arm on purpose: the MCP door
+    /// lets the agent in under its key and the MCP server decides per call
+    /// (only during a run), the ctl route serves it the automation verbs
+    /// alone.
     Agent {
         /// The agent's scope.
         scope: Scope,
-        /// The one refusal, built for this request.
-        refused: Response,
     },
     /// No credential, one that is not ours in shape, or one that resolves to
     /// nobody: the one refusal.
@@ -450,7 +483,6 @@ pub(crate) async fn resolve_bearer(
         return match auth.agent_for_token(token).await {
             Ok(Some(agent)) => Bearer::Agent {
                 scope: agent.scope(),
-                refused: refusal(challenge()),
             },
             Ok(None) => Bearer::Refused(refusal(challenge())),
             Err(error) => {
@@ -516,24 +548,36 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let Some(auth) = self.auth.clone() else {
-            // The gate is off: the legacy open tier, untouched.
+            // The gate is off: the legacy open tier, untouched. An agent token
+            // is told why it opens nothing, from its prefix alone: no store is
+            // read, so its `last_used` stays as it was.
+            if presents_agent_token(request.headers()) {
+                return Box::pin(async move { Ok(agents_need_auth_mcp()) });
+            }
             return Box::pin(async move { Ok(inner.call(request).await?.into_response()) });
         };
         let sessions = self.sessions.clone();
         let oauth = self.oauth.clone();
         Box::pin(async move {
-            let identity = match resolve_bearer(&auth, oauth.as_ref(), request.headers()).await {
-                Bearer::Account(identity) => identity,
-                // No MCP call is open to an agent yet.
-                Bearer::Agent { scope, refused } => {
-                    tracing::debug!(
-                        ?scope,
-                        "an agent token at the MCP door, which agents cannot pass yet"
-                    );
-                    return Ok(refused);
-                }
-                Bearer::Refused(response) | Bearer::Unavailable(response) => return Ok(response),
-            };
+            let (identity, agent) =
+                match resolve_bearer(&auth, oauth.as_ref(), request.headers()).await {
+                    Bearer::Account(identity) => (identity, None),
+                    // An agent passes the door under its key; what it may call
+                    // is decided per call by the MCP server (only during a run).
+                    Bearer::Agent { scope, .. } => {
+                        let Scope::Agent { name, .. } = &scope else {
+                            unreachable!("an agent token resolves to an agent's scope")
+                        };
+                        let identity = McpIdentity {
+                            name: crate::scope::agent_key(name),
+                            admin: false,
+                        };
+                        (identity, Some(McpAgent { scope }))
+                    }
+                    Bearer::Refused(response) | Bearer::Unavailable(response) => {
+                        return Ok(response);
+                    }
+                };
             let named = session_of(&request);
             // A revoked or rotated token never reaches here at all: it stops
             // resolving and `resolve_bearer` refuses it with the ordinary 401
@@ -547,6 +591,9 @@ where
             let terminating = request.method() == axum::http::Method::DELETE;
             let name = identity.name.clone();
             request.extensions_mut().insert(identity);
+            if let Some(agent) = agent {
+                request.extensions_mut().insert(agent);
+            }
             let response = inner.call(request).await?.into_response();
             if let Some(session) = minted_session(&response) {
                 sessions.claim(session, name);
@@ -688,12 +735,12 @@ mod tests {
         }
     }
 
-    /// **A live agent token is resolved and refused at the MCP door**, with
-    /// the bytes an unknown token gets, and never reaches the transport. Its
-    /// scope is resolved all the same, which the door that opens to agents
-    /// later will read.
+    /// **A live agent token passes the MCP door under its key**, carrying
+    /// its scope beside the identity: what it may call is the MCP server's
+    /// decision, per call. An unknown agent token gets the one refusal and
+    /// never reaches the transport.
     #[tokio::test]
-    async fn a_live_agent_token_is_resolved_and_refused_like_an_unknown_one() {
+    async fn a_live_agent_token_passes_the_door_under_its_key() {
         let (_tmp, store, _admin, _editor) = store_with_two_agents().await;
         let (_, issued) = store
             .add_agent(
@@ -706,20 +753,15 @@ mod tests {
             )
             .await
             .unwrap();
+        let expected = Scope::Agent {
+            name: "nightly".to_string(),
+            loops: crate::rest::AgentLoops::Both,
+            token_id: issued.id,
+            token_expires_at: issued.expires_at.clone(),
+        };
         let headers = request_with(Some(&format!("Bearer {}", issued.token)));
         match resolve_bearer(&store, None, headers.headers()).await {
-            Bearer::Agent { scope, refused } => {
-                assert_eq!(
-                    scope,
-                    Scope::Agent {
-                        name: "nightly".to_string(),
-                        loops: crate::rest::AgentLoops::Both,
-                        token_id: issued.id,
-                        token_expires_at: issued.expires_at.clone(),
-                    }
-                );
-                assert_eq!(refused.status(), axum::http::StatusCode::UNAUTHORIZED);
-            }
+            Bearer::Agent { scope } => assert_eq!(scope, expected),
             _ => panic!("a live agent token resolves to the agent"),
         }
 
@@ -735,6 +777,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(agent.status(), axum::http::StatusCode::OK);
+        let extensions = seen.lock().unwrap().take().expect("the transport saw it");
+        let identity = extensions.get::<McpIdentity>().cloned().unwrap();
+        assert_eq!(identity.name, "agent:nightly");
+        assert!(!identity.admin);
+        assert_eq!(extensions.get::<McpAgent>().unwrap().scope, expected);
+
         let unknown = tower_service::Service::call(
             &mut gate,
             request_with(Some(&format!(
@@ -744,18 +793,49 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(unknown.status(), axum::http::StatusCode::UNAUTHORIZED);
         assert!(seen.lock().unwrap().is_none(), "the transport saw nothing");
-        assert_eq!(agent.status(), unknown.status());
-        assert_eq!(
-            agent.headers()[axum::http::header::WWW_AUTHENTICATE],
-            unknown.headers()[axum::http::header::WWW_AUTHENTICATE]
+    }
+
+    /// **With the gate off an agent token is told why it opens nothing**, from
+    /// its prefix alone (no store to look it up in), with a `403` and no
+    /// challenge, and the transport never sees it. Any other request passes
+    /// as before.
+    #[tokio::test]
+    async fn with_the_gate_off_an_agent_token_is_told_agents_need_auth_mcp() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut gate = McpGate::new(
+            CapturingService(seen.clone()),
+            None,
+            Arc::new(SessionOwners::default()),
         );
-        let body = |r: Response| async move {
-            axum::body::to_bytes(r.into_body(), usize::MAX)
-                .await
-                .unwrap()
-        };
-        assert_eq!(body(agent).await, body(unknown).await);
+        let agent = tower_service::Service::call(
+            &mut gate,
+            request_with(Some(&format!(
+                "Bearer {AGENT_TOKEN_PREFIX}{}",
+                "1".repeat(64)
+            ))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            agent
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none()
+        );
+        let body = axum::body::to_bytes(agent.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], AGENTS_NEED_AUTH_MCP);
+        assert!(seen.lock().unwrap().is_none(), "the transport saw nothing");
+
+        let open = tower_service::Service::call(&mut gate, request_with(None))
+            .await
+            .unwrap();
+        assert_eq!(open.status(), axum::http::StatusCode::OK);
     }
 
     /// **The refusal is a function of the configuration and of nothing a

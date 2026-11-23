@@ -290,6 +290,10 @@ pub(crate) const UNATTENDED_OPTION: &str = "unattended";
 /// this session for (see [`HarnessGate::run_domain`]).
 pub(crate) const RUN_DOMAIN_OPTION: &str = "domain=";
 
+/// The option token prefix that names the loop an unattended run started
+/// this session for (see [`HarnessGate::run_loop`]).
+pub(crate) const RUN_LOOP_OPTION: &str = "loop=";
+
 /// What the `crystalline mcp` process resolved about the harness that spawned
 /// it, from its `--harness` argument and this machine's install receipt,
 /// before the session started. Two facts, because they gate two things:
@@ -320,6 +324,11 @@ pub struct HarnessGate {
     /// to what every reader of that domain may read. Counts only while the
     /// session's caller holds a live loop lease on it.
     pub run_domain: Option<String>,
+    /// The loop an unattended run started this session for
+    /// (`crystalline mcp --unattended --domain <D> --loop <L>`), the stdio
+    /// twin of the run-loop header: only that loop's leases count as what
+    /// the session works on, and a write is noted only in that loop's lease.
+    pub run_loop: Option<crystalline_core::automation::Loop>,
 }
 
 impl HarnessGate {
@@ -362,6 +371,9 @@ fn mcp_mode_line(gate: HarnessGate, daemon_parses_options: bool) -> String {
         .filter(|d| !d.is_empty() && !d.contains(char::is_whitespace))
     {
         line.push_str(&format!(" {RUN_DOMAIN_OPTION}{domain}"));
+    }
+    if let Some(lp) = gate.run_loop {
+        line.push_str(&format!(" {RUN_LOOP_OPTION}{lp}"));
     }
     line.push('\n');
     line
@@ -4229,6 +4241,7 @@ mod tests {
         onboarding_verified: true,
         unattended: false,
         run_domain: None,
+        run_loop: None,
     };
 
     /// A hook in the receipt without a verified profile asks for the short
@@ -4241,6 +4254,7 @@ mod tests {
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         };
         assert_eq!(
             mcp_mode_line(unverified.clone(), true),
@@ -4254,6 +4268,7 @@ mod tests {
                     onboarding_verified: true,
                     unattended: false,
                     run_domain: None,
+                    run_loop: None,
                 },
                 true
             ),
@@ -4287,7 +4302,18 @@ mod tests {
             run_domain: Some("eng".into()),
             ..unattended
         };
-        assert_eq!(mcp_mode_line(bound, true), "mcp unattended domain=eng\n");
+        assert_eq!(
+            mcp_mode_line(bound.clone(), true),
+            "mcp unattended domain=eng\n"
+        );
+        let looped = HarnessGate {
+            run_loop: Some(crystalline_core::automation::Loop::Reflect),
+            ..bound
+        };
+        assert_eq!(
+            mcp_mode_line(looped, true),
+            "mcp unattended domain=eng loop=reflect\n"
+        );
     }
 
     /// What a 0.22.0 daemon does with the new token: its check reads only
