@@ -40,7 +40,7 @@ import { formatInstant } from "../format";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
 import { usePageTitle } from "../usePageTitle";
 import type { Notice } from "./accounts";
-import { NoticeLine, PageHeader, ShownOnce } from "./AdminParts";
+import { Labelled, NoticeLine, PageHeader, ShownOnce } from "./AdminParts";
 
 /** What the create button says while `auth.mcp` is off. */
 const NEEDS_AUTH_MCP =
@@ -59,7 +59,6 @@ const LOOPS: readonly { value: AgentLoops; label: string }[] = [
 
 const PRIMARY = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.primary} aria-disabled:cursor-default aria-disabled:opacity-50`;
 const SECONDARY = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary} aria-disabled:cursor-default aria-disabled:opacity-50`;
-const LABEL = "flex flex-col gap-1 text-sm";
 const HINT = "text-xs text-slate-500 dark:text-slate-400";
 
 /** A token shown once, and which agent it belongs to. */
@@ -256,72 +255,82 @@ function CreateAgent({
         }}
       >
         <div className="grid gap-3 sm:grid-cols-3">
-          <label className={LABEL}>
-            Name
-            <input
-              required
-              autoComplete="off"
-              value={name}
-              onChange={(event) => {
-                setName(event.target.value);
-              }}
-              className={FIELD}
-            />
-          </label>
-          <label className={LABEL}>
-            Display name
-            <input
-              autoComplete="off"
-              value={display}
-              placeholder="Same as the name"
-              onChange={(event) => {
-                setDisplay(event.target.value);
-              }}
-              className={FIELD}
-            />
-          </label>
-          <label className={LABEL}>
-            Loops
-            <select
-              value={loops}
-              onChange={(event) => {
-                setLoops(event.target.value as AgentLoops);
-              }}
-              className={FIELD}
-            >
-              {LOOPS.map((loop) => (
-                <option key={loop.value} value={loop.value}>
-                  {loop.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className={LABEL}>
-            First token label
-            <input
-              autoComplete="off"
-              value={label}
-              placeholder="The day it is issued"
-              onChange={(event) => {
-                setLabel(event.target.value);
-              }}
-              className={FIELD}
-            />
-          </label>
-          <label className={LABEL}>
-            Token life in days
-            <input
-              type="number"
-              min={1}
-              max={365}
-              required
-              value={days}
-              onChange={(event) => {
-                setDays(event.target.value);
-              }}
-              className={FIELD}
-            />
-          </label>
+          <Labelled label="Name">
+            {(id) => (
+              <input
+                id={id}
+                required
+                autoComplete="off"
+                value={name}
+                onChange={(event) => {
+                  setName(event.target.value);
+                }}
+                className={FIELD}
+              />
+            )}
+          </Labelled>
+          <Labelled label="Display name">
+            {(id) => (
+              <input
+                id={id}
+                autoComplete="off"
+                value={display}
+                placeholder="Same as the name"
+                onChange={(event) => {
+                  setDisplay(event.target.value);
+                }}
+                className={FIELD}
+              />
+            )}
+          </Labelled>
+          <Labelled label="Loops">
+            {(id) => (
+              <select
+                id={id}
+                value={loops}
+                onChange={(event) => {
+                  setLoops(event.target.value as AgentLoops);
+                }}
+                className={FIELD}
+              >
+                {LOOPS.map((loop) => (
+                  <option key={loop.value} value={loop.value}>
+                    {loop.label}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Labelled>
+          <Labelled label="First token label">
+            {(id) => (
+              <input
+                id={id}
+                autoComplete="off"
+                value={label}
+                placeholder="The day it is issued"
+                onChange={(event) => {
+                  setLabel(event.target.value);
+                }}
+                className={FIELD}
+              />
+            )}
+          </Labelled>
+          <Labelled label="Token life in days">
+            {(id) => (
+              <input
+                id={id}
+                type="number"
+                min={1}
+                max={365}
+                required
+                value={days}
+                onChange={(event) => {
+                  setDays(event.target.value);
+                }}
+                className={FIELD}
+              />
+            )}
+          </Labelled>
         </div>
         <p className={HINT}>
           The name goes into commits and run records. A token lives 1 to 365
@@ -519,32 +528,36 @@ function AgentCard({
           issue.mutate();
         }}
       >
-        <label className={LABEL}>
-          Token label
-          <input
-            autoComplete="off"
-            value={label}
-            placeholder="The day it is issued"
-            onChange={(event) => {
-              setLabel(event.target.value);
-            }}
-            className={FIELD}
-          />
-        </label>
-        <label className={LABEL}>
-          Life in days
-          <input
-            type="number"
-            min={1}
-            max={365}
-            required
-            value={days}
-            onChange={(event) => {
-              setDays(event.target.value);
-            }}
-            className={`w-24 ${FIELD}`}
-          />
-        </label>
+        <Labelled label="Token label">
+          {(id) => (
+            <input
+              id={id}
+              autoComplete="off"
+              value={label}
+              placeholder="The day it is issued"
+              onChange={(event) => {
+                setLabel(event.target.value);
+              }}
+              className={FIELD}
+            />
+          )}
+        </Labelled>
+        <Labelled label="Life in days">
+          {(id) => (
+            <input
+              id={id}
+              type="number"
+              min={1}
+              max={365}
+              required
+              value={days}
+              onChange={(event) => {
+                setDays(event.target.value);
+              }}
+              className={`w-24 ${FIELD}`}
+            />
+          )}
+        </Labelled>
         <button
           type="submit"
           aria-label={`Issue a token for ${agent.name}`}

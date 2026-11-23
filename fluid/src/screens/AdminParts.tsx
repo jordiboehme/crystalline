@@ -4,7 +4,7 @@
  */
 
 import type { ReactNode } from "react";
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 
 import { BUTTON, CONTROL_HEIGHT, FIELD } from "../components/primitives";
 import { copyText, useSaid } from "../components/useSaid";
@@ -120,5 +120,25 @@ export function NoticeLine({
     >
       {text}
     </p>
+  );
+}
+
+/**
+ * A form control with its label tied by id, so the control's name is the
+ * label alone and never the text of the options inside it.
+ */
+export function Labelled({
+  label,
+  children,
+}: {
+  label: string;
+  children: (id: string) => ReactNode;
+}) {
+  const id = useId();
+  return (
+    <div className="flex flex-col gap-1 text-sm">
+      <label htmlFor={id}>{label}</label>
+      {children(id)}
+    </div>
   );
 }

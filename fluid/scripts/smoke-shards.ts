@@ -46,6 +46,9 @@ const COSTS: Readonly<Record<string, Cost>> = {
   // Measured locally on 2026-11-23 (chromium, 4.1 s), rounded up;
   // replace with a CI number.
   "admin.spec.ts": { root: 5, path: 5 },
+  // Measured locally on 2026-11-23 (chromium, 2.2 s and 1.0 s), rounded up;
+  // replace with a CI number.
+  "agents.spec.ts": { root: 3, path: 3 },
   "diagram-editing.spec.ts": { root: 119, path: 119 },
   "diagram-hold.spec.ts": { root: 17, path: 17 },
   "diagram-keys.spec.ts": { root: 135, path: 135 },
@@ -57,6 +60,7 @@ const COSTS: Readonly<Record<string, Cost>> = {
   "diagram-widget.spec.ts": { root: 83, path: 83 },
   "diagrams.spec.ts": { root: 11, path: 11 },
   "hidden-marks.spec.ts": { root: 126, path: 126 },
+  "invites.spec.ts": { root: 2, path: 2 },
   "kept.spec.ts": { root: 4, path: 4 },
   "mcp-tokens.spec.ts": { root: 2, path: 2 },
   "members.spec.ts": { root: 7, path: 8 },

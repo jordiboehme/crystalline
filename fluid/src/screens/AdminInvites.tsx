@@ -41,7 +41,7 @@ import { formatInstant } from "../format";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
 import { usePageTitle } from "../usePageTitle";
 import type { Notice } from "./accounts";
-import { NoticeLine, PageHeader, ShownOnce } from "./AdminParts";
+import { Labelled, NoticeLine, PageHeader, ShownOnce } from "./AdminParts";
 
 /** The roles a link may give an account it makes: every one below admin. */
 const ROLES: readonly { value: Role; label: string }[] = [
@@ -61,7 +61,6 @@ const LEVELS: readonly { value: MemberLevel; label: string }[] = [
 type Show = "current" | "revoked" | "expired";
 
 const PRIMARY = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.primary} aria-disabled:cursor-default aria-disabled:opacity-50`;
-const LABEL = "flex flex-col gap-1 text-sm";
 const HINT = "text-xs text-slate-500 dark:text-slate-400";
 
 export default function AdminInvites() {
@@ -148,20 +147,22 @@ export default function AdminInvites() {
           <h2 id="invites-list" className="text-section">
             Invite links
           </h2>
-          <label className={LABEL}>
-            Show
-            <select
-              value={show}
-              onChange={(event) => {
-                setShow(event.target.value as Show);
-              }}
-              className={FIELD}
-            >
-              <option value="current">Pending and used</option>
-              <option value="revoked">Revoked</option>
-              <option value="expired">Expired</option>
-            </select>
-          </label>
+          <Labelled label="Show">
+            {(id) => (
+              <select
+                id={id}
+                value={show}
+                onChange={(event) => {
+                  setShow(event.target.value as Show);
+                }}
+                className={FIELD}
+              >
+                <option value="current">Pending and used</option>
+                <option value="revoked">Revoked</option>
+                <option value="expired">Expired</option>
+              </select>
+            )}
+          </Labelled>
         </div>
         {invites.error && (
           <NoticeLine kind="problem" text={problemDetail(invites.error)} />
@@ -256,101 +257,111 @@ function CreateInvite({
         }}
       >
         <div className="grid gap-3 sm:grid-cols-3">
-          <label className={LABEL}>
-            Role
-            <select
-              value={role}
-              onChange={(event) => {
-                setRole(event.target.value as Role);
-              }}
-              className={FIELD}
-            >
-              {ROLES.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className={LABEL}>
-            Domain
-            <select
-              value={domain}
-              onChange={(event) => {
-                setDomain(event.target.value);
-              }}
-              className={FIELD}
-            >
-              <option value="">No domain</option>
-              {privateDomains.map((summary) => (
-                <option key={summary.name} value={summary.name}>
-                  {summary.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          {domain !== "" && (
-            <label className={LABEL}>
-              Level in {domain}
+          <Labelled label="Role">
+            {(id) => (
               <select
-                value={level}
+                id={id}
+                value={role}
                 onChange={(event) => {
-                  setLevel(event.target.value as MemberLevel);
+                  setRole(event.target.value as Role);
                 }}
                 className={FIELD}
               >
-                {LEVELS.map((option) => (
+                {ROLES.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>
                 ))}
               </select>
-            </label>
+            )}
+          </Labelled>
+          <Labelled label="Domain">
+            {(id) => (
+              <select
+                id={id}
+                value={domain}
+                onChange={(event) => {
+                  setDomain(event.target.value);
+                }}
+                className={FIELD}
+              >
+                <option value="">No domain</option>
+                {privateDomains.map((summary) => (
+                  <option key={summary.name} value={summary.name}>
+                    {summary.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Labelled>
+          {domain !== "" && (
+            <Labelled label={`Level in ${domain}`}>
+              {(id) => (
+                <select
+                  id={id}
+                  value={level}
+                  onChange={(event) => {
+                    setLevel(event.target.value as MemberLevel);
+                  }}
+                  className={FIELD}
+                >
+                  {LEVELS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </Labelled>
           )}
-          <label className={LABEL}>
-            Label
-            <input
-              autoComplete="off"
-              value={label}
-              placeholder="Who it is for"
-              onChange={(event) => {
-                setLabel(event.target.value);
-              }}
-              className={FIELD}
-            />
-          </label>
-          <label className={LABEL}>
-            Expires in days
-            <input
-              type="number"
-              min={1}
-              max={30}
-              required
-              value={days}
-              onChange={(event) => {
-                setDays(event.target.value);
-              }}
-              className={FIELD}
-            />
-          </label>
+          <Labelled label="Label">
+            {(id) => (
+              <input
+                id={id}
+                autoComplete="off"
+                value={label}
+                placeholder="Who it is for"
+                onChange={(event) => {
+                  setLabel(event.target.value);
+                }}
+                className={FIELD}
+              />
+            )}
+          </Labelled>
+          <Labelled label="Expires in days">
+            {(id) => (
+              <input
+                id={id}
+                type="number"
+                min={1}
+                max={30}
+                required
+                value={days}
+                onChange={(event) => {
+                  setDays(event.target.value);
+                }}
+                className={FIELD}
+              />
+            )}
+          </Labelled>
         </div>
         {offerLocal && (
-          <label className="flex items-start gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={local}
-              onChange={(event) => {
-                setLocal(event.target.checked);
-              }}
-              className="mt-1"
-            />
-            <span>
+          <div className="flex flex-col gap-0.5 text-sm">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={local}
+                aria-describedby={`${ids}-local`}
+                onChange={(event) => {
+                  setLocal(event.target.checked);
+                }}
+              />
               Allow a local account with a password
-              <span className={`block ${HINT}`}>
-                Otherwise the person signs in through the identity provider.
-              </span>
+            </label>
+            <span id={`${ids}-local`} className={`pl-6 ${HINT}`}>
+              Otherwise the person signs in through the identity provider.
             </span>
-          </label>
+          </div>
         )}
         <p className={HINT}>
           Only private domains can be invited into. A link lives 1 to 30 days.
