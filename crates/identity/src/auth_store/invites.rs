@@ -462,6 +462,24 @@ impl AuthStore {
         Ok(changed > 0)
     }
 
+    /// Revoke every unused link to `domain`, inside the caller's
+    /// transaction: the domain went shared or is gone, so no link may give
+    /// membership of it, nor of a later domain that takes its name.
+    pub(super) async fn revoke_invites_to_domain(&self, domain: &str) -> Result<()> {
+        self.db
+            .execute(
+                "UPDATE invites SET revoked_at = ?2
+                 WHERE domain = ?1 AND used_at IS NULL AND revoked_at IS NULL",
+                vec![
+                    Value::Text(domain.to_string()),
+                    Value::Integer(time::now().unix_seconds()),
+                ],
+            )
+            .await
+            .with_context(|| format!("revoking the invite links to domain '{domain}'"))?;
+        Ok(())
+    }
+
     /// Drop every link `name` made, inside the caller's transaction, so a
     /// name used again inherits none of them.
     pub(super) async fn delete_invites_of(&self, name: &str) -> Result<()> {

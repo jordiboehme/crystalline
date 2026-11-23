@@ -6108,6 +6108,7 @@ impl AuthStore {
         let result = async {
             if !private {
                 self.delete_members_of_domain(&domain).await?;
+                self.revoke_invites_to_domain(&domain).await?;
                 self.db
                     .execute(
                         "DELETE FROM domain_acl WHERE domain = ?1",
@@ -6180,7 +6181,8 @@ impl AuthStore {
     /// which is how a caller can tell a private domain's records from a shared
     /// domain's absence of them.
     ///
-    /// Its Reflection collaborators go too, in the same transaction.
+    /// Its Reflection collaborators go too, in the same transaction, and its
+    /// pending invite links are revoked.
     ///
     /// Write-list entries naming the domain are left alone: they match nothing
     /// until a domain of that name exists again.
@@ -6194,6 +6196,7 @@ impl AuthStore {
         let result = async {
             let was_private = self.acl_of(&domain).await?.is_some();
             self.delete_members_of_domain(&domain).await?;
+            self.revoke_invites_to_domain(&domain).await?;
             self.db
                 .execute(
                     "DELETE FROM domain_reflection_grant WHERE domain = ?1",
@@ -6217,7 +6220,8 @@ impl AuthStore {
     /// Carry every record of domain `old` over to `new`: its `domain_acl` row,
     /// its `domain_member` rows, its `overlay_grant` rows (the draft
     /// share-links, revoked ones included, so the history stays with the
-    /// domain) and its Reflection collaborators, in one transaction. For a domain rename, which has already
+    /// domain), its Reflection collaborators and its invite links, in one
+    /// transaction. For a domain rename, which has already
     /// decided the name changes; this decides nothing.
     ///
     /// The renamed domain's records win. Rows already under `new` while `old`
@@ -6301,6 +6305,7 @@ impl AuthStore {
                 "SELECT 1 FROM overlay_grant WHERE domain = ?1",
                 // A shared domain's grants are its only rows here.
                 "SELECT 1 FROM domain_reflection_grant WHERE domain = ?1",
+                "SELECT 1 FROM invites WHERE domain = ?1",
             ] {
                 if self.db
                     .query_first(sql, vec![Value::Text(old.clone())])
@@ -6323,10 +6328,12 @@ impl AuthStore {
                 "DELETE FROM domain_member WHERE domain = ?2",
                 "DELETE FROM overlay_grant WHERE domain = ?2",
                 "DELETE FROM domain_reflection_grant WHERE domain = ?2",
+                "DELETE FROM invites WHERE domain = ?2",
                 "UPDATE domain_acl SET domain = ?2 WHERE domain = ?1",
                 "UPDATE domain_member SET domain = ?2 WHERE domain = ?1",
                 "UPDATE overlay_grant SET domain = ?2 WHERE domain = ?1",
                 "UPDATE domain_reflection_grant SET domain = ?2 WHERE domain = ?1",
+                "UPDATE invites SET domain = ?2 WHERE domain = ?1",
             ] {
                 self.db
                     .execute(sql, names.clone())

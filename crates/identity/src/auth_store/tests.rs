@@ -8004,3 +8004,61 @@ async fn a_removed_accounts_invites_go_with_it() {
         .unwrap();
     assert!(store.invites(Some("mia"), None).await.unwrap().is_empty());
 }
+
+/// Links follow their domain: a rename moves them, and a domain that goes
+/// shared or is forgotten has its pending links revoked, so a later domain
+/// of the same name inherits none that still work.
+#[tokio::test]
+async fn invite_links_follow_their_domain() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("olga", "Olga", None, Role::Viewer, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .set_domain_visibility("team", true, "olga")
+        .await
+        .unwrap();
+    let issued = store
+        .create_invite(&domain_invite("olga"), ROOMY)
+        .await
+        .unwrap();
+    store.rename_domain("team", "crew").await.unwrap();
+    let moved = store.invites(None, None).await.unwrap();
+    assert_eq!(moved[0].domain.as_deref(), Some("crew"));
+    assert_eq!(moved[0].state, InviteState::Pending);
+
+    store
+        .set_domain_visibility("crew", false, "olga")
+        .await
+        .unwrap();
+    let shared = store.invites(None, None).await.unwrap();
+    assert_eq!(shared[0].id, issued.invite.id);
+    assert_eq!(shared[0].state, InviteState::Revoked);
+
+    store
+        .set_domain_visibility("crew", true, "olga")
+        .await
+        .unwrap();
+    let again = store
+        .create_invite(
+            &NewInvite {
+                domain: Some("crew"),
+                ..domain_invite("olga")
+            },
+            ROOMY,
+        )
+        .await
+        .unwrap();
+    store.forget_domain("crew").await.unwrap();
+    let gone = store
+        .invites(None, Some(InviteState::Pending))
+        .await
+        .unwrap();
+    assert!(gone.is_empty(), "{gone:?}");
+    let all = store.invites(None, None).await.unwrap();
+    assert!(
+        all.iter()
+            .any(|i| i.id == again.invite.id && i.state == InviteState::Revoked)
+    );
+}
