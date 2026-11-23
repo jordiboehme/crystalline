@@ -1755,6 +1755,14 @@ pub enum ShareActor {
     /// `Engine::automation_share` takes this actor: a person at the machine (the
     /// CLI, the control socket, stdio MCP) is a person.
     Machine,
+    /// A run by an agent of the loops, by its unique name. It shares as
+    /// [`ShareActor::Machine`] does: through the GitHub App when there is
+    /// one and `github.share_identity` is `instance` or not set, with the
+    /// instance credential when there is no App. An agent has no personal
+    /// GitHub identity, so where `personal` is set by name its share is
+    /// refused and the changes stay here. Unlike the machine it drafts under
+    /// its own name on a domain that reviews changes, and its commits name it.
+    Agent(String),
 }
 
 /// What a removal knows about how much knowledge is at stake.
@@ -1982,6 +1990,12 @@ const PERSON_LINK_MISSING: &str = "This instance shares with personal GitHub ide
 /// nobody to resolve a credential for until an admin names the account those
 /// shares run as - which is what this message teaches, rather than reporting a
 /// missing token for an identity the caller never chose.
+/// The refusal a run by an agent of the loops gets where an admin set
+/// `github.share_identity` to `personal` by name: an agent has no GitHub
+/// identity of its own and never borrows the machine owner's. Plain words, for
+/// whoever reads the run's report.
+const AGENT_SHARES_NO_PERSONAL: &str = "This instance shares with personal GitHub identities, and an agent has none of its own, so this run kept its changes here. Ask an admin to share with the instance identity or through a GitHub App.";
+
 const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured. Ask an admin to name the account agents share as, or share from Fluid or the CLI.";
 
 /// The [`TokenIdentity`] one account's personal credential lives under, or the
@@ -11138,7 +11152,7 @@ impl Drop for AudienceHold<'_> {
 /// rule `crate::changes::change_label` applies to a scope.
 fn share_actor_label(actor: &ShareActor) -> Option<String> {
     match actor {
-        ShareActor::Account(name) => Some(name.clone()),
+        ShareActor::Account(name) | ShareActor::Agent(name) => Some(name.clone()),
         ShareActor::Owner | ShareActor::HttpAgent | ShareActor::Machine => None,
     }
 }

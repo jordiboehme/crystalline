@@ -16,7 +16,7 @@ use crystalline_service::{DomainAccess, Engine, EngineError, ReflectionCaller, S
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::fixture::{Fx, engram, fixture, manifest};
+use crate::fixture::{Fx, engram, fixture, fixture_with, manifest};
 use crate::support::MockProvider;
 
 /// When every test starts.
@@ -1252,4 +1252,265 @@ async fn a_write_while_the_lease_lapsed_is_still_shared() {
     assert_eq!(shared["outcome"], "shared", "{shared}");
     assert_eq!(shared_files(&shared), vec!["notes/late.md"], "{shared}");
     assert_eq!(shared["recorded"], true, "{shared}");
+}
+
+// --- agents of the loops (0.35.0, spec D2 and D3) ----------------------------
+
+/// An agent scope as a resolved token gives it.
+fn agent_scope(name: &str, loops: crystalline_service::rest::AgentLoops) -> Scope {
+    Scope::Agent {
+        name: name.to_string(),
+        loops,
+        token_id: 1,
+        token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+    }
+}
+
+/// An accounts store on `fx` with `keeper` (an editor who owns `lab`) and the
+/// agents `nightly` (both loops, shown as "Nightly"), `curator` (reflect) and
+/// `writer` (evolve), wired into the engine.
+async fn with_agents(fx: &Fx) -> Arc<AuthStore> {
+    use crystalline_service::rest::AgentLoops;
+    let auth = Arc::new(
+        AuthStore::open(&fx.tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("keeper", "Keeper", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    for (name, display, loops) in [
+        ("nightly", Some("Nightly"), AgentLoops::Both),
+        ("curator", None, AgentLoops::Reflect),
+        ("writer", None, AgentLoops::Evolve),
+    ] {
+        auth.add_agent(name, display, loops, "cli", "", 30 * 86_400)
+            .await
+            .unwrap();
+    }
+    fx.engine
+        .set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    auth
+}
+
+/// Reflect needs the curate right and evolve the write right, and an agent
+/// holds exactly the ones its loops give: a reflect-only agent is refused an
+/// evolve lease, an evolve-only agent a reflect lease, though its knowledge
+/// write would make an account a curator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_takes_a_lease_only_for_its_own_loops() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = reflecting().await;
+    open_thread(&fx, "aaaa1111", "Still true?").await;
+    with_agents(&fx).await;
+
+    let curator = agent_scope("curator", AgentLoops::Reflect);
+    let refused = fx
+        .engine
+        .automation_lease_take(Loop::Evolve, "eng", "cron", &curator)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
+    let taken = fx
+        .engine
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &curator)
+        .await
+        .unwrap();
+    assert!(taken["token"].is_string(), "{taken}");
+
+    let writer = agent_scope("writer", AgentLoops::Evolve);
+    let refused = fx
+        .engine
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &writer)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
+    let refused_status = fx
+        .engine
+        .automation_status(Loop::Reflect, &["eng".to_string()], &writer)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused_status, EngineError::Forbidden(_)),
+        "{refused_status}"
+    );
+    let taken = fx
+        .engine
+        .automation_lease_take(Loop::Evolve, "eng", "cron", &writer)
+        .await
+        .unwrap();
+    assert!(taken["token"].is_string(), "{taken}");
+}
+
+/// The lease and the run record carry the agent under its key, so the agent
+/// holds its own lease and the machine owner does not, and every answer shows
+/// it as `agent`, never as an account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lease_and_the_run_record_name_the_agent() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = reflecting().await;
+    open_thread(&fx, "aaaa1111", "Still true?").await;
+    with_agents(&fx).await;
+    let nightly = agent_scope("nightly", AgentLoops::Both);
+
+    let taken = fx
+        .engine
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &nightly)
+        .await
+        .unwrap();
+    let token = taken["token"].as_str().unwrap().to_string();
+    assert_eq!(fx.engine.run_domains(&nightly).await.unwrap(), ["eng"]);
+    assert!(
+        fx.engine
+            .run_domains(&Scope::Unrestricted)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the machine owner holds no agent's lease"
+    );
+    assert!(
+        fx.engine
+            .run_domains(&agent_scope("curator", AgentLoops::Reflect))
+            .await
+            .unwrap()
+            .is_empty(),
+        "nor does another agent"
+    );
+    let s = status(&fx.engine, Loop::Reflect).await;
+    assert_eq!(s["running"]["agent"], "nightly", "{s}");
+    assert!(s["running"]["account"].is_null(), "{s}");
+
+    let recorded = fx
+        .engine
+        .automation_run_record(
+            Loop::Reflect,
+            "eng",
+            &token,
+            &report(RunOutcome::Done, 1, "Answered"),
+            &nightly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recorded["run"]["agent"], "nightly", "{recorded}");
+    assert!(recorded["run"]["account"].is_null(), "{recorded}");
+    let runs = fx
+        .engine
+        .automation_runs(Loop::Reflect, "eng", 5, &nightly)
+        .await
+        .unwrap();
+    assert_eq!(runs["runs"][0]["agent"], "nightly", "{runs}");
+    let s = status(&fx.engine, Loop::Reflect).await;
+    assert_eq!(s["last_run"]["agent"], "nightly", "{s}");
+}
+
+/// `eng` plus `lab` (private to `keeper`) and `frozen` (`read_only: on`),
+/// each with Reflection on and a thread waiting, so both loops have work.
+async fn every_kind() -> Fx {
+    let fx = fixture_with(
+        &[("MANIFEST.md", &manifest("reflection: on\n"))],
+        |cfg, base| {
+            for (name, extra) in [
+                ("lab", "reflection: on\n"),
+                ("frozen", "reflection: on\nread_only: on\n"),
+            ] {
+                let root = base.join(name);
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(root.join("MANIFEST.md"), manifest(extra)).unwrap();
+                cfg.domains.insert(
+                    name.to_string(),
+                    crystalline_core::config::DomainEntry::file(root),
+                );
+            }
+        },
+    )
+    .await;
+    fx.engine.set_automation_now(Some(start()));
+    fx
+}
+
+/// Take the lease and give it back: `Ok` when the take went through, else the
+/// refusal's words.
+async fn take_and_release(
+    engine: &Engine,
+    lp: Loop,
+    domain: &str,
+    scope: &Scope,
+) -> Result<(), String> {
+    let taken = engine
+        .automation_lease_take(lp, domain, "cron", scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    engine
+        .automation_lease_release(lp, domain, taken["token"].as_str().unwrap(), scope)
+        .await
+        .unwrap();
+    Ok(())
+}
+
+/// What a status says of each domain, without the counts.
+fn by_domain(answer: &Value) -> Vec<(String, Value, Value)> {
+    answer["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["domain"].as_str().unwrap().to_string(),
+                d["due"].clone(),
+                d["reason"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// An agent with both loops sees every domain of the instance as the machine's
+/// own run does, a private one included: the same domains, the same answers,
+/// and a locked domain left out of the unnamed status and refused with the
+/// same sentence when it is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_sees_the_loops_as_the_machines_run_does() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = every_kind().await;
+    let auth = with_agents(&fx).await;
+    auth.set_domain_visibility("lab", true, "keeper")
+        .await
+        .unwrap();
+    let nightly = agent_scope("nightly", AgentLoops::Both);
+    for lp in [Loop::Reflect, Loop::Evolve] {
+        let machine = fx
+            .engine
+            .automation_status(lp, &[], &Scope::Unrestricted)
+            .await
+            .unwrap();
+        let agent = fx
+            .engine
+            .automation_status(lp, &[], &nightly)
+            .await
+            .unwrap();
+        assert_eq!(by_domain(&agent), by_domain(&machine), "{lp}");
+        let names: Vec<String> = by_domain(&agent).into_iter().map(|d| d.0).collect();
+        assert!(names.contains(&"lab".to_string()), "{lp}: {names:?}");
+        assert!(!names.contains(&"frozen".to_string()), "{lp}: {names:?}");
+        for domain in ["eng", "lab", "frozen"] {
+            let named = [domain.to_string()];
+            let machine = fx
+                .engine
+                .automation_status(lp, &named, &Scope::Unrestricted)
+                .await
+                .map(|a| by_domain(&a))
+                .map_err(|e| e.to_string());
+            let agent = fx
+                .engine
+                .automation_status(lp, &named, &nightly)
+                .await
+                .map(|a| by_domain(&a))
+                .map_err(|e| e.to_string());
+            assert_eq!(agent, machine, "{lp} on {domain}");
+            // The take: the agent's first, released again, then the
+            // machine's, with the same answer.
+            let agent = take_and_release(&fx.engine, lp, domain, &nightly).await;
+            let machine = take_and_release(&fx.engine, lp, domain, &Scope::Unrestricted).await;
+            assert_eq!(agent, machine, "{lp} on {domain}");
+        }
+    }
 }

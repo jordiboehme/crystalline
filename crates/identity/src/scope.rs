@@ -157,8 +157,13 @@ pub fn overlay_actor(scope: &Scope) -> Option<String> {
         // The open tier's writes run as anonymous; the agent stand-in only
         // answers rights questions, so it holds no draft.
         Scope::Anonymous | Scope::OpenTierIdentity { .. } => None,
-        // An agent drafts nothing until its rights say otherwise.
-        Scope::Agent { .. } => None,
+        // An agent of the loops drafts under its own unique name, as an
+        // account does under its login: accounts and agents share one
+        // namespace, so the key is nobody else's. Not the machine owner's
+        // `owner` key, which the machine's own run uses: an agent's writes
+        // never land in the owner's private drafts, and its share never
+        // carries them.
+        Scope::Agent { name, .. } => Some(name.clone()),
     }
 }
 
@@ -1245,6 +1250,13 @@ impl DomainAccess {
     /// ended. Answers how many were standing.
     pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
         self.auth.end_domain_overlay_grants(domain).await
+    }
+
+    /// The name the agent `name` is shown under, or `None` when there is no
+    /// such agent: what a share names an agent's commits with and a run
+    /// record is shown with.
+    pub async fn agent_display(&self, name: &str) -> Result<Option<String>> {
+        self.auth.agent_display(name).await
     }
 
     /// The display name and contact address of `account`, or `None` for a

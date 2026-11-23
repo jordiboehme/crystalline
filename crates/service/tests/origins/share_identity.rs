@@ -1319,6 +1319,270 @@ async fn a_scheduled_run_shares_as_the_machine() {
     assert!(writes(&fx.forge).is_empty());
 }
 
+// --- a run by an agent of the loops -----------------------------------------------
+
+const AGENT: &str = "nightly";
+
+/// The agent `nightly` (both loops, shown as "Nightly Curator") and the scope a
+/// token of it resolves to.
+async fn nightly(fx: &Case) -> Scope {
+    use crystalline_service::rest::AgentLoops;
+    fx.auth
+        .add_agent(
+            AGENT,
+            Some("Nightly Curator"),
+            AgentLoops::Both,
+            "cli",
+            "",
+            30 * 86_400,
+        )
+        .await
+        .unwrap();
+    Scope::Agent {
+        name: AGENT.to_string(),
+        loops: AgentLoops::Both,
+        token_id: 1,
+        token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+    }
+}
+
+/// One evolve run on `kb` by `nightly`: the take, a write the run made and
+/// noted under the agent's key, the share.
+async fn agent_run_shares(fx: &Case) -> (Value, Result<Value, EngineError>) {
+    use crystalline_core::automation::Loop;
+    let scope = nightly(fx).await;
+    let take = fx
+        .eng
+        .automation_lease_take(Loop::Evolve, "kb", "cron", &scope)
+        .await
+        .unwrap();
+    let token = take["token"].as_str().unwrap().to_string();
+    change(fx, "run");
+    fx.eng
+        .note_written(
+            "kb",
+            &crystalline_service::scope::agent_key(AGENT),
+            &["notes/run.md".to_string()],
+        )
+        .await
+        .unwrap();
+    let shared = fx
+        .eng
+        .automation_share(Loop::Evolve, "kb", &token, "The run", &scope)
+        .await;
+    (take, shared)
+}
+
+/// The pull request bodies the forge was sent on `kb`.
+fn pull_bodies(forge: &Forge) -> Vec<String> {
+    (1..10)
+        .filter_map(|number| forge.repos["acme/kb"].proposal_body(number))
+        .collect()
+}
+
+/// A run by an agent shares exactly as the machine's run does, row by row, and
+/// says whose run it was: through the App the commit's author is the agent at
+/// the bot's noreply address, with the bot as committer; on the instance
+/// credential GitHub records that credential's user. Where `personal` is set by
+/// name the agent is refused at the take and at the share, nothing reaches
+/// GitHub and the run's file stays here, unshared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_by_an_agent_shares_as_the_machine_and_names_the_agent() {
+    // Key absent, App ready: through the App, the agent as the author.
+    let fx = case(App::Ready, None).await;
+    let (take, shared) = agent_run_shares(&fx).await;
+    assert!(take["share_refused"].is_null(), "{take}");
+    let answer = shared.unwrap();
+    assert_eq!(answer["outcome"], "shared", "{answer}");
+    assert_eq!(answer["attributed"], true, "{answer}");
+    let all = writes(&fx.forge);
+    assert!(!all.is_empty());
+    assert!(all.iter().all(|a| *a == bearer("ghs_test")), "{all:?}");
+    let commits = fx.forge.commits();
+    assert_eq!(commits.len(), 1, "{commits:?}");
+    assert_eq!(
+        commits[0]["author"]["name"], "Nightly Curator (agent:nightly)",
+        "{commits:?}"
+    );
+    assert_eq!(
+        commits[0]["author"]["email"],
+        "41898282+crystalline-acme[bot]@users.noreply.127.0.0.1"
+    );
+    assert_eq!(commits[0]["committer"]["name"], "crystalline-acme[bot]");
+    assert_eq!(
+        commits[0]["committer"]["email"],
+        commits[0]["author"]["email"]
+    );
+    let state = crystalline_remote::state::OriginState::load(&fx.tmp.path().join("origins/kb"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.proposals[0].author_login.as_deref(),
+        Some("crystalline-acme[bot]")
+    );
+    let bodies = pull_bodies(&fx.forge);
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("Run by Nightly Curator (agent:nightly).")),
+        "{bodies:?}"
+    );
+
+    // Explicit `instance`, App ready: the App.
+    let fx = case(App::Ready, Some("instance")).await;
+    let (_, shared) = agent_run_shares(&fx).await;
+    assert_eq!(shared.unwrap()["outcome"], "shared");
+    assert!(writes(&fx.forge).iter().all(|a| *a == bearer("ghs_test")));
+
+    // No App, key absent or `instance`: the instance credential, which
+    // authors the commit; the pull request names the agent.
+    for key in [None, Some("instance")] {
+        let fx = case(App::None, key).await;
+        let (take, shared) = agent_run_shares(&fx).await;
+        assert!(take["share_refused"].is_null(), "{key:?}: {take}");
+        assert_eq!(shared.unwrap()["outcome"], "shared", "{key:?}");
+        let all = writes(&fx.forge);
+        assert!(!all.is_empty());
+        assert!(
+            all.iter().all(|a| *a == bearer(INSTANCE_TOKEN)),
+            "{key:?}: {all:?}"
+        );
+        let commits = fx.forge.commits();
+        assert!(
+            commits
+                .iter()
+                .all(|c| c.get("author").is_none() && c.get("committer").is_none()),
+            "{key:?}: {commits:?}"
+        );
+        let bodies = pull_bodies(&fx.forge);
+        assert!(
+            bodies.iter().any(|b| b.contains("(agent:nightly).")),
+            "{key:?}: {bodies:?}"
+        );
+    }
+
+    // Explicit `personal`, with an App or without, and even with the machine
+    // owner's identity on file: refused with a sentence, at the take and at
+    // the share, and the change stays here.
+    for app in [App::Ready, App::None] {
+        let fx = case(app, Some("personal")).await;
+        leave_owner_token(fx.tmp.path());
+        let (take, shared) = agent_run_shares(&fx).await;
+        let warned = take["share_refused"].as_str().unwrap();
+        plain(warned, "127.0.0.1");
+        assert!(warned.contains("kept its changes here"), "{warned}");
+        let refused = shared.unwrap_err().to_string();
+        assert_eq!(refused, warned, "{app:?}");
+        assert!(writes(&fx.forge).is_empty(), "{app:?}");
+        assert!(fx.tmp.path().join("kb/notes/run.md").exists());
+    }
+
+    // A refused App with no key: the App's own reason, as for the machine.
+    let fx = case(App::Refused, None).await;
+    let (_, shared) = agent_run_shares(&fx).await;
+    let refused = shared.unwrap_err();
+    assert!(writes(&fx.forge).is_empty(), "{refused:?}");
+}
+
+/// A write into `kb` as `scope`, with `client` as the actor the door composed.
+async fn write_as(fx: &Case, title: &str, client: Option<&str>, scope: &Scope) -> Value {
+    let params = crystalline_service::params::WriteParams {
+        path: None,
+        base64: None,
+        domain: "kb".into(),
+        title: title.into(),
+        content: Some(format!("{title} body")),
+        folder: Some("notes".into()),
+        engram_type: None,
+        tags: Vec::new(),
+        status: None,
+        metadata: None,
+        overwrite: false,
+        model: None,
+        share_link: None,
+        expected_checksum: None,
+    };
+    fx.eng
+        .write_engram_as(&params, client, scope)
+        .await
+        .unwrap()
+}
+
+/// On a domain that reviews changes an agent works as the machine's run does,
+/// in a draft its run shares, but the draft is its own: it is keyed on the
+/// agent's name, so the machine owner's draft is neither written by the agent
+/// nor carried by its pull request. Its writes record `<client>-for-agent:<name>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_a_reviewing_domain_an_agent_shares_its_own_draft() {
+    use crystalline_core::automation::Loop;
+    let fx = case(App::Ready, None).await;
+    // Review mode wants no unshared work in the folder.
+    std::fs::remove_file(fx.tmp.path().join("kb/notes/new.md")).unwrap();
+    fx.eng
+        .set_review_mode(
+            "kb",
+            Some(crystalline_core::config::ReviewMode::Overlay),
+            crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let scope = nightly(&fx).await;
+    // The machine owner's own draft, made before the run.
+    let owners = write_as(&fx, "Owner Draft", None, &Scope::Unrestricted).await;
+    let owners_path = owners["path"].as_str().unwrap().to_string();
+
+    let take = fx
+        .eng
+        .automation_lease_take(Loop::Evolve, "kb", "cron", &scope)
+        .await
+        .unwrap();
+    let token = take["token"].as_str().unwrap().to_string();
+    let written = write_as(
+        &fx,
+        "Agent Draft",
+        Some("claude-code/2.0 for agent:nightly"),
+        &scope,
+    )
+    .await;
+    let path = written["path"].as_str().unwrap().to_string();
+    let draft = std::fs::read_dir(fx.tmp.path().join("overlays/kb"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(draft.contains(&AGENT.to_string()), "{draft:?}");
+    assert!(draft.contains(&"owner".to_string()), "{draft:?}");
+    let text =
+        std::fs::read_to_string(fx.tmp.path().join("overlays/kb").join(AGENT).join(&path)).unwrap();
+    assert!(text.contains("claude-code/2.0-for-agent:nightly"), "{text}");
+    fx.eng
+        .note_written(
+            "kb",
+            &crystalline_service::scope::agent_key(AGENT),
+            std::slice::from_ref(&path),
+        )
+        .await
+        .unwrap();
+    let shared = fx
+        .eng
+        .automation_share(Loop::Evolve, "kb", &token, "The run", &scope)
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "shared", "{shared}");
+    let files: Vec<String> = shared["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(files.iter().any(|f| f.ends_with(&path)), "{files:?}");
+    assert!(
+        !files.iter().any(|f| f.ends_with(&owners_path)),
+        "{files:?}"
+    );
+}
+
 fn leave_owner_token(root: &Path) {
     crystalline_remote::TokenStore::file_fallback_for(
         &crystalline_remote::TokenIdentity::Personal("owner".to_string()),

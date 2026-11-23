@@ -73,7 +73,7 @@ fn loop_caller(scope: &Scope) -> ReflectionCaller {
         Scope::Anonymous | Scope::OpenTierIdentity { .. } => {
             ReflectionCaller::person(Scope::Anonymous, "anonymous")
         }
-        // Decided under its own scope, which grants it nothing yet.
+        // Decided under its own scope: its loops, on every domain.
         Scope::Agent { name, .. } => ReflectionCaller::person(scope.clone(), name),
     }
 }
@@ -83,19 +83,39 @@ fn share_actor(scope: &Scope) -> ShareActor {
     match scope {
         Scope::Unrestricted => ShareActor::Machine,
         Scope::User { account, .. } => ShareActor::Account(account.clone()),
-        // An agent shares like the open tier until it has its own share
-        // rules; no agent reaches a run today.
-        Scope::Anonymous | Scope::OpenTierIdentity { .. } | Scope::Agent { .. } => {
-            ShareActor::HttpAgent
-        }
+        // As the machine's own run, under its own name.
+        Scope::Agent { name, .. } => ShareActor::Agent(name.clone()),
+        Scope::Anonymous | Scope::OpenTierIdentity { .. } => ShareActor::HttpAgent,
     }
 }
 
-/// The account a runner works as, when it has one.
+/// Who a runner works as, as a lease and a run record keep it: the account,
+/// or an agent of the loops under its key (`agent:<name>`,
+/// [`crate::scope::agent_key`]), which no account name can be. `None` for
+/// the machine's own run.
 fn scope_account(scope: &Scope) -> Option<String> {
     match scope {
         Scope::User { account, .. } => Some(account.clone()),
+        Scope::Agent { name, .. } => Some(crate::scope::agent_key(name)),
         _ => None,
+    }
+}
+
+/// A recorded holder (a lease's or a run's `account`) as the answers show
+/// it: `account` for a person, `agent` with the agent's unique name for an
+/// agent of the loops, so an agent never reads as an account.
+fn split_holder(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let agent = obj
+        .get("account")
+        .and_then(Value::as_str)
+        .and_then(crate::scope::agent_of_key)
+        .map(str::to_string);
+    if let Some(agent) = agent {
+        obj.insert("account".to_string(), Value::Null);
+        obj.insert("agent".to_string(), json!(agent));
     }
 }
 
@@ -138,17 +158,20 @@ fn run_json(run: &AutomationRun) -> Value {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("left_items");
     }
+    split_holder(&mut value);
     value
 }
 
 /// What a status answer shows of a lease that is still fresh.
 fn running_json(lease: &AutomationLease) -> Value {
-    json!({
+    let mut value = json!({
         "runner": lease.holder.runner,
         "account": lease.holder.account,
         "taken_at": lease.taken_at,
         "renewed_at": lease.renewed_at,
-    })
+    });
+    split_holder(&mut value);
+    value
 }
 
 impl Engine {
@@ -279,7 +302,7 @@ impl Engine {
                 if !may_run {
                     for key in ["last_run", "running"] {
                         if let Some(inner) = obj.get_mut(key).and_then(Value::as_object_mut) {
-                            for secret in ["account", "summary", "pr_url"] {
+                            for secret in ["account", "agent", "summary", "pr_url"] {
                                 inner.remove(secret);
                             }
                         }
@@ -316,6 +339,16 @@ impl Engine {
     /// token need not be an admin's. A store that cannot be read says nothing
     /// here, and the share itself answers it.
     fn run_cannot_share(&self, domain: &str, scope: &Scope) -> Option<&'static str> {
+        // An agent of the loops shares as the machine's run does, and only
+        // `personal` set by name refuses it: it has no identity of its own.
+        if let Scope::Agent { .. } = scope {
+            let effective = self.share_identity_effective();
+            return (self.config.read().unwrap().github_enabled()
+                && self.domain_has_origin(domain).unwrap_or(false)
+                && effective.mode == ShareIdentityMode::Personal
+                && !effective.is_default())
+            .then_some(super::AGENT_SHARES_NO_PERSONAL);
+        }
         let Scope::User { account, .. } = scope else {
             return None;
         };
@@ -333,6 +366,29 @@ impl Engine {
         token.is_none().then_some(
             "This account has no GitHub identity, so this run could not share its changes. Ask an admin to link GitHub for this account.",
         )
+    }
+
+    /// How an agent of the loops is named where a person reads it: as a
+    /// commit's author through the GitHub App, and in its run's pull request.
+    /// `<display> (agent:<name>)`, or the key `agent:<name>` alone when its
+    /// display name is its name or cannot be read. The key is what keeps the
+    /// name unique: no account may be named with it.
+    pub(super) async fn agent_author_name(&self, name: &str) -> String {
+        let key = crate::scope::agent_key(name);
+        let display = match self.domain_access.get() {
+            Some(access) => match access.agent_display(name).await {
+                Ok(display) => display,
+                Err(e) => {
+                    tracing::warn!("the display name of agent {name} could not be read: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        match display {
+            Some(display) if display != name => format!("{display} ({key})"),
+            _ => key,
+        }
     }
 
     pub async fn automation_lease_take(
@@ -386,7 +442,8 @@ impl Engine {
             .take_lease(lp, id, &holder, &now, &stale_before)
             .await?;
         // An agent account shares on its own GitHub identity. Without one the
-        // whole run would end in a refusal, so the runner hears it now.
+        // whole run would end in a refusal, so the runner hears it now. An
+        // agent of the loops hears it where `personal` is set by name.
         if let Some(sentence) = self.run_cannot_share(domain, scope)
             && let Value::Object(answer) = &mut taken
         {
@@ -683,6 +740,14 @@ impl Engine {
             self.automation_clock().day().ymd()
         );
         let mut description = cap_summary(summary, SUMMARY_MAX_BYTES).to_string();
+        // A run by an agent of the loops says whose it is, whatever
+        // credential the share goes out on.
+        if let Scope::Agent { name, .. } = scope {
+            description.push_str(&format!(
+                "\n\nRun by {}.",
+                self.agent_author_name(name).await
+            ));
+        }
         if !held_back.is_empty() {
             let n = held_back.len();
             description.push_str(&format!(
@@ -1614,10 +1679,12 @@ impl Engine {
                     Scope::User { account, .. } => {
                         lease.holder.account.as_deref() == Some(account.as_str())
                     }
-                    Scope::Unrestricted => lease.holder.account.is_none(),
-                    Scope::Anonymous | Scope::OpenTierIdentity { .. } | Scope::Agent { .. } => {
-                        false
+                    Scope::Agent { name, .. } => {
+                        lease.holder.account.as_deref()
+                            == Some(crate::scope::agent_key(name).as_str())
                     }
+                    Scope::Unrestricted => lease.holder.account.is_none(),
+                    Scope::Anonymous | Scope::OpenTierIdentity { .. } => false,
                 };
                 if held {
                     out.push((lp, domain.clone()));

@@ -140,7 +140,10 @@ pub fn leave_out_for_non_admin(connection: &mut Value) {
 /// owner is at a command line. The App's own sentences hold a command line and a
 /// host, so they go to the log here.
 fn refusal_for(actor: &ShareActor, e: EngineError) -> EngineError {
-    if !matches!(actor, ShareActor::Account(_) | ShareActor::HttpAgent) {
+    if !matches!(
+        actor,
+        ShareActor::Account(_) | ShareActor::HttpAgent | ShareActor::Agent(_)
+    ) {
         return e;
     }
     match &e {
@@ -1630,9 +1633,10 @@ impl Engine {
         let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
-            crate::scope::Scope::Anonymous
-            | crate::scope::Scope::OpenTierIdentity { .. }
-            | crate::scope::Scope::Agent { .. } => ShareActor::HttpAgent,
+            crate::scope::Scope::Agent { name, .. } => ShareActor::Agent(name.clone()),
+            crate::scope::Scope::Anonymous | crate::scope::Scope::OpenTierIdentity { .. } => {
+                ShareActor::HttpAgent
+            }
         };
         // A refusal is recorded per login, so the status reads it under the
         // login this caller's shares go out on. Resolved once, outside every
@@ -6092,14 +6096,18 @@ impl Engine {
     ///
     /// A scheduled run with no account ([`ShareActor::Machine`]) is the machine's
     /// own work: it takes the App when `personal` is only the default. An admin
-    /// who set `personal` by name gets the owner's identity there too.
+    /// who set `personal` by name gets the owner's identity there too. A run
+    /// by an agent of the loops ([`ShareActor::Agent`]) takes the App as the
+    /// machine's run does; where `personal` is set by name it is refused
+    /// ([`Engine::acting_identity_name`]) instead of borrowing the owner's.
     fn instance_share_app(
         &self,
         effective: EffectiveShareIdentity,
         actor: &ShareActor,
     ) -> Result<Option<Arc<github_app::AppRouter>>> {
         let on_the_app = effective.mode == ShareIdentityMode::Instance
-            || (*actor == ShareActor::Machine && effective.is_default());
+            || (matches!(actor, ShareActor::Machine | ShareActor::Agent(_))
+                && effective.is_default());
         match self.github_app_slot() {
             github_app::AppSlot::Refused(detail)
                 if effective.mode == ShareIdentityMode::Instance || effective.is_default() =>
@@ -6192,6 +6200,13 @@ impl Engine {
             ShareActor::HttpAgent => agent_identity.ok_or_else(|| {
                 EngineError::Remote(RemoteError::Refused(AGENT_IDENTITY_UNSET.to_string()))
             })?,
+            // An agent of the loops has no personal identity and borrows
+            // nobody's: its share is refused and its changes stay here.
+            ShareActor::Agent(_) => {
+                return Err(EngineError::Remote(RemoteError::Refused(
+                    AGENT_SHARES_NO_PERSONAL.to_string(),
+                )));
+            }
         };
         // Normalization belongs to the layer that mints these names - the auth
         // store (`crate::rest::auth_store`) trims and lowercases an account name
