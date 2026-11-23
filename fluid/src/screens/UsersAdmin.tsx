@@ -732,14 +732,12 @@ function AccountsTable({
                   <Link
                     to={linkTo(account.name)}
                     aria-current={here ? "page" : undefined}
-                    className={`rounded font-mono text-link underline-offset-2 hover:underline ${FOCUS_RING}`}
+                    className={`rounded font-mono break-all text-link underline-offset-2 hover:underline ${FOCUS_RING}`}
                   >
                     {account.name}
                   </Link>
                 </th>
-                <td className="max-w-48 truncate px-2 py-2">
-                  {account.display}
-                </td>
+                <td className="px-2 py-2 break-words">{account.display}</td>
                 <td className="px-2 py-2">{account.role}</td>
                 <td className="px-2 py-2">
                   {account.disabled ? "Disabled" : "Active"}
