@@ -184,11 +184,15 @@ fn items<'a>(queue: &'a Value, what: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+/// The pages of the `what` items, sorted: the queue ranks them by age,
+/// which a slow machine can split by a second.
 fn paths(queue: &Value, what: &str) -> Vec<String> {
-    items(queue, what)
+    let mut paths: Vec<String> = items(queue, what)
         .iter()
         .map(|i| i["path"].as_str().unwrap().to_string())
-        .collect()
+        .collect();
+    paths.sort();
+    paths
 }
 
 /// Record a reconcile of `path` now (with the pact hash it has now), then
