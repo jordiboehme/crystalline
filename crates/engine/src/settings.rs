@@ -530,7 +530,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "auth.max_users",
-            doc: "How many accounts external provisioning may mint in total - the trusted header, the forward-auth headers and single sign-on all count against it, and so does every pending invite link (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
+            doc: "How many accounts external provisioning may mint in total - the trusted header, the forward-auth headers and single sign-on all count against it (default 100); a new invite link is refused once the accounts plus the pending links reach it, and redeeming a link that makes an account once the accounts reach it; the crystalline users CLI is never capped (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,

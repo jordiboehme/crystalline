@@ -1249,10 +1249,11 @@ pub struct AuthConfig {
     pub oauth: Option<bool>,
     /// `auth.max_users`. How many accounts external provisioning may mint in
     /// total - the trusted header, the forward-auth headers and single sign-on
-    /// all count against the one cap, and so does every pending invite link;
-    /// absent means the default of 100. Only minting a new account (or a new
-    /// invite link) is capped, and the `crystalline users` CLI is never
-    /// capped at all.
+    /// all count against the one cap; absent means the default of 100. A new
+    /// invite link is refused once the accounts plus the pending links reach
+    /// it, and redeeming a link that makes an account is refused once the
+    /// accounts reach it. Only minting a new account (or a new invite link)
+    /// is capped, and the `crystalline users` CLI is never capped at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_users: Option<u32>,
     /// The single sign-on block. Absent means SSO is off and only the local
