@@ -711,6 +711,49 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
+    /// Within one part a stale group comes before another group of the
+    /// same age on the same page, as the engine ranks it
+    /// (`reflect::rank_tests`); across parts the part order breaks the tie
+    /// first (local, then connect order).
+    #[test]
+    fn a_merged_stale_group_keeps_the_engines_tie_order() {
+        let row = |what: &str, domain: &str, path: &str, section: Value, age: i64| json!({ "kind": "update", "what": what, "domain": domain, "path": path, "section": section, "heading": "", "age_secs": age });
+        let local = Part {
+            source: None,
+            answer: json!({ "total": 2, "queue": [
+                row("stale", "notes", "w.md", Value::Null, 100),
+                row("link_broken", "notes", "w.md", json!("s1"), 100),
+            ] }),
+        };
+        let merged = merge_reflect(vec![local], 1, 10, &[]);
+        let order: Vec<&str> = merged["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["what"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["stale", "link_broken"]);
+
+        // A stale page of a connected server waits for a local group of the
+        // same age and path.
+        let local = Part {
+            source: None,
+            answer: json!({ "total": 1, "queue": [ row("link_broken", "notes", "w.md", json!("s1"), 100) ] }),
+        };
+        let remote = Part {
+            source: Some("acme".into()),
+            answer: json!({ "total": 1, "queue": [ row("stale", "eng", "w.md", Value::Null, 100) ] }),
+        };
+        let merged = merge_reflect(vec![local, remote], 1, 10, &[]);
+        let order: Vec<&str> = merged["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["what"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["link_broken", "stale"]);
+    }
+
     /// A stale item from one part comes after the feedback of every part,
     /// however old it is, and keeps its pact texts; texts of a stale item
     /// that is not on the page stay out.

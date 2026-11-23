@@ -1823,3 +1823,36 @@ fn reflection_files<'a>(
             .map(|inner| (inner, bytes.as_slice()))
     })
 }
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+
+    fn item(what: &'static str, path: &str, section: Option<&str>, age_secs: i64) -> Item {
+        Item {
+            kind: "update",
+            what,
+            domain: "eng".into(),
+            path: path.into(),
+            section: section.map(str::to_string),
+            heading: String::new(),
+            age_secs,
+            extra: Value::Null,
+            basis: String::new(),
+        }
+    }
+
+    /// A stale page and another group of the same age on the same page: the
+    /// stale group comes first, the tie rule the merged queue of a connected
+    /// machine keeps too (`crystalline_remote::fanout`).
+    #[test]
+    fn a_stale_page_comes_before_a_group_of_equal_age_and_page() {
+        let ranked = rank(vec![
+            item("link_broken", "w.md", Some("s1"), 100),
+            item("stale", "w.md", None, 100),
+            item("source_changed", "a.md", Some("s2"), 50),
+        ]);
+        let order: Vec<&str> = ranked.iter().map(|i| i.what).collect();
+        assert_eq!(order, ["stale", "link_broken", "source_changed"]);
+    }
+}
