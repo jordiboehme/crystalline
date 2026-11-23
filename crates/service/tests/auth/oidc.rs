@@ -730,6 +730,7 @@ impl RestCtx {
                 max_users,
                 oidc,
                 login: None,
+                invites: None,
             }),
             service: Some(ServiceConfig {
                 response_format: Some(ResponseFormat::Json),

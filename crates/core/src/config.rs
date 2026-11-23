@@ -498,6 +498,17 @@ impl GlobalConfig {
             .min(MAX_UPDATE_MIN_AGE_HOURS)
     }
 
+    /// `auth.invites.managers`: whether the owner or a manager of a private
+    /// domain may make invite links to it. Absent means off: only admins
+    /// make invite links.
+    pub fn auth_invites_managers(&self) -> bool {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.invites.as_ref())
+            .and_then(|i| i.managers)
+            .unwrap_or(false)
+    }
+
     /// `auth.login.max_delay`. Absent config or an absent key means the
     /// default; zero means the throttle is off.
     pub fn auth_login_max_delay(&self) -> std::time::Duration {
@@ -1238,9 +1249,10 @@ pub struct AuthConfig {
     pub oauth: Option<bool>,
     /// `auth.max_users`. How many accounts external provisioning may mint in
     /// total - the trusted header, the forward-auth headers and single sign-on
-    /// all count against the one cap; absent means the default of 100. Only
-    /// minting a new account is capped, and the `crystalline users` CLI is
-    /// never capped at all.
+    /// all count against the one cap, and so does every pending invite link;
+    /// absent means the default of 100. Only minting a new account (or a new
+    /// invite link) is capped, and the `crystalline users` CLI is never
+    /// capped at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_users: Option<u32>,
     /// The single sign-on block. Absent means SSO is off and only the local
@@ -1252,6 +1264,20 @@ pub struct AuthConfig {
     /// throttle that is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<LoginConfig>,
+    /// The invite links block. Absent means the defaults: only admins make
+    /// invite links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invites: Option<InvitesConfig>,
+}
+
+/// The `auth.invites` block: who besides an admin may make invite links.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InvitesConfig {
+    /// Whether the owner or a manager of a private domain may make invite
+    /// links to that domain, giving instance role `none` and a membership
+    /// level not above their own. Absent means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managers: Option<bool>,
 }
 
 /// The `auth.login` block: what repeated failed sign-ins for one name cost.

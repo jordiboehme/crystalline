@@ -73,6 +73,7 @@ async fn build_engine_with(
             max_users: opts.max_users,
             oidc: None,
             login: None,
+            invites: None,
         }),
         ..GlobalConfig::default()
     };

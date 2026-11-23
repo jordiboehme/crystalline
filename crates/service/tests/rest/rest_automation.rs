@@ -104,6 +104,7 @@ async fn serve_with(anonymous: bool) -> Fixture {
             max_users: None,
             oidc: None,
             login: None,
+            invites: None,
         }),
         automation: Some(AutomationConfig {
             webhook: Some(WebhookConfig {

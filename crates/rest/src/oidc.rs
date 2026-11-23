@@ -2237,6 +2237,7 @@ mod tests {
                 max_users: None,
                 oidc: Some(oidc),
                 login: None,
+                invites: None,
             }),
             ..GlobalConfig::default()
         }

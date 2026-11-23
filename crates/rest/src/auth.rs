@@ -230,8 +230,12 @@ pub struct AuthCfg {
     /// `auth.max_users`: the trusted header, the forward-auth headers and
     /// single sign-on all count against the one cap. Only minting a *new*
     /// account is capped; an existing one always resolves, and the
-    /// `crystalline users` CLI is never capped.
+    /// `crystalline users` CLI is never capped. Every pending invite link
+    /// counts against it too.
     pub max_users: usize,
+    /// Whether the owner or a manager of a private domain may make invite
+    /// links to it, from `auth.invites.managers`. Admins always may.
+    pub invites_managers: bool,
 }
 
 impl Default for AuthCfg {
@@ -244,6 +248,7 @@ impl Default for AuthCfg {
             mcp: false,
             oauth: false,
             max_users: crystalline_core::config::DEFAULT_MAX_USERS,
+            invites_managers: false,
         }
     }
 }
@@ -300,6 +305,7 @@ impl AuthCfg {
             mcp,
             oauth,
             max_users: config.auth_max_users(),
+            invites_managers: config.auth_invites_managers(),
         })
     }
 }
@@ -2516,6 +2522,7 @@ mod tests {
             max_users: Some(5),
             oidc: None,
             login: None,
+            invites: None,
         });
         let cfg = AuthCfg::resolve(&config).unwrap();
         assert_eq!(cfg.trusted_header.unwrap().as_str(), "remote-user");
@@ -2531,6 +2538,7 @@ mod tests {
             max_users: None,
             oidc: None,
             login: None,
+            invites: None,
         });
         let err = AuthCfg::resolve(&config).unwrap_err().to_string();
         assert!(

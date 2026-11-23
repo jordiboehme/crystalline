@@ -13,9 +13,9 @@ use crystalline_core::base::{BasePath, PathProblem, PublicBase};
 use crystalline_core::config::{
     AuthConfig, AutomationConfig, CaptureConfig, DatabaseBackend, DatabaseConfig,
     EffectiveShareIdentity, EvolveConfig, GitHubConfig, GithubAppPresence, GlobalConfig,
-    HttpSetting, IdentityConfig, IndexConfig, LoginConfig, MAX_UPDATE_MIN_AGE_HOURS, OidcConfig,
-    RecallConfig, RemoteConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode,
-    SkillsConfig, SkillsServe, UpdateConfig, WebhookConfig,
+    HttpSetting, IdentityConfig, IndexConfig, InvitesConfig, LoginConfig, MAX_UPDATE_MIN_AGE_HOURS,
+    OidcConfig, RecallConfig, RemoteConfig, ResponseFormat, SearchConfig, ServiceConfig,
+    ShareIdentityMode, SkillsConfig, SkillsServe, UpdateConfig, WebhookConfig,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -530,7 +530,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "auth.max_users",
-            doc: "How many accounts external provisioning may mint in total - the trusted header, the forward-auth headers and single sign-on all count against it (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
+            doc: "How many accounts external provisioning may mint in total - the trusted header, the forward-auth headers and single sign-on all count against it, and so does every pending invite link (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
@@ -648,6 +648,17 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_login_max_delay,
             clear: clear_login_max_delay,
             effective: login_max_delay_effective,
+        },
+        SettingSpec {
+            key: "auth.invites.managers",
+            doc: "Let the owner or a manager of a private domain make invite links to that domain (default false): such a link gives instance role none and a level there not above their own, and never reaches a domain whose access follows GitHub; admins make invite links whatever this says (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            secret: false,
+            operator_only: true,
+            apply: set_invites_managers,
+            clear: clear_invites_managers,
+            effective: invites_managers_effective,
         },
         SettingSpec {
             key: "automation.webhook.url",
@@ -2274,6 +2285,51 @@ fn max_users_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_max_users().to_string(), is_default)
 }
 
+// --- auth.invites.* -----------------------------------------------------------
+
+/// Drop an emptied `auth.invites` block, then an `auth` block emptied by
+/// that, for the reason [`drop_login_if_empty`] states.
+fn drop_invites_if_empty(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut()
+        && a.invites.as_ref() == Some(&InvitesConfig::default())
+    {
+        a.invites = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn set_invites_managers(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.invites.managers must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .invites
+        .get_or_insert_with(InvitesConfig::default)
+        .managers = Some(parsed);
+    Ok(())
+}
+
+fn clear_invites_managers(config: &mut GlobalConfig) {
+    if let Some(i) = config.auth.as_mut().and_then(|a| a.invites.as_mut()) {
+        i.managers = None;
+    }
+    drop_invites_if_empty(config);
+}
+
+fn invites_managers_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .auth
+        .as_ref()
+        .and_then(|a| a.invites.as_ref())
+        .and_then(|i| i.managers)
+        .is_none();
+    (config.auth_invites_managers().to_string(), is_default)
+}
+
 // --- auth.login.* -------------------------------------------------------------
 
 fn login_mut(config: &mut GlobalConfig) -> &mut LoginConfig {
@@ -3097,6 +3153,7 @@ mod tests {
                 "auth.oidc.redirect_uri",
                 "auth.login.free_attempts",
                 "auth.login.max_delay",
+                "auth.invites.managers",
                 "automation.webhook.url",
                 "automation.webhook.secret",
                 "automation.evolve_threshold",
@@ -3146,6 +3203,7 @@ mod tests {
                 "auth.oidc.redirect_uri",
                 "auth.login.free_attempts",
                 "auth.login.max_delay",
+                "auth.invites.managers",
                 "automation.webhook.url",
                 "automation.webhook.secret",
                 "automation.evolve_threshold",
@@ -3314,6 +3372,10 @@ mod tests {
                 (
                     "auth.login.max_delay",
                     "CRYSTALLINE_AUTH_LOGIN_MAX_DELAY".to_string()
+                ),
+                (
+                    "auth.invites.managers",
+                    "CRYSTALLINE_AUTH_INVITES_MANAGERS".to_string()
                 ),
                 (
                     "automation.webhook.url",
@@ -3832,7 +3894,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 49);
+        assert_eq!(views.len(), 50);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -3880,6 +3942,7 @@ mod tests {
                 "auth.oidc.redirect_uri",
                 "auth.login.free_attempts",
                 "auth.login.max_delay",
+                "auth.invites.managers",
                 "automation.webhook.url",
                 "automation.webhook.secret",
                 "automation.evolve_threshold",
@@ -4761,6 +4824,32 @@ mod tests {
             apply(&mut cfg, "auth.trusted_header", good).unwrap();
             assert_eq!(cfg.auth_trusted_header(), Some(good));
         }
+    }
+
+    /// `auth.invites.managers` is a true/false key, off by default, and
+    /// unsetting it leaves the file as it was before.
+    #[test]
+    fn auth_invites_managers_round_trips_and_drops_its_block() {
+        let mut cfg = GlobalConfig::default();
+        assert!(!cfg.auth_invites_managers());
+        assert_eq!(
+            invites_managers_effective(&cfg),
+            ("false".to_string(), true)
+        );
+        apply(&mut cfg, "auth.invites.managers", "true").unwrap();
+        assert!(cfg.auth_invites_managers());
+        assert_eq!(
+            invites_managers_effective(&cfg),
+            ("true".to_string(), false)
+        );
+        let err = apply(&mut cfg, "auth.invites.managers", "yes").unwrap_err();
+        assert!(err.to_string().contains("true or false"), "{err}");
+        assert!(
+            cfg.auth_invites_managers(),
+            "a refused value changes nothing"
+        );
+        unset(&mut cfg, "auth.invites.managers").unwrap();
+        assert!(cfg.auth.is_none(), "the emptied blocks go");
     }
 
     #[test]
