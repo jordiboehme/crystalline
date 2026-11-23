@@ -245,7 +245,12 @@ impl Engine {
             if let Some(freshness) = settings.freshness
                 && let Some(state) = self.reflection_reconcile(domain, inner).await?
                 && let Some(at) = time::parse_rfc3339(&state.last_reconciled)
-                && time::now().unix_seconds() - at.stamp().unix_seconds() >= freshness.seconds
+                && freshness
+                    .timing(
+                        at.stamp().unix_seconds(),
+                        self.automation_clock().stamp().unix_seconds(),
+                    )
+                    .stale()
             {
                 return Err(EngineError::Invalid(format!(
                     "'{inner}' has a stale item in the reflect queue: send its version with reconciled, so a late call for an older period can be told apart"

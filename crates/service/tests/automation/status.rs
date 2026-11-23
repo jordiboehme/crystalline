@@ -278,17 +278,14 @@ async fn a_status_call_folds_the_callers_visibility_once() {
 /// one engram, with a freshness of one day and its reconcile recorded at `at`.
 async fn rolling_page(at: &str) -> Fx {
     let store = TursoStore::open_in_memory().await.unwrap();
+    rolling_page_on(Arc::new(Mutex::new(store)), at).await
+}
+
+/// [`rolling_page`] on `store`.
+async fn rolling_page_on(store: Arc<Mutex<dyn Store>>, at: &str) -> Fx {
     let files = files();
     let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, b)| (*p, b.as_str())).collect();
-    let fx = fixture_on(
-        Arc::new(Mutex::new(store)),
-        &borrowed,
-        |_, _| {},
-        None,
-        None,
-        None,
-    )
-    .await;
+    let fx = fixture_on(store, &borrowed, |_, _| {}, None, None, None).await;
     fx.engine
         .write_reflection(
             &WriteReflectionParams {
@@ -532,4 +529,58 @@ async fn the_control_socket_names_the_overdue_pages() {
     assert_eq!(pages[0]["domain"], "eng", "{answer}");
     assert_eq!(pages[0]["path"], "w.md", "{answer}");
     assert_eq!(pages[0]["overdue_secs"], 3 * 3600, "{answer}");
+}
+
+/// The `reconciled` action reads the same clock as the queue: a page due on
+/// the automation clock needs the stale item's version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconcile_reads_the_automation_clock() {
+    let now = time::now();
+    let fx = rolling_page(&now.rfc3339()).await;
+    fx.engine.set_automation_now(Some(
+        now.saturating_add(time::saturating_seconds(2 * 86_400))
+            .to_offset_utc(),
+    ));
+    let refused = fx
+        .engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: "w.md".into(),
+                action: Some("reconciled".into()),
+                outcome: Some("unchanged".into()),
+                ..Default::default()
+            },
+            &ReflectionCaller::agent(Scope::Unrestricted, "claude-code", false),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("stale item"), "{refused}");
+}
+
+/// The page clocks read through the read connections: on a turso file the
+/// first status (nothing remembered of the pages yet, so their text is
+/// read) answers `next_stale_in_secs` while a test holds the writer lock,
+/// with counts and without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_next_stale_time_never_waits_for_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TursoStore::open(&dir.path().join("index.db"))
+        .await
+        .unwrap();
+    let fx = rolling_page_on(Arc::new(Mutex::new(store)), "2026-10-21T10:00:00+00:00").await;
+    now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
+    let store = fx.engine.store();
+    let held = store.lock().await;
+    for counts in [false, true] {
+        let answer = tokio::time::timeout(PATIENCE, status_with(&fx.engine, Loop::Reflect, counts))
+            .await
+            .unwrap_or_else(|_| panic!("counts {counts}: the status waited for the writer lock"));
+        assert_eq!(
+            answer["domains"][0]["next_stale_in_secs"],
+            22 * 3600,
+            "{answer}"
+        );
+    }
+    drop(held);
 }
