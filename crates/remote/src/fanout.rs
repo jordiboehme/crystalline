@@ -766,6 +766,31 @@ mod tests {
         };
         assert!(first_only(1).get("pacts").is_none(), "{}", first_only(1));
         assert_eq!(first_only(2)["pacts"]["eng"]["PACT.md"], "# Pact");
+
+        // A mount renamed on this machine: the server's answer is translated
+        // before the merge, and its texts are found under the local name.
+        let names = crate::mounts::NameMap {
+            source: "acme".into(),
+            to_remote: [("eng-acme".to_string(), "eng".to_string())].into(),
+            to_local: [("eng".to_string(), "eng-acme".to_string())].into(),
+        };
+        let mut answer = json!({
+            "total": 1, "kinds": {}, "queue": [stale("eng", "week.md", 1)],
+            "pacts": { "eng": { "PACT.md": "# Pact" } },
+            "guidance": "g", "scope": { "domains": ["eng"], "kinds": [] },
+        });
+        crate::mounts::translate_answer(&mut answer, &names);
+        let merged = merge_reflect(
+            vec![Part {
+                source: Some("acme".into()),
+                answer,
+            }],
+            1,
+            10,
+            &[],
+        );
+        assert_eq!(merged["queue"][0]["domain"], "eng-acme", "{merged}");
+        assert_eq!(merged["pacts"]["eng-acme"]["PACT.md"], "# Pact", "{merged}");
     }
 
     #[test]

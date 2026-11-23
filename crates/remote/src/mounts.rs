@@ -865,6 +865,10 @@ const NAME_KEYS: &[&str] = &[
     "src_domain",
 ];
 
+/// Keys whose object is keyed by domain name, with values kept as written:
+/// a `reflect` answer's pact texts, by domain, then path.
+const NAME_MAP_KEYS: &[&str] = &["pacts"];
+
 /// Keys whose array of strings are domain names.
 const NAME_LIST_KEYS: &[&str] = &[
     "domains",
@@ -902,6 +906,19 @@ fn walk(value: &mut Value, names: &NameMap) {
                     {
                         *s = local.clone();
                     }
+                    continue;
+                }
+                if NAME_MAP_KEYS.contains(&k.as_str())
+                    && let Value::Object(by_domain) = v
+                {
+                    let renamed: serde_json::Map<String, Value> = std::mem::take(by_domain)
+                        .into_iter()
+                        .map(|(name, inner)| {
+                            let name = names.to_local.get(&name).cloned().unwrap_or(name);
+                            (name, inner)
+                        })
+                        .collect();
+                    *by_domain = renamed;
                     continue;
                 }
                 if NAME_LIST_KEYS.contains(&k.as_str())
@@ -1008,6 +1025,25 @@ mod tests {
         assert_eq!(answer["threads"][0]["anchor"]["quote"], link);
         assert_eq!(answer["threads"][0]["entries"][0]["text"], link);
         assert_eq!(answer["queue"][0]["diff"], link);
+    }
+
+    /// A reflect answer's pact texts are keyed by domain: the key moves to
+    /// the local name, the texts stay as written.
+    #[test]
+    fn the_pact_texts_of_a_reflect_answer_move_to_the_local_name() {
+        let names = NameMap {
+            source: "beta".to_string(),
+            to_remote: BTreeMap::from([("open-beta".to_string(), "open".to_string())]),
+            to_local: BTreeMap::from([("open".to_string(), "open-beta".to_string())]),
+        };
+        let link = "see crystalline://open/runbooks/deploy";
+        let mut answer = json!({
+            "queue": [{ "domain": "open", "what": "stale", "pacts": ["PACT.md"] }],
+            "pacts": { "open": { "PACT.md": link } },
+        });
+        translate_answer(&mut answer, &names);
+        assert_eq!(answer["queue"][0]["pacts"], json!(["PACT.md"]));
+        assert_eq!(answer["pacts"], json!({ "open-beta": { "PACT.md": link } }));
     }
 
     #[test]
