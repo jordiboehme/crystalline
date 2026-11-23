@@ -255,6 +255,26 @@ export function locateQuote(
  * or at the closing `---`.
  */
 export function stripProvenance(markdown: string): string {
+  return stripTopKeys(markdown, PROVENANCE_KEYS);
+}
+
+const PROVENANCE_KEYS = ["reflection"];
+
+/**
+ * The page settings a curator changes beside the text (`freshness`,
+ * `follows`, `status`), with the block: what a live room leaves out of its
+ * text (the engine's `without_page_keys` over `without_provenance`). The
+ * editor never shows them, and a conflict compares the room's own text.
+ */
+const ROOM_HIDDEN_KEYS = ["reflection", "freshness", "follows", "status"];
+
+/** The page as a live room holds it: no block, no page settings. */
+export function roomText(markdown: string): string {
+  return stripTopKeys(markdown, ROOM_HIDDEN_KEYS);
+}
+
+/** The page without the top-level frontmatter `keys`, each with its block. */
+function stripTopKeys(markdown: string, keys: readonly string[]): string {
   const front = FRONTMATTER.exec(markdown);
   if (front === null) {
     return markdown;
@@ -269,7 +289,7 @@ export function stripProvenance(markdown: string): string {
     const topLevel =
       index === 0 || /^---[ \t]*$/.test(line) || /^[^\s#-][^:]*:/.test(line);
     if (topLevel) {
-      inBlock = /^reflection:/.test(line);
+      inBlock = keys.some((key) => line.startsWith(`${key}:`));
     }
     if (!inBlock) {
       kept.push(raw);

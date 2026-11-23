@@ -107,7 +107,7 @@ import {
   reflectionRoute,
 } from "../paths";
 import { movePageDrafts } from "../reflectionPageDrafts";
-import { firstTitle, stripIdLines, stripProvenance } from "../reflectionText";
+import { firstTitle, roomText, stripIdLines } from "../reflectionText";
 import { useTheme } from "../theme/context";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
@@ -245,12 +245,11 @@ function Room({
   const target = useMemo(
     () => ({
       url: reflectionCollabUrl(domain, path),
-      // The room holds the page without its provenance block, so the text a
-      // conflict is judged against leaves it out too.
+      // The room holds the page without its provenance block and without
+      // the page settings (freshness, follows, status), so the text a
+      // conflict is judged against leaves them out too.
       readCurrent: () =>
-        fetchReflection(domain, path).then((doc) =>
-          stripProvenance(doc.markdown),
-        ),
+        fetchReflection(domain, path).then((doc) => roomText(doc.markdown)),
     }),
     [domain, path],
   );
