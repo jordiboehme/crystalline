@@ -1345,6 +1345,40 @@ pub(super) fn compose_reflection(
     })
 }
 
+/// The refusal of a write below curate that sends the page setting `key`
+/// with `value`, which only a curator changes.
+fn page_key_refusal(
+    domain: &str,
+    key: &str,
+    value: &serde_yaml_ng::Value,
+    create: bool,
+    right: ReflectionRight,
+) -> EngineError {
+    let shown = value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            serde_yaml_ng::to_string(value)
+                .ok()
+                .map(|t| t.trim().to_string())
+        })
+        .unwrap_or_default();
+    let what = if key == r::STATUS_KEY {
+        format!("status '{shown}' retires a page or brings it back, which")
+    } else {
+        format!("{key} '{shown}' is a page setting, which")
+    };
+    let fix = if create {
+        format!("write the new page without {key}")
+    } else {
+        format!("leave {key} out or send it as stored")
+    };
+    EngineError::Forbidden(format!(
+        "{what} a curator changes; your access to the Reflection of '{domain}' is {} and curate is needed, so {fix}",
+        reflection_right_word(right)
+    ))
+}
+
 /// What [`compose_reflection`] answers.
 pub(super) struct Composed {
     /// The text to write, without the bookkeeping block re-emitted yet.
@@ -1802,6 +1836,11 @@ impl Engine {
                 (edit.text, edit.heading_stripped, edit.placed_after_section)
             }
         };
+        // The page settings are a curator's: what the write leaves out keeps
+        // its stored value, and below curate a different value is refused.
+        let incoming = self
+            .settle_page_keys(p, &access, current.as_deref(), &incoming)
+            .await?;
         // An engram attachment is copied into reflections/assets/
         // first; a write that adds an embed of one is refused, nothing
         // written. An embed the stored page already holds (written by hand
@@ -2567,6 +2606,101 @@ impl Engine {
             self.mark_reflection_dirty(domain, BackupCause::Edit);
         }
         Ok(receipt(&final_text))
+    }
+
+    /// The page settings a whole-page write leaves on the page at `p.path`
+    /// (`freshness`, `follows`, `status`, spec 3.2): a key the text does not
+    /// send keeps its stored value, for every writer, so a page rewritten
+    /// without them keeps its schedule. A curator sets a key by sending it
+    /// and clears it by sending it with no value; a `follows` it sets must
+    /// name an existing page of this Reflection and close no cycle. Below
+    /// curate a key sent with another value than the stored one is refused,
+    /// on a new page any key at all; `status` only when the stored or the
+    /// sent value is a retired word.
+    async fn settle_page_keys(
+        &self,
+        p: &WriteReflectionParams,
+        access: &ReflectionAccess,
+        current: Option<&str>,
+        incoming: &str,
+    ) -> Result<String> {
+        let sent = r::page_key_values(incoming);
+        let stored = current.map(r::page_key_values).unwrap_or_default();
+        if sent.is_empty() && stored.is_empty() {
+            return Ok(incoming.to_string());
+        }
+        let curator = access.right >= ReflectionRight::Curate;
+        let retired = |value: &serde_yaml_ng::Value| {
+            value
+                .as_str()
+                .is_some_and(|s| crystalline_core::is_retired_status(&s.trim().to_lowercase()))
+        };
+        let mut carried: Vec<&str> = Vec::new();
+        let mut cleared: Vec<&str> = Vec::new();
+        for key in r::PAGE_KEYS {
+            let value = sent.get(key);
+            let before = stored.get(key);
+            match value {
+                None => carried.push(key),
+                Some(value) if value.is_null() && curator => cleared.push(key),
+                // A key with no value from an editor changes nothing.
+                Some(value) if value.is_null() => carried.push(key),
+                Some(_) if curator => {}
+                Some(value) => {
+                    let guarded = key != r::STATUS_KEY
+                        || retired(value)
+                        || before.is_some_and(|v| retired(v));
+                    if guarded && before != Some(value) {
+                        return Err(page_key_refusal(
+                            &p.domain,
+                            key,
+                            value,
+                            current.is_none(),
+                            access.right,
+                        ));
+                    }
+                }
+            }
+        }
+        if curator
+            && let Some(target) = sent.get(r::FOLLOWS_KEY).filter(|v| !v.is_null())
+            && stored.get(r::FOLLOWS_KEY) != Some(target)
+        {
+            let pages = self.page_links(access.domain_id, &p.path, current).await?;
+            if let Some(refusal) = r::follows_refusal(&p.path, target, &pages) {
+                return Err(EngineError::Invalid(refusal));
+            }
+        }
+        let text = r::carry_page_keys(incoming, current, &carried).map_err(EngineError::Invalid)?;
+        r::carry_page_keys(&text, None, &cleared).map_err(EngineError::Invalid)
+    }
+
+    /// Every page of the Reflection of `domain_id` with what its pact chain
+    /// walks (its `follows` and its owner), from the index rows, with the
+    /// page at `page` as `current` holds it (or with no links when it is
+    /// new): what a `follows` a write sets is checked against. Pact files,
+    /// threads and baselines are no pages.
+    async fn page_links(
+        &self,
+        domain_id: DomainId,
+        page: &str,
+        current: Option<&str>,
+    ) -> Result<BTreeMap<String, r::PageLinks>> {
+        let rows = self.store.lock().await.list_reflections(domain_id).await?;
+        let links = |path: &str, text: &str| {
+            let record = r::read_provenance(text).page;
+            r::read_page_settings(text, path, &record).0.links(&record)
+        };
+        let mut pages: BTreeMap<String, r::PageLinks> = rows
+            .iter()
+            .filter(|row| matches!(r::classify(&row.path), r::ReflectionFile::Page(_)))
+            .map(|row| (row.path.clone(), links(&row.path, &row.content)))
+            .collect();
+        pages.insert(
+            page.to_string(),
+            current.map(|text| links(page, text)).unwrap_or_default(),
+        );
+        Ok(pages)
     }
 
     /// The right to be in a reflection's room: edit, curate for a pact file

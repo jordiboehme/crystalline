@@ -209,3 +209,205 @@ async fn a_room_neither_shows_nor_changes_the_settings() {
         "{after}"
     );
 }
+
+async fn put_err(fx: &Fx, path: &str, text: &str, who: &ReflectionCaller) -> String {
+    put(fx, path, text, who).await.unwrap_err()
+}
+
+fn settings(fx: &Fx, path: &str) -> String {
+    let text = file(fx, path).unwrap();
+    let keys = crystalline_core::reflection::page_key_values(&text);
+    keys.iter()
+        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("?")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A whole-page write below curate keeps the settings as stored: a page
+/// sent without them keeps them, one that sends them as stored passes, and
+/// one that sends other values is refused. `status` is the curator's only
+/// for the retired words.
+#[tokio::test]
+async fn an_editors_write_keeps_the_settings_and_is_refused_when_it_changes_them() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/a.md", SET, &curator).await.unwrap();
+    let all = "follows=guides/b.md,freshness=1d,status=current";
+    assert_eq!(settings(&fx, "guides/a.md"), all);
+
+    put(&fx, "guides/a.md", "# A\n\n## One\n\nChanged.\n", &ann)
+        .await
+        .unwrap();
+    assert_eq!(settings(&fx, "guides/a.md"), all, "kept when not sent");
+    assert!(file(&fx, "guides/a.md").unwrap().contains("Changed."));
+    put(&fx, "guides/a.md", SET, &ann).await.unwrap();
+    assert_eq!(settings(&fx, "guides/a.md"), all, "sent as stored");
+
+    for (key, changed) in [
+        ("freshness", SET.replace("freshness: 1d", "freshness: 6h")),
+        (
+            "follows",
+            SET.replace("follows: guides/b.md", "follows: guides/c.md"),
+        ),
+        ("status", SET.replace("status: current", "status: archived")),
+    ] {
+        let err = put_err(&fx, "guides/a.md", &changed, &ann).await;
+        assert!(err.contains("curate"), "{key}: {err}");
+        assert!(err.contains(key), "{key}: {err}");
+    }
+    assert_eq!(settings(&fx, "guides/a.md"), all);
+
+    // A status that is no retired word is anybody's to change.
+    put(
+        &fx,
+        "guides/a.md",
+        &SET.replace("status: current", "status: draft"),
+        &ann,
+    )
+    .await
+    .unwrap();
+    assert!(settings(&fx, "guides/a.md").ends_with("status=draft"));
+    // A retired page stays retired, whatever an editor sends.
+    put(
+        &fx,
+        "guides/a.md",
+        &SET.replace("status: current", "status: Archived"),
+        &curator,
+    )
+    .await
+    .unwrap();
+    let err = put_err(&fx, "guides/a.md", SET, &ann).await;
+    assert!(err.contains("status"), "{err}");
+    put(&fx, "guides/a.md", PAGE, &ann).await.unwrap();
+    assert!(settings(&fx, "guides/a.md").ends_with("status=Archived"));
+
+    // A section edit leaves the frontmatter alone.
+    fx.engine
+        .write_reflection(
+            &crystalline_service::params::WriteReflectionParams {
+                domain: "eng".into(),
+                path: "guides/a.md".into(),
+                operation: Some("replace_section".into()),
+                section: Some("One".into()),
+                content: Some("By section.".into()),
+                ..Default::default()
+            },
+            &ann,
+        )
+        .await
+        .unwrap();
+    assert!(settings(&fx, "guides/a.md").starts_with("follows=guides/b.md,freshness=1d"));
+}
+
+/// A new page an editor writes carries no settings a curator sets.
+#[tokio::test]
+async fn an_editor_creates_a_page_without_the_curators_settings() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    for (key, text) in [
+        ("freshness", "---\nfreshness: 1d\n---\n\n# N\n"),
+        ("follows", "---\nfollows: guides/b.md\n---\n\n# N\n"),
+        ("status", "---\nstatus: archived\n---\n\n# N\n"),
+    ] {
+        let err = put_err(&fx, "guides/n.md", text, &ann).await;
+        assert!(err.contains("curate") && err.contains(key), "{key}: {err}");
+        assert!(file(&fx, "guides/n.md").is_none());
+    }
+    put(&fx, "guides/n.md", "---\nstatus: draft\n---\n\n# N\n", &ann)
+        .await
+        .unwrap();
+    assert_eq!(settings(&fx, "guides/n.md"), "status=draft");
+}
+
+/// A curator sets and clears the settings by writing the page; a page sent
+/// without them keeps them, and a key with no value clears it.
+#[tokio::test]
+async fn a_curator_sets_keeps_and_clears_the_settings() {
+    let (fx, _ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/a.md", SET, &curator).await.unwrap();
+    put(&fx, "guides/a.md", PAGE, &curator).await.unwrap();
+    assert_eq!(
+        settings(&fx, "guides/a.md"),
+        "follows=guides/b.md,freshness=1d,status=current"
+    );
+    put(
+        &fx,
+        "guides/a.md",
+        &SET.replace("freshness: 1d", "freshness: 6h"),
+        &curator,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settings(&fx, "guides/a.md"),
+        "follows=guides/b.md,freshness=6h,status=current"
+    );
+    put(
+        &fx,
+        "guides/a.md",
+        "---\nfreshness:\nfollows:\n---\n\n# A\n",
+        &curator,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settings(&fx, "guides/a.md"), "status=current");
+}
+
+/// A follows is written only when it names an existing page of the same
+/// Reflection and closes no cycle; the refusal names the cycle.
+#[tokio::test]
+async fn a_follows_that_names_no_page_or_closes_a_cycle_is_refused() {
+    let (fx, _ann, curator) = editor_and_curator().await;
+    put(
+        &fx,
+        "guides/b.md",
+        "---\nfollows: guides/c.md\n---\n\n# B\n",
+        &curator,
+    )
+    .await
+    .unwrap_err();
+    put(&fx, "guides/c.md", PAGE, &curator).await.unwrap();
+    put(
+        &fx,
+        "guides/b.md",
+        "---\nfollows: guides/c.md\n---\n\n# B\n",
+        &curator,
+    )
+    .await
+    .unwrap();
+    put(
+        &fx,
+        "guides/a.md",
+        "---\nfollows: guides/b.md\n---\n\n# A\n",
+        &curator,
+    )
+    .await
+    .unwrap();
+    let err = put_err(
+        &fx,
+        "guides/c.md",
+        "---\nfollows: guides/a.md\n---\n\n# C\n",
+        &curator,
+    )
+    .await;
+    assert!(
+        err.contains("guides/c.md > guides/a.md > guides/b.md > guides/c.md"),
+        "{err}"
+    );
+    assert!(!file(&fx, "guides/c.md").unwrap().contains("follows"));
+    for (target, says) in [
+        ("guides/gone.md", "does not exist"),
+        ("crystalline://ops/x.md", "another domain"),
+        ("PACT.md", "names no page"),
+    ] {
+        let err = put_err(
+            &fx,
+            "guides/c.md",
+            &format!("---\nfollows: {target}\n---\n\n# C\n"),
+            &curator,
+        )
+        .await;
+        assert!(err.contains(says), "{target}: {err}");
+    }
+}
