@@ -2274,8 +2274,10 @@ impl Engine {
                 .map(|s| s.heading.clone())
                 .collect()
         };
-        // A curator's change of freshness or status keeps a current pact
-        // hash current, in the same commit (read before anything is written): it asks for no reconcile.
+        // Any write that changes only freshness or status, with the pact
+        // chain unchanged, keeps a current pact hash current in the same
+        // commit (read before anything is written): it asks for no
+        // reconcile.
         let rehash = self
             .settings_rehash(access.domain_id, &p.path, current.as_deref(), &final_text)
             .await?;
