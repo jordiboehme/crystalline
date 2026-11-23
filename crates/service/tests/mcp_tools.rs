@@ -9562,3 +9562,97 @@ fn representative_args(tool: &str) -> Option<Value> {
         _ => return None,
     })
 }
+
+/// The Reflection tools teach pages that keep themselves current: the
+/// descriptions are the tool-search corpus, so each new verb, item kind,
+/// field and refusal is named where an agent looks for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reflection_tools_teach_pages_that_keep_themselves_current() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let tool = |name: &str| {
+        tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .clone()
+    };
+    let description = |name: &str| {
+        tool(name)
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let schema = |name: &str| serde_json::to_string(&tool(name).input_schema).unwrap();
+
+    let reflect = description("reflect");
+    for needle in [
+        "stale",
+        "freshness",
+        "changed_engrams",
+        "owned_reconciled",
+        "page_pact_changed",
+        "owner_gone",
+        "link_retired",
+        "link_broken",
+        "version",
+        "action=reconciled",
+    ] {
+        assert!(
+            reflect.contains(needle),
+            "reflect lacks {needle}: {reflect}"
+        );
+    }
+    let reflect_schema = schema("reflect");
+    assert!(
+        reflect_schema.contains("changed_engrams") && reflect_schema.contains("null"),
+        "the stale parameter says when the count is unknown: {reflect_schema}"
+    );
+
+    let write = description("write_reflection");
+    for needle in [
+        "action reconciled",
+        "outcome updated or unchanged",
+        "version",
+        "action retire",
+        "action restore",
+        "owner",
+        "owned pages first and the owner last",
+        "never deletes",
+        "retire it instead",
+        "owner: \"\"",
+        "older period",
+        "freshness",
+        "follows",
+    ] {
+        assert!(
+            write.contains(needle),
+            "write_reflection lacks {needle}: {write}"
+        );
+    }
+    let write_schema = schema("write_reflection");
+    for needle in ["retire", "restore", "reconciled", "owner", "version"] {
+        assert!(
+            write_schema.contains(needle),
+            "write_reflection's schema lacks {needle}"
+        );
+    }
+
+    let read = description("read_reflection");
+    for needle in [
+        "freshness",
+        "follows",
+        "owner",
+        "retired",
+        "chain",
+        "page pact",
+    ] {
+        assert!(
+            read.contains(needle),
+            "read_reflection lacks {needle}: {read}"
+        );
+    }
+}

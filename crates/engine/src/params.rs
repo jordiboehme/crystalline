@@ -759,8 +759,9 @@ pub struct WriteReflectionParams {
     /// back under that page; leave it out to restore it as a page of its own.
     #[serde(default)]
     pub owner: Option<String>,
-    /// reconciled: the version of the queue item the reconcile settled, as
-    /// the item gave it.
+    /// reconciled: the version of the stale item the reconcile settled, as
+    /// the item gave it. Needed while the page is stale; a version from
+    /// before the page's last reconcile is refused as an older period.
     #[serde(default)]
     pub version: Option<String>,
     /// write: the checksum read_reflection returned; a reflection that changed

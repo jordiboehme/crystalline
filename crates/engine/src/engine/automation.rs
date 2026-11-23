@@ -229,12 +229,20 @@ impl Engine {
     /// Whether `lp` is due on each of `domains`, or on every domain `scope`
     /// may run it on when none are named: `{loop, domains: [{domain, loop,
     /// due, counts, left_for_person, running, runs_on, reason, last_run,
-    /// delivery}]}`; `delivery` ([`Delivery`]) is null unless the MANIFEST
-    /// turns the loop's webhook trigger on.
+    /// delivery, next_stale_at, next_stale_in_secs}]}`; `delivery`
+    /// ([`Delivery`]) is null unless the MANIFEST turns the loop's webhook
+    /// trigger on.
     ///
     /// Reflect counts the queue a headless run works (threads waiting for
     /// the agent, feedback, page updates; no update of a page open in a live
-    /// editor), evolve counts its findings and only mechanical ones are due.
+    /// editor), with `counts.stale` on its own: pages whose freshness ran
+    /// out, which `updates` and `pages_to_update` leave out (a due page's
+    /// own source changes fold into its stale item and count there).
+    /// `next_stale_at` (RFC 3339) and `next_stale_in_secs` name when the
+    /// next page falls due or a due page enters its next period, also with
+    /// `counts` false; both are null for evolve, for a loop that runs
+    /// elsewhere and when no page keeps itself current. Evolve counts its
+    /// findings and only mechanical ones are due.
     /// An item a finished run left for a person is not due again until it
     /// changes, and is counted in `left_for_person` instead. A held lease
     /// reports `running` and nothing is due; a domain whose loop runs on
