@@ -1142,6 +1142,7 @@ async fn an_unattended_request_ignores_a_stored_confirmation() {
     let sees_harbor = Limit {
         hidden: Default::default(),
         writes: None,
+        unattended: true,
     };
     let err = within(
         Some(sees_harbor),

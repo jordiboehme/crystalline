@@ -582,6 +582,7 @@ async fn a_run_retags_only_the_domain_it_works_on() {
     let on_harbor = Limit {
         hidden: Default::default(),
         writes: Some(vec!["harbor".to_string()]),
+        unattended: true,
     };
     within(
         Some(on_harbor),
@@ -598,6 +599,7 @@ async fn a_run_retags_only_the_domain_it_works_on() {
     let nowhere = Limit {
         hidden: Default::default(),
         writes: Some(Vec::new()),
+        unattended: true,
     };
     let err = within(
         Some(nowhere),

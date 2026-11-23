@@ -1821,19 +1821,14 @@ impl Engine {
 
     /// Whether the Reflection caller `caller` is unattended, so nobody
     /// watches what it removes: an agent of the loops (never anybody's
-    /// interactive session), a request inside a read limit (a session its
-    /// registration or a run header marks unattended, or one whose caller
-    /// holds a live lease: [`crate::read_limit`]), or a caller that holds a
-    /// live loop lease on any surface ([`Engine::run_domains`]; for the
-    /// machine owner any lease held with no account, since the owner and the
-    /// owner's own run look alike). A person in Fluid or in an attended MCP
-    /// session is not. Leases that cannot be read are an error, never an
-    /// answer.
-    pub(crate) async fn is_unattended(&self, caller: &ReflectionCaller) -> Result<bool> {
-        if matches!(caller.scope, Scope::Agent { .. }) || crate::read_limit::current().is_some() {
-            return Ok(true);
-        }
-        Ok(!self.run_domains(&caller.scope).await?.is_empty())
+    /// interactive session), or a request whose session said it is
+    /// unattended (its registration's mark or a run header:
+    /// [`crate::read_limit::Limit::unattended`]). A live lease alone makes
+    /// nobody unattended: the machine owner whose run holds one, an attended
+    /// MCP session limited by it and a person in Fluid still act in person.
+    pub(crate) fn is_unattended(&self, caller: &ReflectionCaller) -> bool {
+        matches!(caller.scope, Scope::Agent { .. })
+            || crate::read_limit::current().is_some_and(|limit| limit.unattended)
     }
 
     /// The domains `scope` holds a live lease of either loop on: what a run
@@ -1963,6 +1958,7 @@ impl Engine {
             return Some(crate::read_limit::Limit {
                 hidden: all.into_iter().collect(),
                 writes: Some(Vec::new()),
+                unattended: marked,
             });
         };
         let domains_of = |only: Option<Loop>| {
@@ -1986,6 +1982,7 @@ impl Engine {
             return Some(crate::read_limit::Limit {
                 hidden: self.hidden_beside(&all, &held).await,
                 writes: Some(Vec::new()),
+                unattended: marked,
             });
         }
         // What the run works on, and so may write into. Without a lease it
@@ -1999,7 +1996,11 @@ impl Engine {
             _ => (all.clone(), None),
         };
         let hidden = self.hidden_beside(&all, &targets).await;
-        Some(crate::read_limit::Limit { hidden, writes })
+        Some(crate::read_limit::Limit {
+            hidden,
+            writes,
+            unattended: marked,
+        })
     }
 
     /// The domains of `all` a run working on `targets` may not read: those

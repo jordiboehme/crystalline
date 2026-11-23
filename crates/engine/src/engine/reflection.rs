@@ -3775,12 +3775,6 @@ impl Engine {
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
         r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
-        // An unattended session answers people it has never met and nobody
-        // watches what it removes: it retires a page and never deletes one
-        // (spec 2.4), here for every surface that reaches this verb.
-        if self.is_unattended(caller).await? {
-            return Err(EngineError::Forbidden(unattended_delete_refusal(inner)));
-        }
         // A page's pact goes with it, so deleting a page that has one is a
         // curator's, as deleting the pact alone is.
         let pact = (!r::is_pact_file(inner))
@@ -3804,6 +3798,19 @@ impl Engine {
             ));
         }
         let abs = access.abs(inner);
+        // An unattended session answers people it has never met and nobody
+        // watches what it removes: it retires a page and never deletes one
+        // (spec 2.4), here for every surface that reaches this verb. After
+        // the agreement's sentence and a missing page's, which need no
+        // advice to retire; the lock below decides a missing page again.
+        if self.is_unattended(caller) {
+            if !abs.exists() {
+                return Err(EngineError::NotFound(format!(
+                    "no reflection '{inner}' in domain '{domain}'"
+                )));
+            }
+            return Err(EngineError::Forbidden(unattended_delete_refusal(inner)));
+        }
         // The test seam sits between the screen and the file lock because that
         // window is the one R81 pins: a room may open in it.
         self.take_room_screen_hold().await;

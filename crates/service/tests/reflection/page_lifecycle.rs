@@ -59,6 +59,15 @@ async fn curator_agent(fx: &Fx) -> ReflectionCaller {
     ReflectionCaller::agent(scope, "curator", false)
 }
 
+/// The limit of a session that says it is unattended (its registration or
+/// a run header).
+fn unattended() -> Limit {
+    Limit {
+        unattended: true,
+        ..Limit::default()
+    }
+}
+
 fn refused_as_unattended(e: &EngineError, path: &str) {
     assert!(matches!(e, EngineError::Forbidden(_)), "{e}");
     let text = e.to_string();
@@ -77,7 +86,7 @@ async fn an_unattended_session_retires_instead_of_deleting() {
     put(&fx, "guides/a.md", PAGE).await;
 
     let refused = within(
-        Some(Limit::default()),
+        Some(unattended()),
         fx.engine.write_reflection(&delete("guides/a.md"), &agent()),
     )
     .await
@@ -87,7 +96,7 @@ async fn an_unattended_session_retires_instead_of_deleting() {
 
     // The engine verb itself refuses, whichever surface calls it.
     let refused = within(
-        Some(Limit::default()),
+        Some(unattended()),
         fx.engine.delete_reflection("eng", "guides/a.md", &person()),
     )
     .await
@@ -96,7 +105,7 @@ async fn an_unattended_session_retires_instead_of_deleting() {
 
     // What it does instead goes through.
     within(
-        Some(Limit::default()),
+        Some(unattended()),
         fx.engine
             .write_reflection(&act("retire", "guides/a.md"), &agent()),
     )
@@ -140,7 +149,7 @@ async fn an_unattended_session_cannot_delete_a_page_pact() {
     .await;
 
     let refused = within(
-        Some(Limit::default()),
+        Some(unattended()),
         fx.engine
             .delete_reflection("eng", "guides/a.pact.md", &person()),
     )
@@ -151,12 +160,16 @@ async fn an_unattended_session_cannot_delete_a_page_pact() {
     assert!(file(&fx, "guides/a.pact.md").is_some());
 }
 
-/// A caller that holds a live loop lease is the run at work: its delete is
-/// refused while the lease lives, with no read limit around the call.
+/// A lease is no mark: the machine owner whose run holds a lease, and an
+/// account while an agent's run holds one on the same domain, still delete
+/// a page when they act in person. So does a session whose limit comes from
+/// a lease alone, which never said it is unattended.
 #[tokio::test]
-async fn a_lease_holder_cannot_delete_a_page() {
+async fn a_live_lease_does_not_stop_an_attended_delete() {
     let fx = reflecting().await;
-    put(&fx, "guides/a.md", PAGE).await;
+    for page in ["guides/a.md", "guides/b.md", "guides/c.md"] {
+        put(&fx, page, PAGE).await;
+    }
     // Work for the reflect loop, so a lease can be taken.
     fx.engine
         .discuss(
@@ -172,18 +185,47 @@ async fn a_lease_holder_cannot_delete_a_page() {
         )
         .await
         .unwrap();
+    let curator = curator_agent(&fx).await;
     fx.engine
-        .automation_lease_take(Loop::Reflect, "eng", "cron", &Scope::Unrestricted)
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &curator.scope)
         .await
         .unwrap();
-
-    let refused = fx
-        .engine
-        .write_reflection(&delete("guides/a.md"), &person())
+    fx.engine
+        .write_reflection(&delete("guides/b.md"), &person())
         .await
-        .unwrap_err();
-    refused_as_unattended(&refused, "guides/a.md");
-    assert!(file(&fx, "guides/a.md").is_some(), "the page stays");
+        .unwrap();
+    assert!(file(&fx, "guides/b.md").is_none());
+    within(
+        Some(Limit::default()),
+        fx.engine
+            .write_reflection(&delete("guides/c.md"), &person()),
+    )
+    .await
+    .unwrap();
+    assert!(file(&fx, "guides/c.md").is_none());
+}
+
+/// PACT.md and a page that is not there get their own answers from an
+/// unattended session too, never the advice to retire them.
+#[tokio::test]
+async fn an_unattended_delete_of_no_page_gets_its_own_answer() {
+    let fx = reflecting().await;
+    put(&fx, "PACT.md", "# Pact\n\n## Tone\n\nPlain.\n").await;
+    let pact = within(
+        Some(unattended()),
+        fx.engine.write_reflection(&delete("PACT.md"), &agent()),
+    )
+    .await
+    .unwrap_err();
+    assert!(pact.to_string().contains("agreement"), "{pact}");
+    assert!(!pact.to_string().contains("retire"), "{pact}");
+    let missing = within(
+        Some(unattended()),
+        fx.engine.write_reflection(&delete("gone.md"), &agent()),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(missing, EngineError::NotFound(_)), "{missing}");
 }
 
 // --- owned pages ------------------------------------------------------------

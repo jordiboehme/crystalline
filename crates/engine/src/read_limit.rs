@@ -34,6 +34,12 @@ pub struct Limit {
     /// `None` when it may write wherever its rights allow, because what it
     /// reads every reader of every domain may read anyway.
     pub writes: Option<Vec<String>>,
+    /// Whether the session said it is unattended: its registration marks
+    /// it, it names a run domain or loop, or it is an agent of the loops.
+    /// `false` for a limit that comes from a live lease alone, an
+    /// interactive session that looks like its owner's run: a person is
+    /// still behind it, and may do what only a person does (delete a page).
+    pub unattended: bool,
 }
 
 tokio::task_local! {
