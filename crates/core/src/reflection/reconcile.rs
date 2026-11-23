@@ -2,16 +2,15 @@
 //! follows, and the pages one page owns.
 //!
 //! The pact hash ([`pact_hash`]) is what a reconcile saw of the pacts the
-//! page follows and of its own settings. Whatever a move rewrites stays out
-//! of it, so a curator's move changes no page's hash: the pact texts are
-//! hashed by their content, never their paths, with every relative link
-//! target left out (a move relinks the pacts that link the moved page and
-//! rebases the moved page's own pact), with the `reflection:` block and the
-//! section id lines left out (Crystalline's bookkeeping, which a settle and
-//! a first write change) and line endings as LF. `follows` as written is
-//! left out too: a move rewrites it, and a page that follows another page
-//! already has that page's pact in its chain. The cost: a pact edit that
-//! changes only a link target does not change the hash.
+//! page follows and of its own settings: the pact texts by their content,
+//! never their paths, with the `reflection:` block and the section id lines
+//! left out (Crystalline's bookkeeping, which a settle and a first write
+//! change) and line endings as LF, then the page's `freshness` and
+//! `status`. `follows` as written is left out: a move rewrites it, and a
+//! page that follows another page already has that page's pact in its
+//! chain. A link inside a pact is content, so a link retargeted on disk or
+//! by a pull changes the hash; a move that rewrites the links of a pact
+//! updates the stored hashes it leaves current in its own commit instead.
 //!
 //! Ownership is recorded on the owned page, in its page record
 //! ([`PageRecord::owner`]); a page's set of owned pages is a scan of the
@@ -27,16 +26,13 @@ use super::provenance::{PageRecord, Provenance, read_provenance, write_provenanc
 use super::sections::parse_id_line;
 
 /// The text of a pact file as the pact hash reads it: LF line endings, no
-/// `reflection:` block, no section id lines and every relative link target
-/// left empty.
+/// `reflection:` block and no section id lines.
 fn pact_content(text: &str) -> String {
     let text = crate::to_lf(text);
     let text = write_provenance(&text, &Provenance::new()).unwrap_or_else(|_| text.to_string());
-    let text: String = text
-        .split_inclusive('\n')
+    text.split_inclusive('\n')
         .filter(|line| parse_id_line(line).is_none())
-        .collect();
-    super::links::map_links(&text, &|_| Some(String::new())).0
+        .collect()
 }
 
 /// The pact hash of a page: the texts of the pacts it follows, in the order
@@ -283,12 +279,13 @@ mod tests {
     }
 
     #[test]
-    fn the_hash_leaves_out_what_a_move_and_the_bookkeeping_rewrite() {
+    fn the_hash_reads_link_targets_and_leaves_out_the_bookkeeping() {
         let settings = PageSettings::default();
         let a = pact_hash(&[PACT], &settings);
-        // A relative link that followed a move.
-        let relinked = PACT.replace("arch/overview.md", "design/overview.md");
-        assert_eq!(a, pact_hash(&[&relinked], &settings), "a link target");
+        // A link retargeted is a change of the pact (a move keeps the
+        // stored hash by updating it in its own commit).
+        let retargeted = PACT.replace("arch/overview.md", "design/overview.md");
+        assert_ne!(a, pact_hash(&[&retargeted], &settings), "a link target");
         // The block and the id lines are Crystalline's.
         let stamped = PACT.replace(
             "title: Pact\n",
@@ -348,21 +345,21 @@ mod tests {
     }
 
     #[test]
-    fn a_follower_keeps_its_hash_when_what_it_follows_moves() {
+    fn a_follower_keeps_its_hash_when_only_the_paths_change() {
         let before = [
-            ("PACT.md", "# Pact\n\nSee [a](guides/a.md).\n"),
+            ("PACT.md", "# Pact\n\nPlain.\n"),
             ("guides/a.md", "# A\n"),
-            ("guides/a.pact.md", "# A pact\n\nSee [b](b.md).\n"),
+            ("guides/a.pact.md", "# A pact\n\nShort.\n"),
             ("guides/b.md", "---\nfollows: guides/a.md\n---\n# B\n"),
         ];
         let after = [
-            ("PACT.md", "# Pact\n\nSee [a](guides/c.md).\n"),
-            ("guides/c.md", "# A\n"),
-            ("guides/c.pact.md", "# A pact\n\nSee [b](b.md).\n"),
-            ("guides/b.md", "---\nfollows: guides/c.md\n---\n# B\n"),
+            ("PACT.md", "# Pact\n\nPlain.\n"),
+            ("design/c.md", "# A\n"),
+            ("design/c.pact.md", "# A pact\n\nShort.\n"),
+            ("guides/b.md", "---\nfollows: design/c.md\n---\n# B\n"),
         ];
         let (before, after) = (pact_hashes(before), pact_hashes(after));
-        assert_eq!(before["guides/a.md"], after["guides/c.md"]);
+        assert_eq!(before["guides/a.md"], after["design/c.md"]);
         assert_eq!(before["guides/b.md"], after["guides/b.md"]);
     }
 

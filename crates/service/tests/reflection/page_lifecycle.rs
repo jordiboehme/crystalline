@@ -763,9 +763,9 @@ async fn no_other_write_records_a_reconcile() {
 }
 
 /// A curator's move keeps the pact hash of the moved page and of the pages
-/// that follow it: the stored hash stays equal to one computed now, though
-/// the move rebased a link in the page's pact, relinked `PACT.md` and
-/// rewrote the follower's `follows`.
+/// that follow it current: the stored hash stays equal to one computed now,
+/// though the move rebased a link in the page's pact, relinked `PACT.md`
+/// and rewrote the follower's `follows`.
 #[tokio::test]
 async fn a_move_keeps_the_pact_hash_of_the_page_and_its_followers() {
     let fx = reflecting().await;
@@ -824,10 +824,49 @@ async fn a_move_keeps_the_pact_hash_of_the_page_and_its_followers() {
             .contains("follows: design/c.md")
     );
     let files = ["PACT.md", "design/c.md", "design/c.pact.md", "guides/b.md"];
-    assert_eq!(stored_hash(&fx, "design/c.md").await.unwrap(), a);
-    assert_eq!(fresh_hash(&fx, "design/c.md", &files), a);
-    assert_eq!(stored_hash(&fx, "guides/b.md").await.unwrap(), b);
-    assert_eq!(fresh_hash(&fx, "guides/b.md", &files), b);
+    // The pact texts changed by the move's own rewrite, and the move's
+    // commit moved the stored hashes along with them.
+    for (page, before) in [("design/c.md", a), ("guides/b.md", b)] {
+        let stored = stored_hash(&fx, page).await.unwrap();
+        assert_eq!(stored, fresh_hash(&fx, page, &files), "{page}");
+        assert_ne!(stored, before, "{page}");
+    }
+}
+
+/// A stored hash that was already stale before a move stays stale: the
+/// move updates only the hashes it alone would have changed.
+#[tokio::test]
+async fn a_move_leaves_a_stale_pact_hash_stale() {
+    let fx = reflecting().await;
+    put(
+        &fx,
+        "PACT.md",
+        "# Pact\n\n## Tone\n\nSee [a](guides/a.md).\n",
+    )
+    .await;
+    put(&fx, "guides/a.md", PAGE).await;
+    put(&fx, "guides/b.md", PAGE).await;
+    fx.engine
+        .write_reflection(&reconciled("guides/b.md", "unchanged", "v1"), &agent())
+        .await
+        .unwrap();
+    // A person changes the agreement after the reconcile.
+    put(
+        &fx,
+        "PACT.md",
+        "# Pact\n\n## Tone\n\nShort. See [a](guides/a.md).\n",
+    )
+    .await;
+    let stale = stored_hash(&fx, "guides/b.md").await.unwrap();
+    let files = ["PACT.md", "guides/a.md", "guides/b.md"];
+    assert_ne!(fresh_hash(&fx, "guides/b.md", &files), stale);
+
+    fx.engine
+        .move_reflection("eng", "guides/a.md", "guides/c.md", &person())
+        .await
+        .unwrap();
+    assert!(file(&fx, "PACT.md").unwrap().contains("guides/c.md"));
+    assert_eq!(stored_hash(&fx, "guides/b.md").await.unwrap(), stale);
 }
 
 /// A retire keeps the status the page had, and a restore puts it back; a
@@ -894,4 +933,89 @@ async fn an_empty_owner_is_refused_everywhere() {
     }
     assert!(file(&fx, "new.md").is_none());
     assert!(record(&fx, "old.md").retired.is_some(), "still retired");
+}
+
+/// A pact link retargeted on disk (or by a pull) is a change of the pact:
+/// the page's pact hash moves away from the one its reconcile recorded.
+#[tokio::test]
+async fn a_pact_link_retargeted_on_disk_changes_the_pact_hash() {
+    let fx = reflecting().await;
+    put(
+        &fx,
+        "PACT.md",
+        "# Pact\n\n## Tone\n\nLike [style](guides/style.md).\n",
+    )
+    .await;
+    put(&fx, "guides/style.md", PAGE).await;
+    put(&fx, "guides/b.md", PAGE).await;
+    fx.engine
+        .write_reflection(&reconciled("guides/b.md", "unchanged", "v1"), &agent())
+        .await
+        .unwrap();
+    let files = ["PACT.md", "guides/style.md", "guides/b.md"];
+    let stored = stored_hash(&fx, "guides/b.md").await.unwrap();
+    assert_eq!(fresh_hash(&fx, "guides/b.md", &files), stored);
+
+    let pact = fx.root.join("reflections/PACT.md");
+    let text = std::fs::read_to_string(&pact).unwrap();
+    std::fs::write(&pact, text.replace("guides/style.md", "guides/style-v2.md")).unwrap();
+    fx.engine.sync(None).await.unwrap();
+
+    assert_ne!(fresh_hash(&fx, "guides/b.md", &files), stored);
+    assert_eq!(
+        stored_hash(&fx, "guides/b.md").await.unwrap(),
+        stored,
+        "the record keeps what the reconcile saw"
+    );
+}
+
+/// The pages an owner owns follow its pact: when the owner moves with a
+/// pact whose links the move rebases, the stored hash of an owned page
+/// stays equal to one computed now.
+#[tokio::test]
+async fn an_owned_page_keeps_its_pact_hash_when_its_owner_moves() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    put(
+        &fx,
+        "arch.pact.md",
+        "# Pact of arch\n\n## Tone\n\nStart at [one](arch/one.md).\n",
+    )
+    .await;
+    fx.engine
+        .write_reflection(&owned("arch/one.md", "arch.md", PAGE), &agent())
+        .await
+        .unwrap();
+    for page in ["arch.md", "arch/one.md"] {
+        fx.engine
+            .write_reflection(&reconciled(page, "unchanged", "v1"), &agent())
+            .await
+            .unwrap();
+    }
+    let (owner, child) = (
+        stored_hash(&fx, "arch.md").await.unwrap(),
+        stored_hash(&fx, "arch/one.md").await.unwrap(),
+    );
+    let pact_before = file(&fx, "arch.pact.md").unwrap();
+
+    fx.engine
+        .move_reflection("eng", "arch.md", "design/d.md", &person())
+        .await
+        .unwrap();
+
+    assert_ne!(
+        file(&fx, "design/d.pact.md").unwrap(),
+        pact_before,
+        "rebased"
+    );
+    assert_eq!(
+        record(&fx, "arch/one.md").owner.as_deref(),
+        Some("design/d.md")
+    );
+    let files = ["design/d.md", "design/d.pact.md", "arch/one.md"];
+    for (page, before) in [("design/d.md", owner), ("arch/one.md", child)] {
+        let stored = stored_hash(&fx, page).await.unwrap();
+        assert_eq!(stored, fresh_hash(&fx, page, &files), "{page}");
+        assert_ne!(stored, before, "{page}: the rebased pact is the pact now");
+    }
 }

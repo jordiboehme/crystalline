@@ -3267,6 +3267,10 @@ struct MoveScreen {
     /// The pages whose frontmatter names the moved page and is rewritten in
     /// the move's own commit.
     followers: Vec<String>,
+    /// The pact files (`PACT.md`, other page pacts) whose links reach the
+    /// moved page or its pact: relinked in the move's own commit, so the
+    /// stored pact hashes it leaves current follow in the same commit.
+    pacts: Vec<String>,
 }
 
 /// What a move writes, read and rewritten under its locks.
@@ -3285,6 +3289,13 @@ struct StagedMove {
     follows_rewritten: usize,
     /// How many owners and former owners in their records do.
     owners_rewritten: usize,
+    /// Each relinked pact file: its path, its file, its new text, its new
+    /// baseline when it has one, and how many links changed.
+    pacts: Vec<(String, PathBuf, String, Option<String>, usize)>,
+    /// The reconcile states whose stored pact hash the move would leave
+    /// stale only because it rewrote paths: each with the hash computed
+    /// after the move, at the page's path after it.
+    rehashed: Vec<crystalline_index::ReflectionReconcile>,
 }
 
 /// `text` with an owner or a former owner in its page record that names
@@ -3379,11 +3390,17 @@ impl Engine {
         let pact_src = access.abs(&mv.pact_from);
         let pact_dst = access.abs(&mv.pact_to);
         let follower_abs: Vec<PathBuf> = screen.followers.iter().map(|f| access.abs(f)).collect();
+        let relinked_abs: Vec<PathBuf> = screen.pacts.iter().map(|p| access.abs(p)).collect();
         let mut lock_paths: Vec<&Path> = vec![&src, &dst, &pact_src, &pact_dst];
         lock_paths.extend(follower_abs.iter().map(PathBuf::as_path));
+        lock_paths.extend(relinked_abs.iter().map(PathBuf::as_path));
         let _locks = self.lock_files(&lock_paths).await;
         let staged = self
-            .stage_reflection_move(&mv, &screen.followers, &follower_abs)
+            .stage_reflection_move(
+                &mv,
+                (&screen.followers, &follower_abs),
+                (&screen.pacts, &relinked_abs),
+            )
             .await?;
         let (undo, threads_moved) = write_reflection_move(&mv, &staged)?;
         // The old rows go and the new ones come in one fenced commit: the
@@ -3411,6 +3428,11 @@ impl Engine {
         for (inner, abs, text) in &staged.refollowed {
             ops.push(RowOp::Page { inner, text, abs });
         }
+        for (inner, abs, text, _, _) in &staged.pacts {
+            ops.push(RowOp::Page { inner, text, abs });
+        }
+        // After the state's own move: a page's state is at its new path.
+        ops.extend(staged.rehashed.iter().map(RowOp::Reconcile));
         self.commit_reflection_rows(access.domain_id, &ops, OnRefusal::put_back(domain, undo))
             .await?;
         self.move_disclosures(access.domain_id, from, to).await?;
@@ -3440,11 +3462,16 @@ impl Engine {
                 change_label(&caller.scope),
             );
         }
-        // A follows or an owner that followed the move: nobody's change.
+        // A follows, an owner or a pact link that followed the move: nobody's
+        // change.
         for (inner, _, _) in &staged.refollowed {
             self.announce_reflection(domain, inner, ReflectionChangeKind::Changed, None, None);
         }
+        for (inner, _, _, _, _) in &staged.pacts {
+            self.announce_reflection(domain, inner, ReflectionChangeKind::Changed, None, None);
+        }
         let (links, failed) = self.relink_after_move(&mv, &screen.others).await;
+        let links = links + staged.pacts.iter().map(|p| p.4).sum::<usize>();
         // The move and every page it relinked.
         self.mark_reflection_dirty(domain, BackupCause::Settled);
         let mut receipt = json!({
@@ -3502,7 +3529,7 @@ impl Engine {
                 )));
             }
         }
-        let others: Vec<String> = rows
+        let mut others: Vec<String> = rows
             .into_iter()
             .map(|row| row.path)
             .filter(|path| mv.is_other(path))
@@ -3511,6 +3538,15 @@ impl Engine {
             rooms_to_rewrite(access, others.iter().map(String::as_str), &|text, inner| {
                 mv.relink_moved(text, inner).1
             });
+        // A pact file whose links follow the move is relinked in the move's
+        // own commit, with the pact hashes that follow it; the other pages
+        // once the move has landed.
+        let pacts: Vec<String> = linking
+            .iter()
+            .filter(|path| r::is_pact_file(path))
+            .cloned()
+            .collect();
+        others.retain(|path| !pacts.contains(path));
         // The pages that follow the moved page follow it to its new path, in
         // this move, and so do the pages it owns or owned (their record names
         // it): they wait for an open room like a link rewrite.
@@ -3535,7 +3571,11 @@ impl Engine {
         }
         self.refuse_taken_page_target(domain, access, from, to)
             .await?;
-        Ok(MoveScreen { others, followers })
+        Ok(MoveScreen {
+            others,
+            followers,
+            pacts,
+        })
     }
 
     /// Read what the move `mv` writes and rewrite it, under the move's
@@ -3546,8 +3586,8 @@ impl Engine {
     async fn stage_reflection_move(
         &self,
         mv: &PageMove<'_>,
-        followers: &[String],
-        follower_abs: &[PathBuf],
+        (followers, follower_abs): (&[String], &[PathBuf]),
+        (pacts, pact_abs): (&[String], &[PathBuf]),
     ) -> Result<StagedMove> {
         let (domain, access, from, to) = (mv.domain, mv.access, mv.from, mv.to);
         let text = read_opt(&access.abs(from))?.ok_or_else(|| {
@@ -3607,7 +3647,30 @@ impl Engine {
             r::rebase_links(s, from, to)
         })
         .map_err(EngineError::Invalid)?;
-        Ok(StagedMove {
+        // Each pact file that links the moved page or its pact, with its
+        // baseline, as a link rewrite that is nobody's change.
+        let mut relinked = Vec::new();
+        for (inner, abs) in pacts.iter().zip(pact_abs) {
+            let Some(text) = read_opt(abs)? else {
+                continue;
+            };
+            let baseline_abs = access.abs(&r::baseline_path(inner));
+            let baseline = read_opt(&baseline_abs)?;
+            let out = r::relink(&text, baseline.as_deref().unwrap_or(""), &|s| {
+                mv.relink_moved(s, inner)
+            })
+            .map_err(EngineError::Invalid)?;
+            if out.links > 0 {
+                relinked.push((
+                    inner.clone(),
+                    abs.clone(),
+                    crystalline_core::to_lf(&out.page).into_owned(),
+                    baseline.is_some().then_some(out.baseline),
+                    out.links,
+                ));
+            }
+        }
+        let mut staged = StagedMove {
             // The row is built from the text as written, so it matches the
             // file.
             page: crystalline_core::to_lf(&moved.page).into_owned(),
@@ -3616,7 +3679,73 @@ impl Engine {
             refollowed,
             follows_rewritten,
             owners_rewritten,
-        })
+            pacts: relinked,
+            rehashed: Vec::new(),
+        };
+        if staged.pact.is_some() || !staged.pacts.is_empty() {
+            staged.rehashed = self.rehash_after_move(mv, &staged).await?;
+        }
+        Ok(staged)
+    }
+
+    /// The reconcile states a move would leave stale only by rewriting
+    /// paths in pact texts (the moved page's own pact rebased, other pacts
+    /// relinked), each with the hash computed after the move at the page's
+    /// path after it. A state whose stored hash already differs from the
+    /// hash before the move stays as it is: that change is real and stays
+    /// to be seen. Read once, in bulk, under the move's locks.
+    async fn rehash_after_move(
+        &self,
+        mv: &PageMove<'_>,
+        staged: &StagedMove,
+    ) -> Result<Vec<crystalline_index::ReflectionReconcile>> {
+        let (rows, states) = {
+            let store = self.store.lock().await;
+            let rows = store.list_reflections(mv.access.domain_id).await?;
+            let states = store.reflection_reconciles(mv.access.domain_id).await?;
+            (rows, states)
+        };
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let before_files: BTreeMap<&str, &str> = rows
+            .iter()
+            .map(|row| (row.path.as_str(), row.content.as_str()))
+            .collect();
+        let mut after_files = before_files.clone();
+        after_files.remove(mv.from);
+        after_files.insert(mv.to, &staged.page);
+        if let Some((pact_text, _)) = &staged.pact {
+            after_files.remove(mv.pact_from.as_str());
+            after_files.insert(&mv.pact_to, pact_text);
+        }
+        for (inner, _, text) in &staged.refollowed {
+            after_files.insert(inner, text);
+        }
+        for (inner, _, text, _, _) in &staged.pacts {
+            after_files.insert(inner, text);
+        }
+        let before = r::pact_hashes(before_files);
+        let after = r::pact_hashes(after_files);
+        Ok(states
+            .into_iter()
+            .filter_map(|state| {
+                let at = if state.path == mv.from {
+                    mv.to.to_string()
+                } else {
+                    state.path.clone()
+                };
+                let was = before.get(&state.path)?;
+                let now = after.get(&at)?;
+                (state.pact_hash == *was && now != was).then(|| {
+                    crystalline_index::ReflectionReconcile {
+                        path: at,
+                        pact_hash: now.clone(),
+                        ..state
+                    }
+                })
+            })
+            .collect())
     }
 
     /// Rewrite the links of every page of `others` that reach the page `mv`
@@ -4057,6 +4186,10 @@ fn write_reflection_move(mv: &PageMove<'_>, staged: &StagedMove) -> Result<(Disk
     for (_, abs, _) in &staged.refollowed {
         undo.record(abs)?;
     }
+    for (inner, abs, _, _, _) in &staged.pacts {
+        undo.record(abs)?;
+        undo.record(&access.abs(&r::baseline_path(inner)))?;
+    }
     let replace = |old_rel: &str, new_rel: &str, text: &str| {
         let (old, new) = (access.abs(old_rel), access.abs(new_rel));
         let case_only = is_case_only_rename(&old, &new, old_rel, new_rel);
@@ -4090,6 +4223,12 @@ fn write_reflection_move(mv: &PageMove<'_>, staged: &StagedMove) -> Result<(Disk
     }
     for (_, abs, text) in &staged.refollowed {
         write_file(abs, text)?;
+    }
+    for (inner, abs, text, baseline, _) in &staged.pacts {
+        write_file(abs, text)?;
+        if let Some(baseline) = baseline {
+            write_file(&access.abs(&r::baseline_path(inner)), baseline)?;
+        }
     }
     Ok((undo, threads_moved))
 }
