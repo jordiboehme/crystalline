@@ -12,7 +12,7 @@ Every runner asks first. When nothing is due, it ends at once and starts no agen
 
 | Command | What it does |
 |---|---|
-| `crystalline <loop> status [--domain D]... [--no-counts]` | Shows per domain what is due, as counts, plus a run that is going, the last run and the webhook state. `--no-counts` works out nothing that is due (see [A frequent poll](#a-frequent-poll)). `--json` prints the answer as it came. |
+| `crystalline <loop> status [--domain D]... [--no-counts]` | Shows per domain what is due, as counts, plus a run that is going, the last run and the webhook state. `--no-counts` works out nothing that is due (see [A frequent poll](#a-frequent-poll)). For reflect it also prints when the next page falls due, for example `next page due: 2026-11-25T06:00:00Z (in 22h)`. `--json` prints the answer as it came. |
 | `crystalline <loop> run [--domain D]` | Works what is due with a headless Claude Code agent: takes the lease, runs the agent with the prompt the server answers (`automation_prompt`), shares its changes as a pull request, records the run and releases the lease. Without `--domain` it works every due domain in turn. |
 | `crystalline <loop> watch [--domain D]... [--interval S]` | Checks the status every `--interval` seconds (default 60) and runs when something is due. Runs until it gets SIGTERM or Ctrl-C. |
 | `crystalline <loop> prompt --domain D [--max-items N] [--skills-loaded [true\|false]] [--config FILE]` | Prints the shipped prompt, for a runner that starts its own agent, with the skills line this machine's `skills.serve` gives. `--json` prints what the `automation_prompt` verb answers (see [The prompt for your own agent](#the-prompt-for-your-own-agent)). |
@@ -21,7 +21,7 @@ Every runner asks first. When nothing is due, it ends at once and starts no agen
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-items N` | 20 | The most items the agent works in one run. |
+| `--max-items N` | 20 | The most items the agent works in one run. A `stale` item counts per page: the owner and each page it owns count as one item each. |
 | `--max-turns N` | 60 | The most agent turns in one run. |
 | `--model M` | Claude Code's default | The model the agent uses. |
 | `--log-dir P` | `runs/` in the state directory | Where the agent's stream is written, one file per run, readable by you only. The newest 50 per loop and domain are kept. |
@@ -41,7 +41,9 @@ A scheduler reads every code that is not 0 as a failed job. The Kubernetes and G
 
 ### A frequent poll
 
-To work out what is due, the status sweeps each domain: the reflect queue reads every page and its threads, the evolve sweep reads every engram. That is fine once a minute, but too much for a dashboard that polls every second. Send `"counts": false` with `automation_status` (`crystalline <loop> status --no-counts`): the answer still says per domain whether a run is going (`running`), the last run, where the loop runs (`runs_on`), the backoff (`reason`) and the webhook state, but `due`, `counts` and `left_for_person` are `null`. Without `counts`, or with `true`, the answer is the full one.
+To work out what is due, the status sweeps each domain: the reflect queue reads every page and its threads, the evolve sweep reads every engram. That is fine once a minute, but too much for a dashboard that polls every second. Send `"counts": false` with `automation_status` (`crystalline <loop> status --no-counts`): the answer still says per domain whether a run is going (`running`), the last run, where the loop runs (`runs_on`), the backoff (`reason`) and the webhook state, but `due`, `counts` and `left_for_person` are `null`. Without `counts`, or with `true`, the answer is the full one. A reflect answer also names when the next page falls due, with counts and without: `next_stale_at` (RFC 3339) and `next_stale_in_secs`. For a page that is due already they name when its next period starts. Both are null for evolve, for a domain whose loop runs on another instance and when no page has a freshness. A runner that polls rarely can sleep until then. `GET /api/v1/domains/{domain}/automation` carries the same two keys.
+
+The reflect `counts` are `waiting_for_the_agent` (threads), `feedback`, `updates`, `pages_to_update` and `stale`. `stale` counts the pages whose freshness ran out (see [Pages that keep themselves current](reflection.md#pages-that-keep-themselves-current)); `updates` and `pages_to_update` leave them out. Once a page is due, its own source changes are counted under `stale` too, so they move from `updates` to `stale` when the page falls due. A `stale` page is due work: `run`, `watch` and the webhook start a run for it.
 
 The status reads through the store's read connections, so a poll does not wait for a write in progress. It uses the writer only in rare cases: once after a start to load the virtual domains, for a domain the index does not hold yet, and on a shared database to claim a domain whose host lock no live instance holds. A lease taken or a run recorded is seen by the next status.
 
@@ -68,6 +70,8 @@ When the server does not serve the `skills` tool (`skills.serve: false`), its pr
 So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. The local MCP config starts `crystalline mcp --unattended --domain <domain> --loop <loop>`, one agent per domain. Against a server the config carries the bearer and the headers `X-Crystalline-Run-Domain: <domain>` and `X-Crystalline-Run-Loop: <loop>`, which the server believes only while that agent or account holds the run's lease there. Both mark the session as one nobody is behind and bind it to the domain the run works on: it is never asked to share Reflection text from a domain fewer people may read, and it reads only the domains every reader of that domain may read (see [What an unattended run may read](reflection.md#what-an-unattended-run-may-read)). You set none of this: `run` writes it into the config. Custom automation that starts its own agent marks it the same way. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config, the prompt and, when the skills are handed over, the skills file. These flags were checked against Claude Code 2.1.327.
 
 The agent gets no Crystalline credentials in its environment: every variable that starts with `CRYSTALLINE_` and holds `TOKEN`, `SECRET` or `PASSWORD` is removed. The remote bearer is in the MCP config only, and the config with its folder is removed when the run ends, also after an error or a stop. Your Anthropic credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`) is passed on as it is.
+
+A `stale` owner and its owned pages are recorded one by one, the owned pages first and the owner last. A run that stops at its cap part way through them leaves the owner due, and the next run skips the owned pages in `owned_reconciled`, which are done for this period.
 
 `run` renews the lease every 60 seconds while the agent works, reads the summary block at the end of the agent's last message, shares, records the run and releases the lease. The outcome is `done` when the agent ended with a summary below its cap, `stopped_at_cap` when it reached the cap and `failed` otherwise (no summary, an agent exit code that is not 0, a stop or a lost lease).
 
@@ -103,7 +107,7 @@ What an agent of the loops may do:
 - It reaches every domain of the instance for its loops, private domains and domains added later included. Evolve writes the knowledge and reads the Reflection. Reflect curates the Reflection and reads the knowledge. A domain that is closed because its GitHub App is gone stays closed. A locked or archived domain is left out of the status and refused by name, as for the machine's own run. An agent is never an admin and never a member of a domain, and it never counts as a reader of a domain.
 - It works only during a run. Outside a live lease of its loop, its MCP session reaches the handshake (`initialize`, `server/discover`), the lists (`tools/list`, `resources/list` with the skills only, and the resource template and prompt lists, which name no engram and no domain) and the `skills` tool with the skill resources. Every other call is refused with a sentence. Status, prompt and lease take are ctl verbs, not MCP calls.
 - On the ctl route it reaches only the eight automation verbs: `automation_status`, `automation_prompt`, `automation_lease_take`, `automation_lease_renew`, `automation_lease_release`, `automation_run_record`, `automation_share` and `automation_runs`. `tool`, `file` and every other command are refused. The JSON API takes no agent token: a request with one is answered like a request without a sign-in.
-- Inside a run the server refuses, when the tool is called, the tools of the prompt's `disallowed_tools`, the `write_reflection` action `delete_asset` and every call with `overwrite: true`. The prompt also forbids deleting a Reflection page; that rule is in the prompt only.
+- Inside a run the server refuses, when the tool is called, the tools of the prompt's `disallowed_tools`, the `write_reflection` action `delete_asset` and every call with `overwrite: true`. Like every unattended session, it may not delete a Reflection page or a page pact, write pact text, move a page that has its own page pact or change a page's `freshness` or `follows` (see [What a headless run leaves for a person](#what-a-headless-run-leaves-for-a-person)).
 - A loop's work needs a live lease of that loop on that domain, and the call must name the domain. Evolve work is `write_engram`, `edit_engram`, `move_engram`, `split_engram`, `delete_engram` and `evolve_engrams`. Reflect work is `write_reflection`, `discuss` (every action, `list` included) and `reflect`. A read goes ahead within what the run may read. So an evolve run cannot call `discuss`, and a reflect run bound to its loop never writes a knowledge engram: every `crystalline reflect run` sends the loop header, and an agent with only the reflect loop is bound without it. A session bound to one loop is refused the other loop's work, whatever leases the agent holds. Only an agent with both loops that sends no loop header can write an engram during a reflect run, and only on a domain where it also holds the evolve lease; that write is noted in the evolve lease. When an engram write is refused, the reflect prompt says what to do: answer the feedback in a thread or settle it as kept, and name it in the summary.
 - A lease take by an agent is refused when nothing is due for its loop on that domain. `force` (`crystalline <loop> run --force`) lifts only the wait after failed runs, never this rule. An agent may try at most 30 lease takes in 10 minutes, refused tries included. The instance that answers keeps this count in memory, so it starts over after a restart or a takeover.
 - Every MCP tool call and every ctl command of an agent is logged at INFO with the agent's name, the tool or command, the domain and whether it was refused.
@@ -142,10 +146,12 @@ The shipped prompts (`crystalline <loop> prompt` prints them) tell the agent tha
 - Never wait for a yes and never ask a question in the session. The reflect agent asks people in a Reflection thread with `discuss`. The evolve agent names its questions in the summary.
 - Stop at the item cap. What it did not reach stays due for the next run.
 - End with a fixed summary block: `Done: <n>`, `Left for a person: <n>`, `Errors: <n>` and a few lines that name each item it left and why.
-- Reflect works the queue. Evolve asks `evolve_engrams` for `mechanical` findings only and never touches a `judgment` finding.
+- Reflect works the queue. A page whose freshness ran out comes as a `stale` item: the agent brings it in line with its pacts and records `write_reflection` action `reconciled`, the owned pages first and the owner last (see [Pages that keep themselves current](reflection.md#pages-that-keep-themselves-current)). Evolve asks `evolve_engrams` for `mechanical` findings only and never touches a `judgment` finding.
 - A tool answer that says the domain was renamed in its MANIFEST is left for a person and named in the summary.
 
 The agent may not call these tools, and `run` passes the same list to `--disallowedTools`: `delete_engram`, `move_engram`, `remove_domain`, `add_domain`, `configure`, `provision`, `share_changes`, `update_domain`, `resolve_conflict`, `withdraw_proposal` and `discard_changes`. Two more rules are parameters, not tools: no `write_reflection` action `delete_asset` and no `write_engram` with `overwrite: true`. For an account they are rules of the prompt only. For an agent of the loops the server refuses them too, when the tool is called (see [An agent of the loops](#an-agent-of-the-loops)).
+
+A few rules hold for every run, whoever it runs as, because the server refuses them to every unattended session: a session started with `crystalline mcp --unattended` or with the header `X-Crystalline-Run-Domain`, and every agent of the loops. Such a session never deletes a Reflection page or a page pact (it retires a page instead), never writes pact text (`PACT.md` or any page pact), never moves a page that has its own page pact and never changes a page's `freshness` or `follows`. The prompt says the same. See [What an unattended run may not change](reflection.md#what-an-unattended-run-may-not-change).
 
 ### The prompt for your own agent
 
@@ -168,7 +174,7 @@ It answers the prompt as a run of this server starts its agent with, filled in f
 
 - `max_items` is a whole number from 0 to 4294967295. Without it the cap is 20, as for `run`.
 - `disallowed_tools` are the bare MCP tool names, in order. Give exactly these to the agent's harness as the tools it may not call (for Claude Code `--disallowedTools`, with the `mcp__<server>__` prefix).
-- `checksum` is `sha256:` and the lowercase hex SHA-256 of the prompt's UTF-8 bytes, one NUL byte, then the tool names joined by a line feed, with nothing after the last one. In JavaScript: `prompt + "\0" + disallowed_tools.join("\n")`. A change to the prompt or to the tools changes it, and `version` is not part of it. A runner that adds its own rules on top can keep the last checksum and stop for a person when it changes.
+- `checksum` is `sha256:` and the lowercase hex SHA-256 of the prompt's UTF-8 bytes, one NUL byte, then the tool names joined by a line feed, with nothing after the last one. In JavaScript: `prompt + "\0" + disallowed_tools.join("\n")`. A change to the prompt or to the tools changes it, and `version` is not part of it. A runner that adds its own rules on top can keep the last checksum and stop for a person when it changes. The prompt is filled in for the domain and the cap, so the checksum differs per domain and cap. 0.35.0 changed the reflect prompt (the reconcile of `stale` pages and the rules for pact text and page settings), so every reflect checksum changed with it.
 - The rights are those of `automation_status` for that loop and domain: a token that may not run the loop there is refused, and a domain it may not see is answered as an unknown one. An agent token may ask for the prompt outside a run.
 
 The prompt starts by calling the `skills` tool. Where the server does not serve it (`skills.serve: false`, or `CRYSTALLINE_SKILLS_SERVE=false`), that sentence becomes "Your skills are already loaded" with the skills it names, and the runner hands the skills to its agent in another way (`crystalline <loop> run` appends them to the agent's system prompt, see [What `run` starts](#what-run-starts)). `skills_loaded: true` asks for that sentence on any server, and `skills_loaded: false` asks for the call to the `skills` tool. `crystalline <loop> run` takes its prompt and the forbidden tools from the server the same way, so a run against a newer server never misses a tool it forbids. Only a server older than the verb, which does not know it, makes the run fall back to the prompt and the list of its own binary; any other refusal ends the run with its error before it takes the lease. `--dry-run` asks too and shows the server's list.
@@ -179,6 +185,7 @@ The prompt starts by calling the `skills` tool. Where the server does not serve 
 
 - Every item that needs a yes: a judgment finding, a delete, a move, a page a person wrote.
 - Every item that needs a person's answer: the agent asks in a Reflection thread and leaves the thread open for that person.
+- A change of pact text, of a page's `freshness` or of its `follows`, and the move of a page that has its own page pact. Feedback or a thread that asks for one is answered in its thread and left to a curator. So is an item on a pact file whose fix would change its text, such as a missing file or an embedded engram attachment.
 - A file only a person can add.
 - A pending rename question.
 
@@ -295,6 +302,7 @@ When it sends:
 
 - Reflect, people waiting (a thread for the agent, feedback): within 60 seconds of the first event, so what arrives in that window is one webhook. It sends again on new events once the 5-minute cap below has passed.
 - Reflect, page updates only: after 30 minutes without a further source change on that domain, so a busy day or a bulk import sends one webhook, not hundreds. The quiet clock is per domain.
+- Reflect, a page whose freshness ran out (`stale`): when it falls due, without the 30-minute quiet rule. The trigger looks again at the time the status names for the next page, so a page falls due with no event at all. While it stays due, a later look sends it again, at most once per 5 minutes like everything else.
 - Evolve: when the mechanical count reaches `automation.evolve_threshold`, once per crossing. A weekly schedule in the runner stays the normal case.
 - When a lease is released and work is still due: within a minute (for evolve the threshold still applies). This is how a thread that arrived during a run gets its own run.
 
@@ -311,7 +319,7 @@ X-Crystalline-Event: reflect
 X-Crystalline-Timestamp: 1792648800
 X-Crystalline-Signature: sha256=<hex>
 
-{"counts":{"feedback":1,"pages_to_update":0,"updates":0,"waiting_for_the_agent":2},"domain":"eng","event":"reflect","instance":"crystalline.example.com","sent_at":"2026-10-22T06:00:00Z"}
+{"counts":{"feedback":1,"pages_to_update":0,"stale":0,"updates":0,"waiting_for_the_agent":2},"domain":"eng","event":"reflect","instance":"crystalline.example.com","sent_at":"2026-10-22T06:00:00Z"}
 ```
 
 The body carries counts only, never content or paths. `event` is `reflect` or `evolve`; evolve counts are `mechanical` and `judgment`. The signature is the lowercase hex HMAC-SHA256, under the secret, of the timestamp, a dot and the raw body. The timestamp is unix seconds and is part of what is signed, so a receiver that refuses an old one refuses a replay.
@@ -355,6 +363,6 @@ n8n allows `require('crypto')` only with `NODE_FUNCTION_ALLOW_BUILTIN=crypto`, a
 
 ## In Fluid
 
-The Reflection home shows "Last reflected" with the time, the runner and the outcome. It also shows how many items wait for a person. The Maintenance screen shows "Last maintained" per domain and the judgment findings waiting. Nothing is shown when a loop never ran.
+The Reflection home shows "Last reflected" with the time, the runner and the outcome. It also shows how many items wait for a person. The Maintenance screen shows "Last maintained" per domain and the judgment findings waiting. Nothing is shown when a loop never ran. When a reflect run started after a page fell due and ended without it, an admin sees a banner, and the Maintenance screen lists such pages under "Reflection pages a reflect run missed"; `crystalline doctor` warns about them too (see [Overdue and missed pages](reflection.md#overdue-and-missed-pages)).
 
 What you see depends on your rights. A reader sees the last run without its summary and its pull request. Someone who may run the loop also sees the summary, the pull request and the counts. A Reflection contributor without the right to the knowledge sees no "Last reflected" line. The webhook state shows only for a domain manager or an admin.
