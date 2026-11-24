@@ -145,6 +145,11 @@ fn team_workspace() -> tempfile::TempDir {
     let mut service = cfg.service.clone().unwrap_or_default();
     service.public_url = Some("https://kb.example.com".into());
     cfg.service = Some(service);
+    // The stricter backup rule: under the default, `full`, the write lands.
+    cfg.reflection = Some(crystalline_core::config::ReflectionConfig {
+        backup_sources: Some(crystalline_core::config::BackupSources::Refuse),
+        ..Default::default()
+    });
     crystalline_core::config::save_yaml(&path, &cfg).unwrap();
     ok(h, &["sync"], None);
     home
@@ -231,7 +236,7 @@ fn a_daemon_with_http_off_refuses_a_source_fewer_people_may_read() {
 }
 
 #[test]
-fn the_embedded_stack_refuses_a_local_source_on_a_github_page() {
+fn the_embedded_stack_refuses_a_local_source_on_a_github_page_under_refuse() {
     let home = team_workspace();
     let answer = cite_over(child(home.path(), &["mcp", "--embedded"]));
     assert!(

@@ -103,6 +103,10 @@ pub(crate) async fn setup(secret: Option<&'static str>) -> Fx {
     if let Some(secret) = secret {
         env.push(("CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET", secret));
     }
+    // A page citing a repository with fewer readers is held back from the
+    // backup (`a_reopened_domain_rescans_the_reflection`); under the
+    // default, `full`, it would go out.
+    env.push(("CRYSTALLINE_REFLECTION_BACKUP_SOURCES", "hold_back"));
     let eng = Arc::new(super::github_app::engine(tmp.path(), &api, &env).await);
     let engine_env = env.clone();
     connect(&eng, "acme/kb", "kb", &tmp.path().join("kb")).await;
