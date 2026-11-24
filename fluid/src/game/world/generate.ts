@@ -168,7 +168,7 @@ export const MACHINE_KINDS: readonly MachineKind[] = [
   "containment",
 ];
 
-const CONSTRUCTION = ["draft", "proposed", "idea", "poc"];
+const CONSTRUCTION = ["draft", "proposed", "idea", "poc", "open"];
 
 /**
  * The condition a status puts a room in. Retirement is Fluid's own rule

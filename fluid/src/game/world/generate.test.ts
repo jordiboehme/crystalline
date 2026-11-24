@@ -49,6 +49,7 @@ describe("conditionFor", () => {
     expect(conditionFor("current")).toBe("clean");
     expect(conditionFor("draft")).toBe("construction");
     expect(conditionFor("POC")).toBe("construction");
+    expect(conditionFor("open")).toBe("construction");
     expect(conditionFor("deprecated")).toBe("dim");
     expect(conditionFor("superseded")).toBe("dim");
     expect(conditionFor("archived")).toBe("derelict");
