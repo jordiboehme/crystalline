@@ -788,6 +788,28 @@ async fn the_configure_description_names_its_domain_refusals() {
 /// agent sets to mark exceptionally valuable knowledge, and `search_engrams`
 /// documents that hybrid ranking lifts a salient hit without ever excluding
 /// one.
+/// build_context names the node fields, the tentative statuses, and that
+/// `draft: true` is the caller's own unshared copy, never the status draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_build_context_description_tells_the_draft_flag_from_the_draft_status() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let tool = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "build_context")
+        .expect("build_context tool present");
+    let text = tool.description.as_deref().unwrap_or("");
+    for needle in [
+        "status, tags and seed",
+        "status draft, proposed, idea, poc or open",
+        "A node with draft: true is your own unshared copy in a review-mode domain, not the status draft.",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_descriptions_teach_salience() {
     let h = Harness::new(&["eng"]).await;
