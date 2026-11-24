@@ -105,7 +105,8 @@ pub struct SettingSpec {
     /// per key and a matching list somewhere else.
     pub secret: bool,
     /// Whether this is an operator setting: the instance's network, its
-    /// database or its sign-in. An operator key is changed only with the
+    /// database, its sign-in, or who may read what (the two
+    /// `reflection.*` reach settings). An operator key is changed only with the
     /// crystalline CLI (`crystalline config set`), `config.yaml` or its
     /// `CRYSTALLINE_*` variable. The MCP `configure` tool neither lists nor
     /// changes it, so an agent cannot open the instance up, point the index
@@ -722,7 +723,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
-            operator_only: false,
+            operator_only: true,
             apply: set_cite_shared,
             clear: clear_cite_shared,
             effective: cite_shared_effective,
@@ -733,7 +734,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
-            operator_only: false,
+            operator_only: true,
             apply: set_backup_sources,
             clear: clear_backup_sources,
             effective: backup_sources_effective,
@@ -3262,7 +3263,9 @@ mod tests {
 
     /// The operator keys are the instance's network, database and sign-in:
     /// every `auth.*`, `database.*` and `service.*` key plus the two GitHub
-    /// keys that decide which GitHub this instance talks to and as which app.
+    /// keys that decide which GitHub this instance talks to and as which app,
+    /// and the two `reflection.*` keys that decide what a Reflection page may
+    /// carry from other domains (and so what an unattended run may read).
     /// No surface outside the CLI lists, reads back or sets one of these.
     #[test]
     fn the_operator_keys_are_the_network_the_database_and_sign_in() {
@@ -3306,6 +3309,8 @@ mod tests {
                 "automation.evolve_threshold",
                 "update.check",
                 "update.min_age_hours",
+                "reflection.cite_shared",
+                "reflection.backup_sources",
             ]
         );
         // The rule, not only the list: a key added under one of the three
@@ -3317,7 +3322,9 @@ mod tests {
                 || spec.key == "github.api_url"
                 || spec.key == "github.oauth_client_id"
                 || spec.key.starts_with("automation.")
-                || spec.key.starts_with("update.");
+                || spec.key.starts_with("update.")
+                || spec.key == "reflection.cite_shared"
+                || spec.key == "reflection.backup_sources";
             assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
             assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
             assert!(is_known_key(spec.key), "{}", spec.key);

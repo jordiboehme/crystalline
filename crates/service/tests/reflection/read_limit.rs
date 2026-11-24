@@ -683,6 +683,40 @@ async fn a_run_cannot_change_the_instance() {
     assert!(!refused_or_empty(&own).contains(refusal), "{own}");
 }
 
+/// A session marked unattended with no lease has a read limit too, so it
+/// cannot change the instance either: a settings change could widen the
+/// very limit it reads under (`reflection.backup_sources` is the operator's,
+/// and any other instance setting is the run refusal's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unattended_session_without_a_lease_cannot_change_the_instance() {
+    let (fx, _auth) = private_harbor().await;
+    let mut wire = session(McpServer::new(fx.engine.clone()).with_unattended(true)).await;
+    let refusal = "a run cannot change this instance";
+    let configured = tool(
+        &mut wire,
+        94,
+        "configure",
+        json!({
+            "set": { "github.enabled": true },
+        }),
+    )
+    .await;
+    assert!(refused(&configured).contains(refusal), "{configured}");
+    let added = tool(
+        &mut wire,
+        95,
+        "add_domain",
+        json!({
+            "domain": "extra", "folder": fx.tmp.path().join("extra").to_string_lossy(),
+        }),
+    )
+    .await;
+    assert!(refused(&added).contains(refusal), "{added}");
+    // The settings page stays a read.
+    let shown = tool(&mut wire, 96, "configure", json!({})).await;
+    assert!(!refused_or_empty(&shown).contains(refusal), "{shown}");
+}
+
 fn refused_or_empty(answer: &Value) -> String {
     answer["error"]["message"]
         .as_str()
