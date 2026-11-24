@@ -123,6 +123,22 @@ pub fn skill(name: &str) -> Option<&'static SkillAsset> {
 mod tests {
     use super::*;
 
+    /// The intelligence skill names tentative knowledge and lets the person
+    /// choose, in the approved wording (only the backticks are formatting).
+    #[test]
+    fn the_intelligence_skill_names_tentative_knowledge() {
+        let body = skill("crystalline-intelligence").unwrap().content;
+        let plain = body.replace('`', "");
+        assert!(
+            plain.contains("Knowledge can be tentative: an engram whose status is draft, proposed, idea, poc or open, or whose observations are [idea] or [question]. Tentative knowledge is not decided, but it can be worth building on. When it shapes an answer, a spec or a plan, name it as tentative and let your person choose: build on it, treat it as an option, or leave it out. When you build on it, say so in what you write (for example \"assumes the proposal X\"), so it can be checked again once X is decided or dropped."),
+            "{body}"
+        );
+        assert!(
+            body.contains("it returns each node's title, type, `status` and `tags`"),
+            "{body}"
+        );
+    }
+
     /// The collaboration skill says what to offer after a refused direct
     /// share, and what to tell the user once shares fall back on their own.
     #[test]

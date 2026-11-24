@@ -1396,6 +1396,9 @@ pub struct GraphNode {
     /// The engram's exact frontmatter status; feeds the retired-status fade in
     /// context ranking.
     pub status: String,
+    /// The engram's tags, alphabetical and folded to lowercase, as a search
+    /// hit carries them; empty when the engram has none.
+    pub tags: Vec<String>,
     /// Whose row this is: empty for the base row the domain's files describe,
     /// and the actor's key for one of their own drafts. A reader only ever
     /// meets their own, so a non-empty value means "this is your draft" and is

@@ -3359,6 +3359,85 @@ async fn build_context_follows_prose_wikilinks() {
     );
 }
 
+/// **Every build_context node carries its engram's `status` and `tags`**, so
+/// an agent gathering context for a plan can tell a decided engram from a
+/// tentative one without reading each. On both transports, in JSON and in
+/// TOON, where the tags join into one cell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_nodes_carry_status_and_tags() {
+    for http in [false, true] {
+        for pin_json in [true, false] {
+            let h = Harness::build(&["eng"], false, pin_json).await;
+            let (client, _server) = if http {
+                h.connect_http().await
+            } else {
+                h.connect().await
+            };
+            let peer = client.peer();
+            call(
+                peer,
+                "write_engram",
+                json!({ "domain": "eng", "title": "Kafka Idea", "status": "proposed",
+                        "tags": ["queue", "kafka"],
+                        "content": "- [idea] move the queue to Kafka #queue" }),
+            )
+            .await
+            .unwrap();
+            call(
+                peer,
+                "write_engram",
+                json!({ "domain": "eng", "title": "Deploy Queue", "tags": ["queue"],
+                        "content": "- [decision] jobs go through Redis #queue\n- relates_to [[Kafka Idea]]" }),
+            )
+            .await
+            .unwrap();
+
+            let text = call_text(
+                peer,
+                "build_context",
+                json!({ "anchor": "crystalline://eng/deploy-queue", "depth": 1 }),
+            )
+            .await
+            .unwrap();
+            let label = format!("http: {http}, json: {pin_json}");
+            if pin_json {
+                let out: Value = serde_json::from_str(&text).unwrap();
+                let nodes = out["nodes"].as_array().unwrap();
+                let node = |permalink: &str| {
+                    nodes
+                        .iter()
+                        .find(|n| n["permalink"] == permalink)
+                        .unwrap_or_else(|| panic!("{label}: no {permalink}: {out}"))
+                        .clone()
+                };
+                let seed = node("deploy-queue");
+                assert_eq!(seed["status"], json!("stable"), "{label}: {seed}");
+                assert_eq!(seed["tags"], json!(["queue"]), "{label}: {seed}");
+                let idea = node("kafka-idea");
+                assert_eq!(idea["status"], json!("proposed"), "{label}: {idea}");
+                assert_eq!(idea["tags"], json!(["kafka", "queue"]), "{label}: {idea}");
+            } else {
+                let header = text
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("nodes["))
+                    .unwrap_or_else(|| panic!("{label}: no nodes table: {text}"));
+                assert!(
+                    header.contains("status") && header.contains("tags"),
+                    "{label}: {header}"
+                );
+                let row = text
+                    .lines()
+                    .find(|l| l.contains("kafka-idea"))
+                    .unwrap_or_else(|| panic!("{label}: no kafka-idea row: {text}"));
+                assert!(
+                    row.contains("proposed") && row.contains("\"kafka,queue\""),
+                    "{label}: {row}"
+                );
+            }
+        }
+    }
+}
+
 /// The neighbour ranking (seeded personalized PageRank, salience-lifted) picks
 /// the truncation survivor by spread mass rather than by ascending engram id.
 /// Far is written first so it lands the smallest id; under the old
@@ -3532,10 +3611,12 @@ async fn build_context_retired_neighbor_loses_to_equal_current() {
         .collect();
     assert!(perms.contains(&"b"), "current B kept: {perms:?}");
     assert!(!perms.contains(&"a"), "retired A dropped: {perms:?}");
+    // The status ranks and, since 0.35.0, is shown too, so a reader tells a
+    // retired or tentative node apart without reading it.
     for node in nodes {
         assert!(
-            node.get("status").is_none(),
-            "node objects must not carry a status key: {node:?}"
+            node["status"].is_string(),
+            "every node carries its status: {node:?}"
         );
     }
 }

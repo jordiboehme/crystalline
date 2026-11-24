@@ -13079,6 +13079,7 @@ mod context_rank_tests {
             engram_type: "engram".to_string(),
             salience,
             status: "current".to_string(),
+            tags: Vec::new(),
             actor: String::new(),
             recorded_at: None,
         }
