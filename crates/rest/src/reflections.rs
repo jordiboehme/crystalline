@@ -419,7 +419,10 @@ pub struct ReflectionDoc {
                            `sections[].sources` is absent, not empty, without \
                            `engrams_visible`. A source's `state` is `current`, \
                            `changed`, `retired`, `missing` or `unavailable` \
-                           (its domain cannot be checked here); a source of \
+                           (its domain cannot be checked here); a source it \
+                           can check carries the engram's `status` as written \
+                           (a `draft`, `proposed`, `idea`, `poc` or `open` \
+                           engram is tentative); a source of \
                            another domain than the page's carries `domain`, \
                            the local name it is reached by here. \
                            `sections[].hidden_sources` counts the sources in a \
@@ -441,9 +444,11 @@ pub struct ReflectionDoc {
                 "checksum": "9f2c...", "sections": [ { "id": "7f3a9c2e",
                     "heading": "Night deploys", "line": 12, "changed": true,
                     "sources": [ { "permalink": "runbooks/deploy",
-                        "title": "Deploy runbook", "state": "current" },
+                        "title": "Deploy runbook", "state": "current",
+                        "status": "stable" },
                         { "permalink": "team/on-call", "domain": "ops",
-                        "title": "On call", "state": "changed" } ],
+                        "title": "On call", "state": "changed",
+                        "status": "proposed" } ],
                     "hidden_sources": 1 } ],
                 "threads": [], "live": { "present": ["jordi"] },
                 "page": { "freshness": "1d", "follows": null, "status": null,

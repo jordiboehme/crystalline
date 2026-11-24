@@ -7947,7 +7947,7 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.",
+            "description": "ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source it can check carries the engram's `status` as written (a `draft`, `proposed`, `idea`, `poc` or `open` engram is tentative); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7996,12 +7996,14 @@
                         {
                           "permalink": "runbooks/deploy",
                           "state": "current",
+                          "status": "stable",
                           "title": "Deploy runbook"
                         },
                         {
                           "domain": "ops",
                           "permalink": "team/on-call",
                           "state": "changed",
+                          "status": "proposed",
                           "title": "On call"
                         }
                       ]

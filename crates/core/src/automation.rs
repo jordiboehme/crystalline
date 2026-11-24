@@ -716,6 +716,21 @@ mod tests {
         );
     }
 
+    /// A section built from tentative engrams says so in its text, in the
+    /// update step where sections are written with their sources.
+    #[test]
+    fn the_reflect_prompt_names_a_section_from_tentative_engrams() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let updates = prompt
+            .lines()
+            .find(|line| line.starts_with("3. Updates:"))
+            .expect("the update step");
+        assert!(
+            updates.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) says so in its text, for example \"proposed:\" or \"not decided yet\"."),
+            "{updates}"
+        );
+    }
+
     /// A page whose freshness ran out is reconciled with its pacts (design
     /// 3.5): the chain run, the readable domains searched, only what new
     /// information requires changed, every source named, owned pages created

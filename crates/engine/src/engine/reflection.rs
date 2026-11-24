@@ -1242,10 +1242,17 @@ pub(crate) fn source_state(src: &r::SourceRef, facts: &SourceFacts) -> (&'static
 
 /// A source as the answers show it; `domain` only for a source of another
 /// domain than the page's, by the local name a reader reaches it by here
-/// ([`SourceFacts::shown_domain`]).
+/// ([`SourceFacts::shown_domain`]). `status` is the cited engram's status as
+/// it writes it, so a reader sees a section that rests on a draft or a
+/// proposal; absent when the engram is missing or cannot be checked here.
 pub(crate) fn source_view(src: &r::SourceRef, facts: &SourceFacts) -> Value {
     let (state, title) = source_state(src, facts);
     let mut view = json!({ "permalink": src.engram, "title": title, "state": state });
+    if !facts.unavailable(src)
+        && let Some(fact) = facts.fact(src)
+    {
+        view["status"] = json!(fact.status);
+    }
     if let Some(domain) = facts.shown_domain(src) {
         view["domain"] = json!(domain);
     }

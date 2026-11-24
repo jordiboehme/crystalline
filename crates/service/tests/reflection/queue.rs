@@ -90,6 +90,23 @@ async fn the_queue_guidance_points_to_the_presentation_skill() {
     );
 }
 
+/// The queue guidance says a section built from tentative engrams says so
+/// in its text, as the headless prompt does.
+#[tokio::test]
+async fn the_queue_guidance_names_a_section_from_tentative_engrams() {
+    let fx = curated_with_a_feedback_item().await;
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let guidance = queue["guidance"].as_str().unwrap();
+    assert!(
+        guidance.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) says so in its text, for example \"proposed:\" or \"not decided yet\"."),
+        "{guidance}"
+    );
+}
+
 fn age_file(fx: &Fx, rel: &str, days: u64) {
     let file = std::fs::File::options()
         .write(true)
