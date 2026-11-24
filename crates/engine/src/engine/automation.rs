@@ -254,6 +254,10 @@ impl Engine {
     /// and `reason` says "backing off after N failed runs", until 5 minutes
     /// after the last failure, doubled for each further failed run in a row
     /// and at most 6 hours. A run that did not fail ends the row.
+    ///
+    /// An agent of the loops also gets `token_id`, `token_expires_at` and
+    /// `token_expires_in_secs` (on this server's clock) of the token it
+    /// called with; nobody else does.
     pub async fn automation_status(
         &self,
         lp: Loop,
@@ -325,7 +329,25 @@ impl Engine {
         .await;
         let named = answer.as_ref().map_or(0, Vec::len);
         crate::log_elapsed!(started, "loop" = ?lp, domains = named, counts, ok = answer.is_ok(), "automation_status answered");
-        Ok(json!({ "loop": lp, "domains": answer? }))
+        let mut out = json!({ "loop": lp, "domains": answer? });
+        // An agent hears when the token it called with ends, counted on this
+        // server's clock, so its runner warns before the runs are refused.
+        // Only the agent's own token, and nothing for an account.
+        if let Scope::Agent {
+            token_id,
+            token_expires_at,
+            ..
+        } = scope
+        {
+            let left = crate::auth_store::agent_token_secs_left(
+                token_expires_at,
+                self.automation_clock().stamp(),
+            );
+            out["token_id"] = json!(token_id);
+            out["token_expires_at"] = json!(token_expires_at);
+            out["token_expires_in_secs"] = json!(left);
+        }
+        Ok(out)
     }
 
     /// What a runner that starts its own agent sets up a run of `lp` on

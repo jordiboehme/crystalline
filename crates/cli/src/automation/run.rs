@@ -64,6 +64,7 @@ pub(super) async fn run_due(
 ) -> anyhow::Result<u8> {
     let named: Vec<String> = domain.map(str::to_string).into_iter().collect();
     let answer = client.status(lp, &named, opts.force, true).await?;
+    warn_token(&answer);
     let due: Vec<String> = domains_of(&answer)
         .iter()
         .filter(|d| d["due"] == true)

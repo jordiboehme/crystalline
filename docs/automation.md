@@ -99,7 +99,7 @@ The command prints the agent's first token once: `cag_` and 64 hex characters. O
 
 `--json` prints the answer as one object, the token included where one is issued. An admin can do the same over the JSON API under `/api/v1/agents`. Names of agents and accounts share one list: a name an account holds cannot be an agent's, and the other way round. No new account or agent may have a name that starts with `agent:`.
 
-To change a token before it expires, issue a second one with `crystalline agents token`, put it in the runner's secret, then revoke the old one with `crystalline agents revoke`. An expired or revoked token gets the same `401` as any wrong token.
+To change a token before it expires, issue a second one with `crystalline agents token`, put it in the runner's secret, then revoke the old one with `crystalline agents revoke`. An expired or revoked token gets the same `401` as any wrong token. Two weeks before a token ends, Crystalline warns: `crystalline doctor` names each live agent token that ends within 14 days and each agent with no live token (whether `auth.mcp` is on or off), `automation_status` tells an agent `token_id`, `token_expires_at` and `token_expires_in_secs` of the token it called with (on the server's clock; an account gets none of it), and `crystalline <loop> status` and `crystalline <loop> run` with an agent token print a warning line on stderr.
 
 What an agent of the loops may do:
 

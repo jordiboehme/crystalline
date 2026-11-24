@@ -247,6 +247,7 @@ async fn dispatch(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<
             } else {
                 print_status(&answer);
             }
+            warn_token(&answer);
             // Without counts nothing says whether work is due.
             Ok(if no_counts || any_due(&answer) {
                 0
@@ -293,6 +294,43 @@ async fn dispatch(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<
 
 fn domains_of(answer: &Value) -> &[Value] {
     answer["domains"].as_array().map_or(&[], Vec::as_slice)
+}
+
+/// The warning a status answer gives when the agent token this runner
+/// calls with ends within [`AGENT_TOKEN_WARN_SECS`], counted on the
+/// server's clock (`token_expires_in_secs`), or has ended. `None` for an
+/// account's answer, which carries no token, and for a later end.
+///
+/// [`AGENT_TOKEN_WARN_SECS`]: crystalline_service::rest::AGENT_TOKEN_WARN_SECS
+fn token_warning(answer: &Value) -> Option<String> {
+    let left = answer["token_expires_in_secs"].as_i64()?;
+    if left > crystalline_service::rest::AGENT_TOKEN_WARN_SECS {
+        return None;
+    }
+    let at = answer["token_expires_at"].as_str().unwrap_or("?");
+    let day = at.get(..10).unwrap_or(at);
+    let fix = "ask an admin for a new token for this agent (crystalline agents token <agent> on the server, or Administration > Agents) and give it to this runner";
+    Some(if left <= 0 {
+        format!(
+            "Warning: the agent token this runner uses ended on {day}, so its runs are refused: {fix}."
+        )
+    } else {
+        let when = match left / 86_400 {
+            0 => "in less than a day".to_string(),
+            1 => "in 1 day".to_string(),
+            n => format!("in {n} days"),
+        };
+        format!(
+            "Warning: the agent token this runner uses ends on {day} ({when}): {fix} before then."
+        )
+    })
+}
+
+/// Print [`token_warning`] to stderr, so `--json` output stays one answer.
+fn warn_token(answer: &Value) {
+    if let Some(line) = token_warning(answer) {
+        eprintln!("{line}");
+    }
 }
 
 fn any_due(answer: &Value) -> bool {
@@ -398,6 +436,31 @@ fn print_status(answer: &Value) {
 mod tests {
     use super::delivery_line;
     use serde_json::json;
+
+    /// A status answer for an agent whose token ends within 14 days, by the
+    /// server's count, gives one warning line that names the date and the
+    /// fix; a later end, an account's answer and an ended token give none
+    /// or the right one.
+    #[test]
+    fn a_token_that_ends_soon_is_warned_about() {
+        let answer = |secs: i64| {
+            json!({
+                "token_id": 3,
+                "token_expires_at": "2026-11-03T10:00:00Z",
+                "token_expires_in_secs": secs,
+            })
+        };
+        let line = super::token_warning(&answer(9 * 86_400 + 3600)).unwrap();
+        assert!(line.contains("2026-11-03"), "{line}");
+        assert!(line.contains("in 9 days"), "{line}");
+        assert!(line.contains("crystalline agents token"), "{line}");
+        let line = super::token_warning(&answer(3600)).unwrap();
+        assert!(line.contains("in less than a day"), "{line}");
+        assert_eq!(super::token_warning(&answer(15 * 86_400)), None);
+        assert_eq!(super::token_warning(&json!({"domains": []})), None);
+        let line = super::token_warning(&answer(-60)).unwrap();
+        assert!(line.contains("ended"), "{line}");
+    }
 
     /// The status names when the next page falls due, also without
     /// counts; nothing when no page keeps itself current.

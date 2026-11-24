@@ -52,6 +52,18 @@ pub const AGENT_TOKEN_MIN_TTL_SECS: i64 = 86_400;
 /// How many live (not revoked, not expired) tokens an agent may hold at once.
 pub const AGENT_LIVE_TOKENS_MAX: i64 = 2;
 
+/// From how long before its end an agent token is warned about: 14 days.
+/// `crystalline doctor`, `<loop> status` and `<loop> run` warn in that
+/// window, so a runner's token is replaced before its runs are refused.
+pub const AGENT_TOKEN_WARN_SECS: i64 = 14 * 86_400;
+
+/// The seconds left of a token that ends at `expires_at` (RFC 3339) as of
+/// `now`: negative once it ended, `None` when the time does not read.
+pub fn agent_token_secs_left(expires_at: &str, now: Stamp) -> Option<i64> {
+    let ends = time::parse_rfc3339(expires_at)?.stamp();
+    Some(ends.unix_seconds() - now.unix_seconds())
+}
+
 /// Which loops an agent runs. Chosen per agent; both by default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

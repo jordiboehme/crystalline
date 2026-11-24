@@ -1345,6 +1345,49 @@ async fn an_agent_takes_a_lease_only_for_its_own_loops() {
     assert!(taken["token"].is_string(), "{taken}");
 }
 
+/// `automation_status` tells an agent when its own token ends, counted on
+/// the server's clock, so a runner can warn before its runs are refused. An
+/// account or the machine owner gets nothing of the kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_status_tells_an_agent_when_its_token_ends() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = reflecting().await;
+    with_agents(&fx).await;
+    let nightly = Scope::Agent {
+        name: "nightly".to_string(),
+        loops: AgentLoops::Both,
+        token_id: 7,
+        token_expires_at: "2026-10-31T10:00:00+00:00".to_string(),
+    };
+    let answer = fx
+        .engine
+        .automation_status(Loop::Reflect, &[], &nightly)
+        .await
+        .unwrap();
+    assert_eq!(answer["token_id"], 7, "{answer}");
+    assert_eq!(
+        answer["token_expires_at"], "2026-10-31T10:00:00+00:00",
+        "{answer}"
+    );
+    assert_eq!(answer["token_expires_in_secs"], 10 * 86_400, "{answer}");
+    for scope in [
+        Scope::Unrestricted,
+        Scope::User {
+            account: "keeper".into(),
+            admin: false,
+        },
+    ] {
+        let answer = fx
+            .engine
+            .automation_status(Loop::Reflect, &[], &scope)
+            .await
+            .unwrap();
+        for key in ["token_id", "token_expires_at", "token_expires_in_secs"] {
+            assert!(answer.get(key).is_none(), "{key}: {answer}");
+        }
+    }
+}
+
 /// The lease and the run record carry the agent under its key, so the agent
 /// holds its own lease and the machine owner does not, and every answer shows
 /// it as `agent`, never as an account.

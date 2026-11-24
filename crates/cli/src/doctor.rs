@@ -1957,6 +1957,17 @@ pub struct DoctorReport {
     /// be read. A warning, never a counted problem.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents_need_auth_mcp: Vec<String>,
+    /// The live agent tokens that end within 14 days
+    /// ([`crystalline_service::rest::AGENT_TOKEN_WARN_SECS`]), soonest first:
+    /// a runner that still holds one is refused from that day on. A
+    /// warning, never a counted problem.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_tokens_ending: Vec<AgentTokenEnding>,
+    /// The agents of the loops with no live token, by name: none of their
+    /// runs is let in until one is issued. A warning, never a counted
+    /// problem.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents_without_token: Vec<String>,
     /// The Reflection pages a reflect run missed (a run of the domain
     /// started after the page fell due and ended without reconciling it),
     /// longest missed first: the daemon's answer when it holds the index,
@@ -1965,6 +1976,22 @@ pub struct DoctorReport {
     /// warning, never a counted problem.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reflection_overdue: Vec<OverdueDoctor>,
+}
+
+/// A live agent token that ends within 14 days, in the `doctor` report.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentTokenEnding {
+    /// The agent.
+    pub agent: String,
+    /// The token's id, which `agents revoke` names.
+    pub token_id: i64,
+    /// When it stops working, RFC 3339.
+    pub expires_at: String,
+    /// Seconds until then, on this machine's clock.
+    pub expires_in_secs: i64,
+    /// The agent holds another live token that ends later than this one:
+    /// it was issued already, and only the runner has to take it up.
+    pub newer_live: bool,
 }
 
 /// One Reflection page a reflect run missed, in the `doctor` report. The times are
@@ -2708,7 +2735,14 @@ pub async fn run(
 
     let kept = check_kept(crate::kept::scan_here(), domain_filter, time::now());
     let case_twins = check_case_twins(cfg);
-    let agents_need_auth_mcp = check_agents(cfg).await;
+    let AgentsCheck {
+        need_auth_mcp: agents_need_auth_mcp,
+        tokens,
+    } = check_agents(cfg).await;
+    let AgentTokenFindings {
+        ending: agent_tokens_ending,
+        without_token: agents_without_token,
+    } = tokens;
     let reflection_overdue =
         check_overdue(matches!(index, IndexAccess::Daemon), store_ref, &targets).await;
 
@@ -2759,32 +2793,135 @@ pub async fn run(
         case_twins,
         update,
         agents_need_auth_mcp,
+        agent_tokens_ending,
+        agents_without_token,
         reflection_overdue,
     })
 }
 
-/// The agents of the loops this instance holds while `auth.mcp` is off (see
-/// [`DoctorReport::agents_need_auth_mcp`]). Reads the accounts only when the
-/// setting is off and they exist; a file that is not there is not made.
-async fn check_agents(cfg: &GlobalConfig) -> Vec<String> {
-    if cfg.auth_mcp() {
-        return Vec::new();
-    }
+/// What doctor found about the agents of the loops.
+#[derive(Debug, Default)]
+struct AgentsCheck {
+    /// Every agent, by name, while `auth.mcp` is off
+    /// ([`DoctorReport::agents_need_auth_mcp`]); empty while it is on.
+    need_auth_mcp: Vec<String>,
+    /// Their tokens, whatever `auth.mcp` says.
+    tokens: AgentTokenFindings,
+}
+
+/// The agent tokens doctor warns about.
+#[derive(Debug, Default)]
+struct AgentTokenFindings {
+    /// Live tokens that end within 14 days, soonest first.
+    ending: Vec<AgentTokenEnding>,
+    /// Agents with no live token, by name.
+    without_token: Vec<String>,
+}
+
+/// The agents of the loops this instance holds: their names while `auth.mcp`
+/// is off (see [`DoctorReport::agents_need_auth_mcp`]) and their tokens that
+/// end soon or are missing. Reads the accounts only when they exist; a file
+/// that is not there is not made, and one that cannot be read says nothing.
+async fn check_agents(cfg: &GlobalConfig) -> AgentsCheck {
     let store = match crystalline_service::existing_accounts_for_cli(cfg).await {
         Ok(Some(store)) => store,
-        Ok(None) => return Vec::new(),
+        Ok(None) => return AgentsCheck::default(),
         Err(e) => {
             tracing::debug!("the agents check could not read the accounts: {e:#}");
-            return Vec::new();
+            return AgentsCheck::default();
         }
     };
-    match store.agents().await {
-        Ok(agents) => agents.into_iter().map(|agent| agent.name).collect(),
+    let agents = match store.agents().await {
+        Ok(agents) => agents,
         Err(e) => {
             tracing::debug!("the agents check could not read the agents: {e:#}");
+            return AgentsCheck::default();
+        }
+    };
+    AgentsCheck {
+        need_auth_mcp: if cfg.auth_mcp() {
             Vec::new()
+        } else {
+            agents.iter().map(|agent| agent.name.clone()).collect()
+        },
+        tokens: agent_token_findings(&agents, time::now()),
+    }
+}
+
+/// The live tokens of `agents` that end within
+/// [`crystalline_service::rest::AGENT_TOKEN_WARN_SECS`] of `now`, soonest
+/// first, and the agents with no live token. A disabled agent opens nothing
+/// whatever its tokens, so it is left out.
+fn agent_token_findings(
+    agents: &[crystalline_service::rest::Agent],
+    now: time::Stamp,
+) -> AgentTokenFindings {
+    use crystalline_service::rest::{
+        AGENT_TOKEN_WARN_SECS, AgentTokenState, agent_token_secs_left,
+    };
+    let mut found = AgentTokenFindings::default();
+    for agent in agents.iter().filter(|agent| !agent.disabled) {
+        // A live token ends after `now`; one whose time does not read is
+        // left out of the warning but still counts as live.
+        let live: Vec<(&crystalline_service::rest::AgentToken, Option<i64>)> = agent
+            .tokens
+            .iter()
+            .filter(|token| token.state == AgentTokenState::Live)
+            .map(|token| (token, agent_token_secs_left(&token.expires_at, now)))
+            .filter(|(_, left)| left.is_none_or(|left| left > 0))
+            .collect();
+        if live.is_empty() {
+            found.without_token.push(agent.name.clone());
+            continue;
+        }
+        for (token, left) in &live {
+            let Some(left) = *left else { continue };
+            if left > AGENT_TOKEN_WARN_SECS {
+                continue;
+            }
+            let newer_live = live
+                .iter()
+                .any(|(_, other)| other.is_none_or(|other| other > left));
+            found.ending.push(AgentTokenEnding {
+                agent: agent.name.clone(),
+                token_id: token.id,
+                expires_at: token.expires_at.clone(),
+                expires_in_secs: left,
+                newer_live,
+            });
         }
     }
+    found.ending.sort_by_key(|t| t.expires_in_secs);
+    found
+}
+
+/// The warning for a live agent token that ends within 14 days: issue a new
+/// one and revoke this one, or, when a newer one was issued, see that the
+/// runner uses it and revoke this one.
+fn ending_token_line(token: &AgentTokenEnding) -> String {
+    let day = token.expires_at.get(..10).unwrap_or(&token.expires_at);
+    let when = match token.expires_in_secs / 86_400 {
+        0 => "in less than a day".to_string(),
+        1 => "in 1 day".to_string(),
+        n => format!("in {n} days"),
+    };
+    let (agent, id) = (&token.agent, token.token_id);
+    if token.newer_live {
+        format!(
+            "[warning] token {id} of agent '{agent}' ends on {day} ({when}) and the agent holds a newer token: see that its runner uses the newer one, then revoke this one with 'crystalline agents revoke {agent} {id}'"
+        )
+    } else {
+        format!(
+            "[warning] token {id} of agent '{agent}' ends on {day} ({when}), and its runs are refused from then on: issue another with 'crystalline agents token {agent}', give it to the runner, then revoke this one with 'crystalline agents revoke {agent} {id}'"
+        )
+    }
+}
+
+/// The warning for an agent of the loops with no live token.
+fn no_token_line(agent: &str) -> String {
+    format!(
+        "[warning] agent '{agent}' has no live token, so every run of it is refused: issue one with 'crystalline agents token {agent}' and give it to the runner, or remove the agent with 'crystalline agents remove {agent}'"
+    )
 }
 
 /// The warning for agents of the loops on an instance with `auth.mcp` off.
@@ -6636,9 +6773,20 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     render_overdue(&mut out, &report.reflection_overdue);
 
-    if !report.agents_need_auth_mcp.is_empty() {
+    if !report.agents_need_auth_mcp.is_empty()
+        || !report.agent_tokens_ending.is_empty()
+        || !report.agents_without_token.is_empty()
+    {
         let _ = writeln!(out, "agents:");
-        let _ = writeln!(out, "  {}", agents_line(&report.agents_need_auth_mcp));
+        if !report.agents_need_auth_mcp.is_empty() {
+            let _ = writeln!(out, "  {}", agents_line(&report.agents_need_auth_mcp));
+        }
+        for token in &report.agent_tokens_ending {
+            let _ = writeln!(out, "  {}", ending_token_line(token));
+        }
+        for agent in &report.agents_without_token {
+            let _ = writeln!(out, "  {}", no_token_line(agent));
+        }
     }
 
     // Advisory tag hygiene: near-duplicate clusters, never a counted problem.
@@ -7021,6 +7169,104 @@ mod tests {
             "{two}"
         );
         assert!(!two.contains('\u{2014}') && !two.contains('\u{2013}'));
+    }
+
+    /// A live token, as `agents list` reads it.
+    fn token(
+        id: i64,
+        expires_at: &str,
+        state: crystalline_service::rest::AgentTokenState,
+    ) -> crystalline_service::rest::AgentToken {
+        crystalline_service::rest::AgentToken {
+            id,
+            label: String::new(),
+            created_at: "2026-08-01T00:00:00Z".into(),
+            expires_at: expires_at.into(),
+            last_used: None,
+            revoked_at: None,
+            state,
+        }
+    }
+
+    fn agent(
+        name: &str,
+        tokens: Vec<crystalline_service::rest::AgentToken>,
+    ) -> crystalline_service::rest::Agent {
+        crystalline_service::rest::Agent {
+            name: name.into(),
+            display: name.into(),
+            loops: crystalline_service::rest::AgentLoops::Both,
+            created_at: "2026-08-01T00:00:00Z".into(),
+            created_by: "cli".into(),
+            disabled: false,
+            tokens,
+        }
+    }
+
+    /// Doctor warns about each live agent token that ends within 14 days and
+    /// about each agent with no live token, whatever `auth.mcp` says, and
+    /// each line names the fix.
+    #[test]
+    fn doctor_warns_about_agent_tokens_that_end_soon_or_are_missing() {
+        use crystalline_service::rest::AgentTokenState::{Expired, Live, Revoked};
+        let now = time::parse_rfc3339("2026-11-24T10:00:00Z").unwrap().stamp();
+        let agents = [
+            agent("nightly", vec![token(3, "2026-12-04T10:00:00Z", Live)]),
+            agent(
+                "rotated",
+                vec![
+                    token(5, "2027-02-20T10:00:00Z", Live),
+                    token(4, "2026-11-30T10:00:00Z", Live),
+                ],
+            ),
+            agent("fresh", vec![token(6, "2027-02-20T10:00:00Z", Live)]),
+            agent(
+                "gone",
+                vec![
+                    token(1, "2026-11-01T10:00:00Z", Expired),
+                    token(2, "2027-01-01T10:00:00Z", Revoked),
+                ],
+            ),
+        ];
+        let found = agent_token_findings(&agents, now);
+        assert_eq!(found.without_token, ["gone"]);
+        assert_eq!(found.ending.len(), 2, "{:?}", found.ending);
+        // Soonest first: the rotated agent's old token ends in 6 days.
+        let nightly = &found.ending[1];
+        assert_eq!((nightly.agent.as_str(), nightly.token_id), ("nightly", 3));
+        assert_eq!(nightly.expires_in_secs, 10 * 86_400);
+        assert!(!nightly.newer_live);
+        let line = ending_token_line(nightly);
+        assert!(
+            line.starts_with(
+                "[warning] token 3 of agent 'nightly' ends on 2026-12-04 (in 10 days)"
+            ),
+            "{line}"
+        );
+        assert!(line.contains("crystalline agents token nightly"), "{line}");
+        assert!(
+            line.contains("crystalline agents revoke nightly 3"),
+            "{line}"
+        );
+        let rotated = &found.ending[0];
+        assert!(rotated.newer_live, "{rotated:?}");
+        let line = ending_token_line(rotated);
+        assert!(line.contains("holds a newer token"), "{line}");
+        assert!(!line.contains("agents token rotated"), "{line}");
+        let line = no_token_line("gone");
+        assert!(line.contains("agent 'gone' has no live token"), "{line}");
+        assert!(line.contains("crystalline agents token gone"), "{line}");
+
+        let report = DoctorReport {
+            agent_tokens_ending: found.ending.clone(),
+            agents_without_token: found.without_token.clone(),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0, "warnings, not problems");
+        let out = render_human(&report);
+        assert!(out.contains("agents:"), "{out}");
+        assert!(out.contains("token 3 of agent 'nightly'"), "{out}");
+        assert!(out.contains("agent 'gone' has no live token"), "{out}");
     }
     use crystalline_core::config::EvolveConfig;
     use crystalline_index::{TursoStore, sync_domain};
