@@ -2260,6 +2260,7 @@ async fn the_queue_guidance_leaves_pact_text_and_settings_to_a_curator_in_a_run(
         "answer in the thread",
         "curator",
         "page or space in a session with them",
+        "an item on a pact file whose fix changes its text",
     ] {
         assert!(
             guidance.contains(needle),

@@ -9638,7 +9638,9 @@ async fn the_reflection_tools_teach_pages_that_keep_themselves_current() {
         );
     }
     assert!(
-        reflect.contains("writes no pact text") && reflect.contains("a curator makes the change"),
+        reflect.contains("writes no pact text")
+            && reflect.contains("a curator makes the change")
+            && reflect.contains("an item on a pact file whose fix changes its text"),
         "reflect lacks the unattended run's pact rule: {reflect}"
     );
     let write_schema = schema("write_reflection");

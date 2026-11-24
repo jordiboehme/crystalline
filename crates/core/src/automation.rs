@@ -783,6 +783,8 @@ mod tests {
             "move a page",
             "curator",
             "thread",
+            "an item on `PACT.md` or a page pact",
+            "left for a person",
         ] {
             assert!(rule.contains(needle), "the rule lacks {needle}: {rule}");
         }
