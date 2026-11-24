@@ -20078,7 +20078,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/UpdateLastCheck",
-                "description": "What the last check found, or null when the check is off or has not\nrun yet."
+                "description": "What the last check found, or null when the check is off or has not\nrun yet. Also null when the last check found a release but this\nserver cannot read its own version to compare it with."
               },
               {
                 "type": "null"

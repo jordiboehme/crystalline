@@ -262,6 +262,22 @@ describe("the Updates row of the General page", () => {
     );
   });
 
+  it("says when the check ran when the server sent a result it does not know", async () => {
+    serveAs(
+      "admin",
+      {},
+      // A result word from a newer server, which this page does not know.
+      { update_check: checkState({ last_check: "later" as never }) },
+    );
+    renderApp("/admin/general");
+
+    const row = await updatesRow();
+    expect(row).toHaveTextContent("Update check on. Last checked 3 hours ago.");
+    expect(row).not.toHaveTextContent("has not checked");
+    expect(row).not.toHaveTextContent("newer release");
+    expect(row).not.toHaveTextContent("failed");
+  });
+
   it("says the last check failed", async () => {
     serveAs(
       "admin",
@@ -376,11 +392,11 @@ describe("the Updates row of the General page", () => {
   it.each([
     [
       "no_update_notifier",
-      "Update check off: NO_UPDATE_NOTIFIER is set on the server. Remove it from the server's environment to turn the check on.",
+      "Update check off: NO_UPDATE_NOTIFIER is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
     ],
     [
       "ci",
-      "Update check off: CI is set on the server. Remove it from the server's environment to turn the check on.",
+      "Update check off: CI is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
     ],
     [
       "docker",

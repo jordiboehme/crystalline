@@ -171,8 +171,8 @@ function Command({ children }: { children: ReactNode }) {
 /** Why a check that is off is off, and what to do instead, per reason. */
 const OFF_TEXT: Record<Exclude<UpdateCheckOff, "not_turned_on">, string> = {
   no_update_notifier:
-    "Update check off: NO_UPDATE_NOTIFIER is set on the server. Remove it from the server's environment to turn the check on.",
-  ci: "Update check off: CI is set on the server. Remove it from the server's environment to turn the check on.",
+    "Update check off: NO_UPDATE_NOTIFIER is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
+  ci: "Update check off: CI is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
   docker:
     "Update check off: this server runs in Docker. To update, pull the new image and start the container again.",
   desktop_extension:
@@ -240,11 +240,12 @@ function UpdateCheckText({
     check.lastChecked === null
       ? null
       : relativeTime(check.lastChecked, new Date());
-  if (check.lastCheck === null || when === null) {
+  if (when === null) {
     return <p>Update check on. It has not checked yet.</p>;
   }
+  // A result the page does not know says only when the check ran.
   const found: ReactNode =
-    check.lastCheck === "failed" ? (
+    check.lastCheck === null ? null : check.lastCheck === "failed" ? (
       " The check failed."
     ) : check.lastCheck === "up_to_date" ? (
       " No newer release."

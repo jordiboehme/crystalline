@@ -84,6 +84,7 @@ test("a curator edits a page's settings, makes its pact, retires, restores and d
     await panel.getByRole("button", { name: "Save", exact: true }).click();
     await expect(status).toContainText(/Last checked .*, due again in /);
     await expect(edit).toBeFocused();
+    await expect(panel.getByRole("status")).toHaveText("Saved");
     await expect(panel).toContainText("6 hours");
     await expect
       .poll(async () => (await pageView(page, path)).freshness)

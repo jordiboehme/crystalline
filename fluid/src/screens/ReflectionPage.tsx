@@ -652,12 +652,16 @@ function PageBody({
     );
   const movable = atLeast(right, "edit") && path !== PACT_PATH;
   // Retire is a curator's change to the page's settings, on a page that is
-  // not retired yet; Restore is on the retired banner.
+  // not retired yet; Restore is on the retired banner. It is not offered
+  // while a retire is on its way, nor after it landed until the page shows
+  // it retired, so it cannot be sent twice.
   const retirable =
     curate &&
     settingsLocked === undefined &&
     page.page !== null &&
-    page.page.retired === null;
+    page.page.retired === null &&
+    !retire.isPending &&
+    lifecycleFocus !== true;
   // A Reflection page has no `crystalline://` name: on paper it is known by
   // its page in this app.
   const address = absoluteUrl(reflectionPageRoute(domain, path));

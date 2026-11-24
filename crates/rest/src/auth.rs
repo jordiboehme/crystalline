@@ -1286,7 +1286,8 @@ pub struct UpdateCheck {
     #[schema(example = "2026-11-24T09:00:00Z")]
     pub last_checked: Option<String>,
     /// What the last check found, or null when the check is off or has not
-    /// run yet.
+    /// run yet. Also null when the last check found a release but this
+    /// server cannot read its own version to compare it with.
     pub last_check: Option<UpdateLastCheck>,
 }
 
@@ -1341,7 +1342,8 @@ pub enum UpdateLastCheck {
 impl UpdateCheck {
     /// The state the daemon's `facts` describe. `current` is this server's
     /// own version, which decides whether a release the last check found is
-    /// newer; without one a found release is told as up to date.
+    /// newer; without one a found release gives no `last_check` result, and
+    /// only `last_checked` says when the check ran.
     pub fn from_facts(
         facts: &crystalline_core::update::UpdateFacts,
         current: Option<&crystalline_core::version::Precedence>,
@@ -1369,15 +1371,15 @@ impl UpdateCheck {
             InstallMethod::Unknown => UpdateInstall::Unknown,
         };
         let last = facts.cache.as_ref().filter(|_| off_reason.is_none());
-        let last_check = last.map(|cache| match cache.outcome {
-            CheckOutcome::Failed { .. } => UpdateLastCheck::Failed,
-            CheckOutcome::Release { .. } => {
-                if current.is_some_and(|current| cache.newer_release(current).is_some()) {
+        let last_check = last.and_then(|cache| match cache.outcome {
+            CheckOutcome::Failed { .. } => Some(UpdateLastCheck::Failed),
+            CheckOutcome::Release { .. } => current.map(|current| {
+                if cache.newer_release(current).is_some() {
                     UpdateLastCheck::Newer
                 } else {
                     UpdateLastCheck::UpToDate
                 }
-            }
+            }),
         });
         UpdateCheck {
             on: off_reason.is_none(),
@@ -2493,6 +2495,42 @@ mod tests {
     use super::*;
     use crate::overlay::EnvOverlay;
     use crate::settings::{apply, change_note, oauth_effective, unset};
+
+    #[test]
+    fn a_found_release_without_the_servers_own_version_gives_no_result() {
+        use crystalline_core::time::Stamp;
+        use crystalline_core::update::{
+            CheckOutcome, CheckState, InstallMethod, UPDATE_CACHE_FORMAT, UpdateCache, UpdateFacts,
+        };
+        let checked_at = Stamp::from_ymd_hms(2026, 11, 18, 9, 0, 0).unwrap();
+        let facts = UpdateFacts {
+            method: InstallMethod::Homebrew,
+            official: true,
+            refusal: None,
+            check: CheckState::On,
+            cache: Some(UpdateCache {
+                v: UPDATE_CACHE_FORMAT,
+                checked_at,
+                outcome: CheckOutcome::Release {
+                    version: "v99.0.0".to_string(),
+                    published_at: None,
+                    first_seen: checked_at,
+                },
+                etag: None,
+                last_release: None,
+            }),
+        };
+        let unknown = UpdateCheck::from_facts(&facts, None);
+        assert!(unknown.on);
+        assert_eq!(unknown.last_check, None);
+        assert_eq!(
+            unknown.last_checked.as_deref(),
+            Some("2026-11-18T09:00:00Z")
+        );
+        let older = crystalline_core::version::Precedence::parse("0.1.0").unwrap();
+        let known = UpdateCheck::from_facts(&facts, Some(&older));
+        assert_eq!(known.last_check, Some(UpdateLastCheck::Newer));
+    }
 
     #[test]
     fn cookie_values_lists_every_value_of_a_name_in_header_order() {

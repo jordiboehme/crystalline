@@ -10,14 +10,20 @@
  * file (a link, or "None" with a Create action for a curator). A curator on
  * a page that is not retired, on an instance and a domain that take writes,
  * gets an Edit action beside the heading: it swaps the view for the form
- * with Save and Cancel, its first field focused. Escape cancels; after a save the server took, or a
- * cancel, the view comes back and the focus returns to Edit. Later sections
- * (tags, links) go under it.
+ * with Save and Cancel, its first field focused. Escape cancels, but not
+ * one that ends a composition; an Escape that closes a native select's
+ * list mostly never reaches the page, so it is not told apart. After a
+ * save the server took, or a cancel, the view comes back and the focus
+ * returns to Edit; a save is also said as "Saved" in a status beside the
+ * heading, until the next Edit. A retire or a lock closes the form, and it
+ * stays closed after a restore. Later sections (tags, links) go under it.
  *
  * Every refusal is the server's: a freshness under 1 hour, a `follows` that
  * closes a cycle. Its sentence is shown in the form, which stays open. A
- * setting is sent only when it changed, and a cleared one as an empty value
- * (the route keeps a key it is not sent).
+ * setting is sent only when the person changed it from what the page held
+ * when the form opened, so a save never undoes what another curator saved
+ * in the meantime. A cleared one is sent as an empty value (the route
+ * keeps a key it is not sent).
  *
  * The column holds no lifecycle buttons: Retire and Delete are in the
  * page's More actions menu, and a retired page shows the retired banner
@@ -134,6 +140,12 @@ function PageSettings({
   const editable = changes && page.retired === null;
   const headingId = useId();
   const [editing, setEditing] = useState(false);
+  // A retire or a lock ends the editing, so a restore does not open the
+  // form again by itself.
+  if (editing && !editable) {
+    setEditing(false);
+  }
+  const [saved, setSaved] = useState(false);
   const editRef = useRef<HTMLButtonElement | null>(null);
   // Set when the form closes, so Edit takes the focus back once it shows.
   const refocus = useRef(false);
@@ -143,8 +155,9 @@ function PageSettings({
       editRef.current?.focus();
     }
   }, [editing]);
-  const close = (): void => {
+  const close = (didSave: boolean): void => {
     refocus.current = true;
+    setSaved(didSave);
     setEditing(false);
   };
   const open = editing && editable;
@@ -154,19 +167,25 @@ function PageSettings({
         <h2 id={headingId} className={RAIL_LABEL}>
           Page settings
         </h2>
-        {editable && !open && (
-          <button
-            ref={editRef}
-            type="button"
-            aria-label="Edit page settings"
-            onClick={() => {
-              setEditing(true);
-            }}
-            className={SMALL_ACTION}
-          >
-            Edit
-          </button>
-        )}
+        <div className="flex items-baseline gap-2">
+          <span role="status" className="text-caption text-muted">
+            {saved ? "Saved" : ""}
+          </span>
+          {editable && !open && (
+            <button
+              ref={editRef}
+              type="button"
+              aria-label="Edit page settings"
+              onClick={() => {
+                setSaved(false);
+                setEditing(true);
+              }}
+              className={SMALL_ACTION}
+            >
+              Edit
+            </button>
+          )}
+        </div>
       </div>
       {open ? (
         <SettingsForm domain={domain} path={path} page={page} onDone={close} />
@@ -257,8 +276,8 @@ function SettingsForm({
   domain: string;
   path: string;
   page: PageView;
-  /** Close the form: after a save the server took, or on Cancel. */
-  onDone: () => void;
+  /** Close the form: with true after a save the server took, with false on Cancel. */
+  onDone: (saved: boolean) => void;
 }): ReactElement {
   const queryClient = useQueryClient();
   const formRef = useRef<HTMLFormElement | null>(null);
@@ -270,7 +289,13 @@ function SettingsForm({
   const customId = useId();
   const followsId = useId();
   const owned = page.owner !== null;
-  const stored = storedFreshness(page, path);
+  // The settings as they were when the form opened: what the person changes
+  // is told apart from these, not from a page read again since.
+  const [base] = useState(() => ({
+    freshness: storedFreshness(page, path),
+    follows: page.follows,
+  }));
+  const stored = base.freshness;
   const [choice, setChoice] = useState(() =>
     stored === null
       ? ""
@@ -279,14 +304,15 @@ function SettingsForm({
         : CUSTOM,
   );
   const [custom, setCustom] = useState(choice === CUSTOM ? (stored ?? "") : "");
-  const [follows, setFollows] = useState(page.follows ?? "");
+  const [follows, setFollows] = useState(base.follows ?? "");
   const tree = useQuery({
     queryKey: reflectionTreeKey(domain),
     queryFn: () => fetchReflectionTree(domain),
   });
   const options = followable(tree.data?.nodes ?? [], path);
-  if (page.follows !== null && !options.some((o) => o.path === page.follows)) {
-    options.unshift({ path: page.follows, title: page.follows });
+  const opened = base.follows;
+  if (opened !== null && !options.some((o) => o.path === opened)) {
+    options.unshift({ path: opened, title: opened });
   }
   // Custom with nothing typed yet changes nothing: only None clears.
   const keepFreshness = owned || (choice === CUSTOM && custom.trim() === "");
@@ -296,10 +322,7 @@ function SettingsForm({
       : { freshness: choice === CUSTOM ? custom : choice }),
     follows,
   };
-  const pending = settingsChanges(
-    { freshness: stored, follows: page.follows },
-    wanted,
-  );
+  const pending = settingsChanges(base, wanted);
   const dirty = Object.keys(pending).length > 0;
   const save = useMutation({
     mutationFn: () => setReflectionSettings(domain, path, pending),
@@ -314,7 +337,7 @@ function SettingsForm({
         );
       }
       invalidateReflection(queryClient, domain);
-      onDone();
+      onDone(true);
     },
   });
   return (
@@ -329,10 +352,15 @@ function SettingsForm({
         }
       }}
       onKeyDown={(event: KeyboardEvent<HTMLFormElement>) => {
-        if (event.key === "Escape" && !save.isPending) {
+        if (
+          event.key === "Escape" &&
+          !event.nativeEvent.isComposing &&
+          !event.defaultPrevented &&
+          !save.isPending
+        ) {
           event.preventDefault();
           event.stopPropagation();
-          onDone();
+          onDone(false);
         }
       }}
     >
@@ -418,7 +446,9 @@ function SettingsForm({
         <button
           type="button"
           disabled={save.isPending}
-          onClick={onDone}
+          onClick={() => {
+            onDone(false);
+          }}
           className={BUTTON.secondary}
         >
           Cancel

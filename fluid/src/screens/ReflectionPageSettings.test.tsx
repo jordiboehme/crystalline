@@ -7,7 +7,8 @@
  * again.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -592,6 +593,112 @@ describe("the page details column", () => {
     expect(
       within(panel).getByRole("button", { name: "Edit page settings" }),
     ).toHaveFocus();
+    // The save is said to a screen reader, until the next Edit.
+    expect(within(panel).getByRole("status")).toHaveTextContent(/^Saved$/);
+    await edit(panel);
+    expect(within(panel).getByRole("status")).toHaveTextContent(/^$/);
+  });
+
+  it("says nothing was saved after a Cancel", async () => {
+    serve("curate");
+    renderApp(URL);
+    const panel = await details();
+    const form = await edit(panel);
+    await userEvent.click(within(form).getByRole("button", { name: "Cancel" }));
+    expect(within(panel).getByRole("status")).toHaveTextContent(/^$/);
+  });
+
+  it("sends only what the curator changed, after another curator saved", async () => {
+    let follows: string | null = null;
+    serve("curate", {
+      [DOC]: () => doc(view({ follows })),
+      "/domains/eng/reflection/settings": () => ({
+        domain: "eng",
+        path: PAGE,
+        checksum: "c2",
+        page: view({ freshness: "6h", follows }),
+      }),
+    });
+    renderApp(URL);
+    const panel = await details();
+    const form = await edit(panel);
+    await userEvent.selectOptions(
+      within(form).getByRole("combobox", { name: "Freshness" }),
+      "6h",
+    );
+    // Another curator makes the page follow the overview, and the page is
+    // read again while the form is open.
+    follows = "arch/overview.md";
+    const reads = (): number =>
+      apiMock.mock.calls.filter(([p]) => p === DOC).length;
+    const before = reads();
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+    await waitFor(() => {
+      expect(reads()).toBeGreaterThan(before);
+    });
+    focusManager.setFocused(undefined);
+    await userEvent.click(within(form).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(sent("PATCH", "/domains/eng/reflection/settings")).toEqual([
+        { path: PAGE, freshness: "6h" },
+      ]);
+    });
+  });
+
+  it("keeps the form open on an Escape that ends a composition", async () => {
+    serve("curate");
+    renderApp(URL);
+    const panel = await details();
+    const form = await edit(panel);
+    fireEvent.keyDown(
+      within(form).getByRole("combobox", { name: "Freshness" }),
+      { key: "Escape", isComposing: true },
+    );
+    expect(within(panel).getByRole("form")).toBeInTheDocument();
+  });
+
+  it("closes the form on a retire, and leaves it closed after a restore", async () => {
+    let retired = false;
+    serve("curate", {
+      [DOC]: () =>
+        doc(
+          retired
+            ? view({ retired: { at: null, by: null, was_owned_by: null } })
+            : view(),
+        ),
+      "/domains/eng/reflection/clock": () => ({ clock: null, checksum: "c1" }),
+      "/domains/eng/reflection/retire": () => {
+        retired = true;
+        return { domain: "eng", path: PAGE, retired: true };
+      },
+      "/domains/eng/reflection/restore": () => {
+        retired = false;
+        return { domain: "eng", path: PAGE, restored: true };
+      },
+    });
+    renderApp(URL);
+    const panel = await details();
+    await edit(panel);
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Retire" }));
+    const banner = await screen.findByRole("note", { name: "Retired" });
+    await waitFor(() => {
+      expect(within(panel).queryByRole("form")).toBeNull();
+    });
+    await userEvent.click(
+      within(banner).getByRole("button", { name: "Restore" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("note", { name: "Retired" })).toBeNull();
+    });
+    await within(panel).findByRole("button", { name: "Edit page settings" });
+    expect(within(panel).queryByRole("form")).toBeNull();
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "More actions" }),
+      ).toHaveFocus();
+    });
   });
 
   it("offers no Edit on a retired page", async () => {
@@ -636,6 +743,39 @@ describe("the page details column", () => {
         { path: PAGE },
       ]);
     });
+  });
+
+  it("says why a retire failed, and offers Retire again", async () => {
+    serve("curate", {
+      "/domains/eng/reflection/retire": () => {
+        throw new ApiProblem(409, "conflict", "the page is open in a room");
+      },
+    });
+    renderApp(URL);
+    await details();
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Retire" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "the page is open in a room",
+    );
+    await moreActions();
+    expect(screen.getByRole("menuitem", { name: "Retire" })).toBeVisible();
+  });
+
+  it("offers no second Retire while one is on its way", async () => {
+    serve("curate", {
+      "/domains/eng/reflection/retire": () => new Promise(() => {}),
+    });
+    renderApp(URL);
+    await details();
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Retire" }));
+    await waitFor(() => {
+      expect(sent("POST", "/domains/eng/reflection/retire")).toHaveLength(1);
+    });
+    await moreActions();
+    expect(screen.getByRole("menuitem", { name: "Move" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Retire" })).toBeNull();
   });
 
   it("offers Retire in the menu only to a curator who may change the page", async () => {
@@ -706,6 +846,8 @@ describe("the page details column", () => {
         screen.getByRole("button", { name: "More actions" }),
       ).toHaveFocus();
     });
+    await moreActions();
+    expect(screen.getByRole("menuitem", { name: "Retire" })).toBeVisible();
   });
 
   it("deletes from the menu only on the second press, and keeps the page on Keep", async () => {

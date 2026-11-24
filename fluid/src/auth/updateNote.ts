@@ -54,7 +54,10 @@ export interface UpdateCheckState {
   deb: boolean;
   /** When the last check ran, as the server sent it; null when it is off or has not run. */
   lastChecked: string | null;
-  /** What the last check found; null when it is off or has not run. */
+  /**
+   * What the last check found; null when it is off, has not run, or found
+   * something this page does not know.
+   */
   lastCheck: UpdateLastCheck | null;
 }
 
@@ -78,7 +81,8 @@ const LAST_CHECKS: readonly UpdateLastCheck[] = [
  * known words pass, so nothing the payload carries becomes text here
  * unchecked: the page builds every sentence itself. A check that is on with
  * an off reason, or off without one, reads as none. A time that does not
- * parse is dropped, and with it what the check found.
+ * parse is dropped, and with it what the check found. A result word this
+ * page does not know drops only the result: the time stays.
  */
 export function updateCheckOf(value: unknown): UpdateCheckState | null {
   if (typeof value !== "object" || value === null) {
@@ -106,7 +110,7 @@ export function updateCheckOf(value: unknown): UpdateCheckState | null {
     on: raw.on,
     offReason: offReason ?? null,
     deb: raw.install === "deb",
-    lastChecked: lastCheck === null ? null : lastChecked,
+    lastChecked,
     lastCheck,
   };
 }

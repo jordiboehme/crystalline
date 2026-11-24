@@ -63,8 +63,9 @@ describe("the update field of the probe", () => {
         lastCheck: null,
       });
     }
+    // A result word this page does not know drops only the result.
     expect(updateCheckOf({ ...on, last_check: "<b>new</b>" })).toMatchObject({
-      lastChecked: null,
+      lastChecked: "2026-11-24T09:00:00Z",
       lastCheck: null,
     });
     // Anything else reads as no state at all.
