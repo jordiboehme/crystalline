@@ -55,9 +55,29 @@ pub fn domain_rel(path: &str) -> String {
     format!("{REFLECTIONS_DIR}/{path}")
 }
 
+/// Whether a path segment has the shape of a Windows 8.3 short name: a `~`
+/// followed by digits that end the segment or come right before a `.`
+/// (`OVERVI~1.MD`, `PROGRA~1`). On an NTFS volume with short names such a
+/// name can be a second name of another file (`overview.pact.md`), so it is
+/// refused as text, on every system alike.
+fn is_short_name(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        if b != b'~' {
+            return false;
+        }
+        let digits = bytes[i + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        digits > 0 && matches!(bytes.get(i + 1 + digits), None | Some(b'.'))
+    })
+}
+
 /// Why `path` cannot name a reflection, or `Ok`. A reflection path is
 /// relative to `reflections/`, forward-slashed, ends in `.md`, has no empty,
-/// `.` or `..` segment, no hidden segment, no backslash, is not a threads
+/// `.` or `..` segment, no hidden segment, no segment shaped like a Windows
+/// short name, no backslash, is not a threads
 /// file, does not take an OKF reserved name and does not spell the pact in
 /// another case.
 pub fn validate_reflection_path(path: &str) -> Result<(), String> {
@@ -89,6 +109,11 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
         if segment.starts_with('.') {
             return Err(format!(
                 "'{path}' has a hidden segment; those are Crystalline's own"
+            ));
+        }
+        if is_short_name(segment) {
+            return Err(format!(
+                "'{path}' has a segment shaped like a Windows short name ('{segment}'), which can be another name of a pact or a hidden file; choose a name without '~' and digits before the extension"
             ));
         }
     }
@@ -473,6 +498,24 @@ mod tests {
             "pact.md",
         ] {
             assert!(validate_reflection_path(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_windows_short_name_is_refused_on_every_system() {
+        // On an NTFS volume with short names `arch/overview.pact.md` is also
+        // `arch/OVERVI~1.MD`; the check is textual, so it holds everywhere.
+        for bad in [
+            "arch/OVERVI~1.md",
+            "arch/overvi~12.md",
+            "PROGRA~1/a.md",
+            "a/B~3/c.md",
+        ] {
+            let err = validate_reflection_path(bad).unwrap_err();
+            assert!(err.contains("short name"), "{bad}: {err}");
+        }
+        for ok in ["a~b.md", "notes~.md", "x/~1a.md", "v~2b/c.md"] {
+            assert!(validate_reflection_path(ok).is_ok(), "{ok}");
         }
     }
 
