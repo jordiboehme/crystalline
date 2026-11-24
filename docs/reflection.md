@@ -38,13 +38,25 @@ A plain editor or a pull can still write `reflection: on` into the MANIFEST. If 
 - `## Level of detail`: how deep the pages go, and what they leave to the engrams.
 - `## Presentation`: which diagrams, callouts, tables and status labels help these readers, and what to avoid.
 - `## Structure`: one glob per top-level bullet, for example `- guides/*.md`. Only top-level bullets are read, so write the reasons in a sentence above the list.
-- `## Pages`: one bullet per page or space a person asked for: its path or glob, what they asked for in their words, who asked and when. The agent adds the bullet when it is asked, and reads it to place new engrams or to recreate a page from the request.
+- `## Pages`: one bullet per page or space a person asked for: its path or glob, what they asked for in their words, who asked and when. The agent adds the bullet when it is asked in a session with that person, and reads it to place new engrams or to recreate a page from the request. An unattended run writes no pact text, so it asks in a thread instead (see [What an unattended run may not change](#what-an-unattended-run-may-not-change)).
 
 The agent reads the pact before it writes. A page that fits none of the `## Structure` globs is reported to the agent as an update item. A change to the pact is reported too, so the agent applies it to the pages it affects. A `write_reflection` receipt names `unsourced_sections` (the headings) when the write created or changed a `##` section that has no sources, with a sentence asking the agent to pass them. It is a hint, never a refusal, and the pact is not a page, so it never reports it.
 
 A `PACT.md` write's receipt names `structure_findings` when a `## Structure` bullet is not read the way it looks. Each finding has the `bullet` and a `reason`: it reads as a sentence, not a glob (a space and none of `*`, `?`, `[`, `/`), it is not a valid glob, it matches no page, or it is a nested bullet that holds a path (nested bullets are not read). When no glob fits any page, every `off_structure` item carries a `hint` that says how the bullets are read.
 
 An agent's own writes never come back to it as feedback. A section an agent writes, changes or removes is reflected at once, with or without sources, on a page and in `PACT.md`, so an agent's pact write raises no `pact_changed`. A person's edit in Fluid, in the files or through the JSON API is still a feedback item (or `pact_changed`), also when an agent writes that section again before the change is settled.
+
+### Page pacts and what a page follows
+
+A page can have a pact of its own: extra instructions for this page and the pages that follow it. It adds to `PACT.md` and never replaces it. The page pact is the file beside the page with `.pact.md` in place of `.md`, for example `arch/overview.pact.md` for `arch/overview.md`. It works like `PACT.md`: its `##` sections get hidden ids, a person's change to it is feedback, and readers and contributors propose a change in a thread. Everyone who may read the page reads its pact. Only a curator writes, deletes or moves a pact file. A page pact moves, is deleted, backed up and exported with its page. It never moves on its own, and no page moves onto a pact file's path.
+
+A page follows `PACT.md` plus every page pact on its way up. Each page on the way follows the first of these that applies:
+
+- its `follows` frontmatter key, when that names an existing page of the same Reflection, for example `follows: arch/overview.md`;
+- else its owner (see [Owned pages](#owned-pages));
+- else its nearest folder parent that exists: `arch/overview.md` for the pages in `arch/overview/`.
+
+So the pacts apply in this order: `PACT.md`, then the pact of each page on the way from the top down, then the page's own pact. Fluid shows the way under the page's title, for example "Follows: PACT.md > Architecture overview". A write through Crystalline that sets a `follows` is refused when the value names no page of this Reflection, a page of another domain or a page that does not exist, or when it would close a cycle; the cycle refusal names the way page by page. A file edited on disk or brought in by a pull cannot be refused: there such a `follows` is ignored and the next rule applies, a page read lists it under `findings`, and a cycle stops the chain where it would close. When a page moves through Crystalline, every `follows` that named it is rewritten in the same step.
 
 ## Presentation
 
@@ -105,6 +117,8 @@ When a run holds a lease without an account, the owner's interactive sessions on
 
 To mark custom automation, for example a cron job that runs `claude -p`, give it its own MCP registration whose command is `crystalline mcp --unattended --domain <domain>`, or, over HTTP, add the header `X-Crystalline-Run-Domain: <domain>` and take the loop's lease with the run's account. An unmarked session that holds no lease is treated as a person's.
 
+A session started for a run is also kept off pact text, a page's settings and deletes. For those limits a lease alone does not count: see [What an unattended run may not change](#what-an-unattended-run-may-not-change).
+
 #### Sharing a source on purpose
 
 Personal knowledge may belong on a shared page, when a person who may read it decides so. So a person can share a source that the rule refuses, on purpose. This confirmation is a deliberate step for a person, not a security boundary against their own agent: an agent with a shell on the owner's machine can do anything the owner can, and a client that answers questions on its own defeats it. What protects against a confused deputy is the read limit above.
@@ -152,8 +166,9 @@ Access has two axes. They are set side by side: per account for every shared dom
 | anonymous visitor, public domain | read, never comment | - | - |
 
 - **Read and comment** means reading every page, its threads and its files, and taking part in threads.
-- **Edit** adds writing pages: create, change, move and delete them, and add new files.
-- **Curate** adds writing `PACT.md`, recording the engrams a section was built from, settling feedback, and replacing, moving and removing files. Everyone who may edit the engrams curates. Readers and contributors propose a pact change in a thread.
+- **Edit** adds writing pages: create, change, move and delete them, and add new files. An editor may change a page's `status` between words that do not retire it, for example from `current` to `draft`.
+- **Curate** adds writing pact files (`PACT.md` and every page pact), recording the engrams a section was built from, settling feedback, and replacing, moving and removing files. It also adds a page's settings: `freshness`, `follows` and a `status` from the retired set, retire and restore, naming an `owner` when a page is created, and recording a reconcile. Moving or deleting a page that has a page pact needs curate, because the pact goes with it, and so does a move onto a path that makes the page the folder parent of pages that already exist. A move that takes a folder parent away from its pages needs only edit. Everyone who may edit the engrams curates. Readers and contributors propose a pact change in a thread.
+- A page's settings never change by accident. A write that leaves `freshness`, `follows` or `status` out keeps the stored value, for every writer, so an agent that rewrites a page without its frontmatter keeps the page's schedule. A curator takes a key off with the key and no value, for example `freshness:`, or with the page settings in Fluid. A write below curate that sends another `freshness` or `follows` than stored, either key on a new page, or a `status` that retires a page or brings it back is refused with a sentence that says to leave the key out or send it as stored. The co-editing editor never shows these keys, and a save there keeps the stored values.
 - A member of a private domain at knowledge `none` needs a Reflection level; without one the membership grants nothing and is refused.
 - An account whose write list leaves a domain out at most reads and comments there, whatever its levels say. The list never grants access.
 - An anonymous visitor reads a public domain's Reflection and never comments.
@@ -200,23 +215,127 @@ crystalline domain members eng reflection remove ada
 | update | `unreflected` | An engram no section covers yet. |
 | update | `off_structure` | A page fits none of the pact's `## Structure` globs. |
 | update | `pact_changed` | A person changed the pact since the pages were last brought in line with it. `sections` lists the ids of the changed parts. |
+| update | `stale` | A page's freshness ran out, so it is brought in line with its pacts again. Only a run, or a call with `stale: true`, gets it. See [Pages that keep themselves current](#pages-that-keep-themselves-current). |
+| update | `page_pact_changed` | A pact on the page's way changed. Either a person changed a page pact (`pacts` names the changed files, `diff` shows the change), or the page's pacts and settings no longer match what its last reconcile saw (`pacts` empty, `pact_hash_changed: true`). `chain` lists the pact files the page follows. See [When a pact changes](#when-a-pact-changes). |
+| update | `owner_gone` | The page that owned this page is missing or retired (`owner`, and `owner_is`: `missing` or `retired`), so no reconcile keeps it current. Retire it, or retire it and restore it without owner, so it stands on its own. |
+| update | `link_retired` | A section links a retired page. `links` names the targets. |
+| update | `link_broken` | A section links a page that is not there. `links` names the targets. |
 | update | `asset_missing` | A page links a file in `reflections/assets/` that is not there. |
 | update | `engram_attachment` | A page embeds an engram attachment instead of a file of its own. |
 | update | `asset_unreferenced` | A file in `reflections/assets/` that no page links. |
 | update | `host_moved` | The domain moved to this instance (for example after a takeover on a PostgreSQL database), and this disk lacks files the previous host wrote. One item per domain, with the counts in `only_elsewhere`. See [One home, one backup](#one-home-one-backup). |
 | review | `thread` | A thread waits for the agent. |
 
-Items about the same section stay together. Groups come oldest first, and inside a group feedback comes before update and update before review. So the agent reads a person's change before it rewrites the section.
+Items about the same section stay together. Groups come oldest first, and inside a group feedback comes before update and update before review. So the agent reads a person's change before it rewrites the section. A `stale` item waits until every group with feedback is placed, then takes its place by age among the others.
+
+A retired page gets none of the update items above except `source_too_wide`: no source, file, link, structure, `stale` or `page_pact_changed` item. Its feedback and threads stay, because they are people's. An owned page and a retired page are never `off_structure`.
 
 The agent settles a feedback item in one of three ways:
 
 - It takes the change into the engrams: it changes the engrams, then writes the section with its source engrams.
-- It keeps the change as the person's text (`write_reflection` with `action: settle` and `outcome: kept`). A settle without `sections` settles the whole page, its top included. A heading with no id line yet is left out. It gets one on the next write through Crystalline, and a settle after that settles it. When the pages follow a changed pact again, the agent settles `PACT.md` this way.
+- It keeps the change as the person's text (`write_reflection` with `action: settle` and `outcome: kept`). A settle without `sections` settles the whole page, its top included. A heading with no id line yet is left out. It gets one on the next write through Crystalline, and a settle after that settles it. When the pages follow a changed pact again, the agent settles `PACT.md` or the changed page pact this way.
 - It answers in a thread (`discuss` with `answers_feedback`), when it disagrees or has a question.
 
 Three nudges point the agent at open items of the Reflections its user curates: the receipt of a write, the reminder at the end of a session (the Stop hook) and the line for the domain in the routing block at session start ("Reflection: 3 open items - call reflect"). The daemon counts the open items every five minutes.
 
 On a machine connected to a server with `crystalline connect`, the server's domains appear under their names on this machine. The agent works their Reflections through the same four tools, with its user's rights on that server. A queue over all domains asks every server. The nudges for these domains come from the server's counts, which the daemon fetches every three minutes.
+
+## Pages that keep themselves current
+
+Some pages move with the knowledge or with the calendar: "the architecture as it is now", "what changed this week", "the open risks". Events alone do not keep such a page current. A new engram in another domain, an engram another page covers already, or the end of a week change nothing on the page. So a page can have a freshness: when it runs out, the reflect loop runs the page's pacts again and brings the page in line.
+
+### Freshness
+
+Set it in the page's frontmatter, for example `freshness: 1d`, or in the page settings in Fluid. It is any span of one hour or more, written the way `build_context` writes a timeframe: a whole number and a lowercase unit, `h` for hours, `d` for days, `w` for weeks, `m` for months of 30 days and `y` for years of 365 days, or a bare number of days (`7`). There is no unit for minutes, so `5m` is five months. A shorter or unreadable value is ignored, and a page read names it under `findings`. A freshness on an owned page is ignored too, because its owner keeps it current. Only a curator sets or changes a freshness (see [Who may do what](#who-may-do-what)).
+
+A page is due when its last reconcile is older than its freshness. It is due also when nothing changed, because a page like "this week" moves with the calendar. When a page was last reconciled is kept in the index at the Reflection's home, never in the page file, so a check that changes nothing makes no file change and no backup commit. A page with no record yet (a new page, a new home, a restore, a `reindex --wipe`) counts as checked when it last changed, so not every page is due at once.
+
+### The `stale` item
+
+`reflect` hands a due page out as a `stale` item. A run gets it by default: an agent of the loops, a session started for a run, or a session whose loop lease limits what it reads. Any other session gets it only with `stale: true`, and `stale: false` turns it off for a run too. It never counts in the nudges and the open-item counts, and the queue of the JSON API and Fluid's Review do not show it. The item carries:
+
+- `freshness`, `last_reconciled` and `outcome` (`updated`, `unchanged`, or null when no reconcile was recorded yet);
+- `pacts`: the pact files the page follows, in the order they apply. The answer carries their texts once, in a top-level `pacts` object by domain and path;
+- `pact_hash`: the hash of those pacts and the page's settings as they are now;
+- `owned`: the pages the page owns, and the pages they own, and `owned_reconciled`: those of them reconciled since the page's own last reconcile;
+- `unsettled`: the ids of the page's sections a person changed and nobody settled yet;
+- `changed_engrams`: how many engrams changed since `last_reconciled` in the domains the caller may read. It is null when that is not known: a domain the caller may read lives on a connected server, or a file domain was not read yet. A caller who may not see engrams gets no count;
+- `source_changed`: the page's own source changes. Once a page is due, its `source_changed` items leave the queue and are listed here instead;
+- `version`: the same for one period and new with the next.
+
+The agent reads the pact texts in order, searches the domains it may read for what changed since `last_reconciled`, changes only what new information requires and names every source. With `changed_engrams` 0 and a page that does not move with the calendar, it records the page unchanged at once. It creates the pages the pact asks for with `owner`, updates the pages the page owns and retires those that are no longer needed. A run never deletes a page.
+
+Then it records the reconcile: `write_reflection` with `action: reconciled`, `outcome` `updated` or `unchanged`, and the item's `version`. Only this action records a reconcile; a write of the page does not. It needs curate, writes no file and sends a change event, so an open page in Fluid shows the new "Last checked". It is refused:
+
+- while the page is due, without a `version`;
+- with the version of an older period: the page was reconciled again after the item was handed out, so nothing is recorded and the agent reads the queue again;
+- for an owner that is due while one of its owned pages has no reconcile after the owner's last one: the refusal names those pages. Owned pages come first and the owner last;
+- for `PACT.md`, a page pact and a retired page.
+
+A failed run records nothing, so the page stays due. A `stale` item that a run left for a person comes back with the next period.
+
+### Owned pages
+
+A page whose pact asks for pages of their own owns them. The agent creates such a page with `write_reflection` and `owner` set to the owning page. Naming an owner needs curate; the owner must exist, must not be retired, and owning must not close a cycle. The owner is recorded in the page's `reflection:` block, and only when the page is created: an existing page keeps its owner, and sending the same owner again changes nothing. A page a person adds to the folder is not owned, and a reconcile leaves it alone.
+
+An owned page needs no freshness of its own and follows its owner's pacts. Reconciling the owner reconciles its set: it creates the pages that are missing, updates the others and retires the ones no longer needed. An owned page may own pages in turn. Each owned page counts as one item toward a run's `--max-items` and gets its own `reconciled`, so a run that stops at its cap resumes after the pages in `owned_reconciled`. Fluid shows "Part of: <owner>" under the title.
+
+### Retired pages
+
+A page is retired when its `status` is a word of the retired set, as an engram's is: `archived`, `superseded`, `deprecated` or `legacy`, in any letter case. `write_reflection` with `action: retire` sets `status: archived`, records when and by whom, and keeps the former owner as `was_owned_by`. `action: restore` takes the status and the record off. With `owner` set to the former owner, the page goes back under it (the owner must still exist and not be retired); without it, the page stands on its own. Both need curate and work on pages only, never on a pact file. A page that already carried a retired word before 0.35.0, for example one that came from an engram, reads as retired too.
+
+A retired page:
+
+- is hidden in Fluid's navigation unless the reader turns on "Show retired pages", and stays reachable by a link and by the Reflection search, which marks it;
+- shows a banner, "Retired: no longer part of <owner>" or "Retired", with restore and delete for a curator;
+- is never reconciled and counts as covering no engram, so an engram only a retired page cites shows as unreflected;
+- gets only the queue items listed under [The reflect queue](#the-reflect-queue), and a page that links it gets `link_retired`.
+
+A person deletes a page in Fluid or in an attended session. An unattended run retires it instead.
+
+### Engrams a page dropped
+
+An engram counts as reflected while a section cites it. A page with a freshness, or an owned page, drops engrams as it moves on: the week page lets go of last week's change. So an engram such a page cited and then dropped stays covered until the engram changes. Then it is `unreflected` again, unless a page cites it now. The index keeps these engrams beside the page with their checksum at the drop. They move with the page and go when the page is deleted. A `reindex --wipe` loses them, so those engrams show as unreflected once.
+
+### When a pact changes
+
+`page_pact_changed` comes in two ways:
+
+- A person changed a page pact on the page's way. The item goes to that page and to every page that follows it, with the changed pact files in `pacts` and the change in `diff`. The agent applies the change to the pages and then settles the pact file with `action: settle`.
+- The page's pacts and settings no longer match what its last reconcile saw. Each reconcile keeps a hash of the pact texts in chain order and the page's `freshness` and `status`. The links inside the pacts are left out of it, so a move that rewrites links changes nothing. When the hash differs, the item has an empty `pacts` and `pact_hash_changed: true`, and it ends with the next `reconciled`. A page with no recorded reconcile has nothing to compare.
+
+A curator's change of only `freshness` or `status` through Crystalline (the page settings or a page write) moves a current record along with it, so it raises nothing. A `follows` that brings other pacts, and a change on disk or by a pull, do raise it. A person's change to `PACT.md` raises `pact_changed` as before, plus a `page_pact_changed` for each page with a recorded reconcile.
+
+### Overdue and missed pages
+
+Fluid shows a page's clock under its title, for example "Last checked 2 hours ago, due again in 1 hour". A page is overdue one whole period after it fell due, that is twice its freshness after its last reconcile: "Overdue since 3 hours, last checked 5 hours ago", in the warning colour. When reflect runs ended in that time and none of them left the page, the loop simply runs less often than the page's freshness, and the page says so: "The reflect loop runs less often than this page's freshness." A due page that is open in the editor shows "Waiting: open in the editor": a run leaves it until the room closes.
+
+A page is missed when a reflect run of its domain started after the page fell due and ended without reconciling it. Only missed pages are warned about: `crystalline doctor` names each one with its domain and since when (a warning, not a counted problem), and admins see a banner and a list on the Maintenance screen in Fluid. A run still going does not count, and with no finished run no page is missed. The page itself then says "A reflect run skipped this page."
+
+### What an unattended run may not change
+
+A run works on its own, and nobody watches what it changes. So Crystalline keeps it off what a curator decides. Here a session is unattended when it is an agent of the loops (a `cag_` token), or when it was started for a run: `crystalline mcp --unattended`, which every `crystalline reflect run` starts, or the header `X-Crystalline-Run-Domain` over HTTP. A live lease alone does not count here: the machine owner's other sessions while its run goes, an attended session limited by a lease and a person in Fluid act in person. No caller of the JSON API is unattended.
+
+An unattended session may not:
+
+- delete a page or a page pact. It retires a page instead (`action: retire`);
+- write pact text: no create, change or overwrite of `PACT.md` or any page pact;
+- move a page that has its own page pact, since the pact moves with it;
+- change a page's `freshness` or `follows`, and it sets neither on a new page, an owned page included.
+
+It still writes the text of pages, settles feedback (on a pact file too), opens and answers threads (on a pact file too), sets a `status`, retires, restores, creates owned pages and records reconciles. Sending `freshness` or `follows` as stored, or leaving them out, is no change. A move rewrites the links in `PACT.md` and in page pacts that point at the moved page; that is no pact write. Feedback or a thread that asks for a pact change, a new freshness or another `follows` is answered in its thread and left to a curator. So is a file item on a pact file, such as a missing file or an embedded engram attachment, because its fix would change the pact's text.
+
+Each refusal says who makes the change and where, for example "an unattended session does not write pact text; 'PACT.md' stays as it is: answer the feedback in its thread, and a curator changes the pact in Fluid or in an attended session".
+
+### Over the JSON API
+
+- `GET /api/v1/domains/{domain}/reflections/{path}`: a page's answer carries `page` with `freshness`, `follows`, `status`, `owner`, `retired` (`at`, `by` and `was_owned_by`; `at` and `by` are null for a page retired only by its status word), `chain` (the pages it follows, from the top down), `pacts` (the pact files in order), `pact` (its own page pact, with `exists`) and `findings`. Nodes of `GET .../reflection/tree` carry `retired` and `owner`, and hits of `GET .../reflection/search` carry `retired`.
+- `PATCH /api/v1/domains/{domain}/reflection/settings` with `path` and any of `freshness`, `follows` and `status` changes a page's settings. A key left out, or sent as null, keeps its value; an empty string takes the key off; any other value sets it. At least one key is needed. It needs curate. It refuses a freshness under one hour or one that does not read, a freshness on an owned page, a retired word in `status` (retire the page instead), any `status` change on a retired page (restore it instead), a pact file and a `follows` the write would refuse. The answer is the write's receipt with the page as it is now.
+- `POST /api/v1/domains/{domain}/reflection/retire` with `path`, and `POST /api/v1/domains/{domain}/reflection/restore` with `path` and an optional `owner`, retire and restore a page.
+- `GET /api/v1/domains/{domain}/reflection/clock?path=<page>` answers `{clock, checksum}`. `clock` holds `freshness`, `last_reconciled`, `last_checked_secs`, `due_in_secs`, `stale`, `overdue_secs`, `missed_secs`, `loop_slower_than_freshness`, `waiting`, `part_of` and `clock_of`. Times are seconds relative to the server's clock. An owned page answers its owner in `part_of` and the clock of the first page up its owners that has one. `clock` is null for a page on its own with no freshness, a retired page and a missing page. `checksum` is the sha256 of the page file as stored, the same as a read's `checksum`, and null for a missing page. A reconcile writes no file, so a client that heard a change compares the checksum with the text it holds and reads the page again only when they differ.
+- `GET /api/v1/reflection/missed` lists the pages a reflect run missed, over every Reflection the caller may read, longest missed first: `{pages: [{domain, path, freshness, last_checked_secs, missed_secs, waiting}]}`.
+
+A reconcile has no route of its own: only an agent records one, with `write_reflection`.
 
 ## Searching a Reflection
 
