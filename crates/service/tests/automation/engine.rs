@@ -1618,11 +1618,14 @@ async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
         .unwrap_err();
     assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
     assert!(refused.to_string().contains("pact text"), "{refused}");
-    // Nothing a person changed waits to be settled, but the right is there:
-    // whatever the answer, it is no refusal of the right.
-    if let Err(e) = fx.engine.write_reflection(&settle, &curator).await {
-        assert!(!matches!(e, EngineError::Forbidden(_)), "{e}");
-    }
+    // The settle lands: its receipt names the section it settled.
+    let settled = fx.engine.write_reflection(&settle, &curator).await.unwrap();
+    assert_eq!(settled["outcome"], "kept", "{settled}");
+    assert_eq!(
+        settled["settled"],
+        serde_json::json!(["aaaa1111"]),
+        "{settled}"
+    );
     let text = std::fs::read_to_string(fx.root.join("reflections/d.md")).unwrap();
     assert!(text.contains("runbooks/deploy"), "{text}");
     let pact_text = std::fs::read_to_string(fx.root.join("reflections/PACT.md"))
