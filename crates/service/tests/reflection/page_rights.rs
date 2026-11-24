@@ -276,18 +276,30 @@ async fn an_editors_write_keeps_the_settings_and_is_refused_when_it_changes_them
     .unwrap();
     assert!(settings(&fx, "guides/a.md").ends_with("status=draft"));
     // A retired page stays retired, whatever an editor sends.
-    put(
+    fx.engine
+        .write_reflection(
+            &crystalline_service::params::WriteReflectionParams {
+                domain: "eng".into(),
+                path: "guides/a.md".into(),
+                action: Some("retire".into()),
+                ..Default::default()
+            },
+            &curator,
+        )
+        .await
+        .unwrap();
+    let err = put_err(&fx, "guides/a.md", SET, &ann).await;
+    assert!(err.contains("status") && err.contains("curate"), "{err}");
+    let err = put_err(
         &fx,
         "guides/a.md",
         &SET.replace("status: current", "status: Archived"),
-        &curator,
+        &ann,
     )
-    .await
-    .unwrap();
-    let err = put_err(&fx, "guides/a.md", SET, &ann).await;
-    assert!(err.contains("status"), "{err}");
+    .await;
+    assert!(err.contains("status") && err.contains("curate"), "{err}");
     put(&fx, "guides/a.md", PAGE, &ann).await.unwrap();
-    assert!(settings(&fx, "guides/a.md").ends_with("status=Archived"));
+    assert!(settings(&fx, "guides/a.md").ends_with("status=archived"));
 
     // A section edit leaves the frontmatter alone.
     fx.engine
@@ -360,6 +372,61 @@ async fn a_curator_sets_keeps_and_clears_the_settings() {
     .await
     .unwrap();
     assert_eq!(settings(&fx, "guides/a.md"), "status=current");
+}
+
+/// A whole-page write never moves `status` into or out of the retired
+/// words, for a curator and an editor alike: retire and restore do that,
+/// and the refusal names them. A write that keeps the page on its side of
+/// the line passes.
+#[tokio::test]
+async fn a_whole_page_write_never_moves_the_status_across_the_retired_words() {
+    let (fx, ann, curator) = editor_and_curator().await;
+    put(&fx, "guides/b.md", PAGE, &curator).await.unwrap();
+    put(&fx, "guides/a.md", SET, &curator).await.unwrap();
+    let archived = SET.replace("status: current", "status: archived");
+    for who in [&curator, &ann] {
+        let err = put_err(&fx, "guides/a.md", &archived, who).await;
+        assert!(err.contains("action=retire"), "{err}");
+    }
+    let err = put_err(
+        &fx,
+        "guides/n.md",
+        "---\nstatus: Archived\n---\n\n# N\n",
+        &curator,
+    )
+    .await;
+    assert!(err.contains("action=retire"), "{err}");
+    assert!(file(&fx, "guides/n.md").is_none());
+    assert!(settings(&fx, "guides/a.md").ends_with("status=current"));
+
+    fx.engine
+        .write_reflection(
+            &crystalline_service::params::WriteReflectionParams {
+                domain: "eng".into(),
+                path: "guides/a.md".into(),
+                action: Some("retire".into()),
+                ..Default::default()
+            },
+            &curator,
+        )
+        .await
+        .unwrap();
+    for text in [SET.to_string(), "---\nstatus:\n---\n\n# A\n".to_string()] {
+        let err = put_err(&fx, "guides/a.md", &text, &curator).await;
+        assert!(err.contains("action=restore"), "{text}: {err}");
+    }
+    assert!(settings(&fx, "guides/a.md").ends_with("status=archived"));
+    // On its side of the line the page is written as ever.
+    put(
+        &fx,
+        "guides/a.md",
+        &archived.replace("First.", "Kept."),
+        &curator,
+    )
+    .await
+    .unwrap();
+    put(&fx, "guides/a.md", PAGE, &curator).await.unwrap();
+    assert!(settings(&fx, "guides/a.md").ends_with("status=archived"));
 }
 
 /// A follows is written only when it names an existing page of the same

@@ -327,7 +327,7 @@ async fn an_owned_pages_clock_is_its_owners() {
     assert_eq!(clock("plain.md").await, Value::Null);
     // Nor does an owned page retired by a status written by hand: its
     // record still names the owner, and it is never reconciled.
-    put(&fx, "plain/p.md", "---\nstatus: archived\n---\n# Part P\n").await;
+    by_hand(&fx, "plain/p.md", "---\nstatus: archived\n---\n# Part P\n").await;
     assert_eq!(clock("plain/p.md").await, Value::Null);
 }
 
@@ -632,6 +632,36 @@ async fn set(fx: &Fx, c: PageSettingsChange) -> Value {
         .unwrap()
 }
 
+/// Retire and restore carry the stored pact hash along as a settings change
+/// does: a page retired, given a freshness while retired and restored asks
+/// for no reconcile.
+#[tokio::test]
+async fn a_retire_and_a_restore_raise_no_pact_item() {
+    let fx = reflecting().await;
+    fx.engine
+        .write_reflection(&write("PACT.md", "# Pact\n\n## Tone\n\nShort.\n"), &agent())
+        .await
+        .unwrap();
+    put(&fx, "notes.md", "# Notes\n\n## One\n\nText.\n").await;
+    reconcile(&fx, "notes.md").await;
+    assert!(pact_items(&fx, "notes.md").await.is_empty());
+    act(&fx, "retire", "notes.md").await;
+    set(
+        &fx,
+        PageSettingsChange {
+            freshness: Some("1d".into()),
+            ..change("notes.md")
+        },
+    )
+    .await;
+    act(&fx, "restore", "notes.md").await;
+    assert_eq!(
+        pact_items(&fx, "notes.md").await,
+        Vec::<Value>::new(),
+        "restored"
+    );
+}
+
 /// A curator's freshness or status change does not ask for a reconcile:
 /// the stored pact hash follows it in the same commit. A follows change
 /// that brings another pact does, and so does a freshness edited on disk.
@@ -726,7 +756,10 @@ async fn a_settings_change_through_crystalline_raises_no_pact_item() {
 #[tokio::test]
 async fn a_page_retired_by_its_status_word_reads_as_retired() {
     let fx = reflecting().await;
-    put(&fx, "old.md", "---\nstatus: superseded\n---\n# Old\n").await;
+    put(&fx, "old.md", "# Old\n").await;
+    // Written by hand: a write never moves the status into the retired
+    // words, retire does.
+    by_hand(&fx, "old.md", "---\nstatus: superseded\n---\n# Old\n").await;
     let page = page_of(&fx, "old.md").await;
     assert_eq!(page["status"], "superseded", "{page}");
     assert_eq!(
@@ -737,4 +770,33 @@ async fn a_page_retired_by_its_status_word_reads_as_retired() {
     // Restored, it reads as a page again.
     act(&fx, "restore", "old.md").await;
     assert_eq!(page_of(&fx, "old.md").await["retired"], Value::Null);
+}
+
+/// The page view says retired only while the status is a retired word: a
+/// retire record left behind on a page whose status was changed by hand
+/// does not make it read as retired, as the engine does not treat it so.
+#[tokio::test]
+async fn a_retire_record_under_a_live_status_does_not_read_as_retired() {
+    let fx = reflecting().await;
+    put(&fx, "old.md", "# Old\n").await;
+    act(&fx, "retire", "old.md").await;
+    assert_eq!(page_of(&fx, "old.md").await["retired"]["by"], "jordi");
+    let path = fx.root.join("reflections/old.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("status: archived", "status: stable");
+    assert!(text.contains("retired"), "the record stays: {text}");
+    by_hand(&fx, "old.md", &text).await;
+    let page = page_of(&fx, "old.md").await;
+    assert_eq!(page["status"], "stable", "{page}");
+    assert_eq!(page["retired"], Value::Null, "{page}");
+}
+
+/// `text` written to the page at `path` on disk, as a person does by hand,
+/// and synced.
+async fn by_hand(fx: &Fx, path: &str, text: &str) {
+    let abs = fx.root.join("reflections").join(path);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, text).unwrap();
+    fx.engine.sync(None).await.unwrap();
 }

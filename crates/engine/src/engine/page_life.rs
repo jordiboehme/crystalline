@@ -100,7 +100,9 @@ impl Engine {
         let mut was_owned_by = None;
         self.change_page_record(domain, inner, caller, |text| {
             let mut prov = r::read_provenance(text);
-            if prov.page.retired.is_some() || is_retired(text, inner) {
+            // Retired by its status word, as the page view reads it: a
+            // record left under a live status is replaced.
+            if is_retired(text, inner) {
                 return Err(EngineError::Conflict(format!(
                     "'{inner}' is already retired; restore it to bring it back"
                 )));
@@ -148,7 +150,9 @@ impl Engine {
         let _lock = self.lock_file(&abs).await;
         let text = read_opt(&abs)?.ok_or_else(|| no_page(domain, inner))?;
         let mut prov = r::read_provenance(&text);
-        if prov.page.retired.is_none() && !is_retired(&text, inner) {
+        // Retired by its status word only: a record left under a live
+        // status (changed by hand) must not put an old status back.
+        if !is_retired(&text, inner) {
             return Err(EngineError::Invalid(format!(
                 "'{inner}' is not retired; there is nothing to restore"
             )));
@@ -184,7 +188,7 @@ impl Engine {
         prov.page.owner = owner.map(str::to_string);
         let changed = r::write_provenance(&text, &prov).map_err(EngineError::Invalid)?;
         let changed = set_status(&changed, was_status.as_deref())?;
-        self.land_page_record(domain, &access, inner, &abs, &changed, caller)
+        self.land_page_record(domain, &access, inner, &abs, &text, &changed, caller)
             .await?;
         drop(_lock);
         self.absorb_into_room(domain, inner).await;
@@ -233,7 +237,9 @@ impl Engine {
         }
         let stored = read_opt(&access.abs(inner))?.ok_or_else(|| no_page(domain, inner))?;
         let record = r::read_provenance(&stored).page;
-        let retired = record.retired.is_some() || is_retired(&stored, inner);
+        // Retired while the status is a retired word, as the page view
+        // reads it; a record left under a live status is no retirement.
+        let retired = is_retired(&stored, inner);
         let mut text = stored.clone();
         for (key, value) in &wanted {
             match (*key, *value) {
@@ -381,7 +387,7 @@ impl Engine {
         let _lock = self.lock_file(&abs).await;
         let text = read_opt(&abs)?.ok_or_else(|| no_page(domain, inner))?;
         let changed = change(&text)?;
-        self.land_page_record(domain, &access, inner, &abs, &changed, caller)
+        self.land_page_record(domain, &access, inner, &abs, &text, &changed, caller)
             .await?;
         drop(_lock);
         self.absorb_into_room(domain, inner).await;
@@ -413,30 +419,46 @@ impl Engine {
         Ok(access)
     }
 
-    /// Write `text` as the page at `inner` (at `abs`, under its lock) and
-    /// index it behind the fence; a refusal puts the file back. Its sections
-    /// are as they were, so its baseline and threads stay.
+    /// Write `text` as the page at `inner` (at `abs`, under its lock), which
+    /// held `current`, and index it behind the fence; a refusal puts the
+    /// file back. Its sections are as they were, so its baseline and threads
+    /// stay. A change of only its `status` (and `freshness`) carries the
+    /// stored pact hash along in the same commit, as a write's does
+    /// ([`Engine::settings_rehash`]), so a retire or a restore asks for no
+    /// reconcile.
+    #[allow(clippy::too_many_arguments)]
     async fn land_page_record(
         &self,
         domain: &str,
         access: &ReflectionAccess,
         inner: &str,
         abs: &Path,
+        current: &str,
         text: &str,
         caller: &ReflectionCaller,
     ) -> Result<()> {
         let text = crystalline_core::to_lf(text).into_owned();
+        let rehash = self
+            .settings_rehash(access.domain_id, inner, Some(current), &text)
+            .await?;
         let mut undo = DiskUndo::default();
         undo.record(abs)?;
         write_file(abs, &text)?;
-        self.index_reflection(
-            access.domain_id,
+        let mut ops = vec![super::fence::RowOp::Page {
             inner,
-            &text,
+            text: &text,
             abs,
-            OnRefusal::put_back(domain, undo),
-        )
-        .await?;
+        }];
+        if let Some((seen_hash, seen_at, hash)) = &rehash {
+            ops.push(super::fence::RowOp::RehashReconcile {
+                path: inner,
+                seen_hash,
+                seen_at,
+                hash,
+            });
+        }
+        self.commit_reflection_rows(access.domain_id, &ops, OnRefusal::put_back(domain, undo))
+            .await?;
         self.mark_reflection_dirty(domain, BackupCause::Settled);
         self.announce_reflection(
             domain,

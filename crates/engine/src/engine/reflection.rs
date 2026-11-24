@@ -1475,6 +1475,50 @@ fn page_key_refusal(
     ))
 }
 
+/// The refusal of a whole-page write that moves the page at `path` across
+/// the retired words in its `status`: into them (`retired` false) or out of
+/// them. Retire and restore are the way, for every writer; below curate the
+/// sentence says that they take curate.
+fn retired_status_refusal(
+    domain: &str,
+    path: &str,
+    sent: Option<&serde_yaml_ng::Value>,
+    retired: bool,
+    create: bool,
+    right: ReflectionRight,
+) -> EngineError {
+    let shown = sent
+        .and_then(serde_yaml_ng::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let what = match (retired, shown) {
+        (false, Some(word)) => format!(
+            "status '{word}' would retire '{path}'; a page is retired with write_reflection action=retire, which keeps the page it was owned by so a restore can put it back"
+        ),
+        (false, None) => {
+            format!("a write would retire '{path}'; use write_reflection action=retire")
+        }
+        (true, Some(word)) => format!(
+            "'{path}' is retired and status '{word}' would bring it back; a page comes back with write_reflection action=restore"
+        ),
+        (true, None) => format!(
+            "'{path}' is retired and a write without its status would bring it back; a page comes back with write_reflection action=restore"
+        ),
+    };
+    let fix = if create {
+        "write the new page without status".to_string()
+    } else {
+        "leave status out or send it as stored".to_string()
+    };
+    if right >= ReflectionRight::Curate {
+        return EngineError::Invalid(format!("{what}, so {fix}"));
+    }
+    EngineError::Forbidden(format!(
+        "{what}, which takes curate; your access to the Reflection of '{domain}' is {}, so {fix}",
+        reflection_right_word(right)
+    ))
+}
+
 /// What [`compose_reflection`] answers.
 pub(super) struct Composed {
     /// The text to write, without the bookkeeping block re-emitted yet.
@@ -2813,7 +2857,9 @@ impl Engine {
     /// name an existing page of this Reflection and close no cycle. Below
     /// curate a key sent with another value than the stored one is refused,
     /// on a new page any key at all; `status` only when the stored or the
-    /// sent value is a retired word. An `unattended` writer
+    /// sent value is a retired word. No writer moves `status` into or out
+    /// of the retired words (retire and restore do, keeping their record).
+    /// An `unattended` writer
     /// ([`Engine::is_unattended`]) changes no `freshness` and no `follows`,
     /// whatever its right: sending one as stored is no change.
     async fn settle_page_keys(
@@ -2862,6 +2908,27 @@ impl Engine {
                 .as_str()
                 .is_some_and(|s| crystalline_core::is_retired_status(&s.trim().to_lowercase()))
         };
+        // Retire and restore move a page across the retired words: they
+        // keep the record (who retired it, the page it was owned by) the
+        // page view and a restore read. A whole-page write never does, for
+        // any writer; a key left out keeps it, and a curator's cleared
+        // status brings the page back as much as a live word would.
+        let before_retired = stored.get(r::STATUS_KEY).is_some_and(retired);
+        let after_retired = match sent.get(r::STATUS_KEY) {
+            None => before_retired,
+            Some(value) if value.is_null() => before_retired && !curator,
+            Some(value) => retired(value),
+        };
+        if before_retired != after_retired {
+            return Err(retired_status_refusal(
+                &p.domain,
+                &p.path,
+                sent.get(r::STATUS_KEY),
+                before_retired,
+                current.is_none(),
+                access.right,
+            ));
+        }
         let mut carried: Vec<&str> = Vec::new();
         let mut cleared: Vec<&str> = Vec::new();
         for key in r::PAGE_KEYS {

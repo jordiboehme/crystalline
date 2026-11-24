@@ -97,19 +97,20 @@ impl Engine {
         };
         findings.extend(chain.findings.iter().cloned());
         let own_pact = r::page_pact_path(inner);
-        // Retired by the record a retire writes, or only by a retired word
-        // in the status (a page from before retire, or one written by
-        // hand): then there is no time, author or owner to name.
+        // Retired only while the status is a retired word, as the engine
+        // treats the page. The record a retire writes names when, by whom
+        // and the page it was owned by; a page retired only by its status (a
+        // page from before retire, or one written by hand) has none of it,
+        // and a record left under a live status (changed by hand) is no
+        // retirement.
         let retired = match &record.retired {
+            _ if !settings.retired() => None,
             Some(retired) => Some(json!({
                 "at": retired.at,
                 "by": retired.by,
                 "was_owned_by": retired.was_owned_by.as_deref().map(|was| page_ref(was, &titles)),
             })),
-            None if settings.retired() => {
-                Some(json!({ "at": null, "by": null, "was_owned_by": null }))
-            }
-            None => None,
+            None => Some(json!({ "at": null, "by": null, "was_owned_by": null })),
         };
         Ok(json!({
             "freshness": settings.freshness.as_ref().map(|f| f.written.clone()),
