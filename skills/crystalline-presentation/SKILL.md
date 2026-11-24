@@ -17,7 +17,7 @@ A reflection is read by people. Present it the way a good technical writer would
 
 Before you write a page, read the domain's `PACT.md` with `read_reflection`. Its `## Presentation` section says which diagrams, callouts and tables help these readers and what to avoid. It narrows or extends the defaults in this skill, and where the two differ, the PACT wins. A PACT that says "no diagrams" means no diagrams, even where this skill requires one, and a PACT that asks for plain text and tables only means no callouts and no diagrams, not even a caution before an irreversible step: say the warning in a sentence.
 
-When the PACT has no `## Presentation` section, use the defaults below. If you see a pattern the readers would want written down, propose it: write it into `PACT.md` when you may curate, otherwise open a thread with `discuss`.
+When the PACT has no `## Presentation` section, use the defaults below. If you see a pattern the readers would want written down, propose it: write it into `PACT.md` when you may curate and a person is in the session, otherwise open a thread with `discuss`.
 
 When you rewrite a whole page, pass the `checksum` from `read_reflection` as `expected_checksum`, so a change a person made since your read is refused instead of overwritten.
 

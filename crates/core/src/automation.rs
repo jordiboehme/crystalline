@@ -769,6 +769,49 @@ mod tests {
     }
 
     #[test]
+    fn the_reflect_prompt_leaves_pact_text_and_page_settings_to_a_curator() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let rule = prompt
+            .lines()
+            .find(|line| line.starts_with("- ") && line.contains("pact text"))
+            .expect("a rule on pact text");
+        for needle in [
+            "`PACT.md`",
+            "page pact",
+            "`freshness`",
+            "`follows`",
+            "move a page",
+            "curator",
+            "thread",
+        ] {
+            assert!(rule.contains(needle), "the rule lacks {needle}: {rule}");
+        }
+        let feedback = prompt
+            .lines()
+            .find(|line| line.starts_with("2. Feedback"))
+            .expect("the feedback step");
+        assert!(
+            feedback.contains("pact file") && feedback.contains("never write pact text"),
+            "{feedback}"
+        );
+        let updates = prompt
+            .lines()
+            .find(|line| line.starts_with("3. Updates"))
+            .expect("the update step");
+        assert!(updates.contains("own page pact"), "{updates}");
+        let threads = prompt
+            .lines()
+            .find(|line| line.starts_with("6. Threads"))
+            .expect("the thread step");
+        assert!(
+            threads.contains("pact") && threads.contains("curator"),
+            "{threads}"
+        );
+        // Nothing asks a run to add to a pact.
+        assert!(!prompt.contains("add a bullet"), "{prompt}");
+    }
+
+    #[test]
     fn a_reflect_run_refused_an_engram_write_answers_the_feedback_another_way() {
         let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
         let line = prompt

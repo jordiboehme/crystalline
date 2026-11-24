@@ -9628,12 +9628,19 @@ async fn the_reflection_tools_teach_pages_that_keep_themselves_current() {
         "older period",
         "freshness",
         "follows",
+        "does not write pact text",
+        "does not change a page's freshness or follows",
+        "answers in the thread",
     ] {
         assert!(
             write.contains(needle),
             "write_reflection lacks {needle}: {write}"
         );
     }
+    assert!(
+        reflect.contains("writes no pact text") && reflect.contains("a curator makes the change"),
+        "reflect lacks the unattended run's pact rule: {reflect}"
+    );
     let write_schema = schema("write_reflection");
     for needle in ["retire", "restore", "reconciled", "owner", "version"] {
         assert!(

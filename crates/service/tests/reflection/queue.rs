@@ -2239,3 +2239,31 @@ async fn the_queue_guidance_teaches_the_reconcile_of_a_stale_page() {
         );
     }
 }
+
+/// The guidance tells an unattended run to leave pact text and a page's
+/// freshness and follows to a curator, and keeps the pact's `## Pages` for a
+/// session with a person.
+#[tokio::test]
+async fn the_queue_guidance_leaves_pact_text_and_settings_to_a_curator_in_a_run() {
+    let fx = curated_with_a_feedback_item().await;
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let guidance = queue["guidance"].as_str().unwrap();
+    for needle in [
+        "An unattended run",
+        "writes no pact text",
+        "own page pact",
+        "freshness or follows",
+        "answer in the thread",
+        "curator",
+        "page or space in a session with them",
+    ] {
+        assert!(
+            guidance.contains(needle),
+            "guidance lacks {needle}: {guidance}"
+        );
+    }
+}
