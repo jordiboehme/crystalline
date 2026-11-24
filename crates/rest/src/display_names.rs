@@ -188,6 +188,13 @@ fn annotate_actors(v: &mut Value, displays: &Displays) {
     }
 }
 
+/// The account a change's actor names: the login inside an OKF person
+/// actor (`human:<login>`), else the label as it is (an account's own name
+/// on a change announced by scope).
+pub(crate) fn actor_account(actor: &str) -> &str {
+    human_login(actor).unwrap_or(actor)
+}
+
 /// The login inside an OKF actor that names a person (`human:<login>`).
 fn human_login(actor: &str) -> Option<&str> {
     let (kind, login) = actor.split_once(':')?;
@@ -203,6 +210,7 @@ pub(crate) async fn enrich_engram(auth: &AuthStore, read: &mut Value) {
         return;
     };
     let fm = obj.get("frontmatter");
+    let extra = fm.and_then(|f| f.get("extra"));
     let mut actors: Vec<String> = Vec::new();
     if let Some(by) = fm
         .and_then(|f| f.get("generated"))
@@ -211,10 +219,12 @@ pub(crate) async fn enrich_engram(auth: &AuthStore, read: &mut Value) {
     {
         actors.push(by.to_string());
     }
-    for v in fm
-        .and_then(|f| f.get("verified"))
-        .and_then(Value::as_array)
+    // The trail is a typed field, or under `extra` when its entries are not
+    // in the typed shape (a bare date, say): a reader shows either.
+    for v in [fm, extra]
         .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("verified").and_then(Value::as_array))
         .flatten()
     {
         if let Some(by) = v.get("by").and_then(Value::as_str) {
@@ -222,16 +232,15 @@ pub(crate) async fn enrich_engram(auth: &AuthStore, read: &mut Value) {
         }
     }
     actors.retain(|a| human_login(a).is_some());
+    actors.sort();
+    actors.dedup();
     let owner = obj.get("draft_owner").and_then(Value::as_str);
     if actors.is_empty() && owner.is_none() {
         return;
     }
     let displays = lookup(
         auth,
-        actors
-            .iter()
-            .filter_map(|a| human_login(a))
-            .chain(owner),
+        actors.iter().filter_map(|a| human_login(a)).chain(owner),
     )
     .await;
     set_beside(obj, "draft_owner", &displays);
@@ -307,8 +316,10 @@ fn set_person(v: &mut Value, displays: &Displays) {
 fn annotate(v: &mut Value, displays: &Displays) {
     match v {
         Value::Object(obj) => {
-            let changed_by: Option<Map<String, Value>> =
-                obj.get("changed_by").and_then(Value::as_array).map(|logins| {
+            let changed_by: Option<Map<String, Value>> = obj
+                .get("changed_by")
+                .and_then(Value::as_array)
+                .map(|logins| {
                     logins
                         .iter()
                         .filter_map(Value::as_str)
@@ -382,7 +393,10 @@ mod tests {
         assert!(entries[1]["author"].get("display").is_none());
         assert!(entries[2]["author"].get("display").is_none());
         assert_eq!(v["people"][0]["display"], "Ada Lovelace");
-        assert_eq!(v["queue"][0]["changed_by_display"], json!({ "ada": "Ada Lovelace" }));
+        assert_eq!(
+            v["queue"][0]["changed_by_display"],
+            json!({ "ada": "Ada Lovelace" })
+        );
         assert!(v["queue"][1].get("changed_by_display").is_none());
         assert_eq!(v["sections"][0]["disclosed"]["by_display"], "Ada Lovelace");
     }

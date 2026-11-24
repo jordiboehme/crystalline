@@ -98,6 +98,24 @@ describe("DetailsPanel", () => {
     expect(screen.getByText("jordi (human)")).toBeInTheDocument();
   });
 
+  test("a person is named by their display name, the login in the tooltip", () => {
+    draw({
+      generatedBy: "human:jordi",
+      verified: [
+        { by: "human:ada", model: null, at: "2026-02-01T10:00:00+01:00" },
+      ],
+      actorDisplay: { "human:jordi": "Jordi Böhme", "human:ada": "Ada King" },
+    });
+    expect(screen.getByText("Jordi Böhme (human)")).toHaveAttribute(
+      "title",
+      "jordi",
+    );
+    expect(screen.getByText("Ada King (human) on 2026-02-01")).toHaveAttribute(
+      "title",
+      "ada",
+    );
+  });
+
   test("shows the model beside the writer", () => {
     draw({
       generatedBy: "claude-code/2.1.271",

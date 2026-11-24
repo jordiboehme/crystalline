@@ -42,6 +42,7 @@ import { refreshAfterWrite } from "../query/refreshAfterWrite";
 import { usePageTitle } from "../usePageTitle";
 import type { Notice } from "./accounts";
 import { Labelled, NoticeLine, PageHeader, ShownOnce } from "./AdminParts";
+import { PersonName } from "../components/PersonName";
 
 /** The roles a link may give an account it makes: every one below admin. */
 const ROLES: readonly { value: Role; label: string }[] = [
@@ -466,14 +467,25 @@ function InviteList({
                       <span className={`block ${HINT}`}>Local account</span>
                     )}
                   </td>
-                  <td className="py-2 pr-3 break-all">{invite.created_by}</td>
+                  <td className="py-2 pr-3 break-all">
+                    <PersonName
+                      login={invite.created_by}
+                      display={invite.created_by_display}
+                      withLogin
+                    />
+                  </td>
                   <td className="py-2 pr-3">
                     {invite.state === "used" ? (
                       <>
                         {invite.used_at ? formatInstant(invite.used_at) : ""}
                         {invite.used_by && (
                           <span className="block break-all">
-                            by {invite.used_by}
+                            by{" "}
+                            <PersonName
+                              login={invite.used_by}
+                              display={invite.used_by_display}
+                              withLogin
+                            />
                           </span>
                         )}
                       </>

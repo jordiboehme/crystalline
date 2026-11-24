@@ -47,14 +47,19 @@ fn author_of(thread: &Value, n: usize) -> &Value {
 #[tokio::test]
 async fn thread_answers_name_people_by_their_display_name() {
     let s = serve().await;
-    s.auth.set_display("vera", Some("Vera Viewer")).await.unwrap();
+    s.auth
+        .set_display("vera", Some("Vera Viewer"))
+        .await
+        .unwrap();
     let vera = Session::login(s.addr, "vera").await;
     let (status, opened) = vera
         .send(
             reqwest::Method::POST,
             "/api/v1/domains/eng/reflection/threads",
-            Some(json!({ "path": "guides/deploying.md", "section": "Night deploys",
-                         "quote": "at night", "text": "Still?" })),
+            Some(
+                json!({ "path": "guides/deploying.md", "section": "Night deploys",
+                         "quote": "at night", "text": "Still?" }),
+            ),
         )
         .await;
     assert_eq!(status, 201, "{opened}");
@@ -73,7 +78,10 @@ async fn thread_answers_name_people_by_their_display_name() {
         .await;
     assert_eq!(status, 200, "{answered}");
     assert_eq!(author_of(&answered, 1)["name"], "ann", "{answered}");
-    assert!(author_of(&answered, 1).get("display").is_none(), "{answered}");
+    assert!(
+        author_of(&answered, 1).get("display").is_none(),
+        "{answered}"
+    );
     assert_eq!(author_of(&answered, 0)["display"], "Vera Viewer");
 
     let (_, listed) = vera.get("/api/v1/domains/eng/reflection/threads").await;

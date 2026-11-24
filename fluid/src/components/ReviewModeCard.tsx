@@ -36,10 +36,21 @@ import { enableReview, fetchReviewPlan, leaveReview } from "../api/review";
 import { useAuth } from "../auth/AuthContext";
 import { BUTTON } from "./primitives";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { displayFrom, personLabel } from "../people";
 
 /** Why a control is disabled on an instance that serves reads only. */
 const READ_ONLY_REASON =
   "This instance is read only, so nothing here can be changed.";
+
+/** People by their display names, joined with "and". */
+function namesOf(
+  logins: string[],
+  displays: Record<string, string> | undefined,
+): string {
+  return logins
+    .map((login) => personLabel(login, displayFrom(displays, login)))
+    .join(" and ");
+}
 
 /** The answer each actor starts at: fold, because ending somebody's unshared work is the choice that should be deliberate. */
 const DEFAULT_CHOICE: FoldChoice = "fold";
@@ -164,13 +175,18 @@ export function ReviewModeCard({
                   {plan.actors.map((row) => (
                     <li key={row.actor}>
                       <fieldset>
-                        <legend className="text-sm font-medium">
-                          {row.actor} ({countOf(row)})
+                        <legend
+                          className="text-sm font-medium"
+                          title={row.actor}
+                        >
+                          {`${personLabel(row.actor, row.actor_display)} (${countOf(row)})`}
                         </legend>
                         {row.files_unreadable === true && (
                           <p className="text-sm text-red-700 dark:text-red-300">
-                            The files {row.actor} has drafted could not be read,
-                            so review mode cannot be taken off until they can.
+                            The files{" "}
+                            {personLabel(row.actor, row.actor_display)} has
+                            drafted could not be read, so review mode cannot be
+                            taken off until they can.
                           </p>
                         )}
                         {/* The server's own sentence, said before anybody
@@ -234,8 +250,8 @@ export function ReviewModeCard({
                     className="mt-2 text-sm text-red-700 dark:text-red-300"
                   >
                     {contested.path} is drafted by{" "}
-                    {contested.actors.join(" and ")}, so at most one of them can
-                    be written into the folder.
+                    {namesOf(contested.actors, contested.actors_display)}, so at
+                    most one of them can be written into the folder.
                   </p>
                 ))}
                 {/*
@@ -251,9 +267,9 @@ export function ReviewModeCard({
                   >
                     {contested.paths.join(" and ")} answer to the address{" "}
                     {contested.permalink}, drafted by{" "}
-                    {contested.actors.join(" and ")}, so at most one of them can
-                    be written into the folder: one engram answers to one
-                    address.
+                    {namesOf(contested.actors, contested.actors_display)}, so at
+                    most one of them can be written into the folder: one engram
+                    answers to one address.
                   </p>
                 ))}
               </>

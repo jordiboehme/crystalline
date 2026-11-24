@@ -506,13 +506,7 @@ async fn members_of(
         // reader: on a public repository every signed-in account reads the
         // domain, and the collaborator list is not public on GitHub.
         let github_people = if right >= DomainRight::Write {
-            Some(
-                state
-                    .engine
-                    .github_people(domain)
-                    .await
-                    .unwrap_or_default(),
-            )
+            Some(state.engine.github_people(domain).await.unwrap_or_default())
         } else {
             None
         };

@@ -37,6 +37,21 @@ export function asStrings(value: unknown): string[] {
   );
 }
 
+/**
+ * The string values of an object, keyed as they came, dropping everything
+ * else: an empty object when the value is not one.
+ */
+export function asStringMap(value: unknown): Record<string, string> {
+  const record = asObject(value);
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(record ?? {})) {
+    if (typeof item === "string" && item !== "") {
+      out[key] = item;
+    }
+  }
+  return out;
+}
+
 /** The finite numbers in an array, dropping everything else. */
 export function asNumbers(value: unknown): number[] {
   return asArray(value).filter(

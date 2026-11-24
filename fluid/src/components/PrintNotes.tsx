@@ -8,6 +8,7 @@ import type { ReactElement } from "react";
 
 import { formatDayLong } from "../format";
 import type { PrintNote } from "../printNotes";
+import { PersonName } from "./PersonName";
 
 /** What a thread entry says, as the thread card words it. */
 function entryText(entry: PrintNote["thread"]["entries"][number]): string {
@@ -85,7 +86,10 @@ export function PrintNotes({
                   <div key={`${entry.at}-${String(index)}`}>
                     <p className="text-caption">
                       <span className="font-semibold text-ink">
-                        {entry.author.name}
+                        <PersonName
+                          login={entry.author.name}
+                          display={entry.author.display}
+                        />
                         {entry.author.agent ? " (agent)" : ""}
                       </span>
                       <span className="text-muted">{` · ${formatDayLong(entry.at)}`}</span>

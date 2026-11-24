@@ -25,6 +25,7 @@ import {
   leaveDraft,
   rememberJoin,
 } from "../api/draftLinks";
+import { personLabel } from "../people";
 
 export function JoinedDraftBar(): ReactElement | null {
   const [join, setJoin] = useState<HeldJoin | null>(() => heldJoin());
@@ -60,8 +61,8 @@ export function JoinedDraftBar(): ReactElement | null {
       role="status"
       className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
     >
-      <p>
-        You are working in {join.owner}&apos;s draft of {join.path}
+      <p title={join.owner}>
+        {`You are working in ${personLabel(join.owner, join.ownerDisplay)}'s draft of ${join.path}`}
       </p>
       <button
         type="button"

@@ -120,7 +120,7 @@ import { domainSpellings } from "../domainNames";
 import type { RecentChange } from "../events/recent";
 import { useRecentChange } from "../events/recent";
 import { useHoldPlace, useScrollKeeper } from "../events/useScrollKeeper";
-import { formatActor, plural } from "../format";
+import { actorLogin, formatActor, plural } from "../format";
 import { useFullWidth } from "../layoutWidth";
 import { useWide } from "../useWide";
 import {
@@ -136,6 +136,7 @@ import { tickAt } from "../taskTick";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { personLabel } from "../people";
 
 /** Where the neighborhood section writes down whether it was left open. */
 const GRAPH_SECTION_KEY = "fluid.section.graph";
@@ -845,9 +846,10 @@ export default function EngramPage() {
           role="status"
           aria-label="Draft"
           className="rounded bg-amber-100 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"
+          title={engram.draftOwner ?? undefined}
         >
           {engram.draftOwner
-            ? `${engram.draftOwner}'s draft, shared with you. The shared tree does not hold this text and it has not been reviewed.`
+            ? `${personLabel(engram.draftOwner, engram.draftOwnerDisplay)}'s draft, shared with you. The shared tree does not hold this text and it has not been reviewed.`
             : "Your private draft. The shared tree has not moved; share it for review when it is ready."}
         </p>
       )}
@@ -1273,6 +1275,11 @@ function RecentChangeLine({ change }: { change: RecentChange | null }) {
       role="status"
       aria-label="Recent change"
       aria-live="polite"
+      title={
+        text === "" || !change?.actor
+          ? undefined
+          : (actorLogin(change.actor) ?? change.actor)
+      }
       className="rounded bg-slate-100 px-3 py-2 text-sm text-slate-700 empty:sr-only print:hidden dark:bg-slate-800 dark:text-slate-200"
     >
       {text}
@@ -1295,7 +1302,9 @@ function recentChangeText(change: RecentChange): string {
     change.kind === "moved_here"
       ? "Moved here a moment ago"
       : "Updated a moment ago";
-  return change.actor ? `${verb} by ${formatActor(change.actor)}` : verb;
+  return change.actor
+    ? `${verb} by ${formatActor(change.actor, change.actorDisplay)}`
+    : verb;
 }
 
 /** Whether this failure is the server saying there is nothing at that address. */

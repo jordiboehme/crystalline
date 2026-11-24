@@ -37,6 +37,7 @@ import { UpdateNoteFailed } from "./UpdateNoteShell";
 import { ITEM_CLASSES } from "./menu";
 import { Loading } from "./Loading";
 import { FOCUS_RING, Tooltip } from "./primitives";
+import { personLabelWithLogin } from "../people";
 
 const UpdateNote = lazyChunk(() => import("./UpdateNote"));
 
@@ -87,7 +88,9 @@ export function AvatarMenu({
   return (
     <>
       <DropdownMenu.Root>
-        <Tooltip label={label}>
+        <Tooltip
+          label={user ? personLabelWithLogin(user.name, user.display) : label}
+        >
           <DropdownMenu.Trigger
             ref={triggerRef}
             aria-label={label}

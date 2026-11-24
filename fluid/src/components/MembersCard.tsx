@@ -88,6 +88,7 @@ import {
   reflectionWords,
 } from "./reflectionLevels";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { PersonName } from "./PersonName";
 
 /**
  * Every knowledge level a member can be invited at, or moved to, least to
@@ -316,6 +317,7 @@ export function MembersCard({ domain }: { domain: string }) {
           <OwnerRow
             domain={domain}
             owner={owner}
+            ownerDisplay={data.owner_display ?? null}
             standing={standing}
             pending={transfer.isPending}
             disabledReason={disabledReason}
@@ -390,6 +392,7 @@ export function MembersCard({ domain }: { domain: string }) {
 function OwnerRow({
   domain,
   owner,
+  ownerDisplay,
   standing,
   pending,
   disabledReason,
@@ -397,6 +400,7 @@ function OwnerRow({
 }: {
   domain: string;
   owner: string | null;
+  ownerDisplay: string | null;
   standing: MyStanding;
   pending: boolean;
   disabledReason?: string | undefined;
@@ -410,7 +414,7 @@ function OwnerRow({
           No owner - removed from the account roster.
         </span>
       ) : (
-        <span>{owner}</span>
+        <PersonName login={owner} display={ownerDisplay} withLogin />
       )}
       {/*
         No `owner !== null` clause: `set_owner` needs only `DomainRight::Own`
@@ -599,7 +603,11 @@ function MemberRow({
   return (
     <tr className="align-top">
       <th scope="row" className="px-2 py-2 font-normal">
-        {member.principal}
+        <PersonName
+          login={member.principal}
+          display={member.principal_display}
+          withLogin
+        />
         {isSelf && (
           <span className="text-caption text-slate-500 dark:text-slate-400">
             {" (you)"}

@@ -935,7 +935,10 @@ mod tests {
                 revoked_at: None,
                 state: auth_store::InviteState::Pending,
             }]),
-            but(but(published::<super::Invite>(), "created_by_display"), "used_by_display")
+            but(
+                but(published::<super::Invite>(), "created_by_display"),
+                "used_by_display"
+            )
         );
         assert_eq!(
             keys([

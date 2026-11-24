@@ -32,6 +32,8 @@ import { useSearchParams } from "react-router";
 import { ApiProblem, navigateTo, problemDetail } from "../api/client";
 import { decideAuthorization, fetchAuthorization } from "../api/oauth";
 import { BUTTON } from "../components/primitives";
+import { useAuth } from "../auth/AuthContext";
+import { PersonName } from "../components/PersonName";
 
 const MUTED = "text-sm text-slate-500 dark:text-slate-400";
 
@@ -46,6 +48,7 @@ function isGone(error: Error): boolean {
 export default function OauthConsent() {
   const [searchParams] = useSearchParams();
   const requestId = searchParams.get("request");
+  const { user } = useAuth();
 
   const authorization = useQuery({
     queryKey: ["oauth-authorization", requestId],
@@ -107,7 +110,14 @@ export default function OauthConsent() {
       <div className="flex flex-col gap-1 text-sm">
         <p>
           <span className="font-medium">{view.client_name}</span> wants to sign
-          in as <span className="font-medium">{view.account}</span>.
+          in as{" "}
+          <PersonName
+            className="font-medium"
+            login={view.account}
+            display={user?.name === view.account ? user.display : null}
+            withLogin
+          />
+          .
         </p>
         <p className={MUTED}>
           It will be sent to{" "}

@@ -110,6 +110,7 @@ import { formatDay } from "../format";
 import NotFound from "./NotFound";
 import { grantEndedText } from "./grantEnded";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { personLabel } from "../people";
 
 /** How often the identity is asked again while a device flow is running. */
 const POLL_MS = 3000;
@@ -760,7 +761,14 @@ function SsoIdentityCard({ user }: { user: User }) {
                 <p className="truncate text-sm text-slate-900 dark:text-slate-100">
                   {link.issuer}
                 </p>
-                <p className={MUTED}>
+                <p
+                  className={MUTED}
+                  title={
+                    linkedByAccount(link, user.name)
+                      ? link.linked_by
+                      : undefined
+                  }
+                >
                   {linkedByLine(link, user.name)} on {formatDay(link.linked_at)}
                 </p>
               </div>
@@ -827,7 +835,16 @@ function linkedByLine(link: IdentityLink, self: string): string {
   if (link.linked_by === self) {
     return "Linked from this profile";
   }
-  return `Linked by ${link.linked_by}`;
+  return `Linked by ${personLabel(link.linked_by, link.linked_by_display)}`;
+}
+
+/** Whether `linkedByLine` names another account, whose login the tooltip shows. */
+function linkedByAccount(link: IdentityLink, self: string): boolean {
+  return (
+    link.linked_by !== "jit" &&
+    link.linked_by !== "cli" &&
+    link.linked_by !== self
+  );
 }
 
 /** The card proper, for a session that may have an identity of its own. */

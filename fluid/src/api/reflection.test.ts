@@ -177,6 +177,45 @@ describe("readers", () => {
     expect(doc.livePresent).toEqual([]);
   });
 
+  it("reads a person's display name beside the login, and none for an agent", () => {
+    const thread = readThread({
+      ...THREAD,
+      entries: [
+        {
+          at: "2026-09-30T10:00:00Z",
+          kind: "comment",
+          author: { name: "jordi", agent: false, display: "Jordi Böhme" },
+          text: "Still true?",
+        },
+        {
+          at: "2026-09-30T11:00:00Z",
+          kind: "comment",
+          author: { name: "claude", agent: true },
+          text: "Yes.",
+        },
+      ],
+    });
+    expect(thread?.entries[0]?.author).toEqual({
+      name: "jordi",
+      agent: false,
+      display: "Jordi Böhme",
+    });
+    expect(thread?.entries[1]?.author.display).toBeUndefined();
+    const queue = readQueue({
+      queue: [
+        {
+          n: 1,
+          kind: "feedback",
+          what: "changed",
+          path: "a.md",
+          changed_by: ["ann", "bob"],
+          changed_by_display: { ann: "Ann Lee" },
+        },
+      ],
+    });
+    expect(queue.items[0]?.changedByDisplay).toEqual({ ann: "Ann Lee" });
+  });
+
   it("reads an unknown anchor state as text_changed, which never paints", () => {
     expect(
       readThread({ ...THREAD, anchor: { ...THREAD.anchor, state: "odd" } })

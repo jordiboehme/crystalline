@@ -25,6 +25,7 @@ import { formatDay } from "../format";
 import { DestructiveAction } from "./DestructiveAction";
 import { BUTTON, FIELD, Field } from "./primitives";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { PersonName } from "./PersonName";
 
 type GrantLevel = "reader" | "contributor";
 
@@ -165,7 +166,11 @@ function GrantRow({
   return (
     <tr className="align-top">
       <th scope="row" className="px-2 py-2 font-normal">
-        {row.account}
+        <PersonName
+          login={row.account}
+          display={row.account_display}
+          withLogin
+        />
       </th>
       <td className="px-2 py-2">
         <label htmlFor={selectId} className="sr-only">

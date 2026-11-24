@@ -23,7 +23,7 @@ import { Copy } from "lucide-react";
 import { Link } from "react-router";
 
 import type { EngramFrontmatter, VerifiedEntry } from "../api/engram";
-import { formatActor, formatDay, formatDayLong } from "../format";
+import { actorLogin, formatActor, formatDay, formatDayLong } from "../format";
 import { tagRoute } from "../paths";
 import { AttachmentsSection } from "./AttachmentsSection";
 import { Chip, FOCUS_RING, IconButton, RAIL_LABEL } from "./primitives";
@@ -53,10 +53,18 @@ export function DetailsPanel({
   body,
   canDelete = false,
 }: DetailsPanelProps) {
-  const { tags, recordedAt, salience, verified, generatedBy, generatedModel } =
-    frontmatter;
+  const {
+    tags,
+    recordedAt,
+    salience,
+    verified,
+    generatedBy,
+    generatedModel,
+    actorDisplay,
+  } = frontmatter;
   const validity = validityOf(frontmatter);
-  const stamp = latestVerification(verified);
+  const stamp = latestVerification(verified, actorDisplay);
+  const verifier = verified[verified.length - 1]?.by;
 
   return (
     <>
@@ -97,12 +105,17 @@ export function DetailsPanel({
           )}
           {generatedBy !== null && (
             <Row label="Captured by">
-              <span>{withModel(formatActor(generatedBy), generatedModel)}</span>
+              <span title={actorLogin(generatedBy)}>
+                {withModel(
+                  formatActor(generatedBy, actorDisplay?.[generatedBy]),
+                  generatedModel,
+                )}
+              </span>
             </Row>
           )}
           {stamp !== null && (
             <Row label="Verified">
-              <span>{stamp}</span>
+              <span title={actorLogin(verifier)}>{stamp}</span>
             </Row>
           )}
           <Row label="Address">
@@ -225,7 +238,10 @@ function validityOf(frontmatter: EngramFrontmatter): string | null {
  * engram. A legacy `last_verified` records no actor, so that stamp is a date
  * alone rather than a date attributed to nobody.
  */
-function latestVerification(entries: VerifiedEntry[]): string | null {
+function latestVerification(
+  entries: VerifiedEntry[],
+  displays?: Record<string, string>,
+): string | null {
   const latest = entries[entries.length - 1];
   if (!latest) {
     return null;
@@ -234,7 +250,10 @@ function latestVerification(entries: VerifiedEntry[]): string | null {
   if (latest.by === null) {
     return day;
   }
-  const who = withModel(formatActor(latest.by), latest.model);
+  const who = withModel(
+    formatActor(latest.by, displays?.[latest.by]),
+    latest.model,
+  );
   return day === null ? who : `${who} on ${day}`;
 }
 

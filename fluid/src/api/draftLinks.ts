@@ -43,6 +43,8 @@ export interface HeldJoin {
   domain: string;
   path: string;
   owner: string;
+  /** The owner's display name, when the account has one. */
+  ownerDisplay?: string | null;
   /** The address the draft answers to, which is what a save is addressed by. */
   permalink: string;
 }

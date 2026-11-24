@@ -118,6 +118,15 @@ describe("the kept texts api module", () => {
     expect(keptKindLabel("comment")).toBe("Comment");
     expect(keptKindLabel("something new")).toBe("Kept text");
     expect(keptFrom(entry({ sender: "ben" }))).toBe("From ben");
+    expect(
+      keptFrom(
+        entry({
+          sender: "ben",
+          sender_account: "ben",
+          sender_display: "Ben Ross",
+        }),
+      ),
+    ).toBe("From Ben Ross");
     expect(keptFrom(entry({ draft: true }))).toBe("From your draft");
     // A room's text records nobody, and nobody is invented for it.
     expect(keptFrom(entry())).toBeNull();

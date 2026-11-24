@@ -292,8 +292,7 @@ pub async fn list(
         sign_in: offered_sign_in(&state),
     })
     .map_err(|e| ApiError::internal(format!("writing the invite list: {e}")))?;
-    super::display_names::enrich_fields(&state.auth, &mut answer, &["created_by", "used_by"])
-        .await;
+    super::display_names::enrich_fields(&state.auth, &mut answer, &["created_by", "used_by"]).await;
     Ok(Json(answer))
 }
 

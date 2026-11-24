@@ -48,6 +48,8 @@ export interface PlannedDraft {
 /** One actor's drafts, as the plan names them. */
 export interface PlannedActor {
   actor: string;
+  /** The display name of `actor`, when it is an account with one. */
+  actor_display?: string;
   /** How many draft changes they are holding: pages plus files. */
   entries: number;
   drafts: PlannedDraft[];
@@ -79,6 +81,8 @@ export interface PlannedActor {
 export interface ContestedPath {
   path: string;
   actors: string[];
+  /** The display names of the logins in `actors` that have one. */
+  actors_display?: Record<string, string>;
 }
 
 /**
@@ -95,6 +99,8 @@ export interface ContestedAddress {
   permalink: string;
   paths: string[];
   actors: string[];
+  /** The display names of the logins in `actors` that have one. */
+  actors_display?: Record<string, string>;
 }
 
 /** What leaving review mode would end. */

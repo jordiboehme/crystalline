@@ -21,7 +21,14 @@ import {
   readAttachmentRows,
   readUploaded,
 } from "./files";
-import { asArray, asNumber, asObject, asString, asStrings } from "./json";
+import {
+  asArray,
+  asNumber,
+  asObject,
+  asString,
+  asStringMap,
+  asStrings,
+} from "./json";
 import { reflectionDocKey, reflectionKey } from "./reflectionDomains";
 import type { PageView } from "./reflectionPage";
 import { readPageView } from "./reflectionPage";
@@ -83,7 +90,11 @@ export type AnchorState = "found" | "text_changed" | "section_gone";
 export interface ThreadEntry {
   at: string;
   kind: "comment" | "resolve" | "reopen";
-  author: { name: string; agent: boolean };
+  /**
+   * `name` is the login (or the agent's label); `display` the account's
+   * display name, null when it has none other than its login.
+   */
+  author: { name: string; agent: boolean; display?: string | null };
   text: string;
 }
 export interface ThreadView {
@@ -128,6 +139,8 @@ export interface QueueItem {
   heading: string | null;
   ageSecs: number;
   changedBy: string[];
+  /** Display names of the logins in `changedBy` that have one. */
+  changedByDisplay?: Record<string, string>;
   /** Id lines are left in by the engine; strip them before showing. */
   diff: string | null;
   sources: SourceView[] | null;
@@ -310,6 +323,17 @@ export function readTree(payload: unknown): ReflectionTree {
   };
 }
 
+/**
+ * `{ [key]: display }` when the server sent a display name, else nothing, so a
+ * name with none reads exactly as it did before display names were sent.
+ */
+function optionalDisplay<K extends string>(
+  key: K,
+  display: string | null,
+): Partial<Record<K, string>> {
+  return display === null ? {} : ({ [key]: display } as Record<K, string>);
+}
+
 function readEntry(value: unknown): ThreadEntry | null {
   const record = asObject(value);
   const at = asString(record?.at);
@@ -327,6 +351,7 @@ function readEntry(value: unknown): ThreadEntry | null {
     author: {
       name: asString(author?.name) ?? "someone",
       agent: author?.agent === true,
+      ...optionalDisplay("display", asString(author?.display)),
     },
     text: typeof record?.text === "string" ? record.text : "",
   };
@@ -434,6 +459,7 @@ function readItem(value: unknown): QueueItem | null {
     heading: asString(r?.heading),
     ageSecs: asNumber(r?.age_secs) ?? 0,
     changedBy: asStrings(r?.changed_by),
+    changedByDisplay: asStringMap(r?.changed_by_display),
     diff: asString(r?.diff),
     sources: readSources(r?.sources),
     hiddenSources: asNumber(r?.hidden_sources) ?? 0,
@@ -642,6 +668,8 @@ export async function moveReflection(
 /** Who shared a section's text on purpose, and when. */
 export interface Disclosed {
   by: string;
+  /** The display name of `by`, null when it has none other than its login. */
+  byDisplay?: string | null;
   at: string;
 }
 
@@ -649,7 +677,9 @@ function readDisclosed(value: unknown): Disclosed | null {
   const r = asObject(value);
   const by = asString(r?.by);
   const at = asString(r?.at);
-  return by === null || at === null ? null : { by, at };
+  return by === null || at === null
+    ? null
+    : { by, ...optionalDisplay("byDisplay", asString(r?.by_display)), at };
 }
 
 /**
@@ -940,6 +970,8 @@ export function openThreadCount(tree: ReflectionTree): number {
 export interface HomeThreadPerson {
   name: string;
   agent: boolean;
+  /** The account's display name, null when it has none other than its login. */
+  display?: string | null;
 }
 
 /** One open thread, as the Reflection home draws it: no entries. */
@@ -982,7 +1014,15 @@ function readHomeThread(value: unknown): HomeThread | null {
     people: asArray(t?.people).flatMap((p) => {
       const person = asObject(p);
       const name = asString(person?.name);
-      return name === null ? [] : [{ name, agent: person?.agent === true }];
+      return name === null
+        ? []
+        : [
+            {
+              name,
+              agent: person?.agent === true,
+              ...optionalDisplay("display", asString(person?.display)),
+            },
+          ];
     }),
   };
 }

@@ -13,6 +13,8 @@ export interface RecentChange {
   /** `moved_away` is what the page at the OLD address sees, with `to` set. */
   kind: "updated" | "moved_here" | "moved_away";
   actor: string | null;
+  /** The display name of `actor`, when it is an account with one. */
+  actorDisplay?: string | null;
   /** `Date.now()` when the frame arrived. */
   at: number;
   to: string | null;
@@ -44,12 +46,14 @@ export class RecentChanges {
       this.entries.set(key(change.domain, change.permalink), {
         kind: "moved_here",
         actor: change.actor,
+        ...(change.actorDisplay ? { actorDisplay: change.actorDisplay } : {}),
         at,
         to: null,
       });
       this.entries.set(key(change.domain, change.from.permalink), {
         kind: "moved_away",
         actor: change.actor,
+        ...(change.actorDisplay ? { actorDisplay: change.actorDisplay } : {}),
         at,
         to: change.permalink,
       });
@@ -57,6 +61,7 @@ export class RecentChanges {
       this.entries.set(key(change.domain, change.permalink), {
         kind: "updated",
         actor: change.actor,
+        ...(change.actorDisplay ? { actorDisplay: change.actorDisplay } : {}),
         at,
         to: null,
       });

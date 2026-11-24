@@ -108,6 +108,8 @@ import {
   RAIL_LABEL,
 } from "./primitives";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { personLabel } from "../people";
+import { PersonName } from "./PersonName";
 
 const ALERT = "text-red-800 dark:text-red-200";
 
@@ -455,15 +457,22 @@ function avatarColor(name: string): string {
   return AVATAR_COLORS[hash % AVATAR_COLORS.length] ?? AVATAR_COLORS[0];
 }
 
-/** A round initial; the name beside it is what a screen reader hears. */
+/**
+ * A round initial; the name beside it is what a screen reader hears. The
+ * initial is the display name's, the colour the login's, so a rename keeps
+ * a person's colour.
+ */
 export function Avatar({
   name,
   agent,
+  display = null,
 }: {
   name: string;
   agent: boolean;
+  display?: string | null | undefined;
 }): ReactElement {
-  const initial = (Array.from(name.trim())[0] ?? "?").toUpperCase();
+  const shown = personLabel(name, display);
+  const initial = (Array.from(shown.trim())[0] ?? "?").toUpperCase();
   return agent ? (
     <span
       aria-hidden
@@ -530,8 +539,9 @@ export function waitingWords(
     return { words: "Waiting for people", answered: false };
   }
   const you = viewer !== null && entryName(viewer) === opener.author.name;
+  const who = personLabel(opener.author.name, opener.author.display);
   return {
-    words: `Answered, waiting for ${you ? "you" : opener.author.name}`,
+    words: `Answered, waiting for ${you ? "you" : who}`,
     answered: true,
   };
 }
@@ -607,10 +617,18 @@ export function ThreadCard({
             key={`${entry.at}-${String(index)}`}
             className="grid grid-cols-[22px_minmax(0,1fr)] gap-x-2.5 gap-y-0.5"
           >
-            <Avatar name={entry.author.name} agent={entry.author.agent} />
+            <Avatar
+              name={entry.author.name}
+              agent={entry.author.agent}
+              display={entry.author.display}
+            />
             <p className="flex flex-wrap items-baseline gap-x-2 text-[13px]">
-              <span className="font-semibold text-ink">
-                {entry.author.name}
+              <span className="text-ink">
+                <PersonName
+                  className="font-semibold"
+                  login={entry.author.name}
+                  display={entry.author.display}
+                />
                 {entry.author.agent && (
                   <span className="font-normal text-muted"> (agent)</span>
                 )}

@@ -113,6 +113,7 @@ import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver } from "../wikilinks";
 import NotFound from "./NotFound";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { personLabel } from "../people";
 
 /** The buffer's accessible name - shared with the state a conflict rebuilds. */
 const ARIA_LABEL = "Engram source";
@@ -1160,8 +1161,11 @@ function Surface({
                 Editing
               </span>
               {engram.draftOwner && (
-                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-caption text-amber-900 dark:bg-amber-950 dark:text-amber-100">
-                  {engram.draftOwner}&apos;s draft
+                <span
+                  className="rounded-full bg-amber-100 px-2 py-0.5 text-caption text-amber-900 dark:bg-amber-950 dark:text-amber-100"
+                  title={engram.draftOwner}
+                >
+                  {`${personLabel(engram.draftOwner, engram.draftOwnerDisplay)}'s draft`}
                 </span>
               )}
             </div>

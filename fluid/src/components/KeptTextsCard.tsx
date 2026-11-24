@@ -21,6 +21,7 @@ import {
   dropKeptText,
   keptDownloadUrl,
   keptFrom,
+  keptSenderLogin,
   keptKey,
   keptKindLabel,
   keptTextKey,
@@ -103,7 +104,10 @@ export function KeptTextsCard({
                   <span className="font-mono text-sm break-all text-ink">
                     {entry.path}
                   </span>
-                  <span className="text-caption text-ink-3">
+                  <span
+                    className="text-caption text-ink-3"
+                    title={keptSenderLogin(entry)}
+                  >
                     {[
                       keptKindLabel(entry.kind),
                       from,

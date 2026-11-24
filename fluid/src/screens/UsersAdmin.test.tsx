@@ -856,7 +856,7 @@ describe("an account's detail panel", () => {
       });
     });
     expect(
-      await screen.findByText("Saved the write list of nora."),
+      await screen.findByText("Saved the write list of Nora (nora)."),
     ).toBeInTheDocument();
     expect(
       within(panel).getByRole("textbox", { name: "Write list for nora" }),
@@ -916,7 +916,7 @@ describe("an account's detail panel", () => {
       ).toHaveLength(1);
     });
     expect(
-      await screen.findByText("Removed the write list of eddy."),
+      await screen.findByText("Removed the write list of Eddy (eddy)."),
     ).toBeInTheDocument();
   });
 
@@ -1034,7 +1034,7 @@ describe("an account's detail panel", () => {
     await waitFor(() => {
       expect(deleted).toHaveBeenCalled();
     });
-    expect(await screen.findByText("Deleted eddy.")).toBeInTheDocument();
+    expect(await screen.findByText("Deleted Eddy (eddy).")).toBeInTheDocument();
     await waitFor(() => {
       expect(
         screen.queryByRole("link", { name: "Back to users" }),
@@ -1280,7 +1280,7 @@ describe("adding accounts and ending drafts", () => {
       password: "hunter2",
       role: "viewer",
     });
-    expect(await screen.findByText("Added bob.")).toBeInTheDocument();
+    expect(await screen.findByText("Added Nora (bob).")).toBeInTheDocument();
     await waitFor(() => {
       expect(apiMock).toHaveBeenCalledWith("/users/bob");
     });

@@ -34,6 +34,7 @@ import {
   keptForPage,
   keptKey,
   keptNoticeSentence,
+  keptSenderLogin,
   keptQuery,
   keptTextKey,
 } from "../api/kept";
@@ -232,7 +233,7 @@ export function KeptTextNotice({
 
   return (
     <aside role="note" aria-label="Kept text" className={NOTICE}>
-      <span>{keptNoticeSentence(entry)}</span>
+      <span title={keptSenderLogin(entry)}>{keptNoticeSentence(entry)}</span>
       {waiting && placed.held !== true && (
         <span role="status">
           {placed.savesBefore === null

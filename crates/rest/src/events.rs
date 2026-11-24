@@ -734,7 +734,8 @@ fn audience_admits(audience: &DomainAudience, scope: &Scope) -> bool {
 }
 
 /// The event's JSON, with `actor_display` beside `actor` when the actor is
-/// an account with a display name other than its login. Resolved when the
+/// an account (its login, or `human:<login>`) with a display name other than
+/// its login. Resolved when the
 /// frame is written, so a rename shows on the next event.
 async fn data_with_actor_display(state: &RestState, change: &Change) -> serde_json::Result<String> {
     let data = change.data()?;
@@ -745,11 +746,14 @@ async fn data_with_actor_display(state: &RestState, change: &Change) -> serde_js
     let Some(actor) = obj.get("actor").and_then(serde_json::Value::as_str) else {
         return Ok(data);
     };
-    let displays = crate::display_names::lookup(&state.auth, [actor]).await;
-    if displays.is_empty() {
+    let account = crate::display_names::actor_account(actor).to_string();
+    let Some(display) = crate::display_names::one(&state.auth, &account).await else {
         return Ok(data);
-    }
-    crate::display_names::set_beside(obj, "actor", &displays);
+    };
+    obj.insert(
+        "actor_display".to_string(),
+        serde_json::Value::String(display),
+    );
     serde_json::to_string(&value)
 }
 

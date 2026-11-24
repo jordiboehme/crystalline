@@ -40,6 +40,7 @@ import { formatInstant, plural, relativeTime } from "../format";
 import { ConflictDialog } from "./ConflictDialog";
 import { BUTTON, FOCUS_RING } from "./primitives";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { PersonName } from "./PersonName";
 
 /**
  * The warning face, for the one thing here that is neither fine nor a failure:
@@ -290,7 +291,10 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
                 {sync.drafts.map((holder) => (
                   <tr key={holder.actor}>
                     <th scope="row" className="pr-4 text-left font-normal">
-                      {holder.actor}
+                      <PersonName
+                        login={holder.actor}
+                        display={holder.display}
+                      />
                     </th>
                     <td className="tabular-nums">
                       {plural(holder.entries, "draft", "drafts")}

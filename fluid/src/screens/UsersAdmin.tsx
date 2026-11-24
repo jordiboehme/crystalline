@@ -74,6 +74,7 @@ import {
   readUsersSearch,
   writeUsersSearch,
 } from "./usersQuery";
+import { personLabelWithLogin } from "../people";
 
 const SECONDARY = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
 const DANGER_BUTTON = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.destructive}`;
@@ -210,7 +211,10 @@ function UsersScreen() {
   const add = useMutation({
     mutationFn: createUser,
     onSuccess: (created) => {
-      setNotice({ kind: "done", text: `Added ${created.name}.` });
+      setNotice({
+        kind: "done",
+        text: `Added ${personLabelWithLogin(created.name, created.display)}.`,
+      });
       void refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY });
       void navigate(usersAddress(searchParams, created.name));
     },
@@ -229,7 +233,14 @@ function UsersScreen() {
           domains.some((row) => row.left.length > 0)
             ? "problem"
             : "done",
-        text: endedDraftsText(name, domains, error),
+        text: endedDraftsText(
+          personLabelWithLogin(
+            name,
+            accounts.find((row) => row.name === name)?.display,
+          ),
+          domains,
+          error,
+        ),
       });
     },
     onError: (error: Error) => {

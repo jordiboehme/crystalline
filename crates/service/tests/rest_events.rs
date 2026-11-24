@@ -585,17 +585,25 @@ async fn an_engram_frame_carries_the_actors_display_name() {
         admin: false,
     };
     fx.engine
-        .edit_engram_as(&edit("eng", "alpha", "one line"), None, &as_ada)
+        .edit_engram_as(
+            &edit("eng", "alpha", "one line"),
+            Some("human:ada"),
+            &as_ada,
+        )
         .await
         .unwrap();
     let heard = read_frames(&mut stream, 1, Duration::from_secs(3)).await;
     assert_eq!(heard.len(), 1, "{heard:?}");
     let data: serde_json::Value = serde_json::from_str(&heard[0].data).unwrap();
-    assert_eq!(data["actor"], "ada");
+    assert_eq!(data["actor"], "human:ada");
     assert_eq!(data["actor_display"], "Ada");
     fx.auth.set_display("ada", Some("Ada King")).await.unwrap();
     fx.engine
-        .edit_engram_as(&edit("eng", "alpha", "two lines"), None, &as_ada)
+        .edit_engram_as(
+            &edit("eng", "alpha", "two lines"),
+            Some("human:ada"),
+            &as_ada,
+        )
         .await
         .unwrap();
     let heard = read_frames(&mut stream, 1, Duration::from_secs(3)).await;
