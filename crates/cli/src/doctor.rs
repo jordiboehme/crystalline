@@ -1968,6 +1968,11 @@ pub struct DoctorReport {
     /// problem.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents_without_token: Vec<String>,
+    /// Why the agents were not checked: on Postgres without an active
+    /// instance doctor opens no accounts tables, since opening them would
+    /// claim and migrate the database. `None` when they were checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_not_checked: Option<String>,
     /// The Reflection pages a reflect run missed (a run of the domain
     /// started after the page fell due and ended without reconciling it),
     /// longest missed first: the daemon's answer when it holds the index,
@@ -2738,7 +2743,8 @@ pub async fn run(
     let AgentsCheck {
         need_auth_mcp: agents_need_auth_mcp,
         tokens,
-    } = check_agents(cfg).await;
+        not_checked: agents_not_checked,
+    } = check_agents(cfg, matches!(index, IndexAccess::Daemon)).await;
     let AgentTokenFindings {
         ending: agent_tokens_ending,
         without_token: agents_without_token,
@@ -2795,9 +2801,15 @@ pub async fn run(
         agents_need_auth_mcp,
         agent_tokens_ending,
         agents_without_token,
+        agents_not_checked,
         reflection_overdue,
     })
 }
+
+/// The note for [`DoctorReport::agents_not_checked`] on Postgres without an
+/// active instance.
+const AGENTS_NOT_CHECKED_ON_POSTGRES: &str =
+    "not checked: on Postgres the agents are read only while an instance is running";
 
 /// What doctor found about the agents of the loops.
 #[derive(Debug, Default)]
@@ -2807,6 +2819,8 @@ struct AgentsCheck {
     need_auth_mcp: Vec<String>,
     /// Their tokens, whatever `auth.mcp` says.
     tokens: AgentTokenFindings,
+    /// Why nothing was read ([`DoctorReport::agents_not_checked`]).
+    not_checked: Option<String>,
 }
 
 /// The agent tokens doctor warns about.
@@ -2822,7 +2836,16 @@ struct AgentTokenFindings {
 /// is off (see [`DoctorReport::agents_need_auth_mcp`]) and their tokens that
 /// end soon or are missing. Reads the accounts only when they exist; a file
 /// that is not there is not made, and one that cannot be read says nothing.
-async fn check_agents(cfg: &GlobalConfig) -> AgentsCheck {
+/// On Postgres they are read only while an active instance (`daemon`) holds
+/// the database: by the CLI rule a report never opens it, because the open
+/// would claim the database and migrate it.
+async fn check_agents(cfg: &GlobalConfig, daemon: bool) -> AgentsCheck {
+    if cfg.database().backend == DatabaseBackend::Postgres && !daemon {
+        return AgentsCheck {
+            not_checked: Some(AGENTS_NOT_CHECKED_ON_POSTGRES.to_string()),
+            ..AgentsCheck::default()
+        };
+    }
     let store = match crystalline_service::existing_accounts_for_cli(cfg).await {
         Ok(Some(store)) => store,
         Ok(None) => return AgentsCheck::default(),
@@ -2845,6 +2868,7 @@ async fn check_agents(cfg: &GlobalConfig) -> AgentsCheck {
             agents.iter().map(|agent| agent.name.clone()).collect()
         },
         tokens: agent_token_findings(&agents, time::now()),
+        not_checked: None,
     }
 }
 
@@ -6776,8 +6800,12 @@ pub fn render_human(report: &DoctorReport) -> String {
     if !report.agents_need_auth_mcp.is_empty()
         || !report.agent_tokens_ending.is_empty()
         || !report.agents_without_token.is_empty()
+        || report.agents_not_checked.is_some()
     {
         let _ = writeln!(out, "agents:");
+        if let Some(note) = &report.agents_not_checked {
+            let _ = writeln!(out, "  {note}");
+        }
         if !report.agents_need_auth_mcp.is_empty() {
             let _ = writeln!(out, "  {}", agents_line(&report.agents_need_auth_mcp));
         }

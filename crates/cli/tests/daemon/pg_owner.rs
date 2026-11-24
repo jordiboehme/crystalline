@@ -2368,6 +2368,14 @@ fn doctor_warns_local_disk_rows_on_postgres() {
         )),
         "{text}"
     );
+    // The agents live in the accounts tables, which doctor does not open
+    // here: it says so instead of claiming and migrating the database.
+    assert!(
+        text.contains(
+            "agents:\n  not checked: on Postgres the agents are read only while an instance is running"
+        ),
+        "{text}"
+    );
     assert_eq!(schema_objects(&pg), "0", "doctor opened the store");
 }
 
