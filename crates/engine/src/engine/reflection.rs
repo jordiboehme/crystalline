@@ -1168,6 +1168,23 @@ pub(crate) fn unattended_settings_refusal(inner: &str) -> String {
     )
 }
 
+/// The refusal of a pact file's write (`PACT.md` or a page pact) by an
+/// unattended session ([`Engine::is_unattended`]): a run answers what asks
+/// for a pact change in its thread, and a curator changes the pact.
+pub(crate) fn unattended_pact_refusal(inner: &str) -> String {
+    format!(
+        "an unattended session does not write pact text; '{inner}' stays as it is: answer the feedback in its thread, and a curator changes the pact in Fluid or in an attended session"
+    )
+}
+
+/// The refusal of a move by an unattended session that would take the
+/// page's pact along.
+pub(crate) fn unattended_pact_move_refusal(from: &str, pact: &str) -> String {
+    format!(
+        "an unattended session does not move pact text, and moving '{from}' moves its page pact '{pact}' along; '{from}' stays, and a curator moves it in Fluid or in an attended session"
+    )
+}
+
 /// A page without its `reflection:` frontmatter block, which names the
 /// source engrams: what a reader who cannot read engrams is answered, what
 /// the search looks at and what a live room holds. The rest of the
@@ -1797,6 +1814,12 @@ impl Engine {
         self.refuse_read_only_domain(&p.domain, &crate::scope::Scope::Unrestricted)
             .await?;
         r::validate_reflection_path(&p.path).map_err(EngineError::Invalid)?;
+        // Pact text is a curator's in person (Jordi, 2026-11-24): a run
+        // settles a pact and answers its threads, and writes none of it,
+        // not even the text it holds.
+        if r::is_pact_file(&p.path) && self.is_unattended(caller) {
+            return Err(EngineError::Forbidden(unattended_pact_refusal(&p.path)));
+        }
         // Rule 7: the whole page, one section of it, or (sources alone) the
         // stored page as it stands, curated by the sources named.
         let op = match (p.markdown.as_deref(), p.operation.as_deref()) {
@@ -3471,6 +3494,16 @@ impl Engine {
             pact_from,
             pact_to: r::page_pact_path(to),
         };
+        // A page pact moves with its page, and pact text is a curator's in
+        // person; the links a move rewrites in other pacts follow it, as a
+        // follows does. Before the screens, so a refused move leaves an
+        // open room alone.
+        if mv.has_pact && self.is_unattended(caller) {
+            return Err(EngineError::Forbidden(unattended_pact_move_refusal(
+                from,
+                &mv.pact_from,
+            )));
+        }
         let screen = self.screen_reflection_move(&mv).await?;
         // The room over the page saves its text and ends; no room opens over
         // the old path until the move is done (the fence). Its sockets are

@@ -292,3 +292,238 @@ async fn an_attended_curator_changes_freshness_and_follows() {
     put(&fx, "guides/a.md", &page("freshness:\n")).await;
     assert!(!file(&fx, "guides/a.md").unwrap().contains("freshness"));
 }
+
+// --- pact text --------------------------------------------------------------
+
+const PACT: &str = "# Pact\n\n## Tone\n\nPlain. See [B](guides/b.md).\n";
+const PAGE_PACT: &str = "# Pact of A\n\n## Tone\n\nShort.\n";
+
+/// PACT.md, a page with its page pact, and a page without one.
+async fn pacted(fx: &Fx) {
+    put(fx, "guides/a.md", BODY).await;
+    put(fx, "guides/b.md", BODY).await;
+    put(fx, "PACT.md", PACT).await;
+    put(fx, "guides/a.pact.md", PAGE_PACT).await;
+}
+
+fn pact_refused(e: &EngineError, run: &Run, what: &str) {
+    assert!(
+        matches!(e, EngineError::Forbidden(_)),
+        "{} {what}: {e}",
+        run.name()
+    );
+    let text = e.to_string();
+    assert!(
+        text.contains("unattended") && text.contains("pact text") && text.contains("curator"),
+        "{} {what}: {text}",
+        run.name()
+    );
+    assert!(text.contains("thread"), "{} {what}: {text}", run.name());
+}
+
+/// Every pact file is a curator's to write in person: an unattended caller
+/// may not overwrite PACT.md (not even with the text it holds), edit a
+/// section of a page pact or create one, in any letter case, and may not
+/// move a page that takes its pact along. Nothing is written.
+#[tokio::test]
+async fn an_unattended_session_does_not_write_pact_text() {
+    let fx = reflecting().await;
+    pacted(&fx).await;
+    let before: Vec<Option<String>> = ["PACT.md", "guides/a.pact.md", "guides/a.md"]
+        .iter()
+        .map(|rel| file(&fx, rel))
+        .collect();
+    for run in Run::both(&fx).await {
+        let tries = [
+            ("PACT.md", write("PACT.md", "# Pact\n\n## Tone\n\nLoud.\n")),
+            (
+                "PACT.md as it is",
+                write("PACT.md", &file(&fx, "PACT.md").unwrap()),
+            ),
+            (
+                "a page pact's section",
+                WriteReflectionParams {
+                    operation: Some("replace_section".into()),
+                    section: Some("Tone".into()),
+                    content: Some("Long.\n".into()),
+                    markdown: None,
+                    ..write("guides/a.pact.md", "")
+                },
+            ),
+            ("a new page pact", write("guides/b.pact.md", PAGE_PACT)),
+        ];
+        for (what, p) in tries {
+            let refused = run.write(&fx, &p).await.unwrap_err();
+            pact_refused(&refused, &run, what);
+        }
+        assert!(file(&fx, "guides/b.pact.md").is_none(), "{}", run.name());
+        // Another letter case names the pact too, and is refused before
+        // anything is read.
+        run.write(&fx, &write("pact.md", "# Pact\n\n## Tone\n\nLoud.\n"))
+            .await
+            .unwrap_err();
+
+        let refused = run
+            .write(
+                &fx,
+                &WriteReflectionParams {
+                    to: Some("design/a.md".into()),
+                    ..act("move", "guides/a.md")
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
+        let text = refused.to_string();
+        assert!(
+            text.contains("unattended")
+                && text.contains("pact")
+                && text.contains("guides/a.md")
+                && text.contains("curator"),
+            "{text}"
+        );
+        assert!(file(&fx, "design/a.md").is_none(), "{}", run.name());
+        let after: Vec<Option<String>> = ["PACT.md", "guides/a.pact.md", "guides/a.md"]
+            .iter()
+            .map(|rel| file(&fx, rel))
+            .collect();
+        assert_eq!(after, before, "{}", run.name());
+    }
+}
+
+/// An unattended caller still settles a pact, answers a thread on one and
+/// moves a page that has no pact of its own (the links PACT.md has to it
+/// follow the move, as a follows does: nobody's change).
+#[tokio::test]
+async fn an_unattended_session_settles_and_answers_on_a_pact() {
+    use crystalline_service::params::DiscussParams;
+    let fx = reflecting().await;
+    pacted(&fx).await;
+    for (n, run) in Run::both(&fx).await.into_iter().enumerate() {
+        let name = run.name();
+        run.write(&fx, &act("settle", "PACT.md"))
+            .await
+            .unwrap_or_else(|e| panic!("{name} settle: {e}"));
+        let opened = fx
+            .engine
+            .discuss(
+                &DiscussParams {
+                    domain: "eng".into(),
+                    action: Some("open".into()),
+                    path: Some("guides/a.pact.md".into()),
+                    section: Some("Tone".into()),
+                    text: Some("Could the tone be longer?".into()),
+                    ..Default::default()
+                },
+                &person(),
+            )
+            .await
+            .unwrap();
+        let thread = opened["thread"]["id"]
+            .as_str()
+            .or(opened["id"].as_str())
+            .expect("the thread's id")
+            .to_string();
+        within(
+            run.limit(),
+            fx.engine.discuss(
+                &DiscussParams {
+                    domain: "eng".into(),
+                    action: Some("answer".into()),
+                    path: Some("guides/a.pact.md".into()),
+                    thread: Some(thread),
+                    text: Some("A curator changes the pact.".into()),
+                    ..Default::default()
+                },
+                &run.caller(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name} answer: {e}"));
+
+        let (from, to) = if n == 0 {
+            ("guides/b.md", "design/b.md")
+        } else {
+            ("design/b.md", "guides/b.md")
+        };
+        run.write(
+            &fx,
+            &WriteReflectionParams {
+                to: Some(to.into()),
+                ..act("move", from)
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name} move: {e}"));
+        assert!(file(&fx, to).is_some(), "{name}");
+        assert!(
+            file(&fx, "PACT.md").unwrap().contains(to),
+            "{name}: PACT.md's link follows"
+        );
+    }
+}
+
+/// A curator in an attended session writes and moves pact text as before.
+#[tokio::test]
+async fn an_attended_curator_writes_and_moves_pacts() {
+    let fx = reflecting().await;
+    pacted(&fx).await;
+    put(&fx, "PACT.md", "# Pact\n\n## Tone\n\nLoud.\n").await;
+    put(&fx, "guides/b.pact.md", PAGE_PACT).await;
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                to: Some("design/a.md".into()),
+                ..act("move", "guides/a.md")
+            },
+            &person(),
+        )
+        .await
+        .unwrap();
+    assert!(file(&fx, "design/a.pact.md").is_some());
+}
+
+/// Over MCP, a stdio session started for a run (its run domain marks it
+/// unattended, with no lease and no hand-built limit) is refused the same
+/// writes and still settles the pact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_session_over_mcp_keeps_off_settings_and_pact_text() {
+    use crate::read_limit::{landed, refused, session, tool};
+    use crystalline_service::McpServer;
+    use serde_json::json;
+
+    let fx = reflecting().await;
+    pacted(&fx).await;
+    put(&fx, "guides/c.md", &page("freshness: 1d\n")).await;
+    let mut wire = session(McpServer::new(fx.engine.clone()).with_run_domain("eng")).await;
+
+    let answer = tool(
+        &mut wire,
+        20,
+        "write_reflection",
+        json!({ "domain": "eng", "path": "PACT.md", "markdown": "# Pact\n\n## Tone\n\nLoud.\n" }),
+    )
+    .await;
+    let text = refused(&answer);
+    assert!(text.contains("pact text"), "{text}");
+
+    let answer = tool(
+        &mut wire,
+        21,
+        "write_reflection",
+        json!({ "domain": "eng", "path": "guides/c.md", "markdown": page("freshness: 6h\n") }),
+    )
+    .await;
+    let text = refused(&answer);
+    assert!(text.contains("freshness or follows"), "{text}");
+    assert!(file(&fx, "guides/c.md").unwrap().contains("freshness: 1d"));
+
+    let answer = tool(
+        &mut wire,
+        22,
+        "write_reflection",
+        json!({ "domain": "eng", "path": "PACT.md", "action": "settle" }),
+    )
+    .await;
+    landed(&answer);
+}
