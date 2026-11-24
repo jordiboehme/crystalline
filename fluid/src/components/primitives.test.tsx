@@ -59,6 +59,10 @@ describe("primitives", () => {
     expect(statusVariant("current")).toBe("positive");
     expect(statusVariant("Stable")).toBe("positive");
     expect(statusVariant("draft")).toBe("caution");
+    // Every tentative status the server knows wears the caution chip.
+    for (const tentative of ["draft", "proposed", "idea", "poc", "open"]) {
+      expect(statusVariant(tentative)).toBe("caution");
+    }
     expect(statusVariant("deprecated")).toBe("retired");
     expect(statusVariant("anything-else")).toBe("neutral");
   });

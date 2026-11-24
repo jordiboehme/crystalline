@@ -65,6 +65,7 @@ export const SUGGESTED_STATUSES = [
   "proposed",
   "idea",
   "poc",
+  "open",
   ...RETIRED_STATUSES,
   "current",
 ];

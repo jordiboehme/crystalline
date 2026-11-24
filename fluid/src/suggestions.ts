@@ -40,6 +40,7 @@ const STATUS_GLOSSES: Record<string, string> = {
   proposed: "put forward, not agreed yet",
   idea: "a thought worth keeping",
   poc: "a proof of concept: shown to work once, in a prototype",
+  open: "an open question, not answered yet",
   deprecated: "still here, no longer advised",
   superseded: "replaced by a newer engram",
   archived: "kept for the record, out of use",

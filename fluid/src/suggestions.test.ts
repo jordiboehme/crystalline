@@ -28,6 +28,12 @@ describe("the recommended vocabulary", () => {
     }
   });
 
+  it("offers every tentative status, open included", () => {
+    for (const tentative of ["draft", "proposed", "idea", "poc", "open"]) {
+      expect(SUGGESTED_STATUSES).toContain(tentative);
+    }
+  });
+
   it("keeps the alias, and says it is one", () => {
     // `current` is what domains written before the rename carry, so it stays
     // offered; the line beside it is what keeps it from reading as a second
