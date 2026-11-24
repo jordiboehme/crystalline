@@ -467,6 +467,12 @@ async fn missed(fx: &Fx) -> Value {
 /// A reflect run of `eng` from `from` to `to` on the automation clock that
 /// stopped at its cap.
 async fn reflect_run(fx: &Fx, from: &str, to: &str) {
+    reflect_run_said(fx, from, to, "").await;
+}
+
+/// [`reflect_run`] whose runner reports `said` as its start, by its own
+/// clock (empty: it reports none).
+async fn reflect_run_said(fx: &Fx, from: &str, to: &str, said: &str) {
     now_at(&fx.engine, from);
     let taken = fx
         .engine
@@ -480,7 +486,7 @@ async fn reflect_run(fx: &Fx, from: &str, to: &str) {
             "eng",
             taken["token"].as_str().unwrap(),
             &crystalline_core::automation::RunReport {
-                started_at: String::new(),
+                started_at: said.to_string(),
                 outcome: crystalline_core::automation::RunOutcome::StoppedAtCap,
                 done: 20,
                 summary: "capped".into(),
@@ -577,6 +583,34 @@ async fn a_run_that_skipped_a_due_page_missed_it_from_its_end() {
             "missed_secs": 3 * 3600,
             "waiting": false,
         }])
+    );
+}
+
+/// Whether a run missed a page is decided on the server's clock: a runner
+/// whose clock is behind reports a start before the page fell due, and the
+/// run still missed the page, because the lease was taken after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_missed_a_page_by_the_servers_clock_not_the_runners() {
+    let fx = hourly_page("2026-10-21T10:00:00+00:00").await;
+    reflect_run_said(
+        &fx,
+        "2026-10-21T13:00:00+00:00",
+        "2026-10-21T13:05:00+00:00",
+        "2026-10-21T10:30:00+00:00",
+    )
+    .await;
+    now_at(&fx.engine, "2026-10-21T16:05:00+00:00");
+    let clock = clock_of(&fx).await;
+    assert_eq!(clock["missed_secs"], 3 * 3600, "{clock}");
+    assert_eq!(missed(&fx).await.as_array().map(Vec::len), Some(1));
+    let runs = fx
+        .engine
+        .automation_status(Loop::Reflect, &["eng".to_string()], &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        runs["domains"][0]["last_run"]["started_at"], "2026-10-21T13:00:00+00:00",
+        "the run started when its lease was taken: {runs}"
     );
 }
 

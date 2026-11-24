@@ -798,12 +798,12 @@ impl Engine {
         } else {
             Vec::new()
         };
+        // The run started when its lease was taken, on the server's clock.
+        // The runner's own `started_at` is checked and not kept: a runner
+        // whose clock is behind would hide a page the run missed, one whose
+        // clock is ahead would flag a page that fell due after the take.
         let run = AutomationRun {
-            started_at: if started_at.is_empty() {
-                lease.taken_at.clone()
-            } else {
-                started_at.to_string()
-            },
+            started_at: lease.taken_at.clone(),
             ended_at: now,
             runner: lease.holder.runner.clone(),
             account: lease.holder.account.clone(),

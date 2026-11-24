@@ -134,7 +134,10 @@ impl RunOutcome {
 /// What a runner reports when a run ends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunReport {
-    /// When the run started, RFC 3339. Empty means when the lease was taken.
+    /// When the run started by the runner's clock, RFC 3339, or empty. A
+    /// value is checked to read as a time and is not kept: the server
+    /// records the run as started when its lease was taken, on its own
+    /// clock, which is what decides whether a run missed a page.
     pub started_at: String,
     /// How it ended.
     pub outcome: RunOutcome,
