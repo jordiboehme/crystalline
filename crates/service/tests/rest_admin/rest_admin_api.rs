@@ -5807,6 +5807,19 @@ fn update_cache(tag: &str) -> crystalline_core::update::UpdateCache {
     }
 }
 
+/// A release one minor above the running version, so an offered update stays
+/// newer whatever the workspace version is.
+fn newer_version() -> String {
+    let mut parts = env!("CARGO_PKG_VERSION").split('.');
+    let major = parts.next().unwrap();
+    let minor: u64 = parts.next().unwrap().parse().unwrap();
+    format!("{major}.{}.0", minor + 1)
+}
+
+fn newer_tag() -> String {
+    format!("v{}", newer_version())
+}
+
 /// Update facts with everything open, as an official tarball install with
 /// the check on would answer them, for whichever setting it is asked with.
 fn open_update_facts(tag: &str) -> crystalline_service::rest::UpdateFactsSource {
@@ -5850,14 +5863,17 @@ async fn me_update_available_is_admin_only() {
     let fx = serve(Options {
         anonymous: true,
         update_check: true,
-        update: Some(open_update_facts("v0.35.0")),
+        update: Some(open_update_facts(&newer_tag())),
         ..Options::default()
     })
     .await;
     let admin = login(fx.addr, "root", "rootpw").await;
     let eddy = login(fx.addr, "eddy", "eddypw").await;
     let vera = login(fx.addr, "vera", "verapw").await;
-    assert_eq!(update_available(fx.addr, Some(&admin)).await, "0.35.0");
+    assert_eq!(
+        update_available(fx.addr, Some(&admin)).await,
+        newer_version().as_str()
+    );
     assert_eq!(
         update_available(fx.addr, Some(&eddy)).await,
         serde_json::Value::Null
@@ -5876,7 +5892,7 @@ async fn me_update_available_is_admin_only() {
     // her next probe, and told nothing again once demoted, on the same
     // session.
     for (role, expected) in [
-        ("admin", serde_json::json!("0.35.0")),
+        ("admin", serde_json::json!(newer_version())),
         ("editor", serde_json::Value::Null),
     ] {
         let resp = as_session(
@@ -5947,7 +5963,7 @@ async fn me_update_available_is_null_without_a_source() {
     );
 
     let off = serve(Options {
-        update: Some(open_update_facts("v0.35.0")),
+        update: Some(open_update_facts(&newer_tag())),
         ..Options::default()
     })
     .await;
@@ -5971,7 +5987,7 @@ async fn the_daemon_loads_the_cache_at_start() {
 
     let dir = tempfile::tempdir().unwrap();
     let cache_path = dir.path().join(UPDATE_CACHE_FILE);
-    let mut cache = update_cache("v0.35.0");
+    let mut cache = update_cache(&newer_tag());
     cache.etag = Some("\"etag\"".to_string());
     std::fs::write(&cache_path, serde_json::to_string(&cache).unwrap()).unwrap();
     let exe = dir.path().join(if cfg!(windows) {
@@ -5997,5 +6013,8 @@ async fn the_daemon_loads_the_cache_at_start() {
     })
     .await;
     let admin = login(fx.addr, "root", "rootpw").await;
-    assert_eq!(update_available(fx.addr, Some(&admin)).await, "0.35.0");
+    assert_eq!(
+        update_available(fx.addr, Some(&admin)).await,
+        newer_version().as_str()
+    );
 }

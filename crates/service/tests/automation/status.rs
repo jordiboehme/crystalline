@@ -131,6 +131,7 @@ async fn a_status_answers_while_the_writer_lock_is_held_on_turso() {
 /// Status of `lp` on `domain` with counts and without: the answer before
 /// the gate's entries expire, and the same answers while a test holds the
 /// writer lock after they expired.
+#[cfg(feature = "postgres")]
 async fn same_under_the_held_lock(engine: &Engine, lp: Loop, domain: &str) -> Value {
     let ask = |counts: bool| async move {
         engine
