@@ -2740,6 +2740,62 @@ impl AuthStore {
             .map(|row| user_from_row(&row)))
     }
 
+    /// The display name of each of `names` that is an account with one, in
+    /// one read, keyed by the name exactly as it was given.
+    ///
+    /// A name that is no account (an agent, the machine owner, a deleted
+    /// account, a GitHub login) or that is no valid account name gets no
+    /// entry, and neither does an account whose display name is its login
+    /// name (what a cleared display name holds). A
+    /// disabled account still answers: a past author keeps their name. The
+    /// lookup only adds a readable form to a name the caller already shows,
+    /// so it checks no rights of its own.
+    pub async fn display_names<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut wanted: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for name in names {
+            if let Ok(folded) = normalize_account_name(name) {
+                let given = wanted.entry(folded).or_default();
+                if !given.iter().any(|g| g == name) {
+                    given.push(name.to_string());
+                }
+            }
+        }
+        let mut out = std::collections::HashMap::new();
+        if wanted.is_empty() {
+            return Ok(out);
+        }
+        let placeholders: Vec<String> = (1..=wanted.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT name, display FROM users WHERE name IN ({})",
+            placeholders.join(", ")
+        );
+        let params = wanted.keys().map(|k| Value::Text(k.clone())).collect();
+        let rows = {
+            let _guard = self.lock().await;
+            self.db
+                .query(&sql, params)
+                .await
+                .context("reading the display names of accounts")?
+        };
+        for row in rows {
+            let (Some(name), Some(display)) = (cell_text(&row, 0), cell_text(&row, 1)) else {
+                continue;
+            };
+            let display = display.trim();
+            if display.is_empty() || display == name {
+                continue;
+            }
+            for given in wanted.get(&name).into_iter().flatten() {
+                out.insert(given.clone(), display.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// The name [`AuthStore::provision_linked_user`] would give a new account
     /// wanting `desired` right now.
     pub async fn free_name_from(&self, desired: &str) -> Result<String> {
