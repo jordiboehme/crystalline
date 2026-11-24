@@ -84,6 +84,11 @@ describe("Enter in a paragraph", () => {
     });
   }
 
+  it("ends the line before a soft break of an older page, which stays", () => {
+    // Text typed on the new line joins the line below it, as written before.
+    expect(enter("one\ntwo", 3)).toBe("one\n\n\ntwo");
+  });
+
   it("leaves an empty line, a heading, code and a table to one break", () => {
     expect(enter("one\n\ntwo", 4)).toBe("one\n\n\ntwo");
     expect(enter("# Title", 7)).toBe("# Title\n");
