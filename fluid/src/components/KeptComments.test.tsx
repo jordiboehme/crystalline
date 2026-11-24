@@ -78,6 +78,7 @@ function mount() {
       oauth: false,
       serverVersion: "test",
       updateAvailable: null,
+      updateCheck: null,
     },
     login: vi.fn(),
     setup: vi.fn(),

@@ -377,6 +377,10 @@ use crate::scope::{DomainAccess, DomainRight};
         auth::LoginResponse,
         auth::LogoutResponse,
         auth::MeResponse,
+        auth::UpdateCheck,
+        auth::UpdateCheckOff,
+        auth::UpdateInstall,
+        auth::UpdateLastCheck,
         auth::SetupBody,
         oidc::StartLinkResponse,
         oidc::ProvidersResponse,
@@ -698,22 +702,31 @@ impl RestState {
         self
     }
 
-    /// The release an admin is told about, rendered: `None` without a
-    /// daemon's facts, or when [`crystalline_core::update::offer`] offers
-    /// nothing for them, the live `update.check` and `update.min_age_hours`
-    /// and this server's own version.
-    pub(crate) fn update_available(&self) -> Option<String> {
-        let source = self.update.as_ref()?;
+    /// What an admin is told about updating, from one read of the daemon's
+    /// facts: the release on offer, rendered, and the state of the daily
+    /// check. Both are `None` without a daemon's facts. The release is
+    /// `None` as well when [`crystalline_core::update::offer`] offers
+    /// nothing for the facts, the live `update.check` and
+    /// `update.min_age_hours` and this server's own version.
+    pub(crate) fn update_news(&self) -> (Option<String>, Option<auth::UpdateCheck>) {
+        let Some(source) = self.update.as_ref() else {
+            return (None, None);
+        };
         let (check, min_age_hours) = self.engine.update_settings();
         let facts = source(check);
-        let current = crystalline_core::version::Precedence::parse(crystalline_core::VERSION)?;
-        crystalline_core::update::offer(
+        let Some(current) = crystalline_core::version::Precedence::parse(crystalline_core::VERSION)
+        else {
+            return (None, Some(auth::UpdateCheck::from_facts(&facts, None)));
+        };
+        let available = crystalline_core::update::offer(
             &facts,
             &current,
             crystalline_core::time::now(),
             min_age_hours,
         )
-        .map(|version| version.render())
+        .map(|version| version.render());
+        let state = auth::UpdateCheck::from_facts(&facts, Some(&current));
+        (available, Some(state))
     }
 
     /// The process's one-time setup token, if it has one. Read by

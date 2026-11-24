@@ -1256,6 +1256,137 @@ pub struct MeResponse {
     /// on this surface updates the server.
     #[schema(example = "0.35.0")]
     update_available: Option<String>,
+    /// Whether this server's daily update check is on, why it is off, and
+    /// what its last run found, or null.
+    ///
+    /// Told to an admin alone, by the same rule as `update_available`; every
+    /// other caller gets null, and so does an admin of a server with no
+    /// daemon behind it. Read-only: the check is turned on or off on the
+    /// server, never through this API.
+    update_check: Option<UpdateCheck>,
+}
+
+/// The state of a server's daily update check, as `crystalline status` says
+/// it: on, or off and why, and with the check on what its last run found.
+/// With the check off nothing from its last run is told, since a check run by
+/// hand writes that whatever the setting is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct UpdateCheck {
+    /// Whether the daily check runs.
+    pub on: bool,
+    /// Why the check is off; null when it is on.
+    pub off_reason: Option<UpdateCheckOff>,
+    /// How this server was installed, as the server detected it at start.
+    /// Says where the check is turned on: a .deb install running as the
+    /// `crystalline` service reads its settings from
+    /// `/etc/default/crystalline`.
+    pub install: UpdateInstall,
+    /// When the last check ran, in RFC 3339, or null when the check is off
+    /// or has not run yet.
+    #[schema(example = "2026-11-24T09:00:00Z")]
+    pub last_checked: Option<String>,
+    /// What the last check found, or null when the check is off or has not
+    /// run yet.
+    pub last_check: Option<UpdateLastCheck>,
+}
+
+/// Why a server's daily update check is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCheckOff {
+    /// `update.check` is not on, which is the default.
+    NotTurnedOn,
+    /// `NO_UPDATE_NOTIFIER` is set in the server's environment.
+    NoUpdateNotifier,
+    /// `CI` is set in the server's environment.
+    Ci,
+    /// A Docker install, which is updated by pulling the new image.
+    Docker,
+    /// The Claude Desktop-only bundle, whose newer .mcpb is opened by hand.
+    DesktopExtension,
+    /// The server has no state folder to keep a check in.
+    NoStateFolder,
+}
+
+/// How a server was installed, as its update check detected it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateInstall {
+    Homebrew,
+    Deb,
+    Msi,
+    Zip,
+    Tarball,
+    Docker,
+    Mcpb,
+    Unknown,
+}
+
+/// What a server's last update check found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateLastCheck {
+    /// No release newer than this server's version.
+    UpToDate,
+    /// A newer release. It is named in `update_available` only when it is
+    /// offered: a release younger than `update.min_age_hours`, a check more
+    /// than 48 hours old, a pre-release, a build that is not an official one
+    /// or an install `crystalline update now` does not act for leaves it
+    /// unnamed.
+    Newer,
+    /// The check failed.
+    Failed,
+}
+
+impl UpdateCheck {
+    /// The state the daemon's `facts` describe. `current` is this server's
+    /// own version, which decides whether a release the last check found is
+    /// newer; without one a found release is told as up to date.
+    pub fn from_facts(
+        facts: &crystalline_core::update::UpdateFacts,
+        current: Option<&crystalline_core::version::Precedence>,
+    ) -> UpdateCheck {
+        use crystalline_core::update::{CheckOutcome, CheckState, InstallMethod, OffReason};
+        let off_reason = match facts.check {
+            CheckState::On => None,
+            CheckState::Off(reason) => Some(match reason {
+                OffReason::NotTurnedOn => UpdateCheckOff::NotTurnedOn,
+                OffReason::NoUpdateNotifier => UpdateCheckOff::NoUpdateNotifier,
+                OffReason::Ci => UpdateCheckOff::Ci,
+                OffReason::Docker => UpdateCheckOff::Docker,
+                OffReason::DesktopExtension => UpdateCheckOff::DesktopExtension,
+                OffReason::NoStateFolder => UpdateCheckOff::NoStateFolder,
+            }),
+        };
+        let install = match facts.method {
+            InstallMethod::Homebrew => UpdateInstall::Homebrew,
+            InstallMethod::Deb => UpdateInstall::Deb,
+            InstallMethod::Msi => UpdateInstall::Msi,
+            InstallMethod::Zip => UpdateInstall::Zip,
+            InstallMethod::Tarball => UpdateInstall::Tarball,
+            InstallMethod::Docker => UpdateInstall::Docker,
+            InstallMethod::Mcpb => UpdateInstall::Mcpb,
+            InstallMethod::Unknown => UpdateInstall::Unknown,
+        };
+        let last = facts.cache.as_ref().filter(|_| off_reason.is_none());
+        let last_check = last.map(|cache| match cache.outcome {
+            CheckOutcome::Failed { .. } => UpdateLastCheck::Failed,
+            CheckOutcome::Release { .. } => {
+                if current.is_some_and(|current| cache.newer_release(current).is_some()) {
+                    UpdateLastCheck::Newer
+                } else {
+                    UpdateLastCheck::UpToDate
+                }
+            }
+        });
+        UpdateCheck {
+            on: off_reason.is_none(),
+            off_reason,
+            install,
+            last_checked: last.map(|cache| cache.checked_at.rfc3339_secs_z()),
+            last_check,
+        }
+    }
 }
 
 /// Exchange credentials for a session: sets [`SESSION_COOKIE`] and returns the
@@ -2064,7 +2195,8 @@ pub async fn logout(
                    `github.share_identity` is `personal`, the default with a GitHub App), and \
                    which server version it is talking to, and, for an \
                    admin only, a newer release the server's update check \
-                   found (`update_available`). Also issues the CSRF token \
+                   found (`update_available`) and whether that check is on, \
+                   why it is off and when it last ran (`update_check`). Also issues the CSRF token \
                    every later mutating request must echo in `x-csrf-token`: a \
                    cookie session has its token reissued here, and an \
                    identity a proxy asserts (`auth.trusted_header` or \
@@ -2166,13 +2298,13 @@ pub async fn me(
         // A refused App refuses every share of a person. An admin keeps the
         // surface, because that is where the App's reason is read and fixed.
         && (identity.require_admin().is_ok() || !state.engine.github_app_refuses_shares());
-    // An admin alone is told about an update: the admin routes' own check,
-    // with no other exception, since only someone who can run a command on
-    // the server can act on it.
-    let update_available = if identity.require_admin().is_ok() {
-        state.update_available()
+    // An admin alone is told about an update and the state of the check: the
+    // admin routes' own check, with no other exception, since only someone
+    // who can run a command on the server can act on it.
+    let (update_available, update_check) = if identity.require_admin().is_ok() {
+        state.update_news()
     } else {
-        None
+        (None, None)
     };
     Ok((
         jar,
@@ -2195,6 +2327,7 @@ pub async fn me(
             oauth: state.oauth.is_some(),
             version: crystalline_core::VERSION,
             update_available,
+            update_check,
         }),
     ))
 }
