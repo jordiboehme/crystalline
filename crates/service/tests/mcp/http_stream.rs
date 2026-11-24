@@ -905,3 +905,154 @@ async fn a_foreign_origin_is_refused_and_a_missing_one_is_not() {
         );
     }
 }
+
+/// One POST on the session `session_id`, with `X-Crystalline-Run-Domain`
+/// when `run_domain` is set: the header an HTTP runner puts on its requests.
+async fn post_as_run(
+    addr: std::net::SocketAddr,
+    body: &str,
+    session_id: &str,
+    run_domain: Option<&str>,
+) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let run = run_domain
+        .map(|domain| format!("X-Crystalline-Run-Domain: {domain}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Mcp-Session-Id: {session_id}\r\n\
+         {run}\
+         Connection: close\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.flush().await;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if String::from_utf8_lossy(&buf).contains("\"jsonrpc\"") {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy_owned(buf)
+}
+
+/// A request that carries `X-Crystalline-Run-Domain` is an unattended run's
+/// over HTTP: its pact write is refused and the pact stays, while the same
+/// session without the header (the machine owner in person) writes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_header_over_http_keeps_a_run_off_pact_text() {
+    let (tmp, engine) = build_engine().await;
+    let manifest = tmp.path().join("eng/MANIFEST.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replacen(
+            "recorded_at: 2026-01-01\n",
+            "recorded_at: 2026-01-01\nreflection: on\n",
+            1,
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let write = |markdown: &str| crystalline_service::params::WriteReflectionParams {
+        domain: "eng".into(),
+        path: "PACT.md".into(),
+        markdown: Some(markdown.into()),
+        ..Default::default()
+    };
+    engine
+        .write_reflection(
+            &write("# Pact\n\n## Tone\n\nPlain.\n"),
+            &crystalline_service::ReflectionCaller::owner(),
+        )
+        .await
+        .unwrap();
+    let pact = tmp.path().join("eng/reflections/PACT.md");
+    let before = std::fs::read_to_string(&pact).unwrap();
+
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let init = post(addr, &init_body("2025-06-18"), None).await;
+    let session = extract_session_id(&init);
+    let _ = post(
+        addr,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        Some(&session),
+    )
+    .await;
+    let call = |id: u32, markdown: &str| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": "write_reflection", "arguments": {
+                "domain": "eng", "path": "PACT.md", "markdown": markdown,
+            } },
+        })
+        .to_string()
+    };
+
+    let raw = post_as_run(
+        addr,
+        &call(2, "# Pact\n\n## Tone\n\nLoud.\n"),
+        &session,
+        Some("eng"),
+    )
+    .await;
+    let answer = payload(&raw);
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .or(answer["error"]["message"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        answer["result"]["isError"] == true || !answer["error"].is_null(),
+        "{answer}"
+    );
+    assert!(
+        text.contains("unattended") && text.contains("pact text"),
+        "{answer}"
+    );
+    assert_eq!(std::fs::read_to_string(&pact).unwrap(), before);
+
+    let raw = post_as_run(
+        addr,
+        &call(3, "# Pact\n\n## Tone\n\nShort.\n"),
+        &session,
+        None,
+    )
+    .await;
+    let answer = payload(&raw);
+    assert_eq!(answer["result"]["isError"], false, "{answer}");
+    assert!(std::fs::read_to_string(&pact).unwrap().contains("Short."));
+}
