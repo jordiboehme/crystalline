@@ -1269,7 +1269,7 @@ async fn a_page_due_inside_the_cap_is_sent_when_it_ends() {
 
 /// A due page a person has open in a live editor waits for the room: it is
 /// not due work, so nothing is sent for it, and its page clock says it is
-/// waiting. The look does not spin on it either.
+/// waiting.
 #[tokio::test(start_paused = true)]
 async fn a_stale_page_open_in_a_live_room_is_not_sent() {
     use crystalline_service::collab::session::CollabSessions;

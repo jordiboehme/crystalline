@@ -982,10 +982,6 @@ mod document_tests {
         );
     }
 
-    /// With `service.read_only` saved in the document, the operator can still
-    /// change the settings (that is how the flag is taken out again), while
-    /// an agent's settings change and every knowledge write stay refused. In
-    /// file mode a read-only instance refuses the operator too, as before.
     /// A daemon pins `auth.mcp` to its start value, as its MCP door does. A
     /// `config set` saves the new value and every reader keeps the start value
     /// until the restart: the open tier keeps its rights. An engine with no pin
@@ -1024,6 +1020,10 @@ mod document_tests {
         assert!(!live.is_open_tier(&crate::scope::Scope::Anonymous));
     }
 
+    /// With `service.read_only` saved in the document, the operator can still
+    /// change the settings (that is how the flag is taken out again), while
+    /// an agent's settings change and every knowledge write stay refused. In
+    /// file mode a read-only instance refuses the operator too, as before.
     #[tokio::test]
     async fn a_read_only_document_takes_settings_from_the_operator() {
         let doc = Arc::new(MemoryDocument::default());

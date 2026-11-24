@@ -783,11 +783,6 @@ async fn the_configure_description_names_its_domain_refusals() {
     }
 }
 
-/// The salience prior (Tasks 1-4) is invisible to an agent unless the tool
-/// copy teaches it: `write_engram` documents the `salience` metadata key an
-/// agent sets to mark exceptionally valuable knowledge, and `search_engrams`
-/// documents that hybrid ranking lifts a salient hit without ever excluding
-/// one.
 /// build_context names the node fields, the tentative statuses, and that
 /// `draft: true` is the caller's own unshared copy, never the status draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -810,6 +805,11 @@ async fn the_build_context_description_tells_the_draft_flag_from_the_draft_statu
     }
 }
 
+/// The salience prior (Tasks 1-4) is invisible to an agent unless the tool
+/// copy teaches it: `write_engram` documents the `salience` metadata key an
+/// agent sets to mark exceptionally valuable knowledge, and `search_engrams`
+/// documents that hybrid ranking lifts a salient hit without ever excluding
+/// one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_descriptions_teach_salience() {
     let h = Harness::new(&["eng"]).await;

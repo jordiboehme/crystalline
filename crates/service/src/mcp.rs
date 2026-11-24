@@ -5688,10 +5688,7 @@ impl McpServer {
             (Some(name), _) | (None, Some(Scope::Agent { name, .. })) => name,
             _ => String::new(),
         };
-        let domain = args
-            .and_then(|args| args.get("domain"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let domain = logged_domain(args);
         // Debug-formatted: the values come from the client, and a newline in
         // them must not start a log line of its own.
         tracing::info!(
@@ -6765,7 +6762,6 @@ fn file_links(domain: &str, files: &[LinkedFile]) -> Vec<ContentBlock> {
         .collect()
 }
 
-/// `files` on a remote read answer, left out when the read shows none.
 /// The engram text of a `read_engram` answer under the name MCP clients get
 /// it by: `markdown`, the key `read_reflection` already uses.
 ///
@@ -6789,6 +6785,7 @@ fn with_markdown_body(mut value: Value) -> Value {
     value
 }
 
+/// `files` on a remote read answer, left out when the read shows none.
 fn with_files(value: &mut Value, files: Vec<LinkedFile>) {
     if files.is_empty() {
         return;
@@ -7658,11 +7655,50 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
     }
 }
 
+/// The domain an agent tool call names, for its log line: `domain`, or the
+/// `domains` list joined with commas when there is no `domain` (`reflect`,
+/// `evolve_engrams`), or nothing.
+fn logged_domain(args: Option<&serde_json::Map<String, Value>>) -> String {
+    let Some(args) = args else {
+        return String::new();
+    };
+    if let Some(domain) = args.get("domain").and_then(Value::as_str) {
+        return domain.to_string();
+    }
+    args.get("domains")
+        .and_then(Value::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// The agent tool-call log names the one `domain`, or the `domains` list
+    /// of `reflect` and `evolve_engrams` when there is no `domain`.
+    #[test]
+    fn the_agent_call_log_names_domains_when_there_is_no_domain() {
+        let args = |v: Value| v.as_object().cloned().unwrap();
+        assert_eq!(
+            logged_domain(Some(&args(serde_json::json!({"domain": "a"})))),
+            "a"
+        );
+        assert_eq!(
+            logged_domain(Some(&args(serde_json::json!({"domains": ["a", "b"]})))),
+            "a,b"
+        );
+        assert_eq!(logged_domain(Some(&args(serde_json::json!({})))), "");
+        assert_eq!(logged_domain(None), "");
+    }
 
     /// A caller of `scope` with `account` and `client` as a door resolves
     /// them.
