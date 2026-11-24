@@ -2,8 +2,11 @@
  * The lines under a Reflection page's title about how it keeps itself
  * current (design 2.1 to 2.3):
  *
- * - "Follows: PACT.md > Architecture overview": the pacts the page follows,
- *   top down, each step a link;
+ * - "Pacts: PACT.md > overview.pact.md > db.pact.md": the pact files that
+ *   apply to the page, in the server's order (`page.pacts`): `PACT.md`, the
+ *   pact of each page up its chain, then its own pact, each only while its
+ *   file exists (no line when none does). Each step is named by its file
+ *   name and links to the pact file;
  * - "Part of: Architecture overview" for a page another page owns;
  * - the freshness line from the page clock (`reflectionClock.ts`), in the
  *   warning colour while the page is overdue, with the hint when the loop
@@ -19,7 +22,6 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 
 import type { PageClock, PageView } from "../api/reflectionPage";
-import { PACT_PATH } from "../api/reflectionDomains";
 import { reflectionPageRoute } from "../paths";
 import {
   freshnessLine,
@@ -29,6 +31,11 @@ import {
 import { CHROME_LINK, FOCUS_RING } from "./primitives";
 
 const STEP = `rounded underline-offset-[3px] ${CHROME_LINK} ${FOCUS_RING}`;
+
+/** The last part of a path: `arch/overview.pact.md` reads `overview.pact.md`. */
+function fileName(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
 
 export function ReflectionPageStatus({
   domain,
@@ -71,20 +78,19 @@ export function ReflectionPageStatus({
       data-testid="page-status"
       className="flex flex-col gap-0.5 text-sm text-ink-3 select-none print:hidden"
     >
-      <p>
-        Follows:{" "}
-        <Link to={reflectionPageRoute(domain, PACT_PATH)} className={STEP}>
-          PACT.md
-        </Link>
-        {page.chain.map((step) => (
-          <span key={step.path}>
-            {" > "}
-            <Link to={reflectionPageRoute(domain, step.path)} className={STEP}>
-              {step.title}
-            </Link>
-          </span>
-        ))}
-      </p>
+      {page.pacts.length > 0 && (
+        <p>
+          Pacts:{" "}
+          {page.pacts.map((pact, index) => (
+            <span key={pact}>
+              {index > 0 && " > "}
+              <Link to={reflectionPageRoute(domain, pact)} className={STEP}>
+                {fileName(pact)}
+              </Link>
+            </span>
+          ))}
+        </p>
+      )}
       {page.owner !== null && page.retired === null && (
         <p>
           Part of:{" "}

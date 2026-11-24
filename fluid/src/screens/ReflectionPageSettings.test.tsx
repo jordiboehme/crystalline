@@ -1,8 +1,10 @@
 /**
  * A Reflection page's life beside its text (design 4): the status lines
- * under the title, the details column with the page settings, the page
- * pact, retire, restore and delete, the retired banner, and the clock that
- * decides when the text is read again.
+ * under the title (the pacts that apply, the clock), the details column
+ * with its read-only view of the page settings and the form behind Edit,
+ * the page pact, retire from the More actions menu, restore and delete on
+ * the retired banner, and the clock that decides when the text is read
+ * again.
  */
 
 import { screen, waitFor, within } from "@testing-library/react";
@@ -155,20 +157,33 @@ async function details(): Promise<HTMLElement> {
   return screen.findByRole("complementary", { name: "Page details" });
 }
 
+/** Opens the settings form behind Edit and returns it. */
+async function edit(panel: HTMLElement): Promise<HTMLElement> {
+  await userEvent.click(
+    await within(panel).findByRole("button", { name: "Edit page settings" }),
+  );
+  return within(panel).getByRole("form", { name: "Page settings" });
+}
+
+/** Opens the page's More actions menu. */
+async function moreActions(): Promise<void> {
+  await userEvent.click(
+    await screen.findByRole("button", { name: "More actions" }),
+  );
+}
+
 describe("the status lines under the title", () => {
-  it("say the pacts the page follows, each a link, and its clock", async () => {
+  it("say the pacts that apply, each a link to its file, and the clock", async () => {
     serve("read");
     renderApp(URL);
     const status = await screen.findByTestId("page-status");
-    expect(status).toHaveTextContent(
-      "Follows: PACT.md > Architecture overview",
-    );
+    expect(status).toHaveTextContent("Pacts: PACT.md > overview.pact.md");
     expect(
       within(status).getByRole("link", { name: "PACT.md" }),
     ).toHaveAttribute("href", "/d/eng/reflection/PACT.md");
     expect(
-      within(status).getByRole("link", { name: "Architecture overview" }),
-    ).toHaveAttribute("href", "/d/eng/reflection/arch/overview.md");
+      within(status).getByRole("link", { name: "overview.pact.md" }),
+    ).toHaveAttribute("href", "/d/eng/reflection/arch/overview.pact.md");
     expect(
       await within(status).findByText(
         "Last checked 2 hours ago, due again in 1 hour",
@@ -184,9 +199,31 @@ describe("the status lines under the title", () => {
     const status = await screen.findByTestId("page-status");
     expect(status.closest("header")).not.toBeNull();
     expect(status.closest("article")).toBeNull();
+    expect(status).toHaveTextContent("Pacts: PACT.md > overview.pact.md");
+  });
+
+  it("end with the page's own pact once it exists", async () => {
+    serve("read", {
+      [DOC]: () =>
+        doc(
+          view({
+            pacts: [
+              "PACT.md",
+              "arch/overview.pact.md",
+              "arch/overview/db.pact.md",
+            ],
+            pact: { path: "arch/overview/db.pact.md", exists: true },
+          }),
+        ),
+    });
+    renderApp(URL);
+    const status = await screen.findByTestId("page-status");
     expect(status).toHaveTextContent(
-      "Follows: PACT.md > Architecture overview",
+      "Pacts: PACT.md > overview.pact.md > db.pact.md",
     );
+    expect(
+      within(status).getByRole("link", { name: "db.pact.md" }),
+    ).toHaveAttribute("href", "/d/eng/reflection/arch/overview/db.pact.md");
   });
 
   it("say since when an overdue page is overdue, in the warning colour, with the loop hint", async () => {
@@ -285,8 +322,10 @@ describe("the page details column", () => {
     expect(within(panel).getByText("Freshness").nextSibling).toHaveTextContent(
       /^1 day$/,
     );
-    expect(within(panel).getByText("Not set")).toBeVisible();
-    expect(within(panel).getByText("None")).toBeVisible();
+    expect(within(panel).getByText("No page, only PACT.md")).toBeVisible();
+    expect(within(panel).getByText("Page pact").nextSibling).toHaveTextContent(
+      /^None$/,
+    );
     expect(within(panel).queryByRole("button")).toBeNull();
     expect(within(panel).queryByRole("combobox")).toBeNull();
     // The section is named once, by its heading.
@@ -332,12 +371,12 @@ describe("the page details column", () => {
       }),
     });
     renderApp(URL);
-    const panel = await details();
+    const panel = await edit(await details());
     await userEvent.selectOptions(
       within(panel).getByRole("combobox", { name: "Freshness" }),
       "custom",
     );
-    const save = within(panel).getByRole("button", { name: "Save settings" });
+    const save = within(panel).getByRole("button", { name: "Save" });
     expect(save).toHaveAttribute("aria-disabled", "true");
     await userEvent.type(
       within(panel).getByRole("textbox", { name: "Custom freshness" }),
@@ -358,8 +397,8 @@ describe("the page details column", () => {
       }),
     });
     renderApp(URL);
-    const panel = await details();
-    const save = within(panel).getByRole("button", { name: "Save settings" });
+    const panel = await edit(await details());
+    const save = within(panel).getByRole("button", { name: "Save" });
     expect(save).toHaveAttribute("aria-disabled", "true");
     await userEvent.selectOptions(
       within(panel).getByRole("combobox", { name: "Freshness" }),
@@ -384,7 +423,7 @@ describe("the page details column", () => {
       }),
     });
     renderApp(URL);
-    const panel = await details();
+    const panel = await edit(await details());
     const follows = within(panel).getByRole("combobox", { name: "Follows" });
     // The pages of the domain, but neither the page itself nor a retired one.
     await waitFor(() => {
@@ -398,10 +437,11 @@ describe("the page details column", () => {
     expect(
       within(follows).queryByRole("option", { name: "Database" }),
     ).toBeNull();
+    expect(
+      within(follows).getByRole("option", { name: "No page, only PACT.md" }),
+    ).toHaveValue("");
     await userEvent.selectOptions(follows, "");
-    await userEvent.click(
-      within(panel).getByRole("button", { name: "Save settings" }),
-    );
+    await userEvent.click(within(panel).getByRole("button", { name: "Save" }));
     await waitFor(() => {
       expect(sent("PATCH", "/domains/eng/reflection/settings")).toEqual([
         { path: PAGE, follows: "" },
@@ -420,7 +460,7 @@ describe("the page details column", () => {
       },
     });
     renderApp(URL);
-    const panel = await details();
+    const panel = await edit(await details());
     await userEvent.selectOptions(
       within(panel).getByRole("combobox", { name: "Freshness" }),
       "custom",
@@ -430,12 +470,12 @@ describe("the page details column", () => {
     });
     expect(custom).toHaveAccessibleDescription(/m means months, not minutes/);
     await userEvent.type(custom, "0h");
-    await userEvent.click(
-      within(panel).getByRole("button", { name: "Save settings" }),
-    );
+    await userEvent.click(within(panel).getByRole("button", { name: "Save" }));
     expect(await within(panel).findByRole("alert")).toHaveTextContent(
       "freshness '0h' is shorter than 1 hour",
     );
+    // A refusal keeps the form open, with what was typed.
+    expect(custom).toHaveValue("0h");
   });
 
   it("has no freshness control on an owned page", async () => {
@@ -453,7 +493,7 @@ describe("the page details column", () => {
         ),
     });
     renderApp(URL);
-    const panel = await details();
+    const panel = await edit(await details());
     expect(
       within(panel).getByRole("combobox", { name: "Follows" }),
     ).toBeVisible();
@@ -486,11 +526,100 @@ describe("the page details column", () => {
     });
     renderApp(URL);
     expect(
-      within(await details()).getByRole("link", { name: "Open the page pact" }),
+      within(await details()).getByRole("link", { name: "db.pact.md" }),
     ).toHaveAttribute("href", "/d/eng/reflection/arch/overview/db.pact.md");
   });
 
-  it("retires a page for a curator", async () => {
+  it("shows the settings to a curator behind Edit, and Cancel and Escape go back to the view", async () => {
+    serve("curate");
+    renderApp(URL);
+    const panel = await details();
+    expect(within(panel).queryByRole("combobox")).toBeNull();
+    const form = await edit(panel);
+    await userEvent.selectOptions(
+      within(form).getByRole("combobox", { name: "Freshness" }),
+      "6h",
+    );
+    await userEvent.click(within(form).getByRole("button", { name: "Cancel" }));
+    expect(within(panel).queryByRole("form")).toBeNull();
+    expect(within(panel).getByText("Freshness").nextSibling).toHaveTextContent(
+      /^1 day$/,
+    );
+    expect(
+      within(panel).getByRole("button", { name: "Edit page settings" }),
+    ).toHaveFocus();
+    // The form starts again from the stored settings.
+    const again = await edit(panel);
+    expect(
+      within(again).getByRole("combobox", { name: "Freshness" }),
+    ).toHaveValue("1d");
+    await userEvent.keyboard("{Escape}");
+    expect(within(panel).queryByRole("form")).toBeNull();
+    expect(
+      within(panel).getByRole("button", { name: "Edit page settings" }),
+    ).toHaveFocus();
+    expect(sent("PATCH", "/domains/eng/reflection/settings")).toEqual([]);
+  });
+
+  it("shows the saved settings after Save, with the focus back on Edit", async () => {
+    let freshness = "1d";
+    serve("curate", {
+      [DOC]: () => doc(view({ freshness })),
+      "/domains/eng/reflection/settings": () => {
+        freshness = "6h";
+        return {
+          domain: "eng",
+          path: PAGE,
+          checksum: "c2",
+          page: view({ freshness }),
+        };
+      },
+    });
+    renderApp(URL);
+    const panel = await details();
+    const form = await edit(panel);
+    await userEvent.selectOptions(
+      within(form).getByRole("combobox", { name: "Freshness" }),
+      "6h",
+    );
+    await userEvent.click(within(form).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(within(panel).queryByRole("form")).toBeNull();
+    });
+    expect(within(panel).getByText("Freshness").nextSibling).toHaveTextContent(
+      /^6 hours$/,
+    );
+    expect(
+      within(panel).getByRole("button", { name: "Edit page settings" }),
+    ).toHaveFocus();
+  });
+
+  it("offers no Edit on a retired page", async () => {
+    serve("curate", {
+      [DOC]: () =>
+        doc(view({ retired: { at: null, by: null, was_owned_by: null } })),
+      "/domains/eng/reflection/clock": () => ({ clock: null, checksum: "c1" }),
+    });
+    renderApp(URL);
+    await screen.findByRole("note", { name: "Retired" });
+    expect(
+      within(await details()).queryByRole("button", {
+        name: "Edit page settings",
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps no lifecycle buttons in the column", async () => {
+    serve("curate");
+    renderApp(URL);
+    const panel = await details();
+    await within(panel).findByRole("button", { name: "Edit page settings" });
+    for (const name of ["Retire", "Restore", "Delete"]) {
+      expect(within(panel).queryByRole("button", { name })).toBeNull();
+    }
+  });
+
+  it("retires a page for a curator from the More actions menu", async () => {
     serve("curate", {
       "/domains/eng/reflection/retire": () => ({
         domain: "eng",
@@ -499,9 +628,9 @@ describe("the page details column", () => {
       }),
     });
     renderApp(URL);
-    await userEvent.click(
-      within(await details()).getByRole("button", { name: "Retire" }),
-    );
+    await details();
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Retire" }));
     await waitFor(() => {
       expect(sent("POST", "/domains/eng/reflection/retire")).toEqual([
         { path: PAGE },
@@ -509,7 +638,35 @@ describe("the page details column", () => {
     });
   });
 
-  it("hands focus to the new button after a retire and after a restore from the banner", async () => {
+  it("offers Retire in the menu only to a curator who may change the page", async () => {
+    serve("edit");
+    const first = renderApp(URL);
+    await details();
+    await moreActions();
+    expect(screen.getByRole("menuitem", { name: "Move" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Retire" })).toBeNull();
+    await userEvent.keyboard("{Escape}");
+    first.unmount();
+    serve("curate", {}, { readOnly: true });
+    const second = renderApp(URL);
+    await details();
+    await moreActions();
+    expect(screen.queryByRole("menuitem", { name: "Retire" })).toBeNull();
+    await userEvent.keyboard("{Escape}");
+    second.unmount();
+    serve("curate", {
+      [DOC]: () =>
+        doc(view({ retired: { at: null, by: null, was_owned_by: null } })),
+      "/domains/eng/reflection/clock": () => ({ clock: null, checksum: "c1" }),
+    });
+    renderApp(URL);
+    await screen.findByRole("note", { name: "Retired" });
+    await moreActions();
+    expect(screen.getByRole("menuitem", { name: "Move" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Retire" })).toBeNull();
+  });
+
+  it("hands focus to the banner's Restore after a retire, and to More actions after a restore", async () => {
     let retired = false;
     serve("curate", {
       [DOC]: () =>
@@ -529,16 +686,15 @@ describe("the page details column", () => {
       },
     });
     renderApp(URL);
-    const panel = await details();
-    await userEvent.click(
-      within(panel).getByRole("button", { name: "Retire" }),
-    );
+    await details();
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Retire" }));
+    const banner = await screen.findByRole("note", { name: "Retired" });
     await waitFor(() => {
       expect(
-        within(panel).getByRole("button", { name: "Restore" }),
+        within(banner).getByRole("button", { name: "Restore" }),
       ).toHaveFocus();
     });
-    const banner = screen.getByRole("note", { name: "Retired" });
     await userEvent.click(
       within(banner).getByRole("button", { name: "Restore" }),
     );
@@ -547,28 +703,26 @@ describe("the page details column", () => {
     });
     await waitFor(() => {
       expect(
-        within(panel).getByRole("button", { name: "Retire" }),
+        screen.getByRole("button", { name: "More actions" }),
       ).toHaveFocus();
     });
   });
 
-  it("deletes only on the second press, and keeps the page on Keep", async () => {
+  it("deletes from the menu only on the second press, and keeps the page on Keep", async () => {
     serve("curate");
     renderApp(URL);
-    const panel = await details();
-    await userEvent.click(
-      within(panel).getByRole("button", { name: "Delete" }),
-    );
-    await userEvent.click(within(panel).getByRole("button", { name: "Keep" }));
+    await details();
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    await userEvent.click(screen.getByRole("button", { name: "Keep" }));
     expect(
       apiMock.mock.calls.some(([, init]) => init?.method === "DELETE"),
     ).toBe(false);
-    expect(within(panel).getByRole("button", { name: "Delete" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "More actions" })).toHaveFocus();
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
     await userEvent.click(
-      within(panel).getByRole("button", { name: "Delete" }),
-    );
-    await userEvent.click(
-      within(panel).getByRole("button", { name: "Confirm delete" }),
+      screen.getByRole("button", { name: "Confirm delete" }),
     );
     await waitFor(() => {
       expect(

@@ -26,7 +26,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Download, FolderInput, Layers, Trash2 } from "lucide-react";
+import { Archive, Download, FolderInput, Layers, Trash2 } from "lucide-react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
@@ -60,6 +60,7 @@ import {
 import {
   fetchReflectionClock,
   reflectionClockKey,
+  retireReflection,
 } from "../api/reflectionPage";
 import { useAuth } from "../auth/AuthContext";
 import { AttachmentsSection } from "../components/AttachmentsSection";
@@ -128,7 +129,8 @@ const PAGE_CHANGED = "The page changed. Try again.";
 
 /**
  * How long a retire or a restore waits for the page to show its new state
- * before the focus it would hand on lapses.
+ * before the focus it would hand on (to the banner's Restore after a
+ * retire, to the More actions button after a restore) lapses.
  */
 const LIFECYCLE_FOCUS_LAPSE_MS = 10_000;
 
@@ -322,21 +324,30 @@ function PageBody({
 }): ReactElement {
   const [deleted, setDeleted] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
-  // After a retire or a restore: the retired state the page will show, so
-  // the details column hands the focus to its new button once it does. It
-  // lapses when the page never shows that state in time, and goes with the
-  // page, so a later change cannot pull the focus away from the person.
+  // After a retire or a restore: the retired state the page will show.
+  // Once it does, a retire hands the focus to the banner's Restore and a
+  // restore (the banner and its button gone) to the More actions button,
+  // where Retire lives. It lapses when the page never shows that state in
+  // time, and goes with the page, so a later change cannot pull the focus
+  // away from the person.
   const [lifecycleFocus, setLifecycleFocus] = useLapsingState<boolean>(
     LIFECYCLE_FOCUS_LAPSE_MS,
   );
   const lifecycleFocused = useCallback(() => {
     setLifecycleFocus(null);
   }, [setLifecycleFocus]);
+  const restored = useCallback(() => {
+    setLifecycleFocus(false);
+  }, [setLifecycleFocus]);
   useEffect(() => {
     setLifecycleFocus(null);
   }, [domain, path, setLifecycleFocus]);
   const moreRef = useRef<HTMLButtonElement | null>(null);
   const skipRefocus = useRef(false);
+  // Retire starts once the menu has closed and handed the focus back to its
+  // button, so the focus the retire hands to the banner's Restore cannot be
+  // taken back by the menu.
+  const retireOnClose = useRef(false);
   const confirmRef = useRef<HTMLDivElement | null>(null);
   const doc = useQuery({
     queryKey: reflectionDocKey(domain, path),
@@ -394,6 +405,23 @@ function PageBody({
       });
     },
   });
+  const retire = useMutation({
+    mutationFn: () => retireReflection(domain, path),
+    onSuccess: () => {
+      setLifecycleFocus(true);
+      invalidateReflection(queryClient, domain);
+    },
+  });
+  const pageRetired =
+    doc.data?.page === undefined || doc.data.page === null
+      ? null
+      : doc.data.page.retired !== null;
+  useEffect(() => {
+    if (lifecycleFocus === false && pageRetired === false) {
+      moreRef.current?.focus();
+      setLifecycleFocus(null);
+    }
+  }, [lifecycleFocus, pageRetired, setLifecycleFocus]);
   const articleRef = useRef<HTMLElement | null>(null);
   /*
    * A task box ticked on the page: the whole page as the GET answered it
@@ -623,6 +651,13 @@ function PageBody({
       </>
     );
   const movable = atLeast(right, "edit") && path !== PACT_PATH;
+  // Retire is a curator's change to the page's settings, on a page that is
+  // not retired yet; Restore is on the retired banner.
+  const retirable =
+    curate &&
+    settingsLocked === undefined &&
+    page.page !== null &&
+    page.page.retired === null;
   // A Reflection page has no `crystalline://` name: on paper it is known by
   // its page in this app.
   const address = absoluteUrl(reflectionPageRoute(domain, path));
@@ -663,13 +698,20 @@ function PageBody({
                 <EditLink to={reflectionEditRoute(domain, path)} />
               )}
               {/*
-              Print view for every reader. Move and Delete are curate verbs
-              and rare ones, so they sit under a rule, Delete in red; the
-              pact can be neither moved nor deleted.
+              Print view for every reader. Move, Retire and Delete are rare
+              changes, so they sit under a rule, Retire and Delete in red;
+              the pact can be neither moved nor deleted, and only a page
+              with page settings can be retired.
             */}
               <MoreActions
                 triggerRef={moreRef}
                 onCloseAutoFocus={(event) => {
+                  if (retireOnClose.current) {
+                    retireOnClose.current = false;
+                    if (!retire.isPending) {
+                      retire.mutate();
+                    }
+                  }
                   // Delete hands focus to its confirmation, not back here.
                   if (skipRefocus.current) {
                     skipRefocus.current = false;
@@ -690,16 +732,28 @@ function PageBody({
                     window.print();
                   }}
                 />
+                {(movable || retirable) && <ActionSeparator />}
+                {movable && (
+                  <ActionItem
+                    label="Move"
+                    icon={FolderInput}
+                    onSelect={() => {
+                      onMove(page.title);
+                    }}
+                  />
+                )}
+                {retirable && (
+                  <ActionItem
+                    label="Retire"
+                    icon={Archive}
+                    destructive
+                    onSelect={() => {
+                      retireOnClose.current = true;
+                    }}
+                  />
+                )}
                 {movable && (
                   <>
-                    <ActionSeparator />
-                    <ActionItem
-                      label="Move"
-                      icon={FolderInput}
-                      onSelect={() => {
-                        onMove(page.title);
-                      }}
-                    />
                     <ActionItem
                       label="Delete"
                       icon={Trash2}
@@ -742,6 +796,14 @@ function PageBody({
               {problemDetail(remove.error)}
             </p>
           )}
+          {retire.error && (
+            <p
+              role="alert"
+              className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+            >
+              {problemDetail(retire.error)}
+            </p>
+          )}
           {!ownTitle && <h1 className="text-display">{page.title}</h1>}
           {!ownTitle && metaLine !== "" && (
             <p className="text-sm text-ink-3">{metaLine}</p>
@@ -766,7 +828,9 @@ function PageBody({
               remove.mutate();
             }}
             deleting={remove.isPending}
-            onLifecycleChanged={setLifecycleFocus}
+            focusRestore={lifecycleFocus === true}
+            onRestoreFocused={lifecycleFocused}
+            onRestored={restored}
           />
         )}
         {tickProblem !== null && (
@@ -845,13 +909,6 @@ function PageBody({
             page={page.page}
             curator={curate}
             lockedReason={settingsLocked}
-            onDelete={() => {
-              remove.mutate();
-            }}
-            deleting={remove.isPending}
-            focusWhenRetired={lifecycleFocus}
-            onLifecycleChanged={setLifecycleFocus}
-            onLifecycleFocused={lifecycleFocused}
           />
         )}
         <ReflectionThreads
