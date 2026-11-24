@@ -730,7 +730,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "reflection.backup_sources",
-            doc: "What happens to a page backed up to GitHub that cites a domain some reader of its repository may not read (a local or virtual domain, or another repository): full (default) backs it up like any other page, hold_back serves it here but leaves it out of the backup, refuse refuses the write. With full, text drawn from other domains reaches everyone who may read the page's repository, the whole internet for a public one; hold_back and refuse are the stricter choices",
+            doc: "What happens to a page backed up to GitHub that cites a domain some reader of its repository may not read (a local or virtual domain, or another repository): full (default) backs it up like any other page, hold_back serves it here but leaves it out of the backup, refuse refuses the write. With full, text drawn from other domains reaches everyone who may read the page's repository, the whole internet for a public one, and so do an unattended run's thread answers and engram writes, which may draw on those domains too; switching away from full takes such a page off the branch head, but the branch history keeps it. hold_back and refuse are the stricter choices, and under both an unattended run reads no such domain",
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
@@ -3338,7 +3338,7 @@ mod tests {
     #[test]
     fn the_agent_snapshot_and_the_agent_unknown_key_error_name_no_operator_key() {
         let views = agent_snapshot(&GlobalConfig::default(), &EnvOverlay::default());
-        assert_eq!(views.len(), 20);
+        assert_eq!(views.len(), 18);
         assert!(views.iter().all(|v| !is_operator_key(&v.key)));
         assert!(views.iter().any(|v| v.key == "github.enabled"));
         assert!(views.iter().any(|v| v.key == "service.response_format"));
@@ -3548,8 +3548,8 @@ mod tests {
         unset(&mut cfg, "reflection.cite_shared").unwrap();
         unset(&mut cfg, "reflection.backup_sources").unwrap();
         assert_eq!(cfg.reflection, None);
-        assert!(!is_operator_key("reflection.cite_shared"));
-        assert!(!is_operator_key("reflection.backup_sources"));
+        assert!(is_operator_key("reflection.cite_shared"));
+        assert!(is_operator_key("reflection.backup_sources"));
     }
 
     #[test]
