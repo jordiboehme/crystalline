@@ -1752,6 +1752,28 @@ async fn nothing_of_the_agent_is_left(fx: &Case, path: &str) {
     );
 }
 
+/// The drafts of a live agent are not ended by the way out for a removed
+/// account's name: that is refused and names `agents remove`, which ends
+/// them with the agent. The draft stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_agents_drafts_are_not_ended_as_a_removed_accounts() {
+    let fx = case_for_agents(App::Ready, None).await;
+    agent_with_a_draft(&fx).await;
+    let (status, body) = as_root(
+        &fx,
+        reqwest::Method::DELETE,
+        &format!("/api/v1/users/{AGENT}/drafts"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body.contains(&format!("crystalline agents remove {AGENT}")),
+        "{body}"
+    );
+    assert!(!fx.eng.account_drafts(AGENT).await.unwrap().is_empty());
+}
+
 /// Removing an agent over the JSON API ends its drafts, their folder and their
 /// links, unlike removing a person, and its name can be used again at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

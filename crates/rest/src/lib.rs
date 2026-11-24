@@ -63,6 +63,7 @@ use crystalline_engine::pending;
 mod reflection_pages;
 mod reflections;
 mod users_api;
+pub use users_api::live_agent_drafts;
 
 use std::sync::Arc;
 

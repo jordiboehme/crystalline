@@ -1368,7 +1368,7 @@ pub async fn remove(
         ),
         (
             status = 409,
-            description = "The name has an account, or is the machine owner's.",
+            description = "The name has an account or a live agent, or is the machine owner's.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1388,6 +1388,9 @@ pub async fn discard_drafts(
             "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
         )));
     }
+    if state.auth.agent(&account).await?.is_some() {
+        return Err(ApiError::conflict(live_agent_drafts(&account)));
+    }
     match state
         .engine
         .discard_account_drafts(&account, caller.name())
@@ -1397,6 +1400,14 @@ pub async fn discard_drafts(
         Err(crate::engine::EngineError::Conflict(sentence)) => Err(ApiError::conflict(sentence)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The refusal of ending the drafts of `name`, a live agent: they go with
+/// the agent when it is removed.
+pub fn live_agent_drafts(name: &str) -> String {
+    format!(
+        "'{name}' is an agent, and its drafts go with it: remove the agent with crystalline agents remove {name} (or in Administration > Agents), which ends them; this is for a name whose account or agent was removed"
+    )
 }
 
 /// `DELETE /users/{name}/github-link` - unlink another account from GitHub.

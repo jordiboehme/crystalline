@@ -14092,7 +14092,7 @@
             }
           },
           "409": {
-            "description": "The name has an account, or is the machine owner's.",
+            "description": "The name has an account or a live agent, or is the machine owner's.",
             "content": {
               "application/problem+json": {
                 "schema": {

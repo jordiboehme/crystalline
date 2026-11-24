@@ -422,6 +422,9 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                     "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
                 );
             }
+            if store.agent(&name).await?.is_some() {
+                bail!(crystalline_service::rest::live_agent_drafts(&account));
+            }
             let report = crystalline_service::client::discard_account_drafts(&account).await?;
             if json {
                 println!("{report}");

@@ -11002,7 +11002,7 @@ export type DiscardUserDraftsErrors = {
      */
     403: ProblemDetail;
     /**
-     * The name has an account, or is the machine owner's.
+     * The name has an account or a live agent, or is the machine owner's.
      */
     409: ProblemDetail;
 };
