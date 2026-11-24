@@ -4859,9 +4859,11 @@ impl Engine {
 
     /// The pages of `domain` its last backup held back, sorted: each cites
     /// a domain fewer people may read than `domain` (a `source_too_wide`
-    /// item in the queue), so it stays off the backup branch, whose head
-    /// loses the copy it had, until a curator settles it. Empty when nothing
-    /// was held back or no backup ran.
+    /// item in the queue) or, under `reflection.backup_sources: hold_back`,
+    /// one the readers of its repository may not read (no queue item: the
+    /// page is fine here), so it stays off the backup branch, whose head
+    /// loses the copy it had, until a curator settles it or the setting
+    /// changes. Empty when nothing was held back or no backup ran.
     pub fn reflection_backup_held_back(&self, domain: &str) -> Vec<String> {
         self.backup_held
             .lock()
@@ -5011,7 +5013,7 @@ impl Engine {
                         if before != held_pages {
                             tracing::warn!(
                                 domain = %domain,
-                                "reflection backup: held back {} because they cite a domain fewer people may read; they go out once a curator settles them",
+                                "reflection backup: held back {} because they cite a domain fewer people may read than the page or its repository (see reflection.backup_sources); they go out once a curator settles them or the setting lets them",
                                 held_pages.join(", ")
                             );
                         }

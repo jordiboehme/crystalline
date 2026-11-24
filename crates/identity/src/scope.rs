@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
+pub use crystalline_core::config::CiteShared;
 
 use crate::auth_store::{
     AgentLoops, AuthStore, DomainAcl, GithubLink, MemberLevel, ReflectionLevel, Role,
@@ -1905,10 +1906,11 @@ impl DomainAccess {
     ///   knowledge `none` whose instance Reflection level is reader or
     ///   contributor, and every account created later. Its engrams are read
     ///   by the same, less the accounts at instance knowledge `none`. So a
-    ///   shared page never covers a private source, and covers another
-    ///   shared domain only while no enabled account at instance knowledge
-    ///   `none` has an instance Reflection level (an account created later
-    ///   with one is caught by the queue, which asks again on every scan);
+    ///   shared page never covers a private source. With `cite` at
+    ///   [`CiteShared::Off`] it covers another shared domain only while no
+    ///   enabled account at instance knowledge `none` has an instance
+    ///   Reflection level (an account created later with one is caught by
+    ///   the queue, which asks again on every scan);
     /// * a private domain's Reflection is read by its owner, every instance
     ///   admin, every member at knowledge viewer or more, and every member at
     ///   knowledge `none` whose Reflection level on it is reader or
@@ -1918,6 +1920,16 @@ impl DomainAccess {
     ///   of its readers also reads the source's engrams;
     /// * the machine owner and the instance admins read everything, so they
     ///   never make a difference.
+    ///
+    /// With `cite` at [`CiteShared::On`] (the default of
+    /// `reflection.cite_shared`) a page reader who does not read the page's
+    /// own engrams (a Reflection-only reader: an account at knowledge `none`
+    /// with a Reflection level, or a Reflection collaborator) is not counted
+    /// against a shared source: the page is a curated view meant for them.
+    /// So a shared page covers every other shared domain here that is not
+    /// closed, and a private page covers a shared domain every reader of its
+    /// engrams reads. A private source is held to every reader as before,
+    /// and so is the anonymous half below.
     ///
     /// On a domain GitHub governs, the owner and the membership rows are not
     /// read:
@@ -1935,8 +1947,8 @@ impl DomainAccess {
     ///
     /// A page always covers its own domain. Read fresh on every call, so a
     /// membership change counts at once.
-    pub async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
-        self.cover(page, source, None).await
+    pub async fn readers_cover(&self, page: &str, source: &str, cite: CiteShared) -> Result<bool> {
+        self.cover(page, source, None, cite).await
     }
 
     /// Who reads a Reflection page of domain `page` right now, as a person's
@@ -2012,10 +2024,11 @@ impl DomainAccess {
         page: &str,
         source: &str,
         confirmed: &PageReaders,
+        cite: CiteShared,
     ) -> Result<bool> {
         match confirmed {
             PageReaders::Everyone => Ok(true),
-            PageReaders::Accounts(names) => self.cover(page, source, Some(names)).await,
+            PageReaders::Accounts(names) => self.cover(page, source, Some(names), cite).await,
         }
     }
 
@@ -2026,6 +2039,7 @@ impl DomainAccess {
         page: &str,
         source: &str,
         confirmed: Option<&std::collections::BTreeSet<String>>,
+        cite: CiteShared,
     ) -> Result<bool> {
         if page.trim() == source.trim() {
             return Ok(true);
@@ -2092,6 +2106,14 @@ impl DomainAccess {
             let (level, _, github) = source_side.inputs(name);
             decide(principal, source_acl.as_ref(), level, github) >= DomainRight::Read
         };
+        // Who reads the page's own engrams. With `cite` on, a reader of the
+        // page who does not (a Reflection-only reader) is not counted
+        // against a shared source.
+        let skip_reflection_only = cite == CiteShared::On && source_acl.is_none();
+        let reads_page_engrams = |principal: &Principal, name: &str| {
+            let (level, _, github) = page_side.inputs(name);
+            decide(principal, page_acl.as_ref(), level, github) >= DomainRight::Read
+        };
         for user in self.auth.list_users().await? {
             if user.disabled {
                 continue;
@@ -2103,6 +2125,7 @@ impl DomainAccess {
             };
             if reads_page(&principal, &user.name)
                 && !reads_source(&principal, &user.name)
+                && !(skip_reflection_only && !reads_page_engrams(&principal, &user.name))
                 && !confirmed.is_some_and(|names| names.contains(&user.name))
             {
                 return Ok(false);
@@ -2553,10 +2576,30 @@ mod tests {
         let auth = store(&dir).await;
         covering(&auth).await;
         let access = DomainAccess::new(auth);
-        assert!(!access.readers_cover("shared", "lab").await.unwrap());
-        assert!(access.readers_cover("lab", "shared").await.unwrap());
-        assert!(access.readers_cover("shared", "other").await.unwrap());
-        assert!(access.readers_cover("lab", "lab").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("shared", "lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("lab", "shared", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("lab", "lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     /// A private page covers a private source exactly when every account
@@ -2569,17 +2612,37 @@ mod tests {
         let auth = store(&dir).await;
         covering(&auth).await;
         let access = DomainAccess::new(auth.clone());
-        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // vault gains a reader lab lacks: still covered.
         auth.upsert_domain_member("vault", "out", MemberLevel::Viewer, None, "keeper")
             .await
             .unwrap();
-        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // So a page in vault no longer covers lab.
-        assert!(!access.readers_cover("vault", "lab").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("vault", "lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // A disabled account reads nothing, so it is nobody's reader.
         auth.set_disabled("out", true).await.unwrap();
-        assert!(access.readers_cover("vault", "lab").await.unwrap());
+        assert!(
+            access
+                .readers_cover("vault", "lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     /// The page's readers are its Reflection's readers, the source's are its
@@ -2592,7 +2655,12 @@ mod tests {
         let auth = store(&dir).await;
         covering(&auth).await;
         let access = DomainAccess::new(auth.clone());
-        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         auth.upsert_domain_member(
             "lab",
             "ann",
@@ -2602,7 +2670,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // Given the same on vault, ann reads vault's Reflection and still no
         // engram there: a source is measured by who reads its engrams.
         auth.upsert_domain_member(
@@ -2614,12 +2687,22 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // As a viewer of vault she reads its engrams.
         auth.upsert_domain_member("vault", "ann", MemberLevel::Viewer, None, "keeper")
             .await
             .unwrap();
-        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     /// An account at instance knowledge `none` reads no shared domain unless
@@ -2637,13 +2720,23 @@ mod tests {
             .await
             .unwrap();
         let access = DomainAccess::new(auth.clone());
-        assert!(!access.readers_cover("lab", "shared").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "shared", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // An instance Reflection level lets nora read shared Reflections,
         // never a shared domain's engrams: still not covered.
         auth.set_reflection_level("nora", ReflectionLevel::Reader)
             .await
             .unwrap();
-        assert!(!access.readers_cover("lab", "shared").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "shared", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     /// A shared page is read by every account at instance knowledge `none`
@@ -2656,18 +2749,135 @@ mod tests {
         let auth = store(&dir).await;
         covering(&auth).await;
         let access = DomainAccess::new(auth.clone());
-        assert!(access.readers_cover("shared", "other").await.unwrap());
+        assert!(
+            access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         auth.add_user("nora", "nora", None, Role::None, "pw12345678")
             .await
             .unwrap();
         assert!(
-            access.readers_cover("shared", "other").await.unwrap(),
+            access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap(),
             "without a Reflection level nora reads neither"
         );
         auth.set_reflection_level("nora", ReflectionLevel::Reader)
             .await
             .unwrap();
-        assert!(!access.readers_cover("shared", "other").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// With `reflection.cite_shared` on, a Reflection-only reader (an
+    /// account at instance knowledge `none` with an instance Reflection
+    /// level) no longer keeps a shared page from covering another shared
+    /// domain. A private source stays out of reach.
+    #[tokio::test]
+    async fn cite_shared_on_lets_a_shared_page_cover_shared_past_reflection_only_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        auth.add_user("nora", "nora", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        auth.set_reflection_level("nora", ReflectionLevel::Reader)
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth.clone());
+        assert!(
+            !access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("shared", "other", CiteShared::On)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !access
+                .readers_cover("shared", "lab", CiteShared::On)
+                .await
+                .unwrap()
+        );
+        // A confirmation for named accounts never covers a page anonymous
+        // callers read, under either setting.
+        let confirmed = PageReaders::Accounts(["nora".to_string()].into_iter().collect());
+        assert!(
+            !access
+                .readers_cover_for("shared", "lab", &confirmed, CiteShared::On)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// With `reflection.cite_shared` on, a member of a private page's domain
+    /// at knowledge `none` with a Reflection level there does not keep the
+    /// page from covering a shared source. A member who reads the page's
+    /// engrams and not the shared domain's still does, and a private source
+    /// keeps the stricter rule.
+    #[tokio::test]
+    async fn cite_shared_on_lets_a_private_page_cover_shared_past_reflection_only_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        auth.add_user("rita", "rita", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        auth.upsert_domain_member(
+            "lab",
+            "rita",
+            MemberLevel::None,
+            Some(ReflectionLevel::Reader),
+            "keeper",
+        )
+        .await
+        .unwrap();
+        let access = DomainAccess::new(auth.clone());
+        assert!(
+            !access
+                .readers_cover("lab", "shared", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("lab", "shared", CiteShared::On)
+                .await
+                .unwrap()
+        );
+        // rita reads lab's Reflection and not vault's engrams: a private
+        // source is held to every reader of the page under either setting.
+        assert!(
+            !access
+                .readers_cover("lab", "vault", CiteShared::On)
+                .await
+                .unwrap()
+        );
+        // nora reads lab's engrams and no shared domain's: still not
+        // covered with the setting on.
+        auth.add_user("nora", "nora", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        auth.upsert_domain_member("lab", "nora", MemberLevel::Viewer, None, "keeper")
+            .await
+            .unwrap();
+        assert!(
+            !access
+                .readers_cover("lab", "shared", CiteShared::On)
+                .await
+                .unwrap()
+        );
     }
 
     /// Who reads a page is named for a confirmation: everyone for a shared
@@ -2708,11 +2918,16 @@ mod tests {
         auth.upsert_domain_member("lab", "ann", MemberLevel::Viewer, None, "keeper")
             .await
             .unwrap();
-        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         let confirmed = access.page_readers("lab").await.unwrap();
         assert!(
             access
-                .readers_cover_for("lab", "vault", &confirmed)
+                .readers_cover_for("lab", "vault", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -2720,7 +2935,7 @@ mod tests {
         auth.remove_domain_member("vault", "mem").await.unwrap();
         assert!(
             access
-                .readers_cover_for("lab", "vault", &confirmed)
+                .readers_cover_for("lab", "vault", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -2733,7 +2948,7 @@ mod tests {
             .unwrap();
         assert!(
             !access
-                .readers_cover_for("lab", "vault", &confirmed)
+                .readers_cover_for("lab", "vault", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -2741,7 +2956,7 @@ mod tests {
         auth.remove_domain_member("lab", "lee").await.unwrap();
         assert!(
             access
-                .readers_cover_for("lab", "vault", &confirmed)
+                .readers_cover_for("lab", "vault", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -2750,13 +2965,13 @@ mod tests {
             .unwrap();
         assert!(
             !access
-                .readers_cover_for("lab", "vault", &confirmed)
+                .readers_cover_for("lab", "vault", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
         assert!(
             access
-                .readers_cover_for("lab", "vault", &PageReaders::Everyone)
+                .readers_cover_for("lab", "vault", &PageReaders::Everyone, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -4688,8 +4903,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let governor = base_governor().close("gh-vault");
         let access = governed_access(&dir, governor).await;
-        assert!(!access.readers_cover("gh-open", "gh-vault").await.unwrap());
-        assert!(access.readers_cover("gh-vault", "gh-open").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("gh-open", "gh-vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("gh-vault", "gh-open", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5240,8 +5465,13 @@ mod tests {
             );
             for source in domains {
                 assert_eq!(
-                    plain.readers_cover(page, source).await.unwrap(),
-                    idle.readers_cover(page, source).await.unwrap(),
+                    plain
+                        .readers_cover(page, source, CiteShared::Off)
+                        .await
+                        .unwrap(),
+                    idle.readers_cover(page, source, CiteShared::Off)
+                        .await
+                        .unwrap(),
                     "{page} <- {source}"
                 );
                 for confirmed in [
@@ -5256,10 +5486,10 @@ mod tests {
                 ] {
                     assert_eq!(
                         plain
-                            .readers_cover_for(page, source, &confirmed)
+                            .readers_cover_for(page, source, &confirmed, CiteShared::Off)
                             .await
                             .unwrap(),
-                        idle.readers_cover_for(page, source, &confirmed)
+                        idle.readers_cover_for(page, source, &confirmed, CiteShared::Off)
                             .await
                             .unwrap(),
                         "{page} <- {source}, {confirmed:?}"
@@ -5334,10 +5564,25 @@ mod tests {
             .grant("ann", "gh-vault", MemberLevel::Viewer);
         let access = DomainAccess::new(auth.clone()).with_governor(Arc::new(governor));
         // gh-vault's readers include gh-lab's: covered one way only.
-        assert!(access.readers_cover("gh-lab", "gh-vault").await.unwrap());
-        assert!(!access.readers_cover("gh-vault", "gh-lab").await.unwrap());
+        assert!(
+            access
+                .readers_cover("gh-lab", "gh-vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !access
+                .readers_cover("gh-vault", "gh-lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // lab (keeper, mem) cites gh-lab (keeper, mem by GitHub): covered.
-        assert!(access.readers_cover("lab", "gh-lab").await.unwrap());
+        assert!(
+            access
+                .readers_cover("lab", "gh-lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // An old member row on gh-lab does not make ann a reader of it.
         auth.upsert_domain_member("gh-lab", "ann", MemberLevel::Viewer, None, "keeper")
             .await
@@ -5345,14 +5590,46 @@ mod tests {
         auth.upsert_domain_member("lab", "ann", MemberLevel::Viewer, None, "keeper")
             .await
             .unwrap();
-        assert!(!access.readers_cover("lab", "gh-lab").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "gh-lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // A shared page reached by anonymous callers never covers a shared
         // GitHub domain anonymous may not read.
-        assert!(!access.readers_cover("open", "gh-open").await.unwrap());
-        assert!(access.readers_cover("gh-open", "open").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("open", "gh-open", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("gh-open", "open", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !access
+                .readers_cover("open", "gh-open", CiteShared::On)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("gh-open", "open", CiteShared::On)
+                .await
+                .unwrap()
+        );
         let public =
             DomainAccess::new(auth).with_governor(Arc::new(base_governor().public("gh-open")));
-        assert!(public.readers_cover("open", "gh-open").await.unwrap());
+        assert!(
+            public
+                .readers_cover("open", "gh-open", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5409,22 +5686,48 @@ mod tests {
         );
         // Unknown on either side: not covered, whichever way the gap would
         // have pointed.
-        assert!(!access.readers_cover("gh-lab", "gh-vault").await.unwrap());
-        assert!(!access.readers_cover("gh-vault", "gh-lab").await.unwrap());
-        assert!(!access.readers_cover("gh-lab", "open").await.unwrap());
-        assert!(!access.readers_cover("lab", "gh-lab").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("gh-lab", "gh-vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !access
+                .readers_cover("gh-vault", "gh-lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !access
+                .readers_cover("gh-lab", "open", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !access
+                .readers_cover("lab", "gh-lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         assert!(
             !access
                 .readers_cover_for(
                     "gh-lab",
                     "gh-vault",
-                    &PageReaders::Accounts(std::iter::once("boss".to_string()).collect())
+                    &PageReaders::Accounts(std::iter::once("boss".to_string()).collect()),
+                    CiteShared::Off
                 )
                 .await
                 .unwrap()
         );
         // A page still covers its own domain.
-        assert!(access.readers_cover("gh-lab", "gh-lab").await.unwrap());
+        assert!(
+            access
+                .readers_cover("gh-lab", "gh-lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     /// The bulk screen and the per-domain answer agree on every governed
@@ -5505,10 +5808,15 @@ mod tests {
             ),
             "every enabled account at viewer or above, never instance none"
         );
-        assert!(!access.readers_cover("gh-open", "gh-lab").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("gh-open", "gh-lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         assert!(
             access
-                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .readers_cover_for("gh-open", "gh-lab", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -5523,7 +5831,7 @@ mod tests {
         );
         assert!(
             !public
-                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .readers_cover_for("gh-open", "gh-lab", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -5544,7 +5852,7 @@ mod tests {
         let confirmed = access.page_readers("gh-open").await.unwrap();
         assert!(
             access
-                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .readers_cover_for("gh-open", "gh-lab", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -5553,7 +5861,7 @@ mod tests {
             .unwrap();
         assert!(
             access
-                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .readers_cover_for("gh-open", "gh-lab", &confirmed, CiteShared::Off)
                 .await
                 .unwrap(),
             "an instance-none account reads no governed page"
@@ -5563,7 +5871,7 @@ mod tests {
             .unwrap();
         assert!(
             !access
-                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .readers_cover_for("gh-open", "gh-lab", &confirmed, CiteShared::Off)
                 .await
                 .unwrap(),
             "a later viewer reads the page and not the source"
@@ -5747,7 +6055,12 @@ mod tests {
             PageReaders::Accounts(names(&["boss"]).into_iter().collect())
         );
         // ann reads no lab engram and still keeps no page from covering it.
-        assert!(access.readers_cover("gh-lab", "lab").await.unwrap());
+        assert!(
+            access
+                .readers_cover("gh-lab", "lab", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     /// Ruling R23: instance knowledge `none` is how a Reflection-only
@@ -5775,7 +6088,12 @@ mod tests {
                 "the instance level alone: {domain}"
             );
         }
-        assert!(access.readers_cover("gh-lab", "gh-vault").await.unwrap());
+        assert!(
+            access
+                .readers_cover("gh-lab", "gh-vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         auth.set_reflection_grant("gh-open", "nora", ReflectionLevel::Contributor, "boss")
             .await
             .unwrap();
@@ -5807,8 +6125,47 @@ mod tests {
             panic!("no anonymous caller reads a private repository's page");
         };
         assert!(shared.contains("nora"), "{shared:?}");
-        assert!(!access.readers_cover("gh-lab", "gh-vault").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("gh-lab", "gh-vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // Closed stays with the admins (R22).
+        // nora reads gh-open's page by her grant and no engram anywhere:
+        // with cite_shared on she no longer keeps it from covering another
+        // shared domain, and a private source still needs her.
+        assert!(
+            !access
+                .readers_cover("gh-open", "open", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("gh-open", "open", CiteShared::On)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !access
+                .readers_cover("gh-lab", "gh-vault", CiteShared::On)
+                .await
+                .unwrap()
+        );
+        // A closed shared source covers nothing, whatever the setting:
+        // only the admins read it.
+        let shut = DomainAccess::new(auth.clone()).with_governor(Arc::new(
+            base_governor()
+                .grant("mem", "gh-lab", MemberLevel::Viewer)
+                .close("gh-open"),
+        ));
+        assert!(
+            !shut
+                .readers_cover("gh-lab", "gh-open", CiteShared::On)
+                .await
+                .unwrap()
+        );
         let closed =
             DomainAccess::new(auth).with_governor(Arc::new(base_governor().close("gh-lab")));
         assert_eq!(
@@ -5888,32 +6245,52 @@ mod tests {
             .await
             .unwrap();
         let access = DomainAccess::new(auth.clone());
-        assert!(access.readers_cover("lab", "vault").await.unwrap());
-        assert!(access.readers_cover("shared", "other").await.unwrap());
+        assert!(
+            access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // A person shared text from vault on a lab page before ann was
         // given the Reflection there.
         let before = access.page_readers("lab").await.unwrap();
         auth.set_reflection_grant("lab", "ann", ReflectionLevel::Reader, "keeper")
             .await
             .unwrap();
-        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // The grant widened the page's readers, so that confirmation is
         // asked again.
         assert!(
             !access
-                .readers_cover_for("lab", "vault", &before)
+                .readers_cover_for("lab", "vault", &before, CiteShared::Off)
                 .await
                 .unwrap()
         );
         auth.set_reflection_grant("vault", "ann", ReflectionLevel::Contributor, "keeper")
             .await
             .unwrap();
-        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("lab", "vault", CiteShared::Off)
+                .await
+                .unwrap()
+        );
         // A confirmation that named ann covers her.
         let confirmed = access.page_readers("lab").await.unwrap();
         assert!(
             access
-                .readers_cover_for("lab", "vault", &confirmed)
+                .readers_cover_for("lab", "vault", &confirmed, CiteShared::Off)
                 .await
                 .unwrap()
         );
@@ -5922,7 +6299,12 @@ mod tests {
         auth.set_reflection_grant("shared", "nora", ReflectionLevel::Reader, "boss")
             .await
             .unwrap();
-        assert!(!access.readers_cover("shared", "other").await.unwrap());
+        assert!(
+            !access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap()
+        );
     }
 
     // ---- Agents of the loops (0.35.0, spec D2) ----
@@ -6190,8 +6572,14 @@ mod tests {
             );
             for source in domains {
                 assert_eq!(
-                    access.readers_cover(domain, source).await.unwrap(),
-                    plain.readers_cover(domain, source).await.unwrap(),
+                    access
+                        .readers_cover(domain, source, CiteShared::Off)
+                        .await
+                        .unwrap(),
+                    plain
+                        .readers_cover(domain, source, CiteShared::Off)
+                        .await
+                        .unwrap(),
                     "{domain} citing {source}"
                 );
             }

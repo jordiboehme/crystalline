@@ -24,7 +24,7 @@
 use crystalline_core::reflection as r;
 use serde::{Deserialize, Serialize};
 
-use super::sources::{RepositoryReach, UNKNOWN_READERS_REFUSAL};
+use super::sources::{Reach, RepositoryReach, UNKNOWN_READERS_REFUSAL};
 use super::*;
 use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
 
@@ -414,13 +414,27 @@ impl Engine {
         source: &str,
         disclosure: Option<&Disclosure>,
     ) -> Result<bool> {
-        if self.readers_cover(page, source).await? {
+        self.source_covered_in(page, source, disclosure, Reach::Rule)
+            .await
+    }
+
+    /// [`Engine::source_covered`] for `reach`: the GitHub half counts as
+    /// [`Engine::repository_half_counts`] says.
+    pub(crate) async fn source_covered_in(
+        &self,
+        page: &str,
+        source: &str,
+        disclosure: Option<&Disclosure>,
+        reach: Reach,
+    ) -> Result<bool> {
+        if self.readers_cover_in(page, source, reach).await? {
             return Ok(true);
         }
         let Some(disclosure) = disclosure else {
             return Ok(false);
         };
-        if self.leaves_repository(page, source).await?
+        if self.repository_half_counts(reach)
+            && self.leaves_repository(page, source).await?
             && !self.backup_still_confirmed(page, source, disclosure).await
         {
             return Ok(false);
@@ -428,9 +442,10 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(self.readers_unknown().is_none());
         };
+        let cite = self.cite_shared();
         let covered = match &disclosure.readers {
-            Some(readers) => access.readers_cover_for(page, source, readers).await,
-            None => access.readers_cover(page, source).await,
+            Some(readers) => access.readers_cover_for(page, source, readers, cite).await,
+            None => access.readers_cover(page, source, cite).await,
         };
         covered.map_err(|e| EngineError::Internal(e.to_string()))
     }
@@ -446,11 +461,28 @@ impl Engine {
         stored: &str,
         recorded: &Disclosures,
     ) -> Result<bool> {
-        if self.readers_cover(page, source).await? {
+        self.source_covered_on_page_in(page, path, source, stored, recorded, Reach::Rule)
+            .await
+    }
+
+    /// [`Engine::source_covered_on_page`] for `reach`.
+    pub(crate) async fn source_covered_on_page_in(
+        &self,
+        page: &str,
+        path: &str,
+        source: &str,
+        stored: &str,
+        recorded: &Disclosures,
+        reach: Reach,
+    ) -> Result<bool> {
+        if self.readers_cover_in(page, source, reach).await? {
             return Ok(true);
         }
         for disclosure in recorded.of(path, stored) {
-            if self.source_covered(page, source, Some(disclosure)).await? {
+            if self
+                .source_covered_in(page, source, Some(disclosure), reach)
+                .await?
+            {
                 return Ok(true);
             }
         }
@@ -515,15 +547,20 @@ impl Engine {
     ) -> Result<Asked> {
         let mut accounts_wide = false;
         let mut gap = BackupGap::default();
+        let repository_half = self.repository_half_counts(Reach::Rule);
         for source in sources {
-            if self.on_github(page) && !self.on_github(source) {
-                gap.not_on_github = true;
-            } else if self.leaves_repository(page, source).await? {
-                gap.narrower_repository = true;
+            // Under `full` and `hold_back` the repository half refuses
+            // nothing, so the question names no gap there.
+            if repository_half {
+                if self.on_github(page) && !self.on_github(source) {
+                    gap.not_on_github = true;
+                } else if self.leaves_repository(page, source).await? {
+                    gap.narrower_repository = true;
+                }
             }
             if let Some(access) = self.domain_access.get() {
                 accounts_wide |= !access
-                    .readers_cover(page, source)
+                    .readers_cover(page, source, self.cite_shared())
                     .await
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
             }
@@ -569,8 +606,9 @@ impl Engine {
         page: &str,
         repo_readers: Option<&RepositoryReaders>,
     ) -> Result<()> {
-        let governed =
-            self.on_github(page) && !matches!(self.repository_reach(), RepositoryReach::NoApp);
+        let governed = self.repository_half_counts(Reach::Rule)
+            && self.on_github(page)
+            && !matches!(self.repository_reach(), RepositoryReach::NoApp);
         if governed && repo_readers.is_none() {
             return Err(EngineError::Invalid(REPO_READERS_UNKNOWN.into()));
         }
@@ -606,8 +644,8 @@ impl Engine {
 
     /// The question a person is asked before this write lands, when it
     /// needs one: it names sources in a domain fewer people may read than
-    /// the page's, or one not shared through GitHub while the page is backed
-    /// up there, that this person has not shared on this page yet (or whose
+    /// the page's, or (under `reflection.backup_sources: refuse`) one not
+    /// shared through GitHub while the page is backed up there, that this person has not shared on this page yet (or whose
     /// sharing no longer holds). The question shows the text the write
     /// leaves in those sections. `None` when nothing in
     /// the write needs a person's confirmation, and when `caller` has nobody

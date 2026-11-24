@@ -53,6 +53,7 @@ impl Engine {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
+                let reach_before = self.reach_settings();
                 // The inner block scopes the lock guards, so they are released
                 // before the announcement below awaits.
                 let view = {
@@ -73,6 +74,7 @@ impl Engine {
                     view
                 };
                 self.contradiction_setting_touched(key);
+                self.reach_setting_touched(reach_before);
                 self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
@@ -81,6 +83,7 @@ impl Engine {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
+                let reach_before = self.reach_settings();
                 let view = {
                     // Same write-lock-first discipline and lock order as Set above.
                     let mut file_guard = self.file_config.write().unwrap();
@@ -91,9 +94,37 @@ impl Engine {
                     view
                 };
                 self.contradiction_setting_touched(key);
+                self.reach_setting_touched(reach_before);
                 self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
+        }
+    }
+
+    /// `reflection.cite_shared` and `reflection.backup_sources` as they read
+    /// now, to compare after a settings write.
+    fn reach_settings(
+        &self,
+    ) -> (
+        crystalline_core::config::CiteShared,
+        crystalline_core::config::BackupSources,
+    ) {
+        (self.cite_shared(), self.backup_sources())
+    }
+
+    /// Mark every Reflection for a backup when a settings write changed what
+    /// the backup holds back (`reach_before` against now): a page the new
+    /// setting lets go goes out at the next pass, and one it holds back
+    /// leaves the branch, without waiting for a change to the page.
+    fn reach_setting_touched(
+        &self,
+        reach_before: (
+            crystalline_core::config::CiteShared,
+            crystalline_core::config::BackupSources,
+        ),
+    ) {
+        if self.reach_settings() != reach_before {
+            self.mark_every_reflection_for_backup();
         }
     }
 

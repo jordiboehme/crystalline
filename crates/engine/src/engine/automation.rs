@@ -1949,7 +1949,8 @@ impl Engine {
     /// lease held with no account, since the owner and the owner's own run
     /// look alike on a local session). It may read a domain X only when
     /// every reader of the domain D it works on may read X
-    /// (`readers_cover(D, X)`, the GitHub rule included). D is:
+    /// (`readers_cover(D, X)`, with `reflection.cite_shared` and, under
+    /// `reflection.backup_sources: refuse`, the GitHub half). D is:
     ///
     /// * `run_domain`, the domain the run started this session for, while
     ///   `scope` holds a live lease on it (a name without that lease counts
@@ -1959,7 +1960,8 @@ impl Engine {
     /// * otherwise every registered domain: a session marked unattended with
     ///   no lease may write anywhere, so it reads only what every domain's
     ///   readers may read (in practice the domains everyone signed in may
-    ///   read, and no local domain while any domain is backed up to GitHub).
+    ///   read, and under `reflection.backup_sources: refuse` no local domain
+    ///   while any domain is backed up to GitHub).
     ///
     /// It writes only into the domains D it works on (the named one, or each
     /// leased one); with no lease it may write wherever its rights allow,
