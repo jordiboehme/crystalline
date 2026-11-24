@@ -245,10 +245,12 @@ pub const MAX_SALIENCE_BOOST: i64 = 10;
 /// clamped.
 pub const MAX_PRIORITY: u8 = 100;
 
-/// Statuses that mark knowledge as not yet asserted. These are exempt from the
-/// lifecycle rules: a draft is allowed to be stale, unverified and out of date,
-/// because it never claimed to be true in the first place.
-pub const SPECULATIVE_STATUSES: [&str; 4] = ["draft", "proposed", "idea", "poc"];
+/// Statuses that mark knowledge as not yet asserted: core's tentative list
+/// ([`crystalline_core::TENTATIVE_STATUSES`]), reachable here under the name
+/// the sweep has always used. These are exempt from the lifecycle rules: a
+/// draft is allowed to be stale, unverified and out of date, because it never
+/// claimed to be true in the first place.
+pub use crystalline_core::TENTATIVE_STATUSES as SPECULATIVE_STATUSES;
 
 /// Engram types the orphan rule never speaks about. A manifest and a schema are
 /// structural files; being unlinked is their normal shape.
@@ -888,9 +890,10 @@ impl EngramFacts {
     }
 
     /// Whether the status says the knowledge was never asserted in the first
-    /// place, which exempts it from the lifecycle rules.
+    /// place, which exempts it from the lifecycle rules. Core's tentative
+    /// check ([`crystalline_core::is_tentative_status`]), so case is ignored.
     pub fn is_speculative(&self) -> bool {
-        SPECULATIVE_STATUSES.contains(&self.status.as_str())
+        crystalline_core::is_tentative_status(&self.status)
     }
 
     /// Days between `recorded_at` and `today`, or `None` when the engram
@@ -1978,7 +1981,11 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             ));
         }
 
-        if fact.is_speculative() {
+        // A tentative engram is exempt from what follows, with one narrow
+        // exception: an `open` question still draws V002, because an author
+        // who set a review date on an open question wants the nudge. (V006
+        // below asks for a current status, which `open` never is.)
+        if fact.is_speculative() && !fact.status.trim().eq_ignore_ascii_case("open") {
             continue;
         }
 

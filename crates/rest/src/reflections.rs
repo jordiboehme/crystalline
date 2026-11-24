@@ -320,7 +320,11 @@ pub async fn status(
             status = 200,
             description = "ReflectionTree: folders first, then reflections, each \
                            level sorted by name in byte order. `PACT.md` is only \
-                           under `pact`, never in `nodes`.",
+                           under `pact`, never in `nodes`, and a page pact \
+                           (`<page>.pact.md`) is in neither: its page's read \
+                           names it. A reflection carries `retired` (a retired \
+                           page: hide it behind a switch) and `owner`, the \
+                           path of the page that owns it, or null.",
             body = Object,
             example = json!({ "domain": "eng",
                 "pact": { "path": "PACT.md", "title": "How we write about eng",
@@ -328,7 +332,8 @@ pub async fn status(
                 "nodes": [ { "kind": "folder", "name": "guides", "path": "guides",
                     "children": [ { "kind": "reflection", "name": "deploying.md",
                         "path": "guides/deploying.md", "title": "Deploying",
-                        "open_threads": 2, "sections": 4 } ] } ] }),
+                        "open_threads": 2, "sections": 4, "retired": false,
+                        "owner": null } ] } ] }),
         ),
         (
             status = 404,
@@ -360,6 +365,35 @@ pub async fn tree(
         .map_err(reflection_error)
 }
 
+/// The answer of `GET /domains/{domain}/reflections/{path}`, as a schema:
+/// the route passes the engine's answer through unchanged, and this names
+/// its shape for the generated client.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReflectionDoc {
+    /// The domain.
+    domain: String,
+    /// The reflection's path inside reflections/.
+    path: String,
+    /// Its title.
+    title: String,
+    /// The text answered (see the response description).
+    markdown: String,
+    /// The checksum of the stored file.
+    checksum: String,
+    /// The `##` sections with their ids, lines, change marks and sources.
+    #[schema(value_type = Vec<Object>)]
+    sections: Vec<Value>,
+    /// The open threads.
+    #[schema(value_type = Vec<Object>)]
+    threads: Vec<Value>,
+    /// Who has the page open in a co-editing room, while one is open.
+    #[schema(value_type = Option<Object>)]
+    live: Option<Value>,
+    /// What the page says about itself beside its text; absent for
+    /// `PACT.md` and a page pact.
+    page: Option<super::reflection_pages::ReflectionPageView>,
+}
+
 /// `GET /domains/{domain}/reflections/{*path}`
 #[utoipa::path(
     get,
@@ -385,25 +419,44 @@ pub async fn tree(
                            `sections[].sources` is absent, not empty, without \
                            `engrams_visible`. A source's `state` is `current`, \
                            `changed`, `retired`, `missing` or `unavailable` \
-                           (its domain cannot be checked here); a source of \
+                           (its domain cannot be checked here); a source it \
+                           can check carries the engram's `status` as written \
+                           (a `draft`, `proposed`, `idea`, `poc` or `open` \
+                           engram is tentative); a source of \
                            another domain than the page's carries `domain`, \
                            the local name it is reached by here. \
                            `sections[].hidden_sources` counts the sources in a \
                            domain the caller may not open, which are never \
                            named; absent when there are none. `threads` holds \
                            the open threads; `live` is present while a \
-                           co-editing room is open.",
-            body = Object,
+                           co-editing room is open. `page` \
+                           (`ReflectionPageView`, for a page, never for \
+                           `PACT.md` or a page pact) holds the page's \
+                           `freshness`, `follows` and `status`, its `owner`, \
+                           its `retired` record, the `chain` of pages it \
+                           follows with their titles, the `pacts` that apply \
+                           in order, its own `pact` file and `findings` for \
+                           what did not read; its clock is \
+                           `GET /domains/{domain}/reflection/clock`.",
+            body = ReflectionDoc,
             example = json!({ "domain": "eng", "path": "guides/deploying.md",
                 "title": "Deploying", "markdown": "# Deploying\n...",
                 "checksum": "9f2c...", "sections": [ { "id": "7f3a9c2e",
                     "heading": "Night deploys", "line": 12, "changed": true,
                     "sources": [ { "permalink": "runbooks/deploy",
-                        "title": "Deploy runbook", "state": "current" },
+                        "title": "Deploy runbook", "state": "current",
+                        "status": "stable" },
                         { "permalink": "team/on-call", "domain": "ops",
-                        "title": "On call", "state": "changed" } ],
+                        "title": "On call", "state": "changed",
+                        "status": "proposed" } ],
                     "hidden_sources": 1 } ],
-                "threads": [], "live": { "present": ["jordi"] } }),
+                "threads": [], "live": { "present": ["jordi"] },
+                "page": { "freshness": "1d", "follows": null, "status": null,
+                    "owner": null, "retired": null,
+                    "chain": [ { "path": "guides.md", "title": "Guides" } ],
+                    "pacts": ["PACT.md", "guides.pact.md"],
+                    "pact": { "path": "guides/deploying.pact.md", "exists": false },
+                    "findings": [] } }),
         ),
         (
             status = 404,
@@ -458,10 +511,18 @@ pub struct SaveReflectionBody {
     tag = "reflection",
     operation_id = "save_reflection",
     summary = "Create or replace a reflection, or PACT.md.",
-    description = "Needs `edit`; `PACT.md` needs `curate`. While a co-editing \
+    description = "Needs `edit`; a pact file (`PACT.md` or a page pact, \
+                   `<page>.pact.md`) needs `curate`. While a co-editing \
                    room is open over the reflection the write composes into \
                    the room, and the answer carries `landed: live` and \
-                   `present`.",
+                   `present`. The page settings `freshness`, `follows` and \
+                   `status` in the frontmatter are a curator's: a key the \
+                   body leaves out keeps its stored value, a curator clears \
+                   one by sending it with no value, and below curate a \
+                   different value (or any `freshness` or `follows` on a new \
+                   page, or a retired word in `status`) is refused with 403. \
+                   `PATCH /domains/{domain}/reflection/settings` changes them \
+                   without the text.",
     params(
         ("domain" = String, Path, description = "The domain."),
         ("path" = String, Path, description = "The reflection's path inside \
@@ -494,10 +555,13 @@ pub struct SaveReflectionBody {
         ),
         (
             status = 403,
-            description = "Below edit access (curate for PACT.md), with a detail \
-                           naming the right held and the right needed; the \
-                           domain is off the caller's write list; or this \
-                           instance is read-only.",
+            description = "Below edit access (curate for a pact file), with a \
+                           detail naming the right held and the right needed; \
+                           a page setting changed below curate (the detail \
+                           names the key and says to leave it out or send it \
+                           as stored); a new page beside a waiting page pact \
+                           below curate; the domain is off the caller's write \
+                           list; or this instance is read-only.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -557,13 +621,20 @@ pub async fn save(
     tag = "reflection",
     operation_id = "delete_reflection",
     summary = "Delete a reflection with its threads and baseline.",
+    description = "Needs `edit`; a page pact, or a page that has one (its \
+                   pact goes with it), needs `curate`. A session marked \
+                   unattended (an MCP session of a reflect run or an agent \
+                   of the loops) never deletes a page or a page pact: it is \
+                   refused with a sentence that says to retire the page \
+                   instead. A person on this API is never such a session.",
     params(
         ("domain" = String, Path, description = "The domain."),
         ("path" = String, Path, description = "The reflection's path inside \
                                                reflections/; may contain slashes."),
     ),
     responses(
-        (status = 204, description = "Deleted with its threads and baseline."),
+        (status = 204, description = "Deleted with its threads and baseline, and \
+                                      its page pact when it has one."),
         (
             status = 401,
             description = "The anonymous viewer of a domain it reads: it reads \
@@ -573,7 +644,8 @@ pub async fn save(
         ),
         (
             status = 403,
-            description = "Below edit access, or this instance is read-only.",
+            description = "Below edit access (curate for a page pact or a page \
+                           that has one), or this instance is read-only.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -634,14 +706,24 @@ pub struct MoveReflectionBody {
     responses(
         (
             status = 200,
-            description = "Moved with its threads and baseline; links to it \
-                           rewritten: `{ from, to, links_rewritten, threads_moved }`. \
-                           `links_failed`, `[{ domain, path, reason }]`, appears only \
-                           when a page that links it could not be rewritten \
-                           after the move.",
+            description = "Moved with its threads and baseline, and its page \
+                           pact when it has one; links to it rewritten: \
+                           `{ from, to, links_rewritten, threads_moved, \
+                           pact_moved, follows_rewritten, owners_rewritten }`. \
+                           `links_rewritten` counts the links rewritten, in \
+                           the pact files rewritten with the move and in the \
+                           pages after it. `pact_moved` says whether its page \
+                           pact moved with it. `follows_rewritten` counts the \
+                           `follows` of other pages that now name the new \
+                           path, and `owners_rewritten` the owners and former \
+                           owners in other pages' records that do. \
+                           `links_failed`, `[{ domain, path, reason }]`, \
+                           appears only when a page that links it could not \
+                           be rewritten after the move.",
             body = Object,
             example = json!({ "from": "guides/a.md", "to": "howto/a.md",
-                "links_rewritten": 2, "threads_moved": true }),
+                "links_rewritten": 2, "threads_moved": true, "pact_moved": false,
+                "follows_rewritten": 1, "owners_rewritten": 0 }),
         ),
         (
             status = 401,
@@ -652,7 +734,10 @@ pub struct MoveReflectionBody {
         ),
         (
             status = 403,
-            description = "Below edit access, or this instance is read-only.",
+            description = "Below edit access; below curate for a page that has \
+                           a page pact or a move onto a path that becomes the \
+                           folder parent of a page already there; or this \
+                           instance is read-only.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -676,7 +761,9 @@ pub struct MoveReflectionBody {
         ),
         (
             status = 422,
-            description = "A bad path, or `PACT.md`, which is edited and never moved.",
+            description = "A bad path, `PACT.md`, which is edited and never \
+                           moved, or a page pact, which moves only with its \
+                           page.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1170,7 +1257,16 @@ pub struct QueueQuery {
                            pact's globs, and `hint` when none of them fits \
                            any page; a `pact_changed` item carries `diff` and \
                            `sections`, the ids of the changed parts of the \
-                           pact.",
+                           pact. A `page_pact_changed` item (a page pact on \
+                           the page's chain changed, or its stored pact hash \
+                           no longer matches) carries `pacts`, `chain`, \
+                           `pact_hash_changed` and `diff`; an `owner_gone` \
+                           item carries `owner`, `owner_is` (`missing` or \
+                           `retired`) and `hint`; `link_retired` and \
+                           `link_broken` (per section) carry `links`, the \
+                           pages it links that are retired or gone. `stale` \
+                           items (a page whose freshness ran out) are a \
+                           run's and never in this queue.",
             body = Object,
             example = json!({ "domain": "eng", "total": 1, "page": 1, "limit": 10,
                 "count": 1, "kinds": { "feedback": 0, "update": 1, "review": 0 },
@@ -1379,8 +1475,9 @@ pub struct SearchQuery {
         (
             status = 200,
             description = "`{ domain, query, mode, total, page, limit, count, \
-                           hits: [{ path, title, section, heading, snippet }] }`, \
-                           best first. `mode` is the search that ran (hybrid, \
+                           hits: [{ path, title, section, heading, snippet, \
+                           retired }] }`, best first. `retired` marks a hit \
+                           on a retired page, shown faded. `mode` is the search that ran (hybrid, \
                            text or semantic), not a score; no hit carries one. \
                            `total` counts every hit, `count` this page's. \
                            `section` is the section id, `_top` for the text \
@@ -1391,7 +1488,7 @@ pub struct SearchQuery {
                 "total": 1, "page": 1, "limit": 20, "count": 1, "hits": [ {
                 "path": "guides/deploying.md", "title": "Deploying",
                 "section": "7f3a9c2e", "heading": "Night deploys",
-                "snippet": "Deploys run at night." } ] }),
+                "snippet": "Deploys run at night.", "retired": false } ] }),
         ),
         (
             status = 404,

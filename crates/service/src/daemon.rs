@@ -660,6 +660,7 @@ pub async fn run_serve(
         .with_embed_channel(embed_tx)
         .with_contradiction_channel(contradiction_tx)
         .with_read_only(read_only)
+        .with_auth_mcp_pinned(loaded.effective.auth_mcp())
         .with_instance_id(instance_id)
         .with_env_overlay(loaded.overlay.clone())
         .with_machine_owner_lookup(crate::client::machine_owner_for_engine());
@@ -1803,12 +1804,18 @@ fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
         .find_map(|o| o.strip_prefix(crate::instance::RUN_DOMAIN_OPTION))
         .filter(|d| !d.is_empty())
         .map(str::to_string);
+    // A word that is no loop binds nothing: the loop only ever narrows.
+    let run_loop = options
+        .iter()
+        .find_map(|o| o.strip_prefix(crate::instance::RUN_LOOP_OPTION))
+        .and_then(|lp| lp.parse().ok());
     if options.contains(&SKILLS_OFF_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
             unattended,
             run_domain,
+            run_loop,
         }
     } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
         HarnessGate {
@@ -1816,11 +1823,13 @@ fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
             onboarding_verified: false,
             unattended,
             run_domain,
+            run_loop,
         }
     } else {
         HarnessGate {
             unattended,
             run_domain,
+            run_loop,
             ..HarnessGate::default()
         }
     }
@@ -3006,7 +3015,7 @@ fn http_router_inner(
         // declared routes and the transport behind them.
         let config = engine.config();
         let api = config.api_enabled();
-        let mcp_auth = config.auth_mcp().then(|| auth.clone());
+        let mcp_auth = engine.auth_mcp().then(|| auth.clone());
         let base_path = crate::settings::base_path(&config);
         let (router, service) = http_base(
             engine,
@@ -3044,9 +3053,11 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // error).
     let config = engine.config();
     let (api, ui) = (config.api_enabled(), config.ui_enabled());
-    // Read here with the other two, and for the same reason: the `auth.*` keys
-    // are startup-effective, so a running daemon serves the tier it started in.
-    let mcp_auth = config.auth_mcp().then(|| auth.clone());
+    // The `auth.*` keys are startup-effective, so a running daemon serves the
+    // tier it started in. Read through the engine, which the daemon pins to
+    // its start value, so the door, the open tier and the agent checks are one
+    // value by construction.
+    let mcp_auth = engine.auth_mcp().then(|| auth.clone());
     let base_path = crate::settings::base_path(&config);
     if ui
         && let Some(index) = E::get("index.html")
@@ -3769,6 +3780,7 @@ async fn run_reflect_count_tick(
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
+                let _pass = crystalline_engine::timing::Pass::start("reflect count tick");
                 if let Err(e) = engine.record_reflect_counts().await {
                     tracing::debug!("reflect counts not recorded: {e}");
                 }
@@ -3822,6 +3834,7 @@ pub async fn run_embed_tick(
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
+                let _pass = crystalline_engine::timing::Pass::start("embed tick");
                 // Every tick, whatever the backlog: a model nobody used for
                 // ten minutes, or one the setting no longer names, goes.
                 engine.drop_idle_scorer();
@@ -4225,7 +4238,7 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
     // most one pass that finds an ordinary engram, as before, or nothing.
     let layout = crystalline_core::DomainLayout::bare(crystalline_core::ReflectionMode::Effective);
     let class = layout.classify(&rel);
-    // A Reflection's pages, the pact, threads and files are indexed, so a
+    // A Reflection's pages, the pact, page pacts, threads and files are indexed, so a
     // change to one wakes a targeted pass, present or gone. The hidden
     // baseline and anything else in the folder are no rows; a vanished
     // `Other` path may have been a folder, so it escalates as every other
@@ -4238,6 +4251,7 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
         return match file {
             ReflectionFile::Page(_)
             | ReflectionFile::Pact
+            | ReflectionFile::PagePact { .. }
             | ReflectionFile::Threads { .. }
             | ReflectionFile::Asset(_) => DirtyKind::Path(rel),
             ReflectionFile::Baseline { .. } => DirtyKind::Ignore,
@@ -4947,12 +4961,14 @@ mod tests {
             onboarding_verified: true,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         };
         let conditional = HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         };
         assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
         assert_eq!(
@@ -4976,6 +4992,16 @@ mod tests {
         assert_eq!(
             harness_gate_from_options(&["unattended", "domain=eng"]).run_domain,
             Some("eng".to_string())
+        );
+        // The loop travels beside the domain, and a word that is no loop
+        // binds nothing.
+        assert_eq!(
+            harness_gate_from_options(&["unattended", "domain=eng", "loop=evolve"]).run_loop,
+            Some(crystalline_core::automation::Loop::Evolve)
+        );
+        assert_eq!(
+            harness_gate_from_options(&["unattended", "loop=both"]).run_loop,
+            None
         );
     }
 

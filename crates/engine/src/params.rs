@@ -102,8 +102,9 @@ pub struct WriteParams {
     #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
     /// Lifecycle `status`. Defaults to `stable`. Recommended values: stable,
-    /// implemented, draft, proposed, idea, poc, deprecated, superseded, archived,
-    /// legacy (guidance so an agent can tell an idea apart from settled fact).
+    /// implemented, draft, proposed, idea, poc, open, deprecated, superseded,
+    /// archived, legacy (guidance so an agent can tell an idea apart from
+    /// settled fact).
     /// `current` is the legacy alias for `stable` and means the same thing; a
     /// status filter on either word matches engrams carrying either.
     #[serde(default)]
@@ -677,7 +678,11 @@ pub struct WriteReflectionParams {
     pub domain: String,
     /// write (the default: create or replace a reflection or PACT.md, or
     /// change one section of it with operation), move, delete, settle (mark
-    /// people's changes to sections as taken in or kept), write_asset
+    /// people's changes to sections as taken in or kept), retire (take a
+    /// page out of the navigation, kept and restorable; an unattended
+    /// session retires and never deletes), restore (bring a retired page
+    /// back), reconciled (record that a page was brought in line with its
+    /// pacts, with outcome updated or unchanged), write_asset
     /// (upload a file under reflections/assets/: path, and content or
     /// base64; replacing one with overwrite needs curate access), move_asset
     /// or delete_asset (move or remove a file under reflections/assets/; both
@@ -746,9 +751,20 @@ pub struct WriteReflectionParams {
     pub sections: Vec<String>,
     /// settle: kept (the person's text stands and the sources stay) or
     /// taken_in (you changed the engrams to match; their checksums are
-    /// refreshed).
+    /// refreshed). reconciled: updated (the page changed) or unchanged.
     #[serde(default)]
     pub outcome: Option<String>,
+    /// write, on create only: the page that owns the new page, by its path
+    /// inside reflections/. Reconciling the owner keeps its owned pages
+    /// current. restore: the page the retired page was owned by, to put it
+    /// back under that page; leave it out to restore it as a page of its own.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// reconciled: the version of the stale item the reconcile settled, as
+    /// the item gave it. Needed while the page is stale; a version from
+    /// before the page's last reconcile is refused as an older period.
+    #[serde(default)]
+    pub version: Option<String>,
     /// write: the checksum read_reflection returned; a reflection that changed
     /// since is refused rather than overwritten.
     #[serde(default)]
@@ -769,6 +785,27 @@ pub struct WriteReflectionParams {
     /// agent can set it in its arguments and the MCP schema does not show it.
     #[serde(skip)]
     pub disclosed: Option<String>,
+}
+
+/// A change to a Reflection page's settings, the frontmatter keys only a
+/// curator changes (`PATCH /domains/{domain}/reflection/settings`): each
+/// key left out keeps its value, an empty value takes the key off the page,
+/// and any other value sets it. The page's text is not touched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageSettingsChange {
+    /// The page's path inside reflections/.
+    pub path: String,
+    /// How often the page is brought in line with its pacts: 1h, 6h, 1d,
+    /// 7d, 30d or any span of an hour or more.
+    #[serde(default)]
+    pub freshness: Option<String>,
+    /// The page of this Reflection whose pact this page follows.
+    #[serde(default)]
+    pub follows: Option<String>,
+    /// The page's status; a retired word is refused (retire the page
+    /// instead).
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// Parameters for `discuss`.
@@ -828,6 +865,18 @@ pub struct ReflectParams {
     /// One-based page number. Defaults to 1.
     #[serde(default)]
     pub page: Option<usize>,
+    /// Whether to hand out `stale` items: pages whose freshness ran out and
+    /// that a reconcile brings in line with their pacts again. Omit for the
+    /// default: a run (an unattended session or one holding a loop's
+    /// lease) gets them, an interactive session does not. A stale item's
+    /// `changed_engrams` counts the engrams changed since its last
+    /// reconcile in the domains you may read, or is null when that is
+    /// unknown (a domain on a connected server, or a file domain that could
+    /// not be walked).
+    // Left out when unset, so a call forwarded to an older server, which
+    // refuses a key it does not know, carries it only when it was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
     /// Screen the named `domains` the way an unnamed queue screens every
     /// domain: one that is read-only, replaced by a connected server, not
     /// registered, or not in effect, or that the caller cannot work, is

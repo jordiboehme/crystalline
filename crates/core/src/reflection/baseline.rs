@@ -335,7 +335,7 @@ pub fn relink(
     let mut carried = false;
     for section in split_sections(&rewritten) {
         let Some(id) = section.id else { continue };
-        let Some(record) = provenance.get_mut(&id) else {
+        let Some(record) = provenance.sections.get_mut(&id) else {
             continue;
         };
         let now = section_hash(&section.text);

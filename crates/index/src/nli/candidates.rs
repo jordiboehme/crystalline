@@ -13,8 +13,7 @@ use super::period::names_period;
 use crate::store::{ContradictionRow, EngramId, ScoredPair, is_current_status};
 use crate::sweep::twins::find_twins_where;
 use crate::sweep::{
-    CONTRADICTION_STORE_FLOOR, FactObservation, MAX_RELATED_PAIRS, RELATED_THRESHOLD,
-    SPECULATIVE_STATUSES, SweepOptions,
+    CONTRADICTION_STORE_FLOOR, FactObservation, MAX_RELATED_PAIRS, RELATED_THRESHOLD, SweepOptions,
 };
 
 /// What candidate selection reads about one base engram.
@@ -72,7 +71,7 @@ pub struct Candidates {
 /// the walk embeds and the sweep's read all apply.
 pub fn eligible(status: &str, valid_to: Option<Day>, today: Day) -> bool {
     is_current_status(status)
-        && !SPECULATIVE_STATUSES.contains(&status)
+        && !crystalline_core::is_tentative_status(status)
         && !expired(valid_to, today)
 }
 

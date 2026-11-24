@@ -90,6 +90,23 @@ async fn the_queue_guidance_points_to_the_presentation_skill() {
     );
 }
 
+/// The queue guidance says a section built from tentative engrams says so
+/// in its text, as the headless prompt does.
+#[tokio::test]
+async fn the_queue_guidance_names_a_section_from_tentative_engrams() {
+    let fx = curated_with_a_feedback_item().await;
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let guidance = queue["guidance"].as_str().unwrap();
+    assert!(
+        guidance.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) says so in its text, for example \"proposed:\" or \"not decided yet\"."),
+        "{guidance}"
+    );
+}
+
 fn age_file(fx: &Fx, rel: &str, days: u64) {
     let file = std::fs::File::options()
         .write(true)
@@ -2204,4 +2221,67 @@ async fn a_page_never_reflected_stays_feedback_without_a_baseline() {
             .any(|(kind, _, heading)| kind == "feedback" && heading == "Idea"),
         "{queue}"
     );
+}
+
+/// The queue's guidance teaches the reconcile of a stale page as the
+/// prompt does: the chain, the domains to search, owned pages with owner,
+/// retire never delete, and reconciled with the item's version, owned
+/// pages first and the owner last.
+#[tokio::test]
+async fn the_queue_guidance_teaches_the_reconcile_of_a_stale_page() {
+    let fx = curated_with_a_feedback_item().await;
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let guidance = queue["guidance"].as_str().unwrap();
+    for needle in [
+        "stale",
+        "search the domains",
+        "change only what new information requires",
+        "owner",
+        "retire",
+        "never delete",
+        "action=reconciled",
+        "version",
+        "changed_engrams",
+        "owned pages first and the owner last",
+        "owned_reconciled",
+        "pact_hash_changed",
+    ] {
+        assert!(
+            guidance.contains(needle),
+            "guidance lacks {needle}: {guidance}"
+        );
+    }
+}
+
+/// The guidance tells an unattended run to leave pact text and a page's
+/// freshness and follows to a curator, and keeps the pact's `## Pages` for a
+/// session with a person.
+#[tokio::test]
+async fn the_queue_guidance_leaves_pact_text_and_settings_to_a_curator_in_a_run() {
+    let fx = curated_with_a_feedback_item().await;
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let guidance = queue["guidance"].as_str().unwrap();
+    for needle in [
+        "An unattended run",
+        "writes no pact text",
+        "own page pact",
+        "freshness or follows",
+        "answer in the thread",
+        "curator",
+        "page or space in a session with them",
+        "an item on a pact file whose fix changes its text",
+    ] {
+        assert!(
+            guidance.contains(needle),
+            "guidance lacks {needle}: {guidance}"
+        );
+    }
 }

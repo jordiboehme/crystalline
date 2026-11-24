@@ -170,6 +170,8 @@ impl Engine {
                 "permalink": node.permalink,
                 "title": node.title,
                 "type": node.engram_type,
+                "status": node.status,
+                "tags": node.tags,
                 "seed": is_seed,
             });
             mark_draft(&mut out, node);

@@ -62,7 +62,7 @@ impl TestKey {
         use rsa::pkcs8::DecodePrivateKey as _;
         use rsa::traits::PublicKeyParts as _;
 
-        let private = rsa::RsaPrivateKey::from_pkcs8_pem(self.pem).expect("the fixture is PKCS#8");
+        let private = rsa::PrivateKey::from_pkcs8_pem(self.pem).expect("the fixture is PKCS#8");
         let public = private.to_public_key();
         let b64 = |bytes: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         serde_json::json!({
@@ -70,8 +70,8 @@ impl TestKey {
             "use": "sig",
             "alg": "RS256",
             "kid": self.kid,
-            "n": b64(public.n().to_bytes_be()),
-            "e": b64(public.e().to_bytes_be()),
+            "n": b64(public.n_bytes().to_vec()),
+            "e": b64(public.e_bytes().to_vec()),
         })
     }
 }
@@ -730,6 +730,7 @@ impl RestCtx {
                 max_users,
                 oidc,
                 login: None,
+                invites: None,
             }),
             service: Some(ServiceConfig {
                 response_format: Some(ResponseFormat::Json),
@@ -2599,4 +2600,228 @@ async fn a_return_to_outside_the_prefix_lands_on_the_prefix_root() {
         let done = ctx.get(&location(&bounced), &cookies).await;
         assert_eq!(location(&done), "/crystalline/", "{return_to:?}");
     }
+}
+
+// --- invite links -------------------------------------------------------------
+
+/// An admin `root` and the private domain `eng` owned by them, and a link
+/// to it giving `role` and editor there: its token.
+async fn eng_invite(ctx: &RestCtx, role: Role) -> String {
+    use crystalline_service::rest::{InviteLimits, MemberLevel, NewInvite};
+    if ctx.user("root").await.is_none() {
+        ctx.create_local_user("root", "root@example.test", Role::Admin)
+            .await;
+        ctx.auth
+            .set_domain_visibility("eng", true, "root")
+            .await
+            .unwrap();
+    }
+    ctx.auth
+        .create_invite(
+            &NewInvite {
+                role,
+                domain: Some("eng"),
+                level: Some(MemberLevel::Editor),
+                label: None,
+                local_account: false,
+                created_by: "root",
+                ttl_secs: 3_600,
+            },
+            InviteLimits {
+                per_creator: 10,
+                max_users: 100,
+            },
+        )
+        .await
+        .unwrap()
+        .token
+}
+
+/// Take an invite link the single sign-on way: `POST /invites/redeem` with no
+/// session answers where to sign in, the provider sends the browser back and
+/// the callback redeems. Returns the callback's response and the authorize
+/// url, for the test that checks the token never rides in it.
+async fn redeem_by_sign_on(ctx: &RestCtx, token: &str) -> (reqwest::Response, String) {
+    let start = ctx
+        .client
+        .post(ctx.url("/invites/redeem"))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 200, "the redeem starts a sign-in");
+    let cookies = cookies_from(&start);
+    let body: serde_json::Value = start.json().await.unwrap();
+    assert_eq!(body["outcome"], "sign_in", "{body}");
+    let authorize = body["location"].as_str().unwrap().to_string();
+    let bounced = ctx.client.get(&authorize).send().await.unwrap();
+    assert_eq!(bounced.status(), 302);
+    (ctx.get(&location(&bounced), &cookies).await, authorize)
+}
+
+async fn eng_level(ctx: &RestCtx, account: &str) -> Option<crystalline_service::rest::MemberLevel> {
+    ctx.auth
+        .domain_members("eng")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.principal == account)
+        .map(|m| m.level)
+}
+
+/// On a single sign-on instance a link is taken by signing on: the confirm
+/// page offers `oidc`, a new identity gets an account at the link's role, a
+/// member at its level, signed in; the token never rides in a URL; a local
+/// account is not offered.
+#[tokio::test]
+async fn an_invite_is_redeemed_after_the_sign_on() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    let token = eng_invite(&ctx, Role::Editor).await;
+    let offer: serde_json::Value = ctx
+        .client
+        .post(ctx.url("/invites/confirm"))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(offer["sign_in"], "oidc", "{offer}");
+    assert_eq!(offer["local_allowed"], false, "{offer}");
+    let local = ctx
+        .client
+        .post(ctx.url("/invites/redeem"))
+        .json(&serde_json::json!({ "token": token, "login": "nina", "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(local.status(), 403, "no local account around the provider");
+
+    idp.set_user(IdpUser {
+        subject: "sub-nina".to_string(),
+        preferred_username: Some("nina".to_string()),
+        name: Some("Nina".to_string()),
+        email: None,
+    });
+    let (done, authorize) = redeem_by_sign_on(&ctx, &token).await;
+    assert!(!authorize.contains(&token), "the token stays server side");
+    assert_eq!(done.status(), 302, "signed in");
+    assert_eq!(location(&done), "/d/eng", "lands on the invited domain");
+    assert!(
+        cookies_from(&done)
+            .iter()
+            .any(|(name, _)| name == "fluid_session")
+    );
+    let nina = ctx.user("nina").await.expect("provisioned by the link");
+    assert_eq!(nina.role, Role::Editor, "the link's role");
+    assert_eq!(
+        eng_level(&ctx, "nina").await,
+        Some(crystalline_service::rest::MemberLevel::Editor)
+    );
+    let used = ctx.auth.invites(None, None).await.unwrap();
+    assert_eq!(used[0].used_by.as_deref(), Some("nina"));
+}
+
+/// A link without a domain lands the new account on the application root,
+/// since there is no domain to show.
+#[tokio::test]
+async fn an_invite_without_a_domain_lands_on_the_root() {
+    use crystalline_service::rest::{InviteLimits, NewInvite};
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("root", "root@example.test", Role::Admin)
+        .await;
+    let token = ctx
+        .auth
+        .create_invite(
+            &NewInvite {
+                role: Role::Viewer,
+                domain: None,
+                level: None,
+                label: None,
+                local_account: false,
+                created_by: "root",
+                ttl_secs: 3_600,
+            },
+            InviteLimits {
+                per_creator: 10,
+                max_users: 100,
+            },
+        )
+        .await
+        .unwrap()
+        .token;
+    idp.set_user(IdpUser {
+        subject: "sub-nina".to_string(),
+        preferred_username: Some("nina".to_string()),
+        name: None,
+        email: None,
+    });
+    let (done, _) = redeem_by_sign_on(&ctx, &token).await;
+    assert_eq!(done.status(), 302, "signed in");
+    assert_eq!(location(&done), "/");
+    assert!(ctx.user("nina").await.is_some());
+}
+
+/// An identity already linked to an account redeems for that account: the
+/// membership only, its role kept.
+#[tokio::test]
+async fn an_invite_for_a_known_identity_gives_the_membership_only() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.set_user(IdpUser {
+        subject: "sub-nina".to_string(),
+        preferred_username: Some("nina".to_string()),
+        name: None,
+        email: None,
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    assert_eq!(ctx.user("nina").await.unwrap().role, Role::Viewer);
+    let token = eng_invite(&ctx, Role::Editor).await;
+    let (done, _) = redeem_by_sign_on(&ctx, &token).await;
+    assert_eq!(done.status(), 302);
+    assert_eq!(ctx.user("nina").await.unwrap().role, Role::Viewer);
+    assert_eq!(
+        eng_level(&ctx, "nina").await,
+        Some(crystalline_service::rest::MemberLevel::Editor)
+    );
+}
+
+/// A link revoked while the browser was away at the provider signs nobody in
+/// and makes no account: the callback answers a page saying why.
+#[tokio::test]
+async fn an_invite_revoked_during_the_sign_on_signs_nobody_in() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    let token = eng_invite(&ctx, Role::Viewer).await;
+    let start = ctx
+        .client
+        .post(ctx.url("/invites/redeem"))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    let cookies = cookies_from(&start);
+    let body: serde_json::Value = start.json().await.unwrap();
+    let bounced = ctx
+        .client
+        .get(body["location"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let id = ctx.auth.invites(None, None).await.unwrap()[0].id;
+    assert!(ctx.auth.revoke_invite(id, None).await.unwrap());
+    let done = ctx.get(&location(&bounced), &cookies).await;
+    assert_eq!(done.status(), 410);
+    assert!(
+        !cookies_from(&done)
+            .iter()
+            .any(|(name, _)| name == "fluid_session"),
+        "nobody is signed in"
+    );
+    let page = done.text().await.unwrap();
+    assert!(page.contains("revoked"), "{page}");
+    assert!(ctx.user("ada.lovelace").await.is_none(), "no account made");
 }

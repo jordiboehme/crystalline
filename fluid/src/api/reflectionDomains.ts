@@ -71,13 +71,18 @@ export function atLeast(
   return RIGHTS.indexOf(held) >= RIGHTS.indexOf(needed);
 }
 
+/** Whether `path` is a pact: `PACT.md`, or a page's own `<page>.pact.md`. */
+export function isPactFile(path: string): boolean {
+  return path === PACT_PATH || path.endsWith(".pact.md");
+}
+
 /**
  * Whether `right` may edit the page at `path`: `edit` for a page, `curate`
- * for `PACT.md`, which only curators write. Everyone who reads it may
- * propose a change through a thread on it.
+ * for `PACT.md` and a page pact, which only curators write. Everyone who
+ * reads it may propose a change through a thread on it.
  */
 export function mayEditPage(right: ReflectionRight, path: string): boolean {
-  return atLeast(right, path === PACT_PATH ? "curate" : "edit");
+  return atLeast(right, isPactFile(path) ? "curate" : "edit");
 }
 
 function oneOf<T extends string>(
@@ -178,6 +183,18 @@ export const REFLECTION_DOMAINS_KEY = ["reflection-domains"] as const;
  */
 export function reflectionKey(domain: string): readonly unknown[] {
   return ["reflection", domain];
+}
+
+/**
+ * One page's read. Here with the prefix rather than with the lazy readers:
+ * the change stream, which is eager, names it to leave a page's text to its
+ * clock (see `events/invalidation.ts`).
+ */
+export function reflectionDocKey(
+  domain: string,
+  path: string,
+): readonly unknown[] {
+  return [...reflectionKey(domain), "doc", path];
 }
 
 export function reflectionStatusKey(domain: string): readonly unknown[] {

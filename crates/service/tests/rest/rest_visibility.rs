@@ -195,6 +195,7 @@ impl RestCtx {
                 max_users: None,
                 oidc: None,
                 login: None,
+                invites: None,
             }),
             github: team.then(|| GitHubConfig {
                 enabled: Some(true),
@@ -2421,4 +2422,169 @@ async fn only_the_owner_or_an_admin_switches_read_only_on_over_rest() {
             .unwrap()
             .contains("read_only: on")
     );
+}
+
+/// Who may search accounts, and what each may find: a domain a caller may not
+/// see is 404 before anything else, a member below manager is 403, a manager
+/// finds people by name but never by email, an admin also by a whole address,
+/// names fold case and accents, disabled accounts are left out, and each hit
+/// says whether it is already in the domain.
+#[tokio::test]
+async fn the_account_search_obeys_the_member_management_gate() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "keeper").await;
+    ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
+    ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
+    ctx.auth
+        .add_user(
+            "zoe",
+            "Zoë Müller",
+            Some("zoe@example.com"),
+            Role::Editor,
+            "s3cret",
+        )
+        .await
+        .unwrap();
+    ctx.auth
+        .add_user("zed", "Zed Gone", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    ctx.auth.set_disabled("zed", true).await.unwrap();
+    ctx.add_member("lab", "zoe", MemberLevel::Viewer).await;
+
+    let names = |body: &serde_json::Value| -> Vec<String> {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // 404 for a stranger, the same words as a domain nobody registered.
+    let out = ctx.as_user("out").await;
+    let hidden = out
+        .get_text("/api/v1/accounts/search?q=zo&domain=lab", 404)
+        .await;
+    let ghost = out
+        .get_text("/api/v1/accounts/search?q=zo&domain=ghost", 404)
+        .await;
+    assert_eq!(hidden.replace("lab", "X"), ghost.replace("ghost", "X"));
+    // 403 for a member who sees the domain and may not manage it.
+    let mem = ctx.as_user("mem").await;
+    mem.get_text("/api/v1/accounts/search?q=zo&domain=lab", 403)
+        .await;
+    // Without a domain, admins only; the anonymous tier has no account.
+    mem.get_text("/api/v1/accounts/search?q=zo", 403).await;
+    ctx.as_anonymous()
+        .get_text("/api/v1/accounts/search?q=zo&domain=lab", 401)
+        .await;
+
+    // A manager finds by folded name, and sees who is a member already.
+    let mgr = ctx.as_user("mgr").await;
+    let body = mgr
+        .get_json("/api/v1/accounts/search?q=MULLER&domain=lab")
+        .await;
+    assert_eq!(names(&body), ["zoe"]);
+    assert_eq!(body["results"][0]["display"], "Zoë Müller");
+    assert_eq!(body["results"][0]["member"], true);
+    let body = mgr
+        .get_json("/api/v1/accounts/search?q=ller&domain=lab")
+        .await;
+    assert!(names(&body).is_empty(), "no prefix inside a word: {body}");
+    // An email address finds nobody for a manager, and an admin only by the
+    // whole address.
+    let body = mgr
+        .get_json("/api/v1/accounts/search?q=zoe%40example.com&domain=lab")
+        .await;
+    assert!(names(&body).is_empty(), "{body}");
+    let boss = ctx.as_user("boss").await;
+    let body = boss
+        .get_json("/api/v1/accounts/search?q=zoe%40example.com&domain=lab")
+        .await;
+    assert_eq!(names(&body), ["zoe"]);
+    let body = boss
+        .get_json("/api/v1/accounts/search?q=zoe%40example")
+        .await;
+    assert!(names(&body).is_empty(), "{body}");
+    // The owner counts as a member; a non-member does not.
+    let body = boss
+        .get_json("/api/v1/accounts/search?q=ke&domain=lab")
+        .await;
+    assert_eq!(body["results"][0]["member"], true, "{body}");
+    let body = boss
+        .get_json("/api/v1/accounts/search?q=ou&domain=lab")
+        .await;
+    assert_eq!(body["results"][0]["name"], "out");
+    assert_eq!(body["results"][0]["member"], false);
+    // Disabled accounts are left out, and one character answers empty.
+    let body = boss.get_json("/api/v1/accounts/search?q=ze").await;
+    assert!(names(&body).is_empty(), "{body}");
+    let body = boss.get_json("/api/v1/accounts/search?q=z").await;
+    assert!(names(&body).is_empty(), "{body}");
+}
+
+/// At most ten accounts, by name, and at most sixty searches a minute per
+/// caller: the next is 429 with a sentence and a `Retry-After`.
+#[tokio::test]
+async fn the_account_search_is_capped_and_rate_limited() {
+    let ctx = RestCtx::two_domains().await;
+    for i in 0..12 {
+        ctx.auth
+            .add_user(&format!("pal{i:02}"), "Pal", None, Role::Viewer, "s3cret")
+            .await
+            .unwrap();
+    }
+    let boss = ctx.as_user("boss").await;
+    let body = boss.get_json("/api/v1/accounts/search?q=pal").await;
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 10);
+    assert_eq!(results[0]["name"], "pal00");
+    assert_eq!(results[9]["name"], "pal09");
+
+    for _ in 1..60 {
+        boss.get_json("/api/v1/accounts/search?q=pal").await;
+    }
+    let refused = boss.get("/api/v1/accounts/search?q=pal").await;
+    assert_eq!(refused.status(), 429);
+    assert!(refused.headers().contains_key("retry-after"));
+    let text = refused.text().await.unwrap();
+    assert!(text.contains("too many account searches"), "{text}");
+    // Another caller has a budget of its own.
+    let keeper = ctx.as_user("keeper").await;
+    keeper.get_text("/api/v1/accounts/search?q=pal", 403).await;
+}
+
+/// An agent is never a person: the account search finds no agent, whatever
+/// the query, because agents live in their own table.
+#[tokio::test]
+async fn an_agent_never_appears_in_the_account_search() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.auth
+        .add_user("nina", "Nina", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    ctx.auth
+        .add_agent(
+            "nightly",
+            Some("Nightly runner"),
+            crystalline_service::rest::AgentLoops::Both,
+            "boss",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    let boss = ctx.as_user("boss").await;
+    for q in ["ni", "nightly", "Nightly%20runner", "runner"] {
+        let body = boss
+            .get_json(&format!("/api/v1/accounts/search?q={q}"))
+            .await;
+        assert!(
+            !body.to_string().contains("nightly"),
+            "an agent showed up for {q}: {body}"
+        );
+    }
+    let body = boss.get_json("/api/v1/accounts/search?q=ni").await;
+    assert_eq!(body["results"][0]["name"], "nina", "{body}");
 }

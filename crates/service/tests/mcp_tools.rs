@@ -735,6 +735,12 @@ async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
             && write.contains("The `reflection:` frontmatter key is Crystalline's bookkeeping; never write it (pass `sources` instead)."),
         "{write}"
     );
+    // A freshness in `m` is months, the one grammar build_context shares;
+    // the write says so, as Fluid's custom freshness note does.
+    assert!(
+        write.contains("m means months and there is no minute unit"),
+        "{write}"
+    );
     // The skills tool is found when an agent is about to present a page.
     let skills = description("skills");
     assert!(
@@ -780,6 +786,28 @@ async fn the_configure_description_names_its_domain_refusals() {
         "a mounted domain",
     ] {
         assert!(text.contains(needle), "configure names {needle}: {text}");
+    }
+}
+
+/// build_context names the node fields, the tentative statuses, and that
+/// `draft: true` is the caller's own unshared copy, never the status draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_build_context_description_tells_the_draft_flag_from_the_draft_status() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let tool = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "build_context")
+        .expect("build_context tool present");
+    let text = tool.description.as_deref().unwrap_or("");
+    for needle in [
+        "status, tags and seed",
+        "status draft, proposed, idea, poc or open",
+        "A node with draft: true is your own unshared copy in a review-mode domain, not the status draft.",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
     }
 }
 
@@ -2259,7 +2287,7 @@ async fn write_read_overwrite_and_domain_errors() {
     )
     .await
     .unwrap();
-    assert!(read["content"].as_str().unwrap().contains("chose alpha"));
+    assert!(read["markdown"].as_str().unwrap().contains("chose alpha"));
     assert_eq!(read["title"], json!("Alpha"));
 
     // Overwrite conflict without the flag.
@@ -2410,7 +2438,7 @@ async fn edit_operations_and_subsection_regression() {
     )
     .await
     .unwrap();
-    let body = read["content"].as_str().unwrap();
+    let body = read["markdown"].as_str().unwrap();
     assert!(body.contains("new api intro"), "section replaced: {body}");
     assert!(body.contains("### Auth"), "subsection kept: {body}");
     assert!(
@@ -2459,7 +2487,7 @@ async fn edit_operations_and_subsection_regression() {
     )
     .await
     .unwrap();
-    assert!(read["content"].as_str().unwrap().contains("appended line"));
+    assert!(read["markdown"].as_str().unwrap().contains("appended line"));
 }
 
 /// Whether the vocabulary response reports a near-duplicate cluster that contains
@@ -3359,6 +3387,85 @@ async fn build_context_follows_prose_wikilinks() {
     );
 }
 
+/// **Every build_context node carries its engram's `status` and `tags`**, so
+/// an agent gathering context for a plan can tell a decided engram from a
+/// tentative one without reading each. On both transports, in JSON and in
+/// TOON, where the tags join into one cell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_nodes_carry_status_and_tags() {
+    for http in [false, true] {
+        for pin_json in [true, false] {
+            let h = Harness::build(&["eng"], false, pin_json).await;
+            let (client, _server) = if http {
+                h.connect_http().await
+            } else {
+                h.connect().await
+            };
+            let peer = client.peer();
+            call(
+                peer,
+                "write_engram",
+                json!({ "domain": "eng", "title": "Kafka Idea", "status": "proposed",
+                        "tags": ["queue", "kafka"],
+                        "content": "- [idea] move the queue to Kafka #queue" }),
+            )
+            .await
+            .unwrap();
+            call(
+                peer,
+                "write_engram",
+                json!({ "domain": "eng", "title": "Deploy Queue", "tags": ["queue"],
+                        "content": "- [decision] jobs go through Redis #queue\n- relates_to [[Kafka Idea]]" }),
+            )
+            .await
+            .unwrap();
+
+            let text = call_text(
+                peer,
+                "build_context",
+                json!({ "anchor": "crystalline://eng/deploy-queue", "depth": 1 }),
+            )
+            .await
+            .unwrap();
+            let label = format!("http: {http}, json: {pin_json}");
+            if pin_json {
+                let out: Value = serde_json::from_str(&text).unwrap();
+                let nodes = out["nodes"].as_array().unwrap();
+                let node = |permalink: &str| {
+                    nodes
+                        .iter()
+                        .find(|n| n["permalink"] == permalink)
+                        .unwrap_or_else(|| panic!("{label}: no {permalink}: {out}"))
+                        .clone()
+                };
+                let seed = node("deploy-queue");
+                assert_eq!(seed["status"], json!("stable"), "{label}: {seed}");
+                assert_eq!(seed["tags"], json!(["queue"]), "{label}: {seed}");
+                let idea = node("kafka-idea");
+                assert_eq!(idea["status"], json!("proposed"), "{label}: {idea}");
+                assert_eq!(idea["tags"], json!(["kafka", "queue"]), "{label}: {idea}");
+            } else {
+                let header = text
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("nodes["))
+                    .unwrap_or_else(|| panic!("{label}: no nodes table: {text}"));
+                assert!(
+                    header.contains("status") && header.contains("tags"),
+                    "{label}: {header}"
+                );
+                let row = text
+                    .lines()
+                    .find(|l| l.contains("kafka-idea"))
+                    .unwrap_or_else(|| panic!("{label}: no kafka-idea row: {text}"));
+                assert!(
+                    row.contains("proposed") && row.contains("\"kafka,queue\""),
+                    "{label}: {row}"
+                );
+            }
+        }
+    }
+}
+
 /// The neighbour ranking (seeded personalized PageRank, salience-lifted) picks
 /// the truncation survivor by spread mass rather than by ascending engram id.
 /// Far is written first so it lands the smallest id; under the old
@@ -3532,10 +3639,12 @@ async fn build_context_retired_neighbor_loses_to_equal_current() {
         .collect();
     assert!(perms.contains(&"b"), "current B kept: {perms:?}");
     assert!(!perms.contains(&"a"), "retired A dropped: {perms:?}");
+    // The status ranks and, since 0.35.0, is shown too, so a reader tells a
+    // retired or tentative node apart without reading it.
     for node in nodes {
         assert!(
-            node.get("status").is_none(),
-            "node objects must not carry a status key: {node:?}"
+            node["status"].is_string(),
+            "every node carries its status: {node:?}"
         );
     }
 }
@@ -5389,7 +5498,7 @@ async fn in_review_mode_set_frontmatter_sources_is_a_draft() {
     )
     .await
     .unwrap();
-    assert_eq!(read["content"], PAGE, "no draft: {read}");
+    assert_eq!(read["markdown"], PAGE, "no draft: {read}");
     let out = call(
         peer,
         "edit_engram",
@@ -5415,7 +5524,7 @@ async fn in_review_mode_set_frontmatter_sources_is_a_draft() {
     .await
     .unwrap();
     assert!(
-        read["content"]
+        read["markdown"]
             .as_str()
             .unwrap()
             .contains("sources:\n- https://example.com/a\n- https://example.com/b\n"),
@@ -8362,7 +8471,7 @@ async fn a_crlf_engram_reads_as_lf_over_mcp_and_its_checksum_guards_an_edit() {
     )
     .await
     .unwrap();
-    let content = read["content"].as_str().unwrap();
+    let content = read["markdown"].as_str().unwrap();
     assert!(!content.contains('\r'), "{content:?}");
     assert!(
         content.contains("Written on a windows machine.\n"),
@@ -8400,7 +8509,7 @@ async fn configure_lists_no_operator_setting() {
         .filter(|s| s.operator_only)
         .map(|s| s.key)
         .collect();
-    assert_eq!(operator.len(), 31);
+    assert_eq!(operator.len(), 32);
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let keys: Vec<&str> = out["settings"]
@@ -9429,4 +9538,241 @@ async fn the_write_reflection_description_names_placed_after_section() {
         ),
         "{description}"
     );
+}
+
+// --- no answer has a top-level `content` key (issue #237) -------------------
+
+/// Hosted ChatGPT shows `{}` for a tool result whose JSON text has a
+/// top-level `content` key (issue #237), so no tool answer may carry one:
+/// `read_engram` names its text `markdown`, as `read_reflection` does.
+///
+/// **What this covers.** Every tool the server lists is called once with
+/// representative arguments on both transports, and the text block is checked
+/// for a top-level `content` key whether it is JSON or TOON. A tool the table
+/// below does not name fails the test, so a tool added later has to be
+/// looked at here before it ships. A tool the harness cannot answer in full
+/// (it needs a team, a provisioning source or a connected account) is called
+/// with arguments it refuses: the refusal text must hold no `content` key
+/// either, and its success shape is pinned by the tool's own tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_answer_has_a_top_level_content_key() {
+    for http in [false, true] {
+        for pin_json in [true, false] {
+            let h = Harness::build(&["eng"], false, pin_json).await;
+            let (client, _server) = if http {
+                h.connect_http().await
+            } else {
+                h.connect().await
+            };
+            let peer = client.peer();
+            for (title, body) in [
+                (
+                    "Alpha",
+                    "- [decision] we chose alpha #core\n- [fact] it is fast #core\n- [lesson] measure first #core",
+                ),
+                (
+                    "Beta",
+                    "- [fact] beta exists #core\n- [fact] beta links alpha #core\n- [lesson] keep notes #core",
+                ),
+            ] {
+                let receipt = call_text(
+                    peer,
+                    "write_engram",
+                    json!({ "domain": "eng", "title": title, "content": body }),
+                )
+                .await
+                .unwrap();
+                assert!(!has_top_level_content(&receipt), "write_engram: {receipt}");
+            }
+
+            let tools = peer.list_tools(Default::default()).await.unwrap().tools;
+            for tool in &tools {
+                let name = tool.name.as_ref();
+                let args = representative_args(name).unwrap_or_else(|| {
+                    panic!(
+                        "tool {name} has no representative arguments in \
+                         no_tool_answer_has_a_top_level_content_key: add them, and keep its \
+                         answer free of a top-level `content` key (issue #237)"
+                    )
+                });
+                let mut params = CallToolRequestParams::new(name.to_string());
+                if let Value::Object(map) = args {
+                    params = params.with_arguments(map);
+                }
+                let Ok(result) = peer.call_tool(params).await else {
+                    continue;
+                };
+                for block in serde_json::to_value(&result).unwrap()["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = block["text"].as_str() {
+                        assert!(
+                            !has_top_level_content(text),
+                            "{name} (http: {http}, json: {pin_json}) answered a top-level \
+                             `content` key: {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True when `text` is a JSON object with a `content` key, or a TOON object
+/// with a `content` line at its top level.
+fn has_top_level_content(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text.split_once("\n\n---\n").map_or(text, |(h, _)| h)) {
+        Ok(Value::Object(map)) => map.contains_key("content"),
+        Ok(_) => false,
+        Err(_) => text
+            .lines()
+            .any(|line| line.starts_with("content:") || line.starts_with("content[")),
+    }
+}
+
+/// Arguments that make each tool answer, or refuse, in a harness holding the
+/// domain `eng` and the engrams `alpha` and `beta`. None for a tool this
+/// table has not seen.
+fn representative_args(tool: &str) -> Option<Value> {
+    Some(match tool {
+        "read_engram" => json!({ "identifier": "alpha", "domain": "eng" }),
+        "search_engrams" => json!({ "query": "alpha" }),
+        "build_context" => json!({ "url": "crystalline://eng/alpha" }),
+        "recent_activity" => json!({}),
+        "list_domains" => json!({ "include_routing": true }),
+        "browse_domain" => json!({ "domain": "eng" }),
+        "validate_engrams" => json!({ "domain": "eng" }),
+        "infer_schema" => json!({ "domain": "eng" }),
+        "vocabulary" => json!({ "domain": "eng" }),
+        "evolve_engrams" => json!({ "domain": "eng" }),
+        "skills" => json!({}),
+        "configure" => json!({}),
+        "reflect" => json!({ "domain": "eng", "action": "status" }),
+        "read_reflection" => json!({ "domain": "eng" }),
+        "discuss" => json!({ "domain": "eng", "action": "list" }),
+        "edit_engram" => json!({
+            "domain": "eng", "identifier": "beta", "operation": "append",
+            "content": "- [fact] appended #core"
+        }),
+        "move_engram" => {
+            json!({ "domain": "eng", "identifier": "beta", "destination": "notes/beta.md" })
+        }
+        "split_engram" => {
+            json!({ "domain": "eng", "identifier": "alpha", "title": "Split Off", "observations": ["- [fact] it is fast #core"] })
+        }
+        "delete_engram" => json!({ "domain": "eng", "identifier": "gone" }),
+        // Refused or minimal: each needs a team, a source or a connected
+        // account this harness has none of.
+        "write_engram" | "write_reflection" | "add_domain" | "remove_domain" | "update_domain"
+        | "share_changes" | "origin_status" | "resolve_conflict" | "withdraw_proposal"
+        | "discard_changes" | "provision" | "onboarding" | "connector" => json!({}),
+        _ => return None,
+    })
+}
+
+/// The Reflection tools teach pages that keep themselves current: the
+/// descriptions are the tool-search corpus, so each new verb, item kind,
+/// field and refusal is named where an agent looks for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reflection_tools_teach_pages_that_keep_themselves_current() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let tool = |name: &str| {
+        tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .clone()
+    };
+    let description = |name: &str| {
+        tool(name)
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let schema = |name: &str| serde_json::to_string(&tool(name).input_schema).unwrap();
+
+    let reflect = description("reflect");
+    for needle in [
+        "stale",
+        "freshness",
+        "changed_engrams",
+        "owned_reconciled",
+        "page_pact_changed",
+        "pact_hash_changed",
+        "owner_gone",
+        "link_retired",
+        "link_broken",
+        "version",
+        "action=reconciled",
+    ] {
+        assert!(
+            reflect.contains(needle),
+            "reflect lacks {needle}: {reflect}"
+        );
+    }
+    let reflect_schema = schema("reflect");
+    assert!(
+        reflect_schema.contains("changed_engrams") && reflect_schema.contains("null"),
+        "the stale parameter says when the count is unknown: {reflect_schema}"
+    );
+
+    let write = description("write_reflection");
+    for needle in [
+        "action reconciled",
+        "outcome updated or unchanged",
+        "version",
+        "action retire",
+        "action restore",
+        "owner",
+        "owned pages first and the owner last",
+        "never deletes",
+        "retire it instead",
+        "owner: \"\"",
+        "older period",
+        "freshness",
+        "follows",
+        "does not write pact text",
+        "does not change a page's freshness or follows",
+        "answers in the thread",
+    ] {
+        assert!(
+            write.contains(needle),
+            "write_reflection lacks {needle}: {write}"
+        );
+    }
+    assert!(
+        reflect.contains("writes no pact text")
+            && reflect.contains("a curator makes the change")
+            && reflect.contains("an item on a pact file whose fix changes its text")
+            && reflect.contains("moves no page that has its own page pact"),
+        "reflect lacks the unattended run's pact rule: {reflect}"
+    );
+    let write_schema = schema("write_reflection");
+    for needle in ["retire", "restore", "reconciled", "owner", "version"] {
+        assert!(
+            write_schema.contains(needle),
+            "write_reflection's schema lacks {needle}"
+        );
+    }
+
+    let read = description("read_reflection");
+    for needle in [
+        "freshness",
+        "follows",
+        "owner",
+        "retired",
+        "chain",
+        "page pact",
+    ] {
+        assert!(
+            read.contains(needle),
+            "read_reflection lacks {needle}: {read}"
+        );
+    }
 }

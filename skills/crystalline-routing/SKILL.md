@@ -99,6 +99,10 @@ Classify the question shape before dropping the currency filter:
 
 When a window filter is not getting traction, the `supersedes`/`superseded_by` relations plus each hit's `status` tell the same temporal story: search by keyword (topic or year) and read which engram covers the period asked about.
 
+## Tentative knowledge
+
+Knowledge can be tentative: an engram whose status is `draft`, `proposed`, `idea`, `poc` or `open`, or whose observations are `[idea]` or `[question]`. Tentative knowledge is not decided, but it can be worth building on. When it shapes an answer, a spec or a plan, name it as tentative and let your person choose: build on it, treat it as an option, or leave it out. When you build on it, say so in what you write (for example "assumes the proposal X"), so it can be checked again once X is decided or dropped. A search hit, a `build_context` node and a Reflection section's source each carry the engram's `status`, so you can see it without a read; the observation categories show only in `read_engram`.
+
 ## Read a MANIFEST only when needed
 
 Read a domain's `MANIFEST.md` (via `read_engram` or `browse_domain`) only when:
@@ -132,7 +136,7 @@ Once you have an anchor engram, follow its relations and links (including across
 }
 ```
 
-A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`. The result carries node titles, typed relations and untyped prose links (the latter surfaced as `rel_type` `links_to`), still no content, ranked by how strongly each node connects to the anchor - follow it with `read_engram` on the nodes that matter.
+A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`. The result carries each node's title, type, `status` and `tags`, typed relations and untyped prose links (the latter surfaced as `rel_type` `links_to`), still no content, ranked by how strongly each node connects to the anchor - follow it with `read_engram` on the nodes that matter.
 
 `read_engram` feeds this loop: it marks each relation and link `resolved` or not, summarizes `inbound` edges (capped at 5 refs) and, when inbound or resolved outbound edges exist, emits a `related` hint naming the `build_context` anchor to run - follow it when the neighbourhood would help. A `resolved: false` edge means the target is not written yet or sits in an unregistered domain, a signal not an error to chase.
 

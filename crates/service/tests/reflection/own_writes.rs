@@ -346,3 +346,70 @@ async fn off_structure_carries_a_hint_when_no_glob_fits() {
     assert_eq!(off.len(), 1, "{q}");
     assert!(off[0].get("hint").is_none(), "{q}");
 }
+
+/// A page pact (`<page>.pact.md`) is no page: it is not a page in the
+/// navigation tree, it is never off the pact's structure, and it does not
+/// count as a page a structure glob fits. Its write names no unsourced
+/// section, as PACT.md's does not.
+#[tokio::test]
+async fn a_page_pact_is_no_page_in_the_tree_the_queue_or_the_structure_findings() {
+    let fx = reflecting().await;
+    fx.engine
+        .write_reflection(&write("guides/a.md", TWO_SECTIONS), &agent())
+        .await
+        .unwrap();
+    let written = fx
+        .engine
+        .write_reflection(
+            &write("guides/a.pact.md", "# Pact of a\n\n## Tone\n\nShort.\n"),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    assert!(written.get("unsourced_sections").is_none(), "{written}");
+
+    // A glob that fits only the page pact fits no page.
+    let pact = "# How we write\n\n## Structure\n\n- guides/?.md\n- guides/*.pact.md\n";
+    let written = fx
+        .engine
+        .write_reflection(&write("PACT.md", pact), &agent())
+        .await
+        .unwrap();
+    assert_eq!(
+        written["structure_findings"],
+        serde_json::json!([
+            {
+                "bullet": "guides/*.pact.md",
+                "reason": crystalline_core::reflection::MATCHES_NO_PAGE
+            }
+        ]),
+        "{written}"
+    );
+
+    // With a structure the page pact does not fit, it is still not off it.
+    fx.engine
+        .write_reflection(
+            &write(
+                "PACT.md",
+                &page(&fx, "PACT.md").replace("- guides/*.pact.md\n", ""),
+            ),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    let q = queue(&fx).await;
+    assert!(items(&q, "off_structure").is_empty(), "{q}");
+    assert!(
+        !q.to_string().contains("guides/a.pact.md"),
+        "no item names the page pact as a page: {q}"
+    );
+
+    let tree = fx
+        .engine
+        .read_reflection_tree("eng", &agent())
+        .await
+        .unwrap();
+    let text = tree.to_string();
+    assert!(text.contains("guides/a.md"), "{tree}");
+    assert!(!text.contains("a.pact.md"), "{tree}");
+}

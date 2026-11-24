@@ -54,6 +54,38 @@ pub struct User {
     pub last_seen: Option<String>,
     /// The Reflection level on every shared domain.
     pub reflection: ReflectionLevel,
+    /// How this account signs in. Filled when one account or the account list
+    /// is read; left out of the JSON where the account was read only to
+    /// authenticate a request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInKind>,
+    /// Whether a GitHub link exists for this account. Filled like `sign_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_linked: Option<bool>,
+}
+
+/// How an account signs in, worked out from what it holds, in this order: a
+/// password (`password`, even when it also has links or tokens), else an
+/// identity link to a sign-on provider (`oidc`), else any personal token row
+/// (`token_only`), else nothing of its own (`proxy`: an upstream proxy or
+/// trusted header authenticates it).
+///
+/// `proxy` and `token_only` are inferred, since nothing stores the kind: the
+/// token table has no expiry or revoked column, so any row counts, an expired
+/// or unused one too, and a proxy account that was later given a token shows
+/// as `token_only`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInKind {
+    /// A password this instance verifies.
+    Password,
+    /// An identity link to a sign-on provider (OIDC).
+    Oidc,
+    /// No password and no link: an upstream proxy or trusted header
+    /// authenticates it.
+    Proxy,
+    /// No password and no link, but a personal token: reachable by token only.
+    TokenOnly,
 }
 
 /// One identity an external provider asserts, tied to one account.
@@ -581,6 +613,123 @@ pub struct DraftResolveReceipt {
     pub draft_warning: Option<String>,
 }
 
+/// Which loops an agent runs. Chosen per agent; both by default.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoops {
+    /// Only the reflect loop, which curates the Reflection.
+    Reflect,
+    /// Only the evolve loop, which writes engrams.
+    Evolve,
+    /// Both loops.
+    Both,
+}
+
+/// Where one agent token stands.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTokenState {
+    /// Not revoked and not expired: it opens what the agent may reach.
+    Live,
+    /// Its time ran out.
+    Expired,
+    /// Revoked by an admin.
+    Revoked,
+}
+
+/// One token of an agent, never carrying the token itself.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AgentToken {
+    /// The row id, which `agents revoke` names.
+    #[schema(example = 4)]
+    pub id: i64,
+    /// What the admin called it.
+    #[schema(example = "issued 2026-11-22")]
+    pub label: String,
+    /// When it was issued, RFC 3339.
+    pub created_at: String,
+    /// When it stops working, RFC 3339.
+    pub expires_at: String,
+    /// When it was last presented, RFC 3339, or `None` when never.
+    pub last_used: Option<String>,
+    /// When it was revoked, RFC 3339, or `None`.
+    pub revoked_at: Option<String>,
+    /// Live, expired or revoked, as of the read.
+    pub state: AgentTokenState,
+}
+
+/// One agent with its tokens, newest first.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct Agent {
+    /// The unique name, folded like a login name. This is what a commit, a
+    /// lease and `generated.by` carry.
+    #[schema(example = "nightly")]
+    pub name: String,
+    /// The name shown to people.
+    #[schema(example = "Nightly runner")]
+    pub display: String,
+    /// The loops it runs.
+    pub loops: AgentLoops,
+    /// When it was created, RFC 3339.
+    pub created_at: String,
+    /// Who created it: the admin's account, or `cli` for `crystalline agents`.
+    pub created_by: String,
+    /// A disabled agent keeps its rows, and none of its tokens opens anything.
+    pub disabled: bool,
+    /// Its tokens, live or not, newest first.
+    pub tokens: Vec<AgentToken>,
+}
+
+/// Where one invite link stands.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteState {
+    /// Not used, not revoked and not expired: it still opens the way in.
+    Pending,
+    /// Redeemed.
+    Used,
+    /// Revoked before it was used.
+    Revoked,
+    /// Its time ran out before it was used.
+    Expired,
+}
+
+/// One invite link, never carrying its token.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct Invite {
+    /// The row id, which a revoke names.
+    #[schema(example = 3)]
+    pub id: i64,
+    /// The instance role an account this link creates gets.
+    pub role: Role,
+    /// The private domain the link gives membership of, if any.
+    #[schema(example = "team")]
+    pub domain: Option<String>,
+    /// The membership level on that domain; set exactly when `domain` is.
+    pub level: Option<MemberLevel>,
+    /// What its creator called it.
+    #[schema(example = "for Bo")]
+    pub label: Option<String>,
+    /// Whether it may create a local account with a password where an
+    /// identity provider would otherwise be the only way in.
+    pub local_account: bool,
+    /// The account that made it.
+    #[schema(example = "ada")]
+    pub created_by: String,
+    /// When it was made, RFC 3339.
+    pub created_at: String,
+    /// When it stops working, RFC 3339.
+    pub expires_at: String,
+    /// When it was used, RFC 3339, or `None`.
+    pub used_at: Option<String>,
+    /// The account that used it, or `None`.
+    pub used_by: Option<String>,
+    /// When it was revoked, RFC 3339, or `None`.
+    pub revoked_at: Option<String>,
+    /// Pending, used, revoked or expired, as of the read.
+    pub state: InviteState,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::auth_store;
@@ -656,8 +805,84 @@ mod tests {
                 disabled: false,
                 last_seen: None,
                 reflection: ReflectionLevel::Default,
+                sign_in: Some(auth_store::SignInKind::Password),
+                github_linked: Some(false),
             }]),
             published::<super::User>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::AgentLoops::Reflect,
+                auth_store::AgentLoops::Evolve,
+                auth_store::AgentLoops::Both
+            ]),
+            published::<super::AgentLoops>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::AgentTokenState::Live,
+                auth_store::AgentTokenState::Expired,
+                auth_store::AgentTokenState::Revoked
+            ]),
+            published::<super::AgentTokenState>()
+        );
+        let token = auth_store::AgentToken {
+            id: 0,
+            label: s(),
+            created_at: s(),
+            expires_at: s(),
+            last_used: None,
+            revoked_at: None,
+            state: auth_store::AgentTokenState::Live,
+        };
+        assert_eq!(keys([token.clone()]), published::<super::AgentToken>());
+        assert_eq!(
+            keys([auth_store::Agent {
+                name: s(),
+                display: s(),
+                loops: auth_store::AgentLoops::Both,
+                created_at: s(),
+                created_by: s(),
+                disabled: false,
+                tokens: vec![token],
+            }]),
+            published::<super::Agent>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::InviteState::Pending,
+                auth_store::InviteState::Used,
+                auth_store::InviteState::Revoked,
+                auth_store::InviteState::Expired
+            ]),
+            published::<super::InviteState>()
+        );
+        assert_eq!(
+            keys([auth_store::Invite {
+                id: 0,
+                role: auth_store::Role::None,
+                domain: None,
+                level: None,
+                label: None,
+                local_account: false,
+                created_by: s(),
+                created_at: s(),
+                expires_at: s(),
+                used_at: None,
+                used_by: None,
+                revoked_at: None,
+                state: auth_store::InviteState::Pending,
+            }]),
+            published::<super::Invite>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::SignInKind::Password,
+                auth_store::SignInKind::Oidc,
+                auth_store::SignInKind::Proxy,
+                auth_store::SignInKind::TokenOnly
+            ]),
+            published::<super::SignInKind>()
         );
         assert_eq!(
             keys([auth_store::IdentityLink {

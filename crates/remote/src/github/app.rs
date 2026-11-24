@@ -154,6 +154,23 @@ fn noreply_domain(host: Option<&str>) -> String {
     }
 }
 
+/// The identity a commit made on the user token `token` names that token's
+/// own GitHub account by: its login and its `noreply` address
+/// (`<id>+<login>@<domain>`, see `noreply_domain`) on the host `api_url`
+/// stands for (`None` is github.com). Asks `GET /user` once.
+pub async fn token_user_identity(
+    api_url: Option<&str>,
+    token: &str,
+) -> Result<CommitIdentity, RemoteError> {
+    let api_url = api_url.unwrap_or(super::DEFAULT_API_URL);
+    let user = super::auth::github_user(api_url, token).await?;
+    let domain = noreply_domain(api_host(api_url).as_deref());
+    Ok(CommitIdentity {
+        email: format!("{}+{}@{domain}", user.id, user.login),
+        name: user.login,
+    })
+}
+
 /// The clock a [`GithubApp`] reads: the issue time of its JWTs and the
 /// moment a cached token is measured against. [`GithubApp::new`] uses the
 /// system clock; [`GithubApp::with_clock`] swaps it.

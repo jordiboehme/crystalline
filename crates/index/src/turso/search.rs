@@ -130,6 +130,35 @@ async fn attach_tags(conn: &Conn, hits: &mut [(i64, SearchHit)]) -> Result<()> {
     Ok(())
 }
 
+/// Set each graph node's tags in one batch query over the slice's ids (`list`,
+/// the comma-joined ids the nodes were hydrated from), alphabetical within a
+/// node, the order [`attach_tags`] gives a search hit. An untagged engram keeps
+/// its empty vec.
+async fn attach_node_tags(conn: &Conn, list: &str, nodes: &mut [GraphNode]) -> Result<()> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "SELECT et.engram_id, t.name FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+         WHERE et.engram_id IN ({list}) ORDER BY et.engram_id, t.name"
+    );
+    let rows = query_all(conn, &sql, vec![]).await?;
+    let mut by_id: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    for r in &rows {
+        let id = cell_i64(r, 0).unwrap_or(0);
+        by_id
+            .entry(id)
+            .or_default()
+            .push(cell_text(r, 1).unwrap_or_default());
+    }
+    for node in nodes.iter_mut() {
+        if let Some(tags) = by_id.remove(&node.id.0) {
+            node.tags = tags;
+        }
+    }
+    Ok(())
+}
+
 /// The actor screen every candidate leg opens its `WHERE` with: which rows of
 /// the `engram` table this search is entitled to see.
 ///
@@ -1503,10 +1532,12 @@ pub(super) async fn neighbors(
                 engram_type: cell_text(r, 4).unwrap_or_default(),
                 salience: cell_real(r, 5),
                 status: cell_text(r, 6).unwrap_or_default(),
+                tags: Vec::new(),
                 actor: cell_text(r, 7).unwrap_or_default(),
                 recorded_at: cell_text(r, 8),
             });
         }
+        attach_node_tags(conn, &list, &mut nodes).await?;
     }
 
     Ok(GraphSlice { nodes, edges })

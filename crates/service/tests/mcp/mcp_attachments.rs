@@ -205,6 +205,23 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Value {
     serde_json::to_value(peer.call_tool(params).await.unwrap()).unwrap()
 }
 
+/// The engram text of a `read_engram` answer is its `markdown` field and the
+/// answer has no top-level `content` key (issue #237: hosted ChatGPT shows
+/// `{}` for a JSON text result that has one). The observations the engram
+/// holds keep their own nested `content`.
+fn assert_markdown_body(answer: &Value) {
+    assert!(
+        answer["markdown"]
+            .as_str()
+            .is_some_and(|text| text.contains("# Shots") || text.contains("assets/shot.png")),
+        "the text is under markdown: {answer}"
+    );
+    assert!(
+        answer.get("content").is_none(),
+        "no top-level content key: {answer}"
+    );
+}
+
 /// The resource-link blocks in a tool result, in order.
 fn resource_links(result: &Value) -> Vec<&Value> {
     result["content"]
@@ -511,6 +528,7 @@ async fn read_engram_links_the_attachments_it_references_and_only_those() {
     assert_eq!(first["type"], json!("text"), "the payload leads: {first}");
     let payload: Value = serde_json::from_str(first["text"].as_str().unwrap()).unwrap();
     assert_eq!(payload["permalink"].as_str(), Some("shots"));
+    assert_markdown_body(&payload);
 
     let links = resource_links(&result);
     assert_eq!(
@@ -749,6 +767,8 @@ async fn the_whole_read_surface_is_served_over_streamable_http_too() {
         )
         .await,
     );
+    let text = read["result"]["content"][0]["text"].as_str().unwrap();
+    assert_markdown_body(&serde_json::from_str(text).unwrap());
     let links = resource_links(&read["result"]);
     assert_eq!(links.len(), 2, "the two resolved references: {read}");
     assert_eq!(
@@ -941,6 +961,54 @@ async fn a_draft_attachment_is_a_resource_for_its_author_and_unknown_to_everybod
         resource_links(&his["result"]).is_empty(),
         "and goes on dangling for bob, who has nothing at that path: {his}"
     );
+}
+
+/// **A draft read answers its text under `markdown`, over HTTP.** alice's own
+/// draft of the reviewed engram is what she reads back, and the key is the
+/// one every read answers by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_read_answers_its_text_under_markdown() {
+    let h = review_harness().await;
+    let alice = crate::support::McpTestSession::open(
+        &h.addr,
+        Some(&h.auth.issue_mcp_token("alice", "t").await.unwrap().token),
+    )
+    .await;
+
+    let edited = payload(
+        &alice
+            .call_tool(
+                "edit_engram",
+                json!({
+                    "domain": "team", "identifier": "deck", "operation": "append",
+                    "content": "- [fact] alice drafted this line #team",
+                }),
+            )
+            .await,
+    );
+    let text = edited["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("\"draft\":true"),
+        "a draft, not the tree: {text}"
+    );
+
+    let read = payload(
+        &alice
+            .call_tool(
+                "read_engram",
+                json!({ "identifier": "deck", "domain": "team" }),
+            )
+            .await,
+    );
+    let text = read["result"]["content"][0]["text"].as_str().unwrap();
+    let answer: Value = serde_json::from_str(text).unwrap();
+    assert!(
+        answer["markdown"]
+            .as_str()
+            .is_some_and(|m| m.contains("alice drafted this line")),
+        "her draft's text is under markdown: {answer}"
+    );
+    assert!(answer.get("content").is_none(), "{answer}");
 }
 
 // --- pictures as images -------------------------------------------------------

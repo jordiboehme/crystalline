@@ -16,6 +16,7 @@ import {
   pageOffset,
   sectionTexts,
   stripIdLines,
+  roomText,
   stripProvenance,
 } from "./reflectionText";
 
@@ -185,6 +186,24 @@ describe("display helpers", () => {
     const page =
       "---\r\ntitle: D\r\nreflection:\r\n  7f3a9c2e:\r\n    reflected: ab\r\n---\r\n\r\n# D\r\n";
     expect(stripProvenance(page)).toBe("---\r\ntitle: D\r\n---\r\n\r\n# D\r\n");
+  });
+
+  it("leaves the page settings out of the room text, as the engine's room does", () => {
+    // The room shows neither the block nor freshness, follows and status
+    // (`without_page_keys` over `without_provenance`), so a conflict compares
+    // the room's own text and an editor never sees them.
+    const page =
+      "---\ntitle: D\nfreshness: 1d\nfollows: arch/overview.md\nreflection:\n  7f3a9c2e:\n    reflected: ab\nstatus: current\ntags: [a]\n---\n\n# D\n";
+    expect(roomText(page)).toBe("---\ntitle: D\ntags: [a]\n---\n\n# D\n");
+    // The download keeps them: only the engine's own block goes there.
+    expect(stripProvenance(page)).toContain("freshness: 1d");
+    // A frontmatter that held only those keys goes with them.
+    expect(
+      roomText(
+        "---\nfreshness: 6h\nreflection:\n  a:\n    reflected: ab\n---\n\n# D\n",
+      ),
+    ).toBe("# D\n");
+    expect(roomText("# No frontmatter\n")).toBe("# No frontmatter\n");
   });
 
   it("drops the fences with the block when it was the only key, as the engine does", () => {

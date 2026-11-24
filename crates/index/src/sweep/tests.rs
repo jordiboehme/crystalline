@@ -60,6 +60,7 @@ fn node_of(f: &EngramFacts) -> GraphNode {
         engram_type: f.engram_type.clone(),
         salience: f.salience,
         status: f.status.clone(),
+        tags: Vec::new(),
         actor: String::new(),
         recorded_at: None,
     }
@@ -412,9 +413,17 @@ fn speculative_statuses_are_exempt_from_v001_v002_and_v003() {
         speculative.valid_to = Some(day("2025-01-01"));
         speculative.stale_on = Some(day("2025-06-01"));
 
+        // An open question keeps V002 alone (see
+        // `an_open_engram_still_draws_v002_and_a_draft_does_not`).
+        let expected: Vec<&str> = if status == "open" {
+            vec!["V002"]
+        } else {
+            vec![]
+        };
         let report = detect(&input(vec![speculative]));
-        assert!(
-            fired(&report).is_empty(),
+        assert_eq!(
+            fired(&report),
+            expected,
             "status {status} drew {:?}",
             fired(&report)
         );
@@ -857,6 +866,7 @@ fn v102_keeps_a_registered_prefix_on_both_sides_of_the_repair() {
         engram_type: "engram".to_string(),
         salience: None,
         status: "stable".to_string(),
+        tags: Vec::new(),
         actor: String::new(),
         recorded_at: None,
     });
@@ -4305,4 +4315,76 @@ fn a_model_that_could_not_load_points_at_status_rather_than_a_pass() {
             "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; the daemon is read-only, so restarting it retries)"
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// The tentative status list, shared with core
+// ---------------------------------------------------------------------------
+
+/// The sweep's speculative list is core's tentative list, reached here
+/// under its old name, so the sweep and every reader agree on one set.
+#[test]
+fn the_speculative_list_is_cores_tentative_list() {
+    assert_eq!(SPECULATIVE_STATUSES, crystalline_core::TENTATIVE_STATUSES);
+    assert_eq!(
+        crate::sweep::SPECULATIVE_STATUSES,
+        ["draft", "proposed", "idea", "poc", "open"]
+    );
+}
+
+/// `open` is tentative, yet an open engram still draws `V002` once its
+/// review date passed: an author who set `stale_after` on an open question
+/// wants the nudge. The other tentative statuses keep their exemption.
+#[test]
+fn an_open_engram_still_draws_v002_and_a_draft_does_not() {
+    let mut open = fact(1, "open-question");
+    open.status = "open".to_string();
+    open.stale_on = Some(day("2026-06-01"));
+    let report = detect(&input(vec![open]));
+    assert_eq!(fired(&report), ["V002"], "open drew {:?}", fired(&report));
+
+    for status in ["draft", "proposed", "idea", "poc"] {
+        let mut tentative = fact(1, "half-baked-idea");
+        tentative.status = status.to_string();
+        tentative.stale_on = Some(day("2026-06-01"));
+        let report = detect(&input(vec![tentative]));
+        assert!(
+            fired(&report).is_empty(),
+            "{status} drew {:?}",
+            fired(&report)
+        );
+    }
+}
+
+/// The sweep decides "tentative" with core's check, which ignores case, so a
+/// hand-written `Draft` is speculative like `draft`.
+#[test]
+fn a_capitalised_tentative_status_is_speculative() {
+    let mut draft = fact(1, "draft-runbook");
+    draft.status = "Draft".to_string();
+    assert!(draft.is_speculative());
+    draft.status = "stable".to_string();
+    assert!(!draft.is_speculative());
+}
+
+/// `open` joined the tentative list: an open engram is no twin of a stable
+/// one that says the same thing, as a draft is not.
+#[test]
+fn an_open_engram_is_no_v301_twin() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    b.status = "open".to_string();
+
+    let report = detect(&input(vec![a, b]));
+    assert!(!fired(&report).contains(&"V301"), "{:?}", fired(&report));
+}
+
+/// The contradiction check took current engrams only before `open` joined
+/// the list, so an open engram was never a candidate and still is not.
+#[test]
+fn an_open_engram_is_no_contradiction_candidate() {
+    assert!(!crate::nli::candidates::eligible("open", None, today()));
+    assert!(crate::nli::candidates::eligible("stable", None, today()));
 }

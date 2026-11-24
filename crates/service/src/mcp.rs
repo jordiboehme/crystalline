@@ -1079,11 +1079,13 @@ impl<'de> serde::Deserialize<'de> for ReflectArgs {
 }
 
 /// Every key [`ReflectParams`] reads, `skip_unavailable` included (kept out
-/// of the schema, still taken): it serializes them all once the flag is set.
-/// A test holds the list against the schema's properties.
+/// of the schema, still taken): it serializes them all once the flag is set
+/// and `stale` holds a value. A test holds the list against the schema's
+/// properties.
 fn reflect_keys() -> Vec<String> {
     match serde_json::to_value(ReflectParams {
         skip_unavailable: true,
+        stale: Some(false),
         ..ReflectParams::default()
     }) {
         Ok(Value::Object(map)) => map.into_iter().map(|(key, _)| key).collect(),
@@ -1201,6 +1203,44 @@ fn mcp_identity(ctx: &RequestContext<RoleServer>) -> Option<crate::mcp_gate::Mcp
         .extensions
         .get::<crate::mcp_gate::McpIdentity>()
         .cloned()
+}
+
+/// The agent of the loops the gate resolved for this request
+/// ([`crate::mcp_gate::McpAgent`]), as its scope before any loop binding.
+/// `None` for anybody else, and always on stdio.
+fn mcp_agent(ctx: &RequestContext<RoleServer>) -> Option<Scope> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    parts
+        .extensions
+        .get::<crate::mcp_gate::McpAgent>()
+        .map(|agent| agent.scope.clone())
+}
+
+/// The text of the request header `name`, trimmed, when it has any.
+fn header_text(ctx: &RequestContext<RoleServer>, name: &str) -> Option<String> {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The live loop leases of a request's caller, read once per call
+/// ([`McpServer::leases_of`]); `None` when they could not be read.
+type Leases = Option<Vec<(crystalline_core::automation::Loop, String)>>;
+
+/// Where an agent's call stands with its run, decided per call
+/// ([`McpServer::agent_call`]).
+enum AgentCall {
+    /// Not an agent of the loops: nothing here applies.
+    NotAnAgent,
+    /// The session's binding is refused, with the sentence why.
+    Refused(String),
+    /// The agent holds no live lease of its bound loop.
+    Outside(String),
+    /// The agent holds a live lease of its bound loop.
+    Inside(String),
 }
 
 /// What stands in for the client half when a client declared no usable name.
@@ -1570,12 +1610,26 @@ pub(crate) struct Caller {
     pub(crate) holder: Option<crate::join::Holder>,
     /// Where this caller opens a page.
     pub(crate) base: crate::web_url::WebBase,
+    /// The loop the session is bound to (the run-loop header), `None` when
+    /// it names none: a run's write is noted only in that loop's lease.
+    pub(crate) run_loop: Option<crystalline_core::automation::Loop>,
 }
 
 impl Caller {
     /// The actor a write records ([`compose_actor`]).
+    ///
+    /// An agent of the loops is named by its key, `agent:<name>`
+    /// ([`crate::scope::agent_key`]), read off the scope rather than
+    /// `account`: `<client>-for-agent:<name>`. A person's half is the login,
+    /// and no login may start with `agent:`, so an agent's writes never read
+    /// as a person's, even after its name is given to a person.
     pub(crate) fn actor(&self) -> Option<String> {
-        compose_actor(self.account.as_deref(), self.client.as_deref())
+        match &self.scope {
+            Scope::Agent { name, .. } => {
+                compose_actor(Some(&crate::scope::agent_key(name)), self.client.as_deref())
+            }
+            _ => compose_actor(self.account.as_deref(), self.client.as_deref()),
+        }
     }
 
     /// The chip a room draws for this call ([`peer_for`]).
@@ -1821,6 +1875,7 @@ impl McpServer {
     /// reads about who asked.
     fn caller(&self, ctx: &RequestContext<RoleServer>) -> Caller {
         Caller {
+            run_loop: self.bound_loop(ctx).ok().flatten(),
             scope: self.scope_of(ctx),
             account: mcp_account(ctx),
             client: client_actor(ctx),
@@ -1959,12 +2014,21 @@ impl McpServer {
     pub fn with_onboarded_harness(self, onboarded: bool) -> McpServer {
         let unattended = self.gate.unattended;
         let run_domain = self.gate.run_domain.clone();
+        let run_loop = self.gate.run_loop;
         self.with_harness_gate(HarnessGate {
+            run_loop,
             hook_installed: onboarded,
             onboarding_verified: onboarded,
             unattended,
             run_domain,
         })
+    }
+
+    /// Bind this session to the loop an unattended run started it for
+    /// (see [`HarnessGate::run_loop`]).
+    pub fn with_run_loop(mut self, lp: crystalline_core::automation::Loop) -> McpServer {
+        self.gate.run_loop = Some(lp);
+        self
     }
 
     /// Bind this session to the domain an unattended run started it for
@@ -2007,6 +2071,13 @@ impl McpServer {
     ///   made anything private is byte-identical to its old self, and one that
     ///   did keeps it out of an unauthenticated agent's reach.
     fn scope_of(&self, ctx: &RequestContext<RoleServer>) -> Scope {
+        if let Some(agent) = mcp_agent(ctx) {
+            // A session bound to one loop has that loop's rights only. A
+            // binding that is refused binds nothing here: every call of such
+            // a session is refused before it reads its scope.
+            let bound = self.bound_loop(ctx).ok().flatten();
+            return crate::agent_gate::narrowed(agent, bound);
+        }
         match self.transport {
             Transport::Stdio => Scope::Unrestricted,
             Transport::Http => match mcp_identity(ctx) {
@@ -2204,8 +2275,10 @@ impl McpServer {
             Scope::Unrestricted => true,
             Scope::Anonymous => !self.engine.auth_mcp(),
             Scope::User { admin, .. } => *admin,
-            // Never resolved at the edge (see `Scope::Agent`), and at most an
+            // Never resolved at the edge (see `Scope::OpenTierIdentity`), and at most an
             // editor where it is: not an admin.
+            Scope::OpenTierIdentity { .. } => false,
+            // An agent of the loops never holds the instance admin role.
             Scope::Agent { .. } => false,
         }
     }
@@ -2253,9 +2326,11 @@ impl McpServer {
     fn share_actor(&self, ctx: &RequestContext<RoleServer>) -> ShareActor {
         match self.transport {
             Transport::Stdio => ShareActor::Owner,
-            Transport::Http => match mcp_account(ctx) {
-                Some(account) => ShareActor::Account(account),
-                None => ShareActor::HttpAgent,
+            Transport::Http => match (mcp_agent(ctx), mcp_account(ctx)) {
+                // An agent of the loops shares as the machine's run does.
+                (Some(Scope::Agent { name, .. }), _) => ShareActor::Agent(name),
+                (_, Some(account)) => ShareActor::Account(account),
+                (_, None) => ShareActor::HttpAgent,
             },
         }
     }
@@ -2425,7 +2500,8 @@ impl McpServer {
             "write_engram" | "edit_engram" => ok_written(value),
             "move_engram" => ok_moved(value),
             "split_engram" => ok_split(value),
-            "read_engram" | "delete_engram" | "infer_schema" => ok(value),
+            "read_engram" => ok(with_markdown_body(value)),
+            "delete_engram" | "infer_schema" => ok(value),
             "search_engrams" => self.ok_found(value),
             // The Reflection tools render as their own handlers do: one page,
             // a write and a thread as plain JSON; a queue, a tree and a thread
@@ -2673,16 +2749,52 @@ impl McpServer {
     /// never reaches it. A caller with no account notes nothing.
     /// A failed note is logged and never fails the write.
     async fn note_run_writes(&self, caller: &Caller, receipt: &Value) {
-        let Scope::User { account, .. } = &caller.scope else {
-            return;
+        // The holder a lease names: an account by its name, an agent by its
+        // key. The loop is the one this session is bound to; an agent with
+        // both loops and no binding notes each write in the loop it belongs
+        // to, never in both.
+        let (holder, bound, agent) = match &caller.scope {
+            Scope::User { account, .. } => (account.clone(), caller.run_loop, false),
+            Scope::Agent { name, loops, .. } => {
+                let bound = match loops {
+                    crate::rest::AgentLoops::Reflect => {
+                        Some(crystalline_core::automation::Loop::Reflect)
+                    }
+                    crate::rest::AgentLoops::Evolve => {
+                        Some(crystalline_core::automation::Loop::Evolve)
+                    }
+                    crate::rest::AgentLoops::Both => None,
+                };
+                (crate::scope::agent_key(name), bound, true)
+            }
+            _ => return,
         };
         // An upload of the bytes the path already held is noted too: it may
         // be the retry of an upload that landed but was never noted (its
         // handler cancelled by a timeout), and the run's pull request must
         // still carry the file.
         for (domain, paths) in written_paths(receipt) {
-            if let Err(e) = self.engine.note_written(&domain, account, &paths).await {
-                tracing::warn!("noting a run's writes in '{domain}': {e}");
+            let mut by_loop: Vec<(Option<crystalline_core::automation::Loop>, Vec<String>)> =
+                Vec::new();
+            for path in paths {
+                let lp = if agent {
+                    Some(crate::agent_gate::loop_of_write(bound, &path))
+                } else {
+                    bound
+                };
+                match by_loop.iter_mut().find(|(l, _)| *l == lp) {
+                    Some((_, group)) => group.push(path),
+                    None => by_loop.push((lp, vec![path])),
+                }
+            }
+            for (lp, paths) in by_loop {
+                if let Err(e) = self
+                    .engine
+                    .note_written_in(&domain, &holder, lp, &paths)
+                    .await
+                {
+                    tracing::warn!("noting a run's writes in '{domain}': {e}");
+                }
             }
         }
     }
@@ -3475,7 +3587,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Also uploads, adds or replaces a file attachment (an image, SVG, picture, PDF, slide deck or data file): pass path under assets/ (for example assets/diagrams/flow.png) plus exactly one of content (text, SVG included) or base64 (any binary file) instead of title; overwrite true replaces an existing file, the default refuses one; title, folder, type, tags, status and metadata are refused with a path; a file is capped at 10 MiB and needs edit access; the receipt carries domain, path, mime, size, sha256 and created (and draft in a review-mode domain). Uploading the same bytes to a path that already holds them succeeds with unchanged: true, so a retry after a timeout is safe. To edit a picture, read it with read_engram and include_images: false (its base64), change it, write it back here with overwrite: true. A server older than 0.31.0 refuses with a message to update it to 0.31.0 or later. An engram write (no path) needs a title and content (empty content is allowed, a missing one is not). content is the body; if it opens with a frontmatter block, its keys are merged into the frontmatter (parameters win; permalink, recorded_at, timestamp and generated are ignored) and the receipt notices name them. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). Pass expected_checksum (the checksum from read_engram) with overwrite to guard a whole-engram rewrite against a change since your read: a changed or deleted engram is refused as a conflict, so re-read and retry; omit it for last-write-wins. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. The receipt may also carry close_folders when the write started a new folder next to existing sibling folders with a close name (planview beside planview-work, note beside notes, a typo or a case variant), each with its engram count, plus folder_guidance: if it is the same topic, move the engram into that folder with move_engram and keep one folder; if the topics differ, leave it. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document is refused and names who is in there, so use edit_engram for the change, which composes into their document. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know (or, in an engram, an observation inside a callout): fix them.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Also uploads, adds or replaces a file attachment (an image, SVG, picture, PDF, slide deck or data file): pass path under assets/ (for example assets/diagrams/flow.png) plus exactly one of content (text, SVG included) or base64 (any binary file) instead of title; overwrite true replaces an existing file, the default refuses one; title, folder, type, tags, status and metadata are refused with a path; a file is capped at 10 MiB and needs edit access; the receipt carries domain, path, mime, size, sha256 and created (and draft in a review-mode domain). Uploading the same bytes to a path that already holds them succeeds with unchanged: true, so a retry after a timeout is safe. To edit a picture, read it with read_engram and include_images: false (its base64), change it, write it back here with overwrite: true. A server older than 0.31.0 refuses with a message to update it to 0.31.0 or later. An engram write (no path) needs a title and content (empty content is allowed, a missing one is not). content is the body; if it opens with a frontmatter block, its keys are merged into the frontmatter (parameters win; permalink, recorded_at, timestamp and generated are ignored) and the receipt notices name them. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, open, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). Pass expected_checksum (the checksum from read_engram) with overwrite to guard a whole-engram rewrite against a change since your read: a changed or deleted engram is refused as a conflict, so re-read and retry; omit it for last-write-wins. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. The receipt may also carry close_folders when the write started a new folder next to existing sibling folders with a close name (planview beside planview-work, note beside notes, a typo or a case variant), each with its engram count, plus folder_guidance: if it is the same topic, move the engram into that folder with move_engram and keep one folder; if the topics differ, leave it. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document is refused and names who is in there, so use edit_engram for the change, which composes into their document. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know (or, in an engram, an observation inside a callout): fix them.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3499,7 +3611,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier under assets/ (domain required, for example assets/diagrams/flow.png) downloads that file attachment instead: domain, path, mime, size and sha256 plus text for a text file (SVG included) or base64 for other binary; a png, jpeg, gif or webp up to 5 MiB comes as an image block you can look at, with a note and no base64, unless you pass include_images: false: then it comes as base64 and no image block. To copy a picture (into the Reflection, for example), read it with include_images: false, then write_asset with that base64. To edit a picture, download it here with include_images: false, change it, then write it back with write_engram path and overwrite: true. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier (a file under assets/ is the one exception, above): a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Pass include_images true to also get the pictures it links (png, jpeg, gif, webp; at most 8 and 5 MiB) as image content you can look at with vision, for a picture marked as needing vision. An engram from a domain served by another machine carries them too, and resources/read fetches them from that server (Crystalline 0.27 or newer there). Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. When their editor cannot save right now (its save is in conflict or was refused) the reply carries the saved version instead, which is where your edits go, with room: waiting, present and room_note: tell the person what room_note says. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section. The answer carries read_only: true when you cannot write in the engram's domain; propose the change to a person instead of editing.",
+        description = "Read an engram's full markdown (the `markdown` field) and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier under assets/ (domain required, for example assets/diagrams/flow.png) downloads that file attachment instead: domain, path, mime, size and sha256 plus text for a text file (SVG included) or base64 for other binary; a png, jpeg, gif or webp up to 5 MiB comes as an image block you can look at, with a note and no base64, unless you pass include_images: false: then it comes as base64 and no image block. To copy a picture (into the Reflection, for example), read it with include_images: false, then write_asset with that base64. To edit a picture, download it here with include_images: false, change it, then write it back with write_engram path and overwrite: true. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier (a file under assets/ is the one exception, above): a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Pass include_images true to also get the pictures it links (png, jpeg, gif, webp; at most 8 and 5 MiB) as image content you can look at with vision, for a picture marked as needing vision. An engram from a domain served by another machine carries them too, and resources/read fetches them from that server (Crystalline 0.27 or newer there). Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. When their editor cannot save right now (its save is in conflict or was refused) the reply carries the saved version instead, which is where your edits go, with room: waiting, present and room_note: tell the person what room_note says. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section. The answer carries read_only: true when you cannot write in the engram's domain; propose the change to a person instead of editing.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -3535,7 +3647,7 @@ impl McpServer {
                 &self.reflection_caller(&ctx),
             )
             .await;
-        let mut result = ok(value)?;
+        let mut result = ok(with_markdown_body(value))?;
         result.content.extend(file_links(&domain, &files));
         if include_images == Some(true) {
             let rc = self.reflection_caller(&ctx);
@@ -3666,7 +3778,7 @@ impl McpServer {
     #[tool(
         name = "build_context",
         title = "Build context",
-        description = "Assemble the neighbourhood around an anchor engram by following its relations and links, across domains too, to gather related context before a task. Related engrams come back ranked by how strongly they connect to the anchor, salience-aware and status-aware (retired statuses rank lower), and max_related keeps the top-ranked (default 10, at most 100). The anchor is a crystalline:// URL; a /* suffix globs a permalink prefix. depth is 1 to 3. Pass timeframe (7d, 24h, 2w, 1y) to keep only related engrams recorded in that recent window, for what changed lately around a topic; the anchors always come back.",
+        description = "Assemble the neighbourhood around an anchor engram by following its relations and links, across domains too, to gather related context before a task. Related engrams come back ranked by how strongly they connect to the anchor, salience-aware and status-aware (retired statuses rank lower), and max_related keeps the top-ranked (default 10, at most 100). Each node carries id, domain, permalink, title, type, status, tags and seed (no content: read_engram a node before citing it), so a tentative node (status draft, proposed, idea, poc or open) shows as one without a read: name it as tentative when it shapes a plan or an answer. A node with draft: true is your own unshared copy in a review-mode domain, not the status draft. The anchor is a crystalline:// URL; a /* suffix globs a permalink prefix. depth is 1 to 3. Pass timeframe (7d, 24h, 2w, 1y) to keep only related engrams recorded in that recent window, for what changed lately around a topic; the anchors always come back.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn build_context(
@@ -3824,7 +3936,7 @@ impl McpServer {
     #[tool(
         name = "reflect",
         title = "Reflect",
-        description = "Get the work queue of a domain's Reflection and work it. The Reflection is the domain's documents for people under reflections/, written at the level its PACT.md agrees on; it exists where the domain's MANIFEST says reflection: on. Three kinds of item, oldest first: feedback (a person changed a section - the diff, who changed it and the engrams the section was built from; judge it into the engrams, keep it as their text, or answer it in a thread), update (an engram behind a section changed, was retired or is gone, in this domain or another; source_unavailable when a source's domain cannot be checked here: keep such a source while its domain may come back, and drop it only by writing its section's sources without it once the domain is gone for good; source_too_wide when a section cites a domain fewer people may read than the page's domain: remove that source and the text drawn from it; engrams no section covers yet; a page off the pact's structure; a changed pact; a file nobody links, a link to a missing file, an embedded engram attachment - bring the engrams into the reflections) and review (threads waiting for you; a thread item carries label and blocking when its opening comment is a conventional comment, and a blocking thread comes first in its section). Within a section the feedback item comes before any update item, so you read a person's change before you rewrite it. A source in a domain you cannot open is never named: a feedback or update item carries hidden_sources and a note instead, so ask a person instead of updating blind. Read-only: it changes nothing. Call it when a session-end reminder or the routing block names a domain's Reflection, when the user asks what the Reflection needs, and in a scheduled run on the home instance. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. domains narrows the queue, kinds filters it, limit and page page through it. When the answer's scope carries unreadable, those domains were left out because their Reflection could not be read; the rest of the queue is complete. When it carries pending, those domains' Reflection waits until the engrams in their reflections/ folder are moved out: tell the person.",
+        description = "Get the work queue of a domain's Reflection and work it. The Reflection is the domain's documents for people under reflections/, written at the level its PACT.md agrees on; it exists where the domain's MANIFEST says reflection: on. Three kinds of item, oldest first: feedback (a person changed a section - the diff, who changed it and the engrams the section was built from; judge it into the engrams, keep it as their text, or answer it in a thread), update (an engram behind a section changed, was retired or is gone, in this domain or another; source_unavailable when a source's domain cannot be checked here: keep such a source while its domain may come back, and drop it only by writing its section's sources without it once the domain is gone for good; source_too_wide when a section cites a domain fewer people may read than the page's domain: remove that source and the text drawn from it; engrams no section covers yet; a page off the pact's structure; a changed pact; a file nobody links, a link to a missing file, an embedded engram attachment - bring the engrams into the reflections; page_pact_changed when a pact on a page's chain changed: apply it to the page, then settle the pact file (with pacts empty and pact_hash_changed true no pact text changed, but the page's settings or the pages it follows did: bring the page in line and record write_reflection action=reconciled); owner_gone when the page that owned a page is gone or retired: retire it, or retire it and restore it without owner; link_retired and link_broken when a section links a retired or removed page: correct or drop the link; stale when a page's freshness ran out: reconcile it with its pacts - read the pact texts the answer's pacts carries, in chain order, search the domains you may read for what changed, change only what new information requires, name every source, create owned pages with owner, retire never delete, then record write_reflection action=reconciled with the item's version. A stale item's changed_engrams counts the engrams changed since the last reconcile (0: record unchanged quickly; null: unknown, so search), owned lists its owned pages and owned_reconciled those already reconciled this period: reconcile the owned pages first and the owner last, and skip owned_reconciled) and review (threads waiting for you; a thread item carries label and blocking when its opening comment is a conventional comment, and a blocking thread comes first in its section). Within a section the feedback item comes before any update item, so you read a person's change before you rewrite it. A source in a domain you cannot open is never named: a feedback or update item carries hidden_sources and a note instead, so ask a person instead of updating blind. Read-only: it changes nothing. Call it when a session-end reminder or the routing block names a domain's Reflection, when the user asks what the Reflection needs, and in a scheduled run on the home instance. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. domains narrows the queue, kinds filters it, limit and page page through it; stale items go to a scheduled run (a session marked unattended or a loop lease holder), and stale true asks for them in a session with a person. An unattended run writes no pact text, moves no page that has its own page pact and changes no page's freshness or follows: it answers a feedback item or thread that asks for such a change in its thread, and a curator makes the change; an item on a pact file whose fix changes its text (a missing file, an embedded engram attachment) is left for a curator the same way. When the answer's scope carries unreadable, those domains were left out because their Reflection could not be read; the rest of the queue is complete. When it carries pending, those domains' Reflection waits until the engrams in their reflections/ folder are moved out: tell the person.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn reflect(
@@ -3846,7 +3958,7 @@ impl McpServer {
     #[tool(
         name = "read_reflection",
         title = "Read reflection",
-        description = "Read a domain's Reflection - its documents for people under reflections/, where the MANIFEST says reflection: on. Without path: the tree of reflections with titles, section counts and open thread counts, and PACT.md, the agreement on audience, level of detail, presentation and structure. With path: one reflection's markdown with every section's hidden id (the <!-- r:... --> line under its ## heading), whether its text changed since it was last reflected, the engrams it was built from (each with its state: current, changed, retired, missing, or unavailable when its domain cannot be checked here; a source in another domain also carries that domain, and sources in a domain you cannot open are only counted as hidden_sources) and its open threads. With query: search the reflections by words and meaning (search_type hybrid by default, text or semantic) and get the matching sections, best first, each with its page, title, section id, heading and a snippet (at most 100 hits per page); pass path or query, not both. A path under assets/ (for example assets/diagrams/flow.png) downloads that Reflection file instead, in the same shape as read_engram's download: domain, path, mime, size, sha256 plus text or base64, and a picture up to 5 MiB as an image block, or as base64 with include_images: false; to edit or copy a picture, download it with include_images: false, change it and write that base64 back with write_reflection write_asset (overwrite true to replace). Files the reflection shows (under reflections/assets/) come back as resource links; fetch one with resources/read when the file itself matters. A page from a domain served by another machine carries them too and resources/read fetches them from that server, which needs Crystalline 0.27 or newer on that server. Read before write_reflection or discuss, and pass the checksum back as expected_checksum. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server.",
+        description = "Read a domain's Reflection - its documents for people under reflections/, where the MANIFEST says reflection: on. Without path: the tree of reflections with titles, section counts and open thread counts, and PACT.md, the agreement on audience, level of detail, presentation and structure; a page is marked retired (hidden in the navigation) and names its owner. With path: one reflection's markdown with every section's hidden id (the <!-- r:... --> line under its ## heading), whether its text changed since it was last reflected, the engrams it was built from (each with its state: current, changed, retired, missing, or unavailable when its domain cannot be checked here; each source it can check also carries the engram's status, so a section built on a draft, proposed, idea, poc or open engram shows as tentative; a source in another domain also carries that domain, and sources in a domain you cannot open are only counted as hidden_sources) and its open threads; a page also carries page: its freshness, follows and status, its owner, its retired record, the chain of pages it follows with their titles, the pacts that apply in order (PACT.md, each page pact on the way, then its own page pact <page>.pact.md) and findings for settings that did not read. With query: search the reflections by words and meaning (search_type hybrid by default, text or semantic) and get the matching sections, best first, each with its page, title, section id, heading, a snippet and retired for a hit on a retired page (at most 100 hits per page); pass path or query, not both. A path under assets/ (for example assets/diagrams/flow.png) downloads that Reflection file instead, in the same shape as read_engram's download: domain, path, mime, size, sha256 plus text or base64, and a picture up to 5 MiB as an image block, or as base64 with include_images: false; to edit or copy a picture, download it with include_images: false, change it and write that base64 back with write_reflection write_asset (overwrite true to replace). Files the reflection shows (under reflections/assets/) come back as resource links; fetch one with resources/read when the file itself matters. A page from a domain served by another machine carries them too and resources/read fetches them from that server, which needs Crystalline 0.27 or newer on that server. Read before write_reflection or discuss, and pass the checksum back as expected_checksum. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn read_reflection(
@@ -3885,7 +3997,7 @@ impl McpServer {
     #[tool(
         name = "write_reflection",
         title = "Write reflection",
-        description = "Create, change, move or delete a reflection - a document for people under reflections/, where the domain's MANIFEST says reflection: on - or edit PACT.md, the domain's agreement on audience, level of detail, presentation and structure (PACT.md and every write with sources need curate access, which everyone who edits the engrams holds; anyone else proposes a PACT.md change with discuss). Write at the level PACT.md describes. action write (the default) takes the whole markdown: keep each ## heading's <!-- r:... --> id line as it is. Crystalline gives a new heading its id line; never write one yourself. The `reflection:` frontmatter key is Crystalline's bookkeeping; never write it (pass `sources` instead). To change one section instead, pass operation replace_section, insert_before_section or insert_after_section with section (the heading path, for example ## Night deploys, or a section's id) and content, exactly as edit_engram does; the section keeps its id line, and a miss lists the headings the page has. insert_after_section puts content right under the section's heading line, unless the content opens with a heading of the section's own level or a higher one: then it goes after the whole section and the receipt says placed_after_section. Pass sources (a ## section's id or heading text to the engrams it was built from: a permalink for an engram in this domain, a crystalline://<domain>/<permalink> address for one in another domain you can read, as long as everyone who may read this page may read that domain too: a source in a domain fewer people may read is refused, and so is a source in a domain not connected to GitHub when this page's domain is: then leave out that source and every sentence drawn from it, or write that text on a page in that domain instead; a person who may read that domain can share it on purpose, disclose or confirm it: when this session's client can put a question to its user, the call asks that person first (input_required on a 2026-07-28 peer, an elicitation request on an older one, one unchecked box) and lands only on their yes, showing the text to share and keeping who confirmed and when on the server; one yes counts once per person, page and source domain, until the page's readers widen; it is a deliberate step for the person, never answer it yourself; a session marked unattended, a headless loop run and a caller holding a loop lease are never asked and do not see such a domain at all) for every section you built from engrams: that curates the section and records what it reflects, and the queue notices when those engrams change. Never write sources into the page as HTML comments or text. A heading this same write creates works as a key; the # title and ### headings are not sections, and a heading two sections share needs their ids from the receipt. Without sources a write records no engrams; a person's change it does not take in stays a feedback item in reflect. Sources alone, with no markdown and no operation, curate those sections as the page stands and rewrite none of its text (a heading without an id line still gets one, and addresses are spelled with current domain names). action settle with sections and outcome kept (the person's text stands, sources stay) or taken_in (you changed the engrams to match) settles feedback items; without sections it settles the whole page, so settle PACT.md this way once the pages follow a changed pact. A heading with no id line yet is left out: it gets one on the next write, then settle again. Your own writes never come back as feedback. PACT.md's ## Structure bullets are globs, one per top-level bullet (for example - guides/*.md), and a PACT.md receipt names structure_findings for bullets that are not read as globs or match no page. action move carries the reflection's threads and baseline and rewrites relative links to it (a page open in a co-editing room is saved first, and the room is closed and told the new path), and its receipt carries links_failed when a page that links it could not be rewritten; delete takes both along. action write_asset uploads an image, SVG, picture or other file a page shows into reflections/assets/: pass path under assets/ (for example assets/diagrams/flow.png), exactly one of content (text, SVG included) or base64 (binary), and overwrite (default create-only; replacing an existing file needs curate access, creating needs edit access; a reader is refused; 10 MiB cap); the receipt carries domain, path, mime, size, sha256 and created. Uploading the same bytes to a path that already holds them succeeds with unchanged: true, so a retry after a timeout is safe. The page then embeds it as ![alt](assets/flow.png) relative to its own folder. To edit a picture, read_reflection it with include_images: false (its base64), change it, write_asset it back with overwrite true. action move_asset (path and to) or delete_asset (path) moves or removes a file under reflections/assets/ and needs curate access; a move rewrites every link to the file, and its receipt carries links_failed (pages whose link could not be rewritten) or note (the file moved and its index row did not follow) when that happened. A page that embeds an engram attachment is refused (copy the file into reflections/assets/ first: read_engram it, then write_reflection write_asset it; to copy a picture, read it with include_images: false, then write_asset with that base64). When a person has the page open in a co-editing room, the receipt says landed live (the room took your text in) or landed file with room (conflict or waiting) and room_note: tell the person what room_note says. Needs edit access; sources and settle need curate access. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. The receipt names unsourced_sections (headings written without sources) when there are any: pass sources for them. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know: fix them. Present the page with the crystalline-presentation skill (callouts, status labels, diagrams, tables, math) where they serve the reader; read it with the skills tool if it is not installed.",
+        description = "Create, change, move or delete a reflection - a document for people under reflections/, where the domain's MANIFEST says reflection: on - or edit PACT.md, the domain's agreement on audience, level of detail, presentation and structure, or a page pact <page>.pact.md, extra instructions for one page and the pages that follow it (a pact file and every write with sources need curate access, which everyone who edits the engrams holds; anyone else proposes a PACT.md change with discuss). Write at the level PACT.md describes. action write (the default) takes the whole markdown: keep each ## heading's <!-- r:... --> id line as it is. Crystalline gives a new heading its id line; never write one yourself. The `reflection:` frontmatter key is Crystalline's bookkeeping; never write it (pass `sources` instead). To change one section instead, pass operation replace_section, insert_before_section or insert_after_section with section (the heading path, for example ## Night deploys, or a section's id) and content, exactly as edit_engram does; the section keeps its id line, and a miss lists the headings the page has. insert_after_section puts content right under the section's heading line, unless the content opens with a heading of the section's own level or a higher one: then it goes after the whole section and the receipt says placed_after_section. Pass sources (a ## section's id or heading text to the engrams it was built from: a permalink for an engram in this domain, a crystalline://<domain>/<permalink> address for one in another domain you can read, as long as everyone who may read this page may read that domain too: a source in a domain fewer people may read is refused, and so is a source in a domain not connected to GitHub when this page's domain is: then leave out that source and every sentence drawn from it, or write that text on a page in that domain instead; a person who may read that domain can share it on purpose, disclose or confirm it: when this session's client can put a question to its user, the call asks that person first (input_required on a 2026-07-28 peer, an elicitation request on an older one, one unchecked box) and lands only on their yes, showing the text to share and keeping who confirmed and when on the server; one yes counts once per person, page and source domain, until the page's readers widen; it is a deliberate step for the person, never answer it yourself; a session marked unattended, a headless loop run and a caller holding a loop lease are never asked and do not see such a domain at all) for every section you built from engrams: that curates the section and records what it reflects, and the queue notices when those engrams change. Never write sources into the page as HTML comments or text. A heading this same write creates works as a key; the # title and ### headings are not sections, and a heading two sections share needs their ids from the receipt. Without sources a write records no engrams; a person's change it does not take in stays a feedback item in reflect. Sources alone, with no markdown and no operation, curate those sections as the page stands and rewrite none of its text (a heading without an id line still gets one, and addresses are spelled with current domain names). action settle with sections and outcome kept (the person's text stands, sources stay) or taken_in (you changed the engrams to match) settles feedback items; without sections it settles the whole page, so settle PACT.md this way once the pages follow a changed pact. A heading with no id line yet is left out: it gets one on the next write, then settle again. Your own writes never come back as feedback. action reconciled with outcome updated or unchanged records that a page was brought in line with its pacts (it answers a stale item, writes no file and needs curate access): pass the stale item's version. While the page is stale a reconciled without version is refused, and so is one for an older period (the page was reconciled again after the item was handed out: read the queue again). An owner's reconciled is refused while a due owned page has no reconcile in this period: reconcile the owned pages first and the owner last. On create, owner names the page that owns the new page (curate access): a reconcile of the owner creates, updates and retires its owned pages, and an owned page takes no freshness of its own; owner: \"\" is refused, and an existing page takes no new owner. action retire takes a page out of the navigation (status archived; kept, found by search and by link, never reconciled, restorable; the receipt names was_owned_by) and action restore brings it back, with owner to put it back under the page it was owned by. A session marked unattended (a reflect run or an agent of the loops) never deletes a page or a page pact: delete is refused, so retire it instead. Such a session also does not write pact text (PACT.md or a page pact: no create, edit or overwrite), does not move a page that has its own page pact and does not change a page's freshness or follows (send them as stored or leave them out); it still settles a pact, sets status, retires, restores and creates owned pages. Where feedback asks for a pact change, it answers in the thread and a curator makes the change. The frontmatter keys freshness (1h, 6h, 1d, 7d, 2w, 3m: how often a reconcile falls due; m means months and there is no minute unit), follows (the page whose pact this page follows) and status are a curator's: a write that leaves one out keeps it, and a curator clears one by writing it with no value; no write moves status into or out of the retired words (archived, superseded, deprecated, legacy): use action retire or restore. PACT.md's ## Structure bullets are globs, one per top-level bullet (for example - guides/*.md), and a PACT.md receipt names structure_findings for bullets that are not read as globs or match no page. action move carries the reflection's threads and baseline and rewrites relative links to it (a page open in a co-editing room is saved first, and the room is closed and told the new path), and its receipt carries links_rewritten (the links rewritten in pages and in pact files) and links_failed when a page that links it could not be rewritten; its page pact moves with it (pact_moved), and the follows and owners of other pages that name it are rewritten (follows_rewritten, owners_rewritten); delete takes both along. action write_asset uploads an image, SVG, picture or other file a page shows into reflections/assets/: pass path under assets/ (for example assets/diagrams/flow.png), exactly one of content (text, SVG included) or base64 (binary), and overwrite (default create-only; replacing an existing file needs curate access, creating needs edit access; a reader is refused; 10 MiB cap); the receipt carries domain, path, mime, size, sha256 and created. Uploading the same bytes to a path that already holds them succeeds with unchanged: true, so a retry after a timeout is safe. The page then embeds it as ![alt](assets/flow.png) relative to its own folder. To edit a picture, read_reflection it with include_images: false (its base64), change it, write_asset it back with overwrite true. action move_asset (path and to) or delete_asset (path) moves or removes a file under reflections/assets/ and needs curate access; a move rewrites every link to the file, and its receipt carries links_failed (pages whose link could not be rewritten) or note (the file moved and its index row did not follow) when that happened. A page that embeds an engram attachment is refused (copy the file into reflections/assets/ first: read_engram it, then write_reflection write_asset it; to copy a picture, read it with include_images: false, then write_asset with that base64). When a person has the page open in a co-editing room, the receipt says landed live (the room took your text in) or landed file with room (conflict or waiting) and room_note: tell the person what room_note says. Needs edit access; sources and settle need curate access. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. The receipt names unsourced_sections (headings written without sources) when there are any: pass sources for them. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know: fix them. Present the page with the crystalline-presentation skill (callouts, status labels, diagrams, tables, math) where they serve the reader; read it with the skills tool if it is not installed.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -4229,7 +4341,7 @@ impl McpServer {
             }
             // The agent identity stands in for the open tier on one governed
             // domain only; it is not the person behind this session.
-            Scope::Anonymous | Scope::Agent { .. } => {
+            Scope::Anonymous | Scope::OpenTierIdentity { .. } | Scope::Agent { .. } => {
                 return ok(json!({
                     "connected": false,
                     "url": Value::Null,
@@ -5494,15 +5606,189 @@ fn run_writes_limited() -> bool {
 /// loop lease on that domain, so it can only narrow what the session reads.
 pub const RUN_DOMAIN_HEADER: &str = "X-Crystalline-Run-Domain";
 
+/// The header a remote loop run sends beside [`RUN_DOMAIN_HEADER`]: the loop
+/// it started this session for, `reflect` or `evolve`. Believed like the run
+/// domain, so it can only narrow: the session counts only that loop's leases
+/// as what it works on, and a write is noted only in that loop's lease. An
+/// agent of the loops that runs one loop is bound to it without the header.
+pub const RUN_LOOP_HEADER: &str = "X-Crystalline-Run-Loop";
+
 impl McpServer {
+    /// The loop this session is bound to.
+    ///
+    /// For an agent of the loops ([`crate::agent_gate::agent_loop`]): the
+    /// loop its header names, else its only loop, else none; a header naming
+    /// no loop, or one the agent does not run, is refused with the sentence
+    /// why. For anybody else the header's loop when it names one, and none
+    /// otherwise: a word that is no loop narrows nothing.
+    fn bound_loop(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<Option<crystalline_core::automation::Loop>, String> {
+        let named = match self.transport {
+            Transport::Http => header_text(ctx, RUN_LOOP_HEADER),
+            Transport::Stdio => self.gate.run_loop.map(|lp| lp.as_str().to_string()),
+        };
+        match mcp_agent(ctx) {
+            Some(Scope::Agent { loops, .. }) => {
+                crate::agent_gate::agent_loop(loops, named.as_deref())
+            }
+            _ => Ok(named.and_then(|named| named.parse().ok())),
+        }
+    }
+
+    /// The live loop leases this request's caller holds, read once per call
+    /// ([`Engine::run_leases`]) so that whether an agent is inside its run,
+    /// what it may do there and the read limit all come from one snapshot.
+    /// `None` when they could not be read, which refuses an agent and hides
+    /// every domain from anybody else.
+    async fn leases_of(&self, ctx: &RequestContext<RoleServer>) -> Leases {
+        match self.engine.run_leases(&self.scope_of(ctx)).await {
+            Ok(leases) => Some(leases),
+            Err(e) => {
+                tracing::warn!("the loop leases were not read: {e}");
+                None
+            }
+        }
+    }
+
+    /// The refusal of a tool call by an agent of the loops, or `None` when it
+    /// may go ahead (or the caller is no agent). Outside a run only the
+    /// `skills` tool. Inside one, never what a run's prompt forbids
+    /// ([`crate::agent_gate::refused_in_run`]), and a loop's work (a write,
+    /// or `evolve_engrams` / `reflect`) only on a domain where the agent holds
+    /// a live lease of that loop ([`crate::agent_gate::loop_work`]). Every
+    /// agent tool call is logged at INFO with the agent, the tool, the domain
+    /// it names and whether it was refused.
+    async fn agent_tool_refusal(
+        &self,
+        request: &rmcp::model::CallToolRequestParams,
+        ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
+    ) -> Option<String> {
+        let tool = request.name.as_ref();
+        let args = request.arguments.as_ref();
+        let (name, refusal) = match self.agent_call(ctx, leases) {
+            AgentCall::NotAnAgent => return None,
+            AgentCall::Refused(refusal) => (None, Some(refusal)),
+            AgentCall::Outside(name) => {
+                let refusal = (tool != crate::agent_gate::OPEN_OUTSIDE_A_RUN)
+                    .then(|| crate::agent_gate::AGENT_OUTSIDE_A_RUN.to_string());
+                (Some(name), refusal)
+            }
+            AgentCall::Inside(name) => {
+                let refusal = match crate::agent_gate::refused_in_run(tool, args) {
+                    Some(refusal) => Some(refusal),
+                    None => self.agent_work_refusal(tool, args, ctx, leases).await,
+                };
+                (Some(name), refusal)
+            }
+        };
+        let agent = match (name, mcp_agent(ctx)) {
+            (Some(name), _) | (None, Some(Scope::Agent { name, .. })) => name,
+            _ => String::new(),
+        };
+        let domain = logged_domain(args);
+        // Debug-formatted: the values come from the client, and a newline in
+        // them must not start a log line of its own.
+        tracing::info!(
+            agent = ?agent,
+            tool = ?tool,
+            domain = ?domain,
+            refused = refusal.is_some(),
+            "agent tool call"
+        );
+        refusal
+    }
+
+    /// The refusal of a loop's work by an agent inside a run, when the call
+    /// is that work ([`crate::agent_gate::loop_work`]) and the agent does not
+    /// hold a live lease of that loop on every domain it names, or its
+    /// session is bound to the other loop.
+    async fn agent_work_refusal(
+        &self,
+        tool: &str,
+        args: Option<&serde_json::Map<String, Value>>,
+        ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
+    ) -> Option<String> {
+        let (lp, domains) = crate::agent_gate::loop_work(tool, args)?;
+        if let Ok(Some(bound)) = self.bound_loop(ctx)
+            && bound != lp
+        {
+            return Some(crate::agent_gate::other_loop(tool, lp, bound));
+        }
+        if domains.is_empty() {
+            return Some(crate::agent_gate::names_no_domain(tool, lp));
+        }
+        let held = leases.as_deref().unwrap_or_default();
+        let scope = self.scope_of(ctx);
+        let hidden = match self.engine.hidden_for(&scope).await {
+            Ok(hidden) => hidden,
+            Err(e) => return Some(to_error(e).message.to_string()),
+        };
+        for typed in domains {
+            let local = self.engine.localize_visible(&typed, &hidden).await;
+            if !held.iter().any(|(l, d)| *l == lp && *d == local) {
+                return Some(crate::agent_gate::no_lease_there(tool, lp, &typed));
+            }
+        }
+        None
+    }
+
+    /// The refusal of a read that is no tool call (a resource other than a
+    /// skill, a prompt) by an agent of the loops outside a run of its loop.
+    fn agent_read_refusal(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
+    ) -> Result<(), ErrorData> {
+        match self.agent_call(ctx, leases) {
+            AgentCall::NotAnAgent | AgentCall::Inside(_) => Ok(()),
+            AgentCall::Refused(refusal) => Err(ErrorData::invalid_request(refusal, None)),
+            AgentCall::Outside(_) => Err(ErrorData::invalid_request(
+                crate::agent_gate::AGENT_READS_ONLY_IN_A_RUN,
+                None,
+            )),
+        }
+    }
+
+    /// Where an agent's call stands with its run, from this call's lease
+    /// snapshot: outside or inside a live lease of the loop its session is
+    /// bound to (either loop when it is unbound). Read again on every call,
+    /// never kept for the session, so a lease released or gone stale ends
+    /// what the agent may call at once. Which domain a loop's work may touch
+    /// is decided per call by [`McpServer::agent_work_refusal`].
+    fn agent_call(&self, ctx: &RequestContext<RoleServer>, leases: &Leases) -> AgentCall {
+        let Some(Scope::Agent { name, .. }) = mcp_agent(ctx) else {
+            return AgentCall::NotAnAgent;
+        };
+        let bound = match self.bound_loop(ctx) {
+            Ok(bound) => bound,
+            Err(refusal) => return AgentCall::Refused(refusal),
+        };
+        match leases {
+            Some(leases) if leases.iter().any(|(lp, _)| bound.is_none_or(|b| b == *lp)) => {
+                AgentCall::Inside(name)
+            }
+            Some(_) => AgentCall::Outside(name),
+            None => AgentCall::Refused(
+                "The leases of this agent's runs could not be read, so this call is refused. Try again."
+                    .to_string(),
+            ),
+        }
+    }
+
     /// What this request may not read because its session is unattended
     /// ([`Engine::read_limit_for`]): marked by its registration, by the run
-    /// domain an HTTP run names, or by a live loop lease its caller holds.
+    /// domain or loop an HTTP run names, or by a live loop lease its caller
+    /// holds.
     async fn read_limit(
         &self,
         ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
     ) -> Option<crystalline_engine::read_limit::Limit> {
-        self.read_limit_marked(ctx).await.0
+        self.read_limit_marked(ctx, leases).await.0
     }
 
     /// [`McpServer::read_limit`], and whether the session itself said it is
@@ -5512,22 +5798,28 @@ impl McpServer {
     async fn read_limit_marked(
         &self,
         ctx: &RequestContext<RoleServer>,
+        leases: &Leases,
     ) -> (Option<crystalline_engine::read_limit::Limit>, bool) {
-        let header = match self.transport {
-            Transport::Http => ctx
-                .extensions
-                .get::<axum::http::request::Parts>()
-                .and_then(|parts| parts.headers.get(RUN_DOMAIN_HEADER))
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            Transport::Stdio => None,
+        let (header, loop_header) = match self.transport {
+            Transport::Http => (
+                header_text(ctx, RUN_DOMAIN_HEADER),
+                header_text(ctx, RUN_LOOP_HEADER),
+            ),
+            Transport::Stdio => (None, None),
         };
         let run_domain = header.as_deref().or(self.gate.run_domain.as_deref());
-        let marked = self.gate.unattended || header.is_some() || run_domain.is_some();
+        // Either run header marks the session, as the stdio twin does, so a
+        // header only ever narrows. An agent of the loops is never anybody's
+        // interactive session.
+        let marked = self.gate.unattended
+            || header.is_some()
+            || loop_header.is_some()
+            || run_domain.is_some()
+            || mcp_agent(ctx).is_some();
+        let run_loop = self.bound_loop(ctx).ok().flatten();
         let limit = self
             .engine
-            .read_limit_for(&self.scope_of(ctx), marked, run_domain)
+            .read_limit_from_leases(leases.as_deref(), marked, run_domain, run_loop)
             .await;
         (limit, marked)
     }
@@ -5671,10 +5963,17 @@ impl ServerHandler for McpServer {
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        // An agent of the loops works only during a run of its loop, and
+        // inside one never calls what a run's prompt forbids. Decided first,
+        // before any argument is read.
+        let leases = self.leases_of(&context).await;
+        if let Some(refusal) = self.agent_tool_refusal(&request, &context, &leases).await {
+            return refuse(refusal).map(rmcp::model::CallToolResponse::from);
+        }
         // An unattended session reads only what every reader of its run's
         // domain may read (`crystalline_engine::read_limit`), for the whole
         // call, whichever tool it is.
-        let (limit, marked) = self.read_limit_marked(&context).await;
+        let (limit, marked) = self.read_limit_marked(&context, &leases).await;
         // An interactive session limited by its owner's run says so, once
         // per answer, in plain words.
         let note = if limit.is_some() && !marked {
@@ -5889,7 +6188,8 @@ impl ServerHandler for McpServer {
 
         // A limited session is onboarded to the domains it may read only:
         // the stdio block `get_info` renders names every domain.
-        if let Some(limit) = self.read_limit(&context).await {
+        let leases = self.leases_of(&context).await;
+        if let Some(limit) = self.read_limit(&context, &leases).await {
             let scope = self.scope_of(&context);
             let mut info = crystalline_engine::read_limit::within(
                 Some(limit),
@@ -5988,7 +6288,8 @@ impl ServerHandler for McpServer {
     ) -> Result<DiscoverResult, ErrorData> {
         self.engine.refresh_routing_cache().await;
         // A limited session is onboarded to the domains it may read only.
-        let limit = self.read_limit(&context).await;
+        let leases = self.leases_of(&context).await;
+        let limit = self.read_limit(&context, &leases).await;
         let info = crystalline_engine::read_limit::within(
             limit,
             self.arrival_info_scoped(&self.scope_of(&context)),
@@ -6274,9 +6575,15 @@ impl ServerHandler for McpServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        // An agent reads a skill at any time and anything else only during
+        // a run of its loop.
+        let leases = self.leases_of(&context).await;
+        if skill_for_uri(&request.uri).is_none() {
+            self.agent_read_refusal(&context, &leases)?;
+        }
         // An engram's attachment is engram content: an unattended session
         // reads it within its read limit, as it does every tool.
-        let limit = self.read_limit(&context).await;
+        let limit = self.read_limit(&context, &leases).await;
         crystalline_engine::engine::as_mcp_call(crystalline_engine::read_limit::within(
             limit,
             self.read_resource_limited(request, context),
@@ -6308,9 +6615,13 @@ impl ServerHandler for McpServer {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        // The onboarding prompt carries the routing block: a limited session
-        // is shown the domains it may read only.
-        let limit = self.read_limit(&context).await;
+        // A prompt is an instruction to act on the domains, and an agent
+        // acts only during a run: outside one it has the handshake's routing
+        // block (cut to what every reader may read) and its skills, and no
+        // prompt. A limited session is shown the domains it may read only.
+        let leases = self.leases_of(&context).await;
+        self.agent_read_refusal(&context, &leases)?;
+        let limit = self.read_limit(&context, &leases).await;
         crystalline_engine::read_limit::within(
             limit,
             Self::prompt_router().get_prompt(PromptContext::new(
@@ -6449,6 +6760,29 @@ fn file_links(domain: &str, files: &[LinkedFile]) -> Vec<ContentBlock> {
             )
         })
         .collect()
+}
+
+/// The engram text of a `read_engram` answer under the name MCP clients get
+/// it by: `markdown`, the key `read_reflection` already uses.
+///
+/// Hosted ChatGPT drops a JSON text result whose top level has a `content`
+/// key and shows `{}` (issue #237), so the MCP answer never carries one. The
+/// rename happens here, at the MCP layer, and nowhere below it: the engine's
+/// value, the REST API, the CLI and the remote tool door keep `content`
+/// (they have their own consumers), which is also why [`McpServer::linked_files`]
+/// reads `content` and runs before this. A mounted read goes through the same
+/// function, so a server of any version, which all answer `content`, reads
+/// the same as a local one. Only the top-level key moves; an observation's
+/// own `content` stays. An answer that already has `markdown`, or none, is
+/// left as it is.
+fn with_markdown_body(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut()
+        && !obj.contains_key("markdown")
+        && let Some(body) = obj.remove("content")
+    {
+        obj.insert("markdown".into(), body);
+    }
+    value
 }
 
 /// `files` on a remote read answer, left out when the read shows none.
@@ -7321,11 +7655,100 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
     }
 }
 
+/// The domain an agent tool call names, for its log line: `domain`, or the
+/// `domains` list joined with commas when there is no `domain` (`reflect`,
+/// `evolve_engrams`), or nothing.
+fn logged_domain(args: Option<&serde_json::Map<String, Value>>) -> String {
+    let Some(args) = args else {
+        return String::new();
+    };
+    if let Some(domain) = args.get("domain").and_then(Value::as_str) {
+        return domain.to_string();
+    }
+    args.get("domains")
+        .and_then(Value::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// The agent tool-call log names the one `domain`, or the `domains` list
+    /// of `reflect` and `evolve_engrams` when there is no `domain`.
+    #[test]
+    fn the_agent_call_log_names_domains_when_there_is_no_domain() {
+        let args = |v: Value| v.as_object().cloned().unwrap();
+        assert_eq!(
+            logged_domain(Some(&args(serde_json::json!({"domain": "a"})))),
+            "a"
+        );
+        assert_eq!(
+            logged_domain(Some(&args(serde_json::json!({"domains": ["a", "b"]})))),
+            "a,b"
+        );
+        assert_eq!(logged_domain(Some(&args(serde_json::json!({})))), "");
+        assert_eq!(logged_domain(None), "");
+    }
+
+    /// A caller of `scope` with `account` and `client` as a door resolves
+    /// them.
+    fn caller_of(scope: Scope, account: Option<&str>, client: Option<&str>) -> Caller {
+        Caller {
+            run_loop: None,
+            scope,
+            account: account.map(str::to_string),
+            client: client.map(str::to_string),
+            holder: None,
+            base: crate::web_url::WebBase::Unresolved,
+        }
+    }
+
+    /// An agent of the loops writes as `<client> for agent:<name>` (on disk
+    /// `<client>-for-agent:<name>`, once the engine folds the spaces), from its
+    /// scope whatever `account` says, and a client cannot write that shape
+    /// for a person: the join word goes from the client half, and no person
+    /// may hold a login that starts with `agent:`.
+    #[test]
+    fn an_agent_writes_under_its_key() {
+        let agent = Scope::Agent {
+            name: "nightly".to_string(),
+            loops: crate::rest::AgentLoops::Both,
+            token_id: 1,
+            token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(
+            caller_of(agent.clone(), None, Some("claude-code/2.0")).actor(),
+            Some("claude-code/2.0 for agent:nightly".to_string())
+        );
+        assert_eq!(
+            caller_of(agent.clone(), Some("nightly"), None).actor(),
+            Some("agent for agent:nightly".to_string())
+        );
+        let person = Scope::User {
+            account: "nightly".to_string(),
+            admin: false,
+        };
+        assert_eq!(
+            caller_of(person.clone(), Some("nightly"), Some("claude-code/2.0")).actor(),
+            Some("claude-code/2.0 for nightly".to_string())
+        );
+        // A client naming itself the agent's shape still writes as the person.
+        let forged = caller_of(person, Some("ada"), Some("x for agent:nightly")).actor();
+        assert_eq!(forged, Some("x-agent:nightly for ada".to_string()));
+        assert!(
+            crystalline_identity::auth_store::normalize_new_account_name("agent:nightly").is_err()
+        );
+    }
 
     /// A headless run may split, so both files of a split are noted for the
     /// run's pull request: the source it edited and the engram it created.
@@ -8182,18 +8605,21 @@ mod tests {
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
             unattended: false,
             run_domain: None,
+            run_loop: None,
         },
     ];
 

@@ -190,7 +190,7 @@ pub(crate) fn confirmer(caller: &ReflectionCaller) -> Option<String> {
     match &caller.scope {
         Scope::User { account, .. } => Some(account.clone()),
         Scope::Unrestricted => Some(crate::scope::OWNER_IDENTITY_NAME.to_string()),
-        Scope::Anonymous | Scope::Agent { .. } => None,
+        Scope::Anonymous | Scope::OpenTierIdentity { .. } | Scope::Agent { .. } => None,
     }
 }
 
@@ -294,7 +294,7 @@ fn question(
 impl Engine {
     /// The confirmations recorded on the Reflection of the domain `id`.
     pub(crate) async fn reflection_disclosures(&self, id: DomainId) -> Result<Disclosures> {
-        let rows = self.store.lock().await.reflection_disclosures(id).await?;
+        let rows = self.reader().reflection_disclosures(id).await?;
         let mut out = HashMap::new();
         for (path, records) in rows {
             // A row this binary cannot read is no confirmation: the section
@@ -743,7 +743,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(path).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, path).await?;
         if let Some(why) = self.readers_unknown() {
             return Err(EngineError::Invalid(format!(
                 "{UNKNOWN_READERS_REFUSAL} ({why})"

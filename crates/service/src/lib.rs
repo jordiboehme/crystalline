@@ -9,6 +9,7 @@
 //! the index) or in-process (a brief standalone open). The MCP tools, the ctl
 //! commands and the CLI data commands all funnel through that one engine.
 
+pub(crate) mod agent_gate;
 pub(crate) mod automation_ctl;
 pub mod automation_trigger;
 pub mod claim;
@@ -99,7 +100,7 @@ pub use crystalline_engine::similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarPr
 pub use crystalline_identity::join::{Holder, Join, Joins};
 pub use crystalline_identity::scope::{
     DomainAccess, DomainRight, DomainScreen, DomainVisibility, ReflectionCaller, ReflectionRight,
-    Scope, WriteRights, overlay_actor, reflection_right_word, write_list_matches,
+    Scope, WriteRights, overlay_actor, parse_write_list, reflection_right_word, write_list_matches,
 };
 pub use crystalline_remote::ops::DiscardTarget;
 pub use daemon::EXIT_FENCED;

@@ -16,6 +16,7 @@ use crystalline_core::config;
 use crystalline_core::text::plural;
 use crystalline_core::verify::{self, VerifyOptions};
 
+mod agents;
 mod automation;
 mod cmd;
 mod desktop_bundle;
@@ -511,42 +512,7 @@ enum Command {
     /// the full stack in-process. HTTP is served by the daemon, not this command,
     /// and a daemon this command starts opens it at 127.0.0.1:7411 by default,
     /// web UI included (service.http=false turns that off).
-    Mcp {
-        /// Run the full stack in-process instead of attaching to a daemon.
-        #[arg(long)]
-        embedded: bool,
-        /// Serve the content API read-only. Applies when this command runs the
-        /// stack in-process or spawns a new daemon; attaching to an
-        /// already-running daemon uses that daemon's mode instead.
-        #[arg(long)]
-        read_only: bool,
-        /// Which harness spawned this server, as `crystalline install` wrote
-        /// it into the MCP registration (claude-code, codex, copilot). Used
-        /// with this machine's install receipt to decide whether that harness
-        /// already has the shipped skills on disk, in which case they are not
-        /// served a second time. Omit it and the whole surface is served.
-        ///
-        /// A plain string rather than a value enum on purpose: a value this
-        /// binary does not recognize (a downgrade meeting a newer
-        /// registration) must serve the surface with a warning, never fail to
-        /// start the server.
-        #[arg(long)]
-        harness: Option<String>,
-        /// Mark this session unattended: nobody is behind it to answer a
-        /// question, so it is never asked to share Reflection text from a
-        /// domain fewer people may read. The MCP config of a headless loop
-        /// run (`crystalline reflect run`, `crystalline evolve run`) passes it.
-        #[arg(long, hide = true)]
-        unattended: bool,
-        /// The domain an unattended run started this session for: its reads
-        /// are limited to what every reader of that domain may read. Implies
-        /// --unattended. `crystalline reflect run` and `evolve run` pass it.
-        #[arg(long, hide = true)]
-        domain: Option<String>,
-        /// Load the global config from this file instead of the default path.
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
+    Mcp(McpArgs),
     /// Send a control command to a running daemon.
     Ctl {
         #[command(subcommand)]
@@ -562,6 +528,14 @@ enum Command {
     Users {
         #[command(subcommand)]
         command: UsersCommand,
+    },
+    /// Manage the agents of the loops: identities of their own for scheduled
+    /// reflect and evolve runs, never accounts, each with tokens that expire.
+    /// Writes the accounts store directly, like `crystalline users`, so it
+    /// works with or without a running daemon.
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
     },
     /// Find and handle the texts this machine's server kept when a
     /// co-editing room could not save: the last person left and the final
@@ -917,6 +891,54 @@ enum Command {
     },
 }
 
+/// The arguments of `crystalline mcp`, in a struct of their own so that
+/// clap parses them in a frame of their own: the derived parser of the
+/// whole command enum otherwise grows past a test thread's stack in an
+/// unoptimized build.
+#[derive(clap::Args, Debug)]
+struct McpArgs {
+    /// Run the full stack in-process instead of attaching to a daemon.
+    #[arg(long)]
+    embedded: bool,
+    /// Serve the content API read-only. Applies when this command runs the
+    /// stack in-process or spawns a new daemon; attaching to an
+    /// already-running daemon uses that daemon's mode instead.
+    #[arg(long)]
+    read_only: bool,
+    /// Which harness spawned this server, as `crystalline install` wrote
+    /// it into the MCP registration (claude-code, codex, copilot). Used
+    /// with this machine's install receipt to decide whether that harness
+    /// already has the shipped skills on disk, in which case they are not
+    /// served a second time. Omit it and the whole surface is served.
+    ///
+    /// A plain string rather than a value enum on purpose: a value this
+    /// binary does not recognize (a downgrade meeting a newer
+    /// registration) must serve the surface with a warning, never fail to
+    /// start the server.
+    #[arg(long)]
+    harness: Option<String>,
+    /// Mark this session unattended: nobody is behind it to answer a
+    /// question, so it is never asked to share Reflection text from a
+    /// domain fewer people may read. The MCP config of a headless loop
+    /// run (`crystalline reflect run`, `crystalline evolve run`) passes it.
+    #[arg(long, hide = true)]
+    unattended: bool,
+    /// The domain an unattended run started this session for: its reads
+    /// are limited to what every reader of that domain may read. Implies
+    /// --unattended. `crystalline reflect run` and `evolve run` pass it.
+    #[arg(long, hide = true)]
+    domain: Option<String>,
+    /// The loop an unattended run started this session for, reflect or
+    /// evolve: only that loop's leases count, and a write is noted only
+    /// in that loop's lease. Implies --unattended. `crystalline reflect
+    /// run` and `evolve run` pass it.
+    #[arg(long = "loop", hide = true)]
+    run_loop: Option<String>,
+    /// Load the global config from this file instead of the default path.
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
 /// Which harness lifecycle event a `hook` invocation answers: `Stop` at the
 /// end of a turn (and at a subagent's start) and `Prompt` in front of every
 /// prompt a person submits; any other verb is answered with silence.
@@ -1130,6 +1152,55 @@ enum KeptCommand {
         /// Skip the confirmation prompt and delete.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCommand {
+    /// Create an agent and print its first token, once. The name is folded
+    /// like a login name and may not be taken by an account or another agent.
+    Add {
+        /// The agent's unique name.
+        name: String,
+        /// The name shown to people. Defaults to the name.
+        #[arg(long, value_name = "TEXT")]
+        display: Option<String>,
+        /// The loops it runs: reflect, evolve, or both as `reflect,evolve`.
+        #[arg(long, value_name = "LOOPS", default_value = "reflect,evolve")]
+        loops: String,
+        /// How long the token lives, in days: `90d` or `90`, 1 to 365.
+        #[arg(long, value_name = "DAYS", default_value = "90d")]
+        expires: String,
+        /// The token's label. Defaults to the day it was issued.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List the agents with their tokens: id, state, expiry and last use.
+    /// Never a token: only its hash is stored.
+    List,
+    /// Issue another token for an agent and print it, once. An agent holds at
+    /// most two live tokens: revoke one first when it has two.
+    Token {
+        /// The agent.
+        name: String,
+        /// How long the token lives, in days: `90d` or `90`, 1 to 365.
+        #[arg(long, value_name = "DAYS", default_value = "90d")]
+        expires: String,
+        /// The token's label. Defaults to the day it was issued.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Revoke one token of an agent by its id (see `agents list`).
+    Revoke {
+        /// The agent.
+        name: String,
+        /// The token's id.
+        token_id: i64,
+    },
+    /// Remove an agent and every token it holds.
+    Remove {
+        /// The agent.
+        name: String,
     },
 }
 
@@ -2658,20 +2729,22 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Command::Mcp {
+        Some(Command::Mcp(McpArgs {
             embedded,
             read_only,
             harness,
             unattended,
             domain,
+            run_loop,
             config,
-        }) => on_runtime(move || {
+        })) => on_runtime(move || {
             mcp_dispatch(
-                embedded, read_only, harness, unattended, domain, config, cli.db,
+                embedded, read_only, harness, unattended, domain, run_loop, config, cli.db,
             )
         }),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
+        Some(Command::Agents { command }) => on_runtime(move || agents::run(command, cli.json)),
         Some(Command::Kept { command }) => kept::run(command, cli.json),
         Some(Command::Reflect { command }) => on_runtime(move || {
             automation::run(
@@ -2755,7 +2828,7 @@ fn hints_after(command: Option<&Command>, json: bool) -> bool {
                     | Command::DesktopBundle { .. }
                     | Command::DaemonTask { .. }
                     | Command::Serve { .. }
-                    | Command::Mcp { .. }
+                    | Command::Mcp(_)
                     | Command::Ctl { .. }
                     | Command::Hook { .. }
             )
@@ -2778,6 +2851,7 @@ fn packaged_setup_step(command: &Command) -> Option<&'static str> {
             action: DaemonTaskAction::Register { .. },
         } => Some("daemon-task register"),
         Command::Users { .. } => Some("users"),
+        Command::Agents { .. } => Some("agents"),
         Command::Github {
             command:
                 GithubCommand::App {
@@ -5498,15 +5572,21 @@ async fn delete_dispatch(
 /// in-process, and serve MCP over stdio. The server starts cleanly with no
 /// domains registered; domains are created at runtime through the `add_domain`
 /// tool, so nothing is pre-seeded here.
+#[allow(clippy::too_many_arguments)]
 async fn mcp_dispatch(
     embedded: bool,
     read_only: bool,
     harness: Option<String>,
     unattended: bool,
     domain: Option<String>,
+    run_loop: Option<String>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let run_loop = run_loop
+        .map(|lp| lp.parse::<crystalline_core::automation::Loop>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--loop: {e}"))?;
     crystalline_service::run_mcp(
         embedded,
         db.as_deref(),
@@ -5515,6 +5595,7 @@ async fn mcp_dispatch(
         harness.as_deref(),
         unattended,
         domain.as_deref(),
+        run_loop,
     )
     .await
 }
@@ -6177,7 +6258,7 @@ fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
 fn init_cli_tracing(command: Option<&Command>) {
     use tracing_subscriber::EnvFilter;
     let filter = match command {
-        Some(Command::Serve { .. } | Command::Mcp { .. }) => return,
+        Some(Command::Serve { .. } | Command::Mcp(_)) => return,
         Some(Command::Hook { .. }) => match EnvFilter::try_from_default_env() {
             Ok(filter) => filter,
             Err(_) => return,
@@ -7541,6 +7622,27 @@ mod tests {
         assert_eq!(name.as_deref(), Some("eng"));
         assert_eq!(path, None);
         assert_eq!(path_flag, None);
+    }
+
+    /// A run's local MCP entry names its domain and its loop.
+    #[test]
+    fn mcp_parses_the_runs_domain_and_loop() {
+        let cli = Cli::try_parse_from([
+            "crystalline",
+            "mcp",
+            "--unattended",
+            "--domain",
+            "eng",
+            "--loop",
+            "evolve",
+        ])
+        .unwrap();
+        let Some(Command::Mcp(args)) = cli.command else {
+            panic!("expected `mcp`");
+        };
+        assert!(args.unattended);
+        assert_eq!(args.domain.as_deref(), Some("eng"));
+        assert_eq!(args.run_loop.as_deref(), Some("evolve"));
     }
 
     /// With no name, `--path` names the folder the name is worked out from.

@@ -708,10 +708,15 @@ impl Engine {
         if !self.store_is_shared().await {
             return Ok(None);
         }
-        let store = self.store.lock().await;
-        let host = match store.domain_id(domain).await? {
-            Some(id) => store.domain_host(id).await?,
-            None => None,
+        // Read first: a domain another live instance holds is named
+        // without the writer, so a status poll never queues for it. Only a
+        // claim below takes the writer.
+        let host = {
+            let reader = self.reader();
+            match reader.domain_id(domain).await? {
+                Some(id) => reader.domain_host(id).await?,
+                None => None,
+            }
         };
         // Another instance's live claim stands. One that sent no heartbeat
         // for the stale threshold is taken over below by a write, with the
@@ -753,6 +758,9 @@ impl Engine {
         if self.is_renaming(domain) {
             return Ok(Some(None));
         }
+        // The store decides the claim under the writer, whatever was read
+        // above.
+        let store = self.store.lock().await;
         match self.claim_file_host(&*store, domain, root, false).await? {
             HostClaim::Acquired { .. } => {
                 drop(store);
@@ -825,9 +833,9 @@ impl Engine {
         if !self.store_is_shared().await {
             return Ok(None);
         }
-        let store = self.store.lock().await;
-        let host = store.domain_host(id).await?;
-        drop(store);
+        // A read: a takeover another instance committed is seen at once,
+        // and nothing is written under the writer with the answer.
+        let host = self.reader().domain_host(id).await?;
         let Some(host) = host.filter(|host| self.foreign_holder(host)) else {
             return Ok(None);
         };
@@ -1138,6 +1146,64 @@ fn now() -> String {
     time::now().rfc3339_secs_z()
 }
 
+/// The refusal of a delete by an unattended session ([`Engine::is_unattended`]).
+pub(crate) fn unattended_delete_refusal(inner: &str) -> String {
+    if r::pact_page_of(inner).is_some() {
+        format!(
+            "an unattended session never deletes a page pact; '{inner}' stays, and a curator deletes it in Fluid or in an attended session"
+        )
+    } else {
+        format!(
+            "an unattended session never deletes a Reflection page; retire '{inner}' instead (write_reflection with action retire), and a person deletes it in Fluid or in an attended session"
+        )
+    }
+}
+
+/// The refusal of a page's `freshness` or `follows` change by an unattended
+/// session ([`Engine::is_unattended`]): a curator decides how often a page
+/// is reconciled and which pact it follows. `new` is a page the write
+/// would create, which has nothing stored to send back.
+pub(crate) fn unattended_settings_refusal(inner: &str, new: bool) -> String {
+    if new {
+        format!(
+            "an unattended session does not set freshness or follows on a new page; leave them out of '{inner}', and a curator sets them in Fluid or in an attended session"
+        )
+    } else {
+        format!(
+            "an unattended session does not change a page's freshness or follows; send them as they are stored or leave them out of '{inner}', and a curator changes them in Fluid or in an attended session"
+        )
+    }
+}
+
+/// The refusal of a pact file's write (`PACT.md` or a page pact) by an
+/// unattended session ([`Engine::is_unattended`]): a run answers what asks
+/// for a pact change in its thread, and a curator changes the pact. `new`
+/// is a pact file the write would create.
+pub(crate) fn unattended_pact_refusal(inner: &str, new: bool) -> String {
+    if new {
+        let what = if r::pact_page_of(inner).is_some() {
+            "a page pact"
+        } else {
+            "the pact"
+        };
+        format!(
+            "an unattended session does not create {what}, as pact text is a curator's; '{inner}' is not written: ask for it in a thread, and a curator creates it in Fluid or in an attended session"
+        )
+    } else {
+        format!(
+            "an unattended session does not write pact text; '{inner}' stays as it is: answer the feedback in its thread, and a curator changes the pact in Fluid or in an attended session"
+        )
+    }
+}
+
+/// The refusal of a move by an unattended session that would take the
+/// page's pact along.
+pub(crate) fn unattended_pact_move_refusal(from: &str, pact: &str) -> String {
+    format!(
+        "an unattended session does not move pact text, and moving '{from}' moves its page pact '{pact}' along; '{from}' stays, and a curator moves it in Fluid or in an attended session"
+    )
+}
+
 /// A page without its `reflection:` frontmatter block, which names the
 /// source engrams: what a reader who cannot read engrams is answered, what
 /// the search looks at and what a live room holds. The rest of the
@@ -1176,10 +1242,17 @@ pub(crate) fn source_state(src: &r::SourceRef, facts: &SourceFacts) -> (&'static
 
 /// A source as the answers show it; `domain` only for a source of another
 /// domain than the page's, by the local name a reader reaches it by here
-/// ([`SourceFacts::shown_domain`]).
+/// ([`SourceFacts::shown_domain`]). `status` is the cited engram's status as
+/// it writes it, so a reader sees a section that rests on a draft or a
+/// proposal; absent when the engram is missing or cannot be checked here.
 pub(crate) fn source_view(src: &r::SourceRef, facts: &SourceFacts) -> Value {
     let (state, title) = source_state(src, facts);
     let mut view = json!({ "permalink": src.engram, "title": title, "state": state });
+    if !facts.unavailable(src)
+        && let Some(fact) = facts.fact(src)
+    {
+        view["status"] = json!(fact.status);
+    }
     if let Some(domain) = facts.shown_domain(src) {
         view["domain"] = json!(domain);
     }
@@ -1276,7 +1349,12 @@ pub(super) fn compose_reflection(
                 .collect()
         })
         .unwrap_or_default();
-    let mut prov = r::Provenance::new();
+    // The page's own record is the engine's, never the writer's: it stays
+    // as it was stored, whatever the text did to the sections.
+    let mut prov = r::Provenance {
+        sections: Default::default(),
+        page: stored.page.clone(),
+    };
     // How many sections under each heading text got their id in this
     // compose so far, for the key into `new_by_heading`. Only the minted
     // ones count, in page order: they are the sections the room saw without
@@ -1330,6 +1408,115 @@ pub(super) fn compose_reflection(
         prov,
         changed,
     })
+}
+
+/// A page that the page moved from `from` to `to` becomes the folder parent
+/// of: a page under `to`'s folder (`a/b/c.md` for `a/b.md`) whose nearest
+/// existing folder parent is `to` once the move is done. `paths` are the
+/// Reflection's files; only pages count.
+fn becomes_folder_parent<'a>(
+    paths: impl Iterator<Item = &'a str>,
+    from: &str,
+    to: &'a str,
+) -> Option<String> {
+    let after: BTreeSet<&str> = paths
+        .filter(|path| *path != from && matches!(r::classify(path), r::ReflectionFile::Page(_)))
+        .chain([to])
+        .collect();
+    let prefix = format!("{}/", to.strip_suffix(".md").unwrap_or(to));
+    after
+        .iter()
+        .filter(|page| page.starts_with(&prefix))
+        .find(|page| {
+            let mut folder = page.rsplit_once('/').map(|(folder, _)| folder);
+            while let Some(f) = folder {
+                let parent = format!("{f}.md");
+                if after.contains(parent.as_str()) {
+                    return parent == to;
+                }
+                folder = f.rsplit_once('/').map(|(folder, _)| folder);
+            }
+            false
+        })
+        .map(|page| page.to_string())
+}
+
+/// The refusal of a write below curate that sends the page setting `key`
+/// with `value`, which only a curator changes.
+fn page_key_refusal(
+    domain: &str,
+    key: &str,
+    value: &serde_yaml_ng::Value,
+    create: bool,
+    right: ReflectionRight,
+) -> EngineError {
+    let shown = value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            serde_yaml_ng::to_string(value)
+                .ok()
+                .map(|t| t.trim().to_string())
+        })
+        .unwrap_or_default();
+    let what = if key == r::STATUS_KEY {
+        format!("status '{shown}' retires a page or brings it back, which")
+    } else {
+        format!("{key} '{shown}' is a page setting, which")
+    };
+    let fix = if create {
+        format!("write the new page without {key}")
+    } else {
+        format!("leave {key} out or send it as stored")
+    };
+    EngineError::Forbidden(format!(
+        "{what} a curator changes; your access to the Reflection of '{domain}' is {} and curate is needed, so {fix}",
+        reflection_right_word(right)
+    ))
+}
+
+/// The refusal of a whole-page write that moves the page at `path` across
+/// the retired words in its `status`: into them (`retired` false) or out of
+/// them. Retire and restore are the way, for every writer; below curate the
+/// sentence says that they take curate.
+fn retired_status_refusal(
+    domain: &str,
+    path: &str,
+    sent: Option<&serde_yaml_ng::Value>,
+    retired: bool,
+    create: bool,
+    right: ReflectionRight,
+) -> EngineError {
+    let shown = sent
+        .and_then(serde_yaml_ng::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let what = match (retired, shown) {
+        (false, Some(word)) => format!(
+            "status '{word}' would retire '{path}'; a page is retired with write_reflection action=retire, which keeps the page it was owned by so a restore can put it back"
+        ),
+        (false, None) => {
+            format!("a write would retire '{path}'; use write_reflection action=retire")
+        }
+        (true, Some(word)) => format!(
+            "'{path}' is retired and status '{word}' would bring it back; a page comes back with write_reflection action=restore"
+        ),
+        (true, None) => format!(
+            "'{path}' is retired and a write without its status would bring it back; a page comes back with write_reflection action=restore"
+        ),
+    };
+    let fix = if create {
+        "write the new page without status".to_string()
+    } else {
+        "leave status out or send it as stored".to_string()
+    };
+    if right >= ReflectionRight::Curate {
+        return EngineError::Invalid(format!("{what}, so {fix}"));
+    }
+    EngineError::Forbidden(format!(
+        "{what}, which takes curate; your access to the Reflection of '{domain}' is {}, so {fix}",
+        reflection_right_word(right)
+    ))
 }
 
 /// What [`compose_reflection`] answers.
@@ -1470,7 +1657,7 @@ fn stamp_reflected(text: &str, prov: &mut r::Provenance, ids: &[String]) -> Resu
             continue;
         };
         let hash = r::section_hash(&section.text);
-        let record = prov.entry(id.clone()).or_default();
+        let record = prov.sections.entry(id.clone()).or_default();
         if record.reflected.as_deref() != Some(hash.as_str()) {
             record.reflected = Some(hash);
             rehashed = true;
@@ -1485,18 +1672,19 @@ fn stamp_reflected(text: &str, prov: &mut r::Provenance, ids: &[String]) -> Resu
 
 impl Engine {
     /// Every engram of a domain by permalink, with the checksum a section's
-    /// sources are compared against.
+    /// sources are compared against. The stamps and the listing are two
+    /// reads, so a sync between them can leave out an engram for one call.
     pub(crate) async fn engram_facts(
         &self,
         domain_id: DomainId,
         domain: &str,
     ) -> Result<HashMap<String, EngramFact>> {
-        let store = self.store.lock().await;
+        let reader = self.reader();
         #[cfg(any(test, feature = "testing"))]
         self.recorded_path_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let stamps = store.file_stamps(domain_id).await?;
-        let engrams = store.list_engrams(domain, None, None).await?;
+        let stamps = reader.file_stamps(domain_id).await?;
+        let engrams = reader.list_engrams(domain, None, None).await?;
         Ok(engrams
             .into_iter()
             .filter_map(|d| {
@@ -1532,12 +1720,7 @@ impl Engine {
         if wanted.is_empty() {
             return Ok(HashMap::new());
         }
-        let cited = self
-            .store
-            .lock()
-            .await
-            .cited_engrams(domain_id, &wanted)
-            .await?;
+        let cited = self.reader().cited_engrams(domain_id, &wanted).await?;
         Ok(cited
             .into_iter()
             .map(|c| {
@@ -1595,6 +1778,32 @@ impl Engine {
 }
 
 impl Engine {
+    /// A Reflection path as a caller names it (a write, a read, a move, a
+    /// settle, a thread): the rules of [`r::validate_reflection_path`], and
+    /// no segment shaped like a Windows short name ([`r::short_name_refusal`])
+    /// unless the index holds a page at exactly that path. On an NTFS volume
+    /// with short names `arch/OVERVI~1.md` can be the file of
+    /// `arch/overview.pact.md`, so a write by that name would land in the
+    /// pact; the sync only meets the names files really have, so a file that
+    /// really is called `draft~2.md` has its row and stays a page.
+    pub(crate) async fn validate_named_reflection_path(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<()> {
+        r::validate_reflection_path(path).map_err(EngineError::Invalid)?;
+        let Some(refusal) = r::short_name_refusal(path) else {
+            return Ok(());
+        };
+        let reader = self.reader();
+        if let Some(id) = reader.domain_id(domain).await?
+            && reader.get_reflection(id, path).await?.is_some()
+        {
+            return Ok(());
+        }
+        Err(EngineError::Invalid(refusal))
+    }
+
     /// `write_reflection`: dispatch on the action.
     pub async fn write_reflection(
         &self,
@@ -1623,6 +1832,21 @@ impl Engine {
                 self.settle_reflection(&p.domain, &p.path, &p.sections, outcome, caller)
                     .await
             }
+            "retire" => self.retire_reflection(&p.domain, &p.path, caller).await,
+            "restore" => {
+                self.restore_reflection(&p.domain, &p.path, p.owner.as_deref(), caller)
+                    .await
+            }
+            "reconciled" => {
+                self.reconciled_reflection(
+                    &p.domain,
+                    &p.path,
+                    p.outcome.as_deref(),
+                    p.version.as_deref(),
+                    caller,
+                )
+                .await
+            }
             "move_asset" => {
                 let to = p.to.as_deref().ok_or_else(|| {
                     EngineError::Invalid(
@@ -1640,7 +1864,7 @@ impl Engine {
             }
             "write_asset" => self.write_reflection_asset(p, caller).await,
             other => Err(EngineError::Invalid(format!(
-                "`{other}` is not a write_reflection action; use write, move, delete, settle, write_asset, move_asset or delete_asset"
+                "`{other}` is not a write_reflection action; use write, move, delete, settle, retire, restore, reconciled, write_asset, move_asset or delete_asset"
             ))),
         }
     }
@@ -1672,9 +1896,10 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        // PACT.md is written by curators; everyone else proposes a
-        // change through a thread on it.
-        let need = if p.sources.is_empty() && p.path != r::PACT_FILE {
+        // A pact file (PACT.md or a page pact) is written by curators;
+        // everyone else proposes a change through a thread on it.
+        // So is naming an owner, which the page record keeps (spec 2.3).
+        let need = if p.sources.is_empty() && !r::is_pact_file(&p.path) && p.owner.is_none() {
             ReflectionRight::Edit
         } else {
             ReflectionRight::Curate
@@ -1684,7 +1909,17 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(&p.domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(&p.path).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(&p.domain, &p.path)
+            .await?;
+        // Pact text is a curator's in person (Jordi, 2026-11-24): a run
+        // settles a pact and answers its threads, and writes none of it,
+        // not even the text it holds.
+        if r::is_pact_file(&p.path) && self.is_unattended(caller) {
+            let new = !access.abs(&p.path).exists();
+            return Err(EngineError::Forbidden(unattended_pact_refusal(
+                &p.path, new,
+            )));
+        }
         // Rule 7: the whole page, one section of it, or (sources alone) the
         // stored page as it stands, curated by the sources named.
         let op = match (p.markdown.as_deref(), p.operation.as_deref()) {
@@ -1760,9 +1995,48 @@ impl Engine {
         }
         if current.is_none() {
             r::validate_new_reflection_path(&p.path).map_err(EngineError::Invalid)?;
+            // A new page takes the page pact waiting beside it as its own, so
+            // below curate it is refused, as a move onto it is.
+            let waiting = r::page_pact_path(&p.path);
+            if !r::is_pact_file(&p.path)
+                && access.right < ReflectionRight::Curate
+                && access.abs(&waiting).exists()
+            {
+                return Err(EngineError::Forbidden(format!(
+                    "a page pact '{waiting}' waits for a page at '{}', and creating the page gives it that pact, which a curator does; your access to the Reflection of '{}' is {} and curate is needed",
+                    p.path,
+                    p.domain,
+                    reflection_right_word(access.right)
+                )));
+            }
             self.refuse_only_elsewhere(&p.domain, access.domain_id, ElsewhereRow::Page(&p.path))
                 .await?;
         }
+        // An owner is named when the page is created (spec 2.3): a page a
+        // person made is never claimed later. Sent again as stored, it
+        // changes nothing; the stored record keeps it either way.
+        let new_owner = match (p.owner.as_deref().map(str::trim), current.as_deref()) {
+            (None, _) => None,
+            (Some(""), _) => {
+                return Err(EngineError::Invalid(super::page_life::EMPTY_OWNER.into()));
+            }
+            (Some(_), _) if r::is_pact_file(&p.path) => {
+                return Err(EngineError::Invalid(format!(
+                    "an owner is named for a page, and '{}' is a pact file; leave owner out",
+                    p.path
+                )));
+            }
+            (Some(owner), Some(stored)) => {
+                if r::read_provenance(stored).page.owner.as_deref() != Some(owner) {
+                    return Err(EngineError::Invalid(format!(
+                        "owner is named when a page is created; '{}' exists already, so leave owner out",
+                        p.path
+                    )));
+                }
+                None
+            }
+            (Some(owner), None) => Some(owner.to_string()),
+        };
         let (incoming, heading_stripped, placed_after_section) = match op {
             None => match (&p.markdown, current.as_deref()) {
                 (Some(markdown), _) => (markdown.clone(), None, false),
@@ -1793,6 +2067,24 @@ impl Engine {
                 (edit.text, edit.heading_stripped, edit.placed_after_section)
             }
         };
+        // The page settings are a curator's: what the write leaves out keeps
+        // its stored value, and below curate a different value is refused.
+        let incoming = self
+            .settle_page_keys(
+                p,
+                &access,
+                self.is_unattended(caller),
+                current.as_deref(),
+                &incoming,
+            )
+            .await?;
+        if let Some(owner) = &new_owner {
+            let follows = r::read_page_settings(&incoming, &p.path, &r::PageRecord::default())
+                .0
+                .follows;
+            self.refuse_owner(access.domain_id, &p.path, owner, None, follows)
+                .await?;
+        }
         // An engram attachment is copied into reflections/assets/
         // first; a write that adds an embed of one is refused, nothing
         // written. An embed the stored page already holds (written by hand
@@ -1967,7 +2259,7 @@ impl Engine {
                     refs.push(src);
                 }
             }
-            let record = prov.entry(id.clone()).or_default();
+            let record = prov.sections.entry(id.clone()).or_default();
             // A write never drops what the writer could not see: the
             // section's sources in a domain hidden from them stay as they
             // were. A source the writer sees is theirs to keep or leave out,
@@ -2038,7 +2330,7 @@ impl Engine {
                 {
                     continue;
                 }
-                let record = prov.entry(id.clone()).or_default();
+                let record = prov.sections.entry(id.clone()).or_default();
                 record.changed_by.clear();
                 record.changed_at = None;
                 record.answered_by = None;
@@ -2054,6 +2346,9 @@ impl Engine {
                     advanced.push(id.clone());
                 }
             }
+        }
+        if let Some(owner) = new_owner {
+            prov.page.owner = Some(owner);
         }
         let final_text = stamp_reflected(&text, &mut prov, &advanced)?;
         // What a person must confirm (`super::disclosure`): the sources the
@@ -2096,8 +2391,8 @@ impl Engine {
         confirmed.dedup();
         // The `##` sections this write created or changed that leave it with
         // no source in their record: provenance alone, whatever else counts
-        // a section as reflected. The pact is no page.
-        let unsourced_sections: Vec<String> = if p.path == r::PACT_FILE {
+        // a section as reflected. A pact file is no page.
+        let unsourced_sections: Vec<String> = if r::is_pact_file(&p.path) {
             Vec::new()
         } else {
             sections
@@ -2117,6 +2412,13 @@ impl Engine {
                 .map(|s| s.heading.clone())
                 .collect()
         };
+        // Any write that changes only freshness or status, with the pact
+        // chain unchanged, keeps a current pact hash current in the same
+        // commit (read before anything is written): it asks for no
+        // reconcile.
+        let rehash = self
+            .settings_rehash(access.domain_id, &p.path, current.as_deref(), &final_text)
+            .await?;
         let removed_with_feedback = removed_with_feedback(stored.as_deref(), &baseline, &sections);
         let threads_abs = access.abs(&r::threads_path(&p.path));
         let mut undo = DiskUndo::default();
@@ -2131,11 +2433,22 @@ impl Engine {
             )?;
         }
         anchor_threads_on_ids(&threads_abs, &final_text);
-        self.index_reflection(
+        let mut ops = vec![super::fence::RowOp::Page {
+            inner: &p.path,
+            text: &final_text,
+            abs: &abs,
+        }];
+        if let Some((seen_hash, seen_at, hash)) = &rehash {
+            ops.push(super::fence::RowOp::RehashReconcile {
+                path: &p.path,
+                seen_hash,
+                seen_at,
+                hash,
+            });
+        }
+        self.commit_reflection_rows(
             access.domain_id,
-            &p.path,
-            &final_text,
-            &abs,
+            &ops,
             OnRefusal {
                 domain: &p.domain,
                 undo,
@@ -2181,6 +2494,9 @@ impl Engine {
             "ids_assigned": minted,
             "curated": curated,
         });
+        if let Some(owner) = r::read_provenance(&final_text).page.owner {
+            receipt["owner"] = json!(owner);
+        }
         note_domain_names_normalized(&mut receipt, normalized);
         note_markdown_findings(
             &mut receipt,
@@ -2203,7 +2519,7 @@ impl Engine {
                 .await?
                 .into_iter()
                 .map(|row| row.path)
-                .filter(|path| path != r::PACT_FILE)
+                .filter(|path| !r::is_pact_file(path))
                 .collect();
             let findings = r::structure_findings(&final_text, &pages);
             if !findings.is_empty() {
@@ -2389,8 +2705,10 @@ impl Engine {
     }
 
     /// A reflection as a room reads it: the page without the block that
-    /// names its source engrams, for everyone in the room; the checksum is
-    /// the file's, so every stale check compares file against file.
+    /// names its source engrams and without the settings only a curator
+    /// changes (`freshness`, `follows`, `status`), for everyone in the room;
+    /// its saves put the stored settings back. The checksum is the file's,
+    /// so every stale check compares file against file.
     pub async fn reflection_room_text(&self, domain: &str, inner: &str) -> Result<EngramText> {
         let not_found =
             || EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"));
@@ -2403,7 +2721,7 @@ impl Engine {
             permalink: inner.to_string(),
             path: r::domain_rel(inner),
             checksum: sha256_hex(file.as_bytes()),
-            content: without_provenance(&file),
+            content: r::without_page_keys(&without_provenance(&file)),
         })
     }
 
@@ -2411,7 +2729,10 @@ impl Engine {
     /// as the room decided them (the signed-in accounts that edited since
     /// its last save, and those that typed a heading still without an id);
     /// an empty list records nobody, or "someone" when the room says so.
-    /// The stored bookkeeping wins over whatever the room text carries.
+    /// The stored bookkeeping wins over whatever the room text carries, and
+    /// so do the stored page settings (`freshness`, `follows`, `status`):
+    /// the room never shows them, and a save puts them back as stored, so
+    /// nobody changes them in a room, a curator neither.
     /// Section ids are assigned on the `final_save` only. Answers the
     /// receipt a room reads (`checksum`, `permalink`, `path`); `permalink`
     /// is `inner`, so a reflection room is never re-keyed.
@@ -2505,8 +2826,10 @@ impl Engine {
             final_save,
             &now(),
         )?;
+        let final_text = r::write_provenance(&composed, &prov).map_err(EngineError::Invalid)?;
         let final_text = crystalline_core::to_lf(
-            &r::write_provenance(&composed, &prov).map_err(EngineError::Invalid)?,
+            &r::carry_page_keys(&final_text, current.as_deref(), &r::PAGE_KEYS)
+                .map_err(EngineError::Invalid)?,
         )
         .into_owned();
         // A refused save puts the files back and keeps nothing itself: the
@@ -2553,8 +2876,155 @@ impl Engine {
         Ok(receipt(&final_text))
     }
 
-    /// The right to be in a reflection's room: edit, curate for `PACT.md`
-    /// (as its `PUT` takes). Public because `require_reflection` is
+    /// The page settings a whole-page write leaves on the page at `p.path`
+    /// (`freshness`, `follows`, `status`, spec 3.2): a key the text does not
+    /// send keeps its stored value, for every writer, so a page rewritten
+    /// without them keeps its schedule. A curator sets a key by sending it
+    /// and clears it by sending it with no value; a `follows` it sets must
+    /// name an existing page of this Reflection and close no cycle. Below
+    /// curate a key sent with another value than the stored one is refused,
+    /// on a new page any key at all; `status` only when the stored or the
+    /// sent value is a retired word. No writer moves `status` into or out
+    /// of the retired words (retire and restore do, keeping their record).
+    /// An `unattended` writer
+    /// ([`Engine::is_unattended`]) changes no `freshness` and no `follows`,
+    /// whatever its right: sending one as stored is no change.
+    async fn settle_page_keys(
+        &self,
+        p: &WriteReflectionParams,
+        access: &ReflectionAccess,
+        unattended: bool,
+        current: Option<&str>,
+        incoming: &str,
+    ) -> Result<String> {
+        // A page key written twice reads as either value to one reader and
+        // as no frontmatter to another: it is never written.
+        if let Some(key) = r::repeated_page_keys(incoming).first() {
+            return Err(EngineError::Invalid(format!(
+                "{key} is written more than once in the frontmatter of '{}'; write it once",
+                p.path
+            )));
+        }
+        let sent = r::page_key_values(incoming);
+        let stored = current.map(r::page_key_values).unwrap_or_default();
+        if sent.is_empty() && stored.is_empty() {
+            return Ok(incoming.to_string());
+        }
+        let curator = access.right >= ReflectionRight::Curate;
+        // How often a page is reconciled and which pact it follows are a
+        // curator's in person: a run keeps them as they are (Jordi,
+        // 2026-11-24), on a new page too.
+        if unattended {
+            for key in [r::FRESHNESS_KEY, r::FOLLOWS_KEY] {
+                let before = stored.get(key).filter(|v| !v.is_null());
+                let after = match sent.get(key) {
+                    None => before,
+                    Some(value) if value.is_null() => before.filter(|_| !curator),
+                    Some(value) => Some(value),
+                };
+                if after != before {
+                    return Err(EngineError::Forbidden(unattended_settings_refusal(
+                        &p.path,
+                        current.is_none(),
+                    )));
+                }
+            }
+        }
+        let retired = |value: &serde_yaml_ng::Value| {
+            value
+                .as_str()
+                .is_some_and(|s| crystalline_core::is_retired_status(&s.trim().to_lowercase()))
+        };
+        // Retire and restore move a page across the retired words: they
+        // keep the record (who retired it, the page it was owned by) the
+        // page view and a restore read. A whole-page write never does, for
+        // any writer; a key left out keeps it, and a curator's cleared
+        // status brings the page back as much as a live word would.
+        let before_retired = stored.get(r::STATUS_KEY).is_some_and(retired);
+        let after_retired = match sent.get(r::STATUS_KEY) {
+            None => before_retired,
+            Some(value) if value.is_null() => before_retired && !curator,
+            Some(value) => retired(value),
+        };
+        if before_retired != after_retired {
+            return Err(retired_status_refusal(
+                &p.domain,
+                &p.path,
+                sent.get(r::STATUS_KEY),
+                before_retired,
+                current.is_none(),
+                access.right,
+            ));
+        }
+        let mut carried: Vec<&str> = Vec::new();
+        let mut cleared: Vec<&str> = Vec::new();
+        for key in r::PAGE_KEYS {
+            let value = sent.get(key);
+            let before = stored.get(key);
+            match value {
+                None => carried.push(key),
+                Some(value) if value.is_null() && curator => cleared.push(key),
+                // A key with no value from an editor changes nothing.
+                Some(value) if value.is_null() => carried.push(key),
+                Some(_) if curator => {}
+                Some(value) => {
+                    let guarded =
+                        key != r::STATUS_KEY || retired(value) || before.is_some_and(retired);
+                    if guarded && before != Some(value) {
+                        return Err(page_key_refusal(
+                            &p.domain,
+                            key,
+                            value,
+                            current.is_none(),
+                            access.right,
+                        ));
+                    }
+                }
+            }
+        }
+        if curator
+            && let Some(target) = sent.get(r::FOLLOWS_KEY).filter(|v| !v.is_null())
+            && stored.get(r::FOLLOWS_KEY) != Some(target)
+        {
+            let pages = self.page_links(access.domain_id, &p.path, current).await?;
+            if let Some(refusal) = r::follows_refusal(&p.path, target, &pages) {
+                return Err(EngineError::Invalid(refusal));
+            }
+        }
+        let text = r::carry_page_keys(incoming, current, &carried).map_err(EngineError::Invalid)?;
+        r::carry_page_keys(&text, None, &cleared).map_err(EngineError::Invalid)
+    }
+
+    /// Every page of the Reflection of `domain_id` with what its pact chain
+    /// walks (its `follows` and its owner), from the index rows, with the
+    /// page at `page` as `current` holds it (or with no links when it is
+    /// new): what a `follows` a write sets is checked against. Pact files,
+    /// threads and baselines are no pages.
+    pub(super) async fn page_links(
+        &self,
+        domain_id: DomainId,
+        page: &str,
+        current: Option<&str>,
+    ) -> Result<BTreeMap<String, r::PageLinks>> {
+        let rows = self.store.lock().await.list_reflections(domain_id).await?;
+        let links = |path: &str, text: &str| {
+            let record = r::read_provenance(text).page;
+            r::read_page_settings(text, path, &record).0.links(&record)
+        };
+        let mut pages: BTreeMap<String, r::PageLinks> = rows
+            .iter()
+            .filter(|row| matches!(r::classify(&row.path), r::ReflectionFile::Page(_)))
+            .map(|row| (row.path.clone(), links(&row.path, &row.content)))
+            .collect();
+        pages.insert(
+            page.to_string(),
+            current.map(|text| links(page, text)).unwrap_or_default(),
+        );
+        Ok(pages)
+    }
+
+    /// The right to be in a reflection's room: edit, curate for a pact file
+    /// (`PACT.md` or a page pact, as its `PUT` takes). Public because `require_reflection` is
     /// engine-private. A room is opened to write, so this is the write gate:
     /// a host lock whose holder went stale is taken over for a signed-in
     /// caller with the right, as a page write takes it.
@@ -2564,7 +3034,7 @@ impl Engine {
         path: &str,
         caller: &ReflectionCaller,
     ) -> Result<()> {
-        let need = if path == r::PACT_FILE {
+        let need = if r::is_pact_file(path) {
             ReflectionRight::Curate
         } else {
             ReflectionRight::Edit
@@ -2611,7 +3081,17 @@ impl Engine {
                 pact = json!({ "path": r::PACT_FILE, "title": row.title, "exists": true, "open_threads": open_threads(r::PACT_FILE) });
                 continue;
             }
+            // A page pact is no page of the tree; its page shows it.
+            if r::is_pact_file(&row.path) {
+                continue;
+            }
             let sections = r::split_sections(&row.content).len().saturating_sub(1);
+            // A retired page is hidden in the navigation behind a switch,
+            // and an owned page names its owner (design 2.3, 2.4).
+            let record = r::read_provenance(&row.content).page;
+            let retired = r::read_page_settings(&row.content, &row.path, &record)
+                .0
+                .retired();
             root.insert(
                 &row.path,
                 json!({
@@ -2621,6 +3101,8 @@ impl Engine {
                     "title": row.title,
                     "open_threads": open_threads(&row.path),
                     "sections": sections,
+                    "retired": retired,
+                    "owner": record.owner,
                 }),
             );
         }
@@ -2664,6 +3146,24 @@ impl TreeNode {
 }
 
 impl Engine {
+    /// The checksum of the page file at `inner` as stored, the same sum
+    /// [`Engine::read_reflection`] answers as `checksum`; `None` when there
+    /// is no such file. Beside a page's clock, so a tab that hears a plain
+    /// change (a reconcile writes no file) reads the text again only when
+    /// it moved.
+    pub async fn reflection_page_checksum(
+        &self,
+        domain: &str,
+        inner: &str,
+        caller: &ReflectionCaller,
+    ) -> Result<Option<String>> {
+        let access = self
+            .require_reflection(domain, caller, ReflectionRight::Read)
+            .await?;
+        self.validate_named_reflection_path(domain, inner).await?;
+        Ok(read_opt(&access.abs(inner))?.map(|text| sha256_hex(text.as_bytes())))
+    }
+
     /// `read_reflection` with a path.
     pub async fn read_reflection(
         &self,
@@ -2674,7 +3174,7 @@ impl Engine {
         let access = self
             .require_reflection(domain, caller, ReflectionRight::Read)
             .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         let text = read_opt(&access.abs(inner))?.ok_or_else(|| {
             EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"))
         })?;
@@ -2791,6 +3291,12 @@ impl Engine {
             "sections": sections,
             "threads": open,
         });
+        // What the page says about itself beside its text: its settings,
+        // the pacts it follows, its owner and its retirement. A pact file is
+        // no page and has none of it.
+        if matches!(r::classify(inner), r::ReflectionFile::Page(_)) {
+            answer["page"] = self.page_view(access.domain_id, inner, &text).await?;
+        }
         // Who has the page open in a co-editing room (R77): nested, as the
         // contract and Fluid read it; absent while no room is open.
         if let Some(rooms) = self.collab_rooms() {
@@ -2935,6 +3441,24 @@ impl Engine {
         let hits = crystalline_index::reflection::rank_sections(
             &rows, query, mode, &vectors, floor, limit, page,
         );
+        // A hit on a retired page says so: search still finds it, shown
+        // faded (design 2.4).
+        let hit_pages: BTreeSet<&str> = hits.items.iter().map(|hit| hit.path.as_str()).collect();
+        let retired: BTreeSet<&str> = rows
+            .iter()
+            .filter(|row| hit_pages.contains(row.path.as_str()))
+            .filter(|row| super::page_life::is_retired(&row.content, &row.path))
+            .map(|row| row.path.as_str())
+            .collect();
+        let items: Vec<Value> = hits
+            .items
+            .iter()
+            .map(|hit| {
+                let mut item = json!(hit);
+                item["retired"] = json!(retired.contains(hit.path.as_str()));
+                item
+            })
+            .collect();
         Ok(json!({
             "domain": domain,
             "query": query,
@@ -2942,10 +3466,120 @@ impl Engine {
             "total": hits.total,
             "page": hits.page,
             "limit": hits.limit,
-            "count": hits.items.len(),
-            "hits": hits.items,
+            "count": items.len(),
+            "hits": items,
         }))
     }
+}
+
+/// One page move inside a Reflection: the page, its pact and where both go,
+/// as every step of [`Engine::move_reflection`] needs them.
+struct PageMove<'a> {
+    domain: &'a str,
+    access: &'a ReflectionAccess,
+    from: &'a str,
+    to: &'a str,
+    pact_from: String,
+    pact_to: String,
+    /// Whether the page has a page pact, which moves with it (spec 2.1).
+    has_pact: bool,
+}
+
+impl PageMove<'_> {
+    /// `text`, the reflection at `inner`, with its links to the moved page
+    /// and to its pact following the move, and how many changed.
+    fn relink_moved(&self, text: &str, inner: &str) -> (String, usize) {
+        let (text, links) = r::rewrite_links_to(text, inner, self.from, self.to);
+        if !self.has_pact {
+            return (text, links);
+        }
+        let (text, more) = r::rewrite_links_to(&text, inner, &self.pact_from, &self.pact_to);
+        (text, links + more)
+    }
+
+    /// Whether `path` is a file the move leaves where it is: neither the
+    /// page nor its pact, on either side of the move.
+    fn is_other(&self, path: &str) -> bool {
+        ![
+            self.from,
+            self.to,
+            self.pact_from.as_str(),
+            self.pact_to.as_str(),
+        ]
+        .contains(&path)
+    }
+}
+
+/// What a move's screen found before it took any lock.
+struct MoveScreen {
+    /// Every other file of the Reflection, whose links may follow the move
+    /// once it has landed.
+    others: Vec<String>,
+    /// The pages whose frontmatter names the moved page and is rewritten in
+    /// the move's own commit.
+    followers: Vec<String>,
+    /// The pact files (`PACT.md`, other page pacts) whose links reach the
+    /// moved page or its pact: relinked in the move's own commit, so the
+    /// stored pact hashes it leaves current follow in the same commit.
+    pacts: Vec<String>,
+}
+
+/// What a move writes, read and rewritten under its locks.
+struct StagedMove {
+    /// The moved page's text, its links rebased.
+    page: String,
+    /// Its baseline with the same rewrite, when it has one.
+    baseline: Option<String>,
+    /// The page pact's text and, when it has one, its baseline, both
+    /// rebased; `None` when the page has no pact.
+    pact: Option<(String, Option<String>)>,
+    /// Each follower whose frontmatter changes: its path, its file and its
+    /// new text.
+    refollowed: Vec<(String, PathBuf, String)>,
+    /// How many `follows` of the followers now name the new path.
+    follows_rewritten: usize,
+    /// How many owners and former owners in their records do.
+    owners_rewritten: usize,
+    /// Each relinked pact file: its path, its file, its new text, its new
+    /// baseline when it has one, and how many links changed.
+    pacts: Vec<(String, PathBuf, String, Option<String>, usize)>,
+    /// The reconcile states whose stored pact hash the move would leave
+    /// stale only because it rewrote paths, as read: each at the page's path
+    /// after the move, with the hash computed after it.
+    rehashed: Vec<Rehash>,
+}
+
+/// A stored pact hash a move carries along: the page's path after the
+/// move, the hash and the time its state held when the move read it, and
+/// the hash after the move.
+struct Rehash {
+    path: String,
+    seen_hash: String,
+    seen_at: String,
+    hash: String,
+}
+
+/// `text` with an owner or a former owner in its page record that names
+/// `from` naming `to` ([`r::rewrite_owner`]), and how many changed. A
+/// frontmatter that cannot be cut is left as it is: that page then names a
+/// page that is gone, which the queue tells a curator.
+fn owner_rewrite(text: &str, from: &str, to: &str) -> (String, usize) {
+    // The screen asks this of every other page of the Reflection: a page
+    // whose text does not even hold the path, or whose record names it
+    // nowhere, is answered before its block is touched.
+    if !text.contains(from) {
+        return (text.to_string(), 0);
+    }
+    let record = r::read_provenance(text).page;
+    let names = record.owner.as_deref() == Some(from)
+        || record
+            .retired
+            .as_ref()
+            .is_some_and(|retired| retired.was_owned_by.as_deref() == Some(from));
+    if !names {
+        return (text.to_string(), 0);
+    }
+    r::rewrite_owner(text, from, to).unwrap_or_else(|_| (text.to_string(), 0))
 }
 
 impl Engine {
@@ -2964,44 +3598,39 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(from).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, from).await?;
         r::validate_new_reflection_path(to).map_err(EngineError::Invalid)?;
         if from == r::PACT_FILE || to == r::PACT_FILE {
             return Err(EngineError::Invalid(
                 "PACT.md is the domain's agreement; edit it instead of moving it".into(),
             ));
         }
-        // Every other page whose links the move rewrites waits: a rewrite
-        // under an open room would race its next save. Screened from the
-        // text on disk before anything moves, and relinked from this list
-        // below. The moved page's own room is not a refusal: it is closed
-        // below, once every screen has passed.
-        let rows = self
-            .store
-            .lock()
-            .await
-            .list_reflection_stamps(access.domain_id)
-            .await?;
-        let others = rows
-            .iter()
-            .map(|row| row.path.as_str())
-            .filter(|path| *path != from && *path != to);
-        let linking = rooms_to_rewrite(&access, others, &|text, inner| {
-            r::rewrite_links_to(text, inner, from, to).1
-        });
-        self.refuse_under_live_pages(domain, &linking).await?;
-        let src = access.abs(from);
-        let dst = access.abs(to);
-        // Every check that can refuse the move runs here first, as a screen,
-        // so a refused move leaves an open room over the page alone; they
-        // run again under the locks below, where they decide.
-        if !src.exists() {
-            return Err(EngineError::NotFound(format!(
-                "no reflection '{from}' in domain '{domain}'"
+        if let Some(page) = [from, to].into_iter().find_map(r::pact_page_of) {
+            return Err(EngineError::Invalid(format!(
+                "a page pact moves with its page and never on its own; move '{page}' instead"
             )));
         }
-        self.refuse_taken_page_target(domain, &access, from, to)
-            .await?;
+        let pact_from = r::page_pact_path(from);
+        let mv = PageMove {
+            domain,
+            access: &access,
+            from,
+            to,
+            has_pact: access.abs(&pact_from).exists(),
+            pact_from,
+            pact_to: r::page_pact_path(to),
+        };
+        // A page pact moves with its page, and pact text is a curator's in
+        // person; the links a move rewrites in other pacts follow it, as a
+        // follows does. Before the screens, so a refused move leaves an
+        // open room alone.
+        if mv.has_pact && self.is_unattended(caller) {
+            return Err(EngineError::Forbidden(unattended_pact_move_refusal(
+                from,
+                &mv.pact_from,
+            )));
+        }
+        let screen = self.screen_reflection_move(&mv).await?;
         // The room over the page saves its text and ends; no room opens over
         // the old path until the move is done (the fence). Its sockets are
         // told where the page went once the move has committed, and
@@ -3028,69 +3657,65 @@ impl Engine {
         // Both pages' locks, in lock-key order, so two crossing moves cannot
         // wait on each other; two spellings of one file take its lock once.
         // Held until the moved page is indexed.
-        let _locks = self.lock_files(&[&src, &dst]).await;
-        let text = read_opt(&src)?.ok_or_else(|| {
-            EngineError::NotFound(format!("no reflection '{from}' in domain '{domain}'"))
-        })?;
-        self.refuse_taken_page_target(domain, &access, from, to)
+        let (src, dst) = (access.abs(from), access.abs(to));
+        let pact_src = access.abs(&mv.pact_from);
+        let pact_dst = access.abs(&mv.pact_to);
+        let follower_abs: Vec<PathBuf> = screen.followers.iter().map(|f| access.abs(f)).collect();
+        let relinked_abs: Vec<PathBuf> = screen.pacts.iter().map(|p| access.abs(p)).collect();
+        let mut lock_paths: Vec<&Path> = vec![&src, &dst, &pact_src, &pact_dst];
+        lock_paths.extend(follower_abs.iter().map(PathBuf::as_path));
+        lock_paths.extend(relinked_abs.iter().map(PathBuf::as_path));
+        let _locks = self.lock_files(&lock_paths).await;
+        let staged = self
+            .stage_reflection_move(
+                &mv,
+                (&screen.followers, &follower_abs),
+                (&screen.pacts, &relinked_abs),
+            )
             .await?;
-        // The page's own relative links follow the move, and its
-        // baseline gets the same rewrite with the `reflected` hashes carried,
-        // so a move owes no feedback.
-        let old_baseline = read_opt(&access.abs(&r::baseline_path(from)))?;
-        let moved = r::relink(&text, old_baseline.as_deref().unwrap_or(""), &|s| {
-            r::rebase_links(s, from, to)
-        })
-        .map_err(EngineError::Invalid)?;
-        // The row is built from the text as written, so it matches the file.
-        let page = crystalline_core::to_lf(&moved.page).into_owned();
-        let mut undo = DiskUndo::default();
-        for (old_rel, new_rel) in [
-            (from.to_string(), to.to_string()),
-            (r::baseline_path(from), r::baseline_path(to)),
-            (r::threads_path(from), r::threads_path(to)),
-        ] {
-            let (old, new) = (access.abs(&old_rel), access.abs(&new_rel));
-            if is_case_only_rename(&old, &new, &old_rel, &new_rel) {
-                undo.record_case_rename(&old, &new)?;
-            } else {
-                undo.record(&old)?;
-                undo.record(&new)?;
-            }
+        let (undo, threads_moved) = write_reflection_move(&mv, &staged)?;
+        // The old rows go and the new ones come in one fenced commit: the
+        // page with its reconcile state, its pact and the pages that follow
+        // it.
+        // The reconcile state moves first: the page row's delete would take
+        // it.
+        let mut ops = vec![
+            RowOp::MoveReconcile { from, to },
+            RowOp::DeletePage(from),
+            RowOp::Page {
+                inner: to,
+                text: &staged.page,
+                abs: &dst,
+            },
+        ];
+        if let Some((pact_text, _)) = &staged.pact {
+            ops.push(RowOp::DeletePage(&mv.pact_from));
+            ops.push(RowOp::Page {
+                inner: &mv.pact_to,
+                text: pact_text,
+                abs: &pact_dst,
+            });
         }
-        let replace = |old_rel: &str, new_rel: &str, text: &str| {
-            let (old, new) = (access.abs(old_rel), access.abs(new_rel));
-            let case_only = is_case_only_rename(&old, &new, old_rel, new_rel);
-            replace_file_with(&old, &new, case_only, |p| write_file(p, text))
-        };
-        replace(from, to, &page)?;
-        if old_baseline.is_some() {
-            replace(
-                &r::baseline_path(from),
-                &r::baseline_path(to),
-                &moved.baseline,
-            )?;
+        for (inner, abs, text) in &staged.refollowed {
+            ops.push(RowOp::Page { inner, text, abs });
         }
-        let mut threads_moved = false;
-        if let Some(body) = read_opt(&access.abs(&r::threads_path(from)))? {
-            replace(&r::threads_path(from), &r::threads_path(to), &body)?;
-            threads_moved = true;
+        for (inner, abs, text, _, _) in &staged.pacts {
+            ops.push(RowOp::Page { inner, text, abs });
         }
-        // The old row goes and the new one comes in one fenced commit.
-        self.commit_reflection_rows(
-            access.domain_id,
-            &[
-                RowOp::DeletePage(from),
-                RowOp::Page {
-                    inner: to,
-                    text: &page,
-                    abs: &dst,
-                },
-            ],
-            OnRefusal::put_back(domain, undo),
-        )
-        .await?;
+        // After the state's own move: a page's state is at its new path.
+        ops.extend(staged.rehashed.iter().map(|rehash| RowOp::RehashReconcile {
+            path: &rehash.path,
+            seen_hash: &rehash.seen_hash,
+            seen_at: &rehash.seen_at,
+            hash: &rehash.hash,
+        }));
+        self.commit_reflection_rows(access.domain_id, &ops, OnRefusal::put_back(domain, undo))
+            .await?;
         self.move_disclosures(access.domain_id, from, to).await?;
+        if staged.pact.is_some() {
+            self.move_disclosures(access.domain_id, &mv.pact_from, &mv.pact_to)
+                .await?;
+        }
         drop(_locks);
         // The page has moved: the room's sockets learn its new path now, and
         // the fence lifts.
@@ -3104,29 +3729,331 @@ impl Engine {
             Some(from),
             change_label(&caller.scope),
         );
-        // Every other page that links the moved one, PACT.md included: a link
-        // that follows a move is no change of the agreement, and a move needs
-        // only edit access. Each page under its own lock. The move has
-        // landed by now, so a page that cannot be relinked is named in the
-        // receipt (and the log) instead of failing a move that happened.
-        let mut failed: Vec<Value> = Vec::new();
-        let mut note_failure = |path: &str, e: EngineError| {
-            tracing::warn!(
+        if staged.pact.is_some() {
+            self.announce_reflection(
                 domain,
-                from,
-                to,
-                page = path,
-                "a link to the moved reflection could not be rewritten: {e}"
+                &mv.pact_to,
+                ReflectionChangeKind::Moved,
+                Some(&mv.pact_from),
+                change_label(&caller.scope),
             );
-            super::move_::note_link_failure(&mut failed, domain, path, &e);
-        };
-        let mut links = 0;
-        for row in rows.iter().filter(|row| row.path != from && row.path != to) {
-            let inner = row.path.as_str();
-            match self
-                .relink_reflection(domain, &access, inner, &|s| {
-                    r::rewrite_links_to(s, inner, from, to)
+        }
+        // A follows, an owner or a pact link that followed the move: nobody's
+        // change.
+        for (inner, _, _) in &staged.refollowed {
+            self.announce_reflection(domain, inner, ReflectionChangeKind::Changed, None, None);
+        }
+        for (inner, _, _, _, _) in &staged.pacts {
+            self.announce_reflection(domain, inner, ReflectionChangeKind::Changed, None, None);
+        }
+        let (links, failed) = self.relink_after_move(&mv, &screen.others).await;
+        let links = links + staged.pacts.iter().map(|p| p.4).sum::<usize>();
+        // The move and every page it relinked.
+        self.mark_reflection_dirty(domain, BackupCause::Settled);
+        let mut receipt = json!({
+            "from": from,
+            "to": to,
+            "links_rewritten": links,
+            "threads_moved": threads_moved,
+            "pact_moved": staged.pact.is_some(),
+            "follows_rewritten": staged.follows_rewritten,
+            "owners_rewritten": staged.owners_rewritten,
+        });
+        if !failed.is_empty() {
+            receipt["links_failed"] = json!(failed);
+        }
+        Ok(receipt)
+    }
+
+    /// Every check that can refuse the move `mv`, run before any lock, so a
+    /// refused move leaves an open room over the page alone: the curator's
+    /// moves, open rooms over the pages it rewrites, a missing page and a
+    /// taken target. The last two run again under the locks
+    /// ([`Engine::stage_reflection_move`]), where they decide.
+    async fn screen_reflection_move(&self, mv: &PageMove<'_>) -> Result<MoveScreen> {
+        let (domain, access, from, to) = (mv.domain, mv.access, mv.from, mv.to);
+        // Every other page whose links the move rewrites waits: a rewrite
+        // under an open room would race its next save. Screened from the
+        // text on disk before anything moves, and relinked from this list
+        // once the move has landed. The moved page's own room is not a
+        // refusal: it is closed once every screen has passed.
+        let rows = self
+            .store
+            .lock()
+            .await
+            .list_reflection_stamps(access.domain_id)
+            .await?;
+        // A move that changes what a curator set is a curator's: the page
+        // takes its pact along, or its new path becomes the folder parent
+        // whose pact the pages under it then follow.
+        if access.right < ReflectionRight::Curate {
+            let because = if mv.has_pact {
+                Some(format!("it takes its page pact '{}' along", mv.pact_from))
+            } else {
+                becomes_folder_parent(rows.iter().map(|row| row.path.as_str()), from, to).map(
+                    |child| {
+                        format!(
+                            "'{to}' becomes the folder parent of '{child}', which then follows its pact"
+                        )
+                    },
+                )
+            };
+            if let Some(because) = because {
+                return Err(EngineError::Forbidden(format!(
+                    "moving '{from}' to '{to}' is a curator's move because {because}; your access to the Reflection of '{domain}' is {} and curate is needed",
+                    reflection_right_word(access.right)
+                )));
+            }
+        }
+        let mut others: Vec<String> = rows
+            .into_iter()
+            .map(|row| row.path)
+            .filter(|path| mv.is_other(path))
+            .collect();
+        let mut linking =
+            rooms_to_rewrite(access, others.iter().map(String::as_str), &|text, inner| {
+                mv.relink_moved(text, inner).1
+            });
+        // A pact file whose links follow the move is relinked in the move's
+        // own commit, with the pact hashes that follow it; the other pages
+        // once the move has landed.
+        let pacts: Vec<String> = linking
+            .iter()
+            .filter(|path| r::is_pact_file(path))
+            .cloned()
+            .collect();
+        others.retain(|path| !pacts.contains(path));
+        // The pages that follow the moved page follow it to its new path, in
+        // this move, and so do the pages it owns or owned (their record names
+        // it): they wait for an open room like a link rewrite.
+        let followers = rooms_to_rewrite(access, others.iter().map(String::as_str), &|text, _| {
+            r::rewrite_follows(text, from, to).1 + owner_rewrite(text, from, to).1
+        });
+        linking.extend(
+            followers
+                .iter()
+                .filter(|f| !linking.contains(f))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        if mv.has_pact {
+            linking.push(mv.pact_from.clone());
+        }
+        self.refuse_under_live_pages(domain, &linking).await?;
+        if !access.abs(from).exists() {
+            return Err(EngineError::NotFound(format!(
+                "no reflection '{from}' in domain '{domain}'"
+            )));
+        }
+        self.refuse_taken_page_target(domain, access, from, to)
+            .await?;
+        Ok(MoveScreen {
+            others,
+            followers,
+            pacts,
+        })
+    }
+
+    /// Read what the move `mv` writes and rewrite it, under the move's
+    /// locks: the page and its pact with their links rebased, and each of
+    /// `followers` (at `follower_abs`) naming the new path. Refuses what the
+    /// screen let through and changed since: a page gone, a target taken, a
+    /// pact written meanwhile.
+    async fn stage_reflection_move(
+        &self,
+        mv: &PageMove<'_>,
+        (followers, follower_abs): (&[String], &[PathBuf]),
+        (pacts, pact_abs): (&[String], &[PathBuf]),
+    ) -> Result<StagedMove> {
+        let (domain, access, from, to) = (mv.domain, mv.access, mv.from, mv.to);
+        let text = read_opt(&access.abs(from))?.ok_or_else(|| {
+            EngineError::NotFound(format!("no reflection '{from}' in domain '{domain}'"))
+        })?;
+        self.refuse_taken_page_target(domain, access, from, to)
+            .await?;
+        // A pact that appeared after the screen was not weighed by the
+        // rights check: the move waits.
+        let pact_src = access.abs(&mv.pact_from);
+        if !mv.has_pact && pact_src.exists() {
+            return Err(EngineError::Conflict(format!(
+                "'{}' was written while this move was on its way; try the move again",
+                mv.pact_from
+            )));
+        }
+        // The pact's own relative links follow the move as the page's do.
+        let pact_baseline = read_opt(&access.abs(&r::baseline_path(&mv.pact_from)))?;
+        let pact = match read_opt(&pact_src)? {
+            Some(pact) if mv.has_pact => {
+                let moved = r::relink(&pact, pact_baseline.as_deref().unwrap_or(""), &|s| {
+                    r::rebase_links(s, &mv.pact_from, &mv.pact_to)
                 })
+                .map_err(EngineError::Invalid)?;
+                Some((
+                    crystalline_core::to_lf(&moved.page).into_owned(),
+                    pact_baseline.is_some().then_some(moved.baseline),
+                ))
+            }
+            _ => None,
+        };
+        // Each follower names the new path in its `follows`, and each page
+        // it owns or owned in its record; only the frontmatter changes,
+        // which no section and no baseline holds.
+        let mut refollowed = Vec::new();
+        let (mut follows_rewritten, mut owners_rewritten) = (0, 0);
+        for (inner, abs) in followers.iter().zip(follower_abs) {
+            if let Some(text) = read_opt(abs)? {
+                let (text, follows) = r::rewrite_follows(&text, from, to);
+                let (text, owners) = owner_rewrite(&text, from, to);
+                follows_rewritten += follows;
+                owners_rewritten += owners;
+                if follows + owners > 0 {
+                    refollowed.push((
+                        inner.clone(),
+                        abs.clone(),
+                        crystalline_core::to_lf(&text).into_owned(),
+                    ));
+                }
+            }
+        }
+        // The page's own relative links follow the move, and its
+        // baseline gets the same rewrite with the `reflected` hashes carried,
+        // so a move owes no feedback.
+        let old_baseline = read_opt(&access.abs(&r::baseline_path(from)))?;
+        let moved = r::relink(&text, old_baseline.as_deref().unwrap_or(""), &|s| {
+            r::rebase_links(s, from, to)
+        })
+        .map_err(EngineError::Invalid)?;
+        // Each pact file that links the moved page or its pact, with its
+        // baseline, as a link rewrite that is nobody's change.
+        let mut relinked = Vec::new();
+        for (inner, abs) in pacts.iter().zip(pact_abs) {
+            let Some(text) = read_opt(abs)? else {
+                continue;
+            };
+            let baseline_abs = access.abs(&r::baseline_path(inner));
+            let baseline = read_opt(&baseline_abs)?;
+            // One pact that cannot be relinked holds the whole move: the
+            // move rewrites it in its own commit, with the hashes that
+            // follow it.
+            let out = r::relink(&text, baseline.as_deref().unwrap_or(""), &|s| {
+                mv.relink_moved(s, inner)
+            })
+            .map_err(|e| {
+                EngineError::Invalid(format!(
+                    "moving '{from}' rewrites the links of the pact file '{inner}', and '{inner}' cannot be rewritten: {e}; fix '{inner}' first, then move again"
+                ))
+            })?;
+            if out.links > 0 {
+                relinked.push((
+                    inner.clone(),
+                    abs.clone(),
+                    crystalline_core::to_lf(&out.page).into_owned(),
+                    baseline.is_some().then_some(out.baseline),
+                    out.links,
+                ));
+            }
+        }
+        let mut staged = StagedMove {
+            // The row is built from the text as written, so it matches the
+            // file.
+            page: crystalline_core::to_lf(&moved.page).into_owned(),
+            baseline: old_baseline.is_some().then_some(moved.baseline),
+            pact,
+            refollowed,
+            follows_rewritten,
+            owners_rewritten,
+            pacts: relinked,
+            rehashed: Vec::new(),
+        };
+        if staged.pact.is_some() || !staged.pacts.is_empty() {
+            staged.rehashed = self.rehash_after_move(mv, &staged).await?;
+        }
+        Ok(staged)
+    }
+
+    /// The reconcile states a move would leave stale only by rewriting
+    /// paths in pact texts (the moved page's own pact rebased, other pacts
+    /// relinked), each with the hash computed after the move at the page's
+    /// path after it. A state whose stored hash already differs from the
+    /// hash before the move stays as it is: that change is real and stays
+    /// to be seen. Read once, in bulk, under the move's locks.
+    ///
+    /// The locks hold the moved page, its pact, the followers and the
+    /// relinked pacts, not every page whose chain runs through them, so a
+    /// `reconciled` of such a page may run beside the move. The update is a
+    /// compare-and-set ([`RowOp::RehashReconcile`]) that touches only the
+    /// hash: a reconcile recorded between this read and the move's commit
+    /// wins. A reconcile that computed its hash before the move and records
+    /// it after the commit stores the hash before the move; the queue then
+    /// reads that page's pact as changed once, which costs one more
+    /// reconcile and loses nothing.
+    async fn rehash_after_move(
+        &self,
+        mv: &PageMove<'_>,
+        staged: &StagedMove,
+    ) -> Result<Vec<Rehash>> {
+        let (rows, states) = {
+            let store = self.store.lock().await;
+            let rows = store.list_reflections(mv.access.domain_id).await?;
+            let states = store.reflection_reconciles(mv.access.domain_id).await?;
+            (rows, states)
+        };
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let before_files: BTreeMap<&str, &str> = rows
+            .iter()
+            .map(|row| (row.path.as_str(), row.content.as_str()))
+            .collect();
+        let mut after_files = before_files.clone();
+        after_files.remove(mv.from);
+        after_files.insert(mv.to, &staged.page);
+        if let Some((pact_text, _)) = &staged.pact {
+            after_files.remove(mv.pact_from.as_str());
+            after_files.insert(&mv.pact_to, pact_text);
+        }
+        for (inner, _, text) in &staged.refollowed {
+            after_files.insert(inner, text);
+        }
+        for (inner, _, text, _, _) in &staged.pacts {
+            after_files.insert(inner, text);
+        }
+        let before = r::pact_hashes(before_files);
+        let after = r::pact_hashes(after_files);
+        Ok(states
+            .into_iter()
+            .filter_map(|state| {
+                let at = if state.path == mv.from {
+                    mv.to.to_string()
+                } else {
+                    state.path.clone()
+                };
+                let was = before.get(&state.path)?;
+                let now = after.get(&at)?;
+                (state.pact_hash == *was && now != was).then(|| Rehash {
+                    path: at,
+                    seen_hash: state.pact_hash,
+                    seen_at: state.last_reconciled,
+                    hash: now.clone(),
+                })
+            })
+            .collect())
+    }
+
+    /// Rewrite the links of every page of `others` that reach the page `mv`
+    /// moved (or its pact), each under its own lock, once the move has
+    /// landed: `PACT.md` included, since a link that follows a move is no
+    /// change of the agreement and a move needs only edit access. A page that
+    /// cannot be relinked is named (and logged) instead of failing a move
+    /// that happened. Answers how many links changed and the pages that
+    /// failed.
+    async fn relink_after_move(&self, mv: &PageMove<'_>, others: &[String]) -> (usize, Vec<Value>) {
+        let (domain, from, to) = (mv.domain, mv.from, mv.to);
+        let mut failed: Vec<Value> = Vec::new();
+        let mut links = 0;
+        for inner in others {
+            match self
+                .relink_reflection(domain, mv.access, inner, &|s| mv.relink_moved(s, inner))
                 .await
             {
                 Ok(n) => {
@@ -3142,21 +4069,25 @@ impl Engine {
                         );
                     }
                 }
-                Err(e) => note_failure(inner, e),
+                Err(e) => {
+                    tracing::warn!(
+                        domain,
+                        from,
+                        to,
+                        page = inner.as_str(),
+                        "a link to the moved reflection could not be rewritten: {e}"
+                    );
+                    super::move_::note_link_failure(&mut failed, domain, inner, &e);
+                }
             }
         }
-        // The move and every page it relinked.
-        self.mark_reflection_dirty(domain, BackupCause::Settled);
-        let mut receipt = json!({ "from": from, "to": to, "links_rewritten": links, "threads_moved": threads_moved });
-        if !failed.is_empty() {
-            receipt["links_failed"] = json!(failed);
-        }
-        Ok(receipt)
+        (links, failed)
     }
 
     /// Refuse a page move whose target is taken (the error ends with
-    /// [`TARGET_TAKEN`]): a page, a threads file or a
-    /// baseline left at `to` would be adopted by the moved page, and a page
+    /// [`TARGET_TAKEN`]): a page, a threads file, a baseline or a page pact
+    /// (with its threads and baseline) left at `to` would be adopted by the
+    /// moved page, and a page
     /// only the previous host of a host move has is the only shared copy.
     /// Asked once as the move's screen and again under its page locks.
     async fn refuse_taken_page_target(
@@ -3166,10 +4097,24 @@ impl Engine {
         from: &str,
         to: &str,
     ) -> Result<()> {
+        let (pact_from, pact_to) = (r::page_pact_path(from), r::page_pact_path(to));
         for (old, leftover, what) in [
             (from.to_string(), to.to_string(), "a reflection"),
             (r::threads_path(from), r::threads_path(to), "a threads file"),
             (r::baseline_path(from), r::baseline_path(to), "a baseline"),
+            // A page pact left at the target, loose or not, is no file the
+            // moved page adopts.
+            (pact_from.clone(), pact_to.clone(), "a page pact"),
+            (
+                r::threads_path(&pact_from),
+                r::threads_path(&pact_to),
+                "a threads file",
+            ),
+            (
+                r::baseline_path(&pact_from),
+                r::baseline_path(&pact_to),
+                "a baseline",
+            ),
         ] {
             // The page itself under another letter case is the same file.
             let itself =
@@ -3256,29 +4201,76 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // A page pact alone is a curator's to delete, as to write. (PACT.md
+        // is refused below for everyone, with the agreement's sentence.)
+        let need = if r::pact_page_of(inner).is_some() {
+            ReflectionRight::Curate
+        } else {
+            ReflectionRight::Edit
+        };
         let access = self
-            .require_reflection_to_write(domain, caller, ReflectionRight::Edit)
+            .require_reflection_to_write(domain, caller, need)
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
+        self.validate_named_reflection_path(domain, inner).await?;
+        // A page's pact goes with it, so deleting a page that has one is a
+        // curator's, as deleting the pact alone is.
+        let pact = (!r::is_pact_file(inner))
+            .then(|| r::page_pact_path(inner))
+            .filter(|pact| access.abs(pact).exists());
+        if let Some(pact) = &pact
+            && access.right < ReflectionRight::Curate
+        {
+            return Err(EngineError::Forbidden(format!(
+                "deleting '{inner}' deletes its page pact '{pact}' too, which a curator does; your access to the Reflection of '{domain}' is {} and curate is needed",
+                reflection_right_word(access.right)
+            )));
+        }
         // After the gate, as in `move_reflection`.
-        self.refuse_under_live_pages(domain, &[inner.to_string()])
-            .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        let mut live = vec![inner.to_string()];
+        live.extend(pact.clone());
+        self.refuse_under_live_pages(domain, &live).await?;
         if inner == r::PACT_FILE {
             return Err(EngineError::Invalid(
                 "PACT.md is the domain's agreement; edit it instead of deleting it".into(),
             ));
         }
         let abs = access.abs(inner);
+        // An unattended session answers people it has never met and nobody
+        // watches what it removes: it retires a page and never deletes one
+        // (spec 2.4), here for every surface that reaches this verb. After
+        // the agreement's sentence and a missing page's, which need no
+        // advice to retire; the lock below decides a missing page again.
+        if self.is_unattended(caller) {
+            if !abs.exists() {
+                return Err(EngineError::NotFound(format!(
+                    "no reflection '{inner}' in domain '{domain}'"
+                )));
+            }
+            return Err(EngineError::Forbidden(unattended_delete_refusal(inner)));
+        }
         // The test seam sits between the screen and the file lock because that
         // window is the one R81 pins: a room may open in it.
         self.take_room_screen_hold().await;
-        let _lock = self.lock_file(&abs).await;
-        let threads_abs = access.abs(&r::threads_path(inner));
-        let baseline_abs = access.abs(&r::baseline_path(inner));
+        let pact_abs = pact.as_deref().map(|pact| access.abs(pact));
+        let mut lock_paths: Vec<&Path> = vec![&abs];
+        lock_paths.extend(pact_abs.as_deref());
+        let _lock = self.lock_files(&lock_paths).await;
+        let mut files = vec![
+            abs.clone(),
+            access.abs(&r::threads_path(inner)),
+            access.abs(&r::baseline_path(inner)),
+        ];
+        if let Some(pact) = &pact {
+            files.extend([
+                access.abs(pact),
+                access.abs(&r::threads_path(pact)),
+                access.abs(&r::baseline_path(pact)),
+            ]);
+        }
         let mut undo = DiskUndo::default();
-        for file in [&abs, &threads_abs, &baseline_abs] {
+        for file in &files {
             undo.record(file)?;
         }
         if !remove_if_there(&abs)? {
@@ -3286,15 +4278,25 @@ impl Engine {
                 "no reflection '{inner}' in domain '{domain}'"
             )));
         }
-        remove_if_there(&threads_abs)?;
-        remove_if_there(&baseline_abs)?;
-        self.commit_reflection_rows(
-            access.domain_id,
-            &[RowOp::DeletePage(inner)],
-            OnRefusal::put_back(domain, undo),
-        )
-        .await?;
+        for file in &files[1..] {
+            remove_if_there(file)?;
+        }
+        // The page row's delete takes its reconcile state in the same commit.
+        let mut ops = vec![RowOp::DeletePage(inner)];
+        ops.extend(pact.as_deref().map(RowOp::DeletePage));
+        self.commit_reflection_rows(access.domain_id, &ops, OnRefusal::put_back(domain, undo))
+            .await?;
         self.drop_disclosures(access.domain_id, inner).await?;
+        if let Some(pact) = &pact {
+            self.drop_disclosures(access.domain_id, pact).await?;
+            self.announce_reflection(
+                domain,
+                pact,
+                ReflectionChangeKind::Deleted,
+                None,
+                change_label(&caller.scope),
+            );
+        }
         self.mark_reflection_dirty(domain, BackupCause::Settled);
         self.announce_reflection(
             domain,
@@ -3329,7 +4331,7 @@ impl Engine {
             .await?;
         // After the gate, so a caller without the right learns nothing about
         // the path; before any file is touched.
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         let abs = access.abs(inner);
         let baseline_abs = access.abs(&r::baseline_path(inner));
         let _lock = self.lock_file(&abs).await;
@@ -3397,7 +4399,7 @@ impl Engine {
                 .iter()
                 .find(|s| s.id.as_deref() == Some(id.as_str()))
             {
-                let record = prov.entry(id.clone()).or_default();
+                let record = prov.sections.entry(id.clone()).or_default();
                 record.reflected = Some(r::section_hash(&section.text));
                 record.changed_by.clear();
                 record.changed_at = None;
@@ -3442,6 +4444,85 @@ impl Engine {
         );
         Ok(json!({ "domain": domain, "path": inner, "settled": ids, "outcome": outcome }))
     }
+}
+
+/// Put what `staged` holds for the move `mv` on disk: the page, its
+/// baseline, threads and pact under their new paths, and each follower's new
+/// text. Answers the undo that puts every file back, and whether a threads
+/// file moved.
+fn write_reflection_move(mv: &PageMove<'_>, staged: &StagedMove) -> Result<(DiskUndo, bool)> {
+    let (access, from, to) = (mv.access, mv.from, mv.to);
+    let (pact_from, pact_to) = (mv.pact_from.as_str(), mv.pact_to.as_str());
+    let mut undo = DiskUndo::default();
+    let mut renames = vec![
+        (from.to_string(), to.to_string()),
+        (r::baseline_path(from), r::baseline_path(to)),
+        (r::threads_path(from), r::threads_path(to)),
+    ];
+    if staged.pact.is_some() {
+        renames.extend([
+            (pact_from.to_string(), pact_to.to_string()),
+            (r::baseline_path(pact_from), r::baseline_path(pact_to)),
+            (r::threads_path(pact_from), r::threads_path(pact_to)),
+        ]);
+    }
+    for (old_rel, new_rel) in renames {
+        let (old, new) = (access.abs(&old_rel), access.abs(&new_rel));
+        if is_case_only_rename(&old, &new, &old_rel, &new_rel) {
+            undo.record_case_rename(&old, &new)?;
+        } else {
+            undo.record(&old)?;
+            undo.record(&new)?;
+        }
+    }
+    for (_, abs, _) in &staged.refollowed {
+        undo.record(abs)?;
+    }
+    for (inner, abs, _, _, _) in &staged.pacts {
+        undo.record(abs)?;
+        undo.record(&access.abs(&r::baseline_path(inner)))?;
+    }
+    let replace = |old_rel: &str, new_rel: &str, text: &str| {
+        let (old, new) = (access.abs(old_rel), access.abs(new_rel));
+        let case_only = is_case_only_rename(&old, &new, old_rel, new_rel);
+        replace_file_with(&old, &new, case_only, |p| write_file(p, text))
+    };
+    replace(from, to, &staged.page)?;
+    if let Some(baseline) = &staged.baseline {
+        replace(&r::baseline_path(from), &r::baseline_path(to), baseline)?;
+    }
+    let mut threads_moved = false;
+    if let Some(body) = read_opt(&access.abs(&r::threads_path(from)))? {
+        replace(&r::threads_path(from), &r::threads_path(to), &body)?;
+        threads_moved = true;
+    }
+    if let Some((pact_text, pact_baseline)) = &staged.pact {
+        replace(pact_from, pact_to, pact_text)?;
+        if let Some(baseline) = pact_baseline {
+            replace(
+                &r::baseline_path(pact_from),
+                &r::baseline_path(pact_to),
+                baseline,
+            )?;
+        }
+        if let Some(body) = read_opt(&access.abs(&r::threads_path(pact_from)))? {
+            replace(
+                &r::threads_path(pact_from),
+                &r::threads_path(pact_to),
+                &body,
+            )?;
+        }
+    }
+    for (_, abs, text) in &staged.refollowed {
+        write_file(abs, text)?;
+    }
+    for (inner, abs, text, baseline, _) in &staged.pacts {
+        write_file(abs, text)?;
+        if let Some(baseline) = baseline {
+            write_file(&access.abs(&r::baseline_path(inner)), baseline)?;
+        }
+    }
+    Ok((undo, threads_moved))
 }
 
 /// Write `text` at `new` and remove `old`. For a case-only rename (see
@@ -3681,6 +4762,77 @@ mod tests {
             "{text}"
         );
         assert!(prov["cccc3333"].changed_by.is_empty(), "{prov:?}");
+    }
+
+    /// The page's own record survives a save that rewrites the sections: it
+    /// is the engine's, so the text a person or an agent sends neither
+    /// carries it nor can change it.
+    #[test]
+    fn a_save_keeps_the_page_record() {
+        let current = "---\nreflection:\n  aaaa1111:\n    reflected: x\n  _page:\n    owner: arch/overview.md\n---\n\n# A\n\n## One\n<!-- r:aaaa1111 -->\n\nFirst.\n";
+        let incoming = "---\nreflection:\n  _page:\n    owner: someone/else.md\n---\n\n# A\n\n## One\n<!-- r:aaaa1111 -->\n\nChanged.\n\n## Two\n\nNew.\n";
+        let Composed { text, prov, .. } = compose_reflection(
+            Some(current),
+            "",
+            incoming,
+            &SectionAuthors::plain(vec!["ada".into()]),
+            true,
+            "2026-11-20T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            prov.page.owner.as_deref(),
+            Some("arch/overview.md"),
+            "{prov:?}"
+        );
+        let stored = r::write_provenance(&text, &prov).unwrap();
+        assert_eq!(
+            r::read_provenance(&stored).page.owner.as_deref(),
+            Some("arch/overview.md"),
+            "{stored}"
+        );
+    }
+
+    /// A page record that does not read survives a save and a relink as it
+    /// was written: it is never dropped, whatever the text did.
+    #[test]
+    fn a_save_and_a_relink_keep_a_page_record_that_does_not_read() {
+        let record = "  _page:\n    owner: arch/overview.md\n    retired:\n      by: ada\n";
+        let body = "# A\n\n## One\n<!-- r:aaaa1111 -->\n\nSee [b](b.md).\n";
+        // The section reads as reflected, so the relink carries its hash and
+        // rewrites the block.
+        let reflected = r::section_hash(&r::split_sections(body)[1].text);
+        let current = format!(
+            "---\nreflection:\n  aaaa1111:\n    reflected: {reflected}\n{record}---\n\n{body}"
+        );
+        let incoming = "# A\n\n## One\n<!-- r:aaaa1111 -->\n\nChanged.\n";
+        let Composed { text, prov, .. } = compose_reflection(
+            Some(&current),
+            "",
+            incoming,
+            &SectionAuthors::plain(vec!["ada".into()]),
+            true,
+            "2026-11-20T00:00:00Z",
+        )
+        .unwrap();
+        let saved = r::write_provenance(&text, &prov).unwrap();
+        assert!(saved.contains(record), "{saved}");
+        assert_eq!(prov.page.unreadable, ["retired"]);
+        let rewrite = |s: &str| {
+            let n = s.matches("](b.md)").count();
+            (s.replace("](b.md)", "](c.md)"), n)
+        };
+        let relinked = r::relink(&current, "", &rewrite).unwrap();
+        assert_eq!(relinked.links, 1);
+        assert!(relinked.page.contains(record), "{}", relinked.page);
+        assert!(relinked.page.contains("](c.md)"), "{}", relinked.page);
+        assert_ne!(
+            r::read_provenance(&relinked.page)["aaaa1111"]
+                .reflected
+                .as_deref(),
+            Some(reflected.as_str()),
+            "the block was rewritten"
+        );
     }
 
     #[test]

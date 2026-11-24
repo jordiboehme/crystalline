@@ -123,6 +123,28 @@ pub fn skill(name: &str) -> Option<&'static SkillAsset> {
 mod tests {
     use super::*;
 
+    /// The approved rule on tentative knowledge, word for word. The skills
+    /// may add backticks around the status words and the categories.
+    const TENTATIVE_RULE: &str = "Knowledge can be tentative: an engram whose status is draft, proposed, idea, poc or open, or whose observations are [idea] or [question]. Tentative knowledge is not decided, but it can be worth building on. When it shapes an answer, a spec or a plan, name it as tentative and let your person choose: build on it, treat it as an option, or leave it out. When you build on it, say so in what you write (for example \"assumes the proposal X\"), so it can be checked again once X is decided or dropped.";
+
+    /// Both skills that carry the read-side behaviour name tentative
+    /// knowledge in the approved wording: the routing skill, which harnesses
+    /// install, and the intelligence skill, which Claude Desktop installs.
+    #[test]
+    fn the_routing_and_intelligence_skills_name_tentative_knowledge() {
+        for name in ["crystalline-routing", "crystalline-intelligence"] {
+            let body = skill(name).unwrap().content;
+            assert!(
+                body.replace('`', "").contains(TENTATIVE_RULE),
+                "{name}: {body}"
+            );
+            assert!(
+                body.contains("each node's title, type, `status` and `tags`"),
+                "{name}: {body}"
+            );
+        }
+    }
+
     /// The collaboration skill says what to offer after a refused direct
     /// share, and what to tell the user once shares fall back on their own.
     #[test]
@@ -390,6 +412,24 @@ mod tests {
             capture.contains("call `reflect`"),
             "capture skill lacks the reflect pointer"
         );
+    }
+
+    /// A headless run leaves pact text, a page with its own pact and a
+    /// page's freshness and follows to a curator, and only a session with a
+    /// person adds a bullet to the PACT's `## Pages`.
+    #[test]
+    fn the_intelligence_skill_keeps_a_run_off_pact_text_and_page_settings() {
+        let intelligence = skill("crystalline-intelligence").unwrap().content;
+        for needle in [
+            "Such a run writes no pact text, moves no page that has its own page pact",
+            "`freshness` or `follows`",
+            "When a person asks you for a page or space in a session with them",
+        ] {
+            assert!(
+                intelligence.contains(needle),
+                "intelligence skill lacks {needle}"
+            );
+        }
     }
 
     #[test]

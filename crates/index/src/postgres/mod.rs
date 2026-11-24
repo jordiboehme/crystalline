@@ -51,34 +51,25 @@
 //!   later that selects a raw `embedding` column joins that list and needs the
 //!   same treatment.
 //!
-//!   Two fixes were tried and rejected before landing on the one below.
-//!   `.persistent(false)` (never cache the statement) looked right but breaks on
-//!   sqlx 0.9: that flag routes the statement through Postgres's unnamed
-//!   prepared statement, which does not survive being interleaved with the raw
-//!   `BEGIN`/`COMMIT` this module sends as plain SQL (see `begin()`) - every
-//!   statement on that connection then fails with "unnamed prepared statement
-//!   does not exist", observed deterministically across the whole parity suite,
-//!   not just the carry SELECT. Retrying the failed statement once in place,
-//!   after `clear_cached_statements` on just that connection, does not work
-//!   either: the carry SELECT runs inside `sync`'s explicit transaction (the raw
-//!   `BEGIN` in `begin()`), and Postgres aborts a transaction block on any error
-//!   raised inside it, so the retry's first statement fails again immediately
-//!   with "current transaction is aborted, commands ignored until end of
-//!   transaction block" rather than a fresh attempt - also confirmed against a
-//!   live database.
-//!
-//!   The fix instead prevents the stale plan from ever being reused:
-//!   `embedding_generation`, an `AtomicU64` on `PostgresStore`, is bumped every
-//!   time `ensure_embedding_width` actually runs its ALTER, on any chunk table.
-//!   It is one counter for every table, not one per table: a resize of any
-//!   table rotates the cache key of every exposed statement, which is safe and
-//!   costs one re-prepare. Every exposed statement folds the current
-//!   generation into its SQL text as a trailing comment, so a width change
-//!   gives each of them different SQL text and therefore a different sqlx
-//!   cache key; every connection, not just the one
-//!   that ran the DDL, prepares fresh the next time it runs one of them after
-//!   a resize, and the plan it had cached under the old generation's text
-//!   simply ages out of the LRU unused.
+//!   The fix is `.persistent(false)` on each of those three statements: sqlx
+//!   runs them as Postgres's unnamed prepared statement and never caches them,
+//!   so whichever pooled connection runs one next plans it against the column
+//!   as it is now. On sqlx 0.9.0 this flag failed with "unnamed prepared
+//!   statement does not exist", because the driver's catalog lookup of a
+//!   custom type's OID (pgvector's `vector`) destroyed the unnamed statement
+//!   before it ran; sqlx 0.9.1 re-parses the statement after that lookup
+//!   (sqlx#4361). Reproduced against a live
+//!   database on 2026-11-22: the same three-statement change failed 231
+//!   tests of this crate's parity suite on 0.9.0 and passed all of them on
+//!   0.9.1, while 0.9.1 with no fix at all still failed
+//!   `lead_vectors_on_read_connections_survive_a_width_flip_parity` with
+//!   "cached plan must not change result type". Until 0.9.1 a counter folded
+//!   into the SQL text of the three statements rotated their cache key on
+//!   every resize instead. Retrying a failed statement in place is no
+//!   alternative: the carry SELECTs run inside `sync`'s explicit transaction
+//!   (the raw `BEGIN` in `begin()`), and Postgres aborts a transaction block
+//!   on any error raised inside it, so a retry fails again with "current
+//!   transaction is aborted".
 
 mod migrations;
 mod owner;
@@ -139,12 +130,13 @@ use crate::store::{
     FileStamp, FtsMode, GraphSlice, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery,
     InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, NewReflectionChunk,
     OBSERVATION_VECTOR_CHUNK, ObservationVector, OutboundRef, Page, RebuildKind, RecentFilter,
-    ReferenceCandidates, ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode,
-    SearchQuery, SectionVector, SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, changed_spellings, count_references_to_sql, domain_url_needles, folder_slash,
-    in_transaction, names_a_domain_url, page_window, reference_match, referencing_domains_sql,
-    rename_onto_taken_row, reset_spelled_references_sql, resolve_references_to_sql,
-    resolve_spelled_references_sql, spelled_references_sql, spelling_plan,
+    ReferenceCandidates, ReflectionCovered, ReflectionReconcile, ReflectionRow, ReflectionStamp,
+    ScoredPair, SearchHit, SearchMode, SearchQuery, SectionVector, SpellingPlan, Store, StoreInfo,
+    StoredEngram, Vocabulary, build_vocabulary, changed_spellings, count_references_to_sql,
+    domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
+    reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
+    resolve_references_to_sql, resolve_spelled_references_sql, spelled_references_sql,
+    spelling_plan,
 };
 use crate::store::{AutomationLease, AutomationRun, LeaseClaim, LeaseHolder};
 use crate::sweep::{SpelledRef, UnresolvedRef};
@@ -250,17 +242,6 @@ pub struct PostgresStore {
     // `ensure_embedding_width`, never by wipe (wiping rows never changes the
     // column type).
     embedding_width: Mutex<HashMap<ChunkTable, i64>>,
-    // Bumped by `ensure_embedding_width` every time its `ALTER TABLE ... TYPE
-    // vector({dims})` actually runs (never on the already-matches fast path).
-    // `replace_chunks` folds the current value into its carry SELECT's SQL
-    // text, which changes sqlx's cache key and so guarantees a fresh prepare
-    // after every width change; see the module doc for why this exists.
-    // `AtomicU64` rather than the `Mutex<_>` used elsewhere because it is only
-    // ever read or bumped, never checked-and-set as part of a larger decision.
-    // Shared with the read connections, which run `lead_vectors` beside the
-    // writer and must see a bump the writer made: bumped with `Release`,
-    // read with `Acquire`.
-    embedding_generation: Arc<AtomicU64>,
     // The last computed embedding coverage snapshot per chunk table, shared by
     // effective_mode, the search staleness gate and CLI status so they issue
     // one aggregate scan, not three. A table with no entry recomputes on its
@@ -493,7 +474,6 @@ impl PostgresStore {
             schema,
             tag_cache: Mutex::new(HashMap::new()),
             embedding_width: Mutex::new(HashMap::new()),
-            embedding_generation: Arc::new(AtomicU64::new(0)),
             coverage: Arc::new(CoverageCache::default()),
             reader_generation: None,
             readers: None,
@@ -534,7 +514,6 @@ impl PostgresStore {
                 schema: self.schema.clone(),
                 tag_cache: Mutex::new(HashMap::new()),
                 embedding_width: Mutex::new(HashMap::new()),
-                embedding_generation: self.embedding_generation.clone(),
                 coverage: self.coverage.clone(),
                 reader_generation: Some(AtomicU64::new(0)),
                 readers: None,
@@ -762,14 +741,11 @@ impl PostgresStore {
     /// result row includes that raw column (Postgres error: "cached plan must
     /// not change result type"). The `clear_cached_statements` at the end
     /// sheds `conn`'s own stale plans but cannot reach the pool's other
-    /// connections, so on a successful resize this bumps
-    /// `embedding_generation`: the statements that return that raw column
+    /// connections. The statements that return that raw column
     /// (`replace_chunks`' and `replace_reflection_chunks`' carry SELECTs and
-    /// `lead_vectors`' SELECT) fold the new
-    /// value into their SQL text, which changes sqlx's cache key and forces a
-    /// fresh prepare everywhere, on this connection and every other one,
-    /// without needing to reach them. See the module doc for the full hazard
-    /// and why those statements cannot instead retry in place.
+    /// `lead_vectors`' SELECT) therefore run with `.persistent(false)`, so no
+    /// connection holds a cached plan for them. See the module doc for the
+    /// full hazard and why those statements cannot instead retry in place.
     ///
     /// The width is kept per chunk table: each table's `embedding` column is
     /// probed and resized on its own, through the statements `chunk_width_sql`
@@ -815,17 +791,14 @@ impl PostgresStore {
         // any plan this connection had cached for a statement returning that
         // column is now stale. `clear_cached_statements` sheds `conn`'s own
         // stale plans directly; it only reaches this one connection, so it is
-        // a courtesy for whichever statements this connection still might run
-        // under the old SQL text (there are none: the statements returning
-        // that raw column, `replace_chunks`' and `replace_reflection_chunks`'
-        // carry SELECTs and `lead_vectors`' SELECT, all carry the current
-        // generation), not what makes
-        // the pool's other connections safe. `embedding_generation` below is
-        // what does that, by changing the cache key everywhere at once.
+        // a courtesy (the statements returning that raw column,
+        // `replace_chunks`' and `replace_reflection_chunks`' carry SELECTs and
+        // `lead_vectors`' SELECT, are never cached), not what makes the pool's
+        // other connections safe. `.persistent(false)` on those statements is
+        // what does that.
         Connection::clear_cached_statements(&mut *conn)
             .await
             .map_err(IndexError::from)?;
-        self.embedding_generation.fetch_add(1, Ordering::Release);
         self.embedding_width.lock().unwrap().insert(table, dims);
         Ok(())
     }
@@ -1960,21 +1933,35 @@ pub fn unresolved_refs_sql(src_screen: &str, rel_pending: &str, link_pending: &s
 /// This selects the raw `embedding` column, whose type includes the column's
 /// typmod, so it is the second of the two statements in this module exposed to
 /// `ensure_embedding_width`'s DDL-vs-cached-plan hazard (see the module doc, and
-/// `replace_chunks` for the first). It carries the trailing `/* w{generation} */`
-/// comment for that reason: inert to postgres, but it changes sqlx's cache key
-/// on every resize, so whichever pooled connection runs this next prepares
+/// `replace_chunks` for the first). `lead_vectors` therefore runs it with
+/// `.persistent(false)`, so whichever pooled connection runs it next plans it
 /// against the current column shape instead of raising "cached plan must not
-/// change result type". The comment is part of the statement, which is why the
-/// generation is an argument here rather than something a caller appends.
+/// change result type".
 #[doc(hidden)]
-pub fn lead_vectors_sql(actor_screen: &str, generation: u64) -> String {
+pub fn lead_vectors_sql(actor_screen: &str) -> String {
     format!(
         "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
          JOIN engram e ON e.id=c.engram_id \
          WHERE {actor_screen} AND e.domain_id=$1 AND c.seq=0 AND c.model=$2 \
            AND c.embedding IS NOT NULL \
-         ORDER BY c.engram_id ASC /* w{generation} */"
+         ORDER BY c.engram_id ASC"
     )
+}
+
+/// A `reflection_reconcile` row: path, last reconciled, outcome, pact hash
+/// and version.
+type ReconcileTuple = (String, String, String, String, String);
+
+fn reconcile_of(
+    (path, last_reconciled, outcome, pact_hash, version): ReconcileTuple,
+) -> ReflectionReconcile {
+    ReflectionReconcile {
+        path,
+        last_reconciled,
+        outcome,
+        pact_hash,
+        version,
+    }
 }
 
 #[async_trait]
@@ -3049,15 +3036,16 @@ impl ReadStore for PostgresStore {
         actor: Option<&str>,
     ) -> Result<Vec<LeadVector>> {
         let mut conn = self.acquire().await?;
-        // The `/* w{generation} */` comment `lead_vectors_sql` carries is what
-        // keeps a resized embedding column out of sqlx's statement cache; see
-        // that builder.
-        let generation = self.embedding_generation.load(Ordering::Acquire);
         let mut params = vec![Param::Int(domain.0), Param::Text(model.to_string())];
         let mut n = 3usize;
         let actor_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
-        let sql = lead_vectors_sql(&actor_screen, generation);
-        let rows = query_all(conn.as_mut(), &sql, params).await?;
+        let sql = lead_vectors_sql(&actor_screen);
+        // Never cached: the statement returns the raw embedding column, whose
+        // type a width change alters (see `lead_vectors_sql`).
+        let rows = bind_all(sqlx::query(AssertSqlSafe(sql)).persistent(false), params)
+            .fetch_all(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let (Some(id), Some(dims)) = (cell_i64(r, 0), cell_i64(r, 1)) else {
@@ -3654,6 +3642,57 @@ impl ReadStore for PostgresStore {
         row.map(|r| automation_lease_of(&r)).transpose()
     }
 
+    async fn reflection_reconcile(
+        &self,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<ReflectionReconcile>> {
+        let mut conn = self.acquire().await?;
+        let row: Option<ReconcileTuple> = sqlx::query_as(
+            "SELECT path, last_reconciled, outcome, pact_hash, version \
+             FROM reflection_reconcile WHERE domain_id=$1 AND path=$2",
+        )
+        .bind(domain.0)
+        .bind(path)
+        .fetch_optional(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(row.map(reconcile_of))
+    }
+
+    async fn reflection_reconciles(&self, domain: DomainId) -> Result<Vec<ReflectionReconcile>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<ReconcileTuple> = sqlx::query_as(
+            "SELECT path, last_reconciled, outcome, pact_hash, version \
+             FROM reflection_reconcile WHERE domain_id=$1 ORDER BY path COLLATE \"C\"",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows.into_iter().map(reconcile_of).collect())
+    }
+
+    async fn reflection_covered(&self, domain: DomainId) -> Result<Vec<ReflectionCovered>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT path, permalink, checksum FROM reflection_covered WHERE domain_id=$1 \
+             ORDER BY path COLLATE \"C\", permalink COLLATE \"C\"",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, permalink, checksum)| ReflectionCovered {
+                path,
+                permalink,
+                checksum,
+            })
+            .collect())
+    }
+
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
         let mut conn = self.acquire().await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
@@ -4147,10 +4186,10 @@ impl Store for PostgresStore {
             let Some((id,)) = id else {
                 return Ok(false);
             };
-            // `domain_lock`, the two automation tables, `reflection_disclosure`
-            // and `tag_alias` name the row without a cascade, and `relation`
-            // and `link` carry its id with no key at all, so each is cleared
-            // before the row itself.
+            // `domain_lock`, the two automation tables, `reflection_disclosure`,
+            // `reflection_reconcile` and `tag_alias` name the row without a
+            // cascade, and `relation` and `link` carry its id with no key at
+            // all, so each is cleared before the row itself.
             for sql in [
                 "DELETE FROM domain_spelling WHERE domain_id=$1",
                 // A chunk is not content, so it does not keep the row; it
@@ -4161,6 +4200,8 @@ impl Store for PostgresStore {
                 "DELETE FROM automation_lease WHERE domain_id=$1",
                 "DELETE FROM automation_run WHERE domain_id=$1",
                 "DELETE FROM reflection_disclosure WHERE domain_id=$1",
+                "DELETE FROM reflection_reconcile WHERE domain_id=$1",
+                "DELETE FROM reflection_covered WHERE domain_id=$1",
                 "DELETE FROM relation WHERE domain_id=$1",
                 "DELETE FROM link WHERE domain_id=$1",
                 "DELETE FROM domain WHERE id=$1",
@@ -4508,20 +4549,16 @@ impl Store for PostgresStore {
         // This selects the raw `embedding` column, whose type includes the
         // column's typmod, so it is the one statement in this module exposed to
         // `ensure_embedding_width`'s DDL-vs-cached-plan hazard (see the module
-        // doc). The trailing `/* w{generation} */` comment is inert to Postgres but not
-        // to sqlx's statement cache: it makes the SQL text - and so the cache
-        // key - change every time the column is resized, which forces a fresh
-        // prepare against the current column shape on whichever connection runs
-        // this next, without needing to reach every pooled connection directly.
-        // This runs inside `sync`'s explicit transaction (the raw `BEGIN` in
-        // `begin()`), where a failed statement would abort the whole
-        // transaction with no way to recover by retrying in place, which is why
-        // prevention rather than retry is the fix here.
-        let generation = self.embedding_generation.load(Ordering::Acquire);
-        let carry_sql = format!(
-            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=$1 AND embedding IS NOT NULL /* w{generation} */"
-        );
-        let existing = sqlx::query(AssertSqlSafe(carry_sql))
+        // doc). `.persistent(false)` keeps it out of sqlx's statement cache, so
+        // whichever connection runs it next plans it against the current
+        // column shape. This runs inside `sync`'s explicit transaction (the
+        // raw `BEGIN` in `begin()`), where a failed statement would abort the
+        // whole transaction with no way to recover by retrying in place, which
+        // is why prevention rather than retry is the fix here.
+        let existing = sqlx::query(
+            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=$1 AND embedding IS NOT NULL",
+        )
+        .persistent(false)
             .bind(eid)
             .fetch_all(&mut *c)
             .await
@@ -5262,6 +5299,7 @@ impl Store for PostgresStore {
         &self,
         domain: DomainId,
         account: &str,
+        only: Option<&str>,
         paths: &[String],
     ) -> Result<u64> {
         // One statement: the union of what the row holds and `paths`, so two
@@ -5271,11 +5309,12 @@ impl Store for PostgresStore {
             "UPDATE automation_lease SET written = ( \
              SELECT COALESCE(jsonb_agg(p ORDER BY p), '[]'::jsonb)::text FROM ( \
              SELECT DISTINCT p FROM jsonb_array_elements_text(written::jsonb || $3::jsonb) AS p) AS u) \
-             WHERE domain_id=$1 AND account=$2",
+             WHERE domain_id=$1 AND account=$2 AND ($4::text IS NULL OR loop_kind=$4)",
         )
         .bind(domain.0)
         .bind(account)
         .bind(serde_json::to_string(paths)?)
+        .bind(only)
         .execute(conn.as_mut())
         .await
         .map_err(IndexError::from)?;
@@ -5365,6 +5404,140 @@ impl Store for PostgresStore {
         .execute(&mut *c)
         .await
         .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn set_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        state: &ReflectionReconcile,
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(
+            "INSERT INTO reflection_reconcile \
+             (domain_id, path, last_reconciled, outcome, pact_hash, version) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (domain_id, path) DO UPDATE SET \
+             last_reconciled=excluded.last_reconciled, outcome=excluded.outcome, \
+             pact_hash=excluded.pact_hash, version=excluded.version",
+        )
+        .bind(domain.0)
+        .bind(&state.path)
+        .bind(&state.last_reconciled)
+        .bind(&state.outcome)
+        .bind(&state.pact_hash)
+        .bind(&state.version)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn swap_reflection_reconcile_hash(
+        &self,
+        domain: DomainId,
+        path: &str,
+        seen_hash: &str,
+        seen_at: &str,
+        hash: &str,
+    ) -> Result<bool> {
+        let mut conn = self.acquire().await?;
+        let done = sqlx::query(
+            "UPDATE reflection_reconcile SET pact_hash=$5 \
+             WHERE domain_id=$1 AND path=$2 AND pact_hash=$3 AND last_reconciled=$4",
+        )
+        .bind(domain.0)
+        .bind(path)
+        .bind(seen_hash)
+        .bind(seen_at)
+        .bind(hash)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn move_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        // The target's state goes only when there is one to take its place.
+        sqlx::query(
+            "DELETE FROM reflection_reconcile WHERE domain_id=$1 AND path=$3 \
+             AND EXISTS (SELECT 1 FROM reflection_reconcile \
+             WHERE domain_id=$1 AND path=$2)",
+        )
+        .bind(domain.0)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        sqlx::query("UPDATE reflection_reconcile SET path=$3 WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(from)
+            .bind(to)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM reflection_covered WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(to)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("UPDATE reflection_covered SET path=$3 WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(from)
+            .bind(to)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn update_reflection_covered(
+        &self,
+        domain: DomainId,
+        path: &str,
+        add: &[(String, String)],
+        remove: &[String],
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        for (permalink, checksum) in add {
+            sqlx::query(
+                "INSERT INTO reflection_covered (domain_id, path, permalink, checksum) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (domain_id, path, permalink) DO UPDATE SET \
+                 checksum=excluded.checksum",
+            )
+            .bind(domain.0)
+            .bind(path)
+            .bind(permalink)
+            .bind(checksum)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        }
+        for permalink in remove {
+            sqlx::query(
+                "DELETE FROM reflection_covered WHERE domain_id=$1 AND path=$2 AND permalink=$3",
+            )
+            .bind(domain.0)
+            .bind(path)
+            .bind(permalink)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        }
         Ok(())
     }
 
@@ -5562,6 +5735,18 @@ impl Store for PostgresStore {
             .execute(&mut *c)
             .await
             .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM reflection_reconcile WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(path)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM reflection_covered WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(path)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
         let n = sqlx::query("DELETE FROM reflection WHERE domain_id=$1 AND path=$2")
             .bind(domain.0)
             .bind(path)
@@ -5585,20 +5770,18 @@ impl Store for PostgresStore {
         let c = conn.as_mut();
         // Carry over the vector of any chunk whose fingerprint is unchanged, as
         // `replace_chunks` does within an engram. This selects the raw
-        // `embedding` column, so it carries the `/* w{generation} */` cache-key
-        // comment for the reason `replace_chunks`' carry SELECT does (see the
-        // module doc).
-        let generation = self.embedding_generation.load(Ordering::Acquire);
-        let carry_sql = format!(
+        // `embedding` column, so it runs with `.persistent(false)` for the
+        // reason `replace_chunks`' carry SELECT does (see the module doc).
+        let existing = sqlx::query(
             "SELECT text_hash, model, dims, embedding FROM reflection_chunk \
-             WHERE domain_id=$1 AND path=$2 AND embedding IS NOT NULL /* w{generation} */"
-        );
-        let existing = sqlx::query(AssertSqlSafe(carry_sql))
-            .bind(domain.0)
-            .bind(path)
-            .fetch_all(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
+             WHERE domain_id=$1 AND path=$2 AND embedding IS NOT NULL",
+        )
+        .persistent(false)
+        .bind(domain.0)
+        .bind(path)
+        .fetch_all(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
         let mut carry: HashMap<String, (Option<String>, Option<i64>, pgvector::Vector)> =
             HashMap::new();
         for r in &existing {

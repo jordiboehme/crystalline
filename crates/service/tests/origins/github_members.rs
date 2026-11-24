@@ -314,6 +314,82 @@ async fn setting_a_member_on_a_governed_domain_is_409() {
     assert_eq!(members[0].principal, "wri");
 }
 
+/// An invite link never reaches a domain GitHub governs, even an admin's:
+/// GitHub decides who is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invite_link_never_reaches_a_governed_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = serve(tmp.path(), &[]).await;
+    old_grants(&fx).await;
+    let root = login(fx.addr, "root").await;
+    let (status, body) = call(
+        &fx,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/invites",
+        Some(json!({"role": "none", "domain": "kb", "level": "viewer"})),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("access to this domain follows GitHub; change it on GitHub"),
+        "{body}"
+    );
+    assert!(fx.auth.invites(None, None).await.unwrap().is_empty());
+    // The members read tells the card the same: no link to make here.
+    let (status, members) = call(
+        &fx,
+        &root,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/members",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{members}");
+    assert_eq!(members["can_invite"], false, "{members}");
+
+    // A link made before the domain's access followed GitHub is not
+    // redeemed: confirm says the one sentence, redeem says why.
+    let issued = fx
+        .auth
+        .create_invite(
+            &crystalline_service::rest::NewInvite {
+                role: Role::Viewer,
+                domain: Some("kb"),
+                level: Some(MemberLevel::Viewer),
+                label: None,
+                local_account: false,
+                created_by: "root",
+                ttl_secs: 3_600,
+            },
+            crystalline_service::rest::InviteLimits {
+                per_creator: 10,
+                max_users: 100,
+            },
+        )
+        .await
+        .unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let confirm = client
+        .post(format!("http://{}/api/v1/invites/confirm", fx.addr))
+        .json(&json!({"token": issued.token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(confirm.status(), 404);
+    let redeem = client
+        .post(format!("http://{}/api/v1/invites/redeem", fx.addr))
+        .json(&json!({"token": issued.token, "login": "nina", "password": "pw12345678"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redeem.status(), 409);
+    assert!(fx.auth.user("nina").await.unwrap().is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_github_maintainer_switches_visibility() {
     let tmp = tempfile::tempdir().unwrap();

@@ -173,6 +173,16 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "wikilink whole target text",
         sql: SCHEMA_V30,
     },
+    Migration {
+        version: 31,
+        label: "reflection reconcile state",
+        sql: SCHEMA_V31,
+    },
+    Migration {
+        version: 32,
+        label: "reflection covered engrams",
+        sql: SCHEMA_V32,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -966,6 +976,42 @@ CREATE INDEX idx_relation_to_whole ON relation(lower(to_whole)) WHERE to_whole I
 CREATE INDEX idx_link_to_whole ON link(lower(to_whole)) WHERE to_whole IS NOT NULL;
 "#;
 
+// When each Reflection page was last reconciled, what that did (`updated` or
+// `unchanged`), the hash of its pact chain and page settings it saw and the
+// version of the queue item it settled. One row per page, kept here and not
+// in the file, so an hourly check that changes nothing makes no file change
+// and no backup commit. A page with no row reads as reconciled at its row's
+// modified time. Goes with the page row (`delete_reflection`) and does not
+// cascade from `domain`: `wipe()` and the empty-row drop clear it by hand.
+const SCHEMA_V31: &str = r#"
+CREATE TABLE reflection_reconcile (
+    domain_id INTEGER NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    last_reconciled TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    pact_hash TEXT NOT NULL,
+    version TEXT NOT NULL,
+    PRIMARY KEY(domain_id, path)
+);
+"#;
+
+// The engrams of a page's own domain that a page with a freshness (or an
+// owned page) cited and then dropped, with each engram's checksum when the
+// page cited it: such an engram stays covered for the reflect queue until
+// its checksum moves (rule A). Written beside the page row by the one
+// writer of page rows, so engine writes and the sync both keep it. Goes with
+// the page row (`delete_reflection`), moves with the page and does not
+// cascade from `domain`: `wipe()` and the empty-row drop clear it by hand.
+const SCHEMA_V32: &str = r#"
+CREATE TABLE reflection_covered (
+    domain_id INTEGER NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    permalink TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    PRIMARY KEY(domain_id, path, permalink)
+);
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -994,8 +1040,8 @@ CREATE TABLE attachment_blob (
 /// and leads the list. `engram_meta_value` references `engram`, so it goes
 /// before it. `reflection` and `reflection_asset` reference `domain(id)` too,
 /// and so does `reflection_chunk`, which goes before `reflection`.
-/// `automation_lease` and `automation_run` reference `domain(id)` as well, and so does
-/// `reflection_disclosure`.
+/// `automation_lease` and `automation_run` reference `domain(id)` as well, and so do
+/// `reflection_disclosure`, `reflection_reconcile` and `reflection_covered`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_vector",
     "contradiction",
@@ -1020,6 +1066,8 @@ pub const WIPE_TABLES: &[&str] = &[
     "automation_lease",
     "automation_run",
     "reflection_disclosure",
+    "reflection_reconcile",
+    "reflection_covered",
     "domain_spelling",
     "domain",
 ];

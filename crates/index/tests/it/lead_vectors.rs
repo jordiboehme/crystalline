@@ -440,8 +440,9 @@ parity!(
 
 /// The width flip again, with every read on the store's read connections:
 /// they prepare the lead-vector statement on connections of their own, which
-/// the writer's resize never touches, so only the generation the writer
-/// shares with them keeps a stale plan from coming back after the ALTER.
+/// the writer's resize never touches, so only `.persistent(false)` on that
+/// statement (nothing cached anywhere) keeps a stale plan from coming back
+/// after the ALTER.
 async fn lead_vectors_on_read_connections_survive_a_width_flip(store: &dyn Store) {
     let reader = store
         .read_pool()

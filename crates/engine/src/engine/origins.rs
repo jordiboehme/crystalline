@@ -140,7 +140,10 @@ pub fn leave_out_for_non_admin(connection: &mut Value) {
 /// owner is at a command line. The App's own sentences hold a command line and a
 /// host, so they go to the log here.
 fn refusal_for(actor: &ShareActor, e: EngineError) -> EngineError {
-    if !matches!(actor, ShareActor::Account(_) | ShareActor::HttpAgent) {
+    if !matches!(
+        actor,
+        ShareActor::Account(_) | ShareActor::HttpAgent | ShareActor::Agent(_)
+    ) {
         return e;
     }
     match &e {
@@ -678,9 +681,9 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<crystalline_identity::auth_store::VisibilityWrite> {
         let set_by = match scope {
-            crate::scope::Scope::User { account, .. } | crate::scope::Scope::Agent { account } => {
-                account.as_str()
-            }
+            crate::scope::Scope::User { account, .. }
+            | crate::scope::Scope::OpenTierIdentity { account } => account.as_str(),
+            crate::scope::Scope::Agent { name, .. } => name.as_str(),
             crate::scope::Scope::Unrestricted | crate::scope::Scope::Anonymous => {
                 crate::scope::OWNER_IDENTITY_NAME
             }
@@ -1630,7 +1633,8 @@ impl Engine {
         let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
-            crate::scope::Scope::Anonymous | crate::scope::Scope::Agent { .. } => {
+            crate::scope::Scope::Agent { name, .. } => ShareActor::Agent(name.clone()),
+            crate::scope::Scope::Anonymous | crate::scope::Scope::OpenTierIdentity { .. } => {
                 ShareActor::HttpAgent
             }
         };
@@ -2108,6 +2112,7 @@ impl Engine {
             if clean_before.is_none() {
                 clean_before = Some(self.rename_questions_already_clean().await);
             }
+            let _pass = crate::timing::Pass::of("origin poll", &name);
             match self.origin_update_one(&name, &entry).await {
                 Ok(v) => {
                     let up_to_date = v["up_to_date"].as_bool().unwrap_or(false);
@@ -5995,10 +6000,43 @@ impl Engine {
                 .map_err(|e| refusal_for(actor, e))?,
         };
         let login = token.user_display().map(str::to_string);
-        Ok((
-            Arc::new(GitHubProvider::new(api_url, Some(token.access_token))),
-            login,
-        ))
+        let mut provider = GitHubProvider::new(api_url.clone(), Some(token.access_token.clone()));
+        if let ShareActor::Agent(name) = actor {
+            provider = self
+                .agent_commit_on_token(provider, name, api_url.as_deref(), &token.access_token)
+                .await;
+        }
+        Ok((Arc::new(provider), login))
+    }
+
+    /// A provider whose commits name the agent of the loops `name` as their
+    /// author, for a share on the instance credential (no App): the author
+    /// is [`Engine::agent_author_name`] at the `noreply` address of the
+    /// credential's own GitHub account (`<id>+<login>@users.noreply.<host>`,
+    /// read with `GET /user`), and that account is the committer. Attribution
+    /// never fails a share: when the account cannot be read, a warning is
+    /// logged and GitHub records the credential's account as it always does.
+    async fn agent_commit_on_token(
+        &self,
+        provider: GitHubProvider,
+        name: &str,
+        api_url: Option<&str>,
+        token: &str,
+    ) -> GitHubProvider {
+        let committer = match crystalline_remote::token_user_identity(api_url, token).await {
+            Ok(identity) => identity,
+            Err(e) => {
+                tracing::warn!(
+                    "the instance credential's GitHub account could not be read, so it authors the share of agent {name}: {e}"
+                );
+                return provider;
+            }
+        };
+        let author = crystalline_remote::CommitIdentity {
+            name: self.agent_author_name(name).await,
+            email: committer.email.clone(),
+        };
+        provider.with_commit_identities(crystalline_remote::CommitIdentities { author, committer })
     }
 
     /// The login a share by `actor` would go out on, the one
@@ -6092,14 +6130,18 @@ impl Engine {
     ///
     /// A scheduled run with no account ([`ShareActor::Machine`]) is the machine's
     /// own work: it takes the App when `personal` is only the default. An admin
-    /// who set `personal` by name gets the owner's identity there too.
+    /// who set `personal` by name gets the owner's identity there too. A run
+    /// by an agent of the loops ([`ShareActor::Agent`]) takes the App as the
+    /// machine's run does; where `personal` is set by name it is refused
+    /// ([`Engine::acting_identity_name`]) instead of borrowing the owner's.
     fn instance_share_app(
         &self,
         effective: EffectiveShareIdentity,
         actor: &ShareActor,
     ) -> Result<Option<Arc<github_app::AppRouter>>> {
         let on_the_app = effective.mode == ShareIdentityMode::Instance
-            || (*actor == ShareActor::Machine && effective.is_default());
+            || (matches!(actor, ShareActor::Machine | ShareActor::Agent(_))
+                && effective.is_default());
         match self.github_app_slot() {
             github_app::AppSlot::Refused(detail)
                 if effective.mode == ShareIdentityMode::Instance || effective.is_default() =>
@@ -6192,6 +6234,13 @@ impl Engine {
             ShareActor::HttpAgent => agent_identity.ok_or_else(|| {
                 EngineError::Remote(RemoteError::Refused(AGENT_IDENTITY_UNSET.to_string()))
             })?,
+            // An agent of the loops has no personal identity and borrows
+            // nobody's: its share is refused and its changes stay here.
+            ShareActor::Agent(_) => {
+                return Err(EngineError::Remote(RemoteError::Refused(
+                    AGENT_SHARES_NO_PERSONAL.to_string(),
+                )));
+            }
         };
         // Normalization belongs to the layer that mints these names - the auth
         // store (`crate::rest::auth_store`) trims and lowercases an account name

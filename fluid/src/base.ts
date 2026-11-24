@@ -63,6 +63,15 @@ export function absoluteUrl(path: string): string {
 }
 
 /**
+ * A link the server built for somebody to copy. Whole when the server knows
+ * its public address; otherwise a path that already carries the base path,
+ * completed here with the origin this browser opened the app at.
+ */
+export function completeServerLink(link: string, relative: boolean): string {
+  return relative ? `${window.location.origin}${link}` : link;
+}
+
+/**
  * Navigate the whole page to `location`, never a fetch.
  *
  * A handful of answers on this API are places to go rather than data to

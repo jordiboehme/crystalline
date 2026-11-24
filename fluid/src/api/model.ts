@@ -33,6 +33,21 @@ export type { UsersResponse } from "./gen";
 /** The `{"user": ...}` envelope every user mutation answers with. */
 export type { UserResponse } from "./gen";
 
+/** How `GET /users` sorts, filters and pages, and what `POST /users/bulk` takes and answers. */
+export type {
+  BulkAction,
+  BulkBody,
+  BulkResult,
+  DraftCount,
+  KindFilter,
+  SignInKind,
+  SortColumn,
+  SortDir,
+  StateFilter,
+  UserDetailResponse,
+  WritesResponse,
+} from "./gen";
+
 /** What `POST /users` takes. */
 export type { CreateBody as CreateUserBody } from "./gen";
 
@@ -226,3 +241,36 @@ export type {
   LoopRun,
   LoopState,
 } from "./gen";
+
+/** An agent of the loops with its tokens, what `GET /agents` lists and whether `auth.mcp` is on. */
+export type {
+  Agent,
+  AgentLoops,
+  AgentToken,
+  AgentTokenState,
+  AgentsResponse,
+  CreateAgentBody,
+  CreatedAgentResponse,
+  IssueAgentTokenBody,
+  IssuedAgentTokenResponse,
+} from "./gen";
+
+/** An invite link, what `GET /invites` lists and the way in it offers, and what making one takes and answers. */
+export type {
+  CreateInviteBody,
+  CreatedInviteResponse,
+  Invite,
+  InviteSignIn,
+  InviteState,
+  InvitesResponse,
+} from "./gen";
+
+/** What opening an invite link shows, and what taking it sends and answers. */
+export type {
+  ConfirmResponse as InviteOffer,
+  RedeemBody,
+  RedeemResponse,
+} from "./gen";
+
+/** One account the people picker found, and the search answer around it. */
+export type { AccountHit, AccountSearchResponse } from "./gen";

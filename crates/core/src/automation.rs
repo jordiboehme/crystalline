@@ -134,7 +134,10 @@ impl RunOutcome {
 /// What a runner reports when a run ends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunReport {
-    /// When the run started, RFC 3339. Empty means when the lease was taken.
+    /// When the run started by the runner's clock, RFC 3339, or empty. A
+    /// value is checked to read as a time and is not kept: the server
+    /// records the run as started when its lease was taken, on its own
+    /// clock, which is what decides whether a run missed a page.
     pub started_at: String,
     /// How it ended.
     pub outcome: RunOutcome,
@@ -713,6 +716,135 @@ mod tests {
                 .any(|line| line.contains("read the pact's `## Pages`")
                     && line.contains("new engrams")),
             "reflect prompt does not read ## Pages to place new engrams"
+        );
+    }
+
+    /// A section built from tentative engrams says so in its text, in the
+    /// update step where sections are written with their sources.
+    #[test]
+    fn the_reflect_prompt_names_a_section_from_tentative_engrams() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let updates = prompt
+            .lines()
+            .find(|line| line.starts_with("3. Updates:"))
+            .expect("the update step");
+        assert!(
+            updates.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) says so in its text, for example \"proposed:\" or \"not decided yet\"."),
+            "{updates}"
+        );
+    }
+
+    /// A page whose freshness ran out is reconciled with its pacts (design
+    /// 3.5): the chain run, the readable domains searched, only what new
+    /// information requires changed, every source named, owned pages created
+    /// with `owner`, retired and never deleted, and `reconciled` recorded
+    /// with the item's version, owned pages first and the owner last, each
+    /// page one item toward the cap.
+    #[test]
+    fn the_reflect_prompt_reconciles_a_stale_page() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let reconcile = prompt
+            .lines()
+            .find(|line| line.contains("`stale`") && line.contains("freshness ran out"))
+            .expect("a reconcile step for stale items");
+        for needle in [
+            "pacts",
+            "search the domains",
+            "change only what new information requires",
+            "name every source",
+            "`owner`",
+            "retire",
+            "never delete",
+            "`reconciled`",
+            "`version`",
+            "`changed_engrams`",
+            "`unchanged`",
+            "null",
+            "owned pages first and the owner last",
+            "`owned_reconciled`",
+        ] {
+            assert!(
+                reconcile.contains(needle),
+                "the reconcile step lacks {needle}: {reconcile}"
+            );
+        }
+        let other = prompt
+            .lines()
+            .find(|line| line.contains("`page_pact_changed`"))
+            .expect("a step for the other page items");
+        assert!(
+            other.contains("`pact_hash_changed`") && other.contains("record `reconciled`"),
+            "a page_pact_changed with no changed pact text is settled with reconciled: {other}"
+        );
+        let cap = prompt
+            .lines()
+            .find(|line| line.starts_with("- Stop after"))
+            .expect("the cap rule");
+        assert!(
+            cap.contains("the owner and each owned page count as one item each"),
+            "{cap}"
+        );
+    }
+
+    #[test]
+    fn the_reflect_prompt_leaves_pact_text_and_page_settings_to_a_curator() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let rule = prompt
+            .lines()
+            .find(|line| line.starts_with("- ") && line.contains("pact text"))
+            .expect("a rule on pact text");
+        for needle in [
+            "`PACT.md`",
+            "page pact",
+            "`freshness`",
+            "`follows`",
+            "move a page",
+            "curator",
+            "thread",
+            "an item on `PACT.md` or a page pact",
+            "left for a person",
+        ] {
+            assert!(rule.contains(needle), "the rule lacks {needle}: {rule}");
+        }
+        let feedback = prompt
+            .lines()
+            .find(|line| line.starts_with("2. Feedback"))
+            .expect("the feedback step");
+        assert!(
+            feedback.contains("pact file") && feedback.contains("never write pact text"),
+            "{feedback}"
+        );
+        let updates = prompt
+            .lines()
+            .find(|line| line.starts_with("3. Updates"))
+            .expect("the update step");
+        assert!(updates.contains("own page pact"), "{updates}");
+        let threads = prompt
+            .lines()
+            .find(|line| line.starts_with("6. Threads"))
+            .expect("the thread step");
+        assert!(
+            threads.contains("pact") && threads.contains("curator"),
+            "{threads}"
+        );
+        // Nothing asks a run to add to a pact.
+        assert!(!prompt.contains("add a bullet"), "{prompt}");
+    }
+
+    #[test]
+    fn a_reflect_run_refused_an_engram_write_answers_the_feedback_another_way() {
+        let prompt = headless_prompt(Loop::Reflect, "work", 7, false);
+        let line = prompt
+            .lines()
+            .find(|line| line.starts_with("2. Feedback"))
+            .expect("the feedback step");
+        // The first way stays for a run that may write the engrams.
+        assert!(line.contains("Take it into the engrams"), "{line}");
+        assert!(
+            line.contains("When an engram write is refused in this run")
+                && line.contains("answer the feedback in a thread or settle it as kept")
+                && line.contains("say so in your summary"),
+            "{line}"
         );
     }
 

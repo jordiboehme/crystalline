@@ -101,6 +101,7 @@ impl PathClass {
             PathClass::Reflection(file) => match file {
                 ReflectionFile::Page(_)
                 | ReflectionFile::Pact
+                | ReflectionFile::PagePact { .. }
                 | ReflectionFile::Threads { .. }
                 | ReflectionFile::Baseline { .. }
                 | ReflectionFile::Asset(_) => true,
@@ -294,6 +295,13 @@ pub fn is_pending_engram(root: &Path, rel: &str, row: EngramRow) -> bool {
         // A threads file is the page's when its page is a marked page; one
         // beside an unmarked or unreadable file stays an engram.
         ReflectionFile::Threads { of } => !page_marked(&folder, &of),
+        // A page pact is the page's as its threads are, and it is marked by
+        // its own id lines or baseline twin too.
+        ReflectionFile::PagePact { of } => {
+            !carries_page_marker(&text)
+                && !has_baseline_twin(&folder, inner)
+                && !page_marked(&folder, &of)
+        }
         _ => !carries_page_marker(&text) && !has_baseline_twin(&folder, inner),
     }
 }
@@ -654,6 +662,47 @@ mod tests {
                 "{rel}"
             );
         }
+    }
+
+    /// A page pact is the page's as a threads file is: marked by its own
+    /// id lines or baseline twin, or by its page being a marked page. A
+    /// hand-written pact beside a marked page needs no id line of its own;
+    /// one beside an unmarked engram stays an engram.
+    #[test]
+    fn a_page_pact_is_marked_by_itself_or_by_a_marked_page() {
+        let dir = domain_with(&[
+            (
+                "reflections/page.md",
+                "# Page\n\n## Part\n<!-- r:aaaa1111 -->\n\nText.\n",
+            ),
+            ("reflections/page.pact.md", "# Pact\n\nBe short.\n"),
+            ("reflections/note.md", "# Note\n"),
+            ("reflections/note.pact.md", "# Pact\n"),
+            (
+                "reflections/own.pact.md",
+                "# Pact\n\n## Tone\n<!-- r:bbbb2222 -->\n\nShort.\n",
+            ),
+        ]);
+        for (rel, pending) in [
+            ("reflections/page.pact.md", false),
+            ("reflections/note.pact.md", true),
+            ("reflections/own.pact.md", false),
+        ] {
+            assert_eq!(
+                is_pending_engram(dir.path(), rel, EngramRow::Unknown),
+                pending,
+                "{rel}"
+            );
+        }
+        let on = DomainLayout::bare(ReflectionMode::Effective);
+        let class = on.classify("reflections/page.pact.md");
+        assert_eq!(
+            class,
+            PathClass::Reflection(ReflectionFile::PagePact {
+                of: "page.md".into()
+            })
+        );
+        assert!(class.backs_up(), "a page pact travels with its page");
     }
 
     /// Only an id line right under a `##` heading outside a fence marks a

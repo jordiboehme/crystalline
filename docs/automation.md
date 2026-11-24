@@ -12,7 +12,7 @@ Every runner asks first. When nothing is due, it ends at once and starts no agen
 
 | Command | What it does |
 |---|---|
-| `crystalline <loop> status [--domain D]...` | Shows per domain what is due, as counts, plus a run that is going, the last run and the webhook state. `--json` prints the answer as it came. |
+| `crystalline <loop> status [--domain D]... [--no-counts]` | Shows per domain what is due, as counts, plus a run that is going, the last run and the webhook state. `--no-counts` works out nothing that is due (see [A frequent poll](#a-frequent-poll)). For reflect it also prints when the next page falls due, for example `next page due: 2026-11-25T06:00:00Z (in 22h)`. `--json` prints the answer as it came. |
 | `crystalline <loop> run [--domain D]` | Works what is due with a headless Claude Code agent: takes the lease, runs the agent with the prompt the server answers (`automation_prompt`), shares its changes as a pull request, records the run and releases the lease. Without `--domain` it works every due domain in turn. |
 | `crystalline <loop> watch [--domain D]... [--interval S]` | Checks the status every `--interval` seconds (default 60) and runs when something is due. Runs until it gets SIGTERM or Ctrl-C. |
 | `crystalline <loop> prompt --domain D [--max-items N] [--skills-loaded [true\|false]] [--config FILE]` | Prints the shipped prompt, for a runner that starts its own agent, with the skills line this machine's `skills.serve` gives. `--json` prints what the `automation_prompt` verb answers (see [The prompt for your own agent](#the-prompt-for-your-own-agent)). |
@@ -21,7 +21,7 @@ Every runner asks first. When nothing is due, it ends at once and starts no agen
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-items N` | 20 | The most items the agent works in one run. |
+| `--max-items N` | 20 | The most items the agent works in one run. A `stale` item counts per page: the owner and each page it owns count as one item each. |
 | `--max-turns N` | 60 | The most agent turns in one run. |
 | `--model M` | Claude Code's default | The model the agent uses. |
 | `--log-dir P` | `runs/` in the state directory | Where the agent's stream is written, one file per run, readable by you only. The newest 50 per loop and domain are kept. |
@@ -34,16 +34,24 @@ Exit codes, so a shell `if` reads naturally:
 
 | Command | 0 | 1 | 2 |
 |---|---|---|---|
-| `status` | something is due | nothing is due | an error |
+| `status` | something is due, or `--no-counts` | nothing is due | an error |
 | `run` | the run is done or stopped at its item cap | nothing is due, or a run already holds the lease | the run failed, or an error |
 
 A scheduler reads every code that is not 0 as a failed job. The Kubernetes and GitHub examples use a small wrapper, [`examples/kubernetes/crystalline-loop.sh`](../examples/kubernetes/crystalline-loop.sh), that turns 1 into 0 and passes SIGTERM on to the run.
+
+### A frequent poll
+
+To work out what is due, the status sweeps each domain: the reflect queue reads every page and its threads, the evolve sweep reads every engram. That is fine once a minute, but too much for a dashboard that polls every second. Send `"counts": false` with `automation_status` (`crystalline <loop> status --no-counts`): the answer still says per domain whether a run is going (`running`), the last run, where the loop runs (`runs_on`), the backoff (`reason`) and the webhook state, but `due`, `counts` and `left_for_person` are `null`. Without `counts`, or with `true`, the answer is the full one. A reflect answer also names when the next page falls due, with counts and without: `next_stale_at` (RFC 3339) and `next_stale_in_secs`. For a page that is due already they name when its next period starts. Both are null for evolve, for a domain whose loop runs on another instance and when no page has a freshness. A runner that polls rarely can sleep until then. `GET /api/v1/domains/{domain}/automation` carries the same two keys.
+
+The reflect `counts` are `waiting_for_the_agent` (threads), `feedback`, `updates`, `pages_to_update` and `stale`. `stale` counts the due pages that have a freshness of their own, one per page: an owner's item covers its owned pages, which are not counted on their own (see [Pages that keep themselves current](reflection.md#pages-that-keep-themselves-current)); `updates` and `pages_to_update` leave them out. Once a page is due, its own source changes are counted under `stale` too, so they move from `updates` to `stale` when the page falls due. A `stale` page is due work: `run`, `watch` and the webhook start a run for it.
+
+The status reads through the store's read connections, so a poll does not wait for a write in progress. It uses the writer only in rare cases: once after a start to load the virtual domains, for a domain the index does not hold yet, and on a shared database to claim a domain whose host lock no live instance holds. A lease taken or a run recorded is seen by the next status.
 
 ### Local or remote
 
 Without anything set, the commands talk to the daemon on this machine, and the agent reaches Crystalline through the stdio entry `crystalline mcp`. With no daemon running they fail with "Start the daemon (crystalline serve)".
 
-With `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` set (or `CRYSTALLINE_REMOTE_TOKEN_FILE`), they talk to that server instead, through its ctl route (`POST /api/v1/ctl`) as the token's account. The agent then reaches the server's MCP endpoint, which is the root of that URL, with the token as a bearer header. A runner job needs nothing but the binary, Claude Code and those two variables.
+With `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` set (or `CRYSTALLINE_REMOTE_TOKEN_FILE`), they talk to that server instead, through its ctl route (`POST /api/v1/ctl`), as the token's agent of the loops or account (see [Who may run a loop](#who-may-run-a-loop)). The agent then reaches the server's MCP endpoint, which is the root of that URL, with the token as a bearer header. A runner job needs nothing but the binary, Claude Code, those two variables and the Anthropic credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`). Remote mode never uses `crystalline connect`: the runner calls only the automation verbs, so an agent token works here, while `connect` does not take one.
 
 The server checks the `Host` header of every request. When a runner reaches the server by a name people do not use (a cluster service name, a container name), add that name to the server's `CRYSTALLINE_SERVICE_ALLOWED_HOSTS`.
 
@@ -59,24 +67,76 @@ claude --mcp-config <config> --strict-mcp-config --setting-sources "" --tools ""
 
 When the server does not serve the `skills` tool (`skills.serve: false`), its prompt says the skills are already loaded, and `run` makes that true: it writes the text of the skills the prompt names, as this binary ships them, into a file in the same private folder and adds `--append-system-prompt-file <file>` before `-p`, so Claude Code appends them to the agent's system prompt. The file goes away with the config.
 
-So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. The local MCP config starts `crystalline mcp --unattended --domain <domain>`, one agent per domain. Against a server the config carries the bearer and the header `X-Crystalline-Run-Domain: <domain>`, which the server believes only while that account holds the run's lease there. Both mark the session as one nobody is behind and bind it to the domain the run works on: it is never asked to share Reflection text from a domain fewer people may read, and it reads only the domains every reader of that domain may read (see [What an unattended run may read](reflection.md#what-an-unattended-run-may-read)). You set none of this: `run` writes it into the config. Custom automation that starts its own agent marks it the same way. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config, the prompt and, when the skills are handed over, the skills file. These flags were checked against Claude Code 2.1.327.
+So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. The local MCP config starts `crystalline mcp --unattended --domain <domain> --loop <loop>`, one agent per domain. Against a server the config carries the bearer and the headers `X-Crystalline-Run-Domain: <domain>` and `X-Crystalline-Run-Loop: <loop>`, which the server believes only while that agent or account holds the run's lease there. Both mark the session as one nobody is behind and bind it to the domain the run works on: it is never asked to share Reflection text from a domain fewer people may read, and it reads only the domains every reader of that domain may read (see [What an unattended run may read](reflection.md#what-an-unattended-run-may-read)). You set none of this: `run` writes it into the config. Custom automation that starts its own agent marks it the same way. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config, the prompt and, when the skills are handed over, the skills file. These flags were checked against Claude Code 2.1.327.
 
 The agent gets no Crystalline credentials in its environment: every variable that starts with `CRYSTALLINE_` and holds `TOKEN`, `SECRET` or `PASSWORD` is removed. The remote bearer is in the MCP config only, and the config with its folder is removed when the run ends, also after an error or a stop. Your Anthropic credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`) is passed on as it is.
+
+A `stale` owner and its owned pages are recorded one by one, the owned pages first and the owner last. A run that stops at its cap part way through them leaves the owner due, and the next run skips the owned pages in `owned_reconciled`, which are done for this period.
 
 `run` renews the lease every 60 seconds while the agent works, reads the summary block at the end of the agent's last message, shares, records the run and releases the lease. The outcome is `done` when the agent ended with a summary below its cap, `stopped_at_cap` when it reached the cap and `failed` otherwise (no summary, an agent exit code that is not 0, a stop or a lost lease).
 
 ## Who may run a loop
 
-A run acts as an account. For a runner job or n8n that is an agent account with a `cmt_` token (see [An account per agent](deployment.md#an-account-per-agent)). With a GitHub App, access to a team domain follows GitHub, so the agent account needs a GitHub link too. An admin runs `crystalline connect github --personal --as <agent-account>` on the server and signs in to GitHub, in the device flow, as a bot user with write on the repository. The device flow must be switched on in the App's settings on GitHub. Write gives editor and lets the account curate the Reflection, which is enough for reflect and evolve.
+A run acts as someone. A local run against your own daemon is the machine owner. A remote run, such as a runner job or n8n, is whoever owns its token: an agent of the loops with a `cag_` token, or an account with a `cmt_` token. Use an agent of the loops for every new runner.
+
+### An agent of the loops
+
+An agent of the loops is an identity made for scheduled runs. It is not an account: it never signs in, it does not show in the list of people, and it needs no GitHub link. An instance admin makes it on the server:
+
+```bash
+crystalline agents add nightly --display "Nightly Curator" --loops reflect
+```
+
+The command prints the agent's first token once: `cag_` and 64 hex characters. Only its hash is stored, so a lost token is revoked and replaced. Run the command where the server keeps its accounts: on the server's machine as the server's user, or inside the server's container, for example `docker compose exec crystalline crystalline agents add nightly --loops reflect` or `kubectl exec <pod> -- crystalline agents add nightly --loops reflect`. On PostgreSQL run it inside the active instance, like the other commands (see [Run on PostgreSQL](deployment.md#run-on-postgresql)).
+
+| Command | What it does |
+|---|---|
+| `crystalline agents add <name> [--display TEXT] [--loops L] [--expires DAYS] [--label TEXT]` | Makes the agent and prints its first token. `--loops` is `reflect`, `evolve` or `reflect,evolve` (the default). `--expires` is the token's life in days, 1 to 365 (default `90d`). `--label` names the token (default: the day it was issued). |
+| `crystalline agents list` | Shows each agent with its loops and its tokens: the id, the label, until when it is live (or when it expired or was revoked) and when it was last used. Never a token. |
+| `crystalline agents token <name> [--expires DAYS] [--label TEXT]` | Issues another token and prints it once. An agent holds at most two live tokens. |
+| `crystalline agents revoke <name> <id>` | Stops one token at once. |
+| `crystalline agents remove <name>` | Removes the agent and every token it holds. Its drafts on domains that review changes, and the draft links it gave, end too. |
+
+`--json` prints the answer as one object, the token included where one is issued. An admin can do the same over the JSON API under `/api/v1/agents`. Names of agents and accounts share one list: a name an account holds cannot be an agent's, and the other way round. No new account or agent may have a name that starts with `agent:`.
+
+To change a token before it expires, issue a second one with `crystalline agents token`, put it in the runner's secret, then revoke the old one with `crystalline agents revoke`. An expired or revoked token gets the same `401` as any wrong token. Two weeks before a token ends, Crystalline warns: `crystalline doctor` names each live agent token that ends within 14 days and each agent with no live token (whether `auth.mcp` is on or off), `automation_status` tells an agent `token_id`, `token_expires_at` and `token_expires_in_secs` of the token it called with (on the server's clock; an account gets none of it), and `crystalline <loop> status` and `crystalline <loop> run` with an agent token print a warning line on stderr.
+
+What an agent of the loops may do:
+
+- It needs `auth.mcp` on. While it is off, `crystalline agents add` and `POST /api/v1/agents` are refused, every request with a `cag_` token gets `403` with a sentence that says so, and `crystalline doctor` warns about the agents the instance holds.
+- It reaches every domain of the instance for its loops, private domains and domains added later included. Evolve writes the knowledge and reads the Reflection. Reflect curates the Reflection and reads the knowledge. A domain that is closed because its GitHub App is gone stays closed. A locked or archived domain is left out of the status and refused by name, as for the machine's own run. An agent is never an admin and never a member of a domain, and it never counts as a reader of a domain.
+- It works only during a run. Outside a live lease of its loop, its MCP session reaches the handshake (`initialize`, `server/discover`), the lists (`tools/list`, `resources/list` with the skills only, and the resource template and prompt lists, which name no engram and no domain) and the `skills` tool with the skill resources. Every other call is refused with a sentence. Status, prompt and lease take are ctl verbs, not MCP calls.
+- On the ctl route it reaches only the eight automation verbs: `automation_status`, `automation_prompt`, `automation_lease_take`, `automation_lease_renew`, `automation_lease_release`, `automation_run_record`, `automation_share` and `automation_runs`. `tool`, `file` and every other command are refused. The JSON API takes no agent token: a request with one is answered like a request without a sign-in.
+- Inside a run the server refuses, when the tool is called, the tools of the prompt's `disallowed_tools`, the `write_reflection` action `delete_asset` and every call with `overwrite: true`. Like every unattended session, it may not delete a Reflection page or a page pact, write pact text, move a page that has its own page pact or change a page's `freshness` or `follows` (see [What a headless run leaves for a person](#what-a-headless-run-leaves-for-a-person)).
+- A loop's work needs a live lease of that loop on that domain, and the call must name the domain. Evolve work is `write_engram`, `edit_engram`, `move_engram`, `split_engram`, `delete_engram` and `evolve_engrams`. Reflect work is `write_reflection`, `discuss` (every action, `list` included) and `reflect`. A read goes ahead within what the run may read. So an evolve run cannot call `discuss`, and a reflect run bound to its loop never writes a knowledge engram: every `crystalline reflect run` sends the loop header, and an agent with only the reflect loop is bound without it. A session bound to one loop is refused the other loop's work, whatever leases the agent holds. Only an agent with both loops that sends no loop header can write an engram during a reflect run, and only on a domain where it also holds the evolve lease; that write is noted in the evolve lease. When an engram write is refused, the reflect prompt says what to do: answer the feedback in a thread or settle it as kept, and name it in the summary.
+- A lease take by an agent is refused when nothing is due for its loop on that domain. `force` (`crystalline <loop> run --force`) lifts only the wait after failed runs, never this rule. An agent may try at most 30 lease takes in 10 minutes, refused tries included. The instance that answers keeps this count in memory, so it starts over after a restart or a takeover.
+- Every MCP tool call and every ctl command of an agent is logged at INFO with the agent's name, the tool or command, the domain and whether it was refused.
+- An agent token does not work with `crystalline connect`: `connect` asks the server's `status`, which an agent token is refused. A runner sets `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` instead (see [Local or remote](#local-or-remote)).
+
+The display name (`--display`, the name by default) is what people see. Records use the unique name: see [Sharing as a pull request](#sharing-as-a-pull-request).
+
+### An account as runner
+
+A runner that uses an account with a `cmt_` token keeps working as before. Nothing turns such an account into an agent. The account needs the right for each loop:
 
 - The reflect loop needs the right to curate the domain's Reflection.
 - The evolve loop needs the right to write the domain.
 
-`status` without `--domain` shows only the domains the account may run the loop on.
+With a GitHub App, access to a team domain follows GitHub, so such an account needs a GitHub link too. An admin runs `crystalline connect github --personal --as <account>` on the server and signs in to GitHub, in the device flow, as a bot user with write on the repository. The device flow must be switched on in the App's settings on GitHub. Write gives editor and lets the account curate the Reflection, which is enough for reflect and evolve.
+
+To move such a runner to an agent of the loops:
+
+1. On the server, make the agent with the loops the runner works: `crystalline agents add nightly --loops reflect`. Make sure `auth.mcp` is on.
+2. Put the printed `cag_` token where the runner had the `cmt_` token: `CRYSTALLINE_REMOTE_TOKEN` (its Secret in Kubernetes, the repository secret in GitHub Actions) or the Bearer Auth credential in n8n. Nothing else in the runner changes.
+3. After the next run worked, revoke the account's token with `crystalline users mcp-token <account> --revoke <id>`, or remove the account with `crystalline users remove <account>` when nothing else uses it.
+
+### What a runner sees
+
+`status` without `--domain` shows only the domains the token may run the loop on.
 
 Reflect runs on one instance per domain, the domain's Reflection home (see [One home, one backup](reflection.md#one-home-one-backup)). Evolve on a team domain runs on the domain's evolve home: the instance whose `service.public_url` is the MANIFEST's `evolve_home`. The first scheduled evolve run at an instance with a `service.public_url` claims it, and its pull request carries the line (see [One evolve runner per team domain](teams.md#one-evolve-runner-per-team-domain)). Every other clone shows `runs on <home>` and is never due, and `run` refuses there. Until an instance claims the home, every clone may run evolve; the run says so, and `crystalline doctor` warns. On PostgreSQL only the active instance runs evolve (see [Run on PostgreSQL](deployment.md#run-on-postgresql)). A standby runs nothing until it takes over. After a takeover the new owner is asked for the home as before; if the home names another address than the owner has, nobody runs, so give the owner the home's `service.public_url` or move the home. A local domain has no evolve home: without a PostgreSQL database every instance with its own copy of it may run evolve.
 
-Give the reflect runner and the evolve runner separate accounts when both work one domain at the same time. Crystalline cannot tell which run made an MCP write, so it notes the write in every lease the account holds on that domain, and each pull request would carry the other run's writes.
+A run names its loop to the server (`--loop` locally, the header `X-Crystalline-Run-Loop` with `reflect` or `evolve` over HTTP, beside `X-Crystalline-Run-Domain`). `crystalline <loop> run` sends both. The loop binds the session: a write is noted only in that loop's lease, so a reflect run and an evolve run of one agent or one account on one domain never carry each other's writes. An agent that runs one loop is bound to it without the header. An agent with both loops and no header is noted by the path it writes: a file under `reflections/` in the reflect lease, everything else in the evolve lease. For an agent, a header that names no loop, or a loop the agent does not run, refuses every tool call of the session, every resource read but a skill, and every prompt; the handshake and the lists still answer. For an account the header only narrows: a valid one binds, any other value is ignored. Custom automation for an account that names no loop has its writes noted in every lease the account holds on that domain, so give its reflect runner and its evolve runner separate tokens, or each pull request would carry the other run's writes.
 
 ## Headless means nobody to ask
 
@@ -86,10 +146,12 @@ The shipped prompts (`crystalline <loop> prompt` prints them) tell the agent tha
 - Never wait for a yes and never ask a question in the session. The reflect agent asks people in a Reflection thread with `discuss`. The evolve agent names its questions in the summary.
 - Stop at the item cap. What it did not reach stays due for the next run.
 - End with a fixed summary block: `Done: <n>`, `Left for a person: <n>`, `Errors: <n>` and a few lines that name each item it left and why.
-- Reflect works the queue. Evolve asks `evolve_engrams` for `mechanical` findings only and never touches a `judgment` finding.
+- Reflect works the queue. A page whose freshness ran out comes as a `stale` item: the agent brings it in line with its pacts and records `write_reflection` action `reconciled`, the owned pages first and the owner last (see [Pages that keep themselves current](reflection.md#pages-that-keep-themselves-current)). Evolve asks `evolve_engrams` for `mechanical` findings only and never touches a `judgment` finding.
 - A tool answer that says the domain was renamed in its MANIFEST is left for a person and named in the summary.
 
-The agent may not call these tools, and `run` passes the same list to `--disallowedTools`: `delete_engram`, `move_engram`, `remove_domain`, `add_domain`, `configure`, `provision`, `share_changes`, `update_domain`, `resolve_conflict`, `withdraw_proposal` and `discard_changes`. Two more rules are parameters, not tools, so they are rules of the prompt only: no `write_reflection` action `delete_asset` and no `write_engram` with `overwrite: true`.
+The agent may not call these tools, and `run` passes the same list to `--disallowedTools`: `delete_engram`, `move_engram`, `remove_domain`, `add_domain`, `configure`, `provision`, `share_changes`, `update_domain`, `resolve_conflict`, `withdraw_proposal` and `discard_changes`. Two more rules are parameters, not tools: no `write_reflection` action `delete_asset` and no `write_engram` with `overwrite: true`. For an account they are rules of the prompt only. For an agent of the loops the server refuses them too, when the tool is called (see [An agent of the loops](#an-agent-of-the-loops)).
+
+A few Reflection rules the server refuses to every unattended session, whoever it runs as: every agent of the loops, and every session marked as a run, by `crystalline mcp --unattended` or by a run header (`X-Crystalline-Run-Domain` or `X-Crystalline-Run-Loop`). So they hold for every `crystalline <loop> run`, locally through `--unattended` and remotely through the headers. Such a session never deletes a Reflection page or a page pact (it retires a page instead), never writes pact text (`PACT.md` or any page pact), never moves a page that has its own page pact and never changes a page's `freshness` or `follows`. The prompt says the same. A runner that uses an account and sends no run header, such as an n8n workflow with a `cmt_` token, gets these rules from the prompt only: give it an agent of the loops, or send the header. See [What an unattended run may not change](reflection.md#what-an-unattended-run-may-not-change).
 
 ### The prompt for your own agent
 
@@ -112,8 +174,8 @@ It answers the prompt as a run of this server starts its agent with, filled in f
 
 - `max_items` is a whole number from 0 to 4294967295. Without it the cap is 20, as for `run`.
 - `disallowed_tools` are the bare MCP tool names, in order. Give exactly these to the agent's harness as the tools it may not call (for Claude Code `--disallowedTools`, with the `mcp__<server>__` prefix).
-- `checksum` is `sha256:` and the lowercase hex SHA-256 of the prompt's UTF-8 bytes, one NUL byte, then the tool names joined by a line feed, with nothing after the last one. In JavaScript: `prompt + "\0" + disallowed_tools.join("\n")`. A change to the prompt or to the tools changes it, and `version` is not part of it. A runner that adds its own rules on top can keep the last checksum and stop for a person when it changes.
-- The rights are those of `automation_status` for that loop and domain: a token that may not run the loop there is refused, and a domain it may not see is answered as an unknown one.
+- `checksum` is `sha256:` and the lowercase hex SHA-256 of the prompt's UTF-8 bytes, one NUL byte, then the tool names joined by a line feed, with nothing after the last one. In JavaScript: `prompt + "\0" + disallowed_tools.join("\n")`. A change to the prompt or to the tools changes it, and `version` is not part of it. A runner that adds its own rules on top can keep the last checksum and stop for a person when it changes. The prompt is filled in for the domain and the cap, so the checksum differs per domain and cap. 0.35.0 changed the reflect prompt (the reconcile of `stale` pages and the rules for pact text and page settings), so every reflect checksum changed with it.
+- The rights are those of `automation_status` for that loop and domain: a token that may not run the loop there is refused, and a domain it may not see is answered as an unknown one. An agent token may ask for the prompt outside a run.
 
 The prompt starts by calling the `skills` tool. Where the server does not serve it (`skills.serve: false`, or `CRYSTALLINE_SKILLS_SERVE=false`), that sentence becomes "Your skills are already loaded" with the skills it names, and the runner hands the skills to its agent in another way (`crystalline <loop> run` appends them to the agent's system prompt, see [What `run` starts](#what-run-starts)). `skills_loaded: true` asks for that sentence on any server, and `skills_loaded: false` asks for the call to the `skills` tool. `crystalline <loop> run` takes its prompt and the forbidden tools from the server the same way, so a run against a newer server never misses a tool it forbids. Only a server older than the verb, which does not know it, makes the run fall back to the prompt and the list of its own binary; any other refusal ends the run with its error before it takes the lease. `--dry-run` asks too and shows the server's list.
 
@@ -123,6 +185,7 @@ The prompt starts by calling the `skills` tool. Where the server does not serve 
 
 - Every item that needs a yes: a judgment finding, a delete, a move, a page a person wrote.
 - Every item that needs a person's answer: the agent asks in a Reflection thread and leaves the thread open for that person.
+- A change of pact text, of a page's `freshness` or of its `follows`, and the move of a page that has its own page pact. Feedback or a thread that asks for one is answered in its thread and left to a curator. So is an item on a pact file whose fix would change its text, such as a missing file or an embedded engram attachment.
 - A file only a person can add.
 - A pending rename question.
 
@@ -132,13 +195,17 @@ A `done` run records each item that was due when it started and is still due whe
 
 On a team domain with a GitHub origin, `run` itself (not the agent) shares the run's changes as a pull request, whatever the domain's `sharing` says. So a headless change is always reviewed. The title names the loop, the domain and the date, for example `Evolve run on eng, 2026-10-22`. The description is the run summary. The run record keeps the pull request's address. A second run while the first pull request is still open adds to it.
 
-- Only the runner's own MCP writes are shared: the paths the lease's account wrote through the MCP tools while it held the lease. A write through the JSON API, Fluid, the files or a sync is never part of it, also when it is made under the same account.
+- Only the runner's own MCP writes are shared: the paths the lease's agent or account wrote through the MCP tools while it held the lease, in that loop. A write through the JSON API, Fluid, the files or a sync is never part of it, also when it is made under the same account.
 - Reflection pages are never part of it. The home backs them up to the `crystalline/reflections` branch as always.
 - A file a person had unshared work on when the run started is held back, even when the run changed it too. The answer lists it in `held_back`, and the pull request says how many files were held back, so a person shares them.
 - The changes of a run that was stopped are not shared, by this run or by a later one. They stay local for a person.
 - A domain with no origin, or an instance with GitHub off, shares nothing (`no_origin`). `--no-share` keeps everything local too.
 
-A local `run` against your own daemon acts as the machine owner, not as an account, so it cannot tell its own writes from yours. With a GitHub App and `github.share_identity` unset, its proposal goes through the App, so the App's bot opens it. With `personal` set it needs `crystalline connect github --personal`. It shares the files that are new or changed since the lease was taken instead, still holding back what you had unshared at the start. Do not edit the domain on that machine while such a run works it, or give the runner its own account and run it in remote mode.
+A local `run` against your own daemon acts as the machine owner, not as an account, so it cannot tell its own writes from yours. With a GitHub App and `github.share_identity` unset, its proposal goes through the App, so the App's bot opens it. With `personal` set it needs `crystalline connect github --personal`. It shares the files that are new or changed since the lease was taken instead, still holding back what you had unshared at the start. Do not edit the domain on that machine while such a run works it, or give the runner an agent of the loops and run it in remote mode.
+
+A run by an agent of the loops (a `cag_` token, not an account) shares the way the machine's own run does, so it needs no GitHub link. With a GitHub App, and `github.share_identity` unset or `instance`, the share goes through the App. The commit names the agent as its author, for example `Nightly Curator (agent:nightly)`, at the App bot's own noreply address (`<bot id>+<slug>[bot]@users.noreply.github.com`, or `users.noreply.<host>` on GitHub Enterprise Server), and the bot is the committer. Without an App the share goes out on the instance credential: the commit names the agent as its author at the noreply address of that credential's own GitHub account (`<id>+<login>@users.noreply.github.com`), and that account is the committer. When the account cannot be read, GitHub records it as author and committer as before. Either way the pull request description ends with `Run by Nightly Curator (agent:nightly).` An agent has no GitHub identity of its own, so where an admin set `github.share_identity: personal` by name, its share is refused with a sentence and the changes stay on the server; the lease take says so too, in `share_refused`. On a domain that reviews changes, the agent writes into a draft under its own name, never into the machine owner's, and its pull request carries that draft.
+
+Everywhere a record names an agent it uses `agent:<name>`: the actor in `generated.by` (`<client>-for-agent:<name>`), the lease, and the run record, which the JSON API shows as `agent` with the agent's display name beside it. No account or agent can be made under a name that starts with `agent:`, so these records never read as a person's.
 
 ## The lease and the run record
 
@@ -146,7 +213,7 @@ Each domain has one lease per loop. A reflect lease and an evolve lease never bl
 
 The lease token is a bearer secret. Whoever holds it can renew, share and record for that lease. Keep it out of logs.
 
-A run record keeps when the run started and ended, the runner label, the account, the outcome (`done`, `stopped_at_cap`, `failed`, `nothing_due` or `expired`), the items done, the items left for a person, the judgment findings waiting (evolve), a summary of at most 2 KiB and the pull request. The last 50 runs per domain and loop are kept in the index, so a full reindex that rebuilds the index loses them.
+A run record keeps when the run started and ended, the runner label, the account or the agent, the outcome (`done`, `stopped_at_cap`, `failed`, `nothing_due` or `expired`), the items done, the items left for a person, the judgment findings waiting (evolve), a summary of at most 2 KiB and the pull request. The last 50 runs per domain and loop are kept in the index, so a full reindex that rebuilds the index loses them.
 
 After a failed run the loop backs off on that domain: status says `backing off after N failed runs` and is not due, and the webhook waits too, until 5 minutes after the last failure, doubled for each further failed run in a row and at most 6 hours. A run that did not fail ends the wait; an `expired` run neither counts nor ends it. `crystalline <loop> run --force` starts a run anyway.
 
@@ -178,7 +245,7 @@ PATH=/usr/local/bin:/usr/bin:/bin:/home/you/.local/bin
 30 6 * * * crystalline evolve run --domain eng >> /home/you/crystalline-evolve.log 2>&1
 ```
 
-A local run acts as the machine owner (see [Sharing as a pull request](#sharing-as-a-pull-request)), so use it on a machine only you use. On a team server, use remote mode with an agent account, as [A scheduled run](reflection.md#a-scheduled-run) shows for systemd. That run is the agent account, so with a GitHub App the account needs its own link: add the account, then run `crystalline connect github --personal --as <agent-account>` on the server. Without a link the run stops when it takes the lease and says so, unless you pass `--no-share`.
+A local run acts as the machine owner (see [Sharing as a pull request](#sharing-as-a-pull-request)), so use it on a machine only you use. On a team server, use remote mode with an agent of the loops, as [A scheduled run](reflection.md#a-scheduled-run) shows for systemd. Its run shares as the machine's own run does, so it needs no GitHub link. A runner that still uses an account needs that account's own link with a GitHub App (see [An account as runner](#an-account-as-runner)).
 
 ## At home: n8n
 
@@ -186,11 +253,11 @@ A local run acts as the machine owner (see [Sharing as a pull request](#sharing-
 
 - `reflect-loop.json` and `evolve-loop.json`: a Schedule trigger at a fixed time (reflect every day at 06:00, evolve every Sunday at 03:00), an optional Webhook trigger with the signature check, the status check, the lease, an AI Agent with the MCP Client Tool, the share and the run record.
 - `renew-lease.json`: a small workflow the two loop workflows start, without waiting for it, right after they take the lease. It renews the lease every 60 seconds while the agent works.
-- `capture.json`: send text to a webhook, and an agent writes it as an engram with `write_engram`.
+- `capture.json`: send text to a webhook, and an agent writes it as an engram with `write_engram`. It is no loop run, so it uses the `cmt_` token of an account that may write the domain. An agent token would be refused, since an agent of the loops works only during a run.
 
 Each workflow has a note with its setup steps. In short:
 
-1. Create a Bearer Auth credential with the `cmt_` token of an agent account and pick it on every HTTP Request node and on the MCP Client Tool. The MCP Client Tool's endpoint is the server root URL with a trailing slash, over HTTP Streamable.
+1. On the server, make one agent of the loops per loop workflow, each with that one loop: `crystalline agents add n8n-reflect --loops reflect` and `crystalline agents add n8n-evolve --loops evolve`. Create a Bearer Auth credential with the agent's `cag_` token and pick it on every HTTP Request node and on the MCP Client Tool. The MCP Client Tool's endpoint is the server root URL with a trailing slash, over HTTP Streamable. As shipped it sends no run headers (it uses a Bearer Auth credential), so the agent must run one loop only: then its session is bound to that loop without them.
 2. Create an Anthropic credential and pick a model.
 3. Edit the Settings node: the server address, the domain and the item cap.
 4. There is nothing to paste: the node Fetch the prompt asks the server for the prompt with `automation_prompt` at the start of every run, so after an upgrade the agent gets the new prompt at once. When the server refuses it (a token that may not run the loop, an unknown domain, a server older than 0.34.0), the node Prompt refused stops the workflow with the server's error, and no lease is taken. The node Same forbidden tools? then compares the server's `disallowed_tools` with the list the node Crystalline MCP excludes. When a later release forbids one more tool, the node Forbidden tools changed stops the workflow before a lease is taken and names the list to set on Crystalline MCP and in Same forbidden tools?.
@@ -207,8 +274,8 @@ An n8n node cannot renew the lease while the AI Agent node works, so the renewin
 [`examples/kubernetes/`](../examples/kubernetes/) has a runner image and three manifests. They run in remote mode against the team server.
 
 - `Dockerfile`: Claude Code 2.1.312 on a Node base image, plus the `crystalline` binary copied from the published image. The published image is distroless, so nothing can be installed on top of it. The runner image is an example, not a published image.
-- `reflect-cronjob.yaml`: `crystalline reflect run --runner k8s` every 5 minutes, with `concurrencyPolicy: Forbid` and a grace period of 30 seconds. `CRYSTALLINE_REMOTE_TOKEN` and the Anthropic credential come from a Secret by reference. Nothing due means the pod ends within seconds.
-- `evolve-cronjob.yaml`: the same shape, weekly, with its own account.
+- `reflect-cronjob.yaml`: `crystalline reflect run --runner k8s` every 5 minutes, with `concurrencyPolicy: Forbid` and a grace period of 30 seconds. `CRYSTALLINE_REMOTE_TOKEN`, the `cag_` token of an agent of the loops, and the Anthropic credential come from a Secret by reference. Nothing due means the pod ends within seconds.
+- `evolve-cronjob.yaml`: the same shape, weekly, with its own agent.
 - `watch-deployment.yaml`: one replica of `crystalline reflect watch`, for answers within a minute instead of within 5 minutes.
 
 [`examples/github/crystalline-loops.yml`](../examples/github/crystalline-loops.yml) runs the same image on a GitHub Actions schedule, for a team without a cluster. GitHub may start a scheduled job some minutes late.
@@ -235,6 +302,7 @@ When it sends:
 
 - Reflect, people waiting (a thread for the agent, feedback): within 60 seconds of the first event, so what arrives in that window is one webhook. It sends again on new events once the 5-minute cap below has passed.
 - Reflect, page updates only: after 30 minutes without a further source change on that domain, so a busy day or a bulk import sends one webhook, not hundreds. The quiet clock is per domain.
+- Reflect, a page whose freshness ran out (`stale`): when it falls due, without the 30-minute quiet rule. The trigger looks again at the time the status names for the next page, so a page falls due with no event at all. While it stays due, a later look sends it again, at most once per 5 minutes like everything else.
 - Evolve: when the mechanical count reaches `automation.evolve_threshold`, once per crossing. A weekly schedule in the runner stays the normal case.
 - When a lease is released and work is still due: within a minute (for evolve the threshold still applies). This is how a thread that arrived during a run gets its own run.
 
@@ -251,7 +319,7 @@ X-Crystalline-Event: reflect
 X-Crystalline-Timestamp: 1792648800
 X-Crystalline-Signature: sha256=<hex>
 
-{"counts":{"feedback":1,"pages_to_update":0,"updates":0,"waiting_for_the_agent":2},"domain":"eng","event":"reflect","instance":"crystalline.example.com","sent_at":"2026-10-22T06:00:00Z"}
+{"counts":{"feedback":1,"pages_to_update":0,"stale":0,"updates":0,"waiting_for_the_agent":2},"domain":"eng","event":"reflect","instance":"crystalline.example.com","sent_at":"2026-10-22T06:00:00Z"}
 ```
 
 The body carries counts only, never content or paths. `event` is `reflect` or `evolve`; evolve counts are `mechanical` and `judgment`. The signature is the lowercase hex HMAC-SHA256, under the secret, of the timestamp, a dot and the raw body. The timestamp is unix seconds and is part of what is signed, so a receiver that refuses an old one refuses a replay.
@@ -295,6 +363,6 @@ n8n allows `require('crypto')` only with `NODE_FUNCTION_ALLOW_BUILTIN=crypto`, a
 
 ## In Fluid
 
-The Reflection home shows "Last reflected" with the time, the runner and the outcome. It also shows how many items wait for a person. The Maintenance screen shows "Last maintained" per domain and the judgment findings waiting. Nothing is shown when a loop never ran.
+The Reflection home shows "Last reflected" with the time, the runner and the outcome. It also shows how many items wait for a person. The Maintenance screen shows "Last maintained" per domain and the judgment findings waiting. Nothing is shown when a loop never ran. When a reflect run started after a page fell due and ended without it, an admin sees a banner, and the Maintenance screen lists such pages under "Reflection pages a reflect run missed"; `crystalline doctor` warns about them too (see [Overdue and missed pages](reflection.md#overdue-and-missed-pages)).
 
 What you see depends on your rights. A reader sees the last run without its summary and its pull request. Someone who may run the loop also sees the summary, the pull request and the counts. A Reflection contributor without the right to the knowledge sees no "Last reflected" line. The webhook state shows only for a domain manager or an admin.

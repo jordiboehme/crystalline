@@ -311,7 +311,7 @@ pub(crate) fn resolve_domain_path(entry: &DomainEntry) -> Option<PathBuf> {
 /// `3h` or `4d`. The single-unit sibling of `main.rs`'s `format_uptime`
 /// (which keeps its own `3h07m` minute precision for a live daemon's "up"
 /// line); this is the coarser granularity a "how long ago" reading wants.
-fn humanize_duration(secs: u64) -> String {
+pub(crate) fn humanize_duration(secs: u64) -> String {
     if secs >= 86_400 {
         format!("{}d", secs / 86_400)
     } else if secs >= 3_600 {

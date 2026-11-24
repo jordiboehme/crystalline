@@ -29,6 +29,8 @@ struct Options {
     /// This machine's own index, configuration and state directory as the
     /// daemon would name them, when a test sets one.
     machine_owner: Option<MachineOwner>,
+    /// `auth.mcp` on (and `auth.oauth` off), which agents of the loops need.
+    agents: bool,
 }
 
 /// Which machine owner a test gives the engine: one naming another index
@@ -71,11 +73,12 @@ async fn serve(opts: Options) -> Fixture {
             trusted_header: opts.trusted_header.map(str::to_string),
             proxy_headers: None,
             anonymous: Some(opts.anonymous),
-            mcp: None,
-            oauth: None,
+            mcp: opts.agents.then_some(true),
+            oauth: opts.agents.then_some(false),
             max_users: None,
             oidc: None,
             login: None,
+            invites: None,
         }),
         ..GlobalConfig::default()
     };
@@ -124,6 +127,9 @@ async fn serve(opts: Options) -> Fixture {
         Some(config_path.clone()),
     )
     .with_read_only(opts.read_only)
+    // Pinned the way the daemon pins it, so the door, the open tier and the
+    // agent routes read one value until a restart.
+    .with_auth_mcp_pinned(opts.agents)
     .with_token_store_dir(root.join("tokens"))
     .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
     // Where a rename keeps its journal; every other write route in
@@ -2383,6 +2389,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
             max_users: None,
             oidc: None,
             login: None,
+            invites: None,
         }),
         ..GlobalConfig::default()
     };
@@ -3136,6 +3143,403 @@ async fn the_last_admin_is_protected_through_the_api() {
     }
 }
 
+/// `POST /users/bulk` answers per account: some are done, an unknown name and
+/// the caller's own account are refused in a sentence, and a disabled account
+/// loses its sessions exactly as it does on the single route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_change_reports_per_account() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let bulk = |body: serde_json::Value| {
+        as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin).json(&body)
+    };
+
+    let resp = bulk(serde_json::json!({
+        "names": ["Eddy", "vera", "ghost", "root", "eddy"],
+        "action": "deactivate"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4, "a repeat counts once: {body}");
+    assert_eq!(results[0]["name"], "eddy");
+    assert_eq!(results[0]["done"], true);
+    assert!(results[0].get("message").is_none());
+    assert_eq!(results[1]["done"], true);
+    assert_eq!(results[2]["name"], "ghost");
+    assert_eq!(results[2]["done"], false);
+    assert!(
+        results[2]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no such user")
+    );
+    assert_eq!(results[3]["name"], "root");
+    assert_eq!(results[3]["done"], false);
+    assert!(
+        results[3]["message"]
+            .as_str()
+            .unwrap()
+            .contains("your own account")
+    );
+
+    let users = fx.auth.list_users().await.unwrap();
+    let state = |n: &str| users.iter().find(|u| u.name == n).unwrap().disabled;
+    assert!(state("eddy") && state("vera") && !state("root"));
+    let dead = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), 401, "disabling ends the sessions");
+
+    let resp = bulk(serde_json::json!({"names": ["eddy", "vera"], "action": "reactivate"}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["done"] == true)
+    );
+    assert!(
+        fx.auth
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .all(|u| !u.disabled)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_role_change_guards_every_account() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    fx.auth
+        .add_user("alex", "Alex", None, Role::Admin, "alexpw")
+        .await
+        .unwrap();
+    let bulk = |body: serde_json::Value| {
+        as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin).json(&body)
+    };
+
+    let resp = bulk(serde_json::json!({
+        "names": ["mark", "tina", "root", "alex"],
+        "action": "role",
+        "role": "viewer"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let done: Vec<bool> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["done"].as_bool().unwrap())
+        .collect();
+    assert_eq!(done, [true, true, false, true], "{body}");
+    let users = fx.auth.list_users().await.unwrap();
+    let role = |n: &str| users.iter().find(|u| u.name == n).unwrap().role;
+    assert_eq!(role("mark"), Role::Viewer);
+    assert_eq!(role("alex"), Role::Viewer);
+    assert_eq!(
+        role("root"),
+        Role::Admin,
+        "the caller's own role is untouched"
+    );
+
+    // The same guard the single route has: the only enabled admin cannot be
+    // taken out, shown here at the store the bulk route asks first.
+    let err = fx
+        .auth
+        .check_change_of("root", "demote", true)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("last admin"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_request_is_validated_and_admin_only() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    for body in [
+        serde_json::json!({"names": [], "action": "deactivate"}),
+        serde_json::json!({"names": ["mark"], "action": "role"}),
+        serde_json::json!({"names": ["mark"], "action": "deactivate", "role": "viewer"}),
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "{body}");
+    }
+    // At most 500 accounts in one request: 500 are answered per account,
+    // 501 are refused whole.
+    let names = |n: usize| (0..n).map(|i| format!("nobody{i}")).collect::<Vec<_>>();
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+        .json(&serde_json::json!({"names": names(501), "action": "deactivate"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let refused: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        refused["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("at most 500 accounts")),
+        "{refused}"
+    );
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+        .json(&serde_json::json!({"names": names(500), "action": "deactivate"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let answered: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(answered["results"].as_array().map(Vec::len), Some(500));
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/bulk",
+        &editor,
+    )
+    .json(&serde_json::json!({"names": ["mark"], "action": "deactivate"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    let resp = as_session(ro.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+        .json(&serde_json::json!({"names": ["mark"], "action": "deactivate"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "read-only refuses like the other routes"
+    );
+    assert!(
+        !ro.auth
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .any(|u| u.disabled)
+    );
+}
+
+/// `GET /users/{name}` answers one account in the list's shape, with its
+/// write list and a drafts summary; an unknown name, an invalid one and an
+/// agent's name are all 404, and only an admin may ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_account_is_read_with_its_write_list_and_drafts() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let get = |path: &str| as_session(fx.addr, reqwest::Method::GET, path, &admin).send();
+
+    let resp = get("/api/v1/users/Eddy").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["user"]["name"], "eddy");
+    assert_eq!(body["user"]["sign_in"], "password");
+    assert_eq!(body["user"]["github_linked"], false);
+    assert!(body["writes"].is_null(), "{body}");
+    assert_eq!(body["drafts"], serde_json::json!([]), "{body}");
+
+    fx.auth
+        .set_write_list("eddy", &["eng".to_string(), "agents-*".to_string()])
+        .await
+        .unwrap();
+    let body: serde_json::Value = get("/api/v1/users/eddy")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["writes"], serde_json::json!(["agents-*", "eng"]));
+
+    fx.auth
+        .add_agent(
+            "nightly",
+            None,
+            crystalline_service::rest::AgentLoops::Both,
+            "root",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    for path in [
+        "/api/v1/users/ghost",
+        "/api/v1/users/nightly",
+        "/api/v1/users/not%20a%20name",
+        "/api/v1/users/nightly/writes",
+    ] {
+        assert_eq!(get(path).await.unwrap().status(), 404, "{path}");
+    }
+
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    for path in ["/api/v1/users/mark", "/api/v1/users/mark/writes"] {
+        let resp = as_session(fx.addr, reqwest::Method::GET, path, &editor)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{path}");
+    }
+    let anonymous = reqwest::Client::new()
+        .get(format!("http://{}/api/v1/users/mark", fx.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401);
+}
+
+/// The write list round trip over `/users/{name}/writes`: set, read, the
+/// same checks `crystalline users writes` makes, removed with null, and
+/// refused on a read-only instance and to anyone but an admin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_list_is_set_read_and_removed() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let put = |name: &str, body: serde_json::Value| {
+        as_session(
+            fx.addr,
+            reqwest::Method::PUT,
+            &format!("/api/v1/users/{name}/writes"),
+            &admin,
+        )
+        .json(&body)
+        .send()
+    };
+
+    let resp = put(
+        "Mark",
+        serde_json::json!({"writes": [" eng ", "agents-*", "eng", ""]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "mark");
+    assert_eq!(body["writes"], serde_json::json!(["agents-*", "eng"]));
+    assert_eq!(
+        fx.auth.write_list("mark").await.unwrap(),
+        Some(vec!["agents-*".to_string(), "eng".to_string()])
+    );
+    let read: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/users/mark/writes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(read, body);
+
+    for bad in [
+        serde_json::json!({"writes": []}),
+        serde_json::json!({"writes": ["  "]}),
+        serde_json::json!({"writes": ["*"]}),
+        serde_json::json!({"writes": ["agents/*"]}),
+        serde_json::json!({"writes": ["a*b"]}),
+    ] {
+        let resp = put("mark", bad.clone()).await.unwrap();
+        assert_eq!(resp.status(), 422, "{bad}");
+    }
+    assert_eq!(
+        fx.auth.write_list("mark").await.unwrap().map(|l| l.len()),
+        Some(2),
+        "a refused list leaves the stored one alone"
+    );
+    assert_eq!(
+        put("ghost", serde_json::json!({"writes": ["eng"]}))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    let resp = put("mark", serde_json::json!({"writes": null}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["writes"].is_null());
+    assert_eq!(fx.auth.write_list("mark").await.unwrap(), None);
+
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/users/mark/writes",
+        &editor,
+    )
+    .json(&serde_json::json!({"writes": ["eng"]}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    let resp = as_session(
+        ro.addr,
+        reqwest::Method::PUT,
+        "/api/v1/users/mark/writes",
+        &admin,
+    )
+    .json(&serde_json::json!({"writes": ["eng"]}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "read-only refuses like the other routes"
+    );
+    assert_eq!(ro.auth.write_list("mark").await.unwrap(), None);
+    let resp = as_session(
+        ro.addr,
+        reqwest::Method::GET,
+        "/api/v1/users/mark/writes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "reading stays open on a read-only instance"
+    );
+}
+
 /// Every mutating user-admin route is refused on a read-only instance, ahead
 /// of the checks each one would otherwise run: an unknown account is never
 /// probed, and a change that would otherwise be well-formed is refused before
@@ -3208,6 +3612,160 @@ async fn a_read_only_instance_refuses_user_mutations() {
         6,
         "nothing above changed anything"
     );
+}
+
+/// The agents routes: an admin creates an agent and sees its token once,
+/// lists it without the token, gets one more token and is refused a third,
+/// revokes one, and removes the agent. An account's name is refused for an
+/// agent and an agent's name for an account (409 both ways); an editor gets
+/// 403 and a read-only instance refuses every change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admins_manage_agents_and_their_tokens() {
+    let fx = serve(Options {
+        agents: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let req = |method: reqwest::Method, path: &str| as_session(fx.addr, method, path, &admin);
+
+    let resp = req(reqwest::Method::POST, "/api/v1/agents")
+        .json(&serde_json::json!({"name": "Nightly", "display": "Nightly runner", "loops": "evolve", "expires_days": 30}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["agent"]["name"], "nightly");
+    assert_eq!(created["agent"]["loops"], "evolve");
+    assert_eq!(created["agent"]["created_by"], "root");
+    let token = created["token"]["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("cag_"));
+    assert!(fx.auth.agent_for_token(&token).await.unwrap().is_some());
+
+    let listed: serde_json::Value = req(reqwest::Method::GET, "/api/v1/agents")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["agents"][0]["name"], "nightly");
+    assert_eq!(listed["agents"][0]["tokens"][0]["state"], "live");
+    assert_eq!(listed["auth_mcp"], true, "{listed}");
+    assert!(
+        !listed.to_string().contains(&token),
+        "never the token again"
+    );
+
+    // One namespace, both ways.
+    let resp = req(reqwest::Method::POST, "/api/v1/agents")
+        .json(&serde_json::json!({"name": "eddy"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let resp = req(reqwest::Method::POST, "/api/v1/users")
+        .json(&serde_json::json!({"name": "nightly", "role": "viewer", "password": "pw12345678"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(resp.text().await.unwrap().contains("belongs to an agent"));
+
+    // Two live tokens at most.
+    let second = req(reqwest::Method::POST, "/api/v1/agents/nightly/tokens")
+        .json(&serde_json::json!({"label": "rollover"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 201);
+    let second: serde_json::Value = second.json().await.unwrap();
+    let third = req(reqwest::Method::POST, "/api/v1/agents/nightly/tokens")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(third.status(), 409);
+    let bad = req(reqwest::Method::POST, "/api/v1/agents/nightly/tokens")
+        .json(&serde_json::json!({"expires_days": 400}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 422);
+    let ghost = req(reqwest::Method::POST, "/api/v1/agents/ghost/tokens")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ghost.status(), 404);
+
+    let id = created["token"]["id"].as_i64().unwrap();
+    let revoke = req(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/agents/nightly/tokens/{id}"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(revoke.status(), 204);
+    assert!(fx.auth.agent_for_token(&token).await.unwrap().is_none());
+    let again = req(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/agents/nightly/tokens/{id}"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(again.status(), 404);
+
+    // An editor is no admin.
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/agents", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let removed = req(reqwest::Method::DELETE, "/api/v1/agents/nightly")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 204);
+    let second_token = second["token"].as_str().unwrap();
+    assert!(
+        fx.auth
+            .agent_for_token(second_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let gone = req(reqwest::Method::DELETE, "/api/v1/agents/nightly")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+
+    let ro = serve(Options {
+        read_only: true,
+        agents: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    let resp = as_session(ro.addr, reqwest::Method::POST, "/api/v1/agents", &admin)
+        .json(&serde_json::json!({"name": "nightly"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(ro.auth.agents().await.unwrap().is_empty());
+    let resp = as_session(ro.addr, reqwest::Method::GET, "/api/v1/agents", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "read-only refuses writes, not reads");
 }
 
 /// One write operation as the matrix drives it.
@@ -3544,6 +4102,27 @@ fn write_ops() -> Vec<WriteOp> {
             read_only_exempt: false,
         },
         WriteOp {
+            method: Method::PATCH,
+            path: "/api/v1/domains/eng/reflection/settings",
+            body: Some(serde_json::json!({"path": "guides/a.md", "freshness": "1d"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/retire",
+            body: Some(serde_json::json!({"path": "guides/a.md"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/restore",
+            body: Some(serde_json::json!({"path": "guides/a.md"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/reflection/threads",
             body: Some(serde_json::json!({"path": "guides/a.md", "section": "A", "text": "Why?"})),
@@ -3604,9 +4183,23 @@ fn write_ops() -> Vec<WriteOp> {
             read_only_exempt: false,
         },
         WriteOp {
+            method: Method::POST,
+            path: "/api/v1/users/bulk",
+            body: Some(serde_json::json!({"names": ["nobody"], "action": "deactivate"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
             method: Method::PATCH,
             path: "/api/v1/users/mark",
             body: Some(serde_json::json!({"display": "M"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/users/mark/writes",
+            body: Some(serde_json::json!({"writes": ["eng", "agents-*"]})),
             min_role: Role::Admin,
             read_only_exempt: false,
         },
@@ -3622,6 +4215,56 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/users/tina",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // The agents of the loops: admin only, and refused on a read-only
+        // instance like the account rows above. Created, given a second
+        // token, one revoked, then removed, so each allowed leg has
+        // something to act on.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/agents",
+            body: Some(serde_json::json!({"name": "matrix-bot"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/agents/matrix-bot/tokens",
+            body: Some(serde_json::json!({})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/agents/matrix-bot/tokens/1",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/agents/matrix-bot",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // Invite links: with `auth.invites.managers` off (this fixture) only
+        // an admin makes one. Any account revokes its own, so the revoke row
+        // is viewer level: a link that is not the caller's answers 404, past
+        // authorization. A read-only instance refuses both.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/invites",
+            body: Some(serde_json::json!({"role": "viewer"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/invites/1",
+            body: None,
+            min_role: Role::Viewer,
             read_only_exempt: false,
         },
         WriteOp {
@@ -4016,8 +4659,13 @@ async fn the_write_matrix_holds_on_every_route() {
     // Serialized against every other test here that writes the shared
     // maintenance state file. See `crate::support::maintenance_guard`.
     let _serialized = crate::support::maintenance_guard().await;
-    // Plain instance: role and CSRF rows.
-    let fx = serve(Options::default()).await;
+    // Plain instance: role and CSRF rows. `auth.mcp` is on, so the agents
+    // routes serve an admin.
+    let fx = serve(Options {
+        agents: true,
+        ..Options::default()
+    })
+    .await;
     let admin = login(fx.addr, "root", "rootpw").await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let viewer = login(fx.addr, "vera", "verapw").await;
@@ -4228,6 +4876,18 @@ fn canonicalize(path: &str) -> String {
     // for the same reason the token ids above are.
     if path.starts_with("/api/v1/me/identity-links/") {
         return "/api/v1/me/identity-links/{issuer}".to_string();
+    }
+    // The agents routes: one agent name and, for a revoke, a numeric token
+    // id the per-segment pass would read as a proposal number.
+    if path.starts_with("/api/v1/invites/") {
+        return "/api/v1/invites/{id}".to_string();
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/agents/") {
+        return match rest.split_once('/') {
+            None => "/api/v1/agents/{name}".to_string(),
+            Some((_, "tokens")) => "/api/v1/agents/{name}/tokens".to_string(),
+            Some(_) => "/api/v1/agents/{name}/tokens/{id}".to_string(),
+        };
     }
     path.split('/')
         .map(|segment| match segment {
@@ -4443,6 +5103,14 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// what bounds it is the signature over the body under the App's webhook
 /// secret. Its refusals (no secret, no or a wrong signature, a session in
 /// place of one) are pinned by `tests/origins/github_webhook.rs`.
+/// The two invite redemption routes, `POST /api/v1/invites/confirm` and
+/// `POST /api/v1/invites/redeem`, have no role dimension either: a person
+/// holding a link usually has no account yet, so both are public by path,
+/// and what bounds them is the token in the body and a per-address throttle.
+/// Confirm writes nothing. Redeem is under the CSRF rule like every POST (a
+/// signed-in caller echoes its token) and is refused on a read-only instance;
+/// those, the sign-in modes and every refusal are pinned by
+/// `tests/rest_admin/rest_invite_redeem.rs` and `tests/auth/oidc.rs`.
 /// The rename row's admin leg really renames `eng` (see its own comment in
 /// `write_ops()`), so every row that still addresses `eng` by that name has
 /// to run before it - an invariant a comment alone cannot enforce. A row
@@ -4474,6 +5142,8 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/oauth/token",
         "POST /api/v1/oauth/revoke",
         "POST /api/v1/github/webhook",
+        "POST /api/v1/invites/confirm",
+        "POST /api/v1/invites/redeem",
     ];
 
     let mutating: BTreeSet<String> = crate::support::MOUNTED_OPERATIONS
@@ -4953,4 +5623,65 @@ async fn creating_a_domain_whose_name_differs_only_in_case_is_a_conflict() {
         );
     }
     assert!(!fx.engine.config().domains.contains_key("ENG"));
+}
+
+/// **No agent is made while `auth.mcp` is off**: an agent token would open
+/// nothing, so `POST /agents` answers `403` with the sentence that says why
+/// and how to turn it on, and no agent is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_is_refused_while_auth_mcp_is_off() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/agents", &admin)
+        .json(&serde_json::json!({"name": "nightly"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["detail"],
+        crystalline_service::rest::AGENTS_NEED_AUTH_MCP,
+        "{body}"
+    );
+    assert!(fx.auth.agents().await.unwrap().is_empty());
+    // The list says so before anyone tries, from the same setting the
+    // refusal reads, so a screen can hold its create button back.
+    let listed: serde_json::Value =
+        as_session(fx.addr, reqwest::Method::GET, "/api/v1/agents", &admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(listed["auth_mcp"], false, "{listed}");
+    assert_eq!(listed["agents"], serde_json::json!([]), "{listed}");
+
+    // Turned on while the server runs: the file changes, and the agent routes
+    // keep answering as the running MCP door does until the restart.
+    fx.engine
+        .configure_as_operator(&crystalline_service::engine::ConfigureAction::Set {
+            key: "auth.mcp".into(),
+            value: "true".into(),
+        })
+        .await
+        .unwrap();
+    assert!(fx.engine.config().auth_mcp(), "the setting is saved");
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/agents", &admin)
+        .json(&serde_json::json!({"name": "nightly"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "still refused until the restart");
+    let listed: serde_json::Value =
+        as_session(fx.addr, reqwest::Method::GET, "/api/v1/agents", &admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(listed["auth_mcp"], false, "{listed}");
+    assert!(fx.auth.agents().await.unwrap().is_empty());
 }

@@ -49,21 +49,26 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use crystalline_identity::account_match::{AccountMatcher, fold};
 use serde::Deserialize;
 
 use super::auth::{Caller, Identity};
-use super::auth_store::{ReflectionLevel, RefusalKind, Role, StoreRefusal, User};
+use super::auth_store::{ReflectionLevel, RefusalKind, Role, SignInKind, StoreRefusal, User};
 use super::{
-    ApiError, ApiJson, ApiPath, ProblemDetail, RestState, check_password, refuse_read_only,
+    ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, check_password,
+    refuse_read_only,
 };
 
 /// What `GET /users` answers with. A wrapper rather than a bare array, matching
 /// the `{"users": [...]}` envelope `crystalline users list --json` prints.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct UsersResponse {
-    /// Every account, by name.
+    /// The accounts of the asked page, or every matching account when no
+    /// `limit` was given.
     #[schema(value_type = Vec<super::schemas::User>)]
     users: Vec<User>,
+    /// How many accounts match the filters in all, whatever the page.
+    total: usize,
 }
 
 /// What every writing route but `DELETE` answers with: the account as stored,
@@ -75,7 +80,239 @@ pub struct UserResponse {
     user: User,
 }
 
-/// `GET /users` - every account, by name.
+/// The state a `GET /users` filter names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateFilter {
+    /// Accounts that may sign in.
+    Active,
+    /// Disabled accounts.
+    Disabled,
+}
+
+/// A sign-in kind a `GET /users` filter names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KindFilter {
+    /// A password this instance verifies.
+    Password,
+    /// A sign-on provider link (OIDC).
+    Oidc,
+    /// Authenticated by an upstream proxy or trusted header.
+    Proxy,
+    /// No password and no link, but a personal token.
+    TokenOnly,
+}
+
+impl KindFilter {
+    fn kind(self) -> SignInKind {
+        match self {
+            KindFilter::Password => SignInKind::Password,
+            KindFilter::Oidc => SignInKind::Oidc,
+            KindFilter::Proxy => SignInKind::Proxy,
+            KindFilter::TokenOnly => SignInKind::TokenOnly,
+        }
+    }
+}
+
+/// The column `GET /users` sorts by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumn {
+    /// The login name (the default).
+    Name,
+    /// The display name, case and accents folded.
+    Display,
+    /// The role, least to most privileged.
+    Role,
+    /// Active before disabled.
+    State,
+    /// When the account was last seen; an account never seen sorts last in
+    /// both directions.
+    LastSeen,
+    /// The sign-in kind, by its name.
+    Kind,
+}
+
+/// The direction of a sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDir {
+    /// Smallest first (the default).
+    Asc,
+    /// Largest first.
+    Desc,
+}
+
+/// The most accounts one page may hold.
+const MAX_PAGE_SIZE: usize = 500;
+
+/// The query string `GET /users` takes. Every field is optional; with none of
+/// them the answer is every account by name, as it always was.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListQuery {
+    /// Search text: a prefix or word prefix of the login or display name (case
+    /// and accents folded), or a whole email address.
+    #[serde(default)]
+    #[param(example = "ada")]
+    q: Option<String>,
+    /// Only accounts with this role.
+    #[serde(default)]
+    #[param(value_type = Option<super::schemas::Role>)]
+    role: Option<Role>,
+    /// Only active or only disabled accounts.
+    #[serde(default)]
+    state: Option<StateFilter>,
+    /// Only accounts that sign in this way.
+    #[serde(default)]
+    kind: Option<KindFilter>,
+    /// Only accounts last seen before this instant (RFC 3339). An account
+    /// never seen is not before anything.
+    #[serde(default)]
+    #[param(example = "2026-11-01T00:00:00Z")]
+    seen_before: Option<String>,
+    /// Only accounts last seen after this instant (RFC 3339).
+    #[serde(default)]
+    #[param(example = "2026-11-01T00:00:00Z")]
+    seen_after: Option<String>,
+    /// `true` for accounts with a GitHub link, `false` for those without.
+    #[serde(default)]
+    github: Option<bool>,
+    /// The column to sort by. Default `name`; `name` breaks every tie.
+    #[serde(default)]
+    sort: Option<SortColumn>,
+    /// The direction. Default `asc`.
+    #[serde(default)]
+    dir: Option<SortDir>,
+    /// The page, from 1. Only read together with `limit`.
+    #[serde(default)]
+    #[param(minimum = 1)]
+    page: Option<usize>,
+    /// Accounts per page (1 to 500). Without it every matching account comes
+    /// back in one answer.
+    #[serde(default)]
+    #[param(minimum = 1, maximum = 500)]
+    limit: Option<usize>,
+}
+
+/// Where a role stands from least to most privileged, for sorting.
+fn role_rank(role: Role) -> u8 {
+    match role {
+        Role::None => 0,
+        Role::Viewer => 1,
+        Role::Editor => 2,
+        Role::Admin => 3,
+    }
+}
+
+/// An RFC 3339 filter value as an instant, or the 400 that names the filter.
+fn instant_filter(name: &str, value: Option<&str>) -> Result<Option<i64>, ApiError> {
+    let Some(value) = value else { return Ok(None) };
+    crystalline_core::time::parse_rfc3339(value)
+        .map(|at| Some(at.stamp().unix_micros()))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "{name} must be an RFC 3339 time, such as 2026-11-01T00:00:00Z"
+            ))
+        })
+}
+
+/// The instant an account was last seen, in microseconds, if it ever was.
+fn seen_micros(user: &User) -> Option<i64> {
+    user.last_seen
+        .as_deref()
+        .and_then(crystalline_core::time::parse_lenient_stamp)
+        .map(|at| at.unix_micros())
+}
+
+/// Filter, sort and page `users` as `query` asks, returning the page and how
+/// many accounts matched before paging.
+///
+/// Lives apart from the handler so the rules (the `last_seen` NULL order, the
+/// `name` tiebreak, the paging) read in one place.
+fn select_users(users: Vec<User>, query: &ListQuery) -> Result<(Vec<User>, usize), ApiError> {
+    let before = instant_filter("seen_before", query.seen_before.as_deref())?;
+    let after = instant_filter("seen_after", query.seen_after.as_deref())?;
+    if query.page == Some(0) {
+        return Err(ApiError::bad_request("page starts at 1"));
+    }
+    if let Some(limit) = query.limit
+        && !(1..=MAX_PAGE_SIZE).contains(&limit)
+    {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_PAGE_SIZE}"
+        )));
+    }
+    let matcher = query
+        .q
+        .as_deref()
+        .map(|q| AccountMatcher::new(q, true))
+        .filter(|matcher| !matcher.is_empty());
+    let mut rows: Vec<User> = users
+        .into_iter()
+        .filter(|user| {
+            matcher
+                .as_ref()
+                .is_none_or(|m| m.matches(&user.name, &user.display, user.email.as_deref()))
+                && query.role.is_none_or(|role| user.role == role)
+                && query.state.is_none_or(|state| match state {
+                    StateFilter::Active => !user.disabled,
+                    StateFilter::Disabled => user.disabled,
+                })
+                && query
+                    .kind
+                    .is_none_or(|kind| user.sign_in == Some(kind.kind()))
+                && query.github.is_none_or(|g| user.github_linked == Some(g))
+                && before.is_none_or(|b| seen_micros(user).is_some_and(|seen| seen < b))
+                && after.is_none_or(|a| seen_micros(user).is_some_and(|seen| seen > a))
+        })
+        .collect();
+    let total = rows.len();
+    let column = query.sort.unwrap_or(SortColumn::Name);
+    let descending = query.dir == Some(SortDir::Desc);
+    rows.sort_by(|a, b| {
+        let by_column = match column {
+            SortColumn::Name => a.name.cmp(&b.name),
+            SortColumn::Display => fold(&a.display).cmp(&fold(&b.display)),
+            SortColumn::Role => role_rank(a.role).cmp(&role_rank(b.role)),
+            SortColumn::State => a.disabled.cmp(&b.disabled),
+            SortColumn::Kind => {
+                let kind = |u: &User| u.sign_in.map(SignInKind::as_str);
+                kind(a).cmp(&kind(b))
+            }
+            SortColumn::LastSeen => {
+                // A never-seen account sorts after every seen one whichever
+                // way the sort runs, so the direction applies to the seen
+                // ones only.
+                return match (seen_micros(a), seen_micros(b)) {
+                    (Some(x), Some(y)) => {
+                        let order = x.cmp(&y);
+                        (if descending { order.reverse() } else { order })
+                            .then_with(|| a.name.cmp(&b.name))
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.name.cmp(&b.name),
+                };
+            }
+        };
+        (if descending {
+            by_column.reverse()
+        } else {
+            by_column
+        })
+        .then_with(|| a.name.cmp(&b.name))
+    });
+    if let Some(limit) = query.limit {
+        let skip = (query.page.unwrap_or(1) - 1).saturating_mul(limit);
+        rows = rows.into_iter().skip(skip).take(limit).collect();
+    }
+    Ok((rows, total))
+}
+
+/// `GET /users` - the accounts, filtered, sorted and paged as asked; every
+/// account, by name, when nothing is asked.
 ///
 /// [`User`] carries no password material, so the rows go out as they come back
 /// from the store. Admin only: the account list names every way into the
@@ -85,12 +322,27 @@ pub struct UserResponse {
     path = "/api/v1/users",
     tag = "users",
     operation_id = "list_users",
-    summary = "Every account, by name.",
+    summary = "The accounts, searched, filtered, sorted and paged.",
     description = "An account carries no password material, so the rows go out \
                    as they come back from the store. Admin only: the account \
-                   list names every way into the instance and who holds it.",
+                   list names every way into the instance and who holds it. \
+                   `q` matches a prefix or word prefix of the login or display \
+                   name (case and accents folded) or a whole email address. \
+                   Sorting is by `sort` and `dir` with the login name as the \
+                   tiebreak; an account never seen sorts last by `last_seen` in \
+                   both directions. Without `limit` every matching account is \
+                   answered, by name, and `page` is ignored. `total` counts the \
+                   matches before paging; paging by `last_seen` can shift as \
+                   accounts are seen.",
+    params(ListQuery),
     responses(
-        (status = 200, description = "Every account.", body = UsersResponse),
+        (status = 200, description = "The matching accounts.", body = UsersResponse),
+        (
+            status = 400,
+            description = "A filter, `page` or `limit` is malformed.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
         (
             status = 401,
             description = "No identity.",
@@ -109,6 +361,7 @@ pub struct UserResponse {
 pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
+    ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<UsersResponse>, ApiError> {
     identity.require_admin()?;
     let users = state
@@ -116,7 +369,8 @@ pub async fn list(
         .list_users()
         .await
         .map_err(|e| store_error(e, ""))?;
-    Ok(Json(UsersResponse { users }))
+    let (users, total) = select_users(users, &query)?;
+    Ok(Json(UsersResponse { users, total }))
 }
 
 /// What `POST /users` takes. `display` defaults to the name as typed, matching
@@ -256,8 +510,9 @@ pub async fn create(
 
 /// The step before an account is made, while the name holds none: see
 /// [`crate::engine::Engine::clear_name_for_new_account`]. A name that holds an
-/// account, or that no account can have, is left alone, so the insert answers it
-/// and nothing saved under the name is touched.
+/// account or an agent, or that no account can have, is left alone, so the insert
+/// answers it and nothing saved under the name is touched. Creating an agent takes
+/// the same step (`agents_api::create`): an agent drafts under its name too.
 ///
 /// `admin_reads` says whether an admin is at the other end: the sentence with the
 /// domains and the command is theirs, and anybody else (a first sign-in through a
@@ -270,7 +525,7 @@ pub(crate) async fn clear_name_for_new_account(
     let Ok(account) = crate::auth_store::normalize_new_account_name(name) else {
         return Ok(());
     };
-    if state.auth.user(&account).await?.is_some() {
+    if state.auth.user(&account).await?.is_some() || state.auth.agent(&account).await?.is_some() {
         return Ok(());
     }
     // The step deletes what is saved under the name, and here that is the bot's
@@ -306,15 +561,46 @@ pub(crate) fn account_cap_refusal(err: &anyhow::Error) -> ApiError {
     ApiError::forbidden(crystalline_core::account::NEW_ACCOUNT_CAP_REACHED)
 }
 
+/// What a provisioning made: the account itself, or an invite redeemed with a
+/// new account. [`provision_clear`] reads the account's name from it.
+pub(crate) trait Provisioned {
+    /// The account that was made.
+    fn account(&self) -> &User;
+
+    /// The id of the invite link it used, if any.
+    fn invite_id(&self) -> Option<i64> {
+        None
+    }
+}
+
+impl Provisioned for User {
+    fn account(&self) -> &User {
+        self
+    }
+}
+
+impl Provisioned for crate::auth_store::RedeemedInvite {
+    fn account(&self) -> &User {
+        &self.user
+    }
+
+    fn invite_id(&self) -> Option<i64> {
+        Some(self.invite.id)
+    }
+}
+
 /// A first sign-in's provisioning with the same step before it. The store picks
 /// the first free name from `desired`, so the step asks about that name. When
 /// another account took it in between, the store picks a later one, which was not
 /// asked about: that account is taken back out and the person signs in again.
-pub(crate) async fn provision_clear(
+/// An invite link the provisioning used is pending again, so the person
+/// follows the same link once more; when it cannot be, they are told to ask
+/// for a new one.
+pub(crate) async fn provision_clear<T: Provisioned>(
     state: &RestState,
     desired: &str,
-    provision: impl std::future::Future<Output = anyhow::Result<User>>,
-) -> Result<anyhow::Result<User>, ApiError> {
+    provision: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<anyhow::Result<T>, ApiError> {
     let cleared = match state.auth.free_name_from(desired).await {
         Ok(name) => {
             clear_name_for_new_account(state, &name, false).await?;
@@ -325,18 +611,40 @@ pub(crate) async fn provision_clear(
     match provision.await {
         // Also when the name could not be asked about: an account stands only on a
         // name that was cleared.
-        Ok(user) if cleared.as_deref() != Some(user.name.as_str()) => {
+        Ok(made) if cleared.as_deref() != Some(made.account().name.as_str()) => {
+            let user = made.account();
             // A sign-in that found an account of its own never reaches here: the
             // caller asks for the linked account first.
-            if let Err(e) = state.auth.remove_user_force(&user.name).await {
-                tracing::warn!(
-                    "the account '{}' could not be taken back out: {e:#}",
-                    user.name
-                );
-            }
-            Err(ApiError::conflict(
-                "Another account took this name just now. Sign in again.",
-            ))
+            let removed = match state.auth.remove_user_force(&user.name).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        "the account '{}' could not be taken back out: {e:#}",
+                        user.name
+                    );
+                    false
+                }
+            };
+            let Some(id) = made.invite_id() else {
+                return Err(ApiError::conflict(
+                    "Another account took this name just now. Sign in again.",
+                ));
+            };
+            // The link was spent on an account that is gone again: it is the
+            // person's still. Left used only when the account stays.
+            let reopened = removed
+                && match state.auth.reopen_invite(id, &user.name).await {
+                    Ok(reopened) => reopened,
+                    Err(e) => {
+                        tracing::warn!("the invite link {id} could not be opened again: {e:#}");
+                        false
+                    }
+                };
+            Err(ApiError::conflict(if reopened {
+                "Another account took this name just now. Open the invite link again."
+            } else {
+                "Another account took this name just now, and the invite link could not be used again. Ask the person who sent it for a new link."
+            }))
         }
         other => Ok(other),
     }
@@ -554,6 +862,254 @@ pub async fn update(
     crate::readers_changed(&state);
     let user = read_back(&state, &name).await?;
     Ok(Json(UserResponse { user }))
+}
+
+/// The most accounts one bulk request names, so a body cannot keep the store's
+/// write lock busy for long.
+const BULK_LIMIT: usize = 500;
+
+/// What a bulk action does to each account it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkAction {
+    /// Disable the accounts, ending their sessions.
+    Deactivate,
+    /// Enable the accounts again.
+    Reactivate,
+    /// Give the accounts the role sent in `role`.
+    Role,
+}
+
+impl BulkAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            BulkAction::Deactivate => "deactivate",
+            BulkAction::Reactivate => "reactivate",
+            BulkAction::Role => "role",
+        }
+    }
+}
+
+/// What `POST /users/bulk` takes.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(description = "One change for a selection of accounts. Each account \
+                        is changed as `PATCH /users/{name}` would change it, \
+                        so the last-admin guard applies to every one, and the \
+                        caller's own account is refused. `role` is required \
+                        with the `role` action and refused with the others.")]
+pub struct BulkBody {
+    /// The login names, in any casing. Repeats count once. At most 500.
+    names: Vec<String>,
+    /// What to do to each account.
+    action: BulkAction,
+    /// The new role, for the `role` action.
+    #[serde(default)]
+    #[schema(value_type = Option<super::schemas::Role>)]
+    role: Option<Role>,
+}
+
+/// What happened to one account of a bulk request.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct BulkResult {
+    /// The account, as the store keys it.
+    name: String,
+    /// Whether the change was made.
+    done: bool,
+    /// The refusal, in a sentence, when `done` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// What `POST /users/bulk` answers with: one entry per distinct account, in the
+/// order they were sent.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct BulkResponse {
+    /// One result per account.
+    results: Vec<BulkResult>,
+}
+
+/// `POST /users/bulk` - deactivate, reactivate or give a role to a selection of
+/// accounts in one request.
+///
+/// It behaves as N single `PATCH /users/{name}` calls, one after the other: the
+/// last-admin guard (`check_change_of`) runs for every account against the
+/// roster as the earlier ones left it, disabling ends the account's sessions as
+/// the single route does, and the caller's own account is refused. A refusal is
+/// that account's result, not the request's: the answer is a 200 with a result
+/// per account, and the rest are still done. One INFO line records the caller,
+/// the action and the counts.
+#[utoipa::path(
+    post,
+    path = "/api/v1/users/bulk",
+    tag = "users",
+    operation_id = "bulk_users",
+    request_body = BulkBody,
+    responses(
+        (status = 200, description = "A result per account.", body = BulkResponse),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "No names, more than 500, or a `role` that does not \
+                           fit the action.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn bulk(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiJson(body): ApiJson<BulkBody>,
+) -> Result<Json<BulkResponse>, ApiError> {
+    let caller = identity.require_admin()?;
+    refuse_read_only(&state)?;
+    if body.names.is_empty() {
+        return Err(ApiError::unprocessable("name at least one account"));
+    }
+    if body.names.len() > BULK_LIMIT {
+        return Err(ApiError::unprocessable(format!(
+            "at most {BULK_LIMIT} accounts in one request"
+        )));
+    }
+    match (body.action, body.role) {
+        (BulkAction::Role, None) => {
+            return Err(ApiError::unprocessable("the role action needs a role"));
+        }
+        (BulkAction::Deactivate | BulkAction::Reactivate, Some(_)) => {
+            return Err(ApiError::unprocessable(
+                "a role goes with the role action only",
+            ));
+        }
+        _ => {}
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    for raw in &body.names {
+        let name = folded(raw);
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let outcome = bulk_one(&state, &caller, &name, body.action, body.role).await;
+        results.push(match outcome {
+            Ok(()) => BulkResult {
+                name,
+                done: true,
+                message: None,
+            },
+            Err(message) => BulkResult {
+                name,
+                done: false,
+                message: Some(message),
+            },
+        });
+    }
+    let done = results.iter().filter(|r| r.done).count();
+    tracing::info!(
+        "{} ran bulk {} on {} accounts: {} done, {} refused",
+        caller.name(),
+        body.action.as_str(),
+        results.len(),
+        done,
+        results.len() - done,
+    );
+    if done > 0 {
+        crate::readers_changed(&state);
+    }
+    Ok(Json(BulkResponse { results }))
+}
+
+/// The sentence a bulk result row carries for a store error on `name`: the
+/// store's own refusal when [`store_error`] reads it as one a person can act
+/// on (no such account, the last admin, a name rule), else one plain
+/// sentence, with the error chain logged instead of shown: the database's
+/// text names tables and paths, not what the admin can do.
+fn bulk_message(e: anyhow::Error, name: &str) -> String {
+    let chain = format!("{e:#}");
+    let api = store_error(e, name);
+    if api.status != StatusCode::INTERNAL_SERVER_ERROR {
+        return api.detail;
+    }
+    tracing::error!("a bulk change of account '{name}' failed: {chain}");
+    format!(
+        "the account '{name}' could not be changed because the accounts store failed; \
+         the server log has the details"
+    )
+}
+
+/// One account of a bulk request: the guard first, then the write, each in the
+/// store's own words ([`bulk_message`]). The error is the sentence for the
+/// result.
+async fn bulk_one(
+    state: &RestState,
+    caller: &Caller,
+    name: &str,
+    action: BulkAction,
+    role: Option<Role>,
+) -> Result<(), String> {
+    let store = &state.auth;
+    if name == caller.name() {
+        let what = match action {
+            BulkAction::Deactivate => "disable",
+            BulkAction::Reactivate => "reactivate",
+            BulkAction::Role => "change the role of",
+        };
+        return Err(format!(
+            "refusing to {what} your own account ('{name}'): ask another admin to do it, \
+             or use `crystalline users` on the server"
+        ));
+    }
+    let said = |e: anyhow::Error| bulk_message(e, name);
+    match (action, role) {
+        (BulkAction::Deactivate, _) => {
+            store
+                .check_change_of(name, "disable", true)
+                .await
+                .map_err(said)?;
+            store.set_disabled(name, true).await.map_err(said)
+        }
+        (BulkAction::Reactivate, _) => {
+            store
+                .check_change_of(name, "reactivate", false)
+                .await
+                .map_err(said)?;
+            store.set_disabled(name, false).await.map_err(said)
+        }
+        (BulkAction::Role, Some(role)) => {
+            store
+                .check_change_of(name, "demote", role != Role::Admin)
+                .await
+                .map_err(said)?;
+            store.set_role(name, role).await.map_err(said)
+        }
+        (BulkAction::Role, None) => Err("the role action needs a role".to_string()),
+    }
 }
 
 /// What `PATCH /me` takes: the one thing a person may change about their own
@@ -845,7 +1401,7 @@ pub async fn remove(
         ),
         (
             status = 409,
-            description = "The name has an account, or is the machine owner's.",
+            description = "The name has an account or a live agent, or is the machine owner's.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -865,6 +1421,9 @@ pub async fn discard_drafts(
             "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
         )));
     }
+    if state.auth.agent(&account).await?.is_some() {
+        return Err(ApiError::conflict(live_agent_drafts(&account)));
+    }
     match state
         .engine
         .discard_account_drafts(&account, caller.name())
@@ -874,6 +1433,14 @@ pub async fn discard_drafts(
         Err(crate::engine::EngineError::Conflict(sentence)) => Err(ApiError::conflict(sentence)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The refusal of ending the drafts of `name`, a live agent: they go with
+/// the agent when it is removed.
+pub fn live_agent_drafts(name: &str) -> String {
+    format!(
+        "'{name}' is an agent, and its drafts go with it: remove the agent with crystalline agents remove {name} (or in Administration > Agents), which ends them; this is for a name whose account or agent was removed"
+    )
 }
 
 /// `DELETE /users/{name}/github-link` - unlink another account from GitHub.
@@ -928,6 +1495,273 @@ pub async fn unlink_github(
     Ok(Json(super::github_link::unlink_response(
         state.engine.unlink_github(&name).await?,
     )))
+}
+
+/// What one domain holds in an account's drafts, counted and never read.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct DraftCount {
+    /// The domain.
+    domain: String,
+    /// How many drafts, kept texts and open draft rooms the account has there.
+    count: u64,
+}
+
+/// What `GET /users/{name}` answers with: the account, its write list and
+/// what it holds in drafts.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct UserDetailResponse {
+    /// The account, as the list shows it.
+    #[schema(value_type = super::schemas::User)]
+    user: User,
+    /// The domains the account may write to, or null when it has no write
+    /// list and writes wherever its role and memberships allow.
+    writes: Option<Vec<String>>,
+    /// What the account holds in drafts, per domain, only domains with any.
+    /// Null when a domain's drafts could not be read. The drafts are the
+    /// person's own, so this route only counts them.
+    drafts: Option<Vec<DraftCount>>,
+}
+
+/// What both verbs on `/users/{name}/writes` answer with.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct WritesResponse {
+    /// The account, as the store keys it.
+    name: String,
+    /// The write list, or null when the account has none.
+    writes: Option<Vec<String>>,
+}
+
+/// What `PUT /users/{name}/writes` takes: the whole list.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(description = "The whole write list. Each entry is a domain name or \
+                        a name prefix ending in one `*`; entries are trimmed \
+                        and repeats count once. `null` removes the list, so \
+                        the account writes wherever its role and memberships \
+                        allow; an empty list is refused.")]
+pub struct WritesBody {
+    /// The new list, or null to remove it.
+    writes: Option<Vec<String>>,
+}
+
+/// The stored account under `name`, or the 404 every route here answers for
+/// a name with no account (a name that is not even a valid login included).
+async fn existing_account(state: &RestState, name: &str) -> Result<User, ApiError> {
+    let missing = || ApiError::not_found(format!("no account named '{}'", folded(name)));
+    let Ok(account) = crate::auth_store::normalize_account_name(name) else {
+        return Err(missing());
+    };
+    state
+        .auth
+        .user(&account)
+        .await
+        .map_err(|e| store_error(e, &account))?
+        .ok_or_else(missing)
+}
+
+/// `GET /users/{name}` - one account, its write list and its drafts.
+///
+/// The account in the shape the list answers with, sign-in kind and GitHub
+/// link included. An agent is not an account, so its name answers 404.
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{name}",
+    tag = "users",
+    operation_id = "get_user",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    responses(
+        (status = 200, description = "The account.", body = UserDetailResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn get_one(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+) -> Result<Json<UserDetailResponse>, ApiError> {
+    identity.require_admin()?;
+    let user = existing_account(&state, &name).await?;
+    let writes = state
+        .auth
+        .write_list(&user.name)
+        .await
+        .map_err(|e| store_error(e, &user.name))?;
+    // A domain whose drafts cannot be read is logged by the engine; the
+    // account itself still answers.
+    let drafts = state
+        .engine
+        .account_drafts(&user.name)
+        .await
+        .ok()
+        .map(|held| {
+            held.into_iter()
+                .map(|(domain, count)| DraftCount { domain, count })
+                .collect()
+        });
+    Ok(Json(UserDetailResponse {
+        user,
+        writes,
+        drafts,
+    }))
+}
+
+/// `GET /users/{name}/writes` - an account's write list.
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{name}/writes",
+    tag = "users",
+    operation_id = "get_user_writes",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    responses(
+        (status = 200, description = "The write list.", body = WritesResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn get_writes(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+) -> Result<Json<WritesResponse>, ApiError> {
+    identity.require_admin()?;
+    let user = existing_account(&state, &name).await?;
+    let writes = state
+        .auth
+        .write_list(&user.name)
+        .await
+        .map_err(|e| store_error(e, &user.name))?;
+    Ok(Json(WritesResponse {
+        name: user.name,
+        writes,
+    }))
+}
+
+/// `PUT /users/{name}/writes` - replace or remove an account's write list,
+/// as `crystalline users writes` does. The list only lowers rights.
+#[utoipa::path(
+    put,
+    path = "/api/v1/users/{name}/writes",
+    tag = "users",
+    operation_id = "set_user_writes",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    request_body = WritesBody,
+    responses(
+        (status = 200, description = "The write list as stored.", body = WritesResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "An entry is not a domain name or a name prefix \
+                           with one `*` at the end, or the list is empty.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_writes(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+    ApiJson(body): ApiJson<WritesBody>,
+) -> Result<Json<WritesResponse>, ApiError> {
+    let caller = identity.require_admin()?;
+    refuse_read_only(&state)?;
+    let user = existing_account(&state, &name).await?;
+    match body.writes {
+        None => {
+            state
+                .auth
+                .clear_write_list(&user.name)
+                .await
+                .map_err(|e| store_error(e, &user.name))?;
+            tracing::info!("{} removed the write list of {}", caller.name(), user.name);
+        }
+        Some(raw) => {
+            let entries =
+                crystalline_identity::scope::parse_write_list(raw.iter().map(String::as_str))
+                    .map_err(|e| ApiError::unprocessable(format!("{e:#}")))?;
+            state
+                .auth
+                .set_write_list(&user.name, &entries)
+                .await
+                .map_err(|e| store_error(e, &user.name))?;
+            tracing::info!(
+                "{} set the write list of {} to {} entries",
+                caller.name(),
+                user.name,
+                entries.len()
+            );
+        }
+    }
+    let writes = state
+        .auth
+        .write_list(&user.name)
+        .await
+        .map_err(|e| store_error(e, &user.name))?;
+    Ok(Json(WritesResponse {
+        name: user.name,
+        writes,
+    }))
 }
 
 /// Refuse an admin acting destructively on its own account. `verb` names what
@@ -1006,6 +1840,16 @@ fn store_error(e: anyhow::Error, subject: &str) -> ApiError {
                 .unwrap_or_else(|| format!("{e:#}")),
         );
     }
+    // The name belongs to an agent: accounts and agents share one
+    // namespace. The store's sentence names the name and the rule only.
+    if StoreRefusal::kind_of(&e) == Some(RefusalKind::NameTaken) {
+        return ApiError::conflict(
+            e.chain()
+                .find_map(|cause| cause.downcast_ref::<StoreRefusal>())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("{e:#}")),
+        );
+    }
     let detail = format!("{e:#}");
     if detail.contains("UNIQUE constraint") {
         // The store's message here is the database's, and it names a column.
@@ -1047,6 +1891,101 @@ mod tests {
             .await
             .unwrap();
         (dir, store)
+    }
+
+    /// A first sign-in through an invite link whose name another account
+    /// took between the check and the redemption is taken back out, and the
+    /// link it used is pending again, so the person follows it once more
+    /// instead of asking for a new one.
+    #[tokio::test]
+    async fn a_taken_back_redemption_leaves_the_link_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(crate::engine::Engine::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crystalline_index::TursoStore::open_in_memory()
+                    .await
+                    .unwrap(),
+            )),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            None,
+        ));
+        let auth = std::sync::Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        auth.add_user("root", "Root", None, Role::Admin, "pw12345678")
+            .await
+            .unwrap();
+        let state = RestState::new(engine, auth.clone(), &[]).unwrap();
+        let issued = auth
+            .create_invite(
+                &crate::auth_store::NewInvite {
+                    role: Role::Editor,
+                    domain: None,
+                    level: None,
+                    label: None,
+                    local_account: false,
+                    created_by: "root",
+                    ttl_secs: 86_400,
+                },
+                crate::auth_store::InviteLimits {
+                    per_creator: 10,
+                    max_users: 100,
+                },
+            )
+            .await
+            .unwrap();
+        let redeem = async {
+            // Another account takes the name after it was checked.
+            auth.add_user("vera", "Vera", None, Role::Viewer, "pw12345678")
+                .await
+                .unwrap();
+            auth.redeem_invite(
+                &issued.token,
+                crate::auth_store::InviteRedeemer::Linked {
+                    issuer: "https://idp.example",
+                    subject: "s-1",
+                    desired_name: "vera",
+                    display: None,
+                    email: None,
+                },
+                100,
+            )
+            .await
+        };
+        let err = provision_clear(&state, "vera", redeem).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.detail.contains("invite link again"), "{}", err.detail);
+        assert!(auth.user("vera-2").await.unwrap().is_none());
+        let invites = auth.invites(None, None).await.unwrap();
+        assert_eq!(
+            invites[0].state,
+            crate::auth_store::InviteState::Pending,
+            "{:?}",
+            invites[0]
+        );
+        assert_eq!(invites[0].used_by, None);
+    }
+
+    /// A bulk result row carries the store's refusal when it is one a person
+    /// reads (no such account, the last admin), and one plain sentence for
+    /// anything else: the database's own text stays in the log.
+    #[tokio::test]
+    async fn a_bulk_row_says_one_plain_sentence_for_a_store_failure() {
+        let (_dir, store) = store().await;
+        let missing = store
+            .check_change_of("nobody", "disable", true)
+            .await
+            .unwrap_err();
+        assert_eq!(bulk_message(missing, "nobody"), "no such user: 'nobody'");
+        let failure = anyhow::anyhow!("near \"FROM\": syntax error in SELECT name FROM users")
+            .context("disabling user 'ada'");
+        let message = bulk_message(failure, "ada");
+        assert!(!message.contains("syntax"), "{message}");
+        assert!(!message.contains("SELECT"), "{message}");
+        assert!(message.contains("'ada'"), "{message}");
     }
 
     /// The classifier against the store's real errors rather than against
@@ -1093,6 +2032,26 @@ mod tests {
         let api = store_error(removed, "ada");
         assert_eq!(api.status, StatusCode::CONFLICT);
         assert!(api.detail.contains("last admin"), "{}", api.detail);
+
+        // An agent's name is taken for an account: a 409 in the store's words.
+        store
+            .add_agent(
+                "nightly",
+                None,
+                crate::auth_store::AgentLoops::Both,
+                "ada",
+                "",
+                crate::auth_store::AGENT_TOKEN_DEFAULT_TTL_SECS,
+            )
+            .await
+            .unwrap();
+        let taken = store
+            .add_user("nightly", "N", None, Role::Viewer, "s3cret")
+            .await
+            .expect_err("an agent holds the name");
+        let api = store_error(taken, "nightly");
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert!(api.detail.contains("belongs to an agent"), "{}", api.detail);
 
         let missing = store
             .set_password("ghost", "s3cret")
@@ -1161,6 +2120,8 @@ mod tests {
             disabled: false,
             last_seen: None,
             reflection: ReflectionLevel::Default,
+            sign_in: None,
+            github_linked: None,
         });
         for spelling in ["root", "ROOT", "  Root  "] {
             let refused = refuse_self(&caller, spelling, "delete")
@@ -1216,5 +2177,82 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert!(check_password(" ").is_ok(), "a space is a character");
+    }
+    fn user(name: &str, seen: Option<&str>) -> User {
+        User {
+            name: name.to_string(),
+            display: name.to_string(),
+            email: None,
+            role: Role::Viewer,
+            disabled: false,
+            last_seen: seen.map(str::to_string),
+            reflection: ReflectionLevel::Default,
+            sign_in: Some(SignInKind::Password),
+            github_linked: Some(false),
+        }
+    }
+
+    fn query(text: &str) -> ListQuery {
+        let pairs: Vec<(String, String)> = text
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (k, v) = p.split_once('=').unwrap();
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        let object: serde_json::Map<String, serde_json::Value> = pairs
+            .into_iter()
+            .map(|(k, v)| {
+                let value = v
+                    .parse::<usize>()
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::String(v));
+                (k, value)
+            })
+            .collect();
+        serde_json::from_value(serde_json::Value::Object(object)).unwrap()
+    }
+
+    fn names(users: &[User]) -> Vec<&str> {
+        users.iter().map(|u| u.name.as_str()).collect()
+    }
+
+    fn roster() -> Vec<User> {
+        vec![
+            user("a", None),
+            user("b", Some("2026-11-02T10:00:00Z")),
+            user("c", Some("2026-11-01T10:00:00+00:00")),
+            user("d", None),
+            // Seen later than "b" by the clock, though it sorts earlier as text.
+            user("e", Some("2026-11-02T09:30:00-02:00")),
+        ]
+    }
+
+    #[test]
+    fn never_seen_sorts_last_in_both_directions_and_ties_break_by_name() {
+        let (asc, _) = select_users(roster(), &query("sort=last_seen")).unwrap();
+        assert_eq!(names(&asc), ["c", "b", "e", "a", "d"]);
+        let (desc, _) = select_users(roster(), &query("sort=last_seen&dir=desc")).unwrap();
+        assert_eq!(names(&desc), ["e", "b", "c", "a", "d"]);
+    }
+
+    #[test]
+    fn the_time_filters_compare_instants_and_skip_accounts_never_seen() {
+        let (rows, total) =
+            select_users(roster(), &query("seen_after=2026-11-01T12:00:00Z")).unwrap();
+        assert_eq!(names(&rows), ["b", "e"]);
+        assert_eq!(total, 2);
+        let (rows, _) = select_users(roster(), &query("seen_before=2026-11-02T09:30:00Z")).unwrap();
+        assert_eq!(names(&rows), ["c"]);
+    }
+
+    #[test]
+    fn no_limit_means_everything_and_paging_reports_the_whole_total() {
+        let (all, total) = select_users(roster(), &query("page=3")).unwrap();
+        assert_eq!((all.len(), total), (5, 5));
+        let (page, total) = select_users(roster(), &query("limit=2&page=3")).unwrap();
+        assert_eq!(names(&page), ["e"]);
+        assert_eq!(total, 5);
     }
 }

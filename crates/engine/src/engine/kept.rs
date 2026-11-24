@@ -3,7 +3,7 @@
 //!
 //! A kept text holds what a person typed into a page or an engram, so it
 //! goes only to somebody who may write that source: a Reflection text needs
-//! `edit` on the domain's Reflection (`curate` for PACT.md), the right its
+//! `edit` on the domain's Reflection (`curate` for a pact file), the right its
 //! room needs, and an engram text needs the right to write engrams there. A
 //! thread comment a refused write kept goes to its sender (matched on the
 //! account recorded beside it, never on a display name) while they read the
@@ -33,13 +33,13 @@ impl KeptRights {
     /// Whether these rights may handle `k` for the account `mine`: an
     /// engram text needs write access to the engrams; a Reflection text
     /// needs what saving its page in a room needs, `edit`, and `curate` for
-    /// PACT.md (as `require_reflection_edit` decides for the room); a kept
+    /// a pact file (as `require_reflection_edit` decides for the room); a kept
     /// comment needs `edit`, or `read` and being its recorded sender.
     fn allows(self, k: &KeptText, mine: Option<&str>) -> bool {
         match k.kind {
             KeptKind::Engram => self.engram,
             KeptKind::Reflection => {
-                let need = if k.path == crystalline_core::reflection::PACT_FILE {
+                let need = if crystalline_core::reflection::is_pact_file(&k.path) {
                     ReflectionRight::Curate
                 } else {
                     ReflectionRight::Edit
@@ -365,5 +365,42 @@ mod tests {
         remove_found(root, &found).unwrap();
         let err = remove_found(root, &found).unwrap_err();
         assert!(matches!(err, EngineError::NotFound(_)), "{err:?}");
+    }
+
+    /// A page pact's kept text needs curate, as its room does; its page's
+    /// needs edit.
+    #[test]
+    fn a_page_pacts_kept_text_needs_curate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for path in ["guides/a.md", "guides/a.pact.md", "PACT.md"] {
+            kept::write(
+                root,
+                "eng",
+                None,
+                KeptKind::Reflection,
+                path,
+                crystalline_core::time::now(),
+                "x",
+            )
+            .unwrap();
+        }
+        let editor = KeptRights {
+            engram: false,
+            reflection: ReflectionRight::Edit,
+        };
+        let curator = KeptRights {
+            engram: false,
+            reflection: ReflectionRight::Curate,
+        };
+        for k in &kept::scan(root) {
+            assert!(curator.allows(k, None), "{}", k.path);
+            assert_eq!(
+                editor.allows(k, None),
+                k.path == "guides/a.md",
+                "{}",
+                k.path
+            );
+        }
     }
 }

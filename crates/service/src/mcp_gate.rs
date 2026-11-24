@@ -5,7 +5,9 @@
 //! refused before the transport sees a byte of it. With the setting off the
 //! gate is a pass-through and the endpoint serves the legacy open tier exactly
 //! as it did before this existed - which is what makes the default install
-//! byte-identical to its old self.
+//! byte-identical to its old self. The one exception is an agent token
+//! (`cag_`): agents need `auth.mcp` on, so with it off such a token is told
+//! so, from its prefix alone, and never looked up.
 //!
 //! # Why the refusal is an HTTP status rather than a JSON-RPC error
 //!
@@ -82,7 +84,11 @@ use std::task::{Context, Poll};
 use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 
-use crate::rest::{AuthStore, MCP_TOKEN_PREFIX, OAUTH_ACCESS_PREFIX, OriginRule, Role};
+use crate::rest::{
+    AGENT_TOKEN_PREFIX, AGENTS_NEED_AUTH_MCP, AuthStore, MCP_TOKEN_PREFIX, OAUTH_ACCESS_PREFIX,
+    OriginRule, Role,
+};
+use crate::scope::Scope;
 
 /// The account a request authenticated as, inserted into the request
 /// extensions the transport hands on. rmcp copies the remaining
@@ -100,6 +106,18 @@ pub struct McpIdentity {
     pub name: String,
     /// Whether that account is an admin.
     pub admin: bool,
+}
+
+/// The agent of the loops a request authenticated as, inserted beside its
+/// [`McpIdentity`] when the bearer was an agent token. The identity then names
+/// the agent by its key (`agent:<name>`, [`crate::scope::agent_key`]), which no
+/// account may take, so a session an agent opened is never one an account can
+/// reuse and the other way round; this carries the scope the MCP server acts
+/// as ([`Scope::Agent`]).
+#[derive(Clone, Debug)]
+pub struct McpAgent {
+    /// The agent's scope, as the token resolved it.
+    pub scope: Scope,
 }
 
 /// The teaching text both refusals share, as a macro rather than a constant
@@ -263,6 +281,9 @@ enum Presented {
     Mcp(String),
     /// An OAuth access token, [`OAUTH_ACCESS_PREFIX`].
     Oauth(String),
+    /// An agent token, [`AGENT_TOKEN_PREFIX`]: looked up in the agents'
+    /// own table and never as an account's.
+    Agent(String),
 }
 
 /// What the `401` says, which is a function of this instance's configuration
@@ -306,10 +327,32 @@ fn presented_token(headers: &axum::http::HeaderMap, oauth: bool) -> Option<Prese
     if credential.starts_with(MCP_TOKEN_PREFIX) {
         return Some(Presented::Mcp(credential.to_string()));
     }
+    if credential.starts_with(AGENT_TOKEN_PREFIX) {
+        return Some(Presented::Agent(credential.to_string()));
+    }
     if oauth && credential.starts_with(OAUTH_ACCESS_PREFIX) {
         return Some(Presented::Oauth(credential.to_string()));
     }
     None
+}
+
+/// Whether `headers` present an agent token, by its prefix alone. What the
+/// MCP door and the ctl route ask while `auth.mcp` is off, where no token is
+/// looked up.
+pub(crate) fn presents_agent_token(headers: &axum::http::HeaderMap) -> bool {
+    matches!(presented_token(headers, false), Some(Presented::Agent(_)))
+}
+
+/// What an agent token is answered while `auth.mcp` is off: `403` with the
+/// teaching sentence ([`AGENTS_NEED_AUTH_MCP`]) and no `WWW-Authenticate`, so
+/// no client goes looking for a better credential. Nothing is wrong with the
+/// token; the instance has to change.
+pub(crate) fn agents_need_auth_mcp() -> Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": AGENTS_NEED_AUTH_MCP })),
+    )
+        .into_response()
 }
 
 /// The one refusal, built fresh per request so nothing about it can be
@@ -392,6 +435,17 @@ fn store_unavailable() -> Response {
 pub(crate) enum Bearer {
     /// A live credential of this account.
     Account(McpIdentity),
+    /// A live agent token, resolved to the agent's scope
+    /// ([`Scope::Agent`]). Each door takes this arm on purpose: the MCP door
+    /// lets the agent in under its key and the MCP server decides per call
+    /// (only during a run), the ctl route serves it the automation verbs
+    /// alone.
+    Agent {
+        /// The agent's name, as its scope carries it.
+        name: String,
+        /// The agent's scope.
+        scope: Scope,
+    },
     /// No credential, one that is not ours in shape, or one that resolves to
     /// nobody: the one refusal.
     Refused(Response),
@@ -427,7 +481,24 @@ pub(crate) async fn resolve_bearer(
     // One lookup, whichever door the credential came through, and it is also
     // what stamps `last_used` so a token list or a connected-client list in
     // Fluid can show when an agent last connected.
+    if let Presented::Agent(token) = &presented {
+        return match auth.agent_for_token(token).await {
+            Ok(Some(agent)) => Bearer::Agent {
+                scope: agent.scope(),
+                name: agent.name,
+            },
+            Ok(None) => Bearer::Refused(refusal(challenge())),
+            Err(error) => {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "an agent token check could not read the account store"
+                );
+                Bearer::Unavailable(store_unavailable())
+            }
+        };
+    }
     let resolved = match (&presented, &origin) {
+        (Presented::Agent(_), _) => Ok(None),
         (Presented::Mcp(token), _) => auth.mcp_token_user(token).await,
         (Presented::Oauth(token), Some(origin)) => auth.oauth_access_user(token, origin).await,
         // No origin is no audience, and an audience-bound credential with
@@ -480,16 +551,33 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let Some(auth) = self.auth.clone() else {
-            // The gate is off: the legacy open tier, untouched.
+            // The gate is off: the legacy open tier, untouched. An agent token
+            // is told why it opens nothing, from its prefix alone: no store is
+            // read, so its `last_used` stays as it was.
+            if presents_agent_token(request.headers()) {
+                return Box::pin(async move { Ok(agents_need_auth_mcp()) });
+            }
             return Box::pin(async move { Ok(inner.call(request).await?.into_response()) });
         };
         let sessions = self.sessions.clone();
         let oauth = self.oauth.clone();
         Box::pin(async move {
-            let identity = match resolve_bearer(&auth, oauth.as_ref(), request.headers()).await {
-                Bearer::Account(identity) => identity,
-                Bearer::Refused(response) | Bearer::Unavailable(response) => return Ok(response),
-            };
+            let (identity, agent) =
+                match resolve_bearer(&auth, oauth.as_ref(), request.headers()).await {
+                    Bearer::Account(identity) => (identity, None),
+                    // An agent passes the door under its key; what it may call
+                    // is decided per call by the MCP server (only during a run).
+                    Bearer::Agent { name, scope } => {
+                        let identity = McpIdentity {
+                            name: crate::scope::agent_key(&name),
+                            admin: false,
+                        };
+                        (identity, Some(McpAgent { scope }))
+                    }
+                    Bearer::Refused(response) | Bearer::Unavailable(response) => {
+                        return Ok(response);
+                    }
+                };
             let named = session_of(&request);
             // A revoked or rotated token never reaches here at all: it stops
             // resolving and `resolve_bearer` refuses it with the ordinary 401
@@ -503,6 +591,9 @@ where
             let terminating = request.method() == axum::http::Method::DELETE;
             let name = identity.name.clone();
             request.extensions_mut().insert(identity);
+            if let Some(agent) = agent {
+                request.extensions_mut().insert(agent);
+            }
             let response = inner.call(request).await?.into_response();
             if let Some(session) = minted_session(&response) {
                 sessions.claim(session, name);
@@ -541,7 +632,9 @@ mod tests {
     /// separately where it matters.
     fn credential(presented: &Option<Presented>) -> Option<&str> {
         match presented {
-            Some(Presented::Mcp(token) | Presented::Oauth(token)) => Some(token),
+            Some(Presented::Mcp(token) | Presented::Oauth(token) | Presented::Agent(token)) => {
+                Some(token)
+            }
             None => None,
         }
     }
@@ -624,6 +717,128 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// An agent token reaches the agents' own lookup, whatever `auth.oauth`
+    /// says, and never the account or OAuth one.
+    #[test]
+    fn an_agent_token_reaches_only_the_agent_door() {
+        let agent = format!("{AGENT_TOKEN_PREFIX}{}", "d".repeat(64));
+        for oauth in [false, true] {
+            assert!(
+                matches!(
+                    presented_token(request_with(Some(&format!("Bearer {agent}"))).headers(), oauth),
+                    Some(Presented::Agent(token)) if token == agent
+                ),
+                "oauth {oauth}"
+            );
+        }
+    }
+
+    /// **A live agent token passes the MCP door under its key**, carrying
+    /// its scope beside the identity: what it may call is the MCP server's
+    /// decision, per call. An unknown agent token gets the one refusal and
+    /// never reaches the transport.
+    #[tokio::test]
+    async fn a_live_agent_token_passes_the_door_under_its_key() {
+        let (_tmp, store, _admin, _editor) = store_with_two_agents().await;
+        let (_, issued) = store
+            .add_agent(
+                "nightly",
+                None,
+                crate::rest::AgentLoops::Both,
+                "ada",
+                "",
+                crate::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+            )
+            .await
+            .unwrap();
+        let expected = Scope::Agent {
+            name: "nightly".to_string(),
+            loops: crate::rest::AgentLoops::Both,
+            token_id: issued.id,
+            token_expires_at: issued.expires_at.clone(),
+        };
+        let headers = request_with(Some(&format!("Bearer {}", issued.token)));
+        match resolve_bearer(&store, None, headers.headers()).await {
+            Bearer::Agent { name, scope } => {
+                assert_eq!(name, "nightly");
+                assert_eq!(scope, expected);
+            }
+            _ => panic!("a live agent token resolves to the agent"),
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut gate = McpGate::new(
+            CapturingService(seen.clone()),
+            Some(store.clone()),
+            Arc::new(SessionOwners::default()),
+        );
+        let agent = tower_service::Service::call(
+            &mut gate,
+            request_with(Some(&format!("Bearer {}", issued.token))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent.status(), axum::http::StatusCode::OK);
+        let extensions = seen.lock().unwrap().take().expect("the transport saw it");
+        let identity = extensions.get::<McpIdentity>().cloned().unwrap();
+        assert_eq!(identity.name, "agent:nightly");
+        assert!(!identity.admin);
+        assert_eq!(extensions.get::<McpAgent>().unwrap().scope, expected);
+
+        let unknown = tower_service::Service::call(
+            &mut gate,
+            request_with(Some(&format!(
+                "Bearer {AGENT_TOKEN_PREFIX}{}",
+                "0".repeat(64)
+            ))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unknown.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(seen.lock().unwrap().is_none(), "the transport saw nothing");
+    }
+
+    /// **With the gate off an agent token is told why it opens nothing**, from
+    /// its prefix alone (no store to look it up in), with a `403` and no
+    /// challenge, and the transport never sees it. Any other request passes
+    /// as before.
+    #[tokio::test]
+    async fn with_the_gate_off_an_agent_token_is_told_agents_need_auth_mcp() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut gate = McpGate::new(
+            CapturingService(seen.clone()),
+            None,
+            Arc::new(SessionOwners::default()),
+        );
+        let agent = tower_service::Service::call(
+            &mut gate,
+            request_with(Some(&format!(
+                "Bearer {AGENT_TOKEN_PREFIX}{}",
+                "1".repeat(64)
+            ))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            agent
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none()
+        );
+        let body = axum::body::to_bytes(agent.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], AGENTS_NEED_AUTH_MCP);
+        assert!(seen.lock().unwrap().is_none(), "the transport saw nothing");
+
+        let open = tower_service::Service::call(&mut gate, request_with(None))
+            .await
+            .unwrap();
+        assert_eq!(open.status(), axum::http::StatusCode::OK);
     }
 
     /// **The refusal is a function of the configuration and of nothing a

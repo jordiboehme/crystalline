@@ -43,6 +43,12 @@ interface Cost {
  * longer than the others; a stale number only costs balance, never coverage.
  */
 const COSTS: Readonly<Record<string, Cost>> = {
+  // Measured locally on 2026-11-23 (chromium, 4.1 s), rounded up;
+  // replace with a CI number.
+  "admin.spec.ts": { root: 5, path: 5 },
+  // Measured locally on 2026-11-23 (chromium, 2.2 s and 1.0 s), rounded up;
+  // replace with a CI number.
+  "agents.spec.ts": { root: 3, path: 3 },
   "diagram-editing.spec.ts": { root: 119, path: 119 },
   "diagram-hold.spec.ts": { root: 17, path: 17 },
   "diagram-keys.spec.ts": { root: 135, path: 135 },
@@ -54,6 +60,10 @@ const COSTS: Readonly<Record<string, Cost>> = {
   "diagram-widget.spec.ts": { root: 83, path: 83 },
   "diagrams.spec.ts": { root: 11, path: 11 },
   "hidden-marks.spec.ts": { root: 126, path: 126 },
+  // Measured locally on 2026-11-23 (chromium, 5.9 s), rounded up; replace
+  // with a CI number.
+  "invite-redeem.spec.ts": { root: 6, path: 6 },
+  "invites.spec.ts": { root: 2, path: 2 },
   "kept.spec.ts": { root: 4, path: 4 },
   "mcp-tokens.spec.ts": { root: 2, path: 2 },
   "members.spec.ts": { root: 7, path: 8 },
@@ -66,6 +76,11 @@ const COSTS: Readonly<Record<string, Cost>> = {
   // rounded up; replace with a CI number.
   "quick-format.spec.ts": { root: 37, path: 37 },
   "reflection.spec.ts": { root: 55, path: 60 },
+  // Measured locally on 2026-11-24 (chromium and webkit, 3.6 s together),
+  // rounded up; replace with a CI number.
+  "reflection-settings.spec.ts": { root: 4, path: 4 },
+  // Estimated from its five short journeys; replace with a CI number.
+  "sidebar.spec.ts": { root: 8, path: 8 },
   "smoke.spec.ts": { root: 66, path: 70 },
   "sso-login.spec.ts": { root: 1, path: 1 },
   "table-grid.spec.ts": { root: 75, path: 75 },
@@ -73,6 +88,9 @@ const COSTS: Readonly<Record<string, Cost>> = {
   // rounded up; replace with a CI number.
   "update-note.spec.ts": { root: 3, path: 2 },
   "users-delete.spec.ts": { root: 4, path: 4 },
+  // Measured locally on 2026-11-23 (chromium only, 10 s), rounded up;
+  // replace with a CI number.
+  "users-table.spec.ts": { root: 11, path: 11 },
 };
 
 /** The cost of a spec file the table does not name yet. */

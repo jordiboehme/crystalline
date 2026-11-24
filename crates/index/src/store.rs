@@ -1396,6 +1396,9 @@ pub struct GraphNode {
     /// The engram's exact frontmatter status; feeds the retired-status fade in
     /// context ranking.
     pub status: String,
+    /// The engram's tags, alphabetical and folded to lowercase, as a search
+    /// hit carries them; empty when the engram has none.
+    pub tags: Vec<String>,
     /// Whose row this is: empty for the base row the domain's files describe,
     /// and the actor's key for one of their own drafts. A reader only ever
     /// meets their own, so a non-empty value means "this is your draft" and is
@@ -1473,17 +1476,11 @@ pub fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
 /// into memory at once.
 pub const LEXICAL_CANDIDATE_CAP: usize = 5000;
 
-/// Statuses that mark knowledge as retired. Exact lowercase match, the same
-/// stance as the canonical current filter.
-pub const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
-
-/// Whether a status belongs to the retired set. Exact lowercase match, the
-/// counterpart of [`is_current_status`]. Retirement is terminal: the
-/// consolidation sweep never flags a retired engram for being old, unverified
-/// or unlinked.
-pub fn is_retired_status(status: &str) -> bool {
-    RETIRED_STATUSES.contains(&status)
-}
+/// The retired set and its test live in crystalline-core, the lowest crate
+/// that needs them (a Reflection page is retired by the same words); they
+/// stay reachable here under their old names. The counterpart of
+/// [`is_current_status`].
+pub use crystalline_core::{RETIRED_STATUSES, is_retired_status};
 
 /// The statuses that mean "this is what holds now", as one equivalence class.
 /// `stable` is the canonical word Crystalline writes and the OKF v0.2 spelling;
@@ -2660,6 +2657,43 @@ pub struct ReflectionStamp {
     pub modified: String,
 }
 
+/// The reconcile state of one Reflection page:
+/// [`ReadStore::reflection_reconcile`] and [`Store::set_reflection_reconcile`].
+/// Kept in the index beside the page row and never in the file, so a check
+/// that changes nothing makes no file change. The engine reads `outcome`;
+/// this crate keeps it as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectionReconcile {
+    /// The page's path inside `reflections/`.
+    pub path: String,
+    /// When the page was last reconciled, RFC 3339.
+    pub last_reconciled: String,
+    /// What that reconcile did to the page (`updated` or `unchanged`).
+    pub outcome: String,
+    /// The hash of the page's resolved pact chain and its page settings as
+    /// that reconcile saw them, so a change made on disk or by a pull is
+    /// seen later.
+    pub pact_hash: String,
+    /// The version of the queue item that reconcile settled.
+    pub version: String,
+}
+
+/// An engram of a page's own domain that a page with a freshness (or an
+/// owned page) once cited and later dropped, with the engram's checksum
+/// when the page cited it: [`ReadStore::reflection_covered`]. Such an
+/// engram counts as covered while its checksum stays the same (rule A of
+/// the reflect queue). Written by
+/// [`crate::reflection::index_reflection_row`] only, beside the page row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectionCovered {
+    /// The page's path inside `reflections/`.
+    pub path: String,
+    /// The engram's permalink in the page's domain.
+    pub permalink: String,
+    /// SHA-256 hex of the engram file when the page cited it.
+    pub checksum: String,
+}
+
 /// Which table a domain's files are kept in. Each table keeps its own rows;
 /// one body of code reads and writes them all, the table chosen here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3545,6 +3579,23 @@ pub trait ReadStore: Send + Sync {
     /// [`Store::set_reflection_disclosures`] stored. Sorted by path.
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>>;
 
+    /// The reconcile state of the page at `path` of `domain`'s Reflection,
+    /// or `None` when it has none.
+    async fn reflection_reconcile(
+        &self,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<ReflectionReconcile>>;
+
+    /// The reconcile state of every page of `domain`'s Reflection that has
+    /// one, sorted by path in byte order.
+    async fn reflection_reconciles(&self, domain: DomainId) -> Result<Vec<ReflectionReconcile>>;
+
+    /// Every engram a page of `domain`'s Reflection keeps covered after it
+    /// dropped it ([`ReflectionCovered`]), sorted by path, then permalink,
+    /// in byte order.
+    async fn reflection_covered(&self, domain: DomainId) -> Result<Vec<ReflectionCovered>>;
+
     /// The lease of `loop_kind` on `domain` as stored, a stale one included.
     async fn automation_lease(
         &self,
@@ -4161,8 +4212,8 @@ pub trait Store: ReadStore {
     /// Insert or replace one reflection's row, keyed by `(domain, path)`.
     async fn upsert_reflection(&self, domain: DomainId, row: &ReflectionRow) -> Result<()>;
 
-    /// Remove one reflection's row and its chunks. `false` when there was no
-    /// row.
+    /// Remove one reflection's row, its chunks, its reconcile state and the
+    /// engrams it keeps covered. `false` when there was no row.
     async fn delete_reflection(&self, domain: DomainId, path: &str) -> Result<bool>;
 
     /// Replace one page's chunk rows with a freshly computed set, carrying over
@@ -4285,16 +4336,18 @@ pub trait Store: ReadStore {
         pr_url: &str,
     ) -> Result<bool>;
 
-    /// Add `paths` to the written paths of every lease on `domain` (either
-    /// loop) that `account` holds, whatever its age: a lease that went stale
-    /// and that nobody took over is still its token's, so what its runner
-    /// wrote meanwhile is kept. A path already noted is kept once. One
-    /// statement per lease, so two writers on a shared database never lose
-    /// each other's paths. Answers how many leases noted them.
+    /// Add `paths` to the written paths of every lease on `domain` that
+    /// `account` holds, of the loop `loop_kind` names or of either loop when
+    /// it names none, whatever its age: a lease that went stale and that
+    /// nobody took over is still its token's, so what its runner wrote
+    /// meanwhile is kept. A path already noted is kept once. One statement
+    /// per lease, so two writers on a shared database never lose each
+    /// other's paths. Answers how many leases noted them.
     async fn note_automation_written(
         &self,
         domain: DomainId,
         account: &str,
+        loop_kind: Option<&str>,
         paths: &[String],
     ) -> Result<u64>;
 
@@ -4306,6 +4359,55 @@ pub trait Store: ReadStore {
         domain: DomainId,
         path: &str,
         records: Option<&str>,
+    ) -> Result<()>;
+
+    /// Replace the reconcile state of the page `state.path` of `domain`'s
+    /// Reflection with `state`. The state goes with the page row
+    /// ([`Store::delete_reflection`]) and with the domain row. A write of the
+    /// page row ([`Store::upsert_reflection`]) leaves it alone, so an edit, a
+    /// sync and a full reindex, which only upsert the rows of pages still
+    /// there, keep it.
+    async fn set_reflection_reconcile(
+        &self,
+        domain: DomainId,
+        state: &ReflectionReconcile,
+    ) -> Result<()>;
+
+    /// Set the stored pact hash of the page at `path` to `hash`, only while
+    /// its state still holds `seen_hash` and `seen_at` (its
+    /// `last_reconciled`), the state the caller read: `false` and nothing
+    /// written when there is no state or another writer changed it in
+    /// between. Nothing else of the state changes. A page move uses it to
+    /// carry the hashes it alone changed, so a reconcile recorded meanwhile
+    /// wins.
+    async fn swap_reflection_reconcile_hash(
+        &self,
+        domain: DomainId,
+        path: &str,
+        seen_hash: &str,
+        seen_at: &str,
+        hash: &str,
+    ) -> Result<bool>;
+
+    /// Carry the reconcile state of the page at `from` to `to`, for a page
+    /// move, and the engrams it keeps covered: a state at `to` is replaced,
+    /// and a page with none at `from` leaves `to` as it is; the covered
+    /// engrams of `to` are replaced by those of `from`. Several statements,
+    /// so run it inside the caller's transaction, with the page rows it
+    /// moves beside.
+    async fn move_reflection_reconcile(&self, domain: DomainId, from: &str, to: &str)
+    -> Result<()>;
+
+    /// Change the engrams the page at `path` keeps covered: each of `add`
+    /// (permalink, checksum) is set, replacing a checksum stored for that
+    /// permalink, then each permalink of `remove` goes. Run it inside the
+    /// caller's transaction, beside the page row.
+    async fn update_reflection_covered(
+        &self,
+        domain: DomainId,
+        path: &str,
+        add: &[(String, String)],
+        remove: &[String],
     ) -> Result<()>;
 
     /// Record one run of `loop_kind` on `domain`, then keep only the newest

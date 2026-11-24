@@ -61,6 +61,7 @@ import {
   stripHtmlComments,
   withoutHtmlComments,
 } from "../markdown/htmlComments";
+import { RETIRED_CLASS } from "../lifecycle";
 import { stripIdLines } from "../reflectionText";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
@@ -602,7 +603,12 @@ function SearchSection({ domain }: { domain: string }): ReactElement {
           {hits.map((hit, index) => (
             // The rank keeps two hits apart that share a path and have no
             // section id yet; the list is redrawn whole on every answer.
-            <li key={`${String(index)}:${hit.path}#${hit.section ?? ""}`}>
+            // A retired page is still found, faded the way every list in
+            // this app fades a retired row, with the word beside it.
+            <li
+              key={`${String(index)}:${hit.path}#${hit.section ?? ""}`}
+              className={hit.retired ? RETIRED_CLASS : undefined}
+            >
               <Link
                 to={`${reflectionPageRoute(domain, hit.path)}${hit.section !== null ? `#s-${hit.section}` : ""}`}
                 className={LINK}
@@ -611,6 +617,11 @@ function SearchSection({ domain }: { domain: string }): ReactElement {
                   ? `${hit.title}: ${withoutHtmlComments(hit.heading).trim()}`
                   : hit.title}
               </Link>
+              {hit.retired && (
+                <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                  retired
+                </span>
+              )}
               <p className="text-caption text-slate-600 dark:text-slate-300">
                 {stripHtmlComments(stripIdLines(hit.snippet))}
               </p>

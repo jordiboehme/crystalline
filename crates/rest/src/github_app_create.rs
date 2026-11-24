@@ -349,7 +349,7 @@ fn page(state: &RestState, status: StatusCode, text: &str) -> Response {
             .replace('>', "&gt;")
             .replace('"', "&quot;")
     };
-    let back = escape(&format!("{}settings/github", state.base_path.href()));
+    let back = escape(&format!("{}admin/github", state.base_path.href()));
     let text = escape(text);
     let body = format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -376,7 +376,7 @@ fn page(state: &RestState, status: StatusCode, text: &str) -> Response {
 
 /// A 303 to the settings page under the base path, with `query`.
 fn to_settings(state: &RestState, query: &str) -> Response {
-    let location = format!("{}settings/github?{query}", state.base_path.href());
+    let location = format!("{}admin/github?{query}", state.base_path.href());
     (
         StatusCode::SEE_OTHER,
         no_store(),
@@ -399,7 +399,7 @@ fn to_settings(state: &RestState, query: &str) -> Response {
                    handed in the last hour and is spent by this call. Then \
                    the code is converted into the App's credentials, which \
                    are stored as `crystalline github app set` stores them, \
-                   and the browser is sent to `/settings/github?app=created`. \
+                   and the browser is sent to `/admin/github?app=created`. \
                    Refused without converting the code when a GitHub App is \
                    already configured. It is a browser landing, so every \
                    refusal is an HTML page, never JSON, and no answer \
@@ -408,7 +408,7 @@ fn to_settings(state: &RestState, query: &str) -> Response {
     responses(
         (
             status = 303,
-            description = "The App is stored: to `/settings/github?app=created`.",
+            description = "The App is stored: to `/admin/github?app=created`.",
         ),
         (
             status = 401,
@@ -593,11 +593,11 @@ fn already_configured_text() -> String {
     summary = "Where GitHub sends the browser after the GitHub App was installed.",
     description = "The manifest's `setup_url`. Changes nothing and reads \
                    nothing GitHub sent: it sends the browser to \
-                   `/settings/github?app=installed`.",
+                   `/admin/github?app=installed`.",
     responses(
         (
             status = 303,
-            description = "To `/settings/github?app=installed`.",
+            description = "To `/admin/github?app=installed`.",
         ),
     ),
 )]

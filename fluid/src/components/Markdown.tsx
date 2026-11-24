@@ -13,6 +13,8 @@
  * in `MarkdownBody.tsx`.
  */
 
+import type { ReactNode } from "react";
+
 import type { AssetResolver } from "../api/files";
 import type { WikilinkResolver } from "../wikilinks";
 import { Loading } from "./Loading";
@@ -71,7 +73,7 @@ export interface MarkdownProps {
    */
   sourceSpans?: boolean;
   /** A line drawn under the first `# Title`, outside the text (see `MarkdownBody`). */
-  titleNote?: string;
+  titleNote?: ReactNode;
   /** A control at the right end of the first heading, outside the text. */
   headingAside?: HeadingAside;
   /**

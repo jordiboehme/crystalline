@@ -227,6 +227,22 @@ pub(crate) enum RowOp<'a> {
         row: &'a crystalline_index::AttachmentRow,
         seen: Option<&'a crystalline_index::AttachmentRow>,
     },
+    /// A page's reconcile state, as recorded.
+    Reconcile(&'a crystalline_index::ReflectionReconcile),
+    /// A page's stored pact hash becomes `hash`, only while its state still
+    /// holds the hash and the time a move read (`seen_hash`, `seen_at`): a
+    /// reconcile recorded in between wins. Put it after the
+    /// [`RowOp::MoveReconcile`] that carries the state to `path`.
+    RehashReconcile {
+        path: &'a str,
+        seen_hash: &'a str,
+        seen_at: &'a str,
+        hash: &'a str,
+    },
+    /// A page's reconcile state goes with it from `from` to `to`. Put it
+    /// before the [`RowOp::DeletePage`] of `from`, which takes the state
+    /// with the row.
+    MoveReconcile { from: &'a str, to: &'a str },
 }
 
 /// Whether `e` is a refusal of the host-lock fence (or of the gate, whose
@@ -317,6 +333,30 @@ impl Engine {
                         store
                             .delete_asset(AssetTable::Reflection, domain_id, path)
                             .await?;
+                    }
+                    RowOp::Reconcile(state) => {
+                        store.set_reflection_reconcile(domain_id, state).await?;
+                    }
+                    RowOp::MoveReconcile { from, to } => {
+                        store.move_reflection_reconcile(domain_id, from, to).await?;
+                    }
+                    RowOp::RehashReconcile {
+                        path,
+                        seen_hash,
+                        seen_at,
+                        hash,
+                    } => {
+                        let swapped = store
+                            .swap_reflection_reconcile_hash(
+                                domain_id, path, seen_hash, seen_at, hash,
+                            )
+                            .await?;
+                        if !swapped {
+                            tracing::debug!(
+                                page = path,
+                                "a reconcile was recorded while the page's pact moved; it stands"
+                            );
+                        }
                     }
                     RowOp::HealAsset { row, seen } => {
                         let now = store

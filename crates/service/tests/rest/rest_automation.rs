@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 struct Fixture {
     addr: std::net::SocketAddr,
     engine: Arc<Engine>,
+    auth: Arc<AuthStore>,
     _state: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
@@ -103,6 +104,7 @@ async fn serve_with(anonymous: bool) -> Fixture {
             max_users: None,
             oidc: None,
             login: None,
+            invites: None,
         }),
         automation: Some(AutomationConfig {
             webhook: Some(WebhookConfig {
@@ -140,7 +142,7 @@ async fn serve_with(anonymous: bool) -> Fixture {
         engine.clone(),
         Arc::new(AtomicUsize::new(0)),
         &[],
-        auth,
+        auth.clone(),
         None,
     )
     .unwrap();
@@ -159,6 +161,7 @@ async fn serve_with(anonymous: bool) -> Fixture {
     Fixture {
         addr,
         engine,
+        auth,
         _state: state,
         _tmp: tmp,
     }
@@ -378,4 +381,70 @@ async fn an_unknown_domain_a_missing_session_and_a_bad_loop_are_refused() {
     assert_eq!(anonymous, 401);
     let (bad, _) = read_query(fx.addr, Some(&cookie), "eng", "?loop=sing").await;
     assert_eq!(bad, 400);
+}
+
+/// A run by an agent of the loops shows the agent's unique name and its display
+/// name, read when the answer is made, and no account; a viewer sees neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_by_an_agent_shows_the_agent_and_its_display_name() {
+    use crystalline_service::rest::AgentLoops;
+    let fx = serve().await;
+    fx.auth
+        .add_agent(
+            "nightly",
+            Some("Nightly Curator"),
+            AgentLoops::Both,
+            "cli",
+            "",
+            30 * 86_400,
+        )
+        .await
+        .unwrap();
+    let nightly = Scope::Agent {
+        name: "nightly".to_string(),
+        loops: AgentLoops::Both,
+        token_id: 1,
+        token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+    };
+    let token = fx
+        .engine
+        .automation_lease_take(Loop::Evolve, "eng", "n8n", &nightly)
+        .await
+        .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.engine
+        .automation_run_record(
+            Loop::Evolve,
+            "eng",
+            &token,
+            &RunReport {
+                started_at: String::new(),
+                outcome: RunOutcome::Done,
+                done: 1,
+                summary: "fixed one".to_string(),
+            },
+            &nightly,
+        )
+        .await
+        .unwrap();
+
+    let cookie = login_as(fx.addr, "root").await;
+    let (status, body) = read(fx.addr, Some(&cookie), "eng").await;
+    assert_eq!(status, 200, "{body}");
+    let run = &body["evolve"]["last_run"];
+    assert_eq!(run["agent"], "nightly", "{body}");
+    assert_eq!(run["agent_display"], "Nightly Curator", "{body}");
+    assert!(run["account"].is_null(), "{body}");
+
+    let cookie = login(fx.addr).await;
+    let (_, body) = read(fx.addr, Some(&cookie), "eng").await;
+    let run = &body["evolve"]["last_run"];
+    for hidden in ["agent", "agent_display", "account"] {
+        assert!(
+            run.get(hidden).is_none_or(Value::is_null),
+            "{hidden}: {body}"
+        );
+    }
 }

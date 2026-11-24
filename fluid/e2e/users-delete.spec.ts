@@ -41,17 +41,27 @@ test("an account is added and deleted behind the two-step confirm", async ({
   await page.goto("users");
   await expect(page.getByRole("heading", { name: "Users" })).toBeVisible();
 
-  await page.getByLabel("Login name").fill(name);
-  await page.getByLabel("Password", { exact: true }).fill("a-long-enough-pass");
-  await page.getByRole("button", { name: "Add user" }).click();
-  await expect(
-    page.getByRole("button", { name: `Delete ${name}` }),
-  ).toBeVisible();
+  const add = page.getByRole("region", { name: "Add an account" });
+  await add.getByLabel("Login name").fill(name);
+  await add.getByLabel("Password", { exact: true }).fill("a-long-enough-pass");
+  await add.getByRole("button", { name: "Add user" }).click();
 
+  // A new account opens at its own address, where its controls are.
+  await expect(page).toHaveURL(
+    (url) => url.pathname === `${BASE_PATH}/admin/users/${name}`,
+  );
   await page.getByRole("button", { name: `Delete ${name}` }).click();
   await page.getByRole("button", { name: `Confirm delete of ${name}` }).click();
 
-  await expect(
-    page.getByRole("button", { name: `Delete ${name}` }),
-  ).toHaveCount(0);
+  // Back on the list, and a search for it finds nothing.
+  await expect(page.getByText(`Deleted ${name}.`)).toBeVisible();
+  await expect(page).toHaveURL(
+    (url) => url.pathname === `${BASE_PATH}/admin/users`,
+  );
+  await page
+    .getByRole("search", { name: "Find accounts" })
+    .getByRole("searchbox")
+    .fill(name);
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("No account matches.")).toBeVisible();
 });

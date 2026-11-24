@@ -30,6 +30,8 @@ mod auth;
 mod automation;
 mod schemas;
 use crystalline_identity::auth_store;
+mod account_search;
+mod agents_api;
 mod discovery;
 mod domain_path;
 mod domains;
@@ -48,6 +50,8 @@ pub mod github_webhook;
 mod graph;
 pub mod host_guard;
 mod identity_links;
+mod invite_redeem;
+mod invites_api;
 mod kept;
 mod login_throttle;
 mod mcp_tokens;
@@ -56,8 +60,10 @@ mod oauth;
 mod oauth_grants;
 mod oidc;
 use crystalline_engine::pending;
+mod reflection_pages;
 mod reflections;
 mod users_api;
+pub use users_api::live_agent_drafts;
 
 use std::sync::Arc;
 
@@ -139,6 +145,8 @@ use crate::scope::{DomainAccess, DomainRight};
         (name = "reflection", description = "A domain's Reflection: documents for people, their threads and the reflect queue."),
         (name = "events", description = "Live changes to the knowledge, as one server-sent event stream per tab."),
         (name = "users", description = "Account management. Admin only."),
+        (name = "agents", description = "The agents of the loops and their tokens. Admin only."),
+        (name = "invites", description = "Invite links: made by admins, and by private domains' owners and managers where the instance allows it."),
         (name = "settings", description = "Instance settings. Admin only."),
         (name = "oauth", description = "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."),
     ),
@@ -237,10 +245,17 @@ use crate::scope::{DomainAccess, DomainRight};
         reflections::asset_write,
         reflections::asset_remove,
         reflections::asset_move,
+        reflection_pages::settings,
+        reflection_pages::retire,
+        reflection_pages::restore,
+        reflection_pages::clock,
+        reflection_pages::missed,
         events::stream_events,
+        account_search::search,
         users_api::list,
         users_api::create,
         users_api::update,
+        users_api::bulk,
         users_api::update_me,
         users_api::reset_password,
         users_api::remove,
@@ -264,6 +279,19 @@ use crate::scope::{DomainAccess, DomainRight};
         github_link::unlink,
         github_webhook::receive,
         users_api::unlink_github,
+        users_api::get_one,
+        users_api::get_writes,
+        users_api::set_writes,
+        agents_api::list,
+        agents_api::create,
+        agents_api::remove,
+        agents_api::issue_token,
+        agents_api::revoke_token,
+        invites_api::list,
+        invites_api::create,
+        invites_api::revoke,
+        invite_redeem::confirm,
+        invite_redeem::redeem,
         mcp_tokens::list,
         mcp_tokens::issue,
         mcp_tokens::rotate,
@@ -290,6 +318,7 @@ use crate::scope::{DomainAccess, DomainRight};
         ProblemDetail,
         ConflictDetail,
         schemas::User,
+        schemas::SignInKind,
         schemas::Role,
         domains::SaveManifestBody,
         domains::ManifestResponse,
@@ -360,12 +389,42 @@ use crate::scope::{DomainAccess, DomainRight};
         draft_links::TokenBody,
         draft_links::LeaveBody,
         draft_links::AcceptedDraft,
+        account_search::AccountHit,
+        account_search::AccountSearchResponse,
         users_api::CreateBody,
         users_api::PatchBody,
         users_api::MyProfileBody,
         users_api::PasswordBody,
         users_api::UserResponse,
         users_api::UsersResponse,
+        users_api::StateFilter,
+        users_api::KindFilter,
+        users_api::SortColumn,
+        users_api::SortDir,
+        users_api::UserDetailResponse,
+        users_api::DraftCount,
+        users_api::WritesResponse,
+        users_api::WritesBody,
+        schemas::Agent,
+        schemas::AgentLoops,
+        schemas::AgentToken,
+        schemas::AgentTokenState,
+        agents_api::AgentsResponse,
+        agents_api::CreateAgentBody,
+        agents_api::CreatedAgentResponse,
+        agents_api::IssueAgentTokenBody,
+        agents_api::IssuedAgentTokenResponse,
+        schemas::Invite,
+        schemas::InviteState,
+        invites_api::InvitesResponse,
+        invites_api::CreateInviteBody,
+        invites_api::CreatedInviteResponse,
+        invite_redeem::ConfirmBody,
+        invite_redeem::ConfirmResponse,
+        invite_redeem::InviteSignIn,
+        invite_redeem::RedeemBody,
+        invite_redeem::RedeemOutcome,
+        invite_redeem::RedeemResponse,
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
         github_settings::GithubAccessResponse,
@@ -409,6 +468,24 @@ use crate::scope::{DomainAccess, DomainRight};
         kept::KeptTextResponse,
         reflections::UploadedReflectionAsset,
         reflections::MoveReflectionAssetBody,
+        reflection_pages::ReflectionPageRef,
+        reflection_pages::ReflectionChainPage,
+        reflection_pages::ReflectionPactFile,
+        reflection_pages::ReflectionPageFinding,
+        reflection_pages::ReflectionRetirement,
+        reflection_pages::ReflectionPageView,
+        reflections::ReflectionDoc,
+        reflection_pages::ReflectionSettingsBody,
+        reflection_pages::ReflectionSettingsReceipt,
+        reflection_pages::RetireReflectionBody,
+        reflection_pages::RetiredReflection,
+        reflection_pages::RestoreReflectionBody,
+        reflection_pages::RestoredReflection,
+        reflection_pages::ReflectionPartOf,
+        reflection_pages::ReflectionPageClock,
+        reflection_pages::ReflectionClockResponse,
+        reflection_pages::MissedReflectionPage,
+        reflection_pages::MissedReflectionPages,
         schemas::EngramChanged,
         schemas::DomainChanged,
         schemas::ChangeKind,
@@ -488,6 +565,12 @@ pub struct RestState {
     /// startup from `auth.login.*` like the rest of the auth settings. See
     /// [`login_throttle`].
     login_throttle: Arc<LoginThrottle>,
+    /// The bound on trying invite tokens at `POST /invites/confirm` and
+    /// `POST /invites/redeem`, keyed by peer address, on the login
+    /// throttle's settings. See [`invite_redeem`].
+    invite_throttle: Arc<LoginThrottle>,
+    /// The per-caller budget of `GET /accounts/search`. See [`account_search`].
+    search_limiter: Arc<account_search::SearchLimiter>,
     /// The daemon's shutdown signal, which every open event stream ends on:
     /// a stream that outlived the drain would hold `axum::serve`'s graceful
     /// shutdown until its browser hung up. `None` on a router built by a
@@ -570,6 +653,8 @@ impl RestState {
             setup_token: None,
             login_slots: auth::login_slots(),
             login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
+            invite_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
+            search_limiter: Arc::default(),
             shutdown: None,
             streams: Arc::new(events::StreamSlots::default()),
             webhook_slots: Arc::new(Semaphore::new(github_webhook::CONCURRENT)),
@@ -682,9 +767,19 @@ impl RestState {
         auth::with_login_slot(&self.login_slots, work).await
     }
 
+    /// The account-search budget, for the one handler that consults it.
+    pub(crate) fn search_limiter(&self) -> &account_search::SearchLimiter {
+        &self.search_limiter
+    }
+
     /// The login throttle, for the one handler that consults it.
     pub(crate) fn login_throttle(&self) -> &LoginThrottle {
         &self.login_throttle
+    }
+
+    /// The invite-token throttle, for the two redemption handlers.
+    pub(crate) fn invite_throttle(&self) -> &LoginThrottle {
+        &self.invite_throttle
     }
 }
 
@@ -1116,6 +1211,7 @@ fn routes(state: RestState) -> Router {
         // The Reflection: a domain's documents for people. Rights are the
         // Reflection's own, decided in the engine; see `reflections`.
         .route("/reflection/domains", get(reflections::domains))
+        .route("/reflection/missed", get(reflection_pages::missed))
         .route("/domains/{domain}/reflection", get(reflections::status))
         .route("/domains/{domain}/reflection/tree", get(reflections::tree))
         .route(
@@ -1125,6 +1221,25 @@ fn routes(state: RestState) -> Router {
         .route(
             "/domains/{domain}/reflection/disclose",
             post(reflections::disclose),
+        )
+        // A page's settings, retirement and clock: static routes with the
+        // page in the body or the query, since nothing may follow the
+        // page wildcard.
+        .route(
+            "/domains/{domain}/reflection/settings",
+            patch(reflection_pages::settings),
+        )
+        .route(
+            "/domains/{domain}/reflection/retire",
+            post(reflection_pages::retire),
+        )
+        .route(
+            "/domains/{domain}/reflection/restore",
+            post(reflection_pages::restore),
+        )
+        .route(
+            "/domains/{domain}/reflection/clock",
+            get(reflection_pages::clock),
         )
         .route(
             "/domains/{domain}/reflection/threads",
@@ -1177,11 +1292,35 @@ fn routes(state: RestState) -> Router {
         // viewer. See [`users_api`] for the three rules these first mutating
         // routes are held to.
         .route("/users", get(users_api::list).post(users_api::create))
+        .route("/users/bulk", post(users_api::bulk))
+        .route("/accounts/search", get(account_search::search))
         .route(
             "/users/{name}",
-            patch(users_api::update).delete(users_api::remove),
+            get(users_api::get_one)
+                .patch(users_api::update)
+                .delete(users_api::remove),
         )
         .route("/users/{name}/drafts", delete(users_api::discard_drafts))
+        .route(
+            "/users/{name}/writes",
+            get(users_api::get_writes).put(users_api::set_writes),
+        )
+        // Admin only, inside the handlers, like the users routes; see
+        // [`agents_api`].
+        .route("/agents", get(agents_api::list).post(agents_api::create))
+        .route("/agents/{name}", delete(agents_api::remove))
+        .route("/agents/{name}/tokens", post(agents_api::issue_token))
+        .route(
+            "/agents/{name}/tokens/{id}",
+            delete(agents_api::revoke_token),
+        )
+        // Rights decided inside the handlers: admins, and private domains'
+        // owners and managers where the instance allows it; see
+        // [`invites_api`].
+        .route("/invites", get(invites_api::list).post(invites_api::create))
+        .route("/invites/{id}", delete(invites_api::revoke))
+        .route(invite_redeem::CONFIRM_PATH, post(invite_redeem::confirm))
+        .route(invite_redeem::REDEEM_PATH, post(invite_redeem::redeem))
         .route("/users/{name}/password", post(users_api::reset_password))
         // Admin only, inside the handler: frees a GitHub account linked to
         // the wrong Crystalline account. See [`github_link`].

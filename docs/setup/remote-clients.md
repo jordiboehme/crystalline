@@ -28,3 +28,5 @@ An agent built on the Messages API MCP connector can keep its context lean by de
 ```
 
 Claude Code does this for you: it turns tool search on automatically once a session's MCP tool descriptions grow large, loading tool names plus each server's instructions up front and the rest on demand. The routing block is sized to survive that mode intact (see [Session onboarding](../learning-loop.md#session-onboarding)).
+
+The engram text of a `read_engram` answer is in its `markdown` field, the name `read_reflection` uses. Hosted ChatGPT shows a tool result as empty when its JSON has a top-level `content` key, so no MCP answer has one. The CLI and the REST API keep their own shapes.

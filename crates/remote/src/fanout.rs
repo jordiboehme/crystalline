@@ -503,7 +503,10 @@ pub fn merge_evolve(parts: Vec<Part>, page: usize, limit: usize, missing: &[Miss
 /// rows of one part with the same domain, path and section. The domains a
 /// part could not read (`scope.unreadable`) and those whose Reflection is
 /// pending (`scope.pending`) stay named, and each key is there only when
-/// one was left out, as in a local answer.
+/// one was left out, as in a local answer. A `stale` item comes after every
+/// group that holds a feedback item, as in the engine's own order, and the
+/// pact texts the `stale` items on the page name (`pacts`, by domain, then
+/// path) come with them, each once.
 pub fn merge_reflect(parts: Vec<Part>, page: usize, limit: usize, missing: &[Missing]) -> Value {
     struct Group {
         oldest: i64,
@@ -513,6 +516,7 @@ pub fn merge_reflect(parts: Vec<Part>, page: usize, limit: usize, missing: &[Mis
         rows: Vec<Value>,
     }
     let page = page.max(1);
+    let mut pacts: Map<String, Value> = Map::new();
     let limit = limit.max(1);
     let text = |row: &Value, key: &str| {
         row.get(key)
@@ -556,6 +560,21 @@ pub fn merge_reflect(parts: Vec<Part>, page: usize, limit: usize, missing: &[Mis
                 }
             }
         }
+        for (domain, texts) in answer
+            .get("pacts")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let into = pacts
+                .entry(domain.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let (Value::Object(into), Value::Object(texts)) = (into, texts) {
+                for (path, text) in texts {
+                    into.entry(path.clone()).or_insert_with(|| text.clone());
+                }
+            }
+        }
         if guidance.is_null() {
             guidance = answer.get("guidance").cloned().unwrap_or(Value::Null);
             scope_kinds = answer
@@ -595,12 +614,39 @@ pub fn merge_reflect(parts: Vec<Part>, page: usize, limit: usize, missing: &[Mis
     }
     // Oldest group first; a tie keeps part order (local first, then connect
     // order), then path. The sort is stable, so a part's own order stands.
-    groups.sort_by(|a, b| {
+    let order = |a: &Group, b: &Group| {
         b.oldest
             .cmp(&a.oldest)
             .then(a.part.cmp(&b.part))
             .then_with(|| a.path.cmp(&b.path))
-    });
+    };
+    groups.sort_by(order);
+    // A stale page waits for every feedback group, however old it is, and
+    // then keeps its place by age (the engine's own rule).
+    let is = |g: &Group, key: &str, value: &str| {
+        g.rows
+            .iter()
+            .any(|row| row.get(key).and_then(Value::as_str) == Some(value))
+    };
+    let (stale, rest): (Vec<Group>, Vec<Group>) =
+        groups.into_iter().partition(|g| is(g, "what", "stale"));
+    let mut feedback_left = rest.iter().filter(|g| is(g, "kind", "feedback")).count();
+    let mut stale = stale.into_iter().peekable();
+    let mut groups: Vec<Group> = Vec::new();
+    for group in rest {
+        while feedback_left == 0
+            && stale
+                .peek()
+                .is_some_and(|s| order(s, &group) != std::cmp::Ordering::Greater)
+        {
+            groups.extend(stale.next());
+        }
+        if is(&group, "kind", "feedback") {
+            feedback_left -= 1;
+        }
+        groups.push(group);
+    }
+    groups.extend(stale);
     let start = (page - 1).saturating_mul(limit);
     let queue: Vec<Value> = groups
         .into_iter()
@@ -629,6 +675,33 @@ pub fn merge_reflect(parts: Vec<Part>, page: usize, limit: usize, missing: &[Mis
     if !pending.is_empty() {
         merged["scope"]["pending"] = Value::Array(pending);
     }
+    // The pact texts of the stale items on this page.
+    let mut shown: Map<String, Value> = Map::new();
+    for row in merged["queue"].as_array().into_iter().flatten() {
+        if row.get("what").and_then(Value::as_str) != Some("stale") {
+            continue;
+        }
+        let domain = text(row, "domain");
+        for path in row
+            .get("pacts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if let Some(body) = pacts.get(&domain).and_then(|texts| texts.get(path)) {
+                let into = shown
+                    .entry(domain.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Value::Object(into) = into {
+                    into.insert(path.to_string(), body.clone());
+                }
+            }
+        }
+    }
+    if !shown.is_empty() {
+        merged["pacts"] = Value::Object(shown);
+    }
     with_missing(merged, missing)
 }
 
@@ -637,6 +710,131 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    /// Within one part a stale group comes before another group of the
+    /// same age on the same page, as the engine ranks it
+    /// (`reflect::rank_tests`); across parts the part order breaks the tie
+    /// first (local, then connect order).
+    #[test]
+    fn a_merged_stale_group_keeps_the_engines_tie_order() {
+        let row = |what: &str, domain: &str, path: &str, section: Value, age: i64| json!({ "kind": "update", "what": what, "domain": domain, "path": path, "section": section, "heading": "", "age_secs": age });
+        let local = Part {
+            source: None,
+            answer: json!({ "total": 2, "queue": [
+                row("stale", "notes", "w.md", Value::Null, 100),
+                row("link_broken", "notes", "w.md", json!("s1"), 100),
+            ] }),
+        };
+        let merged = merge_reflect(vec![local], 1, 10, &[]);
+        let order: Vec<&str> = merged["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["what"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["stale", "link_broken"]);
+
+        // A stale page of a connected server waits for a local group of the
+        // same age and path.
+        let local = Part {
+            source: None,
+            answer: json!({ "total": 1, "queue": [ row("link_broken", "notes", "w.md", json!("s1"), 100) ] }),
+        };
+        let remote = Part {
+            source: Some("acme".into()),
+            answer: json!({ "total": 1, "queue": [ row("stale", "eng", "w.md", Value::Null, 100) ] }),
+        };
+        let merged = merge_reflect(vec![local, remote], 1, 10, &[]);
+        let order: Vec<&str> = merged["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["what"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["link_broken", "stale"]);
+    }
+
+    /// A stale item from one part comes after the feedback of every part,
+    /// however old it is, and keeps its pact texts; texts of a stale item
+    /// that is not on the page stay out.
+    #[test]
+    fn a_merged_reflect_keeps_stale_after_feedback_and_its_pact_texts() {
+        let stale = |domain: &str, path: &str, age: i64| json!({ "kind": "update", "what": "stale", "domain": domain, "path": path, "section": null, "heading": "", "age_secs": age, "pacts": ["PACT.md"], "version": "1:1:x" });
+        let feedback = json!({ "kind": "feedback", "what": "changed", "domain": "notes", "path": "b.md", "section": "s1", "heading": "", "age_secs": 5 });
+        let update = json!({ "kind": "update", "what": "source_changed", "domain": "notes", "path": "c.md", "section": "s2", "heading": "", "age_secs": 1 });
+        let parts = vec![
+            Part {
+                source: None,
+                answer: json!({
+                    "total": 2, "kinds": { "feedback": 1, "update": 1, "review": 0 },
+                    "queue": [feedback, update],
+                    "guidance": "g", "scope": { "domains": ["notes"], "kinds": [] },
+                }),
+            },
+            Part {
+                source: Some("acme".into()),
+                answer: json!({
+                    "total": 2, "kinds": { "feedback": 0, "update": 2, "review": 0 },
+                    "queue": [stale("eng", "week.md", 900), stale("eng", "month.md", 0)],
+                    "pacts": { "eng": { "PACT.md": "# Pact" } },
+                    "guidance": "g", "scope": { "domains": ["eng"], "kinds": [] },
+                }),
+            },
+        ];
+        let merged = merge_reflect(parts, 1, 10, &[]);
+        let order: Vec<&str> = merged["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["b.md", "week.md", "c.md", "month.md"], "{merged}");
+        assert_eq!(merged["queue"][1]["version"], "1:1:x");
+        assert_eq!(merged["pacts"]["eng"]["PACT.md"], "# Pact", "{merged}");
+
+        let first_only = |n| {
+            merge_reflect(
+                vec![Part {
+                    source: None,
+                    answer: json!({
+                        "total": 1, "kinds": {}, "queue": [json!({ "kind": "update", "what": "off_structure", "domain": "eng", "path": "x.md", "section": null, "heading": "", "age_secs": 9 }), stale("eng", "week.md", 1)],
+                        "pacts": { "eng": { "PACT.md": "# Pact" } },
+                        "guidance": "g", "scope": { "domains": ["eng"], "kinds": [] },
+                    }),
+                }],
+                1,
+                n,
+                &[],
+            )
+        };
+        assert!(first_only(1).get("pacts").is_none(), "{}", first_only(1));
+        assert_eq!(first_only(2)["pacts"]["eng"]["PACT.md"], "# Pact");
+
+        // A mount renamed on this machine: the server's answer is translated
+        // before the merge, and its texts are found under the local name.
+        let names = crate::mounts::NameMap {
+            source: "acme".into(),
+            to_remote: [("eng-acme".to_string(), "eng".to_string())].into(),
+            to_local: [("eng".to_string(), "eng-acme".to_string())].into(),
+        };
+        let mut answer = json!({
+            "total": 1, "kinds": {}, "queue": [stale("eng", "week.md", 1)],
+            "pacts": { "eng": { "PACT.md": "# Pact" } },
+            "guidance": "g", "scope": { "domains": ["eng"], "kinds": [] },
+        });
+        crate::mounts::translate_answer(&mut answer, &names);
+        let merged = merge_reflect(
+            vec![Part {
+                source: Some("acme".into()),
+                answer,
+            }],
+            1,
+            10,
+            &[],
+        );
+        assert_eq!(merged["queue"][0]["domain"], "eng-acme", "{merged}");
+        assert_eq!(merged["pacts"]["eng-acme"]["PACT.md"], "# Pact", "{merged}");
+    }
 
     #[test]
     fn reflect_queues_merge_by_the_oldest_group_and_keep_a_group_together() {

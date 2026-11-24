@@ -192,6 +192,16 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "instance secrets",
         sql: SCHEMA_V33,
     },
+    Migration {
+        version: 34,
+        label: "reflection reconcile state",
+        sql: SCHEMA_V34,
+    },
+    Migration {
+        version: 35,
+        label: "reflection covered engrams",
+        sql: SCHEMA_V35,
+    },
 ];
 
 /// A ledger and the ordered steps that raise it: the index set, and the
@@ -958,6 +968,44 @@ CREATE TABLE IF NOT EXISTS instance_secret (
 );
 "#;
 
+// When each Reflection page was last reconciled, what that did (`updated` or
+// `unchanged`), the hash of its pact chain and page settings it saw and the
+// version of the queue item it settled. One row per page, kept here and not
+// in the file, so an hourly check that changes nothing makes no file change
+// and no backup commit. A page with no row reads as reconciled at its row's
+// modified time. Goes with the page row (`delete_reflection`) and does not
+// cascade from `domain`: `wipe()` and the empty-row drop clear it by hand.
+// Guarded, so a replay changes nothing.
+const SCHEMA_V34: &str = r#"
+CREATE TABLE IF NOT EXISTS reflection_reconcile (
+    domain_id BIGINT NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    last_reconciled TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    pact_hash TEXT NOT NULL,
+    version TEXT NOT NULL,
+    PRIMARY KEY(domain_id, path)
+);
+"#;
+
+// The engrams of a page's own domain that a page with a freshness (or an
+// owned page) cited and then dropped, with each engram's checksum when the
+// page cited it: such an engram stays covered for the reflect queue until
+// its checksum moves (rule A). Written beside the page row by the one
+// writer of page rows, so engine writes and the sync both keep it. Goes with
+// the page row (`delete_reflection`), moves with the page and does not
+// cascade from `domain`: `wipe()` and the empty-row drop clear it by hand.
+// Guarded, so a replay changes nothing.
+const SCHEMA_V35: &str = r#"
+CREATE TABLE IF NOT EXISTS reflection_covered (
+    domain_id BIGINT NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    permalink TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    PRIMARY KEY(domain_id, path, permalink)
+);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -987,8 +1035,8 @@ CREATE TABLE attachment_blob (
 /// list. `engram_meta_value` references `engram`, so it goes before it.
 /// `reflection` and `reflection_asset` reference `domain(id)` too, and so does
 /// `reflection_chunk`, which goes before `reflection`. `automation_lease` and
-/// `automation_run` reference `domain(id)` as well, and so does
-/// `reflection_disclosure`.
+/// `automation_run` reference `domain(id)` as well, and so do
+/// `reflection_disclosure`, `reflection_reconcile` and `reflection_covered`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_vector",
     "contradiction",
@@ -1013,6 +1061,8 @@ pub const WIPE_TABLES: &[&str] = &[
     "automation_lease",
     "automation_run",
     "reflection_disclosure",
+    "reflection_reconcile",
+    "reflection_covered",
     "domain_spelling",
     "domain",
 ];

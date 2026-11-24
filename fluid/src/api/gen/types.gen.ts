@@ -63,6 +63,35 @@ export type AcceptedDraft = {
 };
 
 /**
+ * One account the search found.
+ */
+export type AccountHit = {
+    /**
+     * The display name.
+     */
+    display: string;
+    /**
+     * Whether the account is already a member of the asked domain (its
+     * owner counts). Always `false` without `domain`.
+     */
+    member: boolean;
+    /**
+     * The login name.
+     */
+    name: string;
+};
+
+/**
+ * What `GET /accounts/search` answers with.
+ */
+export type AccountSearchResponse = {
+    /**
+     * At most ten matching enabled accounts, by login name.
+     */
+    results: Array<AccountHit>;
+};
+
+/**
  * Acknowledge one finding on one engram: the engram by permalink, the rule id that fired, an optional note saying why it is intentional and, for a rule that fires more than once on an engram, the row's own `scope`. Omit the scope and the server picks the finding by running detection, which is the right answer for every rule that fires once.
  */
 export type AckBody = {
@@ -95,6 +124,102 @@ export type AckBody = {
      * every pair at once on `DELETE`.
      */
     scope?: string | null;
+};
+
+/**
+ * One agent with its tokens, newest first.
+ */
+export type Agent = {
+    /**
+     * When it was created, RFC 3339.
+     */
+    created_at: string;
+    /**
+     * Who created it: the admin's account, or `cli` for `crystalline agents`.
+     */
+    created_by: string;
+    /**
+     * A disabled agent keeps its rows, and none of its tokens opens anything.
+     */
+    disabled: boolean;
+    /**
+     * The name shown to people.
+     */
+    display: string;
+    /**
+     * The loops it runs.
+     */
+    loops: AgentLoops;
+    /**
+     * The unique name, folded like a login name. This is what a commit, a
+     * lease and `generated.by` carry.
+     */
+    name: string;
+    /**
+     * Its tokens, live or not, newest first.
+     */
+    tokens: Array<AgentToken>;
+};
+
+/**
+ * Which loops an agent runs. Chosen per agent; both by default.
+ */
+export type AgentLoops = 'reflect' | 'evolve' | 'both';
+
+/**
+ * One token of an agent, never carrying the token itself.
+ */
+export type AgentToken = {
+    /**
+     * When it was issued, RFC 3339.
+     */
+    created_at: string;
+    /**
+     * When it stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The row id, which `agents revoke` names.
+     */
+    id: number;
+    /**
+     * What the admin called it.
+     */
+    label: string;
+    /**
+     * When it was last presented, RFC 3339, or `None` when never.
+     */
+    last_used?: string | null;
+    /**
+     * When it was revoked, RFC 3339, or `None`.
+     */
+    revoked_at?: string | null;
+    /**
+     * Live, expired or revoked, as of the read.
+     */
+    state: AgentTokenState;
+};
+
+/**
+ * Where one agent token stands.
+ */
+export type AgentTokenState = 'live' | 'expired' | 'revoked';
+
+/**
+ * What `GET /agents` answers with.
+ */
+export type AgentsResponse = {
+    /**
+     * Every agent with its tokens, by name.
+     */
+    agents: Array<Agent>;
+    /**
+     * Whether `auth.mcp` is on in the effective configuration, the value a
+     * new agent is checked against. Agents work only with it on. The MCP
+     * endpoint reads the setting when the server starts, so a change made
+     * since needs a restart there.
+     */
+    auth_mcp: boolean;
 };
 
 /**
@@ -302,6 +427,55 @@ export type AutomationResponse = {
 };
 
 /**
+ * What a bulk action does to each account it names.
+ */
+export type BulkAction = 'deactivate' | 'reactivate' | 'role';
+
+/**
+ * One change for a selection of accounts. Each account is changed as `PATCH /users/{name}` would change it, so the last-admin guard applies to every one, and the caller's own account is refused. `role` is required with the `role` action and refused with the others.
+ */
+export type BulkBody = {
+    /**
+     * What to do to each account.
+     */
+    action: BulkAction;
+    /**
+     * The login names, in any casing. Repeats count once. At most 500.
+     */
+    names: Array<string>;
+    role?: Role | null;
+};
+
+/**
+ * What `POST /users/bulk` answers with: one entry per distinct account, in the
+ * order they were sent.
+ */
+export type BulkResponse = {
+    /**
+     * One result per account.
+     */
+    results: Array<BulkResult>;
+};
+
+/**
+ * What happened to one account of a bulk request.
+ */
+export type BulkResult = {
+    /**
+     * Whether the change was made.
+     */
+    done: boolean;
+    /**
+     * The refusal, in a sentence, when `done` is false.
+     */
+    message?: string | null;
+    /**
+     * The account, as the store keys it.
+     */
+    name: string;
+};
+
+/**
  * What happened to the engram: the four things the sync engine counts, and
  * `files` for an attachment.
  */
@@ -327,6 +501,54 @@ export type ClosedDomain = {
 };
 
 /**
+ * The body of `POST /invites/confirm`.
+ */
+export type ConfirmBody = {
+    /**
+     * The token from the link's fragment.
+     */
+    token: string;
+};
+
+/**
+ * What `POST /invites/confirm` answers with: what the link gives and how to
+ * take it.
+ */
+export type ConfirmResponse = {
+    /**
+     * The private domain the link gives membership of, if any.
+     */
+    domain?: string | null;
+    /**
+     * When the link stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The login name of the person who made the link.
+     */
+    inviter: string;
+    /**
+     * Their display name.
+     */
+    inviter_display: string;
+    level?: MemberLevel | null;
+    /**
+     * Whether the link may make an account with a login name and a
+     * password here.
+     */
+    local_allowed: boolean;
+    /**
+     * The instance role an account this link creates gets. An existing
+     * account keeps its own.
+     */
+    role: Role;
+    /**
+     * The sign-in this instance offers.
+     */
+    sign_in: InviteSignIn;
+};
+
+/**
  * The wire form of a 412: a problem detail carrying the version the server
  * holds now, so a client can show a merge view instead of just failing.
  */
@@ -343,6 +565,30 @@ export type ConflictDetail = {
     status: number;
     title: string;
     type: string;
+};
+
+/**
+ * The body of `POST /agents`.
+ */
+export type CreateAgentBody = {
+    /**
+     * The name shown to people. Defaults to the name.
+     */
+    display?: string | null;
+    /**
+     * The first token's life in days, 1 to 365. Defaults to 90.
+     */
+    expires_days?: number | null;
+    /**
+     * The first token's label. Defaults to the day it was issued.
+     */
+    label?: string | null;
+    loops?: AgentLoops | null;
+    /**
+     * The unique name, folded like a login name. It may not be taken by an
+     * account or another agent.
+     */
+    name: string;
 };
 
 /**
@@ -442,6 +688,71 @@ export type CreateEngramBody = {
      * are guidance.
      */
     type?: string | null;
+};
+
+/**
+ * The body of `POST /invites`.
+ */
+export type CreateInviteBody = {
+    /**
+     * A private domain the link gives membership of. Required for a domain
+     * owner's or manager's link.
+     */
+    domain?: string | null;
+    /**
+     * The link's life in days, 1 to 30. Defaults to 7.
+     */
+    expires_in_days?: number | null;
+    /**
+     * A label for the maker's own list.
+     */
+    label?: string | null;
+    level?: MemberLevel | null;
+    /**
+     * Whether the link may create an account with a password where single
+     * sign-on or a proxy would otherwise be the only way in. Admins only.
+     */
+    local_account?: boolean | null;
+    role?: Role | null;
+};
+
+/**
+ * What `POST /agents` answers with: the agent as stored and its first token.
+ */
+export type CreatedAgentResponse = {
+    /**
+     * The agent as stored.
+     */
+    agent: Agent;
+    /**
+     * Its first token, this once.
+     */
+    token: IssuedAgentTokenResponse;
+};
+
+/**
+ * A freshly made invite link. `token` and `link` are shown here and nowhere else, ever: only the token's hash is stored.
+ */
+export type CreatedInviteResponse = {
+    /**
+     * The link as stored.
+     */
+    invite: Invite;
+    /**
+     * The address to hand over, the token in its fragment. Absolute when
+     * `service.public_url` is set, else a path under the base path that the
+     * browser completes with its own origin.
+     */
+    link: string;
+    /**
+     * Whether `link` is a path the browser completes rather than a whole
+     * address.
+     */
+    relative: boolean;
+    /**
+     * The token itself, this once.
+     */
+    token: string;
 };
 
 /**
@@ -669,6 +980,20 @@ export type DraftConflictsResponse = {
      * text can be taken. Null when every choice is open or nothing is listed.
      */
     settle_note: string | null;
+};
+
+/**
+ * What one domain holds in an account's drafts, counted and never read.
+ */
+export type DraftCount = {
+    /**
+     * How many drafts, kept texts and open draft rooms the account has there.
+     */
+    count: number;
+    /**
+     * The domain.
+     */
+    domain: string;
 };
 
 /**
@@ -1106,6 +1431,102 @@ export type IdentityLinksResponse = {
 };
 
 /**
+ * One invite link, never carrying its token.
+ */
+export type Invite = {
+    /**
+     * When it was made, RFC 3339.
+     */
+    created_at: string;
+    /**
+     * The account that made it.
+     */
+    created_by: string;
+    /**
+     * The private domain the link gives membership of, if any.
+     */
+    domain?: string | null;
+    /**
+     * When it stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The row id, which a revoke names.
+     */
+    id: number;
+    /**
+     * What its creator called it.
+     */
+    label?: string | null;
+    level?: MemberLevel | null;
+    /**
+     * Whether it may create a local account with a password where an
+     * identity provider would otherwise be the only way in.
+     */
+    local_account: boolean;
+    /**
+     * When it was revoked, RFC 3339, or `None`.
+     */
+    revoked_at?: string | null;
+    /**
+     * The instance role an account this link creates gets.
+     */
+    role: Role;
+    /**
+     * Pending, used, revoked or expired, as of the read.
+     */
+    state: InviteState;
+    /**
+     * When it was used, RFC 3339, or `None`.
+     */
+    used_at?: string | null;
+    /**
+     * The account that used it, or `None`.
+     */
+    used_by?: string | null;
+};
+
+/**
+ * Which way in a link offers.
+ */
+export type InviteSignIn = 'local' | 'oidc' | 'proxy';
+
+/**
+ * Where one invite link stands.
+ */
+export type InviteState = 'pending' | 'used' | 'revoked' | 'expired';
+
+/**
+ * What `GET /invites` answers with.
+ */
+export type InvitesResponse = {
+    /**
+     * The links, newest first, never with their tokens.
+     */
+    invites: Array<Invite>;
+    /**
+     * The way in this instance offers a link's holder: `proxy` or `oidc`
+     * when an identity provider names people, else `local`. Only where it
+     * is not `local` does a link's `local_account` flag change anything.
+     */
+    sign_in: InviteSignIn;
+};
+
+/**
+ * The body of `POST /agents/{name}/tokens`.
+ */
+export type IssueAgentTokenBody = {
+    /**
+     * The token's life in days, 1 to 365. Defaults to 90.
+     */
+    expires_days?: number | null;
+    /**
+     * Its label. Defaults to the day it was issued.
+     */
+    label?: string | null;
+};
+
+/**
  * A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again.
  */
 export type IssueBody = {
@@ -1114,6 +1535,28 @@ export type IssueBody = {
      * one nobody dares revoke.
      */
     label: string;
+};
+
+/**
+ * A freshly issued agent token. `token` is shown here and nowhere else, ever: only its hash is stored. The agent sends it as `Authorization: Bearer <token>`.
+ */
+export type IssuedAgentTokenResponse = {
+    /**
+     * When it stops working, RFC 3339.
+     */
+    expires_at: string;
+    /**
+     * The row id, which a revoke names.
+     */
+    id: number;
+    /**
+     * Its label.
+     */
+    label: string;
+    /**
+     * The token itself, this once.
+     */
+    token: string;
 };
 
 /**
@@ -1216,6 +1659,11 @@ export type KeptTextsResponse = {
 };
 
 /**
+ * A sign-in kind a `GET /users` filter names.
+ */
+export type KindFilter = 'password' | 'oidc' | 'proxy' | 'token_only';
+
+/**
  * The key the join was opened under.
  */
 export type LeaveBody = {
@@ -1297,8 +1745,20 @@ export type LoopDelivery = {
 export type LoopRun = {
     /**
      * The account the run worked as; only for a caller who may run the loop.
+     * `null` for a run by an agent of the loops, which `agent` names.
      */
     account?: string | null;
+    /**
+     * The unique name of the agent of the loops the run worked as; only for
+     * a caller who may run the loop, and `null` for a person's run or the
+     * machine's own.
+     */
+    agent?: string | null;
+    /**
+     * The name `agent` is shown under, read when the answer is made; `null`
+     * without an agent, or once the agent is gone.
+     */
+    agent_display?: string | null;
     /**
      * Items done.
      */
@@ -1369,6 +1829,19 @@ export type LoopState = {
      * `null` unless the caller may run the loop and asked for counts.
      */
     left_for_person?: number | null;
+    /**
+     * When the next Reflection page falls due (its freshness runs out) or
+     * a due page enters its next period, RFC 3339 on the server's
+     * automation clock; also with `counts` off. `null` for evolve, for a
+     * loop that runs on another instance and when no page keeps itself
+     * current.
+     */
+    next_stale_at?: string | null;
+    /**
+     * The same instant in seconds from now, at least 1: a client with a
+     * skewed clock counts from this one.
+     */
+    next_stale_in_secs?: number | null;
     running?: LoopRunning | null;
 };
 
@@ -1639,6 +2112,14 @@ export type MembersResponse = {
      */
     archived_reason?: string | null;
     /**
+     * Whether this caller may make an invite link to this domain here:
+     * true for an instance admin, and for its owner or a manager while
+     * `auth.invites.managers` is on, on a private domain GitHub does not
+     * govern and a writable instance. The same gates `POST /invites`
+     * applies.
+     */
+    can_invite: boolean;
+    /**
      * Why this domain is closed (the GitHub App is not installed on its
      * repository), for an instance admin; `null` otherwise.
      */
@@ -1722,6 +2203,47 @@ export type MintedLinkResponse = {
      * The link itself, `dl_` plus 64 hex characters. Hand it to one person.
      */
     token: string;
+};
+
+/**
+ * A page a reflect run missed.
+ */
+export type MissedReflectionPage = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * Its freshness, as written.
+     */
+    freshness: string;
+    /**
+     * Seconds since it was last reconciled.
+     */
+    last_checked_secs: number;
+    /**
+     * Seconds since the end of the first reflect run that started after
+     * the page fell due and left it.
+     */
+    missed_secs: number;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * A co-editing room has the page open: it waits for the room.
+     */
+    waiting: boolean;
+};
+
+/**
+ * What `GET /reflection/missed` answers.
+ */
+export type MissedReflectionPages = {
+    /**
+     * Longest missed first.
+     */
+    pages: Array<MissedReflectionPage>;
 };
 
 /**
@@ -2144,6 +2666,64 @@ export type ProvisioningView = {
 export type Readers = 'shared' | 'private';
 
 /**
+ * The body of `POST /invites/redeem`.
+ */
+export type RedeemBody = {
+    /**
+     * The display name for a new local account. Defaults to the login name
+     * as typed.
+     */
+    display_name?: string | null;
+    /**
+     * The login name for a new local account. Signed in, it may only name
+     * the caller's own account.
+     */
+    login?: string | null;
+    /**
+     * The password for a new local account.
+     */
+    password?: string | null;
+    /**
+     * The token from the link's fragment.
+     */
+    token: string;
+};
+
+/**
+ * What a redeem request came to.
+ */
+export type RedeemOutcome = 'redeemed' | 'sign_in';
+
+/**
+ * What `POST /invites/redeem` answers with.
+ */
+export type RedeemResponse = {
+    /**
+     * Whether the redemption made that account.
+     */
+    created: boolean;
+    /**
+     * The CSRF token of the session this answer signed a new local account
+     * in with.
+     */
+    csrf?: string | null;
+    /**
+     * The domain the account is now a member of, if the link named one.
+     */
+    domain?: string | null;
+    level?: MemberLevel | null;
+    /**
+     * Where to send the browser, for `sign_in`.
+     */
+    location?: string | null;
+    /**
+     * Redeemed, or a sign-in to go through first.
+     */
+    outcome: RedeemOutcome;
+    user?: User | null;
+};
+
+/**
  * Every file of a domain's Reflection.
  */
 export type ReflectionAssetsResponse = {
@@ -2152,6 +2732,20 @@ export type ReflectionAssetsResponse = {
      * (`assets/...`).
      */
     assets: Array<AttachmentView>;
+};
+
+/**
+ * A page a page follows, on the way up its pact chain.
+ */
+export type ReflectionChainPage = {
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Its title.
+     */
+    title: string;
 };
 
 /**
@@ -2186,6 +2780,20 @@ export type ReflectionChanged = {
 };
 
 /**
+ * What `GET /domains/{domain}/reflection/clock` answers.
+ */
+export type ReflectionClockResponse = {
+    /**
+     * The checksum of the page file as stored, the same as a read's
+     * `checksum`; null for a missing page. A reconcile writes no file, so
+     * a client that heard a change compares this with the text it holds
+     * and reads the page again only when they differ.
+     */
+    checksum?: string | null;
+    clock?: ReflectionPageClock | null;
+};
+
+/**
  * `reader` reads the Reflection and comments, `contributor` also edits it. A grant only raises: an engram editor curates whatever it says.
  */
 export type ReflectionCollaboratorBody = {
@@ -2203,6 +2811,53 @@ export type ReflectionCollaboratorsResponse = {
      * Every collaborator, by account name.
      */
     collaborators: Array<ReflectionGrant>;
+};
+
+/**
+ * The answer of `GET /domains/{domain}/reflections/{path}`, as a schema:
+ * the route passes the engine's answer through unchanged, and this names
+ * its shape for the generated client.
+ */
+export type ReflectionDoc = {
+    /**
+     * The checksum of the stored file.
+     */
+    checksum: string;
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * Who has the page open in a co-editing room, while one is open.
+     */
+    live?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * The text answered (see the response description).
+     */
+    markdown: string;
+    page?: ReflectionPageView | null;
+    /**
+     * The reflection's path inside reflections/.
+     */
+    path: string;
+    /**
+     * The `##` sections with their ids, lines, change marks and sources.
+     */
+    sections: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * The open threads.
+     */
+    threads: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * Its title.
+     */
+    title: string;
 };
 
 /**
@@ -2237,6 +2892,256 @@ export type ReflectionGrant = {
  * curator: curating follows from writing the engrams.
  */
 export type ReflectionLevel = 'default' | 'reader' | 'contributor';
+
+/**
+ * A page's own page pact file.
+ */
+export type ReflectionPactFile = {
+    /**
+     * Whether it exists. A curator creates it with a `PUT` of that path.
+     */
+    exists: boolean;
+    /**
+     * Its path inside reflections/: the page's path with `.pact.md`.
+     */
+    path: string;
+};
+
+/**
+ * One page's freshness clock, in seconds relative to the server's
+ * automation clock (design 2.2 and 2.3).
+ */
+export type ReflectionPageClock = {
+    /**
+     * The page whose freshness keeps this one current: the page itself,
+     * or for an owned page the first page up its owners that has a
+     * freshness; null when none has.
+     */
+    clock_of?: string | null;
+    /**
+     * Seconds until a fresh page falls due; null once it is due, and for
+     * an owned page.
+     */
+    due_in_secs?: number | null;
+    /**
+     * The freshness that keeps the page current, as written: its own, or
+     * for an owned page that of `clock_of`; null when none does.
+     */
+    freshness?: string | null;
+    /**
+     * Seconds since then, never negative.
+     */
+    last_checked_secs?: number | null;
+    /**
+     * When the page (or `clock_of`) was last reconciled, RFC 3339; the
+     * page's change time when no reconcile is recorded.
+     */
+    last_reconciled?: string | null;
+    /**
+     * The page is overdue, reflect runs are known and none left it: the
+     * loop runs less often than the page's freshness.
+     */
+    loop_slower_than_freshness: boolean;
+    /**
+     * Seconds since a reflect run of the domain that started after the
+     * page fell due ended without reconciling it; null while no run left
+     * it. Only this is warned about (the missed list, doctor).
+     */
+    missed_secs?: number | null;
+    /**
+     * Seconds since the page turned overdue, one whole period after it
+     * fell due; null before. Show it on the page ("Overdue since ...").
+     */
+    overdue_secs?: number | null;
+    part_of?: ReflectionPartOf | null;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Whether the page is due: its freshness ran out.
+     */
+    stale: boolean;
+    /**
+     * A due page that a co-editing room has open: it waits for the room.
+     */
+    waiting: boolean;
+};
+
+/**
+ * A page setting or link that did not read, and why.
+ */
+export type ReflectionPageFinding = {
+    /**
+     * `freshness`, `follows`, `owner` or `folder parent`.
+     */
+    key: string;
+    /**
+     * The page it is about: this page, or a page up its chain.
+     */
+    page: string;
+    /**
+     * One sentence saying why it is ignored.
+     */
+    reason: string;
+    /**
+     * The value as written.
+     */
+    value: string;
+};
+
+/**
+ * A page as another page names it.
+ */
+export type ReflectionPageRef = {
+    /**
+     * Whether the page exists.
+     */
+    exists: boolean;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Its title; its path when the page does not exist.
+     */
+    title: string;
+};
+
+/**
+ * What a page says about itself beside its text: the `page` member of
+ * `GET /domains/{domain}/reflections/{path}` for a page (never for
+ * `PACT.md` or a page pact), and of a settings change's receipt.
+ */
+export type ReflectionPageView = {
+    /**
+     * The pages this page follows, from the top down; the last one is the
+     * page it follows directly. Empty when it follows only `PACT.md`.
+     */
+    chain: Array<ReflectionChainPage>;
+    /**
+     * What did not read, on this page or up its chain.
+     */
+    findings: Array<ReflectionPageFinding>;
+    /**
+     * The page whose pact this page follows, as written; null when the
+     * page follows its owner or its folder parent.
+     */
+    follows?: string | null;
+    /**
+     * How often the page is brought in line with its pacts, as written
+     * (`6h`, `1d`); null when it has none, when it does not read or is
+     * under an hour (then named in `findings`), or the page is owned (it
+     * is reconciled with its owner).
+     */
+    freshness?: string | null;
+    owner?: ReflectionPageRef | null;
+    /**
+     * The page's own page pact file.
+     */
+    pact: ReflectionPactFile;
+    /**
+     * The pact files that apply, in order: `PACT.md` (when it exists),
+     * then the page pact of each followed page that has one, then the
+     * page's own.
+     */
+    pacts: Array<string>;
+    retired?: ReflectionRetirement | null;
+    /**
+     * The page's `status`, as written. Any word of the retired set, as an
+     * engram's (`archived`, which a retire writes, `superseded`,
+     * `deprecated`, `legacy`; case folded), means the page is retired, and
+     * `retired` is set.
+     */
+    status?: string | null;
+};
+
+/**
+ * The page an owned page is part of.
+ */
+export type ReflectionPartOf = {
+    /**
+     * The owner's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Its title.
+     */
+    title: string;
+};
+
+/**
+ * How and when a page was retired.
+ */
+export type ReflectionRetirement = {
+    /**
+     * When, RFC 3339; null for a page retired only by a retired word in
+     * its status.
+     */
+    at?: string | null;
+    /**
+     * Who retired it: a person's or an agent's name; null as `at` is.
+     */
+    by?: string | null;
+    was_owned_by?: ReflectionPageRef | null;
+};
+
+/**
+ * A page's settings, the frontmatter keys only a curator changes. A key left out, or sent as null, keeps its value; an empty string ("") takes the key off the page; any other value sets it. At least one key.
+ */
+export type ReflectionSettingsBody = {
+    /**
+     * The page of this Reflection whose pact this page follows.
+     */
+    follows?: string | null;
+    /**
+     * How often the page is brought in line with its pacts: `1h`, `6h`,
+     * `1d`, `7d`, `30d` or any span of an hour or more (`h`, `d`, `w`, `m`
+     * for months of 30 days, `y`). Refused on an owned page.
+     */
+    freshness?: string | null;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * The page's status. A retired word is refused: retire the page with
+     * `POST /domains/{domain}/reflection/retire`.
+     */
+    status?: string | null;
+};
+
+/**
+ * What a settings change answers: the write's receipt with the page as it
+ * stands now.
+ */
+export type ReflectionSettingsReceipt = {
+    /**
+     * The checksum of the file as written.
+     */
+    checksum: string;
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * While a co-editing room is open over the page: `live` when the room
+     * took the change in, `file` when it is on disk only.
+     */
+    landed?: string | null;
+    /**
+     * The page's settings, chain, owner and retirement now.
+     */
+    page: ReflectionPageView;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * With `landed: file`: what the people in the room meet.
+     */
+    room_note?: string | null;
+};
 
 /**
  * RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored.
@@ -2363,6 +3268,43 @@ export type ResolveBody = {
 };
 
 /**
+ * What `POST /domains/{domain}/reflection/restore` takes.
+ */
+export type RestoreReflectionBody = {
+    /**
+     * The page it was owned by, to put it back under that page; leave it
+     * out to restore it as a page of its own.
+     */
+    owner?: string | null;
+    /**
+     * The retired page's path inside reflections/.
+     */
+    path: string;
+};
+
+/**
+ * What a restore answers.
+ */
+export type RestoredReflection = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * The page that owns it again; null when it stands on its own.
+     */
+    owner?: string | null;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Always true.
+     */
+    restored: boolean;
+};
+
+/**
  * Guided retirement of one engram: a `status` from a fixed set, an optional close-out date, and, for `superseded`, the successor that wires the reciprocal relation pair.
  */
 export type RetireBody = {
@@ -2383,6 +3325,38 @@ export type RetireBody = {
      * The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown.
      */
     valid_to?: string | null;
+};
+
+/**
+ * What `POST /domains/{domain}/reflection/retire` takes.
+ */
+export type RetireReflectionBody = {
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+};
+
+/**
+ * What a retire answers.
+ */
+export type RetiredReflection = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * The page's path inside reflections/.
+     */
+    path: string;
+    /**
+     * Always true.
+     */
+    retired: boolean;
+    /**
+     * The page that owned it, kept so a restore can put it back.
+     */
+    was_owned_by?: string | null;
 };
 
 /**
@@ -2555,6 +3529,30 @@ export type ShareBody = {
 };
 
 /**
+ * How an account signs in, worked out from what it holds, in this order: a
+ * password (`password`, even when it also has links or tokens), else an
+ * identity link to a sign-on provider (`oidc`), else any personal token row
+ * (`token_only`), else nothing of its own (`proxy`: an upstream proxy or
+ * trusted header authenticates it).
+ *
+ * `proxy` and `token_only` are inferred, since nothing stores the kind: the
+ * token table has no expiry or revoked column, so any row counts, an expired
+ * or unused one too, and a proxy account that was later given a token shows
+ * as `token_only`.
+ */
+export type SignInKind = 'password' | 'oidc' | 'proxy' | 'token_only';
+
+/**
+ * The column `GET /users` sorts by.
+ */
+export type SortColumn = 'name' | 'display' | 'role' | 'state' | 'last_seen' | 'kind';
+
+/**
+ * The direction of a sort.
+ */
+export type SortDir = 'asc' | 'desc';
+
+/**
  * What `POST /me/github-link/start` answers: where to send the browser.
  */
 export type StartGithubLinkResponse = {
@@ -2594,6 +3592,11 @@ export type StarterStanzaView = {
      */
     section: string;
 };
+
+/**
+ * The state a `GET /users` filter names.
+ */
+export type StateFilter = 'active' | 'disabled';
 
 /**
  * One `old -> canonical` mapping, both sides verbatim.
@@ -2819,6 +3822,10 @@ export type User = {
      */
     email?: string | null;
     /**
+     * Whether a GitHub link exists for this account. Filled like `sign_in`.
+     */
+    github_linked?: boolean | null;
+    /**
      * When this account last resolved a session or arrived through the
      * trusted header, RFC 3339. Null for an account never seen.
      */
@@ -2836,6 +3843,29 @@ export type User = {
      * What this account may do.
      */
     role: Role;
+    sign_in?: SignInKind | null;
+};
+
+/**
+ * What `GET /users/{name}` answers with: the account, its write list and
+ * what it holds in drafts.
+ */
+export type UserDetailResponse = {
+    /**
+     * What the account holds in drafts, per domain, only domains with any.
+     * Null when a domain's drafts could not be read. The drafts are the
+     * person's own, so this route only counts them.
+     */
+    drafts?: Array<DraftCount> | null;
+    /**
+     * The account, as the list shows it.
+     */
+    user: User;
+    /**
+     * The domains the account may write to, or null when it has no write
+     * list and writes wherever its role and memberships allow.
+     */
+    writes?: Array<string> | null;
 };
 
 /**
@@ -2855,7 +3885,12 @@ export type UserResponse = {
  */
 export type UsersResponse = {
     /**
-     * Every account, by name.
+     * How many accounts match the filters in all, whatever the page.
+     */
+    total: number;
+    /**
+     * The accounts of the asked page, or every matching account when no
+     * `limit` was given.
      */
     users: Array<User>;
 };
@@ -2944,6 +3979,79 @@ export type WithdrawBody = {
     revert?: boolean | null;
 };
 
+/**
+ * The whole write list. Each entry is a domain name or a name prefix ending in one `*`; entries are trimmed and repeats count once. `null` removes the list, so the account writes wherever its role and memberships allow; an empty list is refused.
+ */
+export type WritesBody = {
+    /**
+     * The new list, or null to remove it.
+     */
+    writes?: Array<string> | null;
+};
+
+/**
+ * What both verbs on `/users/{name}/writes` answer with.
+ */
+export type WritesResponse = {
+    /**
+     * The account, as the store keys it.
+     */
+    name: string;
+    /**
+     * The write list, or null when the account has none.
+     */
+    writes?: Array<string> | null;
+};
+
+export type SearchAccountsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * What was typed: a prefix or word prefix of a login or display name
+         * (case and accents folded). At least two characters, else the answer is
+         * empty. An admin may also give a whole email address.
+         */
+        q?: string;
+        /**
+         * The domain the person is picked for. Without it the search is for
+         * instance admins only.
+         */
+        domain?: string;
+    };
+    url: '/api/v1/accounts/search';
+};
+
+export type SearchAccountsErrors = {
+    /**
+     * No account identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller may not manage the domain's members, or (without `domain`) is not an admin.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * Too many searches; `Retry-After` says when to retry.
+     */
+    429: ProblemDetail;
+};
+
+export type SearchAccountsError = SearchAccountsErrors[keyof SearchAccountsErrors];
+
+export type SearchAccountsResponses = {
+    /**
+     * The matching accounts.
+     */
+    200: AccountSearchResponse;
+};
+
+export type SearchAccountsResponse = SearchAccountsResponses[keyof SearchAccountsResponses];
+
 export type GetActivityData = {
     body?: never;
     path?: never;
@@ -2992,6 +4100,214 @@ export type GetActivityResponses = {
 };
 
 export type GetActivityResponse = GetActivityResponses[keyof GetActivityResponses];
+
+export type ListAgentsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/agents';
+};
+
+export type ListAgentsErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type ListAgentsError = ListAgentsErrors[keyof ListAgentsErrors];
+
+export type ListAgentsResponses = {
+    /**
+     * Every agent, by name.
+     */
+    200: AgentsResponse;
+};
+
+export type ListAgentsResponse = ListAgentsResponses[keyof ListAgentsResponses];
+
+export type CreateAgentData = {
+    body: CreateAgentBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/agents';
+};
+
+export type CreateAgentErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, `auth.mcp` is off (an agent token would open nothing), or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * An account or another agent holds the name.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The body is JSON but not an agent, the name or display name is not allowed, or the life is not 1 to 365 days.
+     */
+    422: ProblemDetail;
+};
+
+export type CreateAgentError = CreateAgentErrors[keyof CreateAgentErrors];
+
+export type CreateAgentResponses = {
+    /**
+     * The agent and its first token, this once.
+     */
+    201: CreatedAgentResponse;
+};
+
+export type CreateAgentResponse = CreateAgentResponses[keyof CreateAgentResponses];
+
+export type DeleteAgentData = {
+    body?: never;
+    path: {
+        /**
+         * The agent, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/agents/{name}';
+};
+
+export type DeleteAgentErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such agent.
+     */
+    404: ProblemDetail;
+};
+
+export type DeleteAgentError = DeleteAgentErrors[keyof DeleteAgentErrors];
+
+export type DeleteAgentResponses = {
+    /**
+     * The agent, its tokens, its drafts and the links on them are gone.
+     */
+    204: void;
+};
+
+export type DeleteAgentResponse = DeleteAgentResponses[keyof DeleteAgentResponses];
+
+export type IssueAgentTokenData = {
+    body: IssueAgentTokenBody;
+    path: {
+        /**
+         * The agent, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/agents/{name}/tokens';
+};
+
+export type IssueAgentTokenErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such agent.
+     */
+    404: ProblemDetail;
+    /**
+     * The agent already holds two live tokens.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The life is not 1 to 365 days.
+     */
+    422: ProblemDetail;
+};
+
+export type IssueAgentTokenError = IssueAgentTokenErrors[keyof IssueAgentTokenErrors];
+
+export type IssueAgentTokenResponses = {
+    /**
+     * The token, this once.
+     */
+    201: IssuedAgentTokenResponse;
+};
+
+export type IssueAgentTokenResponse = IssueAgentTokenResponses[keyof IssueAgentTokenResponses];
+
+export type RevokeAgentTokenData = {
+    body?: never;
+    path: {
+        /**
+         * The agent, in any casing.
+         */
+        name: string;
+        /**
+         * The token's id.
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/api/v1/agents/{name}/tokens/{id}';
+};
+
+export type RevokeAgentTokenErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No live token of that id for this agent.
+     */
+    404: ProblemDetail;
+};
+
+export type RevokeAgentTokenError = RevokeAgentTokenErrors[keyof RevokeAgentTokenErrors];
+
+export type RevokeAgentTokenResponses = {
+    /**
+     * The token is revoked.
+     */
+    204: void;
+};
+
+export type RevokeAgentTokenResponse = RevokeAgentTokenResponses[keyof RevokeAgentTokenResponses];
 
 export type LoginData = {
     body: LoginBody;
@@ -5850,6 +7166,45 @@ export type WriteReflectionAssetResponses = {
 
 export type WriteReflectionAssetResponse = WriteReflectionAssetResponses[keyof WriteReflectionAssetResponses];
 
+export type GetReflectionClockData = {
+    body?: never;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query: {
+        /**
+         * The page's path inside reflections/.
+         */
+        path: string;
+    };
+    url: '/api/v1/domains/{domain}/reflection/clock';
+};
+
+export type GetReflectionClockErrors = {
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The Reflection is not here.
+     */
+    409: ProblemDetail;
+};
+
+export type GetReflectionClockError = GetReflectionClockErrors[keyof GetReflectionClockErrors];
+
+export type GetReflectionClockResponses = {
+    /**
+     * The page's clock.
+     */
+    200: ReflectionClockResponse;
+};
+
+export type GetReflectionClockResponse = GetReflectionClockResponses[keyof GetReflectionClockResponses];
+
 export type DiscloseReflectionSectionData = {
     body: DiscloseReflectionBody;
     path: {
@@ -5916,7 +7271,7 @@ export type MoveReflectionErrors = {
      */
     401: ProblemDetail;
     /**
-     * Below edit access, or this instance is read-only.
+     * Below edit access; below curate for a page that has a page pact or a move onto a path that becomes the folder parent of a page already there; or this instance is read-only.
      */
     403: ProblemDetail;
     /**
@@ -5928,7 +7283,7 @@ export type MoveReflectionErrors = {
      */
     409: ProblemDetail;
     /**
-     * A bad path, or `PACT.md`, which is edited and never moved.
+     * A bad path, `PACT.md`, which is edited and never moved, or a page pact, which moves only with its page.
      */
     422: ProblemDetail;
 };
@@ -5937,7 +7292,7 @@ export type MoveReflectionError = MoveReflectionErrors[keyof MoveReflectionError
 
 export type MoveReflectionResponses = {
     /**
-     * Moved with its threads and baseline; links to it rewritten: `{ from, to, links_rewritten, threads_moved }`. `links_failed`, `[{ domain, path, reason }]`, appears only when a page that links it could not be rewritten after the move.
+     * Moved with its threads and baseline, and its page pact when it has one; links to it rewritten: `{ from, to, links_rewritten, threads_moved, pact_moved, follows_rewritten, owners_rewritten }`. `links_rewritten` counts the links rewritten, in the pact files rewritten with the move and in the pages after it. `pact_moved` says whether its page pact moved with it. `follows_rewritten` counts the `follows` of other pages that now name the new path, and `owners_rewritten` the owners and former owners in other pages' records that do. `links_failed`, `[{ domain, path, reason }]`, appears only when a page that links it could not be rewritten after the move.
      */
     200: {
         [key: string]: unknown;
@@ -6030,7 +7385,7 @@ export type GetReflectQueueError = GetReflectQueueErrors[keyof GetReflectQueueEr
 
 export type GetReflectQueueResponses = {
     /**
-     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact.
+     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact. A `page_pact_changed` item (a page pact on the page's chain changed, or its stored pact hash no longer matches) carries `pacts`, `chain`, `pact_hash_changed` and `diff`; an `owner_gone` item carries `owner`, `owner_is` (`missing` or `retired`) and `hint`; `link_retired` and `link_broken` (per section) carry `links`, the pages it links that are retired or gone. `stale` items (a page whose freshness ran out) are a run's and never in this queue.
      */
     200: {
         [key: string]: unknown;
@@ -6038,6 +7393,98 @@ export type GetReflectQueueResponses = {
 };
 
 export type GetReflectQueueResponse = GetReflectQueueResponses[keyof GetReflectQueueResponses];
+
+export type RestoreReflectionData = {
+    body: RestoreReflectionBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/restore';
+};
+
+export type RestoreReflectionErrors = {
+    /**
+     * The anonymous viewer of a domain it reads.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access, the domain is off the caller's write list, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or page, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The Reflection is not here.
+     */
+    409: ProblemDetail;
+    /**
+     * A page that is not retired, a pact file, an empty `owner`, an `owner` that is not the page it was owned by, or an owner that is gone, retired or would close a cycle.
+     */
+    422: ProblemDetail;
+};
+
+export type RestoreReflectionError = RestoreReflectionErrors[keyof RestoreReflectionErrors];
+
+export type RestoreReflectionResponses = {
+    /**
+     * Restored.
+     */
+    200: RestoredReflection;
+};
+
+export type RestoreReflectionResponse = RestoreReflectionResponses[keyof RestoreReflectionResponses];
+
+export type RetireReflectionData = {
+    body: RetireReflectionBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/retire';
+};
+
+export type RetireReflectionErrors = {
+    /**
+     * The anonymous viewer of a domain it reads.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access, the domain is off the caller's write list, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or page, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The Reflection is not here.
+     */
+    409: ProblemDetail;
+    /**
+     * A pact file, which is no page, or a page already retired.
+     */
+    422: ProblemDetail;
+};
+
+export type RetireReflectionError = RetireReflectionErrors[keyof RetireReflectionErrors];
+
+export type RetireReflectionResponses = {
+    /**
+     * Retired.
+     */
+    200: RetiredReflection;
+};
+
+export type RetireReflectionResponse = RetireReflectionResponses[keyof RetireReflectionResponses];
 
 export type GetReflectionReviewData = {
     body?: never;
@@ -6125,7 +7572,7 @@ export type SearchReflectionsError = SearchReflectionsErrors[keyof SearchReflect
 
 export type SearchReflectionsResponses = {
     /**
-     * `{ domain, query, mode, total, page, limit, count, hits: [{ path, title, section, heading, snippet }] }`, best first. `mode` is the search that ran (hybrid, text or semantic), not a score; no hit carries one. `total` counts every hit, `count` this page's. `section` is the section id, `_top` for the text before the first heading, or `null` for a heading with no id yet.
+     * `{ domain, query, mode, total, page, limit, count, hits: [{ path, title, section, heading, snippet, retired }] }`, best first. `retired` marks a hit on a retired page, shown faded. `mode` is the search that ran (hybrid, text or semantic), not a score; no hit carries one. `total` counts every hit, `count` this page's. `section` is the section id, `_top` for the text before the first heading, or `null` for a heading with no id yet.
      */
     200: {
         [key: string]: unknown;
@@ -6133,6 +7580,52 @@ export type SearchReflectionsResponses = {
 };
 
 export type SearchReflectionsResponse = SearchReflectionsResponses[keyof SearchReflectionsResponses];
+
+export type SetReflectionSettingsData = {
+    body: ReflectionSettingsBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/settings';
+};
+
+export type SetReflectionSettingsErrors = {
+    /**
+     * The anonymous viewer of a domain it reads: it reads the Reflection and never changes it.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access (the detail names the right held and the right needed), the domain is off the caller's write list, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or page, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The page changed while it was written (read it again and repeat), or the Reflection is not here.
+     */
+    409: ProblemDetail;
+    /**
+     * No key to change; a pact file; a freshness that does not read, is under an hour, or is set on an owned page; a follows that names no page of this Reflection or closes a cycle; a retired word in status (retire the page instead); a status change on a retired page (restore it instead).
+     */
+    422: ProblemDetail;
+};
+
+export type SetReflectionSettingsError = SetReflectionSettingsErrors[keyof SetReflectionSettingsErrors];
+
+export type SetReflectionSettingsResponses = {
+    /**
+     * Changed.
+     */
+    200: ReflectionSettingsReceipt;
+};
+
+export type SetReflectionSettingsResponse = SetReflectionSettingsResponses[keyof SetReflectionSettingsResponses];
 
 export type GetReflectionSummaryData = {
     body?: never;
@@ -6346,7 +7839,7 @@ export type GetReflectionTreeError = GetReflectionTreeErrors[keyof GetReflection
 
 export type GetReflectionTreeResponses = {
     /**
-     * ReflectionTree: folders first, then reflections, each level sorted by name in byte order. `PACT.md` is only under `pact`, never in `nodes`.
+     * ReflectionTree: folders first, then reflections, each level sorted by name in byte order. `PACT.md` is only under `pact`, never in `nodes`, and a page pact (`<page>.pact.md`) is in neither: its page's read names it. A reflection carries `retired` (a retired page: hide it behind a switch) and `owner`, the path of the page that owns it, or null.
      */
     200: {
         [key: string]: unknown;
@@ -6377,7 +7870,7 @@ export type DeleteReflectionErrors = {
      */
     401: ProblemDetail;
     /**
-     * Below edit access, or this instance is read-only.
+     * Below edit access (curate for a page pact or a page that has one), or this instance is read-only.
      */
     403: ProblemDetail;
     /**
@@ -6398,7 +7891,7 @@ export type DeleteReflectionError = DeleteReflectionErrors[keyof DeleteReflectio
 
 export type DeleteReflectionResponses = {
     /**
-     * Deleted with its threads and baseline.
+     * Deleted with its threads and baseline, and its page pact when it has one.
      */
     204: void;
 };
@@ -6436,11 +7929,9 @@ export type GetReflectionError = GetReflectionErrors[keyof GetReflectionErrors];
 
 export type GetReflectionResponses = {
     /**
-     * ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open.
+     * ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source it can check carries the engram's `status` as written (a `draft`, `proposed`, `idea`, `poc` or `open` engram is tentative); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.
      */
-    200: {
-        [key: string]: unknown;
-    };
+    200: ReflectionDoc;
 };
 
 export type GetReflectionResponse = GetReflectionResponses[keyof GetReflectionResponses];
@@ -6467,7 +7958,7 @@ export type SaveReflectionErrors = {
      */
     401: ProblemDetail;
     /**
-     * Below edit access (curate for PACT.md), with a detail naming the right held and the right needed; the domain is off the caller's write list; or this instance is read-only.
+     * Below edit access (curate for a pact file), with a detail naming the right held and the right needed; a page setting changed below curate (the detail names the key and says to leave it out or send it as stored); a new page beside a waiting page pact below curate; the domain is off the caller's write list; or this instance is read-only.
      */
     403: ProblemDetail;
     /**
@@ -7746,6 +9237,237 @@ export type GetGraphResponses = {
 
 export type GetGraphResponse = GetGraphResponses[keyof GetGraphResponses];
 
+export type ListInvitesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Only links in this state.
+         */
+        state?: InviteState;
+    };
+    url: '/api/v1/invites';
+};
+
+export type ListInvitesErrors = {
+    /**
+     * `state` is not pending, used, revoked or expired.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * The trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type ListInvitesError = ListInvitesErrors[keyof ListInvitesErrors];
+
+export type ListInvitesResponses = {
+    /**
+     * The links, newest first.
+     */
+    200: InvitesResponse;
+};
+
+export type ListInvitesResponse = ListInvitesResponses[keyof ListInvitesResponses];
+
+export type CreateInviteData = {
+    body: CreateInviteBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/invites';
+};
+
+export type CreateInviteErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin and owners and managers may not make links here, or the caller is not the owner or a manager of the domain, asked for a role other than `none`, a level above their own, no domain or a local-account link; a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is shared or its access follows GitHub, the caller holds as many pending links as allowed, or the accounts and the pending links fill this instance.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The body is JSON but not a link: an admin role, a level without a domain, a level of `none`, a life outside 1 to 30 days, or a label that is too long or holds a control character.
+     */
+    422: ProblemDetail;
+};
+
+export type CreateInviteError = CreateInviteErrors[keyof CreateInviteErrors];
+
+export type CreateInviteResponses = {
+    /**
+     * The link, its token and its address, this once.
+     */
+    201: CreatedInviteResponse;
+};
+
+export type CreateInviteResponse = CreateInviteResponses[keyof CreateInviteResponses];
+
+export type ConfirmInviteData = {
+    body: ConfirmBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/invites/confirm';
+};
+
+export type ConfirmInviteErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * The link is not valid any more: one answer for a token that is unknown, used, revoked or expired, or whose maker or domain no longer allows it.
+     */
+    404: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * The body is JSON but carries no token.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many tokens were tried from this address.
+     */
+    429: ProblemDetail;
+};
+
+export type ConfirmInviteError = ConfirmInviteErrors[keyof ConfirmInviteErrors];
+
+export type ConfirmInviteResponses = {
+    /**
+     * What the link gives and the sign-in offered.
+     */
+    200: ConfirmResponse;
+};
+
+export type ConfirmInviteResponse = ConfirmInviteResponses[keyof ConfirmInviteResponses];
+
+export type RedeemInviteData = {
+    body: RedeemBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/invites/redeem';
+};
+
+export type RedeemInviteErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * The link is taken through the proxy in front of this instance, and this request carried no identity from it.
+     */
+    401: ProblemDetail;
+    /**
+     * A signed-in caller named another login, this link may not make a local account here, the account is disabled, a new account would pass the account cap, a signed-in caller did not echo the CSRF token, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No invite link has this token.
+     */
+    404: ProblemDetail;
+    /**
+     * The link's maker may no longer give what it gives, its domain is no longer private or follows GitHub, the login name is taken, the link names no domain and the caller has an account, or the sign-on identity belongs to an account already.
+     */
+    409: ProblemDetail;
+    /**
+     * The link was used, revoked or has expired.
+     */
+    410: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * A local account needs a login name and a password, and one was missing, empty or not a login name.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many tokens were tried from this address.
+     */
+    429: ProblemDetail;
+    /**
+     * The sign-on provider could not be reached to start the sign-in.
+     */
+    502: ProblemDetail;
+    /**
+     * Too many sign-ins are in flight, or the wait for a password slot ran out.
+     */
+    503: ProblemDetail;
+};
+
+export type RedeemInviteError = RedeemInviteErrors[keyof RedeemInviteErrors];
+
+export type RedeemInviteResponses = {
+    /**
+     * Redeemed, or (`outcome: sign_in`) where to send the browser to sign in first: the callback redeems the link. A new local account is signed in, with the session cookie set and its CSRF token in `csrf`.
+     */
+    200: RedeemResponse;
+};
+
+export type RedeemInviteResponse = RedeemInviteResponses[keyof RedeemInviteResponses];
+
+export type RevokeInviteData = {
+    body?: never;
+    path: {
+        /**
+         * The link's id.
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/api/v1/invites/{id}';
+};
+
+export type RevokeInviteErrors = {
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No unused, unrevoked link of that id that this caller may revoke.
+     */
+    404: ProblemDetail;
+};
+
+export type RevokeInviteError = RevokeInviteErrors[keyof RevokeInviteErrors];
+
+export type RevokeInviteResponses = {
+    /**
+     * The link is revoked.
+     */
+    204: void;
+};
+
+export type RevokeInviteResponse = RevokeInviteResponses[keyof RevokeInviteResponses];
+
 export type UpdateMyProfileData = {
     body: MyProfileBody;
     path?: never;
@@ -8642,6 +10364,22 @@ export type ListReflectionDomainsResponses = {
 
 export type ListReflectionDomainsResponse = ListReflectionDomainsResponses[keyof ListReflectionDomainsResponses];
 
+export type ListMissedReflectionPagesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/reflection/missed';
+};
+
+export type ListMissedReflectionPagesResponses = {
+    /**
+     * The missed pages.
+     */
+    200: MissedReflectionPages;
+};
+
+export type ListMissedReflectionPagesResponse = ListMissedReflectionPagesResponses[keyof ListMissedReflectionPagesResponses];
+
 export type SearchData = {
     body?: never;
     path?: never;
@@ -8940,11 +10678,63 @@ export type GetSyncSummaryResponse = GetSyncSummaryResponses[keyof GetSyncSummar
 export type ListUsersData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Search text: a prefix or word prefix of the login or display name (case
+         * and accents folded), or a whole email address.
+         */
+        q?: string;
+        /**
+         * Only accounts with this role.
+         */
+        role?: Role;
+        /**
+         * Only active or only disabled accounts.
+         */
+        state?: StateFilter;
+        /**
+         * Only accounts that sign in this way.
+         */
+        kind?: KindFilter;
+        /**
+         * Only accounts last seen before this instant (RFC 3339). An account
+         * never seen is not before anything.
+         */
+        seen_before?: string;
+        /**
+         * Only accounts last seen after this instant (RFC 3339).
+         */
+        seen_after?: string;
+        /**
+         * `true` for accounts with a GitHub link, `false` for those without.
+         */
+        github?: boolean;
+        /**
+         * The column to sort by. Default `name`; `name` breaks every tie.
+         */
+        sort?: SortColumn;
+        /**
+         * The direction. Default `asc`.
+         */
+        dir?: SortDir;
+        /**
+         * The page, from 1. Only read together with `limit`.
+         */
+        page?: number;
+        /**
+         * Accounts per page (1 to 500). Without it every matching account comes
+         * back in one answer.
+         */
+        limit?: number;
+    };
     url: '/api/v1/users';
 };
 
 export type ListUsersErrors = {
+    /**
+     * A filter, `page` or `limit` is malformed.
+     */
+    400: ProblemDetail;
     /**
      * No identity.
      */
@@ -8959,7 +10749,7 @@ export type ListUsersError = ListUsersErrors[keyof ListUsersErrors];
 
 export type ListUsersResponses = {
     /**
-     * Every account.
+     * The matching accounts.
      */
     200: UsersResponse;
 };
@@ -9015,6 +10805,47 @@ export type CreateUserResponses = {
 
 export type CreateUserResponse = CreateUserResponses[keyof CreateUserResponses];
 
+export type BulkUsersData = {
+    body: BulkBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/users/bulk';
+};
+
+export type BulkUsersErrors = {
+    /**
+     * The body is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * No names, more than 500, or a `role` that does not fit the action.
+     */
+    422: ProblemDetail;
+};
+
+export type BulkUsersError = BulkUsersErrors[keyof BulkUsersErrors];
+
+export type BulkUsersResponses = {
+    /**
+     * A result per account.
+     */
+    200: BulkResponse;
+};
+
+export type BulkUsersResponse = BulkUsersResponses[keyof BulkUsersResponses];
+
 export type DeleteUserData = {
     body?: never;
     path: {
@@ -9056,6 +10887,44 @@ export type DeleteUserResponses = {
 };
 
 export type DeleteUserResponse = DeleteUserResponses[keyof DeleteUserResponses];
+
+export type GetUserData = {
+    body?: never;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}';
+};
+
+export type GetUserErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+};
+
+export type GetUserError = GetUserErrors[keyof GetUserErrors];
+
+export type GetUserResponses = {
+    /**
+     * The account.
+     */
+    200: UserDetailResponse;
+};
+
+export type GetUserResponse = GetUserResponses[keyof GetUserResponses];
 
 export type UpdateUserData = {
     body: PatchBody;
@@ -9133,7 +11002,7 @@ export type DiscardUserDraftsErrors = {
      */
     403: ProblemDetail;
     /**
-     * The name has an account, or is the machine owner's.
+     * The name has an account or a live agent, or is the machine owner's.
      */
     409: ProblemDetail;
 };
@@ -9242,6 +11111,90 @@ export type ResetUserPasswordResponses = {
 };
 
 export type ResetUserPasswordResponse = ResetUserPasswordResponses[keyof ResetUserPasswordResponses];
+
+export type GetUserWritesData = {
+    body?: never;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/writes';
+};
+
+export type GetUserWritesErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+};
+
+export type GetUserWritesError = GetUserWritesErrors[keyof GetUserWritesErrors];
+
+export type GetUserWritesResponses = {
+    /**
+     * The write list.
+     */
+    200: WritesResponse;
+};
+
+export type GetUserWritesResponse = GetUserWritesResponses[keyof GetUserWritesResponses];
+
+export type SetUserWritesData = {
+    body: WritesBody;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/writes';
+};
+
+export type SetUserWritesErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * An entry is not a domain name or a name prefix with one `*` at the end, or the list is empty.
+     */
+    422: ProblemDetail;
+};
+
+export type SetUserWritesError = SetUserWritesErrors[keyof SetUserWritesErrors];
+
+export type SetUserWritesResponses = {
+    /**
+     * The write list as stored.
+     */
+    200: WritesResponse;
+};
+
+export type SetUserWritesResponse = SetUserWritesResponses[keyof SetUserWritesResponses];
 
 export type ValidateDocumentData = {
     body: ValidateBody;

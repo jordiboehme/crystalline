@@ -454,7 +454,7 @@ jobs:
       # action's manifest; `fallback: none` fails the step rather than
       # downloading an unpinned binary if the manifest ever lacks this host.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-cyclonedx@0.5.9
           fallback: none

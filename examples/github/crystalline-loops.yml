@@ -9,10 +9,24 @@
 #   https://crystalline.example.com
 # - variable CRYSTALLINE_DOMAIN: the domain to work, for example eng
 # - variable CRYSTALLINE_RUNNER_IMAGE: where you pushed the runner image
-# - secret CRYSTALLINE_REFLECT_TOKEN: the cmt_ token of an agent account
-#   that may curate the domain's Reflection
-# - secret CRYSTALLINE_EVOLVE_TOKEN: the cmt_ token of another agent
-#   account that may write the domain
+# - secret CRYSTALLINE_REFLECT_TOKEN: the cag_ token of an agent of the
+#   loops that runs reflect
+# - secret CRYSTALLINE_EVOLVE_TOKEN: the cag_ token of an agent of the
+#   loops that runs evolve
+#
+# The team server needs auth.mcp on (CRYSTALLINE_AUTH_MCP=true). An admin
+# makes the agents once, on the server, and each command prints its token
+# once:
+#
+#   crystalline agents add gha-reflect --loops reflect
+#   crystalline agents add gha-evolve --loops evolve
+#
+# One agent with both loops (--loops reflect,evolve) works too: each run
+# names its loop to the server. Put its token into both secrets, or issue a
+# second token for it with `crystalline agents token <name>`. A token expires after 90 days by default;
+# issue a new one with `crystalline agents token <name>`, update the secret,
+# then revoke the old one with `crystalline agents revoke`. A secret that
+# still holds the cmt_ token of an account keeps working.
 # - secret ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN for a Claude
 #   subscription)
 #

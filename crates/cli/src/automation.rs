@@ -104,6 +104,11 @@ pub enum LoopCommand {
         /// the loop on.
         #[arg(long)]
         domain: Vec<String>,
+        /// Work out nothing that is due: show only a run that is going, the
+        /// last run and where the loop runs. Cheap enough for a frequent
+        /// poll. Exits 0 unless there is an error.
+        #[arg(long)]
+        no_counts: bool,
     },
     /// Work what is due with a headless Claude Code agent: take the lease,
     /// run the agent with the prompt the server answers, share its changes
@@ -235,14 +240,20 @@ pub async fn run(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<(
 async fn dispatch(lp: Loop, command: LoopCommand, json: bool) -> anyhow::Result<u8> {
     let client = AutomationClient::from_env().await?;
     match command {
-        LoopCommand::Status { domain } => {
-            let answer = client.status(lp, &domain, false).await?;
+        LoopCommand::Status { domain, no_counts } => {
+            let answer = client.status(lp, &domain, false, !no_counts).await?;
             if json {
                 println!("{answer}");
             } else {
                 print_status(&answer);
             }
-            Ok(if any_due(&answer) { 0 } else { EXIT_NOTHING })
+            warn_token(&answer);
+            // Without counts nothing says whether work is due.
+            Ok(if no_counts || any_due(&answer) {
+                0
+            } else {
+                EXIT_NOTHING
+            })
         }
         LoopCommand::Run {
             domain,
@@ -285,6 +296,43 @@ fn domains_of(answer: &Value) -> &[Value] {
     answer["domains"].as_array().map_or(&[], Vec::as_slice)
 }
 
+/// The warning a status answer gives when the agent token this runner
+/// calls with ends within [`AGENT_TOKEN_WARN_SECS`], counted on the
+/// server's clock (`token_expires_in_secs`), or has ended. `None` for an
+/// account's answer, which carries no token, and for a later end.
+///
+/// [`AGENT_TOKEN_WARN_SECS`]: crystalline_service::rest::AGENT_TOKEN_WARN_SECS
+fn token_warning(answer: &Value) -> Option<String> {
+    let left = answer["token_expires_in_secs"].as_i64()?;
+    if left > crystalline_service::rest::AGENT_TOKEN_WARN_SECS {
+        return None;
+    }
+    let at = answer["token_expires_at"].as_str().unwrap_or("?");
+    let day = at.get(..10).unwrap_or(at);
+    let fix = "ask an admin for a new token for this agent (crystalline agents token <agent> on the server, or Administration > Agents) and give it to this runner";
+    Some(if left <= 0 {
+        format!(
+            "Warning: the agent token this runner uses ended on {day}, so its runs are refused: {fix}."
+        )
+    } else {
+        let when = match left / 86_400 {
+            0 => "in less than a day".to_string(),
+            1 => "in 1 day".to_string(),
+            n => format!("in {n} days"),
+        };
+        format!(
+            "Warning: the agent token this runner uses ends on {day} ({when}): {fix} before then."
+        )
+    })
+}
+
+/// Print [`token_warning`] to stderr, so `--json` output stays one answer.
+fn warn_token(answer: &Value) {
+    if let Some(line) = token_warning(answer) {
+        eprintln!("{line}");
+    }
+}
+
 fn any_due(answer: &Value) -> bool {
     domains_of(answer).iter().any(|d| d["due"] == true)
 }
@@ -308,6 +356,17 @@ fn delivery_line(delivery: &Value) -> Option<String> {
         Some(at) => format!("trigger: last sent {at}"),
         None => "trigger: nothing sent yet".to_string(),
     })
+}
+
+/// When the next page of a reflect entry falls due, on the server's
+/// clock; `None` when no page keeps itself current (and for evolve).
+fn next_stale_line(entry: &Value) -> Option<String> {
+    let at = entry["next_stale_at"].as_str()?;
+    let secs = entry["next_stale_in_secs"].as_u64().unwrap_or(0);
+    Some(format!(
+        "next page due: {at} (in {})",
+        crate::cmd::humanize_duration(secs)
+    ))
 }
 
 fn count_line(counts: &Value) -> String {
@@ -341,6 +400,8 @@ fn print_status(answer: &Value) {
             )
         } else if d["due"] == true {
             "due".to_string()
+        } else if d["due"].is_null() {
+            "not counted".to_string()
         } else {
             "nothing due".to_string()
         };
@@ -353,6 +414,9 @@ fn print_status(answer: &Value) {
         let left = d["left_for_person"].as_u64().unwrap_or(0);
         if left > 0 {
             println!("  left for a person: {left}");
+        }
+        if let Some(line) = next_stale_line(d) {
+            println!("  {line}");
         }
         if let Some(line) = delivery_line(&d["delivery"]) {
             println!("  {line}");
@@ -372,6 +436,49 @@ fn print_status(answer: &Value) {
 mod tests {
     use super::delivery_line;
     use serde_json::json;
+
+    /// A status answer for an agent whose token ends within 14 days, by the
+    /// server's count, gives one warning line that names the date and the
+    /// fix; a later end, an account's answer and an ended token give none
+    /// or the right one.
+    #[test]
+    fn a_token_that_ends_soon_is_warned_about() {
+        let answer = |secs: i64| {
+            json!({
+                "token_id": 3,
+                "token_expires_at": "2026-11-03T10:00:00Z",
+                "token_expires_in_secs": secs,
+            })
+        };
+        let line = super::token_warning(&answer(9 * 86_400 + 3600)).unwrap();
+        assert!(line.contains("2026-11-03"), "{line}");
+        assert!(line.contains("in 9 days"), "{line}");
+        assert!(line.contains("crystalline agents token"), "{line}");
+        let line = super::token_warning(&answer(3600)).unwrap();
+        assert!(line.contains("in less than a day"), "{line}");
+        assert_eq!(super::token_warning(&answer(15 * 86_400)), None);
+        assert_eq!(super::token_warning(&json!({"domains": []})), None);
+        let line = super::token_warning(&answer(-60)).unwrap();
+        assert!(line.contains("ended"), "{line}");
+    }
+
+    /// The status names when the next page falls due, also without
+    /// counts; nothing when no page keeps itself current.
+    #[test]
+    fn the_next_stale_line_says_when_the_next_page_falls_due() {
+        assert_eq!(
+            super::next_stale_line(&json!({"next_stale_at": null})),
+            None
+        );
+        assert_eq!(
+            super::next_stale_line(&json!({
+                "next_stale_at": "2026-10-22T10:00:00Z",
+                "next_stale_in_secs": 22 * 3600,
+            }))
+            .as_deref(),
+            Some("next page due: 2026-10-22T10:00:00Z (in 22h)")
+        );
+    }
 
     #[test]
     fn the_delivery_line_says_what_the_trigger_did() {

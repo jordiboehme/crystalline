@@ -13696,3 +13696,39 @@ parity!(
     a_host_label_is_the_name_with_a_short_id_on_a_clash_on_both_backends,
     a_host_label_is_the_name_with_a_short_id_on_a_clash
 );
+
+/// A graph node carries its engram's tags, alphabetical and folded to
+/// lowercase as a search hit carries them, and an untagged engram an empty
+/// list, on both backends.
+async fn graph_nodes_carry_tags(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "seed.md",
+        "---\ntype: engram\ntitle: Seed\npermalink: seed\ntags:\n  - Queue\n  - kafka\n  - multi-word\n  - multi_word\nstatus: proposed\n---\n\n# Seed\n\n- relates_to [[Bare]]\n",
+    );
+    write(
+        root,
+        "bare.md",
+        "---\ntype: engram\ntitle: Bare\npermalink: bare\nstatus: stable\n---\n\n# Bare\n\nNo tags here.\n",
+    );
+    sync_domain(store, "eng", root).await.unwrap();
+
+    let seed = store.lookup_id("eng", "seed").await.unwrap().unwrap();
+    let slice = store.neighbors(&[seed], 1, None).await.unwrap();
+    let node = |permalink: &str| {
+        slice
+            .nodes
+            .iter()
+            .find(|n| n.permalink == permalink)
+            .unwrap_or_else(|| panic!("no {permalink} in {:?}", slice.nodes))
+    };
+    assert_eq!(
+        node("seed").tags,
+        ["kafka", "multi-word", "multi_word", "queue"]
+    );
+    assert_eq!(node("seed").status, "proposed");
+    assert!(node("bare").tags.is_empty(), "{:?}", node("bare").tags);
+}
+parity!(graph_nodes_carry_their_tags, graph_nodes_carry_tags);

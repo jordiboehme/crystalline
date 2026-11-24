@@ -1160,3 +1160,145 @@ fn debug_shows_only_the_scheme_and_host_of_the_url() {
         assert!(!shown.contains(hidden), "{hidden} in {shown}");
     }
 }
+
+/// The agent writes `path` with a freshness of one hour, and its reconcile
+/// is recorded at `at`.
+async fn hourly_page(fx: &Fx, path: &str, at: &str) {
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: path.into(),
+                markdown: Some("---\nfreshness: 1h\n---\n# Hourly\n\n## Now\n\nText.\n".into()),
+                sources: BTreeMap::from([("_top".to_string(), Vec::new())]),
+                ..Default::default()
+            },
+            &agent(),
+        )
+        .await
+        .unwrap();
+    let store = fx.engine.store();
+    let store = store.lock().await;
+    let id = store.domain_id("eng").await.unwrap().unwrap();
+    store
+        .set_reflection_reconcile(
+            id,
+            &crystalline_index::ReflectionReconcile {
+                path: path.to_string(),
+                last_reconciled: at.to_string(),
+                outcome: "unchanged".to_string(),
+                pact_hash: String::new(),
+                version: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+fn clock(engine: &Engine, at: &str) {
+    engine.set_automation_now(Some(crystalline_core::time::parse_rfc3339(at).unwrap()));
+}
+
+/// With nothing else happening, the trigger looks again when the status
+/// says the next page falls due (`next_stale_in_secs`), and sends then.
+#[tokio::test(start_paused = true)]
+async fn a_page_that_falls_due_is_sent_when_it_does() {
+    let mut hook = hook();
+    let fx = reflecting("reflect_trigger: webhook\n", Some(&hook.url)).await;
+    hourly_page(&fx, "w.md", "2026-10-21T10:00:00+00:00").await;
+    let task = start(&fx.engine, &hook).await;
+    let begin = Instant::now();
+    assert!(
+        hook.next(minutes(30)).await.is_none(),
+        "nothing while the page is fresh"
+    );
+    // The automation clock moves on while nothing else happens.
+    clock(&fx.engine, "2026-10-21T11:00:30+00:00");
+    let hit = hook.next(minutes(40)).await.expect("one when it falls due");
+    let after = hit.at - begin;
+    assert!(
+        after >= minutes(60) && after <= minutes(62),
+        "sent {after:?} after the start"
+    );
+    assert_eq!(hit.json()["counts"]["stale"], 1, "{}", hit.json());
+    assert!(hook.next(minutes(10)).await.is_none(), "one, not more");
+    task.stop().await;
+}
+
+/// A stale page is sent without waiting for quiet sources: with a source
+/// update beside it, the look an engram change arms sends at once, where
+/// the update alone waits half an hour.
+#[tokio::test(start_paused = true)]
+async fn a_stale_page_skips_the_quiet_rule() {
+    let mut hook = hook();
+    let fx = reflecting("reflect_trigger: webhook\n", Some(&hook.url)).await;
+    hourly_page(&fx, "w.md", "2026-10-21T08:00:00+00:00").await;
+    let task = start(&fx.engine, &hook).await;
+    let begin = Instant::now();
+    with_a_source_update(&fx).await;
+    let hit = hook.next(minutes(3)).await.expect("sent at once");
+    assert!(hit.at - begin <= minutes(2), "{:?}", hit.at - begin);
+    let body = hit.json();
+    assert_eq!(body["counts"]["stale"], 1, "{body}");
+    assert_eq!(body["counts"]["updates"], 1, "{body}");
+    task.stop().await;
+}
+
+/// A page that falls due under five minutes after a delivery waits for the
+/// cap, then goes out with every stale page counted.
+#[tokio::test(start_paused = true)]
+async fn a_page_due_inside_the_cap_is_sent_when_it_ends() {
+    let mut hook = hook();
+    let fx = reflecting("reflect_trigger: webhook\n", Some(&hook.url)).await;
+    // `a.md` is due now, `b.md` falls due two minutes on.
+    hourly_page(&fx, "a.md", "2026-10-21T08:00:00+00:00").await;
+    hourly_page(&fx, "b.md", "2026-10-21T09:02:00+00:00").await;
+    let task = start(&fx.engine, &hook).await;
+    let first = hook.next(minutes(2)).await.expect("the first");
+    assert_eq!(first.json()["counts"]["stale"], 1, "{}", first.json());
+    clock(&fx.engine, "2026-10-21T10:02:30+00:00");
+    let second = hook.next(minutes(10)).await.expect("the second");
+    let gap = second.at - first.at;
+    assert!(
+        gap >= RATE_LIMIT && gap <= RATE_LIMIT + Duration::from_secs(15),
+        "{gap:?}"
+    );
+    assert_eq!(second.json()["counts"]["stale"], 2, "{}", second.json());
+    task.stop().await;
+}
+
+/// A due page a person has open in a live editor waits for the room: it is
+/// not due work, so nothing is sent for it, and its page clock says it is
+/// waiting.
+#[tokio::test(start_paused = true)]
+async fn a_stale_page_open_in_a_live_room_is_not_sent() {
+    use crystalline_service::collab::session::CollabSessions;
+    let mut hook = hook();
+    let fx = reflecting("reflect_trigger: webhook\n", Some(&hook.url)).await;
+    hourly_page(&fx, "w.md", "2026-10-21T08:00:00+00:00").await;
+    let sessions = CollabSessions::new(fx.engine.clone());
+    fx.engine.set_collab_sessions(&sessions);
+    let _joined = sessions
+        .join_reflection("eng", "w.md", "jordi")
+        .await
+        .unwrap();
+    let task = start(&fx.engine, &hook).await;
+    assert!(
+        hook.next(minutes(10)).await.is_none(),
+        "nothing while the page waits for the room"
+    );
+    let status = fx
+        .engine
+        .automation_status(Loop::Reflect, &["eng".to_string()], &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(status["domains"][0]["counts"]["stale"], 0, "{status}");
+    let clock = fx
+        .engine
+        .reflection_page_clock("eng", "w.md", &person())
+        .await
+        .unwrap();
+    assert_eq!(clock["stale"], true, "{clock}");
+    assert_eq!(clock["waiting"], true, "{clock}");
+    task.stop().await;
+}

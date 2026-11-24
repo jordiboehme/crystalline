@@ -1031,6 +1031,18 @@ pub struct Engine {
     // rows `Engine::all_threads` reads. See `Engine::reflection_text_loads`.
     #[cfg(any(test, feature = "testing"))]
     reflection_text_loads: std::sync::atomic::AtomicU64,
+    // How many times an automation status or run worked out what is due
+    // (`Engine::loop_work`). See `Engine::due_detections`.
+    #[cfg(any(test, feature = "testing"))]
+    due_detections: std::sync::atomic::AtomicU64,
+    // How many reads of page texts the page clocks made (one per bulk read
+    // or per page). See `Engine::page_text_reads`.
+    #[cfg(any(test, feature = "testing"))]
+    page_text_reads: std::sync::atomic::AtomicU64,
+    // How many times a caller's visibility was folded rather than recalled
+    // from the call's memo. See `Engine::visibility_folds`.
+    #[cfg(any(test, feature = "testing"))]
+    visibility_folds: std::sync::atomic::AtomicU64,
     // Per domain, a number every announced change of its base engram rows
     // (an `engram` event that is no draft, a `domain` event) and every
     // registration change moves on. Never reset or removed, so an entry
@@ -1070,6 +1082,9 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    /// `auth.mcp` as the HTTP MCP door read it when the daemon started, or
+    /// `None` for an engine with no door (the CLI, tests that never pin it).
+    auth_mcp_pinned: Option<bool>,
     // A test seam: when armed, the next source edit fails on its far side,
     // once. See `Engine::fail_next_source_edit`.
     // Compiled only into a test build (`cfg(test)` for this crate's unit tests,
@@ -1158,6 +1173,10 @@ pub struct Engine {
     automation_deliveries: std::sync::Mutex<
         HashMap<(String, crystalline_core::automation::Loop), automation::DeliveryRecord>,
     >,
+    // The lease takes of each agent of the loops in the last window, so an
+    // agent cannot take leases faster than a run needs them. In memory: a
+    // restart forgets it. See `automation::AgentTakes`.
+    agent_takes: automation::AgentTakes,
     // A seam that is a gate rather than a stopwatch: when armed, the next move
     // or delete of a Reflection signals `entered` after its live-room screen,
     // then waits for `release` before it takes the page lock. See
@@ -1314,6 +1333,11 @@ pub struct Engine {
     /// file from one the engine wrote itself. No entry at all: no walk since
     /// this engine started.
     reflection_walks: std::sync::Mutex<HashMap<String, Option<BTreeMap<String, String>>>>,
+    // What the freshness clocks read of each page's text, by domain, then
+    // path, with the checksum it was read at (`freshness::PageFacts`): a
+    // status poll reads the page stamps and fetches the text only of a page
+    // whose checksum moved.
+    page_facts: freshness::FactsMemo,
     // Overrides where per-domain origin state (the base snapshot, conflict
     // records, `state.json`) is read and written, for tests: `None` means the
     // real `crystalline_core::config::origin_state_dir`, a real machine path
@@ -1755,6 +1779,14 @@ pub enum ShareActor {
     /// `Engine::automation_share` takes this actor: a person at the machine (the
     /// CLI, the control socket, stdio MCP) is a person.
     Machine,
+    /// A run by an agent of the loops, by its unique name. It shares as
+    /// [`ShareActor::Machine`] does: through the GitHub App when there is
+    /// one and `github.share_identity` is `instance` or not set, with the
+    /// instance credential when there is no App. An agent has no personal
+    /// GitHub identity, so where `personal` is set by name its share is
+    /// refused and the changes stay here. Unlike the machine it drafts under
+    /// its own name on a domain that reviews changes, and its commits name it.
+    Agent(String),
 }
 
 /// What a removal knows about how much knowledge is at stake.
@@ -1982,6 +2014,12 @@ const PERSON_LINK_MISSING: &str = "This instance shares with personal GitHub ide
 /// nobody to resolve a credential for until an admin names the account those
 /// shares run as - which is what this message teaches, rather than reporting a
 /// missing token for an identity the caller never chose.
+/// The refusal a run by an agent of the loops gets where an admin set
+/// `github.share_identity` to `personal` by name: an agent has no GitHub
+/// identity of its own and never borrows the machine owner's. Plain words, for
+/// whoever reads the run's report.
+const AGENT_SHARES_NO_PERSONAL: &str = "This instance shares with personal GitHub identities, and an agent has none of its own, so this run kept its changes here. Ask an admin to share with the instance identity or through a GitHub App.";
+
 const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured. Ask an admin to name the account agents share as, or share from Fluid or the CLI.";
 
 /// The [`TokenIdentity`] one account's personal credential lives under, or the
@@ -2588,6 +2626,12 @@ impl Engine {
         let file_config = config.clone();
         let skills_serve = config.skills_serve();
         let reader = reader_for(&store);
+        // Read while nothing holds the lock, so a gate that only needs it
+        // never queues for the writer; a lock held anyway asks on first use.
+        let shared_database = std::sync::OnceLock::new();
+        if let Ok(guard) = store.try_lock() {
+            let _ = shared_database.set(guard.shares_database());
+        }
         Engine {
             store,
             reader,
@@ -2617,6 +2661,12 @@ impl Engine {
             recorded_path_loads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             reflection_text_loads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            due_detections: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            page_text_reads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            visibility_folds: std::sync::atomic::AtomicU64::new(0),
             reflection_generations: std::sync::Mutex::default(),
             pending_cache: std::sync::Mutex::default(),
             contradiction_facts_cache: std::sync::Mutex::default(),
@@ -2629,6 +2679,7 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            auth_mcp_pinned: None,
             #[cfg(any(test, feature = "testing"))]
             prune_statements: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -2664,6 +2715,7 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             automation_now: std::sync::Mutex::new(None),
             automation_deliveries: std::sync::Mutex::new(HashMap::new()),
+            agent_takes: automation::AgentTakes::default(),
             #[cfg(any(test, feature = "testing"))]
             hold_next_room_screen: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
@@ -2679,7 +2731,7 @@ impl Engine {
             label: String::new(),
             resolved_label: std::sync::Mutex::new(None),
             hosted: std::sync::RwLock::new(HashMap::new()),
-            shared_database: std::sync::OnceLock::new(),
+            shared_database,
             one_shot: false,
             taken: std::sync::Mutex::new(HashSet::new()),
             leases: std::sync::Mutex::new(HashMap::new()),
@@ -2704,6 +2756,7 @@ impl Engine {
             backup_held: Default::default(),
             backup_archived_logged: Default::default(),
             reflection_walks: Default::default(),
+            page_facts: Default::default(),
             origins_dir_override: None,
             state_dir_override: None,
             connect_auth: Arc::new(RealConnectAuth),
@@ -3921,8 +3974,8 @@ impl Engine {
     /// base rows under `reflections/` in any letter case. Never the whole
     /// stamp map: up to [`UNDER_REFLECTIONS_PROBE`] rows are read, and only a
     /// domain with that many engrams under the folder (a pending switch,
-    /// whose refusal names them all) reads the rest. The store lock is held
-    /// for these reads only.
+    /// whose refusal names them all) reads the rest, through the read
+    /// connections.
     ///
     /// Remembered per domain (R83, [`PendingEntry`]): an entry filled under
     /// the domain's current generation, its `root` and its MANIFEST's stamp
@@ -3935,9 +3988,12 @@ impl Engine {
         if let Some(recorded) = self.remembered_paths(domain, generation, root, manifest) {
             return Ok(recorded);
         }
-        let (recorded, shared, domain_id) = {
-            let store = self.store.lock().await;
-            let shared = store.shares_database();
+        // Reads only, through the read connections: an automation status
+        // asks this on every poll once the entry expired, and the answer is
+        // only remembered, never written.
+        let shared = self.store_is_shared().await;
+        let (recorded, domain_id) = {
+            let store = self.reader();
             let Some(id) = store.domain_id(domain).await? else {
                 return Ok(RecordedPaths::default());
             };
@@ -3958,7 +4014,6 @@ impl Engine {
                     any,
                     under_reflections,
                 },
-                shared,
                 id,
             )
         };
@@ -4050,6 +4105,14 @@ impl Engine {
     /// without an announce of that domain calls it itself (a removal, the
     /// orphan collector). The number only grows, so an entry filled before
     /// a bump never matches again, however the fills and bumps interleave.
+    /// Forget what the Reflection gate remembers of every domain, as a
+    /// shared database's entries expire after
+    /// [`crate::changes::VISIBILITY_TTL`]: the next gate reads the store.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn forget_remembered_gates(&self) {
+        self.pending_cache.lock().unwrap().clear();
+    }
+
     pub(crate) fn bump_reflection_generation(&self, domain: &str) {
         *self
             .reflection_generations
@@ -4150,6 +4213,34 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn reflection_text_loads(&self) -> u64 {
         self.reflection_text_loads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many reads of page texts the page clocks made since this engine
+    /// was built: one per bulk read of a Reflection's texts, one per page
+    /// read alone. A poll whose pages did not change does not move it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn page_text_reads(&self) -> u64 {
+        self.page_text_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many times the due work of a loop on a domain was worked out
+    /// (the reflect queue or the evolve sweep a status, a lease take or a
+    /// run record counts) since this engine was built. A status asked with
+    /// `counts` false does not move it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn due_detections(&self) -> u64 {
+        self.due_detections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many times a caller's visibility was folded since this engine was
+    /// built. A call that runs within the visibility memo folds once per
+    /// scope, however many rights checks it makes.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn visibility_folds(&self) -> u64 {
+        self.visibility_folds
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -4291,8 +4382,9 @@ impl Engine {
     }
 
     /// Whether the store is shared with other instances
-    /// ([`Store::shares_database`]). The store lock is taken only on the
-    /// first call: the answer is the backend's and never changes.
+    /// ([`Store::shares_database`]). Read when the engine is built, or under
+    /// the store lock on the first call when something held it then: the
+    /// answer is the backend's and never changes.
     pub(crate) async fn store_is_shared(&self) -> bool {
         if let Some(shared) = self.shared_database.get() {
             return *shared;
@@ -4658,6 +4750,16 @@ impl Engine {
         self.read_only
     }
 
+    /// Pin `auth.mcp` to the value the daemon starts with. The HTTP MCP door
+    /// reads the setting once, when it is built, and the open tier, the agent
+    /// checks and the ctl route must answer as that door does: a `config set
+    /// auth.mcp` on a running daemon changes the file and applies at the next
+    /// start, for every reader at once.
+    pub fn with_auth_mcp_pinned(mut self, auth_mcp: bool) -> Engine {
+        self.auth_mcp_pinned = Some(auth_mcp);
+        self
+    }
+
     /// Install the environment overlay and recompute the effective config from
     /// the file config plus this overlay. The daemon and the standalone loader
     /// call this with the overlay parsed at startup; every existing call site
@@ -4986,12 +5088,12 @@ impl Engine {
     /// disk has. A move that could not be read counts as unresolved, so
     /// what waits on it waits for the next try.
     async fn host_move_unresolved(&self, domain: &str) -> bool {
-        let store = self.store.lock().await;
-        if !store.shares_database() {
+        if !self.store_is_shared().await {
             return false;
         }
-        match store.domain_id(domain).await {
-            Ok(Some(id)) => !matches!(store.host_move(id).await, Ok(None)),
+        let reader = self.reader();
+        match reader.domain_id(domain).await {
+            Ok(Some(id)) => !matches!(reader.host_move(id).await, Ok(None)),
             Ok(None) => false,
             Err(_) => true,
         }
@@ -5188,8 +5290,15 @@ impl Engine {
     /// way as [`Engine::github_enabled`]. This is the setting that creates the
     /// legacy open tier, and a write gate reads it once per write, so it must
     /// not clone the whole config to get at one bool.
+    ///
+    /// A daemon pins the value it started with ([`Engine::with_auth_mcp_pinned`]),
+    /// so a runtime change waits for the restart, as the door does. An engine
+    /// with no pin reads the live config.
     pub fn auth_mcp(&self) -> bool {
-        self.config.read().unwrap().auth_mcp()
+        match self.auth_mcp_pinned {
+            Some(pinned) => pinned,
+            None => self.config.read().unwrap().auth_mcp(),
+        }
     }
 
     /// Whose GitHub identity a share on this instance runs as, read live:
@@ -9376,8 +9485,12 @@ impl Engine {
         match source {
             ContentSource::File { root } => read_engram_file(root, rel),
             ContentSource::Virtual => {
-                let store = self.store.lock().await;
-                let content = store.engram_content(domain_id, rel).await.ok().flatten()?;
+                let content = self
+                    .reader()
+                    .engram_content(domain_id, rel)
+                    .await
+                    .ok()
+                    .flatten()?;
                 parse_engram(&content).ok()
             }
         }
@@ -9499,6 +9612,7 @@ mod automation;
 pub use asset_home::{ASSET_EXISTS, MOVE_ONTO_A_FILE};
 pub(crate) use asset_home::{AssetHome, ReplaceRule, WrittenAsset, same_bytes};
 pub use automation::{Delivery, WEBHOOK_NO_SECRET, WebhookTarget};
+pub use freshness::{PageClock, page_clocks_in};
 pub use uploads::{file_answer, is_text_file_mime, upload_bytes};
 mod attachments;
 mod close_folders;
@@ -9550,6 +9664,7 @@ mod domains;
 mod edit;
 mod evolve;
 mod fence;
+mod freshness;
 mod github;
 pub use github::{
     GITHUB_OFF_PLAIN, LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK,
@@ -9573,7 +9688,12 @@ mod name_report;
 mod names;
 mod origins;
 pub use origins::{READERS_REQUIRED, leave_out_for_non_admin};
+mod page_life;
+mod page_view;
 mod read;
+pub use page_life::RETIRED_STATUS;
+mod reconcile;
+pub use reconcile::{PageReconcile, ReconcileOutcome};
 mod reflect;
 pub use reflect::{REFLECT_GUIDANCE, STRUCTURE_HINT};
 mod reflection;
@@ -9601,6 +9721,7 @@ mod threads;
 mod transfer;
 mod uploads;
 mod validate;
+mod visibility_memo;
 mod write;
 mod write_block;
 
@@ -11138,7 +11259,7 @@ impl Drop for AudienceHold<'_> {
 /// rule `crate::changes::change_label` applies to a scope.
 fn share_actor_label(actor: &ShareActor) -> Option<String> {
     match actor {
-        ShareActor::Account(name) => Some(name.clone()),
+        ShareActor::Account(name) | ShareActor::Agent(name) => Some(name.clone()),
         ShareActor::Owner | ShareActor::HttpAgent | ShareActor::Machine => None,
     }
 }
@@ -12646,22 +12767,19 @@ fn now_offset() -> OffsetStamp {
 }
 
 /// The ISO date `spec` before today, for `timeframe` windows like `7d`, `24h`,
-/// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure. A window
+/// `2w`, `3m`, `1y`, read by [`time::timeframe_seconds`]. Falls back to seven
+/// days on a parse failure. A window
 /// reaching past the earliest date the calendar holds stops there instead of
 /// failing, so an agent's `20000y` still lists everything.
 fn timeframe_cutoff(spec: &str) -> Option<String> {
-    let spec = spec.trim();
-    let (num, unit) = spec.split_at(spec.find(|c: char| c.is_alphabetic()).unwrap_or(spec.len()));
-    let n: i64 = num.trim().parse().unwrap_or(7);
-    let days = match unit.trim() {
-        "h" => n.saturating_add(23) / 24,
-        "d" | "" => n,
-        "w" => n.saturating_mul(7),
-        "m" => n.saturating_mul(30),
-        "y" => n.saturating_mul(365),
-        _ => 7,
+    // Hours round up to whole days; what does not read falls back to a week.
+    let seconds = time::timeframe_seconds(spec).unwrap_or(7 * 86_400);
+    let days = if seconds > 0 {
+        (seconds - 1) / 86_400 + 1
+    } else {
+        0
     };
-    let cutoff = time::today_utc().saturating_sub_days(days.max(0));
+    let cutoff = time::today_utc().saturating_sub_days(days);
     Some(cutoff.ymd())
 }
 
@@ -12961,6 +13079,7 @@ mod context_rank_tests {
             engram_type: "engram".to_string(),
             salience,
             status: "current".to_string(),
+            tags: Vec::new(),
             actor: String::new(),
             recorded_at: None,
         }
@@ -13454,6 +13573,15 @@ mod lock_tests {
             timeframe_cutoff(&format!("{}h", i64::MAX)).as_deref(),
             Some(earliest.as_str())
         );
+        // A unit with no number does not read, and falls back to a week.
+        let week = time::today_utc().saturating_sub_days(7).ymd();
+        for spec in ["h", "w", "m", "y"] {
+            assert_eq!(
+                timeframe_cutoff(spec).as_deref(),
+                Some(week.as_str()),
+                "{spec}"
+            );
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("eng");

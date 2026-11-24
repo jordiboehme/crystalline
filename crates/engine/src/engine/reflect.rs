@@ -14,8 +14,12 @@ use super::sources::{HIDDEN_SOURCE_NOTE, TOO_WIDE_NOTE, unavailable_note};
 use super::*;
 use crate::scope::{ReflectionCaller, ReflectionRight, Scope};
 
+mod pages;
+
+pub(crate) use pages::stale_base;
+
 /// How an agent works the queue, returned with every page.
-pub const REFLECT_GUIDANCE: &str = "Work feedback items first: read what the person changed and decide - take it into the engrams (change them, then write_reflection the section with its sources), keep it as their text (write_reflection action=settle outcome=kept), or answer it in a thread (discuss with answers_feedback). Taking feedback into the engrams of another domain needs write access there; without it, answer in a thread or settle it as kept. Then update items: bring changed engrams into their sections and write them with sources; for a source_too_wide item, the section cites a domain fewer people may read than the page's domain: write the section again without that source and without the text drawn from it (the check sees only named sources, so dropping the source and keeping its text still leaks it); when write_reflection refuses a source for the same reason, leave out its text as well, unless your person, asked, wants to share it on purpose (the write asks them when their client can, and Fluid's Review offers it on the item; this is a deliberate step for a person, not a guard against their own agent; an unattended run never asks, cannot read such a domain at all, and leaves the text out); cover unreflected engrams with a new section or reflection; move pages the pact's structure does not fit (its ## Structure bullets are globs, one per top-level bullet); apply a changed pact to the pages it affects, and when the pages follow the pact again, settle PACT.md (write_reflection action=settle without sections settles the whole page). When a person asks you for a page or space, add a bullet to the pact's ## Pages (add the heading if the pact has none) with its path or glob, their request in their words, who asked and the date. Add a matching ## Structure glob and name each section's sources. To place new engrams read ## Pages, and to recreate a page rebuild it from its bullet. Files under reflections/assets/: link an unreferenced file from the section it belongs to, or remove it with write_reflection action=delete_asset (ask first: removing is irreversible); for a missing file, correct the link, or ask a person to add the file when no engram holds it; an engram attachment cannot be embedded, so copy it into reflections/assets/ yourself (read_engram with include_images: false, then write_reflection action=write_asset) and point the link there. A host_moved item means this instance took the domain over on a shared database and its disk lacks files the previous host wrote: their rows are kept and counted, never written here, so do not rewrite or delete those pages and files; ask a person to copy the domain folder over (or restore it) and sync, or to run the sync with --accept-disk if the files are gone for good. Answer review threads in plain words - the people reading them may not see engrams. Answer a person's thread and leave it open. The person who opened it resolves it. A thread item carries the label of its opening comment and whether it blocks: answer blocking threads first; a praise needs no answer unless it asks something. Present every page you write with the crystalline-presentation skill (the skills tool serves it).";
+pub const REFLECT_GUIDANCE: &str = "Work feedback items first: read what the person changed and decide - take it into the engrams (change them, then write_reflection the section with its sources), keep it as their text (write_reflection action=settle outcome=kept), or answer it in a thread (discuss with answers_feedback). Taking feedback into the engrams of another domain needs write access there; without it, answer in a thread or settle it as kept. When an engram write is refused in a run, answer in a thread or settle it as kept too, and say so in the run's summary. Then update items: bring changed engrams into their sections and write them with sources; for a source_too_wide item, the section cites a domain fewer people may read than the page's domain: write the section again without that source and without the text drawn from it (the check sees only named sources, so dropping the source and keeping its text still leaks it); when write_reflection refuses a source for the same reason, leave out its text as well, unless your person, asked, wants to share it on purpose (the write asks them when their client can, and Fluid's Review offers it on the item; this is a deliberate step for a person, not a guard against their own agent; an unattended run never asks, cannot read such a domain at all, and leaves the text out); cover unreflected engrams with a new section or reflection; move pages the pact's structure does not fit (its ## Structure bullets are globs, one per top-level bullet); apply a changed pact to the pages it affects, and when the pages follow the pact again, settle PACT.md (write_reflection action=settle without sections settles the whole page). A section built from tentative engrams (status draft, proposed, idea, poc or open) says so in its text, for example \"proposed:\" or \"not decided yet\". When a person asks you for a page or space in a session with them, add a bullet to the pact's ## Pages (add the heading if the pact has none) with its path or glob, their request in their words, who asked and the date. Add a matching ## Structure glob and name each section's sources. To place new engrams read ## Pages, and to recreate a page rebuild it from its bullet. An unattended run (a scheduled run or an agent of the loops) writes no pact text (PACT.md or a page pact), moves no page that has its own page pact and changes no page's freshness or follows: where feedback or a thread asks for such a change, answer in the thread and leave the change to a curator, and leave an item on a pact file whose fix changes its text (a missing file, an embedded engram attachment) for a curator, asked in a thread; it still settles a pact. Files under reflections/assets/: link an unreferenced file from the section it belongs to, or remove it with write_reflection action=delete_asset (ask first: removing is irreversible); for a missing file, correct the link, or ask a person to add the file when no engram holds it; an engram attachment cannot be embedded, so copy it into reflections/assets/ yourself (read_engram with include_images: false, then write_reflection action=write_asset) and point the link there. A host_moved item means this instance took the domain over on a shared database and its disk lacks files the previous host wrote: their rows are kept and counted, never written here, so do not rewrite or delete those pages and files; ask a person to copy the domain folder over (or restore it) and sync, or to run the sync with --accept-disk if the files are gone for good. A stale item means the page's freshness ran out: reconcile it with its pacts - read the pact texts the answer's pacts carries, in chain order, search the domains you may read for what changed, change only what new information requires and name every source; create the pages its pact asks for with owner set to the page, update the pages it owns and retire the obsolete ones (retire, never delete: an unattended run cannot delete); then record write_reflection action=reconciled with outcome updated or unchanged for each page, the owned pages first and the owner last (the owner with the item's version), skipping the pages in owned_reconciled. changed_engrams 0 lets a page that does not move with the calendar be recorded unchanged at once; null means the count is unknown. For page_pact_changed apply the changed pact, then settle the pact file; when its pacts is empty and pact_hash_changed is true, no pact text changed but the page's settings or the pages it follows did, so bring the page in line and record write_reflection action=reconciled; for owner_gone retire the page, or retire it and restore it without owner; for link_retired and link_broken correct or drop the link. Answer review threads in plain words - the people reading them may not see engrams. Answer a person's thread and leave it open. The person who opened it resolves it. A thread item carries the label of its opening comment and whether it blocks: answer blocking threads first; a praise needs no answer unless it asks something. Present every page you write with the crystalline-presentation skill (the skills tool serves it).";
 
 /// An off-structure item's hint when no Structure glob fits any page.
 pub const STRUCTURE_HINT: &str = "The pact's ## Structure bullets are read as globs, one per top-level bullet, for example - guides/*.md. None of them matches a page.";
@@ -134,12 +138,37 @@ fn rank(items: Vec<Item>) -> Vec<Item> {
         group.sort_by_key(|item| (item.rank(), !item.blocks()));
     }
     let oldest = |g: &Vec<Item>| g.iter().map(|i| i.age_secs).max().unwrap_or(0);
-    groups.sort_by(|a, b| {
+    let order = |a: &Vec<Item>, b: &Vec<Item>| {
         oldest(b)
             .cmp(&oldest(a))
             .then_with(|| a[0].path.cmp(&b[0].path))
-    });
-    groups.into_iter().flatten().collect()
+    };
+    groups.sort_by(order);
+    // A stale page comes after every feedback group, however old it is
+    // (review I6): a person's change is worked before a scheduled check.
+    // Among the other groups it keeps its place by age.
+    let (stale, rest): (Vec<Vec<Item>>, Vec<Vec<Item>>) = groups
+        .into_iter()
+        .partition(|g| g.iter().any(|i| i.what == "stale"));
+    let has_feedback = |g: &Vec<Item>| g.iter().any(|i| i.kind == "feedback");
+    let mut feedback_left = rest.iter().filter(|g| has_feedback(g)).count();
+    let mut stale = stale.into_iter().peekable();
+    let mut out: Vec<Vec<Item>> = Vec::new();
+    for group in rest {
+        while feedback_left == 0
+            && stale
+                .peek()
+                .is_some_and(|s| order(s, &group) != std::cmp::Ordering::Greater)
+        {
+            out.extend(stale.next());
+        }
+        if has_feedback(&group) {
+            feedback_left -= 1;
+        }
+        out.push(group);
+    }
+    out.extend(stale);
+    out.into_iter().flatten().collect()
 }
 
 /// What a thread item carries beside its place: the thread's id and, when
@@ -216,6 +245,63 @@ enum Detail {
 }
 
 impl Engine {
+    /// The times (seconds since the epoch) every engram in the domains
+    /// `scope` may read here last changed, as the index records them for
+    /// each base row (a file's modification time, a virtual write's time),
+    /// sorted: what a `stale` item's `changed_engrams` counts from. The read
+    /// limit of an unattended run hides the domains it may not read. `None`
+    /// when a domain the caller may read cannot be counted here, so the
+    /// count is unknown, never 0, which would say that nothing changed:
+    /// - a domain mounted from a connected server, under any name, or a
+    ///   local copy a server replaces: its engrams change on the server
+    ///   ([`pages::counted_elsewhere`]; a run under a read limit is never
+    ///   routed to a server and reads none of them);
+    /// - a file domain with no index row yet: configured, but not walked
+    ///   (its folder is missing or unreadable, or the first sync has not
+    ///   reached it), so what changed in it is not known.
+    async fn engram_change_times(&self, scope: &Scope) -> Result<Option<Vec<i64>>> {
+        let hidden = self.hidden_domains(scope).await?.unwrap_or_default();
+        let shadowed = self.shadowed_domains();
+        let mounted: Vec<String> = self
+            .sources()
+            .map(|sources| {
+                sources
+                    .table()
+                    .mounts
+                    .iter()
+                    .map(|mount| mount.local.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let limited = crate::read_limit::current().is_some();
+        if pages::counted_elsewhere(mounted.iter().chain(&shadowed), &hidden, limited) {
+            return Ok(None);
+        }
+        let reader = self.reader();
+        let mut times = Vec::new();
+        for name in self.known_domain_names() {
+            if hidden.contains(&name) || shadowed.contains(&name) {
+                continue;
+            }
+            let Some(id) = reader.domain_id(&name).await? else {
+                // A virtual domain gets its row with its first engram, so
+                // without one it holds none; a file domain not yet walked
+                // is unknown.
+                if matches!(self.read_source(&name), ContentSource::Virtual) {
+                    continue;
+                }
+                return Ok(None);
+            };
+            for (path, stamp) in reader.file_stamps(id).await? {
+                if !r::is_under_reflections(&path) && !path.eq_ignore_ascii_case("MANIFEST.md") {
+                    times.push(stamp.mtime);
+                }
+            }
+        }
+        times.sort_unstable();
+        Ok(Some(times))
+    }
+
     /// The files under `reflections/assets/` (by path inside
     /// `reflections/`) that only `held` pages of `domain` link: they carry
     /// what those pages show, so the backup holds them back with them. A
@@ -376,14 +462,15 @@ impl Engine {
         detail: Detail,
         threads: &[(String, th::Thread, String)],
         scope: &Scope,
+        stale: bool,
     ) -> Result<Vec<Item>> {
         let full = detail == Detail::Full;
         let feedback = detail != Detail::Updates;
         let (rows, host_move) = {
-            let store = self.store.lock().await;
+            let reader = self.reader();
             (
-                store.list_reflections(access.domain_id).await?,
-                store.host_move(access.domain_id).await?,
+                reader.list_reflections(access.domain_id).await?,
+                reader.host_move(access.domain_id).await?,
             )
         };
         // The domain's own engrams are scanned once (the unreflected items
@@ -393,6 +480,15 @@ impl Engine {
             .iter()
             .map(|row| r::read_provenance(&row.content))
             .collect();
+        // The pages as a whole: settings, owners, retired ones, chains.
+        let texts: BTreeMap<&str, &str> = rows
+            .iter()
+            .map(|row| (row.path.as_str(), row.content.as_str()))
+            .collect();
+        let view = pages::PageView::read(&texts.iter().map(|(p, t)| (*p, *t)).collect::<Vec<_>>());
+        let mut ages: BTreeMap<&str, i64> = BTreeMap::new();
+        let mut pact_changes: BTreeMap<String, pages::PactChange> = BTreeMap::new();
+        let mut unsettled: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let foreign: Vec<&r::SourceRef> = provenances
             .iter()
             .flat_map(|prov| prov.values())
@@ -426,7 +522,7 @@ impl Engine {
         let no_glob_fits = !pact_globs.is_empty()
             && !rows
                 .iter()
-                .any(|row| row.path != r::PACT_FILE && structure.fits(&row.path));
+                .any(|row| !r::is_pact_file(&row.path) && structure.fits(&row.path));
         let mut cited: HashSet<String> = HashSet::new();
         // Whether this domain's pages may cite each other domain, asked
         // once per domain for the whole scan.
@@ -436,7 +532,7 @@ impl Engine {
         for (row, prov) in rows.iter().zip(&provenances) {
             // The baseline is read for feedback alone, and the pact's is
             // always read: a changed pact is an update.
-            let baseline = if feedback || row.path == r::PACT_FILE {
+            let baseline = if feedback || r::is_pact_file(&row.path) {
                 std::fs::read_to_string(access.abs(&r::baseline_path(&row.path))).ok()
             } else {
                 None
@@ -450,6 +546,7 @@ impl Engine {
             // which does not carry them) the page stands for its baseline.
             let baseline = super::reflection::baseline_or_seed(baseline, Some(&row.content));
             let row_age = secs_since_rfc3339(Some(&row.modified)).unwrap_or(0);
+            ages.insert(row.path.as_str(), row_age);
             if row.path == r::PACT_FILE {
                 let changes = if no_feedback {
                     Vec::new()
@@ -488,11 +585,49 @@ impl Engine {
                 }
                 continue;
             }
+            // A page pact is no page: no page item (feedback, sources,
+            // off_structure) is raised for it. A person's change to it is
+            // raised on the pages that follow it (`page_pact_changed`).
+            if r::is_pact_file(&row.path) {
+                if !no_feedback {
+                    let changes = r::feedback_changes(&row.content, &baseline);
+                    if !changes.is_empty() {
+                        let reflected_entries = r::parse_baseline(&baseline);
+                        let reflected =
+                            joined_text(reflected_entries.iter().map(|(_, t)| t.as_str()));
+                        let sections = r::split_sections(&row.content);
+                        let current = joined_text(sections.iter().map(|s| s.text.as_str()));
+                        let diff = if full {
+                            diffy::create_patch(&reflected, &current).to_string()
+                        } else {
+                            String::new()
+                        };
+                        pact_changes.insert(
+                            row.path.clone(),
+                            pages::PactChange {
+                                diff,
+                                text: row.content.clone(),
+                                age_secs: row_age,
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+            // A retired page is never reconciled: it covers no engram and
+            // gets no item about its sources, its structure or its files.
+            // It stays inside the too-wide check (and the backup hold-back),
+            // and a person's change and threads stay theirs.
+            let retired = view.retired.contains(&row.path);
             let changes = if no_feedback || !feedback {
                 Vec::new()
             } else {
                 r::feedback_changes(&row.content, &baseline)
             };
+            let ids: Vec<String> = changes.iter().filter_map(|c| c.id.clone()).collect();
+            if !ids.is_empty() {
+                unsettled.insert(row.path.clone(), ids);
+            }
             for change in changes {
                 let record = change.id.as_deref().and_then(|id| prov.get(id));
                 if record
@@ -570,6 +705,9 @@ impl Engine {
                     )
                 };
                 for src in &record.sources {
+                    if retired {
+                        continue;
+                    }
                     // Unreflected stays per domain: citing another domain's
                     // engram covers nothing of this one.
                     if src.domain.is_none() {
@@ -758,7 +896,9 @@ impl Engine {
                     basis,
                 });
             }
-            if !structure.fits(&row.path) {
+            // An owned page has its place from its owner, and a retired
+            // page is out of the way (design 2.3).
+            if !retired && !view.is_owned(&row.path) && !structure.fits(&row.path) {
                 items.push(Item {
                     kind: "update",
                     what: "off_structure",
@@ -784,6 +924,9 @@ impl Engine {
         let mut referenced: HashSet<String> = HashSet::new();
         for row in &rows {
             let row_age = secs_since_rfc3339(Some(&row.modified)).unwrap_or(0);
+            // A retired page's files still count as linked; it is asked to
+            // fix none of them.
+            let retired = view.retired.contains(&row.path);
             for section in r::split_sections(&row.content) {
                 let mut missing: Vec<String> = Vec::new();
                 for asset in r::reflection_asset_refs(&section.text, &row.path) {
@@ -797,6 +940,9 @@ impl Engine {
                     referenced.insert(asset);
                 }
                 let embedded = r::engram_attachment_embeds(&section.text, &row.path);
+                if retired {
+                    continue;
+                }
                 for (what, key, list) in [
                     ("asset_missing", "assets", missing),
                     ("engram_attachment", "targets", embedded),
@@ -858,6 +1004,78 @@ impl Engine {
                 extra: json!({ "only_elsewhere": host_move.only_elsewhere }),
                 basis: item_basis([host_move.at.as_str()]),
             });
+        }
+        // Rule A (Jordi 2026-11-23): an engram a worked page with a freshness
+        // (or an owned page) cited and dropped stays covered while its
+        // checksum is the one the page cited.
+        for kept in self.reader().reflection_covered(access.domain_id).await? {
+            if view.worked(&kept.path)
+                && facts
+                    .own
+                    .get(&kept.permalink)
+                    .is_some_and(|fact| fact.checksum == kept.checksum)
+            {
+                cited.insert(kept.permalink);
+            }
+        }
+        let states = self.reflection_reconciles(domain).await?;
+        let hashes = r::pact_hashes(texts.iter().map(|(p, t)| (*p, *t)));
+        let inputs = pages::PageInputs {
+            domain,
+            texts: &texts,
+            ages: &ages,
+            states: &states,
+            hashes: &hashes,
+            pact_changes: &pact_changes,
+            unsettled: &unsettled,
+            full,
+        };
+        items.extend(pages::page_items(&view, &inputs));
+        if stale {
+            // The automation clock, as the status and the trigger read it.
+            let now = self.automation_clock().stamp().unix_seconds();
+            let mut found: Vec<(Item, i64)> = view
+                .pages
+                .keys()
+                .filter_map(|path| pages::stale_item(&view, &inputs, path, now))
+                .collect();
+            if !found.is_empty() {
+                let changed = if full {
+                    Some(self.engram_change_times(scope).await?)
+                } else {
+                    None
+                };
+                for (item, since) in &mut found {
+                    if let Some(changed) = &changed {
+                        item.extra["changed_engrams"] = match changed {
+                            Some(times) => {
+                                let unchanged = times.partition_point(|mtime| mtime <= since);
+                                json!(times.len() - unchanged)
+                            }
+                            None => Value::Null,
+                        };
+                    }
+                    // The page's own source changes are part of its
+                    // reconcile: they fold into its stale item.
+                    let mut folded = Vec::new();
+                    items.retain(|other| {
+                        if other.what == "source_changed" && other.path == item.path {
+                            folded.push(json!({
+                                "section": other.section,
+                                "heading": other.heading,
+                                "sources": other.extra.get("sources").cloned().unwrap_or_default(),
+                            }));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if !folded.is_empty() {
+                        item.extra["source_changed"] = json!(folded);
+                    }
+                }
+                items.extend(found.into_iter().map(|(item, _)| item));
+            }
         }
         let mut loose: BTreeMap<String, Vec<&EngramFact>> = BTreeMap::new();
         for fact in facts.own.values() {
@@ -947,6 +1165,8 @@ impl Engine {
         let page = page.unwrap_or(1).max(1);
         let offset = (page - 1).saturating_mul(limit);
         let count = |k: &str| filtered.iter().filter(|i| i.kind == k).count();
+        // Each pact text a stale item on this page names, once per answer.
+        let mut pacts: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
         let queue: Vec<Value> = filtered
             .iter()
             .enumerate()
@@ -965,6 +1185,12 @@ impl Engine {
                 });
                 if let (Value::Object(target), Value::Object(extra)) = (&mut row, i.extra.clone()) {
                     for (k, v) in extra {
+                        if k == pages::PACT_TEXTS {
+                            if let Value::Object(texts) = v {
+                                pacts.entry(i.domain.clone()).or_default().extend(texts);
+                            }
+                            continue;
+                        }
                         target.insert(k, v);
                     }
                 }
@@ -980,11 +1206,15 @@ impl Engine {
                     obj.remove("hidden_sources");
                     obj.remove("note");
                     obj.remove("sections");
+                    // How many engrams changed, and the sources a stale
+                    // item took in from its page.
+                    obj.remove("changed_engrams");
+                    obj.remove("source_changed");
                 }
                 row
             })
             .collect();
-        json!({
+        let mut answer = json!({
             "total": filtered.len(),
             "page": page,
             "limit": limit,
@@ -992,7 +1222,11 @@ impl Engine {
             "kinds": { "feedback": count("feedback"), "update": count("update"), "review": count("review") },
             "queue": queue,
             "guidance": REFLECT_GUIDANCE,
-        })
+        });
+        if !pacts.is_empty() {
+            answer["pacts"] = json!(pacts);
+        }
+        answer
     }
 
     /// The domains a queue or a count runs over: the named ones (each once,
@@ -1061,6 +1295,12 @@ impl Engine {
         })
     }
 
+    /// Every registered domain whose Reflection is in effect here, as an
+    /// unnamed queue runs over them.
+    pub(super) async fn reflections_here(&self) -> Result<Vec<String>> {
+        Ok(self.reflect_scope(&[], false).await?.domains)
+    }
+
     /// The `reflect` tool.
     pub async fn reflect(&self, p: &ReflectParams, caller: &ReflectionCaller) -> Result<Value> {
         for kind in &p.kinds {
@@ -1073,6 +1313,12 @@ impl Engine {
         // A named domain that cannot be worked is refused, unless the caller
         // asked for the unnamed queue's leniency over its names.
         let named = !p.domains.is_empty() && !p.skip_unavailable;
+        // Stale pages go to a run (an unattended session, or one whose
+        // lease limits what it reads) and on request, never by default to
+        // an interactive session (review I8).
+        let stale = p.stale.unwrap_or_else(|| {
+            crate::read_limit::current().is_some() || matches!(caller.scope, Scope::Agent { .. })
+        });
         let mut items = Vec::new();
         let mut swept = Vec::new();
         let mut visible_everywhere = true;
@@ -1107,8 +1353,15 @@ impl Engine {
             visible_everywhere &= access.engrams_visible;
             let found = match self.all_threads(&access).await {
                 Ok(threads) => {
-                    self.detect_reflection(&domain, &access, Detail::Full, &threads, &caller.scope)
-                        .await
+                    self.detect_reflection(
+                        &domain,
+                        &access,
+                        Detail::Full,
+                        &threads,
+                        &caller.scope,
+                        stale,
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             };
@@ -1152,8 +1405,15 @@ impl Engine {
             .await?;
         let threads = self.all_threads(&access).await?;
         let items = rank(
-            self.detect_reflection(domain, &access, Detail::Full, &threads, &caller.scope)
-                .await?,
+            self.detect_reflection(
+                domain,
+                &access,
+                Detail::Full,
+                &threads,
+                &caller.scope,
+                false,
+            )
+            .await?,
         );
         let mut value = Self::page_json(&items, &[], limit, page, access.engrams_visible);
         value["domain"] = json!(domain);
@@ -1211,8 +1471,15 @@ impl Engine {
             out.into_iter().map(|(_, v)| v).collect()
         };
         let items = rank(
-            self.detect_reflection(domain, &access, Detail::Full, &threads, &caller.scope)
-                .await?,
+            self.detect_reflection(
+                domain,
+                &access,
+                Detail::Full,
+                &threads,
+                &caller.scope,
+                false,
+            )
+            .await?,
         );
         let mut queue = Self::page_json(&items, &[], Some(50), Some(1), access.engrams_visible);
         queue["domain"] = json!(domain);
@@ -1294,7 +1561,14 @@ impl Engine {
             .collect();
         open_by_page.sort_by(|a, b| a.0.cmp(b.0));
         let items = self
-            .detect_reflection(domain, &access, Detail::Updates, &threads, &caller.scope)
+            .detect_reflection(
+                domain,
+                &access,
+                Detail::Updates,
+                &threads,
+                &caller.scope,
+                false,
+            )
             .await?;
         let shown: Vec<&Item> = items
             .iter()
@@ -1322,8 +1596,9 @@ impl Engine {
     /// Every item of `domain`'s reflect queue that a headless run would
     /// work, each with its stable key and its version (R3), for the
     /// automation status: what the caller may see, and no update of a page
-    /// a person has open in a live editor. The caller curates the
-    /// Reflection; the gate refuses anyone else.
+    /// a person has open in a live editor. A page whose freshness ran out
+    /// (`stale`) is due work too. The caller curates the Reflection; the
+    /// gate refuses anyone else.
     pub(super) async fn reflect_due_items(
         &self,
         domain: &str,
@@ -1334,7 +1609,14 @@ impl Engine {
             .await?;
         let threads = self.all_threads(&access).await?;
         let items = self
-            .detect_reflection(domain, &access, Detail::Count, &threads, &caller.scope)
+            .detect_reflection(
+                domain,
+                &access,
+                Detail::Count,
+                &threads,
+                &caller.scope,
+                true,
+            )
             .await?;
         let rooms = self.collab_rooms();
         let mut out = Vec::new();
@@ -1398,8 +1680,16 @@ impl Engine {
             };
             let found = match self.all_threads(&access).await {
                 Ok(threads) => {
-                    self.detect_reflection(&domain, &access, Detail::Count, &threads, &caller.scope)
-                        .await
+                    // Stale pages are no open item for a nudge (review I8).
+                    self.detect_reflection(
+                        &domain,
+                        &access,
+                        Detail::Count,
+                        &threads,
+                        &caller.scope,
+                        false,
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             };
@@ -1532,4 +1822,37 @@ fn reflection_files<'a>(
         crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
             .map(|inner| (inner, bytes.as_slice()))
     })
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+
+    fn item(what: &'static str, path: &str, section: Option<&str>, age_secs: i64) -> Item {
+        Item {
+            kind: "update",
+            what,
+            domain: "eng".into(),
+            path: path.into(),
+            section: section.map(str::to_string),
+            heading: String::new(),
+            age_secs,
+            extra: Value::Null,
+            basis: String::new(),
+        }
+    }
+
+    /// A stale page and another group of the same age on the same page: the
+    /// stale group comes first, the tie rule the merged queue of a connected
+    /// machine keeps too (`crystalline_remote::fanout`).
+    #[test]
+    fn a_stale_page_comes_before_a_group_of_equal_age_and_page() {
+        let ranked = rank(vec![
+            item("link_broken", "w.md", Some("s1"), 100),
+            item("stale", "w.md", None, 100),
+            item("source_changed", "a.md", Some("s2"), 50),
+        ]);
+        let order: Vec<&str> = ranked.iter().map(|i| i.what).collect();
+        assert_eq!(order, ["stale", "link_broken", "source_changed"]);
+    }
 }

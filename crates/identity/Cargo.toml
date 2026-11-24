@@ -28,6 +28,8 @@ crystalline-index = { workspace = true }
 # `Author` and `sanitize_name` for `ReflectionCaller` (scope.rs).
 crystalline-core = { workspace = true }
 anyhow = { workspace = true }
+# URL-safe base64 for invite tokens (`auth_store/invites.rs`).
+base64 = { workspace = true }
 # `KnowledgeGovernor` (scope.rs), the engine's GitHub role lookup.
 async-trait = { workspace = true }
 argon2 = { workspace = true }
@@ -39,6 +41,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+# Accent folding for the account matcher (`account_match.rs`).
+unicode-normalization = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true }
 sqlx = { workspace = true, optional = true }

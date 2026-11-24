@@ -1039,6 +1039,13 @@ impl Engine {
     /// the commit to whichever GitHub account holds that address; an
     /// identity provider address marked `email_verified: false` is never
     /// stored, so it never gets here.
+    ///
+    /// A run by an agent of the loops ([`ShareActor::Agent`]) is named as
+    /// the author by [`agent_author_name`], at the App bot's own `noreply`
+    /// address (`<bot id>+<slug>[bot]@users.noreply.<host>`, see
+    /// [`GithubApp::bot_identity`]): an agent has no address of its own, and
+    /// the bot's is one GitHub already shows for this instance. The bot is
+    /// the committer.
     pub(super) async fn app_share_router(
         &self,
         router: Arc<AppRouter>,
@@ -1047,6 +1054,22 @@ impl Engine {
     ) -> Arc<AppRouter> {
         if let Err(e) = router.app().slug().await {
             tracing::debug!("the GitHub App's slug could not be read before a share: {e}");
+        }
+        if let ShareActor::Agent(name) = actor {
+            let committer = match router.app().bot_identity(repo).await {
+                Ok(bot) => bot,
+                Err(e) => {
+                    tracing::warn!(
+                        "the GitHub App's bot identity could not be read, so the App authors the share of agent {name}: {e}"
+                    );
+                    return router;
+                }
+            };
+            let author = CommitIdentity {
+                name: self.agent_author_name(name).await,
+                email: committer.email.clone(),
+            };
+            return Arc::new(router.with_commit(CommitIdentities { author, committer }));
         }
         let ShareActor::Account(account) = actor else {
             return router;

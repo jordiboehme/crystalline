@@ -2165,6 +2165,7 @@ pub(super) fn rename_caller(scope: &crate::scope::Scope) -> Option<RenameCaller>
         // Anonymous never owns a domain, so it never reaches a rename.
         crate::scope::Scope::Unrestricted
         | crate::scope::Scope::Anonymous
+        | crate::scope::Scope::OpenTierIdentity { .. }
         | crate::scope::Scope::Agent { .. } => None,
     }
 }

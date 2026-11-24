@@ -232,7 +232,7 @@ describe("the members card", () => {
     renderApp("/d/eng/settings");
     const card = await membersCard();
     await userEvent.type(
-      within(card).getByRole("textbox", { name: "Account" }),
+      within(card).getByRole("combobox", { name: "Account" }),
       "ann",
     );
     await userEvent.selectOptions(
@@ -269,7 +269,7 @@ describe("the members card", () => {
     renderApp("/d/eng/settings");
     const card = await membersCard();
     await userEvent.type(
-      within(card).getByRole("textbox", { name: "Account" }),
+      within(card).getByRole("combobox", { name: "Account" }),
       "ann",
     );
     await userEvent.selectOptions(

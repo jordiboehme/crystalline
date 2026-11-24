@@ -80,7 +80,8 @@ pub use emit::emit_engram;
 pub use engram::{
     EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkForm, LinkTarget,
     META_KEY_MAX_BYTES, META_VALUE_MAX_BYTES, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
-    Relation, SchemaDef, Verification, Verified, WikiLink, meta_value_text,
+    RETIRED_STATUSES, Relation, SchemaDef, TENTATIVE_STATUSES, Verification, Verified, WikiLink,
+    is_retired_status, is_tentative_status, meta_value_text,
 };
 pub use harness::profile::{
     CommandSpelling, EntryShape, HookDialect, HostSignal, McpStyle, PathSpec, PointerStyle,
@@ -157,5 +158,26 @@ mod tests {
     fn recommended_sets_are_populated() {
         assert!(RECOMMENDED_TYPES.contains(&"engram"));
         assert!(RECOMMENDED_STATUSES.contains(&"current"));
+    }
+
+    /// The tentative check ignores case and surrounding blanks, since a
+    /// status is free form and `Proposed` says what `proposed` says.
+    #[test]
+    fn the_tentative_check_ignores_case() {
+        for status in ["proposed", "Proposed", "OPEN", " poc ", "Idea", "draft"] {
+            assert!(is_tentative_status(status), "{status:?}");
+        }
+        for status in ["stable", "Stable", "deprecated", "", "drafted", "opened"] {
+            assert!(!is_tentative_status(status), "{status:?}");
+        }
+    }
+
+    /// Every tentative status is a recommended one, so the write_engram
+    /// description suggests it and verify's `T002` stays quiet about it.
+    #[test]
+    fn every_tentative_status_is_recommended() {
+        for status in TENTATIVE_STATUSES {
+            assert!(RECOMMENDED_STATUSES.contains(&status), "{status}");
+        }
     }
 }

@@ -53,6 +53,7 @@ pub mod subscribers;
 pub mod temp_store;
 #[cfg(test)]
 pub(crate) mod test_vault;
+pub mod timing;
 #[doc(hidden)]
 pub mod toon;
 #[cfg(feature = "postgres")]

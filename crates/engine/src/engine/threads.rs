@@ -79,7 +79,7 @@ impl Engine {
                 let access = self
                     .require_reflection_to_write(domain, caller, need)
                     .await?;
-                r::validate_reflection_path(path).map_err(EngineError::Invalid)?;
+                self.validate_named_reflection_path(domain, path).await?;
                 Ok(TargetAccess::Reflection(access))
             }
         }
@@ -328,7 +328,8 @@ impl Engine {
                         ))
                     })?;
                     let mut prov = r::read_provenance(&page);
-                    prov.entry(id.to_string()).or_default().answered_by = Some(thread.id.clone());
+                    prov.sections.entry(id.to_string()).or_default().answered_by =
+                        Some(thread.id.clone());
                     Some(r::write_provenance(&page, &prov).map_err(EngineError::Invalid)?)
                 } else {
                     None
@@ -568,12 +569,7 @@ impl Engine {
         #[cfg(any(test, feature = "testing"))]
         self.reflection_text_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rows = self
-            .store
-            .lock()
-            .await
-            .list_reflections(access.domain_id)
-            .await?;
+        let rows = self.reader().list_reflections(access.domain_id).await?;
         let pages: Vec<(PathBuf, String, String)> = rows
             .into_iter()
             .map(|row| {

@@ -7,6 +7,7 @@
 
 mod automation;
 mod contradictions;
+mod covered;
 mod disclosures;
 mod embed;
 mod embed_model;
@@ -19,6 +20,7 @@ mod perf_meta;
 mod pg;
 mod plans;
 mod read_connections;
+mod reconcile;
 mod recovery;
 mod reflection_search;
 mod reindex;

@@ -1984,6 +1984,59 @@ fn users_add_while_daemon_owns_is_seen_at_once() {
     );
 }
 
+/// `agents` writes the accounts database beside a daemon that owns it, like
+/// `users`: the agent lands in the database, no accounts file appears, the
+/// owner row stays the daemon's, and its token reaches only the automation
+/// verbs at the ctl route. `auth.mcp` is on, which agents need.
+#[test]
+fn agents_add_while_daemon_owns_lands_in_the_database() {
+    let Some(pg) = PgScratch::new("agowned") else {
+        return;
+    };
+    let env = Env::new("agowned")
+        .on_postgres(&pg)
+        .with_var("CRYSTALLINE_AUTH_MCP", "true");
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let (ok, out, err) = env.run_full(&["--json", "agents", "add", "nightly"]);
+    assert!(ok, "{out}{err}");
+    let added: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let token = added["token"]["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        pg.text(&format!(
+            "SELECT count(*)::text FROM {}.agents WHERE name = 'nightly'",
+            pg.schema
+        )),
+        "1"
+    );
+    let (ok, out, err) = env.run_full(&["agents", "list"]);
+    assert!(ok && out.contains("nightly"), "{out}{err}");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+    assert!(
+        !env.state_dir().join("web-auth.db").exists(),
+        "an accounts file was made"
+    );
+    let reply = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{}/api/v1/ctl", serve.addr))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "v": 1, "cmd": "status" }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .unwrap();
+    assert_eq!(reply.status().as_u16(), 200);
+    let reply: serde_json::Value = reply.json().unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("only the automation verbs")),
+        "{reply}"
+    );
+}
+
 /// Only an owner migrates the accounts tables: with the ledger stamped
 /// below this binary while a daemon owns the database, `users` is refused
 /// naming both versions and where to run it, and migrates nothing.
@@ -1995,12 +2048,12 @@ fn users_refused_when_auth_ledger_behind_and_owned() {
     let env = Env::new("acbehind").on_postgres(&pg);
     let mut serve = Serve::start(&env, None);
     serve.wait_ready();
-    assert_eq!(auth_ledger(&pg), "1");
+    assert_eq!(auth_ledger(&pg), "3");
     assert!(pg.sql(&format!("DELETE FROM {}.auth_schema_migration", pg.schema)));
     let (ok, out, err) = env.run_full(&["users", "list"]);
     assert!(!ok, "{out}{err}");
     assert!(
-        err.contains("the accounts tables are at version 0, this binary needs 1, and only the instance that owns the database migrates them: the database")
+        err.contains("the accounts tables are at version 0, this binary needs 3, and only the instance that owns the database migrates them: the database")
             && err.contains("is owned by the active instance")
             && err.matches("Run the command there").count() == 1,
         "{err}"
@@ -2023,7 +2076,7 @@ fn users_migrates_when_auth_ledger_behind_and_free() {
     };
     let env = Env::new("acfree").on_postgres(&pg);
     users_add(&env, "ada", "ada-password");
-    assert_eq!(auth_ledger(&pg), "1");
+    assert_eq!(auth_ledger(&pg), "3");
     let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
     assert_eq!(
         pg.text(&format!(
@@ -2041,7 +2094,7 @@ fn users_migrates_when_auth_ledger_behind_and_free() {
     env.setup_domain("eng");
     assert!(pg.sql(&format!("DELETE FROM {}.auth_schema_migration", pg.schema)));
     users_add(&env, "bob", "bob-password");
-    assert_eq!(auth_ledger(&pg), "1");
+    assert_eq!(auth_ledger(&pg), "3");
     assert_eq!(owner_command(&pg), "crystalline users add|true");
 }
 
@@ -2313,6 +2366,14 @@ fn doctor_warns_local_disk_rows_on_postgres() {
             "the accounts file {} is not read",
             leftover.display()
         )),
+        "{text}"
+    );
+    // The agents live in the accounts tables, which doctor does not open
+    // here: it says so instead of claiming and migrating the database.
+    assert!(
+        text.contains(
+            "agents:\n  not checked: on Postgres the agents are read only while an instance is running"
+        ),
         "{text}"
     );
     assert_eq!(schema_objects(&pg), "0", "doctor opened the store");

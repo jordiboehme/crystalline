@@ -7,6 +7,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod agents;
 mod answers;
 mod assets;
 mod automation;

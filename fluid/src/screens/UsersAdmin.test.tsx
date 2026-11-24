@@ -1,20 +1,22 @@
 /**
- * The account administration screen.
+ * The account administration screen, built for hundreds of accounts.
  *
  * What is pinned here is the part an admin has to be able to trust: that the
- * screen exists for nobody else, that a change to a role shows up before the
- * server has answered and un-shows itself when the server refuses, and that
- * the refusal on screen is the server's own sentence rather than a house
- * message pasted over it. NOT_LAST_ADMIN is the one that matters most: it is
- * the guard that keeps an instance administrable, and an admin who is told
- * "something went wrong" instead learns nothing about how to get past it.
+ * screen exists for nobody else; that the search, filters, sort and page live
+ * in the address and a bad value there falls back quietly; that the table
+ * holds no edit field and a row opens the account at its own address; that a
+ * change shows before the server has answered and un-shows itself when the
+ * server refuses, in the server's own sentence (NOT_LAST_ADMIN above all);
+ * and that a bulk change asks with the count first and reports every account,
+ * refusals first.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import type { User } from "../api/model";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
@@ -23,6 +25,12 @@ import {
   renderApp,
   userFixture,
 } from "../test/harness";
+import {
+  DEFAULT_USERS_REQUEST,
+  narrowed,
+  readUsersSearch,
+  writeUsersSearch,
+} from "./usersQuery";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -31,65 +39,154 @@ vi.mock("../api/client", async (importOriginal) => {
 
 const apiMock = vi.mocked(api);
 
-/** Two accounts: the admin asking, and a disabled editor to act on. */
-function usersListing() {
-  return {
-    users: [
-      {
-        name: "root",
-        display: "Root",
-        email: null,
-        role: "admin",
-        reflection: "default",
-        disabled: false,
-        last_seen: "2026-08-08T09:00:00Z",
-      },
-      {
-        name: "eddy",
-        display: "Eddy",
-        email: null,
-        role: "editor",
-        reflection: "default",
-        disabled: true,
-        last_seen: null,
-      },
-      {
-        name: "nora",
-        display: "Nora",
-        email: null,
-        role: "none",
-        reflection: "contributor",
-        disabled: false,
-        last_seen: null,
-      },
-    ],
-  };
+/** The admin asking, a disabled editor with a GitHub link, and a none. */
+function accounts(): User[] {
+  return [
+    {
+      name: "root",
+      display: "Root",
+      email: null,
+      role: "admin",
+      reflection: "default",
+      disabled: false,
+      last_seen: "2026-08-08T09:00:00Z",
+      sign_in: "password",
+      github_linked: false,
+    },
+    {
+      name: "eddy",
+      display: "Eddy",
+      email: "eddy@example.com",
+      role: "editor",
+      reflection: "default",
+      disabled: true,
+      last_seen: null,
+      sign_in: "oidc",
+      github_linked: true,
+    },
+    {
+      name: "nora",
+      display: "Nora",
+      email: null,
+      role: "none",
+      reflection: "contributor",
+      disabled: false,
+      last_seen: null,
+      sign_in: "token_only",
+      github_linked: false,
+    },
+  ];
 }
 
-/** The app, signed in as `root` in the given role, with the listing served. */
+function account(name: string): User {
+  const found = accounts().find((row) => row.name === name);
+  if (!found) throw new Error(`no fixture ${name}`);
+  return found;
+}
+
+/**
+ * The listing as the server would answer the path: a `q` keeps the accounts
+ * whose name starts with it, anything else answers every account.
+ */
+function listingFor(path: string, rows: User[] = accounts()) {
+  const q = new URLSearchParams(path.split("?")[1] ?? "").get("q");
+  const users = q === null ? rows : rows.filter((u) => u.name.startsWith(q));
+  return { users, total: users.length };
+}
+
+/** What `GET /users/{name}` answers for a fixture account. */
+function detailOf(name: string, extra: Record<string, unknown> = {}) {
+  return { user: account(name), writes: null, drafts: [], ...extra };
+}
+
+/**
+ * The app, signed in as `root` in the given role, with the listing served.
+ *
+ * Every fixture account answers `GET /users/{name}` with its detail, or with
+ * what `reads` gives for its name; a route in `routes` for the same address
+ * answers its writes.
+ */
 function serveAs(
   role: "admin" | "editor",
   routes: Record<string, Answer> = {},
+  reads: Record<string, Answer> = {},
 ) {
+  const perAccount = Object.fromEntries(
+    accounts().map(({ name }): [string, Answer] => [
+      `/users/${name}`,
+      (path, init) => {
+        if ((init?.method ?? "GET") === "GET") {
+          const read = reads[name];
+          return read ? read(path, init) : detailOf(name);
+        }
+        const write = routes[`/users/${name}`];
+        if (!write)
+          throw new ApiProblem(404, "not found", `no stub for ${path}`);
+        return write(path, init);
+      },
+    ]),
+  );
   apiMock.mockImplementation(
     answersFor({
       "/auth/me": () =>
         meResponse({ user: userFixture({ name: "root", role }) }),
       "/domains": domainsResponse,
-      "/users": () => usersListing(),
+      "/users": (path) => listingFor(path),
       ...routes,
+      ...perAccount,
     }),
   );
 }
 
+/** Every listing request the screen sent, as its query parameters. */
+function listingCalls(): URLSearchParams[] {
+  return apiMock.mock.calls
+    .map(([path]) => path)
+    .filter((path) => path.startsWith("/users?") && path.includes("limit="))
+    .map((path) => new URLSearchParams(path.split("?")[1]));
+}
+
+/** The last listing request, as its query parameters. */
+function lastListing(): URLSearchParams {
+  const last = listingCalls().at(-1);
+  if (!last) throw new Error("no listing request");
+  return last;
+}
+
 /** The table row an account is drawn in. */
 async function rowFor(name: string): Promise<HTMLElement> {
-  const cell = await screen.findByText(name);
-  const row = cell.closest("tr");
-  if (!row) {
-    throw new Error(`no row for ${name}`);
-  }
+  const table = await screen.findByRole("table");
+  const link = await within(table).findByRole("link", { name });
+  const row = link.closest("tr");
+  if (!row) throw new Error(`no row for ${name}`);
   return row;
+}
+
+/** The detail panel, once it shows the account. */
+async function panelFor(name: string): Promise<HTMLElement> {
+  const back = await screen.findByRole("link", { name: "Back to users" });
+  const panel = back.closest("section");
+  if (!panel) throw new Error("no panel");
+  await within(panel).findByText(name);
+  return panel;
+}
+
+/** Open an account from its row. */
+async function openFromRow(name: string): Promise<HTMLElement> {
+  await userEvent.click(within(await rowFor(name)).getByRole("link", { name }));
+  return panelFor(name);
+}
+
+/** The users screen's own search field. */
+function searchField(): HTMLElement {
+  return within(
+    screen.getByRole("search", { name: "Find accounts" }),
+  ).getByRole("searchbox");
+}
+
+/** The form that adds an account. */
+function createForm(): HTMLElement {
+  return screen.getByRole("region", { name: "Add an account" });
 }
 
 /** The body of the request the app sent to `path` with `method`, parsed. */
@@ -111,7 +208,1173 @@ beforeEach(() => {
   apiMock.mockReset();
 });
 
-describe("the user admin screen", () => {
+describe("the users address", () => {
+  it("reads every value it knows and writes back only what is not a default", () => {
+    const search =
+      "q=ed&role=editor&state=disabled&kind=token_only&github=true&seen_after=2026-01-02&seen_before=2026-03-04&sort=last_seen&dir=desc&page=3&size=25";
+    const read = readUsersSearch(new URLSearchParams(search));
+    expect(read).toEqual({
+      q: "ed",
+      role: "editor",
+      state: "disabled",
+      kind: "token_only",
+      github: true,
+      seenAfter: "2026-01-02",
+      seenBefore: "2026-03-04",
+      sort: "last_seen",
+      dir: "desc",
+      page: 3,
+      size: 25,
+    });
+    expect(writeUsersSearch(read).toString()).toBe(search);
+    expect(writeUsersSearch(DEFAULT_USERS_REQUEST).toString()).toBe("");
+  });
+
+  it("falls back to the defaults for anything it does not know", () => {
+    expect(
+      readUsersSearch(
+        new URLSearchParams(
+          "role=god&state=gone&kind=magic&github=yes&seen_after=2026-02-30&seen_before=soon&sort=age&dir=up&page=-1&size=7",
+        ),
+      ),
+    ).toEqual(DEFAULT_USERS_REQUEST);
+    expect(readUsersSearch(new URLSearchParams("page=0")).page).toBe(1);
+    expect(readUsersSearch(new URLSearchParams("page=2.5")).page).toBe(1);
+  });
+
+  it("starts again at the first page when what is listed changes", () => {
+    const onPage4 = { ...DEFAULT_USERS_REQUEST, page: 4 };
+    expect(narrowed(onPage4, { role: "admin" })).toMatchObject({
+      role: "admin",
+      page: 1,
+    });
+  });
+});
+
+describe("the users table", () => {
+  it("lists accounts with role, state, sign-in and last seen, and no edit field", async () => {
+    serveAs("admin");
+    renderApp("/admin/users");
+
+    const eddy = await rowFor("eddy");
+    expect(within(eddy).getByText("Disabled")).toBeInTheDocument();
+    expect(within(eddy).getByText("SSO")).toBeInTheDocument();
+    expect(within(eddy).getByText("Never")).toBeInTheDocument();
+    const nora = await rowFor("nora");
+    expect(within(nora).getByText("Token only")).toBeInTheDocument();
+    const root = await rowFor("root");
+    expect(within(root).getByText("2026-08-08")).toBeInTheDocument();
+    const table = screen.getByRole("table");
+    expect(within(table).queryAllByRole("combobox")).toHaveLength(0);
+    expect(within(table).queryAllByRole("textbox")).toHaveLength(0);
+    expect(lastListing().toString()).toBe("sort=name&dir=asc&page=1&limit=50");
+  });
+
+  it("asks the server for what the address says", async () => {
+    serveAs("admin");
+    renderApp(
+      "/admin/users?q=ed&role=editor&kind=oidc&github=true&seen_after=2026-01-02&sort=last_seen&dir=desc&page=2&size=25",
+    );
+
+    await waitFor(() => {
+      expect(listingCalls().length).toBeGreaterThan(0);
+    });
+    const sent = listingCalls()[0];
+    expect(sent?.get("q")).toBe("ed");
+    expect(sent?.get("role")).toBe("editor");
+    expect(sent?.get("kind")).toBe("oidc");
+    expect(sent?.get("github")).toBe("true");
+    expect(sent?.get("seen_after")).toBe("2026-01-02T00:00:00Z");
+    expect(sent?.get("sort")).toBe("last_seen");
+    expect(sent?.get("dir")).toBe("desc");
+    expect(sent?.get("page")).toBe("2");
+    expect(sent?.get("limit")).toBe("25");
+    expect(searchField()).toHaveValue("ed");
+    // Sorting by last seen says that paging can shift.
+    expect(
+      screen.getByText(/an account that signs in while you page can move/),
+    ).toBeInTheDocument();
+  });
+
+  it("falls back to the defaults without an error for a bad address", async () => {
+    serveAs("admin");
+    renderApp("/admin/users?sort=age&page=nope&size=7&role=god");
+
+    await rowFor("eddy");
+    expect(listingCalls()[0]?.toString()).toBe(
+      "sort=name&dir=asc&page=1&limit=50",
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("sorts by a column header, and flips the direction on a second click", async () => {
+    const user = userEvent.setup();
+    serveAs("admin");
+    renderApp("/admin/users");
+    await rowFor("eddy");
+
+    await user.click(screen.getByRole("button", { name: "Display name" }));
+    await waitFor(() => {
+      expect(lastListing().get("sort")).toBe("display");
+    });
+    expect(lastListing().get("dir")).toBe("asc");
+    expect(
+      screen.getByRole("button", { name: "Display name" }).closest("th"),
+    ).toHaveAttribute("aria-sort", "ascending");
+
+    await user.click(screen.getByRole("button", { name: "Display name" }));
+    await waitFor(() => {
+      expect(lastListing().get("dir")).toBe("desc");
+    });
+    expect(
+      screen.getByRole("button", { name: "Display name" }).closest("th"),
+    ).toHaveAttribute("aria-sort", "descending");
+
+    // Last seen starts with the most recent.
+    await user.click(screen.getByRole("button", { name: "Last seen" }));
+    await waitFor(() => {
+      expect(lastListing().get("sort")).toBe("last_seen");
+    });
+    expect(lastListing().get("dir")).toBe("desc");
+  });
+
+  it("offers a sort on every column", async () => {
+    serveAs("admin");
+    renderApp("/admin/users");
+    const table = await screen.findByRole("table");
+    for (const name of [
+      "Name",
+      "Display name",
+      "Role",
+      "State",
+      "Sign-in",
+      "Last seen",
+    ]) {
+      expect(within(table).getByRole("button", { name })).toBeInTheDocument();
+    }
+  });
+
+  it("searches after a pause, and from the first page", async () => {
+    const user = userEvent.setup();
+    serveAs("admin");
+    renderApp("/admin/users?page=3");
+    await screen.findByRole("search", { name: "Find accounts" });
+
+    await user.type(searchField(), "ed");
+    // Not yet: the list waits for the typing to stop.
+    expect(listingCalls().some((call) => call.get("q") === "ed")).toBe(false);
+    await waitFor(() => {
+      expect(lastListing().get("q")).toBe("ed");
+    });
+    expect(lastListing().get("page")).toBe("1");
+    // The address changed under the field, and the typing goes on there.
+    expect(searchField()).toHaveFocus();
+  });
+
+  it("searches at once on Enter", async () => {
+    const user = userEvent.setup();
+    serveAs("admin");
+    renderApp("/admin/users");
+    await screen.findByRole("search", { name: "Find accounts" });
+
+    await user.type(searchField(), "no{Enter}");
+    // At once, without the pause the typing waits for.
+    expect(lastListing().get("q")).toBe("no");
+  });
+
+  it("filters by role, state, sign-in, GitHub and last seen", async () => {
+    const user = userEvent.setup();
+    serveAs("admin");
+    renderApp("/admin/users?page=2");
+    const find = await screen.findByRole("search", { name: "Find accounts" });
+
+    await user.selectOptions(within(find).getByLabelText("Role"), "editor");
+    await waitFor(() => {
+      expect(lastListing().get("role")).toBe("editor");
+    });
+    expect(lastListing().get("page")).toBe("1");
+    await user.selectOptions(within(find).getByLabelText("State"), "active");
+    await user.selectOptions(
+      within(find).getByLabelText("Sign-in"),
+      "token_only",
+    );
+    await user.selectOptions(within(find).getByLabelText("GitHub"), "false");
+    await user.type(within(find).getByLabelText("Seen until"), "2026-05-06");
+    // Until a day includes the day: up to the start of the next one.
+    await waitFor(() => {
+      expect(lastListing().get("seen_before")).toBe("2026-05-07T00:00:00Z");
+    });
+    const sent = lastListing();
+    expect(sent.get("state")).toBe("active");
+    expect(sent.get("kind")).toBe("token_only");
+    expect(sent.get("github")).toBe("false");
+
+    await user.click(
+      within(find).getByRole("button", { name: "Clear filters" }),
+    );
+    await waitFor(() => {
+      expect(lastListing().toString()).toBe(
+        "sort=name&dir=asc&page=1&limit=50",
+      );
+    });
+  });
+
+  it("pages with the total, and changes the page size", async () => {
+    const user = userEvent.setup();
+    const many = Array.from({ length: 50 }, (_, index) => ({
+      ...account("nora"),
+      name: `user${String(index).padStart(3, "0")}`,
+    }));
+    serveAs("admin", {
+      "/users": () => ({ users: many, total: 120 }),
+    });
+    renderApp("/admin/users");
+
+    const pages = await screen.findByRole("navigation", { name: "Pages" });
+    expect(within(pages).getByText("1 to 50 of 120")).toBeInTheDocument();
+    expect(within(pages).getByText("Page 1 of 3")).toBeInTheDocument();
+    expect(
+      within(pages).getByRole("button", { name: "Previous page" }),
+    ).toBeDisabled();
+
+    await user.click(within(pages).getByRole("button", { name: "Next page" }));
+    await waitFor(() => {
+      expect(lastListing().get("page")).toBe("2");
+    });
+    await user.selectOptions(within(pages).getByLabelText("Per page"), "25");
+    await waitFor(() => {
+      expect(lastListing().get("limit")).toBe("25");
+    });
+    expect(lastListing().get("page")).toBe("1");
+  });
+
+  it("goes to the last page there is when the address asks past the end", async () => {
+    serveAs("admin");
+    renderApp("/admin/users?page=9");
+
+    await waitFor(() => {
+      expect(lastListing().get("page")).toBe("1");
+    });
+    await rowFor("eddy");
+  });
+
+  it("says when nothing matches", async () => {
+    serveAs("admin", { "/users": () => ({ users: [], total: 0 }) });
+    renderApp("/admin/users?q=zz");
+    expect(await screen.findByText("No account matches.")).toBeInTheDocument();
+  });
+
+  it("teaches what to do when no account is listed", async () => {
+    serveAs("admin", { "/users": () => ({ users: [], total: 0 }) });
+    renderApp("/admin/users");
+
+    expect(await screen.findByText(/no accounts yet/i)).toBeInTheDocument();
+  });
+
+  it("is not there for a non-admin", async () => {
+    serveAs("editor");
+    renderApp("/admin/users");
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("heading", { name: /users/i }),
+      ).not.toBeInTheDocument();
+    });
+    // The address leaks nothing: it is the not-found screen, not a shell with
+    // an empty table in it.
+    expect(
+      await screen.findByText(/nothing is filed at this address/i),
+    ).toBeInTheDocument();
+    expect(
+      apiMock.mock.calls.filter(([path]) => path.startsWith("/users")),
+    ).toHaveLength(0);
+    // And the frame does not advertise a screen this session cannot open.
+    expect(
+      screen.queryByRole("link", { name: /users/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("is not there for a non-admin at an account's address either", async () => {
+    serveAs("editor");
+    renderApp("/admin/users/eddy");
+
+    expect(
+      await screen.findByText(/nothing is filed at this address/i),
+    ).toBeInTheDocument();
+    expect(
+      apiMock.mock.calls.filter(([path]) => path.startsWith("/users")),
+    ).toHaveLength(0);
+  });
+
+  it("offers the nav entry to an admin", async () => {
+    serveAs("admin");
+    renderApp("/admin/users");
+
+    // Inside the identity menu rather than on an icon of its own: who you are
+    // and the accounts only you may administer are one subject, and the frame
+    // gathers them in one place.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ada Lovelace" }),
+    );
+    expect(
+      await screen.findByRole("menuitem", { name: "Users" }),
+    ).toHaveAttribute("href", "/admin/users");
+  });
+});
+
+describe("an account's detail panel", () => {
+  it("opens from the row at its own address, keeping the list's search", async () => {
+    serveAs("admin");
+    renderApp("/admin/users?role=editor");
+
+    const row = await rowFor("eddy");
+    expect(within(row).getByRole("link", { name: "eddy" })).toHaveAttribute(
+      "href",
+      "/admin/users/eddy?role=editor",
+    );
+    const panel = await openFromRow("eddy");
+    expect(
+      within(panel).getByRole("heading", { name: "Eddy" }),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).getByRole("link", { name: "Back to users" }),
+    ).toHaveAttribute("href", "/admin/users?role=editor");
+    expect(within(panel).getByText("SSO")).toBeInTheDocument();
+    expect(within(panel).getByText("eddy@example.com")).toBeInTheDocument();
+    // The Users entry of the area stays the current page.
+    expect(
+      screen
+        .getByRole("navigation", { name: "Administration" })
+        .querySelector('[aria-current="page"]'),
+    ).toHaveTextContent("Users");
+  });
+
+  it("reads a linked account from its own address", async () => {
+    serveAs("admin");
+    renderApp("/admin/users/eddy");
+
+    const panel = await panelFor("eddy");
+    expect(
+      within(panel).getByRole("heading", { name: "Eddy" }),
+    ).toBeInTheDocument();
+    expect(apiMock).toHaveBeenCalledWith("/users/eddy");
+    // Opened directly, the panel leaves the focus where the page put it.
+    expect(
+      within(panel).getByRole("heading", { name: "Eddy" }),
+    ).not.toHaveFocus();
+  });
+
+  it("says when there is no such account", async () => {
+    serveAs("admin");
+    renderApp("/admin/users/ghost");
+
+    expect(
+      await screen.findByRole("heading", { name: "No such account" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("There is no account named ghost.")).toBeVisible();
+  });
+
+  it("sets the Reflection level beside the role, and shows curator for editors", async () => {
+    serveAs("admin");
+    renderApp("/admin/users/nora");
+
+    const nora = await panelFor("nora");
+    expect(
+      within(nora).getByRole("combobox", { name: "Role for nora" }),
+    ).toHaveValue("none");
+    expect(
+      within(nora).getByRole("combobox", { name: "Reflection for nora" }),
+    ).toHaveValue("contributor");
+    const roles = within(
+      within(nora).getByRole("combobox", { name: "Role for nora" }),
+    )
+      .getAllByRole("option")
+      .map((option) => option.textContent);
+    expect(roles).toEqual(["none", "viewer", "editor", "admin"]);
+
+    const eddy = await openFromRow("eddy");
+    expect(within(eddy).getByText("curator")).toBeVisible();
+    expect(
+      within(eddy).queryByRole("combobox", { name: "Reflection for eddy" }),
+    ).toBeNull();
+  });
+
+  it("sends a Reflection change as a patch of its own", async () => {
+    serveAs("admin", {
+      "/users/nora": () => ({
+        user: { ...account("nora"), reflection: "reader" },
+      }),
+    });
+    renderApp("/admin/users/nora");
+
+    const nora = await panelFor("nora");
+    await userEvent.selectOptions(
+      within(nora).getByRole("combobox", { name: "Reflection for nora" }),
+      "reader",
+    );
+    await waitFor(() => {
+      expect(sentBody("/users/nora", "PATCH")).toEqual({
+        reflection: "reader",
+      });
+    });
+  });
+
+  it("moves an account to none with a Reflection level in the same patch", async () => {
+    serveAs("admin", {
+      "/users/eddy": () => ({ user: account("eddy") }),
+    });
+    renderApp("/admin/users/eddy");
+
+    const eddy = await panelFor("eddy");
+    await userEvent.selectOptions(
+      within(eddy).getByRole("combobox", { name: "Role for eddy" }),
+      "none",
+    );
+    await waitFor(() => {
+      expect(sentBody("/users/eddy", "PATCH")).toEqual({
+        role: "none",
+        reflection: "reader",
+      });
+    });
+  });
+
+  it("surfaces a NOT_LAST_ADMIN refusal in the server's words", async () => {
+    serveAs("admin", {
+      "/users/root": () => {
+        throw new ApiProblem(
+          409,
+          "conflict",
+          "refusing to demote the last admin ('root'): add or enable another admin first",
+        );
+      },
+    });
+    renderApp("/admin/users/root");
+
+    const panel = await panelFor("root");
+    const roleSelect = within(panel).getByRole("combobox", {
+      name: "Role for root",
+    });
+    await userEvent.selectOptions(roleSelect, "viewer");
+
+    expect(
+      await screen.findByText(/add or enable another admin first/i),
+    ).toBeInTheDocument();
+    // And the optimistic change is taken back: the panel and the row say what
+    // the server still holds, not what was asked for.
+    await waitFor(() => {
+      expect(roleSelect).toHaveValue("admin");
+    });
+    expect(within(await rowFor("root")).getByText("admin")).toBeInTheDocument();
+  });
+
+  it("takes a refused change back even before the panel has read the account", async () => {
+    serveAs(
+      "admin",
+      {
+        "/users/root": () => {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "add or enable another admin first",
+          );
+        },
+      },
+      // The panel's own read never answers, so it shows the table's row.
+      { root: () => new Promise(() => undefined) },
+    );
+    renderApp("/admin/users/root");
+
+    const panel = await panelFor("root");
+    const roleSelect = within(panel).getByRole("combobox", {
+      name: "Role for root",
+    });
+    await userEvent.selectOptions(roleSelect, "viewer");
+    expect(await screen.findByText(/another admin first/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(roleSelect).toHaveValue("admin");
+    });
+  });
+
+  it("shows a role change in the panel and the row before the server has answered", async () => {
+    // A patch the test holds open, so what the screen shows in the meantime
+    // is the optimistic copy rather than anything the server has said.
+    const gate: { settle: () => void } = { settle: () => undefined };
+    serveAs("admin", {
+      "/users/eddy": () =>
+        new Promise((resolve) => {
+          gate.settle = () => {
+            resolve({ user: { ...account("eddy"), role: "admin" } });
+          };
+        }),
+    });
+    renderApp("/admin/users/eddy");
+
+    const panel = await panelFor("eddy");
+    const roleSelect = within(panel).getByRole("combobox", {
+      name: "Role for eddy",
+    });
+    await userEvent.selectOptions(roleSelect, "admin");
+
+    expect(roleSelect).toHaveValue("admin");
+    expect(within(await rowFor("eddy")).getByText("admin")).toBeInTheDocument();
+    act(() => {
+      gate.settle();
+    });
+  });
+
+  it("reactivates a disabled account, and never offers the caller their own", async () => {
+    serveAs("admin", {
+      "/users/eddy": () => ({ user: { ...account("eddy"), disabled: false } }),
+    });
+    renderApp("/admin/users/root");
+    await panelFor("root");
+
+    // The caller cannot lock themselves out from here: the server refuses it,
+    // and the screen does not offer it.
+    expect(
+      screen.queryByRole("button", { name: /deactivate root/i }),
+    ).not.toBeInTheDocument();
+
+    await openFromRow("eddy");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Reactivate eddy" }),
+    );
+    await waitFor(() => {
+      expect(sentBody("/users/eddy", "PATCH")).toEqual({ disabled: false });
+    });
+  });
+
+  it("replaces a password and says what that cost", async () => {
+    const reset = vi.fn(() => ({ user: account("eddy") }));
+    serveAs("admin", { "/users/eddy/password": () => reset() });
+    renderApp("/admin/users/eddy");
+    const panel = await panelFor("eddy");
+
+    await userEvent.click(
+      within(panel).getByRole("button", { name: "Reset password" }),
+    );
+    await userEvent.type(
+      screen.getByLabelText("New password for eddy"),
+      "correct horse",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Set password for eddy" }),
+    );
+
+    await waitFor(() => {
+      expect(reset).toHaveBeenCalled();
+    });
+    expect(sentBody("/users/eddy/password", "POST")).toEqual({
+      password: "correct horse",
+    });
+    expect(await screen.findByText(/signed out/i)).toBeInTheDocument();
+  });
+
+  it("renames an account's display", async () => {
+    serveAs("admin", {
+      "/users/eddy": () => ({
+        user: { ...account("eddy"), display: "Edward" },
+      }),
+    });
+    renderApp("/admin/users/eddy");
+    const panel = await panelFor("eddy");
+
+    const save = within(panel).getByRole("button", {
+      name: "Save display for eddy",
+    });
+    expect(save).toBeDisabled();
+    const display = within(panel).getByRole("textbox", {
+      name: "Display name for eddy",
+    });
+    await userEvent.clear(display);
+    await userEvent.type(display, "Edward");
+    await userEvent.click(save);
+
+    await waitFor(() => {
+      expect(sentBody("/users/eddy", "PATCH")).toEqual({ display: "Edward" });
+    });
+  });
+
+  it("unlinks GitHub and passes on the warning", async () => {
+    serveAs("admin", {
+      "/users/eddy/github-link": () => ({
+        linked: false,
+        unlinked: true,
+        warning: "unlinked here; revoke it in your GitHub settings",
+      }),
+    });
+    renderApp("/admin/users/eddy");
+    const panel = await panelFor("eddy");
+    expect(within(panel).getByText("Linked")).toBeInTheDocument();
+
+    await userEvent.click(
+      within(panel).getByRole("button", { name: "Unlink eddy from GitHub" }),
+    );
+    expect(
+      await screen.findByText(/revoke it in your GitHub settings/),
+    ).toHaveAttribute("role", "alert");
+    expect(
+      apiMock.mock.calls.some(
+        ([path, init]) =>
+          path === "/users/eddy/github-link" && init?.method === "DELETE",
+      ),
+    ).toBe(true);
+  });
+
+  it("offers no unlink for an account without a GitHub link", async () => {
+    serveAs("admin");
+    renderApp("/admin/users/nora");
+    const panel = await panelFor("nora");
+    expect(within(panel).getByText("Not linked")).toBeInTheDocument();
+    expect(within(panel).queryByRole("button", { name: /unlink/i })).toBeNull();
+  });
+
+  it("shows that an account has no write list, and saves a typed one", async () => {
+    const saved = vi.fn(() => ({ name: "nora", writes: ["agents-*", "eng"] }));
+    serveAs("admin", { "/users/nora/writes": () => saved() });
+    renderApp("/admin/users/nora");
+    const panel = await panelFor("nora");
+    expect(
+      await within(panel).findByText(/No list: it writes wherever/),
+    ).toBeInTheDocument();
+    const save = within(panel).getByRole("button", {
+      name: "Save write list for nora",
+    });
+    expect(save).toBeDisabled();
+    expect(
+      within(panel).queryByRole("button", { name: /remove the write list/i }),
+    ).toBeNull();
+
+    await userEvent.type(
+      within(panel).getByRole("textbox", { name: "Write list for nora" }),
+      "eng, agents-*, ",
+    );
+    await userEvent.click(save);
+    await waitFor(() => {
+      expect(sentBody("/users/nora/writes", "PUT")).toEqual({
+        writes: ["eng", "agents-*"],
+      });
+    });
+    expect(
+      await screen.findByText("Saved the write list of nora."),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).getByRole("textbox", { name: "Write list for nora" }),
+    ).toHaveValue("agents-*, eng");
+    expect(
+      within(panel).getByText("It writes only to these domains."),
+    ).toBeVisible();
+  });
+
+  it("removes a write list, and shows a refused one in the server's words", async () => {
+    let refuse = true;
+    serveAs(
+      "admin",
+      {
+        "/users/eddy/writes": () => {
+          if (refuse) {
+            refuse = false;
+            throw new ApiProblem(
+              422,
+              "unprocessable",
+              "'a/b' is not a domain name or a name prefix with one * at the end",
+            );
+          }
+          return { name: "eddy", writes: null };
+        },
+      },
+      { eddy: () => detailOf("eddy", { writes: ["eng"] }) },
+    );
+    renderApp("/admin/users/eddy");
+    const panel = await panelFor("eddy");
+    const field = await within(panel).findByRole("textbox", {
+      name: "Write list for eddy",
+    });
+    expect(field).toHaveValue("eng");
+
+    await userEvent.clear(field);
+    await userEvent.type(field, "a/b");
+    await userEvent.click(
+      within(panel).getByRole("button", { name: "Save write list for eddy" }),
+    );
+    expect(
+      await screen.findByText(/'a\/b' is not a domain name/),
+    ).toHaveAttribute("role", "alert");
+
+    await userEvent.click(
+      within(panel).getByRole("button", {
+        name: "Remove the write list of eddy",
+      }),
+    );
+    await waitFor(() => {
+      expect(
+        apiMock.mock.calls.filter(
+          ([path, init]) =>
+            path === "/users/eddy/writes" &&
+            init?.body === JSON.stringify({ writes: null }),
+        ),
+      ).toHaveLength(1);
+    });
+    expect(
+      await screen.findByText("Removed the write list of eddy."),
+    ).toBeInTheDocument();
+  });
+
+  it("counts the drafts an account holds, and changes none of them", async () => {
+    serveAs(
+      "admin",
+      {},
+      {
+        eddy: () =>
+          detailOf("eddy", {
+            drafts: [
+              { domain: "eng", count: 2 },
+              { domain: "ops", count: 1 },
+            ],
+          }),
+        nora: () => detailOf("nora", { drafts: null }),
+      },
+    );
+    renderApp("/admin/users/eddy");
+    const eddy = await panelFor("eddy");
+    const items = (await within(eddy).findAllByRole("listitem")).map(
+      (item) => item.textContent,
+    );
+    expect(items).toEqual(["eng: 2 drafts", "ops: 1 draft"]);
+    expect(within(eddy).getByText(/Drafts belong to the person/)).toBeVisible();
+
+    const nora = await openFromRow("nora");
+    expect(
+      await within(nora).findByText("The drafts could not be read."),
+    ).toBeInTheDocument();
+    const root = await openFromRow("root");
+    expect(await within(root).findByText("No drafts.")).toBeInTheDocument();
+  });
+
+  it("follows a display name changed elsewhere, but never over typed text", async () => {
+    let display = "Eddy";
+    serveAs(
+      "admin",
+      { "/users/eddy": () => ({ user: account("eddy") }) },
+      {
+        eddy: () => detailOf("eddy", { user: { ...account("eddy"), display } }),
+      },
+    );
+    renderApp("/admin/users/eddy");
+    const panel = await panelFor("eddy");
+    const field = within(panel).getByRole("textbox", {
+      name: "Display name for eddy",
+    });
+    expect(field).toHaveValue("Eddy");
+
+    // Somebody else renames it; the next read brings the new name.
+    display = "Edwin";
+    await userEvent.selectOptions(
+      within(panel).getByRole("combobox", { name: "Role for eddy" }),
+      "viewer",
+    );
+    await waitFor(() => {
+      expect(field).toHaveValue("Edwin");
+    });
+    expect(
+      within(panel).getByRole("button", { name: "Save display for eddy" }),
+    ).toBeDisabled();
+
+    await userEvent.clear(field);
+    await userEvent.type(field, "Ed");
+    display = "Edmund";
+    await userEvent.selectOptions(
+      within(panel).getByRole("combobox", { name: "Role for eddy" }),
+      "editor",
+    );
+    await waitFor(() => {
+      expect(
+        within(panel).getByRole("heading", { name: "Edmund" }),
+      ).toBeInTheDocument();
+    });
+    expect(field).toHaveValue("Ed");
+  });
+
+  it("puts the focus on the panel it opens, and back on the row when it closes", async () => {
+    serveAs("admin");
+    renderApp("/admin/users");
+    const panel = await openFromRow("eddy");
+    await waitFor(() => {
+      expect(
+        within(panel).getByRole("heading", { name: "Eddy" }),
+      ).toHaveFocus();
+    });
+
+    await userEvent.click(
+      within(panel).getByRole("link", { name: "Back to users" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(screen.getByRole("table")).getByRole("link", { name: "eddy" }),
+      ).toHaveFocus();
+    });
+  });
+
+  it("asks twice before deleting, then goes back to the list", async () => {
+    const deleted = vi.fn(() => undefined);
+    serveAs("admin", {
+      "/users/eddy": () => deleted(),
+    });
+    renderApp("/admin/users/eddy?role=editor");
+    const panel = await panelFor("eddy");
+
+    await userEvent.click(
+      within(panel).getByRole("button", { name: "Delete eddy" }),
+    );
+    expect(deleted).not.toHaveBeenCalled();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm delete of eddy" }),
+    );
+    await waitFor(() => {
+      expect(deleted).toHaveBeenCalled();
+    });
+    expect(await screen.findByText("Deleted eddy.")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("link", { name: "Back to users" }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  it("takes back the confirmation on escape, with the focus", async () => {
+    serveAs("admin");
+    renderApp("/admin/users/eddy");
+    await panelFor("eddy");
+
+    const trigger = screen.getByRole("button", { name: "Delete eddy" });
+    await userEvent.click(trigger);
+    expect(
+      screen.getByRole("button", { name: "Confirm delete of eddy" }),
+    ).toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("button", { name: "Confirm delete of eddy" }),
+    ).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+});
+
+describe("bulk changes", () => {
+  it("selects accounts on the page, but never the caller's own", async () => {
+    const user = userEvent.setup();
+    serveAs("admin");
+    renderApp("/admin/users");
+    const root = await rowFor("root");
+    // The caller's own row says why it cannot be ticked.
+    expect(
+      within(root).getByRole("checkbox", {
+        name: "Your own account cannot be selected",
+      }),
+    ).toBeDisabled();
+
+    await user.click(
+      screen.getByRole("checkbox", {
+        name: "Select every account on this page",
+      }),
+    );
+    expect(screen.getByRole("checkbox", { name: "Select eddy" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Select nora" })).toBeChecked();
+    expect(screen.getByText("2 accounts selected")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "Select nora" }));
+    expect(screen.getByText("1 account selected")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Select every account on this page",
+      }),
+    ).toHaveProperty("indeterminate", true);
+  });
+
+  it("asks with the count, then reports every account, refusals first", async () => {
+    const user = userEvent.setup();
+    serveAs("admin", {
+      "/users/bulk": () => ({
+        results: [
+          { name: "eddy", done: true },
+          {
+            name: "nora",
+            done: false,
+            message: "refusing to disable the last admin",
+          },
+        ],
+      }),
+    });
+    renderApp("/admin/users");
+    await rowFor("eddy");
+    await user.click(screen.getByRole("checkbox", { name: "Select eddy" }));
+    await user.click(screen.getByRole("checkbox", { name: "Select nora" }));
+
+    const bar = screen.getByRole("region", { name: "Selected accounts" });
+    await user.click(within(bar).getByRole("button", { name: "Deactivate" }));
+    expect(within(bar).getByText("Deactivate for 2 accounts?")).toBeVisible();
+    expect(apiMock.mock.calls.some(([path]) => path === "/users/bulk")).toBe(
+      false,
+    );
+    await user.click(
+      within(bar).getByRole("button", { name: "Deactivate 2 accounts" }),
+    );
+
+    await waitFor(() => {
+      expect(sentBody("/users/bulk", "POST")).toEqual({
+        names: ["eddy", "nora"],
+        action: "deactivate",
+      });
+    });
+    const results = await screen.findByRole("alert", {
+      name: "Bulk results",
+    });
+    // The answer to the confirm takes the focus the confirm had.
+    await waitFor(() => {
+      expect(results).toHaveFocus();
+    });
+    expect(
+      within(results).getByText("Deactivate: 1 done, 1 refused."),
+    ).toBeVisible();
+    const items = within(results)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent);
+    expect(items).toEqual([
+      "nora: refusing to disable the last admin",
+      "eddy: done",
+    ]);
+    // The selection is used up.
+    expect(
+      screen.getByRole("checkbox", { name: "Select eddy" }),
+    ).not.toBeChecked();
+  });
+
+  it("changes the role of the selection", async () => {
+    const user = userEvent.setup();
+    serveAs("admin", {
+      "/users/bulk": () => ({ results: [{ name: "nora", done: true }] }),
+    });
+    renderApp("/admin/users");
+    await rowFor("nora");
+    await user.click(screen.getByRole("checkbox", { name: "Select nora" }));
+
+    const bar = screen.getByRole("region", { name: "Selected accounts" });
+    await user.selectOptions(
+      within(bar).getByLabelText("New role for the selected accounts"),
+      "editor",
+    );
+    await user.click(within(bar).getByRole("button", { name: "Set role" }));
+    expect(
+      within(bar).getByText("Set role editor for 1 account?"),
+    ).toBeVisible();
+    await user.click(
+      within(bar).getByRole("button", { name: "Set role editor 1 account" }),
+    );
+    await waitFor(() => {
+      expect(sentBody("/users/bulk", "POST")).toEqual({
+        names: ["nora"],
+        action: "role",
+        role: "editor",
+      });
+    });
+    expect(
+      await screen.findByRole("status", { name: "Bulk results" }),
+    ).toHaveTextContent("Set role editor: 1 done.");
+  });
+
+  it("asks nothing when the confirm is cancelled", async () => {
+    const user = userEvent.setup();
+    serveAs("admin");
+    renderApp("/admin/users");
+    await rowFor("eddy");
+    await user.click(screen.getByRole("checkbox", { name: "Select eddy" }));
+    const bar = screen.getByRole("region", { name: "Selected accounts" });
+    await user.click(within(bar).getByRole("button", { name: "Reactivate" }));
+    await user.click(within(bar).getByRole("button", { name: "Cancel" }));
+    expect(within(bar).queryByText(/for 1 account\?/)).toBeNull();
+    expect(apiMock.mock.calls.some(([path]) => path === "/users/bulk")).toBe(
+      false,
+    );
+  });
+
+  it("never counts or sends a tick that is not on the page shown", async () => {
+    const user = userEvent.setup();
+    const later: { answer: () => void } = { answer: () => undefined };
+    const other = { ...account("nora"), name: "olga" };
+    serveAs("admin", {
+      "/users": (path) => {
+        if (new URLSearchParams(path.split("?")[1]).get("page") !== "2") {
+          return { users: accounts(), total: 120 };
+        }
+        return new Promise((resolve) => {
+          later.answer = () => {
+            resolve({ users: [other], total: 120 });
+          };
+        });
+      },
+    });
+    renderApp("/admin/users");
+    await rowFor("eddy");
+    await user.click(screen.getByRole("button", { name: "Next page" }));
+    await waitFor(() => {
+      expect(lastListing().get("page")).toBe("2");
+    });
+    // The first page is still drawn while the second loads; a tick there
+    // belongs to no row of the page that arrives.
+    await user.click(screen.getByRole("checkbox", { name: "Select nora" }));
+    // The range still names the rows on screen, not the page on its way.
+    expect(screen.getByText("1 to 3 of 120")).toBeInTheDocument();
+    act(() => {
+      later.answer();
+    });
+    await rowFor("olga");
+    expect(screen.queryByText(/selected$/)).toBeNull();
+  });
+
+  it("starts with nothing selected on another page or sort", async () => {
+    const user = userEvent.setup();
+    serveAs("admin");
+    renderApp("/admin/users");
+    await rowFor("eddy");
+    await user.click(screen.getByRole("checkbox", { name: "Select eddy" }));
+    expect(screen.getByText("1 account selected")).toBeInTheDocument();
+
+    await user.click(
+      within(screen.getByRole("table")).getByRole("button", { name: "Role" }),
+    );
+    await waitFor(() => {
+      expect(lastListing().get("sort")).toBe("role");
+    });
+    expect(screen.queryByText("1 account selected")).toBeNull();
+    expect(
+      screen.getByRole("checkbox", { name: "Select eddy" }),
+    ).not.toBeChecked();
+  });
+});
+
+describe("adding accounts and ending drafts", () => {
+  it("creates an account through the form and opens it", async () => {
+    const created = vi.fn(() => ({
+      user: { ...account("nora"), name: "bob" },
+    }));
+    serveAs("admin", {
+      "/users": (path, init) =>
+        init?.method === "POST" ? created() : listingFor(path),
+    });
+    renderApp("/admin/users");
+    await rowFor("root");
+
+    const form = createForm();
+    await userEvent.type(within(form).getByLabelText("Login name"), "bob");
+    await userEvent.type(within(form).getByLabelText("Password"), "hunter2");
+    await userEvent.click(
+      within(form).getByRole("button", { name: "Add user" }),
+    );
+
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    expect(sentBody("/users", "POST")).toMatchObject({
+      name: "bob",
+      password: "hunter2",
+      role: "viewer",
+    });
+    expect(await screen.findByText("Added bob.")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(apiMock).toHaveBeenCalledWith("/users/bob");
+    });
+  });
+
+  it("keeps what was typed when the server refuses a new account", async () => {
+    serveAs("admin", {
+      "/users": (path, init) => {
+        if (init?.method === "POST") {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "an account named 'bob' already exists",
+          );
+        }
+        return listingFor(path);
+      },
+    });
+    renderApp("/admin/users");
+    await rowFor("root");
+
+    const form = createForm();
+    const nameField = within(form).getByLabelText("Login name");
+    await userEvent.type(nameField, "bob");
+    await userEvent.type(within(form).getByLabelText("Password"), "hunter2");
+    await userEvent.click(
+      within(form).getByRole("button", { name: "Add user" }),
+    );
+
+    expect(await screen.findByText(/already exists/i)).toBeInTheDocument();
+    // The fix for a name in use is a different name, not typing it all again.
+    expect(nameField).toHaveValue("bob");
+  });
+
+  it("resets a chosen Reflection level when the new account's role curates", async () => {
+    serveAs("admin", {
+      "/users": (path, init) =>
+        init?.method === "POST" ? { user: account("eddy") } : listingFor(path),
+    });
+    renderApp("/admin/users");
+
+    await rowFor("nora");
+    const form = createForm();
+    await userEvent.type(within(form).getByLabelText("Login name"), "kim");
+    await userEvent.type(within(form).getByLabelText("Password"), "pw");
+    await userEvent.selectOptions(
+      within(form).getByLabelText("Reflection"),
+      "contributor",
+    );
+    await userEvent.selectOptions(
+      within(form).getByLabelText("Role"),
+      "editor",
+    );
+    expect(within(form).getByLabelText("Reflection")).toHaveTextContent(
+      "curator",
+    );
+    await userEvent.click(
+      within(form).getByRole("button", { name: "Add user" }),
+    );
+    await waitFor(() => {
+      expect(sentBody("/users", "POST")).toEqual({
+        name: "kim",
+        password: "pw",
+        role: "editor",
+      });
+    });
+  });
+
+  it("adds an account at none with a Reflection level, never with nothing", async () => {
+    serveAs("admin", {
+      "/users": (path, init) =>
+        init?.method === "POST" ? { user: account("nora") } : listingFor(path),
+    });
+    renderApp("/admin/users");
+
+    await rowFor("nora");
+    const form = createForm();
+    await userEvent.type(within(form).getByLabelText("Login name"), "kim");
+    await userEvent.type(within(form).getByLabelText("Password"), "pw");
+    await userEvent.selectOptions(within(form).getByLabelText("Role"), "none");
+    expect(within(form).getByLabelText("Reflection")).toHaveValue("reader");
+    await userEvent.click(
+      within(form).getByRole("button", { name: "Add user" }),
+    );
+    await waitFor(() => {
+      expect(sentBody("/users", "POST")).toEqual({
+        name: "kim",
+        password: "pw",
+        role: "none",
+        reflection: "reader",
+      });
+    });
+  });
+
   it("ends a removed account's drafts only once the name is typed twice", async () => {
     const user = userEvent.setup();
     serveAs("admin", {
@@ -120,7 +1383,7 @@ describe("the user admin screen", () => {
         domains: [{ domain: "team", discarded: 2, left: [] }],
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     const end = await screen.findByRole("button", { name: "End these drafts" });
     expect(end).toBeDisabled();
 
@@ -159,7 +1422,7 @@ describe("the user admin screen", () => {
         ],
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await user.type(
       await screen.findByLabelText("Removed account's name"),
       "ada",
@@ -181,7 +1444,7 @@ describe("the user admin screen", () => {
         error: "the kept texts of domain 'team' could not be read",
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await user.type(
       await screen.findByLabelText("Removed account's name"),
       "gone",
@@ -200,7 +1463,7 @@ describe("the user admin screen", () => {
         throw new ApiProblem(409, "conflict", "'eddy' is an account");
       },
     });
-    renderApp("/users");
+    renderApp("/admin/users");
     await user.type(
       await screen.findByLabelText("Removed account's name"),
       "eddy",
@@ -208,436 +1471,5 @@ describe("the user admin screen", () => {
     await user.type(screen.getByLabelText("Type the name again"), "eddy");
     await user.click(screen.getByRole("button", { name: "End these drafts" }));
     expect(await screen.findByText("'eddy' is an account")).toBeVisible();
-  });
-
-  it("sets the Reflection level beside the role, and shows curator for editors", async () => {
-    serveAs("admin");
-    renderApp("/users");
-
-    const nora = await rowFor("nora");
-    expect(
-      within(nora).getByRole("combobox", { name: "Role for nora" }),
-    ).toHaveValue("none");
-    expect(
-      within(nora).getByRole("combobox", { name: "Reflection for nora" }),
-    ).toHaveValue("contributor");
-    const eddy = await rowFor("eddy");
-    expect(within(eddy).getByText("curator")).toBeVisible();
-    expect(
-      within(eddy).queryByRole("combobox", { name: "Reflection for eddy" }),
-    ).toBeNull();
-    const roles = within(
-      within(nora).getByRole("combobox", { name: "Role for nora" }),
-    )
-      .getAllByRole("option")
-      .map((option) => option.textContent);
-    expect(roles).toEqual(["none", "viewer", "editor", "admin"]);
-  });
-
-  it("sends a Reflection change as a patch of its own", async () => {
-    serveAs("admin", {
-      "/users/nora": (_path, init) =>
-        init?.method === "PATCH"
-          ? { user: { ...usersListing().users[2], reflection: "reader" } }
-          : usersListing(),
-    });
-    renderApp("/users");
-
-    const nora = await rowFor("nora");
-    await userEvent.selectOptions(
-      within(nora).getByRole("combobox", { name: "Reflection for nora" }),
-      "reader",
-    );
-    await waitFor(() => {
-      expect(sentBody("/users/nora", "PATCH")).toEqual({
-        reflection: "reader",
-      });
-    });
-  });
-
-  it("moves an account to none with a Reflection level in the same patch", async () => {
-    serveAs("admin", {
-      "/users/eddy": () => ({ user: usersListing().users[1] }),
-    });
-    renderApp("/users");
-
-    const eddy = await rowFor("eddy");
-    await userEvent.selectOptions(
-      within(eddy).getByRole("combobox", { name: "Role for eddy" }),
-      "none",
-    );
-    await waitFor(() => {
-      expect(sentBody("/users/eddy", "PATCH")).toEqual({
-        role: "none",
-        reflection: "reader",
-      });
-    });
-  });
-
-  it("resets a chosen Reflection level when the new account's role curates", async () => {
-    serveAs("admin", {
-      "/users": (_path, init) =>
-        init?.method === "POST"
-          ? { user: usersListing().users[1] }
-          : usersListing(),
-    });
-    renderApp("/users");
-
-    await rowFor("nora");
-    await userEvent.type(screen.getByLabelText("Login name"), "kim");
-    await userEvent.type(screen.getByLabelText("Password"), "pw");
-    await userEvent.selectOptions(
-      screen.getByLabelText("Reflection"),
-      "contributor",
-    );
-    await userEvent.selectOptions(screen.getByLabelText("Role"), "editor");
-    expect(screen.getByLabelText("Reflection")).toHaveTextContent("curator");
-    await userEvent.click(screen.getByRole("button", { name: "Add user" }));
-    await waitFor(() => {
-      expect(sentBody("/users", "POST")).toEqual({
-        name: "kim",
-        password: "pw",
-        role: "editor",
-      });
-    });
-  });
-
-  it("adds an account at none with a Reflection level, never with nothing", async () => {
-    serveAs("admin", {
-      "/users": (_path, init) =>
-        init?.method === "POST"
-          ? { user: usersListing().users[2] }
-          : usersListing(),
-    });
-    renderApp("/users");
-
-    await rowFor("nora");
-    await userEvent.type(screen.getByLabelText("Login name"), "kim");
-    await userEvent.type(screen.getByLabelText("Password"), "pw");
-    await userEvent.selectOptions(screen.getByLabelText("Role"), "none");
-    expect(screen.getByLabelText("Reflection")).toHaveValue("reader");
-    await userEvent.click(screen.getByRole("button", { name: "Add user" }));
-    await waitFor(() => {
-      expect(sentBody("/users", "POST")).toEqual({
-        name: "kim",
-        password: "pw",
-        role: "none",
-        reflection: "reader",
-      });
-    });
-  });
-
-  it("lists accounts with role, state and last seen", async () => {
-    serveAs("admin");
-    renderApp("/users");
-
-    expect(
-      await screen.findByRole("heading", { name: /users/i }),
-    ).toBeInTheDocument();
-    expect(await screen.findByText("eddy")).toBeInTheDocument();
-    expect(screen.getByText(/disabled/i)).toBeInTheDocument();
-    expect(screen.getAllByText(/never/i)).toHaveLength(2);
-    expect(screen.getByText("2026-08-08")).toBeInTheDocument();
-  });
-
-  it("is not there for a non-admin", async () => {
-    serveAs("editor");
-    renderApp("/users");
-
-    await waitFor(() => {
-      expect(
-        screen.queryByRole("heading", { name: /users/i }),
-      ).not.toBeInTheDocument();
-    });
-    // The address leaks nothing: it is the not-found screen, not a shell with
-    // an empty table in it.
-    expect(
-      await screen.findByText(/nothing is filed at this address/i),
-    ).toBeInTheDocument();
-    expect(
-      apiMock.mock.calls.filter(([path]) => path === "/users"),
-    ).toHaveLength(0);
-    // And the frame does not advertise a screen this session cannot open.
-    expect(
-      screen.queryByRole("link", { name: /users/i }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("offers the nav entry to an admin", async () => {
-    serveAs("admin");
-    renderApp("/users");
-
-    // Inside the identity menu rather than on an icon of its own: who you are
-    // and the accounts only you may administer are one subject, and the frame
-    // gathers them in one place.
-    await userEvent.click(
-      await screen.findByRole("button", { name: "Ada Lovelace" }),
-    );
-    expect(
-      await screen.findByRole("menuitem", { name: "Users" }),
-    ).toHaveAttribute("href", "/users");
-  });
-
-  it("teaches what to do when no account is listed", async () => {
-    serveAs("admin", { "/users": () => ({ users: [] }) });
-    renderApp("/users");
-
-    expect(await screen.findByText(/no accounts yet/i)).toBeInTheDocument();
-  });
-
-  it("surfaces a NOT_LAST_ADMIN refusal in the server's words", async () => {
-    serveAs("admin", {
-      "/users/root": (_path, init) => {
-        if (init?.method === "PATCH") {
-          throw new ApiProblem(
-            409,
-            "conflict",
-            "refusing to demote the last admin ('root'): add or enable another admin first",
-          );
-        }
-        return usersListing();
-      },
-    });
-    renderApp("/users");
-
-    const row = await rowFor("root");
-    const roleSelect = within(row).getByLabelText(/role/i);
-    await userEvent.selectOptions(roleSelect, "viewer");
-
-    expect(
-      await screen.findByText(/add or enable another admin first/i),
-    ).toBeInTheDocument();
-    // And the optimistic change is taken back: the row says what the server
-    // still holds, not what was asked for.
-    await waitFor(() => {
-      expect(roleSelect).toHaveValue("admin");
-    });
-  });
-
-  it("shows a role change before the server has answered", async () => {
-    // A patch the test holds open, so what the row shows in the meantime is
-    // the optimistic copy rather than anything the server has said.
-    const gate: { settle: () => void } = { settle: () => undefined };
-    serveAs("admin", {
-      "/users/eddy": (_path, init) => {
-        if (init?.method === "PATCH") {
-          return new Promise((resolve) => {
-            gate.settle = () => {
-              resolve({
-                user: {
-                  name: "eddy",
-                  display: "Eddy",
-                  email: null,
-                  role: "admin",
-                  disabled: true,
-                  last_seen: null,
-                },
-              });
-            };
-          });
-        }
-        return usersListing();
-      },
-    });
-    renderApp("/users");
-
-    const row = await rowFor("eddy");
-    const roleSelect = within(row).getByLabelText(/role/i);
-    await userEvent.selectOptions(roleSelect, "admin");
-
-    expect(roleSelect).toHaveValue("admin");
-    gate.settle();
-  });
-
-  it("creates an account through the form", async () => {
-    const created = vi.fn(() => ({
-      user: {
-        name: "bob",
-        display: "Bob",
-        email: null,
-        role: "viewer",
-        disabled: false,
-        last_seen: null,
-      },
-    }));
-    serveAs("admin", {
-      "/users": (_path, init) =>
-        init?.method === "POST" ? created() : usersListing(),
-    });
-    renderApp("/users");
-    await rowFor("root");
-
-    await userEvent.type(screen.getByLabelText(/login name/i), "bob");
-    await userEvent.type(screen.getByLabelText(/password/i), "hunter2");
-    await userEvent.click(screen.getByRole("button", { name: /add user/i }));
-
-    await waitFor(() => {
-      expect(created).toHaveBeenCalled();
-    });
-    expect(sentBody("/users", "POST")).toMatchObject({
-      name: "bob",
-      password: "hunter2",
-      role: "viewer",
-    });
-  });
-
-  it("keeps what was typed when the server refuses a new account", async () => {
-    serveAs("admin", {
-      "/users": (_path, init) => {
-        if (init?.method === "POST") {
-          throw new ApiProblem(
-            409,
-            "conflict",
-            "an account named 'bob' already exists",
-          );
-        }
-        return usersListing();
-      },
-    });
-    renderApp("/users");
-    await rowFor("root");
-
-    const nameField = screen.getByLabelText(/login name/i);
-    await userEvent.type(nameField, "bob");
-    await userEvent.type(screen.getByLabelText(/password/i), "hunter2");
-    await userEvent.click(screen.getByRole("button", { name: /add user/i }));
-
-    expect(await screen.findByText(/already exists/i)).toBeInTheDocument();
-    // The fix for a name in use is a different name, not typing it all again.
-    expect(nameField).toHaveValue("bob");
-  });
-
-  it("asks twice before deleting", async () => {
-    const deleted = vi.fn(() => undefined);
-    serveAs("admin", {
-      "/users/eddy": (_path, init) =>
-        init?.method === "DELETE" ? deleted() : usersListing(),
-    });
-    renderApp("/users");
-    await rowFor("eddy");
-
-    await userEvent.click(screen.getByRole("button", { name: /delete eddy/i }));
-    expect(deleted).not.toHaveBeenCalled();
-
-    await userEvent.click(
-      screen.getByRole("button", { name: /confirm delete/i }),
-    );
-    await waitFor(() => {
-      expect(deleted).toHaveBeenCalled();
-    });
-  });
-
-  it("takes back the confirmation on escape, with the focus", async () => {
-    serveAs("admin");
-    renderApp("/users");
-    await rowFor("eddy");
-
-    const trigger = screen.getByRole("button", { name: /delete eddy/i });
-    await userEvent.click(trigger);
-    expect(
-      screen.getByRole("button", { name: /confirm delete/i }),
-    ).toBeInTheDocument();
-
-    await userEvent.keyboard("{Escape}");
-    expect(
-      screen.queryByRole("button", { name: /confirm delete/i }),
-    ).not.toBeInTheDocument();
-    expect(trigger).toHaveFocus();
-  });
-
-  it("reactivates a disabled account, and never offers the caller their own", async () => {
-    serveAs("admin", {
-      "/users/eddy": (_path, init) =>
-        init?.method === "PATCH"
-          ? {
-              user: {
-                name: "eddy",
-                display: "Eddy",
-                email: null,
-                role: "editor",
-                disabled: false,
-                last_seen: null,
-              },
-            }
-          : usersListing(),
-    });
-    renderApp("/users");
-    await rowFor("eddy");
-
-    // The caller cannot lock themselves out from here: the server refuses it,
-    // and the screen does not offer it.
-    expect(
-      screen.queryByRole("button", { name: /deactivate root/i }),
-    ).not.toBeInTheDocument();
-
-    await userEvent.click(
-      screen.getByRole("button", { name: /reactivate eddy/i }),
-    );
-    await waitFor(() => {
-      expect(sentBody("/users/eddy", "PATCH")).toEqual({ disabled: false });
-    });
-  });
-
-  it("replaces a password and says what that cost", async () => {
-    const reset = vi.fn(() => ({
-      user: {
-        name: "eddy",
-        display: "Eddy",
-        email: null,
-        role: "editor",
-        disabled: true,
-        last_seen: null,
-      },
-    }));
-    serveAs("admin", { "/users/eddy/password": () => reset() });
-    renderApp("/users");
-    const row = await rowFor("eddy");
-
-    await userEvent.click(
-      within(row).getByRole("button", { name: /reset password/i }),
-    );
-    await userEvent.type(
-      screen.getByLabelText(/new password for eddy/i),
-      "correct horse",
-    );
-    await userEvent.click(
-      screen.getByRole("button", { name: /set password for eddy/i }),
-    );
-
-    await waitFor(() => {
-      expect(reset).toHaveBeenCalled();
-    });
-    expect(await screen.findByText(/signed out/i)).toBeInTheDocument();
-  });
-
-  it("renames an account's display through the row", async () => {
-    serveAs("admin", {
-      "/users/eddy": (_path, init) =>
-        init?.method === "PATCH"
-          ? {
-              user: {
-                name: "eddy",
-                display: "Edward",
-                email: null,
-                role: "editor",
-                disabled: true,
-                last_seen: null,
-              },
-            }
-          : usersListing(),
-    });
-    renderApp("/users");
-    const row = await rowFor("eddy");
-
-    const display = within(row).getByLabelText(/display name for eddy/i);
-    await userEvent.clear(display);
-    await userEvent.type(display, "Edward");
-    await userEvent.click(
-      within(row).getByRole("button", { name: /save display for eddy/i }),
-    );
-
-    await waitFor(() => {
-      expect(sentBody("/users/eddy", "PATCH")).toEqual({ display: "Edward" });
-    });
   });
 });

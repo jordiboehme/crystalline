@@ -259,7 +259,10 @@ impl StreamSlots {
     fn acquire(self: &Arc<Self>, scope: &Scope) -> Option<StreamSlot> {
         let account = match scope {
             Scope::User { account, .. } => Some(account.trim().to_lowercase()),
-            Scope::Unrestricted | Scope::Anonymous | Scope::Agent { .. } => None,
+            Scope::Unrestricted
+            | Scope::Anonymous
+            | Scope::OpenTierIdentity { .. }
+            | Scope::Agent { .. } => None,
         };
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         if open.total >= self.total {
@@ -719,11 +722,14 @@ impl Subscriber {
 /// that was shared with everyone.
 fn audience_admits(audience: &DomainAudience, scope: &Scope) -> bool {
     match (audience, scope) {
+        // No request on this surface resolves to an agent of the loops (the
+        // JSON API takes no agent token); were one to, it reads nothing here.
+        (_, Scope::Agent { .. }) => false,
         (DomainAudience::Everyone, _) | (_, Scope::Unrestricted) => true,
         (DomainAudience::Accounts(accounts), Scope::User { account, admin }) => {
             *admin || accounts.contains(&account.trim().to_lowercase())
         }
-        (DomainAudience::Accounts(_), Scope::Anonymous | Scope::Agent { .. }) => false,
+        (DomainAudience::Accounts(_), Scope::Anonymous | Scope::OpenTierIdentity { .. }) => false,
     }
 }
 
@@ -803,6 +809,8 @@ mod tests {
                 disabled: false,
                 last_seen: None,
                 reflection: crate::ReflectionLevel::Default,
+                sign_in: None,
+                github_linked: None,
             }),
             csrf: None,
             anonymous: false,

@@ -43,7 +43,7 @@ import { defaultHub } from "./hub";
 import type { IgnoredEngrams } from "./ignored";
 import { IgnoredEngramsContext, createIgnoredEngrams } from "./ignored";
 import type { QueryKey } from "./invalidation";
-import { keysFor } from "./invalidation";
+import { keysFor, sparedBy } from "./invalidation";
 import { RecentChanges, RecentChangesContext } from "./recent";
 
 export type {
@@ -151,6 +151,13 @@ export function ChangeStreamProvider({
 
   useEffect(() => {
     const pending = new Map<string, QueryKey>();
+    /**
+     * Per pending key, the queries under it every event that queued it
+     * agreed to leave alone (`sparedBy`); absent when one of them spared
+     * nothing. An intersection, so a coalesced window never spares what one
+     * of its events needs refetched.
+     */
+    const spared = new Map<string, Set<string>>();
     let timer: ReturnType<typeof setTimeout> | null = null;
     /**
      * Engrams whose `modified` refreshed search inside the last window: the
@@ -163,9 +170,20 @@ export function ChangeStreamProvider({
 
     const flush = () => {
       timer = null;
-      const keys = [...pending.values()];
+      const keys = [...pending.entries()];
+      const spares = new Map(spared);
       pending.clear();
-      for (const queryKey of keys) {
+      spared.clear();
+      for (const [id, queryKey] of keys) {
+        const spare = spares.get(id);
+        if (spare !== undefined && spare.size > 0) {
+          void queryClient.invalidateQueries({
+            queryKey,
+            predicate: (query: Query) =>
+              !spare.has(JSON.stringify(query.queryKey)),
+          });
+          continue;
+        }
         // The editor's exemption, decided here for every key alike, so an
         // editor that mounted inside the window is honoured too.
         if (queryKey[0] === "engram" || queryKey[0] === "graph") {
@@ -185,9 +203,28 @@ export function ChangeStreamProvider({
         }
       }
     };
-    const queue = (keys: QueryKey[]) => {
+    const queue = (keys: QueryKey[], spare: QueryKey | null = null) => {
       for (const key of keys) {
-        pending.set(JSON.stringify(key), key);
+        const id = JSON.stringify(key);
+        // The spare applies to the key it lies under, and only while every
+        // event that queued that key spared it too.
+        const under =
+          spare !== null &&
+          key.length < spare.length &&
+          key.every((part, i) => part === spare[i]);
+        const had = pending.has(id);
+        const before = spared.get(id);
+        if (!under) {
+          spared.delete(id);
+        } else if (!had) {
+          spared.set(id, new Set([JSON.stringify(spare)]));
+        } else if (before !== undefined) {
+          const kept = new Set(
+            [...before].filter((s) => s === JSON.stringify(spare)),
+          );
+          spared.set(id, kept);
+        }
+        pending.set(id, key);
       }
       timer ??= setTimeout(flush, COALESCE_MS);
     };
@@ -209,6 +246,7 @@ export function ChangeStreamProvider({
       let keys = keysFor(event);
       if (keys === "everything") {
         pending.clear();
+        spared.clear();
         if (timer) clearTimeout(timer);
         timer = null;
         void queryClient.invalidateQueries();
@@ -231,7 +269,7 @@ export function ChangeStreamProvider({
           }
         }
       }
-      queue(keys);
+      queue(keys, sparedBy(event));
     };
 
     const detach = (hub ?? defaultHub()).attach({

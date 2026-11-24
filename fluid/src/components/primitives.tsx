@@ -384,7 +384,7 @@ export function Chip({
 }
 
 const POSITIVE = new Set(["current", "stable", "implemented"]);
-const CAUTION = new Set(["draft", "proposed", "idea", "poc"]);
+const CAUTION = new Set(["draft", "proposed", "idea", "poc", "open"]);
 
 /** Which chip a lifecycle status wears. Free-form values stay neutral. */
 // eslint-disable-next-line react-refresh/only-export-components

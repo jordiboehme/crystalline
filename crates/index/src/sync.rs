@@ -604,9 +604,11 @@ pub fn reflection_files_on_disk(root: &Path) -> bool {
             }
             let rel = slash_rel(root, item.path());
             let gets_a_row = match layout.classify(&rel) {
-                PathClass::Reflection(ReflectionFile::Page(_) | ReflectionFile::Pact) => {
-                    read_page(item.path()).is_ok()
-                }
+                PathClass::Reflection(
+                    ReflectionFile::Page(_)
+                    | ReflectionFile::Pact
+                    | ReflectionFile::PagePact { .. },
+                ) => read_page(item.path()).is_ok(),
                 PathClass::Reflection(ReflectionFile::Asset(_)) => {
                     item.metadata().is_ok_and(|meta| {
                         let fname = item.file_name().to_string_lossy();
@@ -1170,9 +1172,12 @@ fn walk_domain(name: &str, root: &Path, stamps: HashMap<String, FileStamp>) -> R
             // search hit, and a row left over from before this exclusion
             // disappears on the next scan (absent on disk means deleted).
             PathClass::Hidden | PathClass::Reserved | PathClass::Artifact | PathClass::Other => {}
-            // A reflection page and the pact are rows of the Reflection's own
-            // index, keyed by their path inside the folder; never engrams.
-            PathClass::Reflection(ReflectionFile::Page(_) | ReflectionFile::Pact) => {
+            // A reflection page, the pact and a page pact are rows of the
+            // Reflection's own index, keyed by their path inside the folder;
+            // never engrams.
+            PathClass::Reflection(
+                ReflectionFile::Page(_) | ReflectionFile::Pact | ReflectionFile::PagePact { .. },
+            ) => {
                 let Ok(meta) = entry.metadata() else {
                     unread += 1;
                     unread_reflections = true;
@@ -1369,7 +1374,10 @@ pub async fn scan_paths(
                 }
                 continue;
             }
-            if matches!(file, ReflectionFile::Page(_) | ReflectionFile::Pact) {
+            if matches!(
+                file,
+                ReflectionFile::Page(_) | ReflectionFile::Pact | ReflectionFile::PagePact { .. }
+            ) {
                 let inner = inner_rel(&rel);
                 match std::fs::symlink_metadata(&abs) {
                     Ok(meta) if meta.is_file() => reflections.push(FileCandidate {

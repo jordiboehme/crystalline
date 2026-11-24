@@ -10,9 +10,12 @@ use std::fmt;
 /// with one of them: the daemon accepts a request with and without its prefix,
 /// so behind a stripping proxy a prefix `/api` would strip the request for
 /// `/api/v1/...` a second time. A new route goes under an existing first
-/// segment, so an upgrade never makes a prefix in use invalid.
+/// segment, so an upgrade never makes a prefix in use invalid. The two
+/// exceptions are `admin` (0.35.0, the Administration area) and `invite`
+/// (0.35.0, the page an invite link opens), which the release notes name: a
+/// prefix starting with either stops working on that upgrade.
 /// `crates/core/tests/it/base_routes.rs` checks Fluid's route table against it.
-pub const RESERVED_FIRST_SEGMENTS: [&str; 17] = [
+pub const RESERVED_FIRST_SEGMENTS: [&str; 19] = [
     "api",
     "assets",
     "health",
@@ -30,6 +33,8 @@ pub const RESERVED_FIRST_SEGMENTS: [&str; 17] = [
     "users",
     "settings",
     "profile",
+    "admin",
+    "invite",
 ];
 
 /// Why a path cannot be a base path.
@@ -337,6 +342,8 @@ mod tests {
             ("/.well-known", PathProblem::Reserved(".well-known".into())),
             ("/d", PathProblem::Reserved("d".into())),
             ("/robots.txt", PathProblem::Reserved("robots.txt".into())),
+            ("/admin", PathProblem::Reserved("admin".into())),
+            ("/invite", PathProblem::Reserved("invite".into())),
         ];
         for (path, problem) in cases {
             assert_eq!(BasePath::parse(path), Err(problem), "{path}");

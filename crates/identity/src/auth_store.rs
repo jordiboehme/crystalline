@@ -71,7 +71,9 @@ use crystalline_core::time::{self, Stamp};
 use sha2::{Digest, Sha256};
 use turso::{Builder, Connection, Database, Value};
 
+mod agents;
 mod db;
+mod invites;
 #[cfg(test)]
 mod lint;
 #[cfg(feature = "postgres")]
@@ -81,7 +83,19 @@ mod pg_migrations;
 #[cfg(test)]
 mod tests;
 
+pub use agents::{
+    AGENT_LIVE_TOKENS_MAX, AGENT_TOKEN_DEFAULT_TTL_SECS, AGENT_TOKEN_MAX_TTL_SECS,
+    AGENT_TOKEN_MIN_TTL_SECS, AGENT_TOKEN_PREFIX, AGENT_TOKEN_WARN_SECS, AGENTS_NEED_AUTH_MCP,
+    Agent, AgentLoops, AgentSession, AgentToken, AgentTokenState, IssuedAgentToken,
+    agent_token_secs_left, check_agent_token_ttl,
+};
 use db::{AuthDb, AuthRow};
+pub use invites::{
+    INVITE_DEFAULT_TTL_SECS, INVITE_LABEL_MAX_CHARS, INVITE_MAX_TTL_SECS, INVITE_MIN_TTL_SECS,
+    INVITE_PENDING_MAX_ADMIN, INVITE_PENDING_MAX_MANAGER, INVITE_TOKEN_PREFIX, Invite,
+    InviteLimits, InviteOffer, InviteRedeemer, InviteState, IssuedInvite, NewInvite,
+    RedeemedInvite,
+};
 #[cfg(feature = "postgres")]
 pub use pg::auth_write_lock;
 #[cfg(feature = "postgres")]
@@ -133,9 +147,9 @@ impl From<anyhow::Error> for AuthOpenError {
     }
 }
 
-/// The orphan prunes of the four credential lookups: a row whose account no
+/// The orphan prunes of the credential lookups: a row whose account no
 /// longer exists (and, for sessions, an expired one). Turso runs each on
-/// every lookup; Postgres runs all four at open and then hourly
+/// every lookup; Postgres runs all of them at open and then hourly
 /// ([`AuthStore::prune_orphans_if_due`]).
 const PRUNE_SESSIONS: &str = "DELETE FROM sessions
                  WHERE expires_at <= ?1
@@ -146,11 +160,15 @@ const PRUNE_IDENTITY_LINKS: &str = "DELETE FROM identity_link
                  WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.\"user\")";
 const PRUNE_OAUTH_GRANTS: &str = "DELETE FROM oauth_grants
                  WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.\"user\")";
+/// The agent tokens whose agent no longer exists: the same orphan prune,
+/// for the agents' own credential table.
+const PRUNE_AGENT_TOKENS: &str = "DELETE FROM agent_tokens
+                 WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.name = agent_tokens.agent)";
 
-/// On Postgres, the orphans of one name, swept before an account of that
-/// name is created: the hourly prune leaves a window, and an orphan is
+/// On Postgres, the orphans of one name, swept before an account or an
+/// agent of that name is created: the hourly prune leaves a window, and an orphan is
 /// exactly what the next account to take the name would inherit.
-const SWEEP_ORPHANS_OF: [&str; 4] = [
+const SWEEP_ORPHANS_OF: [&str; 6] = [
     "DELETE FROM sessions WHERE user_name = ?1
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
     "DELETE FROM mcp_tokens WHERE \"user\" = ?1
@@ -158,6 +176,10 @@ const SWEEP_ORPHANS_OF: [&str; 4] = [
     "DELETE FROM identity_link WHERE \"user\" = ?1
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
     "DELETE FROM oauth_grants WHERE \"user\" = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM agent_tokens WHERE agent = ?1
+     AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.name = ?1)",
+    "DELETE FROM invites WHERE created_by = ?1
      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
 ];
 
@@ -300,6 +322,16 @@ pub fn normalize_new_account_name(name: &str) -> Result<String> {
             ),
         ));
     }
+    if folded.starts_with(crate::scope::AGENT_KEY_PREFIX) {
+        return Err(refuse(
+            RefusalKind::InvalidName,
+            format!(
+                "a name starting with '{}' is how an agent is named in the records of its \
+                 writes and runs, so no account or agent may take it: pick another name",
+                crate::scope::AGENT_KEY_PREFIX
+            ),
+        ));
+    }
     Ok(folded)
 }
 
@@ -408,6 +440,61 @@ pub struct User {
     pub last_seen: Option<String>,
     /// The Reflection level on every shared domain.
     pub reflection: ReflectionLevel,
+    /// How this account signs in. Filled by [`AuthStore::user`] and
+    /// [`AuthStore::list_users`]; `None` (and left out of the JSON) on a user
+    /// read for authentication, which does not look.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInKind>,
+    /// Whether a GitHub link exists for this account. Filled like `sign_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_linked: Option<bool>,
+}
+
+/// How an account signs in, worked out from what it holds, in this order: a
+/// password (`password`, even when it also has links or tokens), else an
+/// identity link to a sign-on provider (`oidc`), else any personal token row
+/// (`token_only`), else nothing of its own (`proxy`: an upstream proxy or
+/// trusted header authenticates it).
+///
+/// `proxy` and `token_only` are inferred, since nothing stores the kind: the
+/// token table has no expiry or revoked column, so any row counts, an expired
+/// or unused one too, and a proxy account that was later given a token shows
+/// as `token_only`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInKind {
+    /// A password this instance verifies.
+    Password,
+    /// An identity link to a sign-on provider (OIDC).
+    Oidc,
+    /// No password and no link: an upstream proxy or trusted header
+    /// authenticates it.
+    Proxy,
+    /// No password and no link, but a personal token: reachable by token only.
+    TokenOnly,
+}
+
+impl SignInKind {
+    /// The name the API and the filters use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignInKind::Password => "password",
+            SignInKind::Oidc => "oidc",
+            SignInKind::Proxy => "proxy",
+            SignInKind::TokenOnly => "token_only",
+        }
+    }
+
+    /// The kind a filter names, or `None` for an unknown word.
+    pub fn parse(word: &str) -> Option<SignInKind> {
+        match word {
+            "password" => Some(SignInKind::Password),
+            "oidc" => Some(SignInKind::Oidc),
+            "proxy" => Some(SignInKind::Proxy),
+            "token_only" => Some(SignInKind::TokenOnly),
+            _ => None,
+        }
+    }
 }
 
 /// One identity an external provider asserts, tied to one account.
@@ -1150,6 +1237,42 @@ pub enum RefusalKind {
     /// The display name given is too long or holds a control or invisible
     /// character. See [`normalize_display_name`].
     InvalidDisplayName,
+    /// The name is taken by the other kind of identity: an account was asked
+    /// for under an agent's name, or an agent under an account's. Accounts
+    /// and agents share one namespace (see the `agents` module).
+    NameTaken,
+    /// No agent of that name. See [`AuthStore::remove_agent`].
+    NoSuchAgent,
+    /// The agent already holds [`AGENT_LIVE_TOKENS_MAX`] live tokens, so no
+    /// further one is issued until one is revoked or expires.
+    AgentTokenLimit,
+    /// An agent token's life is outside what [`check_agent_token_ttl`]
+    /// allows.
+    InvalidTokenExpiry,
+    /// The creator already holds as many pending invite links as allowed.
+    /// See [`AuthStore::create_invite`].
+    InviteLimit,
+    /// An invite link whose shape cannot work: an admin role, a domain
+    /// without a level or the other way round, a level of `none`, a life
+    /// outside what is allowed or a label that is too long or holds a
+    /// control character. See [`AuthStore::create_invite`].
+    InvalidInvite,
+    /// No invite link has this token. Also what a surface answers for a link
+    /// it will not describe; see [`AuthStore::invite_offer`].
+    InviteUnknown,
+    /// The invite link was redeemed already.
+    InviteUsed,
+    /// The invite link was revoked.
+    InviteRevoked,
+    /// The invite link's time ran out.
+    InviteExpired,
+    /// The account that made the invite link may not give what it gives any
+    /// more: it is gone or disabled, it is no longer an admin where the link
+    /// needs one, or it no longer manages the domain at the link's level.
+    InviteCreatorLapsed,
+    /// The invite link gives no domain, so it can only make a new account,
+    /// and an existing account tried to redeem it.
+    InviteNeedsNewAccount,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
@@ -1346,6 +1469,9 @@ pub struct AuthStore {
 /// an older binary still opens the file, and hold placeholders (see
 /// `AuthStore::move_oauth_tokens`). `oauth_grant_ended` records why a grant
 /// ended, for the Connected clients card ([`AuthStore::list_ended_oauth_grants`]).
+/// `agents` and `agent_tokens` (0.35.0) hold the agents of the loops and their
+/// tokens, apart from `users` so no sign-in path can reach an agent
+/// (see the `agents` module); an older binary never reads them.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY,
@@ -1481,6 +1607,41 @@ CREATE TABLE IF NOT EXISTS domain_reflection_grant (
     domain TEXT NOT NULL, account TEXT NOT NULL, level TEXT NOT NULL,
     added_by TEXT NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (domain, account));
 CREATE TABLE IF NOT EXISTS github_delivery (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS agents (
+    name TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
+    loops TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    disabled INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    last_used TEXT,
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS agent_tokens_agent ON agent_tokens (agent);
+CREATE TABLE IF NOT EXISTS invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    domain TEXT,
+    level TEXT,
+    label TEXT,
+    local_account INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER,
+    used_by TEXT,
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS invites_created_by ON invites (created_by);
 ";
 
 /// The error [`AuthStore::register_oauth_client_within`] fails with when it
@@ -1635,6 +1796,18 @@ const NO_REDIRECT_HOST: &str = "an address with no host";
 
 /// The columns every user read selects, in the order [`user_from_row`] decodes.
 const USER_COLUMNS: &str = "name, display, email, role, disabled, last_seen_at, reflection";
+
+/// [`USER_COLUMNS`] plus the sign-in kind and the GitHub link flag, decoded by
+/// [`user_from_row`] at columns 7 and 8. Only for reads that end in a `User`
+/// with nothing trailing, since the extra columns would shift a trailing one.
+const USER_COLUMNS_WITH_SIGN_IN: &str =
+    "name, display, email, role, disabled, last_seen_at, reflection,
+     CASE WHEN pass_hash IS NOT NULL THEN 'password'
+          WHEN EXISTS (SELECT 1 FROM identity_link il WHERE il.\"user\" = users.name) THEN 'oidc'
+          WHEN EXISTS (SELECT 1 FROM mcp_tokens mt WHERE mt.\"user\" = users.name) THEN 'token_only'
+          ELSE 'proxy' END,
+     CASE WHEN EXISTS (SELECT 1 FROM github_link gl WHERE gl.account = users.name)
+          THEN 1 ELSE 0 END";
 
 /// [`USER_COLUMNS`] qualified for the session join, where `users` is aliased
 /// `u`. Same columns in the same order, so [`user_from_row`] decodes both.
@@ -2062,17 +2235,17 @@ impl AuthStore {
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.lock().await;
-        // On Postgres the insert takes the write lock, so it cannot slip past
-        // `add_first_admin`'s empty-table check, and it sweeps the name's
-        // orphans first. Turso's single writer needs neither.
-        let pg = self.db.is_postgres();
-        if pg {
-            self.db
-                .begin_immediate()
-                .await
-                .with_context(|| format!("adding user '{name}'"))?;
-        }
+        // One transaction on both backends: the agent check and the insert
+        // must see the same names (accounts and agents share one namespace).
+        // On Postgres the insert also takes the write lock, so it cannot slip
+        // past `add_first_admin`'s empty-table check, and it sweeps the name's
+        // orphans first.
+        self.db
+            .begin_immediate()
+            .await
+            .with_context(|| format!("adding user '{name}'"))?;
         let result = async {
+            self.refuse_agent_name(&name).await?;
             self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
@@ -2097,11 +2270,7 @@ impl AuthStore {
             Ok(())
         }
         .await;
-        if pg {
-            self.db.finish(result).await
-        } else {
-            result
-        }
+        self.db.finish(result).await
     }
 
     /// How many accounts exist. Zero is what opens the first-run setup path,
@@ -2148,6 +2317,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("creating the first admin '{name}'"))?;
         let result = async {
+            self.refuse_agent_name(&name).await?;
             self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
@@ -2481,6 +2651,7 @@ impl AuthStore {
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.delete_overlay_grants_held_by(&name).await?;
+            self.delete_invites_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .db
@@ -2531,6 +2702,7 @@ impl AuthStore {
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.delete_overlay_grants_held_by(&name).await?;
+            self.delete_invites_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .db
@@ -2561,7 +2733,7 @@ impl AuthStore {
         Ok(self
             .db
             .query_first(
-                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                &format!("SELECT {USER_COLUMNS_WITH_SIGN_IN} FROM users WHERE name = ?1"),
                 vec![Value::Text(name)],
             )
             .await?
@@ -2600,7 +2772,7 @@ impl AuthStore {
         let rows = self
             .db
             .query(
-                &format!("SELECT {USER_COLUMNS} FROM users ORDER BY name"),
+                &format!("SELECT {USER_COLUMNS_WITH_SIGN_IN} FROM users ORDER BY name"),
                 vec![],
             )
             .await
@@ -2684,6 +2856,7 @@ impl AuthStore {
                 .await?
                 .is_some();
             if !exists {
+                self.refuse_agent_name(&name).await?;
                 let count = match self
                     .db
                     .query_first("SELECT COUNT(*) FROM users", vec![])
@@ -3673,6 +3846,10 @@ impl AuthStore {
                 "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
                 vec![Value::Integer(id), Value::Text(now.rfc3339())],
             ),
+            ("agent_tokens", false) => (
+                "UPDATE agent_tokens SET last_used = ?2 WHERE id = ?1",
+                vec![Value::Integer(id), Value::Text(now.rfc3339())],
+            ),
             ("mcp_tokens", true) => (
                 "UPDATE mcp_tokens SET last_used = ?2
                  WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
@@ -3691,13 +3868,22 @@ impl AuthStore {
                     Value::Text(stamp_cutoff(now)),
                 ],
             ),
+            ("agent_tokens", true) => (
+                "UPDATE agent_tokens SET last_used = ?2
+                 WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
+                vec![
+                    Value::Integer(id),
+                    Value::Text(now.rfc3339()),
+                    Value::Text(stamp_cutoff(now)),
+                ],
+            ),
             _ => bail!("no last_used stamp on {table}"),
         };
         self.db.execute(sql, params).await?;
         Ok(())
     }
 
-    /// The Postgres orphan prune: the four lookup prunes at once, at open
+    /// The Postgres orphan prune: every lookup prune at once, at open
     /// and then at most hourly. The caller holds `guard`.
     async fn prune_orphans_if_due(&self) -> Result<()> {
         if !self.db.prune_due() {
@@ -3720,6 +3906,10 @@ impl AuthStore {
             .execute(PRUNE_OAUTH_GRANTS, vec![])
             .await
             .context("pruning orphaned oauth grants")?;
+        self.db
+            .execute(PRUNE_AGENT_TOKENS, vec![])
+            .await
+            .context("pruning orphaned agent tokens")?;
         self.db.prune_done();
         Ok(())
     }
@@ -3951,6 +4141,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("adding user '{name}'"))?;
         let result = async {
+            self.refuse_agent_name(&name).await?;
             self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
@@ -5935,6 +6126,7 @@ impl AuthStore {
         let result = async {
             if !private {
                 self.delete_members_of_domain(&domain).await?;
+                self.revoke_invites_to_domain(&domain).await?;
                 self.db
                     .execute(
                         "DELETE FROM domain_acl WHERE domain = ?1",
@@ -6007,7 +6199,8 @@ impl AuthStore {
     /// which is how a caller can tell a private domain's records from a shared
     /// domain's absence of them.
     ///
-    /// Its Reflection collaborators go too, in the same transaction.
+    /// Its Reflection collaborators go too, in the same transaction, and its
+    /// pending invite links are revoked.
     ///
     /// Write-list entries naming the domain are left alone: they match nothing
     /// until a domain of that name exists again.
@@ -6021,6 +6214,7 @@ impl AuthStore {
         let result = async {
             let was_private = self.acl_of(&domain).await?.is_some();
             self.delete_members_of_domain(&domain).await?;
+            self.revoke_invites_to_domain(&domain).await?;
             self.db
                 .execute(
                     "DELETE FROM domain_reflection_grant WHERE domain = ?1",
@@ -6044,7 +6238,8 @@ impl AuthStore {
     /// Carry every record of domain `old` over to `new`: its `domain_acl` row,
     /// its `domain_member` rows, its `overlay_grant` rows (the draft
     /// share-links, revoked ones included, so the history stays with the
-    /// domain) and its Reflection collaborators, in one transaction. For a domain rename, which has already
+    /// domain), its Reflection collaborators and its invite links, in one
+    /// transaction. For a domain rename, which has already
     /// decided the name changes; this decides nothing.
     ///
     /// The renamed domain's records win. Rows already under `new` while `old`
@@ -6128,6 +6323,7 @@ impl AuthStore {
                 "SELECT 1 FROM overlay_grant WHERE domain = ?1",
                 // A shared domain's grants are its only rows here.
                 "SELECT 1 FROM domain_reflection_grant WHERE domain = ?1",
+                "SELECT 1 FROM invites WHERE domain = ?1",
             ] {
                 if self.db
                     .query_first(sql, vec![Value::Text(old.clone())])
@@ -6150,10 +6346,12 @@ impl AuthStore {
                 "DELETE FROM domain_member WHERE domain = ?2",
                 "DELETE FROM overlay_grant WHERE domain = ?2",
                 "DELETE FROM domain_reflection_grant WHERE domain = ?2",
+                "DELETE FROM invites WHERE domain = ?2",
                 "UPDATE domain_acl SET domain = ?2 WHERE domain = ?1",
                 "UPDATE domain_member SET domain = ?2 WHERE domain = ?1",
                 "UPDATE overlay_grant SET domain = ?2 WHERE domain = ?1",
                 "UPDATE domain_reflection_grant SET domain = ?2 WHERE domain = ?1",
+                "UPDATE invites SET domain = ?2 WHERE domain = ?1",
             ] {
                 self.db
                     .execute(sql, names.clone())
@@ -7008,8 +7206,9 @@ impl AuthStore {
     }
 
     /// The first free account name from `base`, `base-2`, `base-3` and so on.
-    /// Called inside a transaction, so the name it found is still free when
-    /// the insert beside it runs.
+    /// A name an agent holds is not free: accounts and agents share one
+    /// namespace. Called inside a transaction, so the name it found is still
+    /// free when the insert beside it runs.
     async fn free_account_name(&self, base: &str) -> Result<String> {
         for attempt in 1..=MAX_NAME_ATTEMPTS {
             let candidate = if attempt == 1 {
@@ -7020,7 +7219,8 @@ impl AuthStore {
             if self
                 .db
                 .query_first(
-                    "SELECT 1 FROM users WHERE name = ?1",
+                    "SELECT 1 WHERE EXISTS (SELECT 1 FROM users WHERE name = ?1)
+                        OR EXISTS (SELECT 1 FROM agents WHERE name = ?1)",
                     vec![Value::Text(candidate.clone())],
                 )
                 .await?
@@ -7198,7 +7398,8 @@ async fn ensure_column(conn: &Connection, table: &str, column_def: &str) -> Resu
     }
 }
 
-/// Decode the [`USER_COLUMNS`] prefix of a row.
+/// Decode the [`USER_COLUMNS`] prefix of a row, and the two trailing columns
+/// of [`USER_COLUMNS_WITH_SIGN_IN`] when the row has them.
 fn user_from_row(row: &AuthRow) -> User {
     User {
         name: cell_text(row, 0).unwrap_or_default(),
@@ -7208,6 +7409,11 @@ fn user_from_row(row: &AuthRow) -> User {
         disabled: matches!(row.get_value(4), Ok(Value::Integer(i)) if i != 0),
         last_seen: cell_text(row, 5),
         reflection: reflection_level_from_db(cell_text(row, 6)),
+        sign_in: cell_text(row, 7).and_then(|kind| SignInKind::parse(&kind)),
+        github_linked: match row.get_value(8) {
+            Ok(Value::Integer(i)) => Some(i != 0),
+            _ => None,
+        },
     }
 }
 
@@ -7237,13 +7443,19 @@ fn cell_text(row: &AuthRow, idx: usize) -> Option<String> {
     }
 }
 
-/// `N` bytes from the OS CSPRNG, lowercase hex. The single entropy source
-/// behind every random value this file mints, so an audit of "where does the
-/// randomness come from" reads one function rather than one per family.
+/// `N` bytes from [`random_bytes`], lowercase hex, so an audit of "where does
+/// the randomness come from" reads one function rather than one per family.
 fn random_hex_bytes<const N: usize>() -> String {
+    crystalline_index::hex_lower(&random_bytes::<N>())
+}
+
+/// `N` bytes from the OS CSPRNG: the single entropy source behind every
+/// random value this store mints, hex ([`random_hex_bytes`]) or otherwise
+/// (an invite token's base64).
+fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
-    crystalline_index::hex_lower(&bytes)
+    bytes
 }
 
 /// 32 bytes, 64 hex characters: the random half of every credential here - a

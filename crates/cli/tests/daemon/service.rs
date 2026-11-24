@@ -59,7 +59,13 @@ impl Env {
     /// Point every child at the scratch schema of `pg` through the
     /// `CRYSTALLINE_DATABASE_*` variables.
     pub(crate) fn on_postgres(mut self, pg: &PgScratch) -> Env {
-        self.extra = pg.env();
+        self.extra.extend(pg.env());
+        self
+    }
+
+    /// Give every child the environment variable `key` set to `value`.
+    pub(crate) fn with_var(mut self, key: &'static str, value: &str) -> Env {
+        self.extra.push((key, value.to_string()));
         self
     }
 

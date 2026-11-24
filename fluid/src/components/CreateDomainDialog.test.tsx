@@ -161,7 +161,7 @@ describe("registering a domain", () => {
         relation_types: [],
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     const before = listingReads();
@@ -225,7 +225,7 @@ describe("registering a domain", () => {
         relation_types: [],
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
@@ -282,7 +282,7 @@ describe("registering a domain", () => {
         relation_types: [],
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
@@ -301,7 +301,7 @@ describe("registering a domain", () => {
 
   it("tells the truth about who private protects a domain from, instance admins included", async () => {
     serveAs("admin");
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
 
@@ -328,7 +328,7 @@ describe("registering a domain", () => {
       "/domains": (_path, init) =>
         init?.method === "POST" ? created() : domainsResponse(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -359,7 +359,7 @@ describe("registering a domain", () => {
       "/domains": (_path, init) =>
         init?.method === "POST" ? created() : domainsResponse(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -383,7 +383,7 @@ describe("registering a domain", () => {
     serveAs("admin", {
       "/settings/github": () => githubStatus(false),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -395,7 +395,7 @@ describe("registering a domain", () => {
     const link = await within(dialog).findByRole("link", {
       name: /connect github in settings/i,
     });
-    expect(link).toHaveAttribute("href", "/settings/github");
+    expect(link).toHaveAttribute("href", "/admin/github");
     await waitFor(() => {
       expect(
         within(dialog).getByRole("button", { name: "Create domain" }),
@@ -418,7 +418,7 @@ describe("registering a domain", () => {
       "/domains": (_path, init) =>
         init?.method === "POST" ? created() : domainsResponse(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -468,7 +468,7 @@ describe("registering a domain", () => {
       "/domains": (_path, init) =>
         init?.method === "POST" ? created() : domainsResponse(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -527,7 +527,7 @@ describe("registering a domain", () => {
         return domainsResponse();
       },
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
@@ -592,7 +592,7 @@ describe("registering a domain", () => {
     // this listing with no launcher of its own, and the sidebar is the only
     // way in there.
     home.unmount();
-    renderApp("/users");
+    renderApp("/admin/users");
     expect(
       await within(
         await screen.findByRole("navigation", { name: "Domains" }),
@@ -602,7 +602,7 @@ describe("registering a domain", () => {
 
   it("asks GitHub nothing while the form is in a local mode", async () => {
     serveAs("admin", { "/settings/github": () => githubStatus(true) });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     // Counted from where the dialog opens rather than from zero: the frame
     // asks the same question once for every admin session, to decide whether
@@ -632,7 +632,7 @@ describe("previewing a repository's declared name", () => {
       "/settings/github": () => githubStatus(true),
       "/github/domain-name": peeked,
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -669,7 +669,7 @@ describe("previewing a repository's declared name", () => {
         default_name: "kb",
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -696,7 +696,7 @@ describe("previewing a repository's declared name", () => {
       "/settings/github": () => githubStatus(true),
       "/github/domain-name": peeked,
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -725,7 +725,7 @@ describe("previewing a repository's declared name", () => {
       "/settings/github": () => githubStatus(true),
       "/github/domain-name": peeked,
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -748,7 +748,7 @@ describe("previewing a repository's declared name", () => {
       "/settings/github": () => githubStatus(true),
       "/github/domain-name": peeked,
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.type(within(dialog).getByLabelText("Name"), "scratch");
@@ -773,7 +773,7 @@ describe("previewing a repository's declared name", () => {
           ? first
           : { domain_name: "second", default_name: "kb2" },
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -816,7 +816,7 @@ describe("previewing a repository's declared name", () => {
         default_name: "kb",
       }),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -854,7 +854,7 @@ describe("previewing a repository's declared name", () => {
       "/github/domain-name": () => pending,
     });
     const errors = vi.spyOn(console, "error");
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -901,7 +901,7 @@ describe("previewing a repository's declared name", () => {
       "/domains": (_path, init) =>
         init?.method === "POST" ? created() : domainsResponse(),
     });
-    renderApp("/users");
+    renderApp("/admin/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(

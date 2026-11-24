@@ -64,6 +64,8 @@ import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { Link } from "react-router";
 
+import { MissedPagesList } from "../components/MissedReflectionPages";
+
 import { automationQuery, lastRunSentence } from "../api/automation";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -293,6 +295,13 @@ export default function Maintenance() {
           partial={findings.length < queue.total}
         />
       )}
+
+      {/*
+        The Reflection pages a reflect run left behind, every one of them:
+        the admin banner names the first few and points here. Its own read,
+        so the sweep's filters do not narrow it.
+      */}
+      <MissedPagesList />
 
       {guidance !== null && (
         <p className="text-caption text-slate-500 dark:text-slate-400">

@@ -982,6 +982,44 @@ mod document_tests {
         );
     }
 
+    /// A daemon pins `auth.mcp` to its start value, as its MCP door does. A
+    /// `config set` saves the new value and every reader keeps the start value
+    /// until the restart: the open tier keeps its rights. An engine with no pin
+    /// (the CLI) reads the live config.
+    #[tokio::test]
+    async fn a_pinned_auth_mcp_waits_for_the_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            GlobalConfig::default(),
+            None,
+            Some(tmp.path().join("pinned.yaml")),
+        )
+        .with_auth_mcp_pinned(false);
+        engine
+            .configure_as_operator(&set("auth.mcp", "true"))
+            .await
+            .unwrap();
+        assert!(engine.config().auth_mcp(), "the saved value changed");
+        assert!(
+            !engine.auth_mcp(),
+            "the running engine keeps its start value"
+        );
+        assert!(engine.is_open_tier(&crate::scope::Scope::Anonymous));
+
+        let live = Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            GlobalConfig::default(),
+            None,
+            Some(tmp.path().join("live.yaml")),
+        );
+        live.configure_as_operator(&set("auth.mcp", "true"))
+            .await
+            .unwrap();
+        assert!(live.auth_mcp(), "with no pin the live config answers");
+        assert!(!live.is_open_tier(&crate::scope::Scope::Anonymous));
+    }
+
     /// With `service.read_only` saved in the document, the operator can still
     /// change the settings (that is how the flag is taken out again), while
     /// an agent's settings change and every knowledge write stay refused. In

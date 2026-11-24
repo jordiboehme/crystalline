@@ -29,6 +29,8 @@ import type {
 } from "../api/events";
 import {
   REFLECTION_DOMAINS_KEY,
+  isPactFile,
+  reflectionDocKey,
   reflectionKeys,
   reflectionStatusKey,
 } from "../api/reflectionDomains";
@@ -104,6 +106,29 @@ export function keysForDomain(change: DomainChange): QueryKey[] {
  */
 export function keysForReflection(change: ReflectionChange): QueryKey[] {
   return reflectionKeys(change.domain);
+}
+
+/**
+ * The one query a change leaves alone under the prefixes it invalidates:
+ * the text of a page whose change is a plain `changed`. A reconcile writes
+ * no file and announces exactly that, once per check, in every open tab;
+ * the page's clock (refetched with the prefix) carries the checksum of the
+ * file as stored, and the page reads its text again only when that moved
+ * (`ReflectionPage`). Threads, a move, a delete, a change of many pages
+ * at once (an empty path) and a change of a pact (which has no clock)
+ * spare nothing.
+ */
+export function sparedBy(event: ChangeEvent): QueryKey | null {
+  if (
+    event.event !== "reflection" ||
+    event.change.kind !== "changed" ||
+    event.change.path === "" ||
+    // A pact keeps no clock, so nothing would read its text again.
+    isPactFile(event.change.path)
+  ) {
+    return null;
+  }
+  return reflectionDocKey(event.change.domain, event.change.path);
 }
 
 export function keysFor(event: ChangeEvent): QueryKey[] | "everything" {

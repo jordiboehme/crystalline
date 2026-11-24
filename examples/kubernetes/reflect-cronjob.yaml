@@ -5,16 +5,27 @@
 # Build the image from examples/kubernetes/Dockerfile and push it where the
 # cluster pulls from; replace the image below.
 #
+# The runner acts as an agent of the loops. The server needs auth.mcp on
+# (CRYSTALLINE_AUTH_MCP=true). An admin makes the agent once, on the server,
+# and the command prints its token once:
+#
+#   kubectl exec <server pod> -- crystalline agents add reflect-runner \
+#     --display "Reflect runner" --loops reflect
+#
 # The secret is created once, outside this file, for example:
 #
 #   kubectl create secret generic crystalline-runner \
-#     --from-literal=remote-token=cmt_... \
+#     --from-literal=remote-token=cag_... \
 #     --from-literal=anthropic-api-key=sk-ant-...
 #
-# remote-token is the cmt_ token of an agent account that may curate the
-# domain's Reflection. Use claude-code-oauth-token instead of
-# anthropic-api-key for a Claude subscription. Give the evolve runner its own
-# account when both loops work one domain.
+# remote-token is the agent's cag_ token. The agent reaches every domain of
+# the instance for its loop and needs no GitHub link: its run shares as the
+# server's own run does. The token expires after 90 days by default; issue a
+# new one with `crystalline agents token reflect-runner`, update the secret,
+# then revoke the old one with `crystalline agents revoke`. A runner that
+# still uses the cmt_ token of an account keeps working. Use
+# claude-code-oauth-token instead of anthropic-api-key for a Claude
+# subscription.
 apiVersion: batch/v1
 kind: CronJob
 metadata:

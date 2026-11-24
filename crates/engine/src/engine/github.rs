@@ -1479,7 +1479,7 @@ impl Engine {
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(NewAccountRefusal::Drafts(format!(
-                    "the name '{account}' still holds drafts of a removed account: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them from the users screen, or with: crystalline users discard-drafts {account} (DELETE /api/v1/users/{account}/drafts), and add the account again"
+                    "the name '{account}' still holds drafts of a removed account or agent: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them from the users screen, or with: crystalline users discard-drafts {account} (DELETE /api/v1/users/{account}/drafts), and add the account again"
                 )));
             }
             Err(e) => return Err(NewAccountRefusal::Unread(e.to_string())),

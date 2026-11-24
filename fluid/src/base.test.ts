@@ -112,6 +112,21 @@ describe("under a prefix", () => {
     );
   });
 
+  it("completes a server's relative link once, keeping its base path", async () => {
+    const base = document.createElement("base");
+    base.href = "/crystalline/";
+    document.head.prepend(base);
+    vi.resetModules();
+    const mod = await import("./base");
+    // The server already put the base path in; it is not added twice.
+    expect(mod.completeServerLink("/crystalline/invite#cin_x", true)).toBe(
+      `${window.location.origin}/crystalline/invite#cin_x`,
+    );
+    expect(
+      mod.completeServerLink("https://kb.example.com/c/invite#cin_x", false),
+    ).toBe("https://kb.example.com/c/invite#cin_x");
+  });
+
   it("ssoSignInUrl puts the base path in front of return_to under a prefix", async () => {
     const base = document.createElement("base");
     base.href = "/crystalline/";

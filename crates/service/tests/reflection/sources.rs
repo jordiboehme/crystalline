@@ -199,13 +199,13 @@ async fn a_source_in_another_domain_is_named_by_its_address() {
     assert_eq!(
         sources_by_heading(&doc, "Team"),
         serde_json::json!([{ "permalink": "team/harbor-team", "domain": "harbor",
-            "title": "Harbor team", "state": "current" }]),
+            "title": "Harbor team", "state": "current", "status": "stable" }]),
         "{doc}"
     );
     assert_eq!(
         sources_by_heading(&doc, "Deploys"),
         serde_json::json!([{ "permalink": "runbooks/deploy", "title": "Deploy",
-            "state": "current" }]),
+            "state": "current", "status": "stable" }]),
         "{doc}"
     );
     let stored = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
@@ -663,4 +663,50 @@ async fn a_settle_reports_no_unsourced_sections() {
         .await
         .unwrap();
     assert!(settled.get("unsourced_sections").is_none(), "{settled}");
+}
+
+/// **A section's source carries the cited engram's `status` beside its
+/// `state`**, so a reader sees that a section rests on a proposal. The status
+/// is as the engram writes it; the state stays `current` for a tentative
+/// engram, since nothing about the citation changed.
+#[tokio::test]
+async fn a_source_carries_the_status_of_the_engram_it_cites() {
+    let fx = crate::fixture::fixture(&[
+        ("MANIFEST.md", &crate::fixture::manifest("reflection: on\n")),
+        (
+            "runbooks/deploy.md",
+            &crate::fixture::engram("Deploy", "runbooks/deploy", "- [fact] deploys run at night"),
+        ),
+        (
+            "ideas/kafka.md",
+            "---\ntype: engram\ntitle: Kafka\npermalink: ideas/kafka\ntags:\n  - eng\nstatus: Proposed\nrecorded_at: 2026-09-01\n---\n\n# Kafka\n\n- [idea] move the queue to Kafka\n",
+        ),
+    ])
+    .await;
+    let mut p = write(
+        "queue.md",
+        "# Queue\n\nFor people.\n\n## Today\n\nRedis.\n\n## Maybe\n\nProposed: Kafka.\n",
+    );
+    p.sources = BTreeMap::from([
+        ("Today".to_string(), vec!["runbooks/deploy".to_string()]),
+        ("Maybe".to_string(), vec!["ideas/kafka".to_string()]),
+    ]);
+    fx.engine.write_reflection(&p, &agent()).await.unwrap();
+    let doc = fx
+        .engine
+        .read_reflection("eng", "queue.md", &agent())
+        .await
+        .unwrap();
+    assert_eq!(
+        sources_by_heading(&doc, "Today"),
+        serde_json::json!([{ "permalink": "runbooks/deploy", "title": "Deploy",
+            "state": "current", "status": "stable" }]),
+        "{doc}"
+    );
+    assert_eq!(
+        sources_by_heading(&doc, "Maybe"),
+        serde_json::json!([{ "permalink": "ideas/kafka", "title": "Kafka",
+            "state": "current", "status": "Proposed" }]),
+        "{doc}"
+    );
 }

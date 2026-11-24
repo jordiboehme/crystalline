@@ -2,6 +2,7 @@
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
+use super::page::{PAGE_PACT_SUFFIX, pact_page_of, strip_pact_suffix};
 use crate::parse::{body_lines, parse_heading};
 
 /// The folder under a domain root that holds the Reflection.
@@ -54,6 +55,40 @@ pub fn domain_rel(path: &str) -> String {
     format!("{REFLECTIONS_DIR}/{path}")
 }
 
+/// Whether a path segment has the shape of a Windows 8.3 short name: a `~`
+/// followed by digits that end the segment or come right before a `.`
+/// (`OVERVI~1.MD`, `PROGRA~1`). On an NTFS volume with short names such a
+/// name can be a second name of another file (`overview.pact.md`), so it is
+/// refused as text, on every system alike.
+fn is_short_name(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        if b != b'~' {
+            return false;
+        }
+        let digits = bytes[i + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        digits > 0 && matches!(bytes.get(i + 1 + digits), None | Some(b'.'))
+    })
+}
+
+/// Why a path a caller names cannot be taken as written, when one of its
+/// segments has the shape of a Windows short name (a `~` and digits that end
+/// the segment or come before a `.`): on an
+/// NTFS volume with short names the file system may resolve it to another
+/// file, a pact among them. Checked where a caller names a path (a write, a
+/// create, a move, a read), never by the sync or the tree walk, which only
+/// meet the names files really have: an existing `draft~2.md` stays a page.
+/// Textual, so it answers alike on every system.
+pub fn short_name_refusal(path: &str) -> Option<String> {
+    let segment = path.split('/').find(|segment| is_short_name(segment))?;
+    Some(format!(
+        "'{path}' has a segment shaped like a Windows short name ('{segment}'), which the file system can resolve to another file, a pact among them; name the file by its full name, or choose a name without '~' and digits before the extension"
+    ))
+}
+
 /// Why `path` cannot name a reflection, or `Ok`. A reflection path is
 /// relative to `reflections/`, forward-slashed, ends in `.md`, has no empty,
 /// `.` or `..` segment, no hidden segment, no backslash, is not a threads
@@ -98,11 +133,24 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
     if is_pact(path) && path != PACT_FILE {
         return Err(format!("'{path}' names the pact; spell it {PACT_FILE}"));
     }
+    if let Some(stem) = strip_pact_suffix(path)
+        && !path.ends_with(PAGE_PACT_SUFFIX)
+    {
+        return Err(format!(
+            "'{path}' names a page pact; spell it {stem}{PAGE_PACT_SUFFIX}"
+        ));
+    }
+    if strip_pact_suffix(path).is_some() && pact_page_of(path).is_none() {
+        return Err(format!(
+            "'{path}' ends in {PAGE_PACT_SUFFIX}, which holds a page's pact, and names no page that could have one"
+        ));
+    }
     Ok(())
 }
 
 /// Why `path` cannot name a new reflection, or `Ok`: the rules of
-/// [`validate_reflection_path`], and no first segment that repeats the
+/// [`validate_reflection_path`], no segment shaped like a Windows short name
+/// ([`short_name_refusal`]), and no first segment that repeats the
 /// `reflections/` folder (ASCII case folded, as the folder is matched). The
 /// path is inside the folder already, so `reflections/guides/a.md` would put
 /// the page at `reflections/reflections/guides/a.md`, outside the pact's
@@ -111,6 +159,9 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
 /// be read, edited and moved out.
 pub fn validate_new_reflection_path(path: &str) -> Result<(), String> {
     validate_reflection_path(path)?;
+    if let Some(refusal) = short_name_refusal(path) {
+        return Err(refusal);
+    }
     if is_under_reflections(path) {
         let rest = path.split_once('/').map_or("", |(_, rest)| rest);
         return Err(format!(
@@ -138,6 +189,12 @@ pub enum ReflectionFile {
     Page(String),
     /// `PACT.md` at the folder root.
     Pact,
+    /// The page pact of the page at `of` (`<page>.pact.md` beside it):
+    /// extra instructions for that page and the pages that follow it. Told
+    /// by its path alone, as a threads file is, so whether the page exists
+    /// is asked where the pages are known
+    /// ([`is_loose_pact`](super::is_loose_pact)).
+    PagePact { of: String },
     /// The threads of the reflection at `of`.
     Threads { of: String },
     /// The baseline of the reflection at `of`.
@@ -162,7 +219,10 @@ fn threads_of(path: &str) -> Option<String> {
 /// ASCII case folded, as the folder is. The baseline prefix is read first,
 /// so a baseline of a page or of a threads file is a baseline. A threads
 /// file or a baseline whose page could not be a reflection (hidden, reserved,
-/// climbing out) is `Other`, like any stray file.
+/// climbing out) is `Other`, like any stray file. A path ending in
+/// [`PAGE_PACT_SUFFIX`] is the page pact of the page beside it, by its path
+/// alone; one whose page could not be a page (`PACT.pact.md`, a pact of a
+/// pact or of a threads file, a reserved or hidden name) is `Other`.
 pub fn classify(path: &str) -> ReflectionFile {
     // Nothing under assets/ is a reflection: an allowlisted file is the
     // Reflection's own attachment, everything else there is nobody's.
@@ -190,11 +250,34 @@ pub fn classify(path: &str) -> ReflectionFile {
             None => ReflectionFile::Other,
         };
     }
+    // The suffix in any letter case, as the pact's name: a spelling the
+    // path rules refuse (`a.Pact.md`) still names the pact on a case-folding
+    // disk, so every gate that asks is told it is one.
+    if strip_pact_suffix(path).is_some() {
+        return match pact_page_of(path) {
+            Some(of) if validate_reflection_path(&super::page::page_pact_path(&of)).is_ok() => {
+                ReflectionFile::PagePact { of }
+            }
+            _ => ReflectionFile::Other,
+        };
+    }
     if validate_reflection_path(path).is_ok() {
         ReflectionFile::Page(path.to_string())
     } else {
         ReflectionFile::Other
     }
+}
+
+/// Whether `path` (inside `reflections/`) is a pact file: `PACT.md` or a
+/// page pact. Neither is a page: a walk over the pages (the navigation
+/// tree, the queue's page items, the pages a structure glob is checked
+/// against) leaves both out, while the sync, the backup and an export keep
+/// them as files.
+pub fn is_pact_file(path: &str) -> bool {
+    matches!(
+        classify(path),
+        ReflectionFile::Pact | ReflectionFile::PagePact { .. }
+    )
 }
 
 /// One line of a pact's `## Structure` section that is a bullet: its text
@@ -428,6 +511,30 @@ mod tests {
             "pact.md",
         ] {
             assert!(validate_reflection_path(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_windows_short_name_is_refused_on_every_system() {
+        // On an NTFS volume with short names `arch/overview.pact.md` is also
+        // `arch/OVERVI~1.MD`; the check is textual, so it holds everywhere.
+        for bad in [
+            "arch/OVERVI~1.md",
+            "arch/overvi~12.md",
+            "PROGRA~1/a.md",
+            "a/B~3/c.md",
+        ] {
+            let err = short_name_refusal(bad).unwrap();
+            assert!(err.contains("short name"), "{bad}: {err}");
+            assert!(validate_new_reflection_path(bad).is_err(), "{bad}");
+            // A file that really has such a name is still a page to the
+            // sync and the tree walk.
+            assert!(validate_reflection_path(bad).is_ok(), "{bad}");
+            assert_eq!(classify(bad), ReflectionFile::Page(bad.to_string()));
+        }
+        for ok in ["a~b.md", "notes~.md", "x/~1a.md", "v~2b/c.md"] {
+            assert_eq!(short_name_refusal(ok), None, "{ok}");
+            assert!(validate_new_reflection_path(ok).is_ok(), "{ok}");
         }
     }
 

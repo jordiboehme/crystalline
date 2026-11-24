@@ -130,6 +130,20 @@ impl ApiError {
         }
     }
 
+    /// A 410 for something that existed and is over for good: an invite link
+    /// that was used, revoked or ran out. Asking again cannot help.
+    pub fn gone(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::GONE,
+            title: "gone",
+            detail: detail.into(),
+            token_required: None,
+            retry_after: None,
+            home_url: None,
+            reason: None,
+        }
+    }
+
     /// A 422 for a request the server understood but cannot act on, matching
     /// the status the engine's own caller errors take.
     pub fn unprocessable(detail: impl Into<String>) -> ApiError {

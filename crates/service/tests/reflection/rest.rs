@@ -906,7 +906,7 @@ fn reflection_requests(domain: &str) -> Vec<(reqwest::Method, String, Option<Val
     let body = json!({
         "markdown": "# A\n", "path": "guides/deploying.md", "section": "Night deploys",
         "text": "Why?", "outcome": "Yes.", "from": "guides/deploying.md", "to": "x/deploying.md",
-        "basis": "b1",
+        "basis": "b1", "freshness": "1d",
     });
     let ops: Vec<_> = crate::support::MOUNTED_OPERATIONS
         .iter()
@@ -927,15 +927,20 @@ fn reflection_requests(domain: &str) -> Vec<(reqwest::Method, String, Option<Val
             if path.ends_with("/reflection/search") {
                 path.push_str("?q=night");
             }
+            if path.ends_with("/reflection/clock") {
+                path.push_str("?path=guides/deploying.md");
+            }
             let method: reqwest::Method = method.parse().unwrap();
-            let body = (method == reqwest::Method::POST || method == reqwest::Method::PUT)
+            let body = (method == reqwest::Method::POST
+                || method == reqwest::Method::PUT
+                || method == reqwest::Method::PATCH)
                 .then(|| body.clone());
             (method, path, body)
         })
         .collect();
     assert_eq!(
         ops.len(),
-        19,
+        23,
         "every per-domain reflection operation: {ops:?}"
     );
     ops

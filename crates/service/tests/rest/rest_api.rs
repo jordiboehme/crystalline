@@ -73,6 +73,7 @@ async fn build_engine_with(
             max_users: opts.max_users,
             oidc: None,
             login: None,
+            invites: None,
         }),
         ..GlobalConfig::default()
     };
@@ -3761,6 +3762,216 @@ async fn user_routes_are_refused_to_a_viewer_and_an_editor() {
     }
 }
 
+/// `GET /users` searches, filters, sorts and pages: one fixture with every
+/// sign-in kind, a disabled account, a GitHub link and a mix of seen and never
+/// seen accounts, asked every way the route answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_user_listing_searches_filters_sorts_and_pages() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+    let auth = &fixture.auth;
+    auth.add_user(
+        "ada",
+        "Ada Lovelace",
+        Some("ada@example.com"),
+        Role::Viewer,
+        "pw",
+    )
+    .await
+    .unwrap();
+    auth.add_user("zoe", "Zoë Müller", None, Role::Editor, "pw")
+        .await
+        .unwrap();
+    auth.provision_linked_user(
+        "https://idp.example",
+        "sub-1",
+        "sso",
+        Some("Sam Single-Signon"),
+        None,
+        Role::Viewer,
+        100,
+    )
+    .await
+    .unwrap();
+    auth.add_token_only_user("bot", "Build Bot", None, Role::Editor, "ci")
+        .await
+        .unwrap();
+    auth.ensure_user("prox", Role::Viewer, 100).await.unwrap();
+    auth.set_disabled("zoe", true).await.unwrap();
+    auth.link_github("ada", "github.com", 7, "ada-gh")
+        .await
+        .unwrap();
+    auth.mark_seen("ada").await.unwrap();
+
+    let list = |query: &str| {
+        let path = format!("/api/v1/users{query}");
+        let (token, csrf) = (token.clone(), csrf.clone());
+        async move {
+            let resp = as_session(addr, reqwest::Method::GET, &path, &token, &csrf)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            let body: serde_json::Value = resp.json().await.unwrap();
+            (status, body)
+        }
+    };
+    let names = |query: &str| {
+        let answer = list(query);
+        async move {
+            let (status, body) = answer.await;
+            assert_eq!(status, 200, "{body}");
+            user_names(&body)
+        }
+    };
+
+    // No parameters: everyone, by name, with the new fields, and the total.
+    let (status, all) = list("").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        user_names(&all),
+        ["ada", "bot", "prox", "root", "sso", "zoe"]
+    );
+    assert_eq!(all["total"], 6);
+    let row = |name: &str| {
+        all["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row("ada")["sign_in"], "password");
+    assert_eq!(row("ada")["github_linked"], true);
+    assert_eq!(row("bot")["sign_in"], "token_only");
+    assert_eq!(row("bot")["github_linked"], false);
+    assert_eq!(row("prox")["sign_in"], "proxy");
+    assert_eq!(row("sso")["sign_in"], "oidc");
+
+    // q: prefix and word prefix, case and accents folded, exact email.
+    assert_eq!(names("?q=ada").await, ["ada"]);
+    assert_eq!(names("?q=LOVE").await, ["ada"]);
+    assert_eq!(names("?q=muller").await, ["zoe"]);
+    assert_eq!(names("?q=zo%C3%AB").await, ["zoe"]);
+    assert_eq!(names("?q=signon").await, ["sso"]);
+    assert_eq!(names("?q=ada%40example.com").await, ["ada"]);
+    assert!(names("?q=ada%40example").await.is_empty());
+    assert!(names("?q=nobody").await.is_empty());
+
+    // Filters.
+    assert_eq!(names("?role=editor").await, ["bot", "zoe"]);
+    assert_eq!(names("?state=disabled").await, ["zoe"]);
+    assert_eq!(
+        names("?state=active").await,
+        ["ada", "bot", "prox", "root", "sso"]
+    );
+    assert_eq!(names("?kind=token_only").await, ["bot"]);
+    assert_eq!(names("?kind=proxy").await, ["prox"]);
+    assert_eq!(names("?kind=oidc").await, ["sso"]);
+    assert_eq!(names("?kind=password").await, ["ada", "root", "zoe"]);
+    assert_eq!(names("?github=true").await, ["ada"]);
+    assert_eq!(
+        names("?github=false").await,
+        ["bot", "prox", "root", "sso", "zoe"]
+    );
+    assert_eq!(
+        names("?seen_after=2000-01-01T00:00:00Z").await,
+        ["ada", "prox", "root"],
+        "an account never seen is after nothing"
+    );
+    assert!(
+        names("?seen_before=2000-01-01T00:00:00Z").await.is_empty(),
+        "and before nothing"
+    );
+    assert_eq!(
+        names("?seen_before=2100-01-01T00:00:00Z").await,
+        ["ada", "prox", "root"]
+    );
+    assert_eq!(names("?role=viewer&kind=password").await, ["ada"]);
+    assert_eq!(
+        names("?kind=password&state=active&role=viewer&github=true&q=ada").await,
+        ["ada"]
+    );
+
+    // Sorting, with name as the tiebreak.
+    assert_eq!(
+        names("?sort=name&dir=desc").await,
+        ["zoe", "sso", "root", "prox", "bot", "ada"]
+    );
+    assert_eq!(
+        names("?sort=display").await,
+        ["ada", "bot", "prox", "root", "sso", "zoe"]
+    );
+    assert_eq!(
+        names("?sort=role").await,
+        ["ada", "prox", "sso", "bot", "zoe", "root"]
+    );
+    assert_eq!(
+        names("?sort=role&dir=desc").await,
+        ["root", "bot", "zoe", "ada", "prox", "sso"]
+    );
+    assert_eq!(
+        names("?sort=state").await,
+        ["ada", "bot", "prox", "root", "sso", "zoe"]
+    );
+    assert_eq!(
+        names("?sort=state&dir=desc").await,
+        ["zoe", "ada", "bot", "prox", "root", "sso"]
+    );
+    assert_eq!(
+        names("?sort=kind").await,
+        ["sso", "ada", "root", "zoe", "prox", "bot"]
+    );
+
+    // Never seen sorts last whichever way the sort runs.
+    let asc = names("?sort=last_seen").await;
+    let desc = names("?sort=last_seen&dir=desc").await;
+    assert_eq!(asc[3..], ["bot", "sso", "zoe"]);
+    assert_eq!(desc[3..], ["bot", "sso", "zoe"]);
+    let mut seen_asc = asc[..3].to_vec();
+    seen_asc.reverse();
+    assert_eq!(seen_asc, desc[..3]);
+    let mut seen_sorted = asc[..3].to_vec();
+    seen_sorted.sort();
+    assert_eq!(seen_sorted, ["ada", "prox", "root"]);
+
+    // Paging: the total is the match count, whatever the page.
+    let (_, page) = list("?limit=2&page=2").await;
+    assert_eq!(user_names(&page), ["prox", "root"]);
+    assert_eq!(page["total"], 6);
+    let (_, page) = list("?limit=2").await;
+    assert_eq!(user_names(&page), ["ada", "bot"], "page defaults to 1");
+    let (_, page) = list("?limit=4&page=2").await;
+    assert_eq!(user_names(&page), ["sso", "zoe"]);
+    let (_, page) = list("?limit=2&page=9").await;
+    assert!(user_names(&page).is_empty());
+    assert_eq!(page["total"], 6);
+    let (_, page) = list("?role=editor&limit=1&page=2&sort=name").await;
+    assert_eq!(user_names(&page), ["zoe"]);
+    assert_eq!(page["total"], 2, "the total counts the filtered set");
+    let (_, page) = list("?page=2").await;
+    assert_eq!(
+        page["users"].as_array().unwrap().len(),
+        6,
+        "no limit, no paging"
+    );
+
+    // Malformed asks are refused.
+    for bad in [
+        "?limit=0",
+        "?limit=501",
+        "?page=0&limit=2",
+        "?kind=carrier-pigeon",
+        "?sort=shoe-size",
+        "?seen_before=yesterday",
+        "?seen_after=2026-13-45",
+    ] {
+        let (status, _) = list(bad).await;
+        assert_eq!(status, 400, "{bad}");
+    }
+}
+
 /// The admin round trip: create an account, see it in the listing, edit it,
 /// and remove it again. The response carries the account as stored - the name
 /// folded, no password material - and the listing is the `{"users": [...]}`
@@ -3797,10 +4008,12 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
             "disabled",
             "display",
             "email",
+            "github_linked",
             "last_seen",
             "name",
             "reflection",
-            "role"
+            "role",
+            "sign_in"
         ],
         "no password material may reach the client: {body}"
     );
@@ -3822,10 +4035,12 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
             "disabled",
             "display",
             "email",
+            "github_linked",
             "last_seen",
             "name",
             "reflection",
-            "role"
+            "role",
+            "sign_in"
         ],
         "the listing carries no hashes either: {body}"
     );

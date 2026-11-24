@@ -512,6 +512,11 @@ struct Pending {
     /// where a freshly signed-in person is sent. It has already been through
     /// [`safe_return_path`] before it gets here.
     return_to: Option<String>,
+    /// The invite link this sign-in was started to redeem, from
+    /// `POST /invites/redeem`, by its token. Kept here and nowhere the browser
+    /// or the provider sees, so no URL ever carries it. `None` is an ordinary
+    /// sign-in. Never set together with `link_for`.
+    invite: Option<String>,
     /// When the record was made, for the TTL and for the eviction order.
     started: Instant,
 }
@@ -1278,7 +1283,7 @@ pub async fn login(
         .return_to
         .as_deref()
         .and_then(|path| safe_return_path(path, &state.base_path));
-    let started = start_sign_on(&state, &headers, None, return_to).await?;
+    let started = start_sign_on(&state, &headers, None, return_to, None).await?;
     Ok((
         jar.add(started.cookie),
         super::auth::no_store(),
@@ -1400,7 +1405,7 @@ pub async fn start_link(
     // No `return_to`: a link is started by a script that is already on the
     // page it wants to stay on, and answers a location in a body rather than
     // a redirect. The one caller that needs the landing carried is the GET.
-    let started = start_sign_on(&state, &headers, Some(account.name), None).await?;
+    let started = start_sign_on(&state, &headers, Some(account.name), None, None).await?;
     Ok((
         jar.add(started.cookie),
         super::auth::no_store(),
@@ -1425,6 +1430,7 @@ async fn start_sign_on(
     headers: &HeaderMap,
     link_for: Option<String>,
     return_to: Option<String>,
+    invite: Option<String>,
 ) -> Result<StartedSignOn, ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
     let redirect_uri = client.settings.redirect_uri(headers)?;
@@ -1451,6 +1457,7 @@ async fn start_sign_on(
             redirect_uri,
             link_for,
             return_to,
+            invite,
             started: Instant::now(),
         },
     );
@@ -1482,6 +1489,19 @@ async fn start_sign_on(
         authorize_url: authorize_url.to_string(),
         cookie,
     })
+}
+
+/// Start a sign-on that redeems the invite link `token` once it comes back:
+/// where to send the browser, and the state cookie that binds the journey to
+/// it. The token rides in the pending record, never in a URL. See
+/// [`super::invite_redeem`].
+pub(crate) async fn start_invite_sign_on(
+    state: &RestState,
+    headers: &HeaderMap,
+    token: String,
+) -> Result<(String, Cookie<'static>), ApiError> {
+    let started = start_sign_on(state, headers, None, None, Some(token)).await?;
+    Ok((started.authorize_url, started.cookie))
 }
 
 /// The query of `GET /auth/oidc/callback`: what the provider sends back, in
@@ -1598,10 +1618,24 @@ pub async fn callback(
             .build(),
     );
     let outcome = finish(&state, bound, query).await;
-    let (claims, return_to) = match outcome {
+    let (claims, return_to, invite) = match outcome {
         Ok(finished) => finished,
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
+    if let Some(token) = invite {
+        // A person's browser lands here: every refusal is a page, and nobody
+        // is signed in when the link could not be redeemed.
+        let (user, domain) = match resolve_oidc_invite(&state, &claims, &token).await {
+            Ok(redeemed) => redeemed,
+            Err(err) => {
+                let page = super::github_link::plain_page(err.status, "Invite", &err.detail);
+                return Ok((jar, super::auth::no_store(), page).into_response());
+            }
+        };
+        let jar = super::auth::issue_session(&state, jar, &headers, &user).await?;
+        let landing = invite_landing(&state, domain.as_deref());
+        return Ok((jar, super::auth::no_store(), found(&landing)).into_response());
+    }
     let user = resolve_oidc_identity(&state, claims, &identity).await;
     let user = match user {
         Ok(user) => user,
@@ -1637,7 +1671,7 @@ async fn finish(
     state: &RestState,
     bound: Vec<String>,
     query: CallbackQuery,
-) -> Result<(OidcClaims, Option<String>), ApiError> {
+) -> Result<(OidcClaims, Option<String>, Option<String>), ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
     let issuer = &client.settings.issuer;
     if let Some(error) = query.error.as_deref() {
@@ -1703,6 +1737,7 @@ async fn finish(
         )
         .await?;
     let return_to = pending.return_to;
+    let invite = pending.invite;
     let mut claims = OidcClaims::from_id_token(&verified, pending.link_for);
     if claims.lacks_presentation_claims() {
         client
@@ -1719,7 +1754,7 @@ async fn finish(
         claims.subject,
         claims.issuer
     );
-    Ok((claims, return_to))
+    Ok((claims, return_to, invite))
 }
 
 /// A 302 to `location`.
@@ -2123,6 +2158,107 @@ async fn resolve_oidc_identity(
     }
 }
 
+/// Where the browser lands after an invite sign-on: the invited domain's
+/// page under the base path, so the person sees where they were let in, or
+/// the application root for a link without a domain.
+fn invite_landing(state: &RestState, domain: Option<&str>) -> String {
+    const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    match domain {
+        Some(domain) => format!(
+            "{}/d/{}",
+            state.base_path.as_str(),
+            percent_encoding::utf8_percent_encode(domain, SEGMENT)
+        ),
+        None => state.base_path.href(),
+    }
+}
+
+/// Redeem the invite link `token` for the identity a sign-on just validated,
+/// and answer the account to sign in and the domain the link let it into.
+///
+/// The same two cases [`resolve_oidc_identity`] tells apart, never a match by
+/// address: an identity linked to an account redeems for that account (the
+/// membership only); an identity nobody has seen gets a fresh account at the
+/// link's role, created, linked and made a member in the one transaction that
+/// marks the link used. A refused link signs nobody in: the person can still
+/// sign in the ordinary way.
+async fn resolve_oidc_invite(
+    state: &RestState,
+    claims: &OidcClaims,
+    token: &str,
+) -> Result<(User, Option<String>), ApiError> {
+    use super::auth_store::InviteRedeemer;
+    use super::invite_redeem::{log_redeemed, redeem_error, refuse_beyond_store};
+    super::refuse_read_only(state)?;
+    let offer = state.auth.invite_offer(token).await.map_err(redeem_error)?;
+    refuse_beyond_store(state, &offer.invite).await?;
+    let max_users = state.auth_cfg.max_users;
+    let existing = |name: String| async move {
+        state
+            .auth
+            .redeem_invite(token, InviteRedeemer::Account(&name), max_users)
+            .await
+            .map_err(redeem_error)
+    };
+    let done = match state
+        .auth
+        .linked_user(&claims.issuer, &claims.subject)
+        .await?
+    {
+        Some(user) if user.disabled => return Err(account_is_disabled()),
+        Some(user) => existing(user.name).await?,
+        None => {
+            let derived = derive_account_name(claims);
+            let provisioned = super::users_api::provision_clear(
+                state,
+                &derived,
+                state.auth.redeem_invite(
+                    token,
+                    InviteRedeemer::Linked {
+                        issuer: &claims.issuer,
+                        subject: &claims.subject,
+                        desired_name: &derived,
+                        display: claims.display.as_deref(),
+                        email: claims.email.as_deref(),
+                    },
+                    max_users,
+                ),
+            )
+            .await?;
+            match provisioned {
+                Ok(done) => done,
+                Err(err) => {
+                    // Two first sign-ins for one subject can race: the loser
+                    // finds the winner's account and redeems for it.
+                    match state
+                        .auth
+                        .linked_user(&claims.issuer, &claims.subject)
+                        .await?
+                    {
+                        Some(user)
+                            if StoreRefusal::kind_of(&err)
+                                == Some(RefusalKind::IdentityAlreadyLinked) =>
+                        {
+                            if user.disabled {
+                                return Err(account_is_disabled());
+                            }
+                            existing(user.name).await?
+                        }
+                        _ => return Err(redeem_error(err)),
+                    }
+                }
+            }
+        }
+    };
+    log_redeemed(&done);
+    super::readers_changed(state);
+    Ok((done.user, done.invite.domain))
+}
+
 /// Case 1 of [`resolve_oidc_identity`]: tie this identity to the account whose
 /// session started the sign-in, and sign that account in.
 ///
@@ -2237,6 +2373,7 @@ mod tests {
                 max_users: None,
                 oidc: Some(oidc),
                 login: None,
+                invites: None,
             }),
             ..GlobalConfig::default()
         }

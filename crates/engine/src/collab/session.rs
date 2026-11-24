@@ -657,8 +657,10 @@ impl CollabSessions {
         author: &str,
         viewer: crate::scope::Scope,
     ) -> Result<Joined, JoinError> {
-        crystalline_core::reflection::validate_reflection_path(path)
-            .map_err(|e| JoinError::Engine(EngineError::Invalid(e)))?;
+        self.engine
+            .validate_named_reflection_path(domain, path)
+            .await
+            .map_err(JoinError::Engine)?;
         self.engine
             .refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await

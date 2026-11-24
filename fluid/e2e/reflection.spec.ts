@@ -1086,11 +1086,17 @@ test.describe.serial("the Reflection journeys", () => {
     await expect(
       page.getByRole("combobox", { name: `Reflection for ${CONTRIBUTOR}` }),
     ).toHaveValue("contributor");
-    await page.goto("users");
+    // Each account's controls are in its detail panel, at its own address.
+    await page.goto(`admin/users/${CONTRIBUTOR}`);
     await expect(
       page.getByRole("combobox", { name: `Role for ${CONTRIBUTOR}` }),
     ).toHaveValue("none");
-    // The smoke's own admin curates: the cell says so and offers no choice.
+    // The smoke's own admin curates: the panel says so and offers no choice.
+    await page.goto(`admin/users/${USER}`);
+    await expect(
+      page.getByRole("combobox", { name: `Role for ${USER}` }),
+    ).toHaveValue("admin");
+    await expect(page.getByText("curator", { exact: true })).toBeVisible();
     await expect(
       page.getByRole("combobox", { name: `Reflection for ${USER}` }),
     ).toHaveCount(0);

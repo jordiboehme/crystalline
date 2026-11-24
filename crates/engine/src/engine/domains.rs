@@ -371,7 +371,8 @@ impl Engine {
                 }
             }
             ContentSource::Virtual => {
-                let store = self.store.lock().await;
+                // A read: the automation status asks it on every poll.
+                let store = self.reader();
                 let content = match store.find_engram(domain, "manifest").await? {
                     Some(d) => store.engram_content(d.domain_id, &d.path).await?,
                     // A row at the path under another permalink is the

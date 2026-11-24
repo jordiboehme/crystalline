@@ -86,6 +86,7 @@ async fn every_command_off_the_allow_list_is_refused_remotely() {
         "holder",
         "file_stamps",
         "collect_orphaned_domains",
+        "reflection_overdue",
         "name_report",
         "fix_local_spellings",
         "scaffold_manifest",
@@ -510,4 +511,65 @@ async fn a_hidden_domain_is_refused_like_an_unknown_one() {
         texts.push(reply["error"].as_str().unwrap().replace(domain, "X"));
     }
     assert_eq!(texts[0], texts[1], "{texts:?}");
+}
+
+/// **An agent token reaches the automation verbs at the ctl route and
+/// nothing else.** `status`, `tool`, `file` and every other command are
+/// refused with a sentence that says where tool calls go; an automation verb
+/// is answered under the agent's scope. An agent token nobody issued gets the
+/// one refusal, `401`.
+#[tokio::test]
+async fn an_agent_token_reaches_only_the_automation_verbs_at_the_ctl_route() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let (_, issued) = server
+        .auth
+        .add_agent(
+            "nightly",
+            None,
+            crystalline_service::rest::AgentLoops::Both,
+            "keeper",
+            "",
+            crystalline_service::rest::AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    for cmd in [
+        status(),
+        json!({ "v": 1, "cmd": "tool", "tool": "list_domains", "args": {} }),
+        json!({ "v": 1, "cmd": "file", "domain": "open", "path": "assets/shot.png" }),
+        json!({ "v": 1, "cmd": "routing_bullets" }),
+        json!({ "v": 1, "cmd": "origin_status" }),
+    ] {
+        let (code, reply) = server.ctl(Some(&issued.token), cmd.clone()).await;
+        assert_eq!(code, 200, "{cmd}: {reply}");
+        assert_eq!(reply["ok"], false, "{cmd}: {reply}");
+        let error = reply["error"].as_str().unwrap();
+        assert!(
+            error.contains("is refused for an agent token")
+                && error.contains("only the automation verbs"),
+            "{cmd}: {error}"
+        );
+    }
+    let (code, reply) = server
+        .ctl(
+            Some(&issued.token),
+            json!({ "v": 1, "cmd": "automation_status", "loop": "evolve" }),
+        )
+        .await;
+    assert_eq!(code, 200, "{reply}");
+    assert_eq!(reply["ok"], true, "{reply}");
+    let names: Vec<&str> = reply["data"]["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["domain"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"lab"),
+        "every domain, a private one too: {names:?}"
+    );
+
+    let unknown = format!("cag_{}", "0".repeat(64));
+    let (code, _) = server.ctl(Some(&unknown), status()).await;
+    assert_eq!(code, 401);
 }

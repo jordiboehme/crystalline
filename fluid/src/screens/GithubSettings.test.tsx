@@ -141,7 +141,7 @@ beforeEach(() => {
 describe("the GitHub settings screen", () => {
   it("is not there for a non-admin", async () => {
     serveAs("editor");
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(/nothing is filed at this address/i),
@@ -159,7 +159,7 @@ describe("the GitHub settings screen", () => {
 
   it("offers the settings door to an admin, inside the identity menu", async () => {
     serveAs("admin");
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     const user = userEvent.setup();
     await user.click(
@@ -168,12 +168,12 @@ describe("the GitHub settings screen", () => {
     const settings = await screen.findByRole("menuitem", {
       name: "GitHub connection",
     });
-    expect(settings).toHaveAttribute("href", "/settings/github");
+    expect(settings).toHaveAttribute("href", "/admin/github");
   });
 
   it("shows the disconnected state with both connect paths", async () => {
     serveAs("admin");
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByRole("heading", { name: "GitHub connection" }),
@@ -211,7 +211,7 @@ describe("the GitHub settings screen", () => {
           share_identity_default: true,
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
     expect(
       await screen.findByText(
         /Each person opens proposals under their own GitHub account.*This is the default with a GitHub App\. To have the App open them, set github.share_identity to instance\./,
@@ -236,7 +236,7 @@ describe("the GitHub settings screen", () => {
           share_identity_default: false,
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
     expect(
       await screen.findByText(
         /The App opens proposals and names the person who shares as the commit author\. To have each person open their own, set github.share_identity to personal\./,
@@ -261,7 +261,7 @@ describe("the GitHub settings screen", () => {
           share_identity_default: false,
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(
@@ -289,7 +289,7 @@ describe("the GitHub settings screen", () => {
           share_identity: "instance",
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(
@@ -351,7 +351,7 @@ describe("the GitHub settings screen", () => {
           app: APP,
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(
@@ -382,7 +382,7 @@ describe("the GitHub settings screen", () => {
           token_store: "environment",
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(
@@ -412,7 +412,7 @@ describe("the GitHub settings screen", () => {
           },
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(/Not connected: the GitHub App cannot be used/),
@@ -431,7 +431,7 @@ describe("the GitHub settings screen", () => {
           token_store: "GitHub App",
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText("Connected through the GitHub App."),
@@ -449,7 +449,7 @@ describe("the GitHub settings screen", () => {
           token_store: "GitHub App",
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(
@@ -467,7 +467,7 @@ describe("the GitHub settings screen", () => {
         return status;
       },
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     await userEvent.click(
       await screen.findByRole("button", { name: /connect with github/i }),
@@ -498,7 +498,7 @@ describe("the GitHub settings screen", () => {
           error: "the code expired before it was confirmed",
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(await screen.findByText("ABCD-1234")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -518,7 +518,7 @@ describe("the GitHub settings screen", () => {
         return status;
       },
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     const field = await screen.findByLabelText(/personal access token/i);
     await userEvent.type(field, "ghp_secret");
@@ -553,7 +553,7 @@ describe("the GitHub settings screen", () => {
           token_store: "keyring",
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     await userEvent.type(
       await screen.findByLabelText(/personal access token/i),
@@ -592,7 +592,7 @@ describe("the GitHub settings screen", () => {
         );
       },
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     const field = await screen.findByLabelText(/personal access token/i);
     await userEvent.type(field, "ghp_stale");
@@ -609,7 +609,7 @@ describe("the GitHub settings screen", () => {
       "/settings/github": () =>
         statusPayload({ enabled: true, error: "authorization denied" }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/authorization denied/i);
@@ -630,7 +630,7 @@ describe("the GitHub settings screen", () => {
       "/settings/github": (_path, init) =>
         init?.method === "DELETE" ? forgotten() : status,
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText("Removes the token stored for octo."),
@@ -669,7 +669,7 @@ describe("the GitHub settings screen", () => {
       .mockImplementation(function (this: HTMLFormElement) {
         sent.push(this);
       });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     await userEvent.type(await screen.findByLabelText(/organization/i), "acme");
     await userEvent.click(
@@ -705,7 +705,7 @@ describe("the GitHub settings screen", () => {
         );
       },
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     await userEvent.click(
       await screen.findByRole("button", { name: "Create GitHub App" }),
@@ -727,7 +727,7 @@ describe("the GitHub settings screen", () => {
           app: APP,
         }),
     });
-    renderApp("/settings/github?app=created");
+    renderApp("/admin/github?app=created");
 
     const install = await screen.findByRole("link", {
       name: "Install on repositories",
@@ -750,7 +750,7 @@ describe("the GitHub settings screen", () => {
     serveAs("admin", {
       "/settings/github": () => statusPayload({ app: APP }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(
@@ -781,7 +781,7 @@ describe("the GitHub settings screen", () => {
             },
           }),
       });
-      renderApp("/settings/github");
+      renderApp("/admin/github");
 
       expect(
         await screen.findByText(
@@ -808,7 +808,7 @@ describe("the GitHub settings screen", () => {
           app: { ...APP, source: "environment", client_secret_set: false },
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(/the App has no client secret/),
@@ -828,7 +828,7 @@ describe("the GitHub settings screen", () => {
           app: { ...APP, source: null, client_secret_set: false },
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(
@@ -857,7 +857,7 @@ describe("the GitHub settings screen", () => {
             },
           }),
       });
-      renderApp("/settings/github");
+      renderApp("/admin/github");
 
       expect(
         await screen.findByText("the private key is not valid"),
@@ -881,7 +881,7 @@ describe("the GitHub settings screen", () => {
           },
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(await screen.findByText("Reading the App")).toBeInTheDocument();
     expect(screen.queryByText(/client secret/i)).not.toBeInTheDocument();
@@ -892,7 +892,7 @@ describe("the GitHub settings screen", () => {
       "/settings/github": () =>
         statusPayload({ app: { ...APP, client_secret_set: false } }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByText(/nothing is filed at this address/i),
@@ -918,7 +918,7 @@ describe("the GitHub settings screen", () => {
           },
         }),
     });
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     // The status has arrived: the connection line says so.
     expect(await screen.findByText("Not connected.")).toBeInTheDocument();
@@ -940,7 +940,7 @@ describe("the GitHub settings screen", () => {
         "/settings/github": () => statusPayload(),
       }),
     );
-    renderApp("/settings/github");
+    renderApp("/admin/github");
 
     expect(
       await screen.findByRole("heading", { name: "GitHub App" }),

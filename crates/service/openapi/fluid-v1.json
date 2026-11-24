@@ -9,6 +9,90 @@
     "version": "v1"
   },
   "paths": {
+    "/api/v1/accounts/search": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Find enabled accounts by typed text, for a people picker.",
+        "description": "With `domain`, open to whoever may manage that domain's members (its owner, a manager, an instance admin); a domain the caller may not see is answered 404, exactly as for one nobody registered, and a caller who sees it but does not manage it is 403. Without `domain`, instance admins only. `q` matches a prefix or word prefix of the login or display name, case and accents folded; an admin may also give a whole email address. A `q` shorter than two characters answers an empty list. At most ten accounts, disabled ones left out, each with whether it is already a member of `domain`. At most 60 searches per minute per caller, then 429 with `Retry-After`.",
+        "operationId": "search_accounts",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "What was typed: a prefix or word prefix of a login or display name\n(case and accents folded). At least two characters, else the answer is\nempty. An admin may also give a whole email address.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "ada"
+          },
+          {
+            "name": "domain",
+            "in": "query",
+            "description": "The domain the person is picked for. Without it the search is for\ninstance admins only.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "kb"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The matching accounts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountSearchResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No account identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not manage the domain's members, or (without `domain`) is not an admin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many searches; `Retry-After` says when to retry.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/activity": {
       "get": {
         "tags": [
@@ -99,6 +183,368 @@
           },
           "403": {
             "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agents": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`GET /agents` - every agent with its tokens, by name. Never carries a\ntoken: only hashes are stored.",
+        "operationId": "list_agents",
+        "responses": {
+          "200": {
+            "description": "Every agent, by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`POST /agents` - create an agent and issue its first token, answering 201\nwith both. The token is shown this once.",
+        "operationId": "create_agent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAgentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The agent and its first token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedAgentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, `auth.mcp` is off (an agent token would open nothing), or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "An account or another agent holds the name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not an agent, the name or display name is not allowed, or the life is not 1 to 365 days.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{name}": {
+      "delete": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`DELETE /agents/{name}` - remove an agent, every token it holds and every\ndraft it left, answering 204.",
+        "operationId": "delete_agent",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The agent, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The agent, its tokens, its drafts and the links on them are gone."
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{name}/tokens": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`POST /agents/{name}/tokens` - issue another token, answering 201 with it,\nthis once. Refused while the agent holds two live tokens.",
+        "operationId": "issue_agent_token",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The agent, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueAgentTokenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedAgentTokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The agent already holds two live tokens.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The life is not 1 to 365 days.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{name}/tokens/{id}": {
+      "delete": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "`DELETE /agents/{name}/tokens/{id}` - revoke one token, answering 204. The\ntoken stays listed as revoked.",
+        "operationId": "revoke_agent_token",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The agent, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The token's id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The token is revoked."
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live token of that id for this agent.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1679,7 +2125,7 @@
           "domains"
         ],
         "summary": "When the reflect and evolve loops last ran on this domain.",
-        "description": "Reading needs the right to read the domain, and each caller sees its own share. Every reader gets the last run (when, which runner, the outcome and the counts) and the runner working now. A caller who may run the loop also gets the run's summary, pull request and account, and, with `counts` on, how many items wait for a person. Only a domain manager or an instance admin gets `delivery`, the state of the loop's webhook trigger where the MANIFEST turns it on. Never the items a run left.",
+        "description": "Reading needs the right to read the domain, and each caller sees its own share. Every reader gets the last run (when, which runner, the outcome and the counts) and the runner working now. A caller who may run the loop also gets the run's summary, pull request and account (or, for a run by an agent of the loops, the agent's name and display name), and, with `counts` on, how many items wait for a person. Every reader gets `next_stale_at` and `next_stale_in_secs` for reflect, also with `counts` off. Only a domain manager or an instance admin gets `delivery`, the state of the loop's webhook trigger where the MANIFEST turns it on. Never the items a run left.",
         "operationId": "read_automation",
         "parameters": [
           {
@@ -6004,6 +6450,69 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/reflection/clock": {
+      "get": {
+        "tags": [
+          "reflection"
+        ],
+        "summary": "When a page was last checked, when it is due, and whether it is overdue.",
+        "description": "Needs `read`. For the line under a page's title: \"Last checked 2 hours ago, due again in 1 hour\", \"Overdue since 3 hours\", \"Waiting: open in the editor\", or for an owned page \"Part of: Architecture overview\" with its owner's last check.",
+        "operationId": "get_reflection_clock",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "The page's path inside reflections/.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "arch/overview.md"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The page's clock.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReflectionClockResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Reflection is not here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/reflection/disclose": {
       "post": {
         "tags": [
@@ -6136,15 +6645,18 @@
         },
         "responses": {
           "200": {
-            "description": "Moved with its threads and baseline; links to it rewritten: `{ from, to, links_rewritten, threads_moved }`. `links_failed`, `[{ domain, path, reason }]`, appears only when a page that links it could not be rewritten after the move.",
+            "description": "Moved with its threads and baseline, and its page pact when it has one; links to it rewritten: `{ from, to, links_rewritten, threads_moved, pact_moved, follows_rewritten, owners_rewritten }`. `links_rewritten` counts the links rewritten, in the pact files rewritten with the move and in the pages after it. `pact_moved` says whether its page pact moved with it. `follows_rewritten` counts the `follows` of other pages that now name the new path, and `owners_rewritten` the owners and former owners in other pages' records that do. `links_failed`, `[{ domain, path, reason }]`, appears only when a page that links it could not be rewritten after the move.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object"
                 },
                 "example": {
+                  "follows_rewritten": 1,
                   "from": "guides/a.md",
                   "links_rewritten": 2,
+                  "owners_rewritten": 0,
+                  "pact_moved": false,
                   "threads_moved": true,
                   "to": "howto/a.md"
                 }
@@ -6162,7 +6674,7 @@
             }
           },
           "403": {
-            "description": "Below edit access, or this instance is read-only.",
+            "description": "Below edit access; below curate for a page that has a page pact or a move onto a path that becomes the folder parent of a page already there; or this instance is read-only.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6192,7 +6704,7 @@
             }
           },
           "422": {
-            "description": "A bad path, or `PACT.md`, which is edited and never moved.",
+            "description": "A bad path, `PACT.md`, which is edited and never moved, or a page pact, which moves only with its page.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6344,7 +6856,7 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact.",
+            "description": "ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact. A `page_pact_changed` item (a page pact on the page's chain changed, or its stored pact hash no longer matches) carries `pacts`, `chain`, `pact_hash_changed` and `diff`; an `owner_gone` item carries `owner`, `owner_is` (`missing` or `retired`) and `hint`; `link_retired` and `link_broken` (per section) carry `links`, the pages it links that are retired or gone. `stale` items (a page whose freshness ran out) are a run's and never in this queue.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6395,6 +6907,192 @@
           },
           "409": {
             "description": "The Reflection is not here (then possibly `home_url`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection/restore": {
+      "post": {
+        "tags": [
+          "reflection"
+        ],
+        "summary": "Bring a retired page back, on its own or under its owner.",
+        "description": "Needs `curate`. The page gets back the status it had before it was retired (none when it had none). With `owner`, which must be the page it was owned by and still a page that may own it, it goes back under that page.",
+        "operationId": "restore_reflection",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreReflectionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Restored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoredReflection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The anonymous viewer of a domain it reads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Below curate access, the domain is off the caller's write list, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or page, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Reflection is not here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A page that is not retired, a pact file, an empty `owner`, an `owner` that is not the page it was owned by, or an owner that is gone, retired or would close a cycle.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection/retire": {
+      "post": {
+        "tags": [
+          "reflection"
+        ],
+        "summary": "Retire a page: hidden, kept and restorable.",
+        "description": "Needs `curate`. The page's status becomes `archived`, it leaves its owner's set (the owner is kept as the page it was owned by) and it is hidden in the navigation, never reconciled, and still reached by link and by search. Its threads stay. This is what an unattended run does where a person would delete.",
+        "operationId": "retire_reflection",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireReflectionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Retired.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetiredReflection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The anonymous viewer of a domain it reads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Below curate access, the domain is off the caller's write list, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or page, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Reflection is not here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A pact file, which is no page, or a page already retired.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6547,7 +7245,7 @@
         ],
         "responses": {
           "200": {
-            "description": "`{ domain, query, mode, total, page, limit, count, hits: [{ path, title, section, heading, snippet }] }`, best first. `mode` is the search that ran (hybrid, text or semantic), not a score; no hit carries one. `total` counts every hit, `count` this page's. `section` is the section id, `_top` for the text before the first heading, or `null` for a heading with no id yet.",
+            "description": "`{ domain, query, mode, total, page, limit, count, hits: [{ path, title, section, heading, snippet, retired }] }`, best first. `retired` marks a hit on a retired page, shown faded. `mode` is the search that ran (hybrid, text or semantic), not a score; no hit carries one. `total` counts every hit, `count` this page's. `section` is the section id, `_top` for the text before the first heading, or `null` for a heading with no id yet.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6560,6 +7258,7 @@
                     {
                       "heading": "Night deploys",
                       "path": "guides/deploying.md",
+                      "retired": false,
                       "section": "7f3a9c2e",
                       "snippet": "Deploys run at night.",
                       "title": "Deploying"
@@ -6596,6 +7295,99 @@
           },
           "422": {
             "description": "A missing or empty `q`, or a `search_type` other than hybrid, text or semantic.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection/settings": {
+      "patch": {
+        "tags": [
+          "reflection"
+        ],
+        "summary": "Change a page's freshness, follows or status.",
+        "description": "Needs `curate`. Only the frontmatter keys named (`freshness`, `follows`, `status`) change; the page's text, its sections and their sources stay, so nobody owes feedback. A co-editing room open over the page takes the change in, and the editor never shows these keys. A change of `freshness` or `status` keeps a recorded reconcile current. A `follows` that brings other pacts raises a `page_pact_changed` item, since the page now follows another pact.",
+        "operationId": "set_reflection_settings",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReflectionSettingsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Changed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReflectionSettingsReceipt"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The anonymous viewer of a domain it reads: it reads the Reflection and never changes it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Below curate access (the detail names the right held and the right needed), the domain is off the caller's write list, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or page, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The page changed while it was written (read it again and repeat), or the Reflection is not here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No key to change; a pact file; a freshness that does not read, is under an hour, or is set on an owned page; a follows that names no page of this Reflection or closes a cycle; a retired word in status (retire the page instead); a status change on a retired page (restore it instead).",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7066,7 +7858,7 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectionTree: folders first, then reflections, each level sorted by name in byte order. `PACT.md` is only under `pact`, never in `nodes`.",
+            "description": "ReflectionTree: folders first, then reflections, each level sorted by name in byte order. `PACT.md` is only under `pact`, never in `nodes`, and a page pact (`<page>.pact.md`) is in neither: its page's read names it. A reflection carries `retired` (a retired page: hide it behind a switch) and `owner`, the path of the page that owns it, or null.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7081,7 +7873,9 @@
                           "kind": "reflection",
                           "name": "deploying.md",
                           "open_threads": 2,
+                          "owner": null,
                           "path": "guides/deploying.md",
+                          "retired": false,
                           "sections": 4,
                           "title": "Deploying"
                         }
@@ -7153,11 +7947,11 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open.",
+            "description": "ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source it can check carries the engram's `status` as written (a `draft`, `proposed`, `idea`, `poc` or `open` engram is tentative); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/ReflectionDoc"
                 },
                 "example": {
                   "checksum": "9f2c...",
@@ -7168,6 +7962,28 @@
                     ]
                   },
                   "markdown": "# Deploying\n...",
+                  "page": {
+                    "chain": [
+                      {
+                        "path": "guides.md",
+                        "title": "Guides"
+                      }
+                    ],
+                    "findings": [],
+                    "follows": null,
+                    "freshness": "1d",
+                    "owner": null,
+                    "pact": {
+                      "exists": false,
+                      "path": "guides/deploying.pact.md"
+                    },
+                    "pacts": [
+                      "PACT.md",
+                      "guides.pact.md"
+                    ],
+                    "retired": null,
+                    "status": null
+                  },
                   "path": "guides/deploying.md",
                   "sections": [
                     {
@@ -7180,12 +7996,14 @@
                         {
                           "permalink": "runbooks/deploy",
                           "state": "current",
+                          "status": "stable",
                           "title": "Deploy runbook"
                         },
                         {
                           "domain": "ops",
                           "permalink": "team/on-call",
                           "state": "changed",
+                          "status": "proposed",
                           "title": "On call"
                         }
                       ]
@@ -7224,7 +8042,7 @@
           "reflection"
         ],
         "summary": "Create or replace a reflection, or PACT.md.",
-        "description": "Needs `edit`; `PACT.md` needs `curate`. While a co-editing room is open over the reflection the write composes into the room, and the answer carries `landed: live` and `present`.",
+        "description": "Needs `edit`; a pact file (`PACT.md` or a page pact, `<page>.pact.md`) needs `curate`. While a co-editing room is open over the reflection the write composes into the room, and the answer carries `landed: live` and `present`. The page settings `freshness`, `follows` and `status` in the frontmatter are a curator's: a key the body leaves out keeps its stored value, a curator clears one by sending it with no value, and below curate a different value (or any `freshness` or `follows` on a new page, or a retired word in `status`) is refused with 403. `PATCH /domains/{domain}/reflection/settings` changes them without the text.",
         "operationId": "save_reflection",
         "parameters": [
           {
@@ -7288,7 +8106,7 @@
             }
           },
           "403": {
-            "description": "Below edit access (curate for PACT.md), with a detail naming the right held and the right needed; the domain is off the caller's write list; or this instance is read-only.",
+            "description": "Below edit access (curate for a pact file), with a detail naming the right held and the right needed; a page setting changed below curate (the detail names the key and says to leave it out or send it as stored); a new page beside a waiting page pact below curate; the domain is off the caller's write list; or this instance is read-only.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7334,6 +8152,7 @@
           "reflection"
         ],
         "summary": "Delete a reflection with its threads and baseline.",
+        "description": "Needs `edit`; a page pact, or a page that has one (its pact goes with it), needs `curate`. A session marked unattended (an MCP session of a reflect run or an agent of the loops) never deletes a page or a page pact: it is refused with a sentence that says to retire the page instead. A person on this API is never such a session.",
         "operationId": "delete_reflection",
         "parameters": [
           {
@@ -7357,7 +8176,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Deleted with its threads and baseline."
+            "description": "Deleted with its threads and baseline, and its page pact when it has one."
           },
           "401": {
             "description": "The anonymous viewer of a domain it reads: it reads the Reflection and never changes it.",
@@ -7370,7 +8189,7 @@
             }
           },
           "403": {
-            "description": "Below edit access, or this instance is read-only.",
+            "description": "Below edit access (curate for a page pact or a page that has one), or this instance is read-only.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9490,7 +10309,7 @@
           "settings"
         ],
         "summary": "Where GitHub sends the browser back after creating the GitHub App.",
-        "description": "Needs the admin session that asked for the manifest form (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a form this session was handed in the last hour and is spent by this call. Then the code is converted into the App's credentials, which are stored as `crystalline github app set` stores them, and the browser is sent to `/settings/github?app=created`. Refused without converting the code when a GitHub App is already configured. It is a browser landing, so every refusal is an HTML page, never JSON, and no answer carries a secret.",
+        "description": "Needs the admin session that asked for the manifest form (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a form this session was handed in the last hour and is spent by this call. Then the code is converted into the App's credentials, which are stored as `crystalline github app set` stores them, and the browser is sent to `/admin/github?app=created`. Refused without converting the code when a GitHub App is already configured. It is a browser landing, so every refusal is an HTML page, never JSON, and no answer carries a secret.",
         "operationId": "finish_github_app_manifest",
         "parameters": [
           {
@@ -9514,7 +10333,7 @@
         ],
         "responses": {
           "303": {
-            "description": "The App is stored: to `/settings/github?app=created`."
+            "description": "The App is stored: to `/admin/github?app=created`."
           },
           "401": {
             "description": "An HTML page: no signed-in session. The state is not spent.",
@@ -9549,11 +10368,11 @@
           "settings"
         ],
         "summary": "Where GitHub sends the browser after the GitHub App was installed.",
-        "description": "The manifest's `setup_url`. Changes nothing and reads nothing GitHub sent: it sends the browser to `/settings/github?app=installed`.",
+        "description": "The manifest's `setup_url`. Changes nothing and reads nothing GitHub sent: it sends the browser to `/admin/github?app=installed`.",
         "operationId": "github_app_installed",
         "responses": {
           "303": {
-            "description": "To `/settings/github?app=installed`."
+            "description": "To `/admin/github?app=installed`."
           }
         }
       }
@@ -9997,6 +10816,469 @@
           },
           "422": {
             "description": "The anchor is not a `crystalline://` URL.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/invites": {
+      "get": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`GET /invites` - the invite links, newest first: every one for an admin,\nthe caller's own for anyone else. Never carries a token.",
+        "operationId": "list_invites",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Only links in this state.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/InviteState"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The links, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`state` is not pending, used, revoked or expired.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`POST /invites` - make an invite link, answering 201 with it, its token\nand the address to copy, this once.",
+        "operationId": "create_invite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInviteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The link, its token and its address, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedInviteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin and owners and managers may not make links here, or the caller is not the owner or a manager of the domain, asked for a role other than `none`, a level above their own, no domain or a local-account link; a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is shared or its access follows GitHub, the caller holds as many pending links as allowed, or the accounts and the pending links fill this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not a link: an admin role, a level without a domain, a level of `none`, a life outside 1 to 30 days, or a label that is too long or holds a control character.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/invites/confirm": {
+      "post": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`POST /invites/confirm` - what an invite link gives and how to take it.\nRedeems nothing.",
+        "operationId": "confirm_invite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What the link gives and the sign-in offered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The link is not valid any more: one answer for a token that is unknown, used, revoked or expired, or whose maker or domain no longer allows it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but carries no token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many tokens were tried from this address.",
+            "headers": {
+              "retry-after": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before trying again."
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/invites/redeem": {
+      "post": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`POST /invites/redeem` - take an invite link.",
+        "operationId": "redeem_invite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedeemBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Redeemed, or (`outcome: sign_in`) where to send the browser to sign in first: the callback redeems the link. A new local account is signed in, with the session cookie set and its CSRF token in `csrf`.",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` cookie for a new local account, or the `fluid_oidc_state` cookie for a sign-in to go through."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RedeemResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The link is taken through the proxy in front of this instance, and this request carried no identity from it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A signed-in caller named another login, this link may not make a local account here, the account is disabled, a new account would pass the account cap, a signed-in caller did not echo the CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No invite link has this token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The link's maker may no longer give what it gives, its domain is no longer private or follows GitHub, the login name is taken, the link names no domain and the caller has an account, or the sign-on identity belongs to an account already.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The link was used, revoked or has expired.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A local account needs a login name and a password, and one was missing, empty or not a login name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many tokens were tried from this address.",
+            "headers": {
+              "retry-after": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before trying again."
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The sign-on provider could not be reached to start the sign-in.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many sign-ins are in flight, or the wait for a password slot ran out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/invites/{id}": {
+      "delete": {
+        "tags": [
+          "invites"
+        ],
+        "summary": "`DELETE /invites/{id}` - revoke an unused link, answering 204: an admin\nany, its maker their own. The link stays listed as revoked.",
+        "operationId": "revoke_invite",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The link's id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The link is revoked."
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No unused, unrevoked link of that id that this caller may revoke.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11565,6 +12847,28 @@
         }
       }
     },
+    "/api/v1/reflection/missed": {
+      "get": {
+        "tags": [
+          "reflection"
+        ],
+        "summary": "The Reflection pages a reflect run left behind.",
+        "description": "For the admin banner and the maintenance view: every page of a Reflection served here that the caller may read, where a reflect run of its domain started after the page fell due and ended without reconciling it. A page that is only overdue because the loop runs less often than its freshness is not here: the loop did not fail it. A domain whose pages cannot be read is left out.",
+        "operationId": "list_missed_reflection_pages",
+        "responses": {
+          "200": {
+            "description": "The missed pages.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MissedReflectionPages"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/search": {
       "get": {
         "tags": [
@@ -12145,16 +13449,133 @@
         "tags": [
           "users"
         ],
-        "summary": "Every account, by name.",
-        "description": "An account carries no password material, so the rows go out as they come back from the store. Admin only: the account list names every way into the instance and who holds it.",
+        "summary": "The accounts, searched, filtered, sorted and paged.",
+        "description": "An account carries no password material, so the rows go out as they come back from the store. Admin only: the account list names every way into the instance and who holds it. `q` matches a prefix or word prefix of the login or display name (case and accents folded) or a whole email address. Sorting is by `sort` and `dir` with the login name as the tiebreak; an account never seen sorts last by `last_seen` in both directions. Without `limit` every matching account is answered, by name, and `page` is ignored. `total` counts the matches before paging; paging by `last_seen` can shift as accounts are seen.",
         "operationId": "list_users",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Search text: a prefix or word prefix of the login or display name (case\nand accents folded), or a whole email address.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "ada"
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "Only accounts with this role.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Role"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Only active or only disabled accounts.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/StateFilter"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Only accounts that sign in this way.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/KindFilter"
+            }
+          },
+          {
+            "name": "seen_before",
+            "in": "query",
+            "description": "Only accounts last seen before this instant (RFC 3339). An account\nnever seen is not before anything.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-11-01T00:00:00Z"
+          },
+          {
+            "name": "seen_after",
+            "in": "query",
+            "description": "Only accounts last seen after this instant (RFC 3339).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-11-01T00:00:00Z"
+          },
+          {
+            "name": "github",
+            "in": "query",
+            "description": "`true` for accounts with a GitHub link, `false` for those without.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "The column to sort by. Default `name`; `name` breaks every tie.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SortColumn"
+            }
+          },
+          {
+            "name": "dir",
+            "in": "query",
+            "description": "The direction. Default `asc`.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SortDir"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "The page, from 1. Only read together with `limit`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Accounts per page (1 to 500). Without it every matching account comes\nback in one answer.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Every account.",
+            "description": "The matching accounts.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UsersResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A filter, `page` or `limit` is malformed.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
                 }
               }
             }
@@ -12290,7 +13711,150 @@
         }
       }
     },
+    "/api/v1/users/bulk": {
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`POST /users/bulk` - deactivate, reactivate or give a role to a selection of\naccounts in one request.",
+        "description": "It behaves as N single `PATCH /users/{name}` calls, one after the other: the\nlast-admin guard (`check_change_of`) runs for every account against the\nroster as the earlier ones left it, disabling ends the account's sessions as\nthe single route does, and the caller's own account is refused. A refusal is\nthat account's result, not the request's: the answer is a 200 with a result\nper account, and the rest are still done. One INFO line records the caller,\nthe action and the counts.",
+        "operationId": "bulk_users",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "A result per account.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No names, more than 500, or a `role` that does not fit the action.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/{name}": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`GET /users/{name}` - one account, its write list and its drafts.",
+        "description": "The account in the shape the list answers with, sign-in kind and GitHub\nlink included. An agent is not an account, so its name answers 404.",
+        "operationId": "get_user",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The account.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDetailResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
       "delete": {
         "tags": [
           "users"
@@ -12528,7 +14092,7 @@
             }
           },
           "409": {
-            "description": "The name has an account, or is the machine owner's.",
+            "description": "The name has an account or a live agent, or is the machine owner's.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12713,6 +14277,158 @@
                 "description": "Seconds to wait before trying again."
               }
             },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{name}/writes": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`GET /users/{name}/writes` - an account's write list.",
+        "operationId": "get_user_writes",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The write list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WritesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`PUT /users/{name}/writes` - replace or remove an account's write list,\nas `crystalline users writes` does. The list only lowers rights.",
+        "operationId": "set_user_writes",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WritesBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The write list as stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WritesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An entry is not a domain name or a name prefix with one `*` at the end, or the list is empty.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12969,6 +14685,47 @@
           }
         }
       },
+      "AccountHit": {
+        "type": "object",
+        "description": "One account the search found.",
+        "required": [
+          "name",
+          "display",
+          "member"
+        ],
+        "properties": {
+          "display": {
+            "type": "string",
+            "description": "The display name.",
+            "example": "Ada Lovelace"
+          },
+          "member": {
+            "type": "boolean",
+            "description": "Whether the account is already a member of the asked domain (its\nowner counts). Always `false` without `domain`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The login name.",
+            "example": "ada"
+          }
+        }
+      },
+      "AccountSearchResponse": {
+        "type": "object",
+        "description": "What `GET /accounts/search` answers with.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountHit"
+            },
+            "description": "At most ten matching enabled accounts, by login name."
+          }
+        }
+      },
       "AckBody": {
         "type": "object",
         "description": "Acknowledge one finding on one engram: the engram by permalink, the rule id that fired, an optional note saying why it is intentional and, for a rule that fires more than once on an engram, the row's own `scope`. Omit the scope and the server picks the finding by running detection, which is the right answer for every rule that fires once.",
@@ -13002,6 +14759,143 @@
             ],
             "description": "The evidence this acknowledgment is for, copied from the queue row's\nown `scope`.\n\nOnly `V112`, `V301` and `V302` send one: they are the three rules that\nfire more than once on an engram (a folder can sit close to two sibling\nfolders, an engram can be the semantic twin of several others, and\nseveral of its lines can read as contradicting another's), so they are\nthe ones where naming the rule does not name the finding.\nOn `POST` the server checks the scope is really firing and refuses with\na 422 if it is not, which is what a queue read too long ago looks like;\non `DELETE` it takes back that pair's entry and leaves the engram's\nother pairs silenced. Every other rule ignores it, and omitting it on\n`V112`, `V301` or `V302` means the whole rule: the server's own pick on `POST`,\nevery pair at once on `DELETE`.",
             "example": "notes/backoff-lesson, notes/retry-queue-gotcha"
+          }
+        }
+      },
+      "Agent": {
+        "type": "object",
+        "description": "One agent with its tokens, newest first.",
+        "required": [
+          "name",
+          "display",
+          "loops",
+          "created_at",
+          "created_by",
+          "disabled",
+          "tokens"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "When it was created, RFC 3339."
+          },
+          "created_by": {
+            "type": "string",
+            "description": "Who created it: the admin's account, or `cli` for `crystalline agents`."
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "A disabled agent keeps its rows, and none of its tokens opens anything."
+          },
+          "display": {
+            "type": "string",
+            "description": "The name shown to people.",
+            "example": "Nightly runner"
+          },
+          "loops": {
+            "$ref": "#/components/schemas/AgentLoops",
+            "description": "The loops it runs."
+          },
+          "name": {
+            "type": "string",
+            "description": "The unique name, folded like a login name. This is what a commit, a\nlease and `generated.by` carry.",
+            "example": "nightly"
+          },
+          "tokens": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgentToken"
+            },
+            "description": "Its tokens, live or not, newest first."
+          }
+        }
+      },
+      "AgentLoops": {
+        "type": "string",
+        "description": "Which loops an agent runs. Chosen per agent; both by default.",
+        "enum": [
+          "reflect",
+          "evolve",
+          "both"
+        ]
+      },
+      "AgentToken": {
+        "type": "object",
+        "description": "One token of an agent, never carrying the token itself.",
+        "required": [
+          "id",
+          "label",
+          "created_at",
+          "expires_at",
+          "state"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "When it was issued, RFC 3339."
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "When it stops working, RFC 3339."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, which `agents revoke` names.",
+            "example": 4
+          },
+          "label": {
+            "type": "string",
+            "description": "What the admin called it.",
+            "example": "issued 2026-11-22"
+          },
+          "last_used": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was last presented, RFC 3339, or `None` when never."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was revoked, RFC 3339, or `None`."
+          },
+          "state": {
+            "$ref": "#/components/schemas/AgentTokenState",
+            "description": "Live, expired or revoked, as of the read."
+          }
+        }
+      },
+      "AgentTokenState": {
+        "type": "string",
+        "description": "Where one agent token stands.",
+        "enum": [
+          "live",
+          "expired",
+          "revoked"
+        ]
+      },
+      "AgentsResponse": {
+        "type": "object",
+        "description": "What `GET /agents` answers with.",
+        "required": [
+          "agents",
+          "auth_mcp"
+        ],
+        "properties": {
+          "agents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Agent"
+            },
+            "description": "Every agent with its tokens, by name."
+          },
+          "auth_mcp": {
+            "type": "boolean",
+            "description": "Whether `auth.mcp` is on in the effective configuration, the value a\nnew agent is checked against. Agents work only with it on. The MCP\nendpoint reads the setting when the server starts, so a change made\nsince needs a restart there."
           }
         }
       },
@@ -13302,6 +15196,89 @@
           }
         }
       },
+      "BulkAction": {
+        "type": "string",
+        "description": "What a bulk action does to each account it names.",
+        "enum": [
+          "deactivate",
+          "reactivate",
+          "role"
+        ]
+      },
+      "BulkBody": {
+        "type": "object",
+        "description": "One change for a selection of accounts. Each account is changed as `PATCH /users/{name}` would change it, so the last-admin guard applies to every one, and the caller's own account is refused. `role` is required with the `role` action and refused with the others.",
+        "required": [
+          "names",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkAction",
+            "description": "What to do to each account."
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The login names, in any casing. Repeats count once. At most 500."
+          },
+          "role": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "The new role, for the `role` action."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "BulkResponse": {
+        "type": "object",
+        "description": "What `POST /users/bulk` answers with: one entry per distinct account, in the\norder they were sent.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkResult"
+            },
+            "description": "One result per account."
+          }
+        }
+      },
+      "BulkResult": {
+        "type": "object",
+        "description": "What happened to one account of a bulk request.",
+        "required": [
+          "name",
+          "done"
+        ],
+        "properties": {
+          "done": {
+            "type": "boolean",
+            "description": "Whether the change was made."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The refusal, in a sentence, when `done` is false."
+          },
+          "name": {
+            "type": "string",
+            "description": "The account, as the store keys it."
+          }
+        }
+      },
       "ChangeKind": {
         "type": "string",
         "description": "What happened to the engram: the four things the sync engine counts, and\n`files` for an attachment.",
@@ -13333,6 +15310,80 @@
           "repo": {
             "type": "string",
             "description": "Its repository, `owner/name`."
+          }
+        }
+      },
+      "ConfirmBody": {
+        "type": "object",
+        "description": "The body of `POST /invites/confirm`.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token from the link's fragment.",
+            "example": "cin_q2V0..."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConfirmResponse": {
+        "type": "object",
+        "description": "What `POST /invites/confirm` answers with: what the link gives and how to\ntake it.",
+        "required": [
+          "inviter",
+          "inviter_display",
+          "role",
+          "expires_at",
+          "sign_in",
+          "local_allowed"
+        ],
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The private domain the link gives membership of, if any.",
+            "example": "team"
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "When the link stops working, RFC 3339."
+          },
+          "inviter": {
+            "type": "string",
+            "description": "The login name of the person who made the link.",
+            "example": "ada"
+          },
+          "inviter_display": {
+            "type": "string",
+            "description": "Their display name.",
+            "example": "Ada Lovelace"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The level there."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "local_allowed": {
+            "type": "boolean",
+            "description": "Whether the link may make an account with a login name and a\npassword here."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The instance role an account this link creates gets. An existing\naccount keeps its own."
+          },
+          "sign_in": {
+            "$ref": "#/components/schemas/InviteSignIn",
+            "description": "The sign-in this instance offers."
           }
         }
       },
@@ -13371,6 +15422,57 @@
             "type": "string"
           }
         }
+      },
+      "CreateAgentBody": {
+        "type": "object",
+        "description": "The body of `POST /agents`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name shown to people. Defaults to the name.",
+            "example": "Nightly runner"
+          },
+          "expires_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The first token's life in days, 1 to 365. Defaults to 90.",
+            "example": 90,
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first token's label. Defaults to the day it was issued."
+          },
+          "loops": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AgentLoops",
+                "description": "The loops it runs. Defaults to both."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "The unique name, folded like a login name. It may not be taken by an\naccount or another agent.",
+            "example": "nightly"
+          }
+        },
+        "additionalProperties": false
       },
       "CreateBody": {
         "type": "object",
@@ -13536,6 +15638,116 @@
             ],
             "description": "The engram `type`. Defaults to `engram`. Free form; recommended values\nare guidance.",
             "example": "decision"
+          }
+        }
+      },
+      "CreateInviteBody": {
+        "type": "object",
+        "description": "The body of `POST /invites`.",
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A private domain the link gives membership of. Required for a domain\nowner's or manager's link.",
+            "example": "team"
+          },
+          "expires_in_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The link's life in days, 1 to 30. Defaults to 7.",
+            "example": 7,
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A label for the maker's own list.",
+            "example": "for Bo"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The level on that domain: `viewer`, `editor` or `manager`. Defaults to\n`viewer` when a domain is given; not above the maker's own."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "local_account": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the link may create an account with a password where single\nsign-on or a proxy would otherwise be the only way in. Admins only."
+          },
+          "role": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "The instance role an account this link creates gets: `none`, `viewer`\nor `editor`. Defaults to `viewer` for an admin's link; a domain\nowner's or manager's link is always `none`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreatedAgentResponse": {
+        "type": "object",
+        "description": "What `POST /agents` answers with: the agent as stored and its first token.",
+        "required": [
+          "agent",
+          "token"
+        ],
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/Agent",
+            "description": "The agent as stored."
+          },
+          "token": {
+            "$ref": "#/components/schemas/IssuedAgentTokenResponse",
+            "description": "Its first token, this once."
+          }
+        }
+      },
+      "CreatedInviteResponse": {
+        "type": "object",
+        "description": "A freshly made invite link. `token` and `link` are shown here and nowhere else, ever: only the token's hash is stored.",
+        "required": [
+          "invite",
+          "token",
+          "link",
+          "relative"
+        ],
+        "properties": {
+          "invite": {
+            "$ref": "#/components/schemas/Invite",
+            "description": "The link as stored."
+          },
+          "link": {
+            "type": "string",
+            "description": "The address to hand over, the token in its fragment. Absolute when\n`service.public_url` is set, else a path under the base path that the\nbrowser completes with its own origin.",
+            "example": "https://kb.example.com/invite#cin_q2V0..."
+          },
+          "relative": {
+            "type": "boolean",
+            "description": "Whether `link` is a path the browser completes rather than a whole\naddress."
+          },
+          "token": {
+            "type": "string",
+            "description": "The token itself, this once.",
+            "example": "cin_q2V0..."
           }
         }
       },
@@ -13914,6 +16126,26 @@
               "null"
             ],
             "description": "What you may not do with these conflicts here, in a sentence to show:\non a read-only server or without write access none can be settled,\nand on a read-only domain or an archived repository only the team's\ntext can be taken. Null when every choice is open or nothing is listed."
+          }
+        }
+      },
+      "DraftCount": {
+        "type": "object",
+        "description": "What one domain holds in an account's drafts, counted and never read.",
+        "required": [
+          "domain",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many drafts, kept texts and open draft rooms the account has there.",
+            "minimum": 0
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain."
           }
         }
       },
@@ -14586,6 +16818,164 @@
           }
         }
       },
+      "Invite": {
+        "type": "object",
+        "description": "One invite link, never carrying its token.",
+        "required": [
+          "id",
+          "role",
+          "local_account",
+          "created_by",
+          "created_at",
+          "expires_at",
+          "state"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "When it was made, RFC 3339."
+          },
+          "created_by": {
+            "type": "string",
+            "description": "The account that made it.",
+            "example": "ada"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The private domain the link gives membership of, if any.",
+            "example": "team"
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "When it stops working, RFC 3339."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, which a revoke names.",
+            "example": 3
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What its creator called it.",
+            "example": "for Bo"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The membership level on that domain; set exactly when `domain` is."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "local_account": {
+            "type": "boolean",
+            "description": "Whether it may create a local account with a password where an\nidentity provider would otherwise be the only way in."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was revoked, RFC 3339, or `None`."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The instance role an account this link creates gets."
+          },
+          "state": {
+            "$ref": "#/components/schemas/InviteState",
+            "description": "Pending, used, revoked or expired, as of the read."
+          },
+          "used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was used, RFC 3339, or `None`."
+          },
+          "used_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account that used it, or `None`."
+          }
+        }
+      },
+      "InviteSignIn": {
+        "type": "string",
+        "description": "Which way in a link offers.",
+        "enum": [
+          "local",
+          "oidc",
+          "proxy"
+        ]
+      },
+      "InviteState": {
+        "type": "string",
+        "description": "Where one invite link stands.",
+        "enum": [
+          "pending",
+          "used",
+          "revoked",
+          "expired"
+        ]
+      },
+      "InvitesResponse": {
+        "type": "object",
+        "description": "What `GET /invites` answers with.",
+        "required": [
+          "invites",
+          "sign_in"
+        ],
+        "properties": {
+          "invites": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Invite"
+            },
+            "description": "The links, newest first, never with their tokens."
+          },
+          "sign_in": {
+            "$ref": "#/components/schemas/InviteSignIn",
+            "description": "The way in this instance offers a link's holder: `proxy` or `oidc`\nwhen an identity provider names people, else `local`. Only where it\nis not `local` does a link's `local_account` flag change anything."
+          }
+        }
+      },
+      "IssueAgentTokenBody": {
+        "type": "object",
+        "description": "The body of `POST /agents/{name}/tokens`.",
+        "properties": {
+          "expires_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The token's life in days, 1 to 365. Defaults to 90.",
+            "example": 90,
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its label. Defaults to the day it was issued."
+          }
+        },
+        "additionalProperties": false
+      },
       "IssueBody": {
         "type": "object",
         "description": "A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again.",
@@ -14597,6 +16987,39 @@
             "type": "string",
             "description": "What this token is for. Required and non-empty: an unlabeled row is\none nobody dares revoke.",
             "example": "laptop"
+          }
+        }
+      },
+      "IssuedAgentTokenResponse": {
+        "type": "object",
+        "description": "A freshly issued agent token. `token` is shown here and nowhere else, ever: only its hash is stored. The agent sends it as `Authorization: Bearer <token>`.",
+        "required": [
+          "id",
+          "token",
+          "label",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "description": "When it stops working, RFC 3339.",
+            "example": "2027-02-20T09:00:00Z"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, which a revoke names.",
+            "example": 4
+          },
+          "label": {
+            "type": "string",
+            "description": "Its label.",
+            "example": "issued 2026-11-22"
+          },
+          "token": {
+            "type": "string",
+            "description": "The token itself, this once.",
+            "example": "cag_1f3c..."
           }
         }
       },
@@ -14744,6 +17167,16 @@
           }
         }
       },
+      "KindFilter": {
+        "type": "string",
+        "description": "A sign-in kind a `GET /users` filter names.",
+        "enum": [
+          "password",
+          "oidc",
+          "proxy",
+          "token_only"
+        ]
+      },
       "LeaveBody": {
         "type": "object",
         "description": "The key the join was opened under.",
@@ -14854,8 +17287,24 @@
               "string",
               "null"
             ],
-            "description": "The account the run worked as; only for a caller who may run the loop.",
+            "description": "The account the run worked as; only for a caller who may run the loop.\n`null` for a run by an agent of the loops, which `agent` names.",
             "example": "robot"
+          },
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique name of the agent of the loops the run worked as; only for\na caller who may run the loop, and `null` for a person's run or the\nmachine's own.",
+            "example": "nightly"
+          },
+          "agent_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name `agent` is shown under, read when the answer is made; `null`\nwithout an agent, or once the agent is gone.",
+            "example": "Nightly curator"
           },
           "done": {
             "type": "integer",
@@ -14977,6 +17426,23 @@
             "description": "Items a finished run left for a person that have not changed since.\n`null` unless the caller may run the loop and asked for counts.",
             "example": 3,
             "minimum": 0
+          },
+          "next_stale_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the next Reflection page falls due (its freshness runs out) or\na due page enters its next period, RFC 3339 on the server's\nautomation clock; also with `counts` off. `null` for evolve, for a\nloop that runs on another instance and when no page keeps itself\ncurrent.",
+            "example": "2026-10-21T11:00:00Z"
+          },
+          "next_stale_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The same instant in seconds from now, at least 1: a client with a\nskewed clock counts from this one.",
+            "example": 2400
           },
           "running": {
             "oneOf": [
@@ -15270,7 +17736,8 @@
           "visibility",
           "members",
           "governance",
-          "overridden"
+          "overridden",
+          "can_invite"
         ],
         "properties": {
           "archived_reason": {
@@ -15280,6 +17747,10 @@
             ],
             "description": "On a domain GitHub governs whose repository is archived on GitHub,\nthe sentence that says the domain is read-only for everybody until\nthe repository is unarchived; `null` otherwise.",
             "example": "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub"
+          },
+          "can_invite": {
+            "type": "boolean",
+            "description": "Whether this caller may make an invite link to this domain here:\ntrue for an instance admin, and for its owner or a manager while\n`auth.invites.managers` is on, on a private domain GitHub does not\ngovern and a writable instance. The same gates `POST /invites`\napplies."
           },
           "closed_reason": {
             "type": [
@@ -15391,6 +17862,67 @@
           "token": {
             "type": "string",
             "description": "The link itself, `dl_` plus 64 hex characters. Hand it to one person."
+          }
+        }
+      },
+      "MissedReflectionPage": {
+        "type": "object",
+        "description": "A page a reflect run missed.",
+        "required": [
+          "domain",
+          "path",
+          "freshness",
+          "last_checked_secs",
+          "missed_secs",
+          "waiting"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The domain.",
+            "example": "eng"
+          },
+          "freshness": {
+            "type": "string",
+            "description": "Its freshness, as written.",
+            "example": "1d"
+          },
+          "last_checked_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds since it was last reconciled.",
+            "example": 172800
+          },
+          "missed_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds since the end of the first reflect run that started after\nthe page fell due and left it.",
+            "example": 10800
+          },
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/.",
+            "example": "status/this-week.md"
+          },
+          "waiting": {
+            "type": "boolean",
+            "description": "A co-editing room has the page open: it waits for the room."
+          }
+        }
+      },
+      "MissedReflectionPages": {
+        "type": "object",
+        "description": "What `GET /reflection/missed` answers.",
+        "required": [
+          "pages"
+        ],
+        "properties": {
+          "pages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MissedReflectionPage"
+            },
+            "description": "Longest missed first."
           }
         }
       },
@@ -15982,6 +18514,114 @@
           "private"
         ]
       },
+      "RedeemBody": {
+        "type": "object",
+        "description": "The body of `POST /invites/redeem`.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name for a new local account. Defaults to the login name\nas typed.",
+            "example": "Nina"
+          },
+          "login": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The login name for a new local account. Signed in, it may only name\nthe caller's own account.",
+            "example": "nina"
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The password for a new local account.",
+            "example": "correct horse battery staple"
+          },
+          "token": {
+            "type": "string",
+            "description": "The token from the link's fragment.",
+            "example": "cin_q2V0..."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RedeemOutcome": {
+        "type": "string",
+        "description": "What a redeem request came to.",
+        "enum": [
+          "redeemed",
+          "sign_in"
+        ]
+      },
+      "RedeemResponse": {
+        "type": "object",
+        "description": "What `POST /invites/redeem` answers with.",
+        "required": [
+          "outcome",
+          "created"
+        ],
+        "properties": {
+          "created": {
+            "type": "boolean",
+            "description": "Whether the redemption made that account."
+          },
+          "csrf": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CSRF token of the session this answer signed a new local account\nin with."
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain the account is now a member of, if the link named one."
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MemberLevel",
+                "description": "The level it holds there now: the link's, or a higher one it held."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where to send the browser, for `sign_in`."
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/RedeemOutcome",
+            "description": "Redeemed, or a sign-in to go through first."
+          },
+          "user": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/User",
+                "description": "The account that redeemed the link, as stored, for `redeemed`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "ReflectionAssetsResponse": {
         "type": "object",
         "description": "Every file of a domain's Reflection.",
@@ -15995,6 +18635,26 @@
               "$ref": "#/components/schemas/AttachmentView"
             },
             "description": "The rows, ordered by path; `path` is inside `reflections/`\n(`assets/...`)."
+          }
+        }
+      },
+      "ReflectionChainPage": {
+        "type": "object",
+        "description": "A page a page follows, on the way up its pact chain.",
+        "required": [
+          "path",
+          "title"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/.",
+            "example": "arch/overview.md"
+          },
+          "title": {
+            "type": "string",
+            "description": "Its title.",
+            "example": "Architecture overview"
           }
         }
       },
@@ -16045,6 +18705,30 @@
           }
         }
       },
+      "ReflectionClockResponse": {
+        "type": "object",
+        "description": "What `GET /domains/{domain}/reflection/clock` answers.",
+        "properties": {
+          "checksum": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The checksum of the page file as stored, the same as a read's\n`checksum`; null for a missing page. A reconcile writes no file, so\na client that heard a change compares this with the text it holds\nand reads the page again only when they differ."
+          },
+          "clock": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionPageClock",
+                "description": "The clock; null for a page on its own with no freshness, a retired\npage and a missing one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "ReflectionCollaboratorBody": {
         "type": "object",
         "description": "`reader` reads the Reflection and comments, `contributor` also edits it. A grant only raises: an engram editor curates whatever it says.",
@@ -16071,6 +18755,73 @@
               "$ref": "#/components/schemas/ReflectionGrant"
             },
             "description": "Every collaborator, by account name."
+          }
+        }
+      },
+      "ReflectionDoc": {
+        "type": "object",
+        "description": "The answer of `GET /domains/{domain}/reflections/{path}`, as a schema:\nthe route passes the engine's answer through unchanged, and this names\nits shape for the generated client.",
+        "required": [
+          "domain",
+          "path",
+          "title",
+          "markdown",
+          "checksum",
+          "sections",
+          "threads"
+        ],
+        "properties": {
+          "checksum": {
+            "type": "string",
+            "description": "The checksum of the stored file."
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain."
+          },
+          "live": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Who has the page open in a co-editing room, while one is open."
+          },
+          "markdown": {
+            "type": "string",
+            "description": "The text answered (see the response description)."
+          },
+          "page": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionPageView",
+                "description": "What the page says about itself beside its text; absent for\n`PACT.md` and a page pact."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "The reflection's path inside reflections/."
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "The `##` sections with their ids, lines, change marks and sources."
+          },
+          "threads": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "The open threads."
+          },
+          "title": {
+            "type": "string",
+            "description": "Its title."
           }
         }
       },
@@ -16110,6 +18861,394 @@
           "reader",
           "contributor"
         ]
+      },
+      "ReflectionPactFile": {
+        "type": "object",
+        "description": "A page's own page pact file.",
+        "required": [
+          "path",
+          "exists"
+        ],
+        "properties": {
+          "exists": {
+            "type": "boolean",
+            "description": "Whether it exists. A curator creates it with a `PUT` of that path."
+          },
+          "path": {
+            "type": "string",
+            "description": "Its path inside reflections/: the page's path with `.pact.md`.",
+            "example": "arch/overview.pact.md"
+          }
+        }
+      },
+      "ReflectionPageClock": {
+        "type": "object",
+        "description": "One page's freshness clock, in seconds relative to the server's\nautomation clock (design 2.2 and 2.3).",
+        "required": [
+          "path",
+          "stale",
+          "loop_slower_than_freshness",
+          "waiting"
+        ],
+        "properties": {
+          "clock_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page whose freshness keeps this one current: the page itself,\nor for an owned page the first page up its owners that has a\nfreshness; null when none has.",
+            "example": "arch/overview.md"
+          },
+          "due_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds until a fresh page falls due; null once it is due, and for\nan owned page.",
+            "example": 3600
+          },
+          "freshness": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The freshness that keeps the page current, as written: its own, or\nfor an owned page that of `clock_of`; null when none does.",
+            "example": "1d"
+          },
+          "last_checked_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds since then, never negative.",
+            "example": 7200
+          },
+          "last_reconciled": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the page (or `clock_of`) was last reconciled, RFC 3339; the\npage's change time when no reconcile is recorded."
+          },
+          "loop_slower_than_freshness": {
+            "type": "boolean",
+            "description": "The page is overdue, reflect runs are known and none left it: the\nloop runs less often than the page's freshness."
+          },
+          "missed_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds since a reflect run of the domain that started after the\npage fell due ended without reconciling it; null while no run left\nit. Only this is warned about (the missed list, doctor)."
+          },
+          "overdue_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds since the page turned overdue, one whole period after it\nfell due; null before. Show it on the page (\"Overdue since ...\")."
+          },
+          "part_of": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionPartOf",
+                "description": "The page that owns this one; null for a page on its own."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/."
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Whether the page is due: its freshness ran out."
+          },
+          "waiting": {
+            "type": "boolean",
+            "description": "A due page that a co-editing room has open: it waits for the room."
+          }
+        }
+      },
+      "ReflectionPageFinding": {
+        "type": "object",
+        "description": "A page setting or link that did not read, and why.",
+        "required": [
+          "page",
+          "key",
+          "value",
+          "reason"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "`freshness`, `follows`, `owner` or `folder parent`.",
+            "example": "freshness"
+          },
+          "page": {
+            "type": "string",
+            "description": "The page it is about: this page, or a page up its chain.",
+            "example": "notes.md"
+          },
+          "reason": {
+            "type": "string",
+            "description": "One sentence saying why it is ignored.",
+            "example": "is shorter than the minimum of 1 hour, so it is ignored"
+          },
+          "value": {
+            "type": "string",
+            "description": "The value as written.",
+            "example": "0h"
+          }
+        }
+      },
+      "ReflectionPageRef": {
+        "type": "object",
+        "description": "A page as another page names it.",
+        "required": [
+          "path",
+          "title",
+          "exists"
+        ],
+        "properties": {
+          "exists": {
+            "type": "boolean",
+            "description": "Whether the page exists."
+          },
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/.",
+            "example": "arch/overview.md"
+          },
+          "title": {
+            "type": "string",
+            "description": "Its title; its path when the page does not exist.",
+            "example": "Architecture overview"
+          }
+        }
+      },
+      "ReflectionPageView": {
+        "type": "object",
+        "description": "What a page says about itself beside its text: the `page` member of\n`GET /domains/{domain}/reflections/{path}` for a page (never for\n`PACT.md` or a page pact), and of a settings change's receipt.",
+        "required": [
+          "chain",
+          "pacts",
+          "pact",
+          "findings"
+        ],
+        "properties": {
+          "chain": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReflectionChainPage"
+            },
+            "description": "The pages this page follows, from the top down; the last one is the\npage it follows directly. Empty when it follows only `PACT.md`."
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReflectionPageFinding"
+            },
+            "description": "What did not read, on this page or up its chain."
+          },
+          "follows": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page whose pact this page follows, as written; null when the\npage follows its owner or its folder parent."
+          },
+          "freshness": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How often the page is brought in line with its pacts, as written\n(`6h`, `1d`); null when it has none, when it does not read or is\nunder an hour (then named in `findings`), or the page is owned (it\nis reconciled with its owner).",
+            "example": "1d"
+          },
+          "owner": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionPageRef",
+                "description": "The page that owns this one: reconciling it keeps this page current."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pact": {
+            "$ref": "#/components/schemas/ReflectionPactFile",
+            "description": "The page's own page pact file."
+          },
+          "pacts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pact files that apply, in order: `PACT.md` (when it exists),\nthen the page pact of each followed page that has one, then the\npage's own.",
+            "example": [
+              "PACT.md",
+              "arch/overview.pact.md"
+            ]
+          },
+          "retired": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionRetirement",
+                "description": "Set when the page is retired (as the tree's `retired` says): hidden\nin the navigation, never reconciled, still found by search and by\nlink, and restorable."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page's `status`, as written. Any word of the retired set, as an\nengram's (`archived`, which a retire writes, `superseded`,\n`deprecated`, `legacy`; case folded), means the page is retired, and\n`retired` is set."
+          }
+        }
+      },
+      "ReflectionPartOf": {
+        "type": "object",
+        "description": "The page an owned page is part of.",
+        "required": [
+          "path",
+          "title"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The owner's path inside reflections/.",
+            "example": "arch/overview.md"
+          },
+          "title": {
+            "type": "string",
+            "description": "Its title.",
+            "example": "Architecture overview"
+          }
+        }
+      },
+      "ReflectionRetirement": {
+        "type": "object",
+        "description": "How and when a page was retired.",
+        "properties": {
+          "at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When, RFC 3339; null for a page retired only by a retired word in\nits status.",
+            "example": "2026-11-20T09:00:00Z"
+          },
+          "by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who retired it: a person's or an agent's name; null as `at` is.",
+            "example": "claude-code"
+          },
+          "was_owned_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionPageRef",
+                "description": "The page that owned it then; a restore can put it back under that\npage."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ReflectionSettingsBody": {
+        "type": "object",
+        "description": "A page's settings, the frontmatter keys only a curator changes. A key left out, or sent as null, keeps its value; an empty string (\"\") takes the key off the page; any other value sets it. At least one key.",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "follows": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page of this Reflection whose pact this page follows."
+          },
+          "freshness": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How often the page is brought in line with its pacts: `1h`, `6h`,\n`1d`, `7d`, `30d` or any span of an hour or more (`h`, `d`, `w`, `m`\nfor months of 30 days, `y`). Refused on an owned page.",
+            "example": "1d"
+          },
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/.",
+            "example": "arch/overview.md"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page's status. A retired word is refused: retire the page with\n`POST /domains/{domain}/reflection/retire`."
+          }
+        }
+      },
+      "ReflectionSettingsReceipt": {
+        "type": "object",
+        "description": "What a settings change answers: the write's receipt with the page as it\nstands now.",
+        "required": [
+          "domain",
+          "path",
+          "checksum",
+          "page"
+        ],
+        "properties": {
+          "checksum": {
+            "type": "string",
+            "description": "The checksum of the file as written."
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain."
+          },
+          "landed": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "While a co-editing room is open over the page: `live` when the room\ntook the change in, `file` when it is on disk only."
+          },
+          "page": {
+            "$ref": "#/components/schemas/ReflectionPageView",
+            "description": "The page's settings, chain, owner and retirement now."
+          },
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/."
+          },
+          "room_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "With `landed: file`: what the people in the room meet."
+          }
+        }
       },
       "RegisterBody": {
         "type": "object",
@@ -16285,6 +19424,58 @@
           }
         }
       },
+      "RestoreReflectionBody": {
+        "type": "object",
+        "description": "What `POST /domains/{domain}/reflection/restore` takes.",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page it was owned by, to put it back under that page; leave it\nout to restore it as a page of its own.",
+            "example": "arch/overview.md"
+          },
+          "path": {
+            "type": "string",
+            "description": "The retired page's path inside reflections/.",
+            "example": "arch/overview/old.md"
+          }
+        }
+      },
+      "RestoredReflection": {
+        "type": "object",
+        "description": "What a restore answers.",
+        "required": [
+          "domain",
+          "path",
+          "restored"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The domain."
+          },
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page that owns it again; null when it stands on its own."
+          },
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/."
+          },
+          "restored": {
+            "type": "boolean",
+            "description": "Always true."
+          }
+        }
+      },
       "RetireBody": {
         "type": "object",
         "description": "Guided retirement of one engram: a `status` from a fixed set, an optional close-out date, and, for `superseded`, the successor that wires the reciprocal relation pair.",
@@ -16316,6 +19507,50 @@
               "null"
             ],
             "description": "The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown."
+          }
+        }
+      },
+      "RetireReflectionBody": {
+        "type": "object",
+        "description": "What `POST /domains/{domain}/reflection/retire` takes.",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/.",
+            "example": "arch/overview/old.md"
+          }
+        }
+      },
+      "RetiredReflection": {
+        "type": "object",
+        "description": "What a retire answers.",
+        "required": [
+          "domain",
+          "path",
+          "retired"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The domain."
+          },
+          "path": {
+            "type": "string",
+            "description": "The page's path inside reflections/."
+          },
+          "retired": {
+            "type": "boolean",
+            "description": "Always true."
+          },
+          "was_owned_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The page that owned it, kept so a restore can put it back."
           }
         }
       },
@@ -16551,6 +19786,36 @@
           }
         }
       },
+      "SignInKind": {
+        "type": "string",
+        "description": "How an account signs in, worked out from what it holds, in this order: a\npassword (`password`, even when it also has links or tokens), else an\nidentity link to a sign-on provider (`oidc`), else any personal token row\n(`token_only`), else nothing of its own (`proxy`: an upstream proxy or\ntrusted header authenticates it).\n\n`proxy` and `token_only` are inferred, since nothing stores the kind: the\ntoken table has no expiry or revoked column, so any row counts, an expired\nor unused one too, and a proxy account that was later given a token shows\nas `token_only`.",
+        "enum": [
+          "password",
+          "oidc",
+          "proxy",
+          "token_only"
+        ]
+      },
+      "SortColumn": {
+        "type": "string",
+        "description": "The column `GET /users` sorts by.",
+        "enum": [
+          "name",
+          "display",
+          "role",
+          "state",
+          "last_seen",
+          "kind"
+        ]
+      },
+      "SortDir": {
+        "type": "string",
+        "description": "The direction of a sort.",
+        "enum": [
+          "asc",
+          "desc"
+        ]
+      },
       "StartGithubLinkResponse": {
         "type": "object",
         "description": "What `POST /me/github-link/start` answers: where to send the browser.",
@@ -16603,6 +19868,14 @@
             "example": "Tag Aliases"
           }
         }
+      },
+      "StateFilter": {
+        "type": "string",
+        "description": "The state a `GET /users` filter names.",
+        "enum": [
+          "active",
+          "disabled"
+        ]
       },
       "TagAliasDeclView": {
         "type": "object",
@@ -16903,6 +20176,13 @@
             "description": "Optional contact address; never used for login.",
             "example": "ada@example.com"
           },
+          "github_linked": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether a GitHub link exists for this account. Filled like `sign_in`."
+          },
           "last_seen": {
             "type": [
               "string",
@@ -16923,6 +20203,50 @@
           "role": {
             "$ref": "#/components/schemas/Role",
             "description": "What this account may do."
+          },
+          "sign_in": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SignInKind",
+                "description": "How this account signs in. Filled when one account or the account list\nis read; left out of the JSON where the account was read only to\nauthenticate a request."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "UserDetailResponse": {
+        "type": "object",
+        "description": "What `GET /users/{name}` answers with: the account, its write list and\nwhat it holds in drafts.",
+        "required": [
+          "user"
+        ],
+        "properties": {
+          "drafts": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/DraftCount"
+            },
+            "description": "What the account holds in drafts, per domain, only domains with any.\nNull when a domain's drafts could not be read. The drafts are the\nperson's own, so this route only counts them."
+          },
+          "user": {
+            "$ref": "#/components/schemas/User",
+            "description": "The account, as the list shows it."
+          },
+          "writes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The domains the account may write to, or null when it has no write\nlist and writes wherever its role and memberships allow."
           }
         }
       },
@@ -16943,15 +20267,21 @@
         "type": "object",
         "description": "What `GET /users` answers with. A wrapper rather than a bare array, matching\nthe `{\"users\": [...]}` envelope `crystalline users list --json` prints.",
         "required": [
-          "users"
+          "users",
+          "total"
         ],
         "properties": {
+          "total": {
+            "type": "integer",
+            "description": "How many accounts match the filters in all, whatever the page.",
+            "minimum": 0
+          },
           "users": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/User"
             },
-            "description": "Every account, by name."
+            "description": "The accounts of the asked page, or every matching account when no\n`limit` was given."
           }
         }
       },
@@ -17074,6 +20404,46 @@
             "example": false
           }
         }
+      },
+      "WritesBody": {
+        "type": "object",
+        "description": "The whole write list. Each entry is a domain name or a name prefix ending in one `*`; entries are trimmed and repeats count once. `null` removes the list, so the account writes wherever its role and memberships allow; an empty list is refused.",
+        "properties": {
+          "writes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The new list, or null to remove it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WritesResponse": {
+        "type": "object",
+        "description": "What both verbs on `/users/{name}/writes` answer with.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The account, as the store keys it."
+          },
+          "writes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The write list, or null when the account has none."
+          }
+        }
       }
     }
   },
@@ -17121,6 +20491,14 @@
     {
       "name": "users",
       "description": "Account management. Admin only."
+    },
+    {
+      "name": "agents",
+      "description": "The agents of the loops and their tokens. Admin only."
+    },
+    {
+      "name": "invites",
+      "description": "Invite links: made by admins, and by private domains' owners and managers where the instance allows it."
     },
     {
       "name": "settings",

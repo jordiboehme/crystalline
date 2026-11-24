@@ -150,7 +150,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Personal workstation](docs/deployment.md#personal-workstation) | The default: local folders, agents over stdio, one shared background daemon |
 | [Updating](docs/deployment.md#updating) | `crystalline update check` and `update now` per install method, signed release checksums and an opt-in daily check |
 | [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | `crystalline install claude-desktop` builds a small extension that connects Claude Desktop to the Crystalline you installed; a Desktop-only bundle with Crystalline inside exists for Mac users of Claude Desktop alone |
-| [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP with its own token |
+| [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP with its own token, and scheduled runners use agents of the loops |
 | [Web UI from the daemon](docs/deployment.md#web-ui-from-the-daemon) | The browser UI ships built into the binary, on by default at localhost - browse what your agents know with zero extra moving parts, and follow the links they hand you into it |
 | [Team server with Fluid](docs/deployment.md#team-server-with-fluid) | The scale-out variant: nginx replicas in front when one daemon port is not enough |
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
@@ -160,13 +160,13 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
 | [Team server with a GitHub App](docs/deployment.md#team-server-with-a-github-app) | An App of your own reads, pulls and shares; access to each domain follows the repository on GitHub |
 | [Reflection on a team server](docs/deployment.md#reflection-on-a-team-server) | People and agents work on a domain's Reflection on one home instance, backed up to its own branch |
-| [Loop runners](docs/deployment.md#loop-runners) | A CronJob, a `watch` process or an n8n workflow runs the reflect and evolve loops when work is due, and shares the changes as a pull request |
-| [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |
+| [Loop runners](docs/deployment.md#loop-runners) | A CronJob, a `watch` process or an n8n workflow runs the reflect and evolve loops when work is due, as an agent of the loops with a token that works only during a run, and shares the changes as a pull request |
+| [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI; agents of the loops get `cag_` tokens from `crystalline agents` |
 | [MCP clients over OAuth](docs/deployment.md#mcp-clients-over-oauth) | A hosted client such as Claude.ai signs the person in and consents once; no token is pasted |
 | [A local Crystalline with domains from shared servers](docs/deployment.md#a-local-crystalline-with-domains-from-shared-servers) | `crystalline connect` adds a server as a source; your agent sees your local domains and every server's at once, through one registration |
 | [Under a path](docs/deployment.md#under-a-path) | Share a host name: `https://example.com/crystalline` behind nginx or Caddy, with the proxy stripping the path or passing it through |
-| [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in |
-| [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet |
+| [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in, and an invite link is taken by signing in |
+| [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet; an invite link gives that person the membership it offers |
 
 ## Go deeper
 

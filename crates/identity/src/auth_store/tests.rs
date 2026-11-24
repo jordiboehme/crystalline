@@ -7219,7 +7219,7 @@ mod postgres {
         let loc = AccountsLocation::Postgres(scratch.config());
         let opts = PgSessionOptions::default();
         match AuthStore::open_at_no_migrate(&loc, &opts).await {
-            Err(AuthOpenError::Behind { found: 0, need: 1 }) => {}
+            Err(AuthOpenError::Behind { found: 0, need: 3 }) => {}
             Err(other) => panic!("{other}"),
             Ok(_) => panic!("an unmigrated schema opened"),
         }
@@ -7236,7 +7236,7 @@ mod postgres {
         match AuthStore::open_at_no_migrate(&loc, &opts).await {
             Err(AuthOpenError::TooNew {
                 found: 99,
-                known: 1,
+                known: 3,
             }) => {}
             Err(other) => panic!("{other}"),
             Ok(_) => panic!("a newer schema opened"),
@@ -7331,4 +7331,1230 @@ mod postgres {
         let other = guard.second().await;
         assert_eq!(count(&other).await, 0);
     }
+}
+
+/// The listing and the single read say how each account signs in and whether
+/// it has a GitHub link; a read made to authenticate does not look. Runs on
+/// whichever backend the suite is pointed at.
+#[tokio::test]
+async fn a_user_read_carries_the_sign_in_kind_and_the_github_link() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("pw", "Pw", None, Role::Viewer, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .provision_linked_user(
+            "https://idp.example",
+            "s1",
+            "sso",
+            None,
+            None,
+            Role::Viewer,
+            100,
+        )
+        .await
+        .unwrap();
+    store
+        .add_token_only_user("bot", "Bot", None, Role::Editor, "ci")
+        .await
+        .unwrap();
+    store.ensure_user("prox", Role::Viewer, 100).await.unwrap();
+    store
+        .link_github("pw", "github.com", 42, "pw-gh")
+        .await
+        .unwrap();
+
+    let listed = store.list_users().await.unwrap();
+    let of = |name: &str| listed.iter().find(|u| u.name == name).unwrap();
+    assert_eq!(of("pw").sign_in, Some(SignInKind::Password));
+    assert_eq!(of("sso").sign_in, Some(SignInKind::Oidc));
+    assert_eq!(of("bot").sign_in, Some(SignInKind::TokenOnly));
+    assert_eq!(of("prox").sign_in, Some(SignInKind::Proxy));
+    assert_eq!(of("pw").github_linked, Some(true));
+    assert_eq!(of("bot").github_linked, Some(false));
+
+    let one = store.user("bot").await.unwrap().unwrap();
+    assert_eq!(one.sign_in, Some(SignInKind::TokenOnly));
+    assert_eq!(one.github_linked, Some(false));
+    let session = store.create_session("pw", 60).await.unwrap();
+    let (read, _csrf) = store.session_user(&session.token).await.unwrap().unwrap();
+    assert_eq!((read.sign_in, read.github_linked), (None, None));
+}
+
+/// An agent with the default token life, created by `ada`.
+async fn add_test_agent(store: &AuthStore, name: &str) -> IssuedAgentToken {
+    store
+        .add_agent(
+            name,
+            None,
+            AgentLoops::Both,
+            "ada",
+            "",
+            AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap()
+        .1
+}
+
+/// Accounts and agents share one namespace: every account insert refuses an
+/// agent's name, and an agent is refused under an account's name, both with
+/// [`RefusalKind::NameTaken`].
+#[tokio::test]
+async fn accounts_and_agents_share_one_namespace() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("ada", "Ada", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    add_test_agent(&store, "Nightly").await;
+
+    let taken = |e: anyhow::Error| StoreRefusal::kind_of(&e) == Some(RefusalKind::NameTaken);
+    // Account first, agent second.
+    assert!(taken(
+        store
+            .add_agent("ADA", None, AgentLoops::Both, "ada", "", 86_400)
+            .await
+            .unwrap_err()
+    ));
+    // Agent first, every account path second.
+    assert!(taken(
+        store
+            .add_user("nightly", "N", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap_err()
+    ));
+    assert!(taken(
+        store
+            .add_token_only_user("nightly", "N", None, Role::Viewer, "t")
+            .await
+            .unwrap_err()
+    ));
+    assert!(taken(
+        store
+            .ensure_user_created("nightly", Role::Viewer, usize::MAX)
+            .await
+            .unwrap_err()
+    ));
+    // A single sign-on wanting the name gets the next free one instead.
+    let provisioned = store
+        .provision_linked_user(
+            "https://idp.test",
+            "sub-1",
+            "nightly",
+            None,
+            None,
+            Role::Viewer,
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.name, "nightly-2");
+    assert_eq!(store.free_name_from("nightly").await.unwrap(), "nightly-3");
+    // Another agent of the same name.
+    assert!(taken(
+        store
+            .add_agent("nightly", None, AgentLoops::Reflect, "ada", "", 86_400)
+            .await
+            .unwrap_err()
+    ));
+    // No agent shows up as an account.
+    assert!(store.user("nightly").await.unwrap().is_none());
+    assert!(
+        !store
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .any(|u| u.name == "nightly")
+    );
+}
+
+/// On a fresh instance the first admin cannot take an agent's name either.
+#[tokio::test]
+async fn the_first_admin_cannot_take_an_agents_name() {
+    let (store, _guard) = test_store().await;
+    add_test_agent(&store, "nightly").await;
+    let err = store
+        .add_first_admin("nightly", "N", "pw12345678")
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NameTaken));
+    assert_eq!(store.user_count().await.unwrap(), 0);
+}
+
+/// A token is shown once, resolves to its agent and loops, stamps
+/// `last_used`, stops resolving once revoked, and a revoked token stays
+/// listed. Removing the agent removes its tokens.
+#[tokio::test]
+async fn agent_token_lifecycle() {
+    let (store, _guard) = test_store().await;
+    let (agent, issued) = store
+        .add_agent(
+            "Nightly",
+            Some("Nightly runner"),
+            AgentLoops::Evolve,
+            "ada",
+            "first",
+            AGENT_TOKEN_DEFAULT_TTL_SECS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(agent.name, "nightly");
+    assert_eq!(agent.display, "Nightly runner");
+    assert_eq!(agent.loops, AgentLoops::Evolve);
+    assert_eq!(agent.created_by, "ada");
+    assert!(issued.token.starts_with(AGENT_TOKEN_PREFIX));
+    assert_eq!(issued.token.len(), AGENT_TOKEN_PREFIX.len() + 64);
+    assert!(!format!("{issued:?}").contains(&issued.token[4..]));
+
+    let session = store.agent_for_token(&issued.token).await.unwrap().unwrap();
+    assert_eq!(session.name, "nightly");
+    assert_eq!(session.loops, AgentLoops::Evolve);
+    assert_eq!(
+        session.scope(),
+        crate::scope::Scope::Agent {
+            name: "nightly".to_string(),
+            loops: AgentLoops::Evolve,
+            token_id: issued.id,
+            token_expires_at: issued.expires_at.clone(),
+        }
+    );
+    assert_eq!(session.token_expires_at, issued.expires_at);
+    // Never resolved as an account's token, nor an account's as an agent's.
+    assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+
+    let listed = store.agent("NIGHTLY").await.unwrap().unwrap();
+    assert_eq!(listed.tokens.len(), 1);
+    assert_eq!(listed.tokens[0].label, "first");
+    assert_eq!(listed.tokens[0].state, AgentTokenState::Live);
+    assert!(
+        listed.tokens[0].last_used.is_some(),
+        "the lookup stamped it"
+    );
+
+    assert!(
+        store
+            .revoke_agent_token("nightly", issued.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .revoke_agent_token("nightly", issued.id)
+            .await
+            .unwrap(),
+        "already revoked"
+    );
+    assert!(!store.revoke_agent_token("other", issued.id).await.unwrap());
+    assert!(
+        store
+            .agent_for_token(&issued.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let listed = store.agent("nightly").await.unwrap().unwrap();
+    assert_eq!(listed.tokens[0].state, AgentTokenState::Revoked);
+    assert!(listed.tokens[0].revoked_at.is_some());
+
+    let second = store
+        .issue_agent_token("nightly", "second", 86_400)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .agent_for_token(&second.token)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store.remove_agent("nightly").await.unwrap();
+    assert!(
+        store
+            .agent_for_token(&second.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.agents().await.unwrap().is_empty());
+    let err = store.remove_agent("nightly").await.unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NoSuchAgent));
+    let err = store
+        .issue_agent_token("nightly", "", 86_400)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NoSuchAgent));
+}
+
+/// A token stops resolving when its time is up, and the listing says so.
+/// The life is checked: one day to a year.
+#[tokio::test]
+async fn agent_tokens_expire() {
+    let (store, _guard) = test_store().await;
+    let long_ago = crystalline_core::time::Stamp::from_unix(1_700_000_000, 0).unwrap();
+    let (_, old) = store
+        .add_agent_at(
+            "nightly",
+            None,
+            AgentLoops::Both,
+            "ada",
+            "",
+            AGENT_TOKEN_DEFAULT_TTL_SECS,
+            long_ago,
+        )
+        .await
+        .unwrap();
+    assert!(old.label.starts_with("issued 2023-11-14"), "{}", old.label);
+    assert!(
+        store
+            .agent_for_token_at(&old.token, long_ago)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.agent_for_token(&old.token).await.unwrap().is_none());
+    let listed = store.agent("nightly").await.unwrap().unwrap();
+    assert_eq!(listed.tokens[0].state, AgentTokenState::Expired);
+
+    for bad in [0, 3_600, AGENT_TOKEN_MAX_TTL_SECS + 1] {
+        let err = store
+            .issue_agent_token("nightly", "", bad)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::InvalidTokenExpiry),
+            "{bad}"
+        );
+    }
+    assert!(
+        store
+            .issue_agent_token("nightly", "", AGENT_TOKEN_MAX_TTL_SECS)
+            .await
+            .is_ok()
+    );
+}
+
+/// The count every cap reads (the invite caps and an agent's live tokens)
+/// is an error when the answer is not a number, never a zero that would let
+/// everything through.
+#[tokio::test]
+async fn a_cap_count_that_reads_no_number_is_an_error() {
+    let (store, _guard) = test_store().await;
+    let err = store.count("SELECT NULL", vec![]).await.unwrap_err();
+    assert!(
+        format!("{err}").contains("the cap cannot be checked"),
+        "{err}"
+    );
+    assert_eq!(
+        store
+            .count("SELECT COUNT(*) FROM users", vec![])
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// At most two live tokens at once; an expired or revoked one does not
+/// count.
+#[tokio::test]
+async fn an_agent_holds_at_most_two_live_tokens() {
+    let (store, _guard) = test_store().await;
+    let first = add_test_agent(&store, "nightly").await;
+    let second = store
+        .issue_agent_token("nightly", "b", 86_400)
+        .await
+        .unwrap();
+    let err = store
+        .issue_agent_token("nightly", "c", 86_400)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::AgentTokenLimit)
+    );
+    assert!(format!("{err}").contains("crystalline agents revoke nightly"));
+    assert!(store.revoke_agent_token("nightly", first.id).await.unwrap());
+    store
+        .issue_agent_token("nightly", "c", 86_400)
+        .await
+        .unwrap();
+    // Two days on, the one-day tokens have expired and no longer count.
+    let later = crystalline_core::time::Stamp::from_unix(
+        crystalline_core::time::now().unix_seconds() + 2 * 86_400,
+        0,
+    )
+    .unwrap();
+    store
+        .issue_agent_token_at("nightly", "d", 86_400, later)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .agent_for_token(&second.token)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A disabled agent's tokens open nothing.
+#[tokio::test]
+async fn a_disabled_agents_token_resolves_to_nobody() {
+    let (store, _guard) = test_store().await;
+    let issued = add_test_agent(&store, "nightly").await;
+    store
+        .db
+        .execute(
+            "UPDATE agents SET disabled = 1 WHERE name = ?1",
+            vec![Value::Text("nightly".to_string())],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .agent_for_token(&issued.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.agent("nightly").await.unwrap().unwrap().disabled);
+}
+
+/// The orphan sweep covers agents: a token row whose agent is gone is
+/// pruned, so an agent made later under that name inherits nothing.
+#[tokio::test]
+async fn an_agent_made_again_inherits_no_orphaned_token() {
+    let (store, _guard) = test_store().await;
+    let issued = add_test_agent(&store, "nightly").await;
+    // The agent row vanishes other than through `remove_agent`.
+    store
+        .db
+        .execute(
+            "DELETE FROM agents WHERE name = ?1",
+            vec![Value::Text("nightly".to_string())],
+        )
+        .await
+        .unwrap();
+    add_test_agent(&store, "nightly").await;
+    assert!(
+        store
+            .agent_for_token(&issued.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let listed = store.agent("nightly").await.unwrap().unwrap();
+    assert_eq!(listed.tokens.len(), 1, "only the new agent's own token");
+}
+
+/// The loops are read from a list in either order.
+#[test]
+fn agent_loops_parse() {
+    assert_eq!(AgentLoops::parse("reflect"), Some(AgentLoops::Reflect));
+    assert_eq!(AgentLoops::parse("evolve"), Some(AgentLoops::Evolve));
+    assert_eq!(AgentLoops::parse("evolve, reflect"), Some(AgentLoops::Both));
+    assert_eq!(AgentLoops::parse("both"), Some(AgentLoops::Both));
+    assert_eq!(AgentLoops::parse(""), None);
+    assert_eq!(AgentLoops::parse("reflect,nap"), None);
+    assert!(AgentLoops::Both.reflect() && AgentLoops::Both.evolve());
+    assert!(!AgentLoops::Reflect.evolve() && !AgentLoops::Evolve.reflect());
+}
+
+/// What an admin's link to a domain is made of, for the invite tests.
+fn domain_invite<'a>(created_by: &'a str) -> NewInvite<'a> {
+    NewInvite {
+        role: Role::Viewer,
+        domain: Some("team"),
+        level: Some(MemberLevel::Editor),
+        label: Some("  for Bo  "),
+        local_account: false,
+        created_by,
+        ttl_secs: INVITE_DEFAULT_TTL_SECS,
+    }
+}
+
+const ROOMY: InviteLimits = InviteLimits {
+    per_creator: INVITE_PENDING_MAX_ADMIN,
+    max_users: 100,
+};
+
+/// A link is answered with its token once, listed without it, filtered by
+/// state and creator, revoked by its creator or an admin but by nobody else,
+/// and a revoked link stays listed.
+#[tokio::test]
+async fn invite_lifecycle() {
+    let (store, _guard) = test_store().await;
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    assert!(issued.token.starts_with(INVITE_TOKEN_PREFIX));
+    assert_eq!(issued.token.len(), INVITE_TOKEN_PREFIX.len() + 43);
+    assert!(
+        issued.token[4..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "URL-safe base64: {}",
+        issued.token
+    );
+    assert!(!format!("{issued:?}").contains(&issued.token[4..]));
+    let invite = &issued.invite;
+    assert_eq!(invite.role, Role::Viewer);
+    assert_eq!(invite.domain.as_deref(), Some("team"));
+    assert_eq!(invite.level, Some(MemberLevel::Editor));
+    assert_eq!(invite.label.as_deref(), Some("for Bo"));
+    assert_eq!(invite.created_by, "ada");
+    assert_eq!(invite.state, InviteState::Pending);
+    let other = store
+        .create_invite(
+            &NewInvite {
+                role: Role::None,
+                domain: None,
+                level: None,
+                label: None,
+                local_account: true,
+                created_by: "mia",
+                ttl_secs: INVITE_MIN_TTL_SECS,
+            },
+            ROOMY,
+        )
+        .await
+        .unwrap();
+    assert_ne!(other.token, issued.token);
+
+    let all = store.invites(None, None).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, other.invite.id, "newest first");
+    assert!(all[0].local_account && all[0].label.is_none());
+    let stored = &all[1];
+    assert_eq!(stored.id, invite.id);
+    assert_eq!(stored.expires_at, invite.expires_at);
+    assert_eq!(stored.created_at, invite.created_at);
+    let of_ada = store.invites(Some("ada"), None).await.unwrap();
+    assert_eq!(of_ada.len(), 1);
+    assert_eq!(of_ada[0].id, invite.id);
+
+    assert!(
+        !store.revoke_invite(invite.id, Some("mia")).await.unwrap(),
+        "not hers"
+    );
+    assert!(store.revoke_invite(invite.id, Some("ada")).await.unwrap());
+    assert!(
+        !store.revoke_invite(invite.id, None).await.unwrap(),
+        "already revoked"
+    );
+    assert!(store.revoke_invite(other.invite.id, None).await.unwrap());
+    assert!(!store.revoke_invite(9_999, None).await.unwrap());
+    let revoked = store
+        .invites(None, Some(InviteState::Revoked))
+        .await
+        .unwrap();
+    assert_eq!(revoked.len(), 2);
+    assert!(revoked.iter().all(|i| i.revoked_at.is_some()));
+    assert!(
+        store
+            .invites(None, Some(InviteState::Pending))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A link whose shape cannot work is refused before anything is written.
+#[tokio::test]
+async fn an_invite_that_cannot_work_is_refused() {
+    let (store, _guard) = test_store().await;
+    let long = "x".repeat(INVITE_LABEL_MAX_CHARS + 1);
+    let bad: Vec<NewInvite> = vec![
+        NewInvite {
+            role: Role::Admin,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            level: None,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            domain: None,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            level: Some(MemberLevel::None),
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            ttl_secs: INVITE_MIN_TTL_SECS - 1,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            ttl_secs: INVITE_MAX_TTL_SECS + 1,
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            label: Some(&long),
+            ..domain_invite("ada")
+        },
+        NewInvite {
+            label: Some("two\nlines"),
+            ..domain_invite("ada")
+        },
+    ];
+    for new in bad {
+        let err = store.create_invite(&new, ROOMY).await.unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::InvalidInvite),
+            "{new:?}: {err:#}"
+        );
+    }
+    assert!(store.invites(None, None).await.unwrap().is_empty());
+}
+
+/// A creator holds at most `per_creator` pending links, and the accounts
+/// plus every pending link stay below `max_users`. Revoked and expired links
+/// count for neither.
+#[tokio::test]
+async fn pending_invites_are_capped() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("ada", "Ada", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let two = InviteLimits {
+        per_creator: 2,
+        max_users: 100,
+    };
+    let first = store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .unwrap();
+    store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .unwrap();
+    let err = store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::InviteLimit));
+    assert!(!format!("{err}").contains("auth."), "{err}");
+    store
+        .create_invite(&domain_invite("mia"), two)
+        .await
+        .expect("another creator has her own slots");
+    assert!(store.revoke_invite(first.invite.id, None).await.unwrap());
+    store
+        .create_invite(&domain_invite("ada"), two)
+        .await
+        .expect("a revoked link frees its slot");
+
+    // One account and three pending links: a cap of 4 is full.
+    let full = InviteLimits {
+        per_creator: 50,
+        max_users: 4,
+    };
+    let err = store
+        .create_invite(&domain_invite("bo"), full)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::CapReached));
+    store
+        .create_invite(
+            &domain_invite("bo"),
+            InviteLimits {
+                max_users: 5,
+                ..full
+            },
+        )
+        .await
+        .expect("one place left");
+
+    // A link that has expired holds no place.
+    let long_ago = crystalline_core::time::Stamp::from_unix(1_700_000_000, 0).unwrap();
+    let (store, _guard) = test_store().await;
+    let old = store
+        .create_invite_at(&domain_invite("ada"), ROOMY, long_ago)
+        .await
+        .unwrap();
+    assert_eq!(old.invite.state, InviteState::Pending);
+    let listed = store.invites(None, None).await.unwrap();
+    assert_eq!(listed[0].state, InviteState::Expired);
+    store
+        .create_invite(
+            &domain_invite("ada"),
+            InviteLimits {
+                per_creator: 1,
+                max_users: 1,
+            },
+        )
+        .await
+        .expect("the expired link counts for neither cap");
+}
+
+/// A removed account's links go with it, so a name used again inherits none.
+#[tokio::test]
+async fn a_removed_accounts_invites_go_with_it() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("ada", "Ada", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .add_user("mia", "Mia", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .create_invite(&domain_invite("mia"), ROOMY)
+        .await
+        .unwrap();
+    store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    store.remove_user("mia").await.unwrap();
+    let left = store.invites(None, None).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].created_by, "ada");
+    store
+        .add_user("mia", "Mia", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    assert!(store.invites(Some("mia"), None).await.unwrap().is_empty());
+}
+
+/// Links follow their domain: a rename moves them, and a domain that goes
+/// shared or is forgotten has its pending links revoked, so a later domain
+/// of the same name inherits none that still work.
+#[tokio::test]
+async fn invite_links_follow_their_domain() {
+    let (store, _guard) = test_store().await;
+    store
+        .add_user("olga", "Olga", None, Role::Viewer, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .set_domain_visibility("team", true, "olga")
+        .await
+        .unwrap();
+    let issued = store
+        .create_invite(&domain_invite("olga"), ROOMY)
+        .await
+        .unwrap();
+    store.rename_domain("team", "crew").await.unwrap();
+    let moved = store.invites(None, None).await.unwrap();
+    assert_eq!(moved[0].domain.as_deref(), Some("crew"));
+    assert_eq!(moved[0].state, InviteState::Pending);
+
+    store
+        .set_domain_visibility("crew", false, "olga")
+        .await
+        .unwrap();
+    let shared = store.invites(None, None).await.unwrap();
+    assert_eq!(shared[0].id, issued.invite.id);
+    assert_eq!(shared[0].state, InviteState::Revoked);
+
+    store
+        .set_domain_visibility("crew", true, "olga")
+        .await
+        .unwrap();
+    let again = store
+        .create_invite(
+            &NewInvite {
+                domain: Some("crew"),
+                ..domain_invite("olga")
+            },
+            ROOMY,
+        )
+        .await
+        .unwrap();
+    store.forget_domain("crew").await.unwrap();
+    let gone = store
+        .invites(None, Some(InviteState::Pending))
+        .await
+        .unwrap();
+    assert!(gone.is_empty(), "{gone:?}");
+    let all = store.invites(None, None).await.unwrap();
+    assert!(
+        all.iter()
+            .any(|i| i.id == again.invite.id && i.state == InviteState::Revoked)
+    );
+}
+
+/// The accounts and the private domain the redemption tests start from:
+/// `ada` an admin, `olga` (viewer) owns `team` with `mona` (editor) its
+/// manager and `vera` (viewer) a viewer there, and `bo` (editor) is in no
+/// domain.
+async fn redemption_store() -> (AuthStore, crate::auth_store::db::TestGuard) {
+    let (store, guard) = test_store().await;
+    for (name, role) in [
+        ("ada", Role::Admin),
+        ("olga", Role::Viewer),
+        ("mona", Role::Editor),
+        ("vera", Role::Viewer),
+        ("bo", Role::Editor),
+    ] {
+        store
+            .add_user(name, &name.to_uppercase(), None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    store
+        .set_domain_visibility("team", true, "olga")
+        .await
+        .unwrap();
+    store
+        .upsert_domain_member("team", "mona", MemberLevel::Manager, None, "olga")
+        .await
+        .unwrap();
+    store
+        .upsert_domain_member("team", "vera", MemberLevel::Viewer, None, "olga")
+        .await
+        .unwrap();
+    (store, guard)
+}
+
+/// A manager's link: role none, `team` at `level`.
+fn manager_invite(created_by: &str, level: MemberLevel) -> NewInvite<'_> {
+    NewInvite {
+        role: Role::None,
+        level: Some(level),
+        label: None,
+        ..domain_invite(created_by)
+    }
+}
+
+fn local<'a>(name: &'a str) -> InviteRedeemer<'a> {
+    InviteRedeemer::Local {
+        name,
+        display: Some("  Nina N  "),
+        password: "pw12345678",
+    }
+}
+
+async fn level_in_team(store: &AuthStore, account: &str) -> Option<MemberLevel> {
+    store
+        .domain_members("team")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.principal == account)
+        .map(|m| m.level)
+}
+
+/// A link makes a local account with the link's role and the membership,
+/// marks itself used by that account, and works once.
+#[tokio::test]
+async fn a_link_makes_a_local_account_once() {
+    let (store, _guard) = redemption_store().await;
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    let offer = store.invite_offer(&issued.token).await.unwrap();
+    assert_eq!(offer.inviter_display, "ADA");
+    assert_eq!(offer.invite.id, issued.invite.id);
+
+    let done = store
+        .redeem_invite(&issued.token, local("Nina"), 100)
+        .await
+        .unwrap();
+    assert!(done.created);
+    assert_eq!(done.user.name, "nina");
+    assert_eq!(done.user.display, "Nina N");
+    assert_eq!(done.user.role, Role::Viewer, "the link's role");
+    assert_eq!(done.level, Some(MemberLevel::Editor));
+    assert_eq!(done.invite.state, InviteState::Used);
+    assert_eq!(done.invite.used_by.as_deref(), Some("nina"));
+    assert!(
+        store
+            .verify_password("nina", "pw12345678")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        level_in_team(&store, "nina").await,
+        Some(MemberLevel::Editor)
+    );
+    let listed = store.invites(None, Some(InviteState::Used)).await.unwrap();
+    assert_eq!(listed[0].used_by.as_deref(), Some("nina"));
+
+    let again = store
+        .redeem_invite(&issued.token, local("nora"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&again), Some(RefusalKind::InviteUsed));
+    assert!(store.user("nora").await.unwrap().is_none());
+    let offer = store.invite_offer(&issued.token).await.unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&offer), Some(RefusalKind::InviteUsed));
+}
+
+/// An existing account gets the membership only: its role stays, a higher
+/// level it holds stays, a lower one is raised, and the owner needs no row.
+#[tokio::test]
+async fn an_existing_account_gets_the_membership_raised_only() {
+    let (store, _guard) = redemption_store().await;
+    let editor_link = |by| NewInvite {
+        role: Role::Editor,
+        ..domain_invite(by)
+    };
+    // `bo` is in no domain: he joins at the link's level and keeps his own
+    // role, `none`, where the link gives `viewer`.
+    let viewer_link = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    store.set_role("bo", Role::None).await.unwrap();
+    let done = store
+        .redeem_invite(&viewer_link.token, InviteRedeemer::Account("Bo"), 100)
+        .await
+        .unwrap();
+    assert!(!done.created);
+    assert_eq!(
+        done.user.role,
+        Role::None,
+        "an existing account keeps its role"
+    );
+    assert_eq!(done.level, Some(MemberLevel::Editor));
+
+    // `mona` manages `team`: an editor link leaves her a manager.
+    let link = store
+        .create_invite(&editor_link("ada"), ROOMY)
+        .await
+        .unwrap();
+    let done = store
+        .redeem_invite(&link.token, InviteRedeemer::Account("mona"), 100)
+        .await
+        .unwrap();
+    assert_eq!(done.level, Some(MemberLevel::Manager));
+    assert_eq!(
+        level_in_team(&store, "mona").await,
+        Some(MemberLevel::Manager)
+    );
+
+    // `vera` is a viewer there: raised to editor.
+    let link = store
+        .create_invite(&editor_link("ada"), ROOMY)
+        .await
+        .unwrap();
+    store
+        .redeem_invite(&link.token, InviteRedeemer::Account("vera"), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        level_in_team(&store, "vera").await,
+        Some(MemberLevel::Editor)
+    );
+
+    // The owner holds every level and gets no row.
+    let link = store
+        .create_invite(&editor_link("ada"), ROOMY)
+        .await
+        .unwrap();
+    let done = store
+        .redeem_invite(&link.token, InviteRedeemer::Account("olga"), 100)
+        .await
+        .unwrap();
+    assert_eq!(done.level, Some(MemberLevel::Manager));
+    assert_eq!(level_in_team(&store, "olga").await, None);
+}
+
+/// Two redemptions of one link at once: exactly one wins.
+#[tokio::test]
+async fn two_redemptions_racing_leave_one_winner() {
+    let (store, _guard) = redemption_store().await;
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    let before = store.user_count().await.unwrap();
+    let (a, b) = tokio::join!(
+        store.redeem_invite(&issued.token, local("nina"), 100),
+        store.redeem_invite(&issued.token, local("nora"), 100),
+    );
+    let (won, lost) = match (a, b) {
+        (Ok(won), Err(lost)) | (Err(lost), Ok(won)) => (won, lost),
+        other => panic!("exactly one must win: {other:?}"),
+    };
+    assert_eq!(StoreRefusal::kind_of(&lost), Some(RefusalKind::InviteUsed));
+    assert_eq!(store.user_count().await.unwrap(), before + 1);
+    assert_eq!(
+        store.invites(None, None).await.unwrap()[0]
+            .used_by
+            .as_deref(),
+        Some(won.user.name.as_str())
+    );
+}
+
+/// Every refusal leaves the link as it was and writes nothing.
+#[tokio::test]
+async fn a_redemption_is_refused_for_every_way_a_link_ends() {
+    let (store, _guard) = redemption_store().await;
+    let err = store
+        .redeem_invite("cin_nobody", local("nina"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::InviteUnknown)
+    );
+    let err = store.invite_offer("cin_nobody").await.unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::InviteUnknown)
+    );
+
+    let revoked = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    store.revoke_invite(revoked.invite.id, None).await.unwrap();
+    let err = store
+        .redeem_invite(&revoked.token, local("nina"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::InviteRevoked)
+    );
+
+    let long_ago = crystalline_core::time::Stamp::from_unix(1_700_000_000, 0).unwrap();
+    let expired = store
+        .create_invite_at(&domain_invite("ada"), ROOMY, long_ago)
+        .await
+        .unwrap();
+    let err = store
+        .redeem_invite(&expired.token, local("nina"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::InviteExpired)
+    );
+    // At a moment before its expiry the same link still works.
+    store
+        .redeem_invite_at(
+            &expired.token,
+            InviteRedeemer::Account("bo"),
+            100,
+            crystalline_core::time::Stamp::from_unix(1_700_000_060, 0).unwrap(),
+        )
+        .await
+        .expect("a link redeemed inside its life");
+
+    // The cap counts the accounts: five of them fill a cap of five.
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    let err = store
+        .redeem_invite(&issued.token, local("nina"), 5)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::CapReached));
+    // An existing account is no new account: the cap does not apply.
+    store
+        .redeem_invite(&issued.token, InviteRedeemer::Account("vera"), 5)
+        .await
+        .expect("the cap counts only new accounts");
+
+    // A disabled account, a name an account or an agent holds, a link
+    // without a domain for an existing account.
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    store.set_disabled("bo", true).await.unwrap();
+    let err = store
+        .redeem_invite(&issued.token, InviteRedeemer::Account("bo"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::NoSuchAccount)
+    );
+    let err = store
+        .redeem_invite(&issued.token, local("vera"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NameTaken));
+    add_test_agent(&store, "nightly").await;
+    let err = store
+        .redeem_invite(&issued.token, local("nightly"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(StoreRefusal::kind_of(&err), Some(RefusalKind::NameTaken));
+    let no_domain = store
+        .create_invite(
+            &NewInvite {
+                domain: None,
+                level: None,
+                ..domain_invite("ada")
+            },
+            ROOMY,
+        )
+        .await
+        .unwrap();
+    let err = store
+        .redeem_invite(&no_domain.token, InviteRedeemer::Account("vera"), 100)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        StoreRefusal::kind_of(&err),
+        Some(RefusalKind::InviteNeedsNewAccount)
+    );
+    let pending = store
+        .invites(None, Some(InviteState::Pending))
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 2, "no refusal burns a link: {pending:?}");
+}
+
+/// What a link gives is checked again against its creator at redemption: a
+/// disabled creator, an admin no longer admin, a manager no longer manager.
+#[tokio::test]
+async fn a_redemption_checks_the_creator_again() {
+    let (store, _guard) = redemption_store().await;
+    let lapsed = |err: anyhow::Error| {
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::InviteCreatorLapsed),
+            "{err:#}"
+        );
+    };
+
+    // An admin's viewer link after the admin is demoted.
+    store
+        .add_user("adam", "Adam", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let admins = store
+        .create_invite(&domain_invite("adam"), ROOMY)
+        .await
+        .unwrap();
+    store.set_role("adam", Role::Editor).await.unwrap();
+    lapsed(store.invite_offer(&admins.token).await.unwrap_err());
+    lapsed(
+        store
+            .redeem_invite(&admins.token, local("nina"), 100)
+            .await
+            .unwrap_err(),
+    );
+
+    // A manager's link after she is made an editor there.
+    let managers = store
+        .create_invite(&manager_invite("mona", MemberLevel::Editor), ROOMY)
+        .await
+        .unwrap();
+    store
+        .redeem_invite(&managers.token, InviteRedeemer::Account("bo"), 100)
+        .await
+        .expect("a manager's link works while she manages");
+    let managers = store
+        .create_invite(&manager_invite("mona", MemberLevel::Editor), ROOMY)
+        .await
+        .unwrap();
+    store
+        .upsert_domain_member("team", "mona", MemberLevel::Editor, None, "olga")
+        .await
+        .unwrap();
+    lapsed(
+        store
+            .redeem_invite(&managers.token, local("nina"), 100)
+            .await
+            .unwrap_err(),
+    );
+
+    // The owner's link after the owner is disabled.
+    let owners = store
+        .create_invite(&manager_invite("olga", MemberLevel::Manager), ROOMY)
+        .await
+        .unwrap();
+    store.set_disabled("olga", true).await.unwrap();
+    lapsed(
+        store
+            .redeem_invite(&owners.token, local("nina"), 100)
+            .await
+            .unwrap_err(),
+    );
+    assert!(store.user("nina").await.unwrap().is_none());
+}
+
+/// A used link is pending again once its redemption is taken back, and only
+/// for the account that used it.
+#[tokio::test]
+async fn a_taken_back_redemption_reopens_its_link() {
+    let (store, _guard) = redemption_store().await;
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    let done = store
+        .redeem_invite(&issued.token, local("nina"), 100)
+        .await
+        .unwrap();
+    assert!(!store.reopen_invite(done.invite.id, "other").await.unwrap());
+    store.remove_user_force("nina").await.unwrap();
+    assert!(store.reopen_invite(done.invite.id, "nina").await.unwrap());
+    let link = store
+        .invites(None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == done.invite.id)
+        .unwrap();
+    assert_eq!(link.state, InviteState::Pending);
+    assert_eq!(link.used_by, None);
+    store
+        .redeem_invite(&issued.token, local("nina"), 100)
+        .await
+        .unwrap();
+}
+
+/// A sign-on identity seen for the first time gets an account with the
+/// link's role, a name of its own and the link, in the same transaction.
+#[tokio::test]
+async fn a_link_makes_a_linked_account_for_a_new_identity() {
+    let (store, _guard) = redemption_store().await;
+    let issued = store
+        .create_invite(
+            &NewInvite {
+                role: Role::Editor,
+                ..domain_invite("ada")
+            },
+            ROOMY,
+        )
+        .await
+        .unwrap();
+    let done = store
+        .redeem_invite(
+            &issued.token,
+            InviteRedeemer::Linked {
+                issuer: "https://idp.example",
+                subject: "s-1",
+                desired_name: "vera",
+                display: Some("Vera Two"),
+                email: Some("v2@example.com"),
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    assert!(done.created);
+    assert_eq!(done.user.name, "vera-2", "a taken name is uniquified");
+    assert_eq!(done.user.role, Role::Editor);
+    assert_eq!(done.user.email.as_deref(), Some("v2@example.com"));
+    let linked = store
+        .linked_user("https://idp.example", "s-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(linked.name, "vera-2");
+    assert_eq!(
+        level_in_team(&store, "vera-2").await,
+        Some(MemberLevel::Editor)
+    );
 }

@@ -103,6 +103,7 @@ async fn serve(opts: Options) -> Fixture {
             max_users: None,
             oidc: None,
             login: None,
+            invites: None,
         }),
         ..GlobalConfig::default()
     };

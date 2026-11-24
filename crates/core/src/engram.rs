@@ -42,11 +42,44 @@ pub const RECOMMENDED_STATUSES: &[&str] = &[
     "proposed",
     "idea",
     "poc",
+    "open",
     "deprecated",
     "superseded",
     "archived",
     "legacy",
 ];
+
+/// Statuses that mark knowledge as retired: an engram no longer holds, a
+/// Reflection page is retired. Exact lowercase match, the same stance as the
+/// canonical current filter; a caller holding a status as written lowercases
+/// it first.
+pub const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
+
+/// Whether a status belongs to the retired set ([`RETIRED_STATUSES`]).
+/// Exact lowercase match. Retirement is terminal: the consolidation sweep
+/// never flags a retired engram for being old, unverified or unlinked.
+pub fn is_retired_status(status: &str) -> bool {
+    RETIRED_STATUSES.contains(&status)
+}
+
+/// Statuses that mark knowledge as tentative: written down but not decided
+/// yet. A draft, a proposal, an idea, a proof of concept or an open question
+/// can be worth building on, so nothing refuses or hides it; a reader names
+/// it as tentative instead. The consolidation sweep exempts these from its
+/// lifecycle rules, because such an engram never claimed to hold. Decide
+/// membership with [`is_tentative_status`], which ignores case.
+pub const TENTATIVE_STATUSES: [&str; 5] = ["draft", "proposed", "idea", "poc", "open"];
+
+/// Whether a status belongs to the tentative set ([`TENTATIVE_STATUSES`]).
+/// Case and surrounding blanks are ignored, because a status is free form
+/// and a hand-written `Proposed` is as tentative as `proposed`; a reader that
+/// shows the status as written and one that decides by it then agree.
+pub fn is_tentative_status(status: &str) -> bool {
+    let status = status.trim();
+    TENTATIVE_STATUSES
+        .iter()
+        .any(|tentative| tentative.eq_ignore_ascii_case(status))
+}
 
 /// A parsed Engram: typed frontmatter, the verbatim body and the structured
 /// elements scanned out of the body.

@@ -78,6 +78,8 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> std::process::Output {
         let mut cmd = bin();
         isolate(&mut cmd, self.home.path());
+        // Agents need `auth.mcp` on.
+        cmd.env("CRYSTALLINE_AUTH_MCP", "true");
         cmd.args(args);
         cmd.output().unwrap()
     }
@@ -351,4 +353,120 @@ fn users_add_refuses_a_name_with_drafts_and_discard_drafts_is_the_way_out() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "a name with an account: {out:?}");
+}
+
+/// [`Fixture::new`] synced and copied to the default configuration, which
+/// `users` and `agents` read, with a draft of `actor` held in `team` (an index
+/// row and its journal file).
+fn with_a_draft_of(actor: &str) -> Fixture {
+    let fx = Fixture::new();
+    fx.ok(&["sync", "--config", fx.config.to_str().unwrap()]);
+    let config_home = if cfg!(windows) { "roaming" } else { "config" };
+    let default_config = fx
+        .home
+        .path()
+        .join(config_home)
+        .join("crystalline/config.yaml");
+    std::fs::create_dir_all(default_config.parent().unwrap()).unwrap();
+    std::fs::copy(&fx.config, &default_config).unwrap();
+    let state = crate::common::isolated_state_dir(fx.home.path());
+    let text = "---\ntype: engram\ntitle: Left\npermalink: left\ntags:\n  - team\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Left\n\nLeft behind.\n";
+    let journal = state.join("overlays/team").join(actor);
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::write(journal.join("left.md"), text).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        use crystalline_index::ReadStore;
+        use crystalline_index::Store as _;
+        let store = crystalline_index::TursoStore::open(&state.join("index.db"))
+            .await
+            .unwrap();
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        let mut record = crystalline_index::EngramRecord::from_engram(
+            &crystalline_core::parse_engram(text).unwrap(),
+            "left.md",
+            crystalline_index::FileStamp {
+                mtime: 0,
+                size: text.len() as u64,
+                sha256: "0".repeat(64),
+            },
+        );
+        record.content = text.to_string();
+        store.upsert_overlay(id, actor, &record).await.unwrap();
+    });
+    fx
+}
+
+/// The drafts `actor` holds in `team`'s index rows.
+fn drafts_held(fx: &Fixture, actor: &str) -> usize {
+    let state = crate::common::isolated_state_dir(fx.home.path());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use crystalline_index::ReadStore;
+        let store = crystalline_index::TursoStore::open(&state.join("index.db"))
+            .await
+            .unwrap();
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        store.overlay_paths(id, actor).await.unwrap().len()
+    })
+}
+
+/// `agents add` refuses a name that still holds a removed person's drafts, as
+/// `users add` does: the agent would draft under that name and its run would
+/// share them. `users discard-drafts` is the way out.
+#[test]
+fn agents_add_refuses_a_name_with_a_removed_persons_drafts() {
+    let fx = with_a_draft_of("gone-ada");
+    let err = fx.fails(&["agents", "add", "gone-ada"]);
+    assert!(err.contains("1 in team"), "{err}");
+    assert!(err.contains("removed account or agent"), "{err}");
+    assert!(!fx.ok(&["agents", "list"]).contains("gone-ada"));
+    fx.ok(&["users", "discard-drafts", "gone-ada"]);
+    let added = fx.ok(&["agents", "add", "gone-ada"]);
+    assert!(added.contains("Added agent 'gone-ada'"), "{added}");
+}
+
+/// `agents remove` ends what the agent drafted, unlike `users remove`: the
+/// draft, its journal folder and the links on it go, so the name is taken again
+/// at once.
+#[test]
+fn agents_remove_ends_the_agents_drafts_and_frees_the_name() {
+    use crystalline_service::rest::AuthStore;
+    let fx = with_a_draft_of("nightly");
+    let state = crate::common::isolated_state_dir(fx.home.path());
+    // The draft is there before the agent is made, so the add would refuse:
+    // make the agent straight in the store, as if it had drafted afterwards.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let auth = AuthStore::open(&state.join("web-auth.db")).await.unwrap();
+        auth.add_agent(
+            "nightly",
+            None,
+            crystalline_service::rest::AgentLoops::Both,
+            "cli",
+            "",
+            30 * 86_400,
+        )
+        .await
+        .unwrap();
+        auth.mint_overlay_grant("team", "left.md", "nightly", None)
+            .await
+            .unwrap();
+    });
+    assert_eq!(drafts_held(&fx, "nightly"), 1);
+    assert!(state.join("overlays/team/nightly/left.md").exists());
+
+    fx.ok(&["agents", "remove", "nightly"]);
+    assert_eq!(drafts_held(&fx, "nightly"), 0);
+    assert!(!state.join("overlays/team/nightly").exists());
+    runtime.block_on(async {
+        let auth = AuthStore::open(&state.join("web-auth.db")).await.unwrap();
+        assert!(
+            auth.overlay_grants_of("nightly", "team", "left.md")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+    let added = fx.ok(&["agents", "add", "nightly"]);
+    assert!(added.contains("Added agent 'nightly'"), "{added}");
 }
