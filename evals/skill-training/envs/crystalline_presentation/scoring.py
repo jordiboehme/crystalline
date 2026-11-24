@@ -1,8 +1,9 @@
 """Deterministic scoring for presentation tasks.
 
 The presentation benchmark asks whether an agent that works the reflect
-queue picks the right element for the shape of the content, with
-restraint, and lets the domain's PACT win over the skill's defaults. The
+queue shows the shape of the content with the right element, marks a
+status with a chip in the scheme colour, adds no decoration, and lets the
+domain's PACT win over the skill's defaults. The
 fixture workspace is ``beacon``: ``relay`` holds four engrams (a handshake
 between three parties, an irreversible purge, three transport options with
 verdicts and a one-line restart) and ``quiet`` holds the same engrams with
@@ -30,9 +31,14 @@ Classes, each reading an optional ``expect[<class>]`` object with a
   ``> [!WARNING]`` or ``> [!CAUTION]`` callout that is not folded.
 - ``table_for_comparison``: the section built from the transport engram
   has a GFM table with at least three body rows.
-- ``restraint``: the restart how-to is covered, its section (when it is
-  not shared with other engrams) has no mermaid fence and at most one
-  callout, and no page has two callouts in a row.
+- ``status_chip``: the section built from the transport engram has a
+  status chip with one of the six scheme colours, and a chip that says an
+  option is recommended is green (one that says not recommended is red).
+- ``no_decoration``: the restart how-to is covered, its section (when it
+  is not shared with other engrams) has no mermaid fence and at most one
+  callout, no page has two callouts in a row, and no page holds an element
+  without content: an empty or type-only mermaid fence, a callout with no
+  title and no body, an empty status chip or a table with no body rows.
 - ``pact_override``: a page covers the handshake, and no mermaid fence
   and no callout stands anywhere under the domain's reflections/ (the
   PACT said plain text and tables only).
@@ -76,6 +82,7 @@ STATUS_COLOURS = {"grey", "blue", "green", "yellow", "red", "purple"}
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*([^\s`]*)")
 _CALLOUT = re.compile(r"^\s*>\s*\[!([A-Za-z]+)\]([+-]?)")
 _STATUS = re.compile(r":status\[[^\]]*\](?:\{([^}]*)\})?")
+_CHIP = re.compile(r":status\[([^\]]*)\](?:\{([^}]*)\})?")
 _ID_LINE = re.compile(r"^\s*<!--\s*r:([0-9a-fA-F]+)\s*-->\s*$")
 _TABLE_DELIM = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 
@@ -169,6 +176,18 @@ def consecutive_callouts(text: str) -> bool:
     between them: blocks are separated by blank lines, and a second head
     inside one quote counts as a second callout."""
     last_was_callout = False
+    for lines in _blocks(text):
+        heads = sum(1 for ln in lines if _CALLOUT.match(ln))
+        is_callout = bool(_CALLOUT.match(lines[0]))
+        if heads > 1 or (is_callout and last_was_callout):
+            return True
+        last_was_callout = is_callout
+    return False
+
+
+def _blocks(text: str) -> list[list[str]]:
+    """The blocks of a text outside code fences, split at blank lines. A
+    fenced block shows as a single ```` ``` ```` line."""
     block: list[str] = []
     blocks: list[list[str]] = []
     for line, fence in _walk(text):
@@ -182,13 +201,44 @@ def consecutive_callouts(text: str) -> bool:
             block = []
     if block:
         blocks.append(block)
-    for lines in blocks:
-        heads = sum(1 for ln in lines if _CALLOUT.match(ln))
-        is_callout = bool(_CALLOUT.match(lines[0]))
-        if heads > 1 or (is_callout and last_was_callout):
-            return True
-        last_was_callout = is_callout
-    return False
+    return blocks
+
+
+def chips(text: str) -> list[tuple[str, str | None]]:
+    """Every status chip outside code fences as (label, colour or None)."""
+    out = []
+    for line, fence in _walk(text):
+        if fence is None:
+            for m in _CHIP.finditer(line):
+                colour = m.group(2).strip().lower() if m.group(2) is not None else None
+                out.append((m.group(1), colour))
+    return out
+
+
+def empty_elements(text: str) -> list[str]:
+    """Every element that carries no content: a mermaid fence with no
+    diagram under its type line, a callout with no title and no body, a
+    status chip with no label, and a table with no body rows."""
+    found: list[str] = []
+    for f in mermaid_fences(text):
+        if sum(1 for ln in f.lines if ln.strip()) < 2:
+            found.append(f"an empty mermaid fence ({f.first_word or 'no type'})")
+    for lines in _blocks(text):
+        heads = [i for i, ln in enumerate(lines) if _CALLOUT.match(ln)]
+        for n, i in enumerate(heads):
+            m = _CALLOUT.match(lines[i])
+            title = lines[i][m.end():].strip()
+            stop = heads[n + 1] if n + 1 < len(heads) else len(lines)
+            body = [ln.strip().lstrip(">").strip() for ln in lines[i + 1:stop]]
+            if not title and not any(body):
+                found.append(f"an empty {m.group(1).upper()} callout")
+    for label, _ in chips(text):
+        if not label.strip():
+            found.append("an empty status chip")
+    for rows in table_body_rows(text):
+        if rows == 0:
+            found.append("a table with no body rows")
+    return found
 
 
 def table_body_rows(text: str) -> list[int]:
@@ -314,7 +364,32 @@ def score_table_for_comparison(ev: Evidence, spec: dict) -> list[Check]:
     )]
 
 
-def score_restraint(ev: Evidence, spec: dict) -> list[Check]:
+def score_status_chip(ev: Evidence, spec: dict) -> list[Check]:
+    domain = str(spec.get("domain", DEFAULT_DOMAIN))
+    secs = covered_sections(ev, domain, COMPARISON)
+    if not secs:
+        return [_no_section(COMPARISON)]
+    found = [c for _, body, _ in secs for c in chips(body)]
+    coloured = [(label, colour) for label, colour in found if colour in STATUS_COLOURS]
+    wrong = sorted({
+        label.strip()
+        for label, colour in found
+        if "recommended" in label.lower()
+        and colour != ("red" if "not" in label.lower().split() else "green")
+    })
+    return [
+        (
+            bool(coloured),
+            "the transport verdicts need a status chip with a scheme colour (:status[...]{green} and so on)",
+        ),
+        (
+            not wrong,
+            f"a recommended option is green and a not recommended one red, not {wrong}",
+        ),
+    ]
+
+
+def score_no_decoration(ev: Evidence, spec: dict) -> list[Check]:
     domain = str(spec.get("domain", DEFAULT_DOMAIN))
     secs = covered_sections(ev, domain, HOWTO)
     checks: list[Check] = []
@@ -333,6 +408,11 @@ def score_restraint(ev: Evidence, spec: dict) -> list[Check]:
     checks.append((
         not any(consecutive_callouts(t) for t in pages.values()),
         "no page may hold two callouts in a row",
+    ))
+    empty = sorted({e for p, t in pages.items() if p != "PACT.md" for e in empty_elements(t)})
+    checks.append((
+        not empty,
+        f"every element carries content, never decoration: found {empty}",
     ))
     return checks
 
@@ -408,7 +488,8 @@ SCORERS: dict[str, Callable[[Evidence, dict], list[Check]]] = {
     "diagram_for_protocol": score_diagram_for_protocol,
     "callout_for_risk": score_callout_for_risk,
     "table_for_comparison": score_table_for_comparison,
-    "restraint": score_restraint,
+    "status_chip": score_status_chip,
+    "no_decoration": score_no_decoration,
     "pact_override": score_pact_override,
     "clean_dialect": score_clean_dialect,
 }
@@ -475,10 +556,16 @@ _DESCRIPTIONS = {
         "Options compared are a table: the transport section carries a "
         "table with one body row per option."
     ),
-    "restraint": (
-        "An element earns its place only when it does a job prose cannot. "
-        "The one-line restart how-to stays plain (no diagram, at most one "
-        "callout), and no page holds two callouts in a row."
+    "status_chip": (
+        "Anything with a status gets a status chip in the scheme colour: the "
+        "transport section marks each verdict with :status[...]{colour}, a "
+        "recommended option green and a not recommended one red."
+    ),
+    "no_decoration": (
+        "Every element carries content, never decoration. The one-line "
+        "restart how-to may stay short (no diagram, at most one callout), "
+        "no page holds two callouts in a row, and no page holds an empty "
+        "diagram, callout, status chip or table."
     ),
     "pact_override": (
         "The domain's PACT Presentation section says no diagrams, and the "

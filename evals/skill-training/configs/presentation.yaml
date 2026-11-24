@@ -1,8 +1,8 @@
 # Crystalline presentation benchmark, training config. Self-contained like
 # evolve.yaml. The trainable document is the presentation skill: does an
-# agent working the reflect queue pick the right element (diagram, callout,
-# table) for the shape of the content, with restraint, and let the PACT win
-# over the skill's defaults.
+# agent working the reflect queue show the shape of the content with the
+# right element (diagram, callout, table, status chip), add no decoration,
+# and let the PACT win over the skill's defaults.
 #
 # Rollouts fetch the reflect queue and write pages, so tasks get 40 turns
 # and ten minutes. Scoring is deterministic (see

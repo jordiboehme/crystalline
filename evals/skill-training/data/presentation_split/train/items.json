@@ -9,7 +9,8 @@
         "diagram_for_protocol",
         "callout_for_risk",
         "table_for_comparison",
-        "restraint",
+        "status_chip",
+        "no_decoration",
         "clean_dialect"
       ]
     }
@@ -24,7 +25,8 @@
         "diagram_for_protocol",
         "callout_for_risk",
         "table_for_comparison",
-        "restraint",
+        "status_chip",
+        "no_decoration",
         "clean_dialect"
       ]
     }
@@ -50,7 +52,8 @@
     "expect": {
       "checks": [
         "table_for_comparison",
-        "restraint",
+        "status_chip",
+        "no_decoration",
         "clean_dialect"
       ]
     }
@@ -64,7 +67,7 @@
       "checks": [
         "pact_override",
         "table_for_comparison",
-        "restraint",
+        "no_decoration",
         "clean_dialect"
       ],
       "pact_override": {
@@ -73,7 +76,7 @@
       "table_for_comparison": {
         "domain": "quiet"
       },
-      "restraint": {
+      "no_decoration": {
         "domain": "quiet"
       },
       "clean_dialect": {
@@ -91,7 +94,8 @@
         "diagram_for_protocol",
         "callout_for_risk",
         "table_for_comparison",
-        "restraint",
+        "status_chip",
+        "no_decoration",
         "clean_dialect"
       ]
     }

@@ -3,7 +3,7 @@
 Engrams and reflections are plain Markdown. Crystalline adds a few small elements on top: links between engrams, callouts, status labels, math, task items, footnotes, colour swatches and diagrams. Each one reads sensibly as raw text, so nothing is lost in a plain editor or on GitHub. This page lists every element with its raw form, when it fits and how it reads without Crystalline. Agents get the same sheet in the `crystalline-presentation` skill.
 
 > [!NOTE]
-> An element earns its place when it does a job prose cannot. A page with no callout and no diagram is often the right page.
+> An element carries content, never decoration. On a reflection page, show the shape of the content: a status as a label, a list of attributes as a table, a flow as a diagram.
 
 ## Links between engrams
 
@@ -63,7 +63,7 @@ A small coloured label in a sentence or a table cell. The colour is exactly one 
 
 `:status[...]` is the only directive. Everything else that starts with a colon, such as `10:30` or `note:this`, is ordinary text.
 
-When it fits: a verdict in a comparison table, or the state of a plan.
+When it fits: a verdict in a comparison table, the state of a step or a plan, or a section built from knowledge that is not settled yet. Reflection pages use one scheme: green for done, decided, stable or recommended; blue for in progress or in review; yellow for at risk, partial or needs attention; red for blocked, failed, not recommended or deprecated; purple for proposed, idea or draft; grey for not started, unknown or retired.
 
 On GitHub: it reads as the text `:status[In review]{blue}`.
 

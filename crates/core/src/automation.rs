@@ -719,7 +719,7 @@ mod tests {
         );
     }
 
-    /// A section built from tentative engrams says so in its text, in the
+    /// A section built from tentative engrams shows a status chip, in the
     /// update step where sections are written with their sources.
     #[test]
     fn the_reflect_prompt_names_a_section_from_tentative_engrams() {
@@ -729,9 +729,48 @@ mod tests {
             .find(|line| line.starts_with("3. Updates:"))
             .expect("the update step");
         assert!(
-            updates.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) says so in its text, for example \"proposed:\" or \"not decided yet\"."),
+            updates.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) shows a status chip, for example `:status[Proposed]{purple}`."),
             "{updates}"
         );
+    }
+
+    /// Reflection pages are read by people: every section is written and
+    /// changed with the presentation skill, read with the `skills` tool when
+    /// the harness has not loaded it, and the PACT's `## Presentation` wins
+    /// over it. The rule reads the same whether the start calls the `skills`
+    /// tool or says the skills are loaded, and neither start contradicts it.
+    #[test]
+    fn the_reflect_prompt_writes_pages_for_people_with_the_presentation_skill() {
+        for loaded in [false, true] {
+            let prompt = headless_prompt(Loop::Reflect, "work", 7, loaded);
+            let rule = prompt
+                .lines()
+                .find(|line| line.starts_with("- Reflection pages are read by people."))
+                .expect("a rule on the readers of a page");
+            for needle in [
+                "every section",
+                "`crystalline-presentation` skill (if it is not loaded, read it with the `skills` tool, name `crystalline-presentation`)",
+                "`## Presentation`",
+                "wins over the skill",
+            ] {
+                assert!(
+                    rule.contains(needle),
+                    "loaded={loaded}: the readers rule lacks {needle}: {rule}"
+                );
+            }
+            let loaded_start = "Your skills are already loaded: `crystalline-intelligence` and `crystalline-presentation`.";
+            let tool_start = "Start: call the `skills` tool with name `crystalline-intelligence` and read it, then with name `crystalline-presentation`.";
+            let (start, other) = if loaded {
+                (loaded_start, tool_start)
+            } else {
+                (tool_start, loaded_start)
+            };
+            assert!(prompt.contains(start), "loaded={loaded}: {prompt}");
+            assert!(!prompt.contains(other), "loaded={loaded}: {prompt}");
+            // The rule's fallback is conditional, so it never orders a
+            // `skills` call where the start says the skills are loaded.
+            assert!(rule.contains("if it is not loaded"), "{rule}");
+        }
     }
 
     /// A page whose freshness ran out is reconciled with its pacts (design
