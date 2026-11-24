@@ -245,10 +245,12 @@ pub const MAX_SALIENCE_BOOST: i64 = 10;
 /// clamped.
 pub const MAX_PRIORITY: u8 = 100;
 
-/// Statuses that mark knowledge as not yet asserted. These are exempt from the
-/// lifecycle rules: a draft is allowed to be stale, unverified and out of date,
-/// because it never claimed to be true in the first place.
-pub const SPECULATIVE_STATUSES: [&str; 4] = ["draft", "proposed", "idea", "poc"];
+/// Statuses that mark knowledge as not yet asserted: core's tentative list
+/// ([`crystalline_core::TENTATIVE_STATUSES`]), reachable here under the name
+/// the sweep has always used. These are exempt from the lifecycle rules: a
+/// draft is allowed to be stale, unverified and out of date, because it never
+/// claimed to be true in the first place.
+pub use crystalline_core::TENTATIVE_STATUSES as SPECULATIVE_STATUSES;
 
 /// Engram types the orphan rule never speaks about. A manifest and a schema are
 /// structural files; being unlinked is their normal shape.

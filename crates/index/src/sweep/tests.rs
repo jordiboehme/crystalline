@@ -4306,3 +4306,56 @@ fn a_model_that_could_not_load_points_at_status_rather_than_a_pass() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// The tentative status list, shared with core
+// ---------------------------------------------------------------------------
+
+/// The sweep's speculative list is core's tentative list, reached here
+/// under its old name, so the sweep and every reader agree on one set.
+#[test]
+fn the_speculative_list_is_cores_tentative_list() {
+    assert_eq!(SPECULATIVE_STATUSES, crystalline_core::TENTATIVE_STATUSES);
+    assert_eq!(
+        crate::sweep::SPECULATIVE_STATUSES,
+        ["draft", "proposed", "idea", "poc", "open"]
+    );
+}
+
+/// `open` joined the tentative list: an open engram is not asserted yet,
+/// so an elapsed review date does not draw `V002`.
+#[test]
+fn an_open_engram_draws_no_v002() {
+    let mut open = fact(1, "open-question");
+    open.status = "open".to_string();
+    open.stale_on = Some(day("2026-06-01"));
+
+    let report = detect(&input(vec![open]));
+    assert!(
+        !fired(&report).contains(&"V002"),
+        "open drew {:?}",
+        fired(&report)
+    );
+}
+
+/// `open` joined the tentative list: an open engram is no twin of a stable
+/// one that says the same thing, as a draft is not.
+#[test]
+fn an_open_engram_is_no_v301_twin() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    b.status = "open".to_string();
+
+    let report = detect(&input(vec![a, b]));
+    assert!(!fired(&report).contains(&"V301"), "{:?}", fired(&report));
+}
+
+/// The contradiction check took current engrams only before `open` joined
+/// the list, so an open engram was never a candidate and still is not.
+#[test]
+fn an_open_engram_is_no_contradiction_candidate() {
+    assert!(!crate::nli::candidates::eligible("open", None, today()));
+    assert!(crate::nli::candidates::eligible("stable", None, today()));
+}

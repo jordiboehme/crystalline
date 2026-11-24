@@ -61,6 +61,20 @@ pub fn is_retired_status(status: &str) -> bool {
     RETIRED_STATUSES.contains(&status)
 }
 
+/// Statuses that mark knowledge as tentative: written down but not decided
+/// yet. A draft, a proposal, an idea, a proof of concept or an open question
+/// can be worth building on, so nothing refuses or hides it; a reader names
+/// it as tentative instead. The consolidation sweep exempts these from its
+/// lifecycle rules, because such an engram never claimed to hold. Exact
+/// lowercase match, the same stance as [`RETIRED_STATUSES`].
+pub const TENTATIVE_STATUSES: [&str; 5] = ["draft", "proposed", "idea", "poc", "open"];
+
+/// Whether a status belongs to the tentative set ([`TENTATIVE_STATUSES`]).
+/// Exact lowercase match.
+pub fn is_tentative_status(status: &str) -> bool {
+    TENTATIVE_STATUSES.contains(&status)
+}
+
 /// A parsed Engram: typed frontmatter, the verbatim body and the structured
 /// elements scanned out of the body.
 #[derive(Debug, Clone, PartialEq, Serialize)]

@@ -80,8 +80,8 @@ pub use emit::emit_engram;
 pub use engram::{
     EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkForm, LinkTarget,
     META_KEY_MAX_BYTES, META_VALUE_MAX_BYTES, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
-    RETIRED_STATUSES, Relation, SchemaDef, Verification, Verified, WikiLink, is_retired_status,
-    meta_value_text,
+    RETIRED_STATUSES, Relation, SchemaDef, TENTATIVE_STATUSES, Verification, Verified, WikiLink,
+    is_retired_status, is_tentative_status, meta_value_text,
 };
 pub use harness::profile::{
     CommandSpelling, EntryShape, HookDialect, HostSignal, McpStyle, PathSpec, PointerStyle,
