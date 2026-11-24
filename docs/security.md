@@ -147,13 +147,13 @@ Apart from these sealed secrets, nothing is encrypted at rest. Use disk encrypti
 
 ## What a scheduled run may change
 
-A reflect or evolve run works without a person watching it. Crystalline keeps such a run within limits on the server, not only in its prompt:
+A reflect or evolve run works without a person watching it. When the server knows a session is such a run, it keeps it within limits on the server, not only in its prompt:
 
 - It reads only the domains every reader of its domain may read, and writes only into the domains it works on (see [What an unattended run may read](reflection.md#what-an-unattended-run-may-read)).
 - It never deletes a Reflection page or a page pact. It retires a page instead, and a person deletes it later in Fluid or in an attended session.
 - It never writes pact text: no create, change or overwrite of `PACT.md` or any page pact. It never moves a page that has its own page pact, and it never changes a page's `freshness` or `follows`. A curator makes these changes in Fluid or in an attended session.
 
-These limits hold for every session that is unattended: an agent of the loops, a session started with `crystalline mcp --unattended` and a session with the header `X-Crystalline-Run-Domain`. See [What an unattended run may not change](reflection.md#what-an-unattended-run-may-not-change).
+The server knows it for an agent of the loops, a session started with `crystalline mcp --unattended` and a session with a run header (`X-Crystalline-Run-Domain` or `X-Crystalline-Run-Loop`), so for every `crystalline <loop> run`. A runner that uses an account and sends no run header, such as an n8n workflow with a `cmt_` token, is kept to the last two points by its prompt only. Give such a runner an agent of the loops. See [What an unattended run may not change](reflection.md#what-an-unattended-run-may-not-change).
 
 Pact files and a page's settings are a curator's in every session. Only a curator writes, moves or deletes `PACT.md` or a page pact, changes a page's `freshness`, `follows` or a `status` that retires it, retires or restores a page, and moves or deletes a page that has a page pact. The co-editing editor never shows these keys, and a write below curate that changes them is refused (see [Who may do what](reflection.md#who-may-do-what)).
 

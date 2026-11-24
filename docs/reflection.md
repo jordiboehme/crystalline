@@ -252,7 +252,7 @@ A page is due when its last reconcile is older than its freshness. It is due als
 
 ### The `stale` item
 
-`reflect` hands a due page out as a `stale` item. A run gets it by default: an agent of the loops, a session started for a run, or a session whose loop lease limits what it reads. Any other session gets it only with `stale: true`, and `stale: false` turns it off for a run too. It never counts in the nudges and the open-item counts, and the queue of the JSON API and Fluid's Review do not show it. The item carries:
+`reflect` hands a due page out as a `stale` item. A run gets it by default: an agent of the loops, a session started for a run, or a session whose loop lease limits what it reads. Any other session gets it only with `stale: true`, and `stale: false` turns it off for a run too. It never counts in the session nudges (the routing line and the Stop hook), and the queue of the JSON API and Fluid's Review do not show it. The automation status counts it on its own (see [Run the loops on their own](automation.md#a-frequent-poll)). The item carries:
 
 - `freshness`, `last_reconciled` and `outcome` (`updated`, `unchanged`, or null when no reconcile was recorded yet);
 - `pacts`: the pact files the page follows, in the order they apply. The answer carries their texts once, in a top-level `pacts` object by domain and path;
@@ -314,7 +314,7 @@ A page is missed when a reflect run of its domain started after the page fell du
 
 ### What an unattended run may not change
 
-A run works on its own, and nobody watches what it changes. So Crystalline keeps it off what a curator decides. Here a session is unattended when it is an agent of the loops (a `cag_` token), or when it was started for a run: `crystalline mcp --unattended`, which every `crystalline reflect run` starts, or the header `X-Crystalline-Run-Domain` over HTTP. A live lease alone does not count here: the machine owner's other sessions while its run goes, an attended session limited by a lease and a person in Fluid act in person. No caller of the JSON API is unattended.
+A run works on its own, and nobody watches what it changes. So Crystalline keeps it off what a curator decides. Here a session is unattended when it is an agent of the loops (a `cag_` token), or when it was marked as a run: `crystalline mcp --unattended`, which a local `crystalline reflect run` starts, or a run header over HTTP (`X-Crystalline-Run-Domain` or `X-Crystalline-Run-Loop`), which a remote run sends. A live lease alone does not count here: the machine owner's other sessions while its run goes, an attended session limited by a lease and a person in Fluid act in person. No caller of the JSON API is unattended. A runner that uses an account and sends no run header, such as an n8n workflow with a `cmt_` token, gets these rules from the prompt only; give it an agent of the loops, or send the header.
 
 An unattended session may not:
 
