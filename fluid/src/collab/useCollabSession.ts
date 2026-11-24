@@ -62,6 +62,8 @@ function joinedUnreadableDetail(noun: string): string {
 /** What a participant's awareness state carries about them. */
 interface PresenceUser {
   name?: string;
+  /** The account's login, so a chip can name it in its tooltip. */
+  login?: string;
   color?: string;
   colorLight?: string;
   /** Set by the server on the slot it publishes for an agent working in this
@@ -80,6 +82,8 @@ export interface CollabConflict {
 
 export interface CollabParticipant {
   name: string;
+  /** The participant's login, when their client published one. */
+  login?: string;
   color: string;
   self: boolean;
   /** Whether this peer is an agent rather than a person. The strip draws it
@@ -263,6 +267,7 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
     const awareness = new Awareness(doc);
     awareness.setLocalStateField("user", {
       name: identity.current.displayName,
+      login: identity.current.account,
       ...presenceColor(identity.current.account),
     });
     const readParticipants = () => {
@@ -274,6 +279,7 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
         }
         room.push({
           name: user.name,
+          ...(user.login ? { login: user.login } : {}),
           // A participant with no color of their own still gets a chip; the
           // room's own palette is what the color usually comes from. An agent
           // is always that case: the server publishes its name and leaves the

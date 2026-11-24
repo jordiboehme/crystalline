@@ -33,6 +33,7 @@ use crystalline_identity::auth_store;
 mod account_search;
 mod agents_api;
 mod discovery;
+mod display_names;
 mod domain_path;
 mod domains;
 mod domains_admin;

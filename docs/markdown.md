@@ -165,6 +165,8 @@ On GitHub: GitHub builds its own outline from the headings.
 
 A flowchart is edited in the page, by its boxes and arrows, and a sequence diagram by its participants and messages, as **Diagrams** above says. The editor has one **Insert** menu with Callout (five kinds), Expand block, Status label, Diagram, Code block, Math and Footnote; Table and Task list have their own buttons. Type `/` at the start of an empty line to open every element at the caret, the table and the task list included, and filter it as you type. It does not open inside a quote or an HTML comment. Escape closes it, and so does a space right after the `/`; a query with no match closes it too. The `/` stays in the text.
 
+In a paragraph, Enter starts a new paragraph: it writes a blank line, so the page shows the text as the editor does. Shift+Enter starts a new line in the same paragraph: it writes a backslash at the end of the line, which the editor shows faded. In a list item or a quote Enter continues the list or the quote. In Raw, Enter writes one line break, which the reading page and GitHub join with the next line.
+
 In a list item, Tab moves the item under the item before it and Shift+Tab moves it back out, with everything inside it; this works in Raw too. Anywhere else Tab moves the focus, and in a list Escape and then Tab does.
 
 In a table the arrow keys move between cells. Home and End go to the start and the end of the row, and Ctrl+Home and Ctrl+End (Cmd+Home and Cmd+End on a Mac) to the first and the last cell. On a Mac, Cmd+Up Arrow and Cmd+Down Arrow go to the first and the last row of the column. Enter or F2 opens a cell, and Shift+F10 (Ctrl+Return on a Mac) opens Cell actions.

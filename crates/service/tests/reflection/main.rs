@@ -10,6 +10,7 @@ mod assets_mcp;
 mod backup;
 mod disclosure;
 mod disk_changes;
+mod display_names;
 mod docs;
 mod fixture;
 mod guards;

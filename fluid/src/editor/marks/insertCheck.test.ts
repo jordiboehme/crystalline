@@ -156,7 +156,8 @@ describe.each([false, true])(
       const view = markView("ab**cd**", { room });
       setCaret(view, 8);
       keys(view, "Enter");
-      expect(bytes(view.state)).toBe("ab**cd**\n");
+      // A plain paragraph: Enter writes a new paragraph.
+      expect(bytes(view.state)).toBe("ab**cd**\n\n");
       undoOnce(view);
       expect(bytes(view.state)).toBe("ab**cd**");
     });
@@ -243,7 +244,8 @@ const ENTER: [string, string, number | "end", string][] = [
   ["a task, at its text start", "- [ ] **ab**", 6, "- [ ] \n- [ ] **ab**"],
   ["a quoted item, at its end", "> - **a**", "end", "> - **a**\n> - "],
   ["a quoted item, at its text start", "> - **ab**", 4, "> - \n> - **ab**"],
-  ["a plain line, at its end", "**ab**", "end", "**ab**\n"],
+  // A plain paragraph: a new paragraph at its end, one break at its start.
+  ["a plain line, at its end", "**ab**", "end", "**ab**\n\n"],
   ["a plain line, at its start", "**ab**", 0, "\n**ab**"],
   ["a heading, at its end", "## **h**", "end", "## **h**\n"],
 ];
@@ -275,11 +277,12 @@ describe.each(
   ),
 )("Enter at the end of a format, $mode mode, room $room", ({ mode, room }) => {
   it.each([
-    ["*a word* z", 7, "*a word*\n z"],
-    ["_a word_ z", 7, "_a word_\n z"],
-    ["**a word** z", 8, "**a word**\n z"],
-    ["~~a word~~ z", 8, "~~a word~~\n z"],
-    ["x *a word*", 9, "x *a word*\n"],
+    // A plain paragraph is split into two (a blank line between them).
+    ["*a word* z", 7, "*a word*\n\n z"],
+    ["_a word_ z", 7, "_a word_\n\n z"],
+    ["**a word** z", 8, "**a word**\n\n z"],
+    ["~~a word~~ z", 8, "~~a word~~\n\n z"],
+    ["x *a word*", 9, "x *a word*\n\n"],
     ["- *a word* z", 9, "- *a word*\n-  z"],
   ])("%j, Enter at %i", (text, at, want) => {
     const view = markView(text, { mode, room });
@@ -350,15 +353,19 @@ describe.each([false, true])(
   },
 );
 
-/** The same places in hidden mode keep the bytes they kept before (P48). */
+/**
+ * The same places in hidden mode: the caret stands after the link, where
+ * Enter in a paragraph writes a new paragraph, or inside the autolink or the
+ * code, where a break is written as it lands (P48).
+ */
 describe.each([false, true])(
   "Enter inside link syntax, hidden mode, room %s",
   (room) => {
     it.each([
-      ['a [x](u "ti tle") b', 11, 'a [x](u "ti tle")\nb'],
-      ['a ![x](p.png "ti tle") b', 16, 'a ![x](p.png "ti tle")\nb'],
-      ["a [x](<u v>) b", 8, "a [x](<u v>)\nb"],
-      ['a [x](u "t  e") b', 10, 'a [x](u "t  e")\nb'],
+      ['a [x](u "ti tle") b', 11, 'a [x](u "ti tle")\n\nb'],
+      ['a ![x](p.png "ti tle") b', 16, 'a ![x](p.png "ti tle")\n\nb'],
+      ["a [x](<u v>) b", 8, "a [x](<u v>)\n\nb"],
+      ['a [x](u "t  e") b', 10, 'a [x](u "t  e")\n\nb'],
       ["a <https://x.y> b", 9, "a <https:\n//x.y> b"],
       ["a `co de` b", 5, "a `co\nde` b"],
       ["a ``co de`` b", 6, "a ``co\nde`` b"],
@@ -409,10 +416,10 @@ describe.each([false, true])(
   "Enter between touching formats, room %s",
   (room) => {
     it.each([
-      ["**a***b*", "a", "**a**\n*b*"],
-      ["**a**_b_", "a", "**a**\n_b_"],
-      ["*a***b**", "a", "*a*\n**b**"],
-      ["**a***b*", "b", "**a**\n*b*"],
+      ["**a***b*", "a", "**a**\n\n*b*"],
+      ["**a**_b_", "a", "**a**\n\n_b_"],
+      ["*a***b**", "a", "*a*\n\n**b**"],
+      ["**a***b*", "b", "**a**\n\n*b*"],
     ])("%s, Enter at %s's edge", (text, letter, want) => {
       const view = markView(text, { room });
       const at = text.indexOf(letter);

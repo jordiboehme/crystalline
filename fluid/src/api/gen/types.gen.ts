@@ -48,6 +48,11 @@ export type AcceptedDraft = {
      */
     owner: string;
     /**
+     * The display name of `owner`, when that account has one other than its
+     * login; absent otherwise.
+     */
+    owner_display?: string | null;
+    /**
      * The domain-relative path it stands at.
      */
     path: string;
@@ -840,6 +845,12 @@ export type DiscloseReflectionBody = {
  */
 export type DomainChanged = {
     actor?: string | null;
+    /**
+     * The display name of `actor`, when the actor is an account with one
+     * other than its login; added as the frame is written, absent
+     * otherwise.
+     */
+    actor_display?: string | null;
     domain: string;
 };
 
@@ -866,6 +877,11 @@ export type DomainMember = {
      * The member's login name, folded by [`normalize_account_name`].
      */
     principal: string;
+    /**
+     * The display name of `principal`, when that account has one other than
+     * its login; absent otherwise. The route adds it as it answers.
+     */
+    principal_display?: string | null;
     /**
      * The Reflection level on this domain.
      */
@@ -1061,6 +1077,12 @@ export type EngramChanged = {
      * found on disk and for a write nobody signed.
      */
     actor?: string | null;
+    /**
+     * The display name of `actor`, when the actor is an account with one
+     * other than its login; added as the frame is written, absent
+     * otherwise.
+     */
+    actor_display?: string | null;
     /**
      * Lowercase hex SHA-256 of the new content, the value every write
      * receipt reports as `checksum`. Absent for `deleted`.
@@ -1302,6 +1324,11 @@ export type GithubPerson = {
      */
     account?: string | null;
     /**
+     * The display name of `account`, when that account has one other than
+     * its login; absent otherwise. The route adds it as it answers.
+     */
+    account_display?: string | null;
+    /**
      * Their role on the repository: `admin`, `maintain`, `write`,
      * `triage` or `read`.
      */
@@ -1409,6 +1436,11 @@ export type IdentityLink = {
      */
     linked_by: string;
     /**
+     * The display name of `linked_by`, when that account has one other than
+     * its login; absent otherwise. The route adds it as it answers.
+     */
+    linked_by_display?: string | null;
+    /**
      * The provider's stable identifier for the person.
      */
     subject: string;
@@ -1442,6 +1474,11 @@ export type Invite = {
      * The account that made it.
      */
     created_by: string;
+    /**
+     * The display name of `created_by`, when that account has one other than
+     * its login; absent otherwise. The route adds it as it answers.
+     */
+    created_by_display?: string | null;
     /**
      * The private domain the link gives membership of, if any.
      */
@@ -1484,6 +1521,11 @@ export type Invite = {
      * The account that used it, or `None`.
      */
     used_by?: string | null;
+    /**
+     * The display name of `used_by`, when that account has one other than
+     * its login; absent otherwise. The route adds it as it answers.
+     */
+    used_by_display?: string | null;
 };
 
 /**
@@ -1628,6 +1670,11 @@ export type KeptTextEntry = {
      * apart: the shown name is not proof of who sent it, the account is.
      */
     sender_account?: string | null;
+    /**
+     * The display name of `sender_account`, when that account has one other
+     * than its login; absent otherwise.
+     */
+    sender_display?: string | null;
 };
 
 /**
@@ -2156,6 +2203,14 @@ export type MembersResponse = {
      */
     owner?: string | null;
     /**
+     * The display name of `owner`, when that account has one other than its
+     * login; absent otherwise. Every account name in this answer carries
+     * one the same way: `principal_display` beside a member's and an
+     * overridden row's `principal`, `account_display` beside a GitHub
+     * person's and a Reflection collaborator's `account`.
+     */
+    owner_display?: string | null;
+    /**
      * The Reflection collaborators of a domain kept as files, for a caller
      * with manager access; `null` for everybody else and on a domain kept
      * in the database.
@@ -2463,6 +2518,11 @@ export type OverlayGrant = {
      */
     grantee?: string | null;
     /**
+     * The display name of `grantee`, when that account has one other than
+     * its login; absent otherwise. Added by the listing route.
+     */
+    grantee_display?: string | null;
+    /**
      * The row id, which is what revokes this link.
      */
     id: number;
@@ -2766,6 +2826,12 @@ export type ReflectionChanged = {
      * change found on disk.
      */
     actor?: string | null;
+    /**
+     * The display name of `actor`, when the actor is an account with one
+     * other than its login; added as the frame is written, absent
+     * otherwise.
+     */
+    actor_display?: string | null;
     domain: string;
     /**
      * `moved`, and `files` on a move: the path before.
@@ -2871,6 +2937,11 @@ export type ReflectionGrant = {
      * The account's login name, folded.
      */
     account: string;
+    /**
+     * The display name of `account`, when that account has one other than
+     * its login; absent otherwise. The route adds it as it answers.
+     */
+    account_display?: string | null;
     /**
      * RFC 3339, when this grant was last written.
      */
@@ -5417,7 +5488,7 @@ export type GetDomainDraftsError = GetDomainDraftsErrors[keyof GetDomainDraftsEr
 
 export type GetDomainDraftsResponses = {
     /**
-     * Every actor holding drafts here, by name and count, ordered by actor. Empty when nobody is.
+     * Every actor holding drafts here, by name and count, ordered by actor. Empty when nobody is. `actor_display` is the account's display name, absent when it has none other than its login.
      */
     200: {
         [key: string]: unknown;
@@ -5825,7 +5896,7 @@ export type GetEngramResponses = {
     /**
      * The engine's own read payload, unchanged.
      *
-     * On a domain that reviews changes a read answers the caller's own draft of the page where they hold one, and `draft` is true. At a path a draft share-link was minted on, the grantee's read answers the author's draft instead, with `draft` true and `draft_owner` naming them: a draft standing where the team's page stands must never be mistaken for that page, so a client shows whose work it is. Both keys are absent on every ordinary read.
+     * On a domain that reviews changes a read answers the caller's own draft of the page where they hold one, and `draft` is true. At a path a draft share-link was minted on, the grantee's read answers the author's draft instead, with `draft` true and `draft_owner` naming them: a draft standing where the team's page stands must never be mistaken for that page, so a client shows whose work it is. Both keys are absent on every ordinary read. `draft_owner_display` is the draft owner's display name and `actor_display` maps each person's actor (`human:<login>`) in the frontmatter's `generated.by` and `verified[].by` to theirs; each is absent when no such name has a display name other than its login.
      */
     200: {
         [key: string]: unknown;
@@ -7428,7 +7499,7 @@ export type GetReflectQueueError = GetReflectQueueErrors[keyof GetReflectQueueEr
 
 export type GetReflectQueueResponses = {
     /**
-     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact. A `page_pact_changed` item (a page pact on the page's chain changed, or its stored pact hash no longer matches) carries `pacts`, `chain`, `pact_hash_changed` and `diff`; an `owner_gone` item carries `owner`, `owner_is` (`missing` or `retired`) and `hint`; `link_retired` and `link_broken` (per section) carry `links`, the pages it links that are retired or gone. `stale` items (a page whose freshness ran out) are a run's and never in this queue.
+     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact. A `page_pact_changed` item (a page pact on the page's chain changed, or its stored pact hash no longer matches) carries `pacts`, `chain`, `pact_hash_changed` and `diff`; an `owner_gone` item carries `owner`, `owner_is` (`missing` or `retired`) and `hint`; `link_retired` and `link_broken` (per section) carry `links`, the pages it links that are retired or gone. `stale` items (a page whose freshness ran out) are a run's and never in this queue. `changed_by_display` maps each login in an item's `changed_by` that has a display name other than itself to that name; absent when none has.
      */
     200: {
         [key: string]: unknown;
@@ -7742,7 +7813,7 @@ export type ListReflectionThreadsError = ListReflectionThreadsErrors[keyof ListR
 
 export type ListReflectionThreadsResponses = {
     /**
-     * `{ threads: [ThreadView] }`, oldest first. A thread's `anchor.section` is the section's id, or its heading text for a heading with no id yet; `anchor.state` is `found`, `text_changed` or `section_gone`; `waiting_on` is `agent` when the last entry is a person's and `people` when it is an agent's; `age_secs` counts from the last entry.
+     * `{ threads: [ThreadView] }`, oldest first. A thread's `anchor.section` is the section's id, or its heading text for a heading with no id yet; `anchor.state` is `found`, `text_changed` or `section_gone`; `waiting_on` is `agent` when the last entry is a person's and `people` when it is an agent's; `age_secs` counts from the last entry. A person's `author` carries `display`, the account's display name, when it has one other than its login.
      */
     200: {
         [key: string]: unknown;
@@ -7972,7 +8043,7 @@ export type GetReflectionError = GetReflectionErrors[keyof GetReflectionErrors];
 
 export type GetReflectionResponses = {
     /**
-     * ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source it can check carries the engram's `status` as written (a `draft`, `proposed`, `idea`, `poc` or `open` engram is tentative); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.
+     * ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source it can check carries the engram's `status` as written (a `draft`, `proposed`, `idea`, `poc` or `open` engram is tentative); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. A section's `disclosed.by_display` and a thread entry's `author.display` are the account's display name, present when it has one other than its login. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.
      */
     200: ReflectionDoc;
 };
@@ -8258,7 +8329,7 @@ export type SetDomainReviewModeError = SetDomainReviewModeErrors[keyof SetDomain
 
 export type SetDomainReviewModeResponses = {
     /**
-     * The plan, for a `direct` body with no `folds` key (`applied` false), or what the change did: `folded` and `discarded` per actor, `rooms_closed` for the co-editing rooms it ended, and `review` naming the mode the domain is in now.
+     * The plan, for a `direct` body with no `folds` key (`applied` false), or what the change did: `folded` and `discarded` per actor, `rooms_closed` for the co-editing rooms it ended, and `review` naming the mode the domain is in now. Beside an `actor` that is an account with a display name other than its login stands `actor_display`, and beside a list of names `actors` (`contested_paths`, `contested_addresses`) stands `actors_display`, a map from login to display name.
      */
     200: {
         [key: string]: unknown;
@@ -8308,7 +8379,7 @@ export type GetDomainSyncStatusResponses = {
      *
      * `kept_branches` lists share branches Crystalline keeps upstream instead of deleting them: a merged, declined or withdrawn share's branch that an open pull request is based on or comes from, one whose pull request cannot move because the target branch no longer exists, one GitHub refused to delete and a declined or withdrawn share's branch that a waiting move still needs. Each entry carries `branch`, `number`, `onto`, `why` (`merged`, `declined` or `withdrawn`), `kind` (`base`, `head`, `target_gone`, `delete_refused` or `awaited`), `blocked_by` (the pull request in the way, null when the open pull requests could not be listed or the delete was refused), `reason` (the forge's answer, null when there is none) and `message`, the sentence to show. Always present, empty when nothing is kept.
      *
-     * On a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.
+     * On a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's (with `actor_display`, the account's display name, when it has one other than its login), and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.
      */
     200: {
         [key: string]: unknown;

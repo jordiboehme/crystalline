@@ -16,7 +16,12 @@ import { useState } from "react";
 
 import { problemDetail } from "../api/client";
 import type { KeptTextEntry } from "../api/kept";
-import { fetchKeptText, keptFrom, keptTextKey } from "../api/kept";
+import {
+  fetchKeptText,
+  keptFrom,
+  keptSenderLogin,
+  keptTextKey,
+} from "../api/kept";
 import { formatInstant } from "../format";
 import { Loading } from "./Loading";
 import { useSaid } from "./useSaid";
@@ -69,7 +74,12 @@ export function KeptTextDialog({
             <span className="font-mono">{entry.path}</span>
             {", "}
             {formatInstant(entry.kept_at)}
-            {from !== null && `. ${from}`}
+            {from !== null && (
+              <>
+                {". "}
+                <span title={keptSenderLogin(entry)}>{from}</span>
+              </>
+            )}
           </Dialog.Description>
           {text.isPending ? (
             <Loading compact label="Loading the kept text" />

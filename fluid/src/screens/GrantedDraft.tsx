@@ -39,6 +39,7 @@ import {
   saveJoinedDraft,
 } from "../api/draftLinks";
 import type { AcceptedDraft } from "../api/model";
+import { personLabel } from "../people";
 
 /**
  * Whether a held join is a join to THIS draft.
@@ -126,6 +127,7 @@ export default function GrantedDraft(): ReactElement {
           domain: opened.domain,
           path: opened.path,
           owner: opened.owner,
+          ownerDisplay: opened.owner_display ?? null,
           permalink: opened.permalink,
         });
       }
@@ -183,7 +185,9 @@ export default function GrantedDraft(): ReactElement {
         <div>
           <h1 className="text-lg font-semibold">{draft.path}</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            {draft.owner}&apos;s draft in {draft.domain}, shared with you.
+            <span title={draft.owner}>
+              {`${personLabel(draft.owner, draft.owner_display)}'s draft in ${draft.domain}, shared with you.`}
+            </span>
           </p>
         </div>
         {draft.editable && !joined && (
@@ -233,7 +237,7 @@ export default function GrantedDraft(): ReactElement {
       )}
 
       <textarea
-        aria-label={`${draft.owner}'s draft of ${draft.path}`}
+        aria-label={`${personLabel(draft.owner, draft.owner_display)}'s draft of ${draft.path}`}
         readOnly={!joined}
         value={buffer}
         onChange={(event) => {

@@ -514,7 +514,7 @@ impl Subscriber {
             Seen::No => return Step::Skip,
             Seen::Gone => return Step::End,
         }
-        let Ok(data) = envelope.change.data() else {
+        let Ok(data) = data_with_actor_display(&self.state, &envelope.change).await else {
             return Step::Skip;
         };
         Step::Send(
@@ -731,6 +731,30 @@ fn audience_admits(audience: &DomainAudience, scope: &Scope) -> bool {
         }
         (DomainAudience::Accounts(_), Scope::Anonymous | Scope::OpenTierIdentity { .. }) => false,
     }
+}
+
+/// The event's JSON, with `actor_display` beside `actor` when the actor is
+/// an account (its login, or `human:<login>`) with a display name other than
+/// its login. Resolved when the
+/// frame is written, so a rename shows on the next event.
+async fn data_with_actor_display(state: &RestState, change: &Change) -> serde_json::Result<String> {
+    let data = change.data()?;
+    let mut value: serde_json::Value = serde_json::from_str(&data)?;
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(data);
+    };
+    let Some(actor) = obj.get("actor").and_then(serde_json::Value::as_str) else {
+        return Ok(data);
+    };
+    let account = crate::display_names::actor_account(actor).to_string();
+    let Some(display) = crate::display_names::one(&state.auth, &account).await else {
+        return Ok(data);
+    };
+    obj.insert(
+        "actor_display".to_string(),
+        serde_json::Value::String(display),
+    );
+    serde_json::to_string(&value)
 }
 
 fn reset_frame() -> Event {

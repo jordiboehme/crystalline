@@ -777,9 +777,12 @@ pub async fn remove(
         (
             status = 200,
             description = "Every actor holding drafts here, by name and count, \
-                           ordered by actor. Empty when nobody is.",
+                           ordered by actor. Empty when nobody is. \
+                           `actor_display` is the account's display name, \
+                           absent when it has none other than its login.",
             body = Object,
-            example = json!({ "actors": [{ "actor": "ada", "entries": 3 }] }),
+            example = json!({ "actors": [{ "actor": "ada", "entries": 3,
+                "actor_display": "Ada Lovelace" }] }),
         ),
         (
             status = 401,
@@ -814,12 +817,12 @@ pub async fn drafts(
     // log in (401) rather than that it is forbidden (403).
     identity.require_account()?;
     // No refuse_read_only: a read, like the sync status beside it.
-    Ok(Json(
-        state
-            .engine
-            .domain_drafts(&domain, &identity.scope())
-            .await?,
-    ))
+    let mut answer = state
+        .engine
+        .domain_drafts(&domain, &identity.scope())
+        .await?;
+    super::display_names::enrich_actors(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 /// One domain's entry out of an aggregate origin report.
@@ -996,7 +999,9 @@ fn single_domain(
                            nothing is kept.\n\nOn a domain that reviews changes \
                            three more keys say where the drafts stand. \
                            `my_drafts` counts this account's own draft \
-                           changes, `drafts` counts every actor's, and \
+                           changes, `drafts` counts every actor's (with \
+                           `actor_display`, the account's display name, when \
+                           it has one other than its login), and \
                            `out_of_band` names the changed files in the folder \
                            the team reviewed that no draft accounts for - work \
                            written past review mode, which a client surfaces \
@@ -1134,7 +1139,9 @@ pub async fn sync_status(
         );
     }
     report.insert("may_share".to_string(), Value::from(may_share));
-    Ok(Json(Value::Object(report)))
+    let mut report = Value::Object(report);
+    super::display_names::enrich_actors(&state.auth, &mut report).await;
+    Ok(Json(report))
 }
 
 /// `GET /sync` - the instance-wide sync summary: this machine's GitHub
@@ -3213,7 +3220,12 @@ pub struct ReviewBody {
                            (`applied` false), or what the change did: `folded` \
                            and `discarded` per actor, `rooms_closed` for the \
                            co-editing rooms it ended, and `review` naming the \
-                           mode the domain is in now.",
+                           mode the domain is in now. Beside an `actor` that \
+                           is an account with a display name other than its \
+                           login stands `actor_display`, and beside a list of \
+                           names `actors` (`contested_paths`, \
+                           `contested_addresses`) stands `actors_display`, a \
+                           map from login to display name.",
             body = Object,
             example = json!({
                 "domain": "eng",
@@ -3339,6 +3351,8 @@ pub async fn set_review_mode(
             EngineError::Conflict(detail) => ApiError::conflict(detail),
             other => other.into(),
         })?;
+    let mut report = report;
+    super::display_names::enrich_actors(&state.auth, &mut report).await;
     Ok(Json(report))
 }
 

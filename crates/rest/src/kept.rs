@@ -15,6 +15,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use super::auth::Identity;
+use super::display_names;
 use super::{ApiError, ApiPath, ProblemDetail, RestState, refuse_read_only};
 
 /// The anonymous viewer's answer: kept texts belong to people who write.
@@ -79,6 +80,11 @@ pub struct KeptTextEntry {
     /// apart: the shown name is not proof of who sent it, the account is.
     #[schema(example = "ada")]
     pub sender_account: Option<String>,
+    /// The display name of `sender_account`, when that account has one other
+    /// than its login; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub sender_display: Option<String>,
 }
 
 /// What `GET /domains/{domain}/kept` answers.
@@ -105,7 +111,9 @@ pub struct KeptTextResponse {
     pub text: String,
 }
 
-fn entry(kept: KeptText) -> KeptTextEntry {
+fn entry(kept: KeptText, displays: &display_names::Displays) -> KeptTextEntry {
+    let sender_display =
+        display_names::beside(kept.sender.as_ref().map(|s| s.account.as_str()), displays);
     KeptTextEntry {
         file: kept::is_file_copy(&kept),
         id: kept.id,
@@ -116,6 +124,7 @@ fn entry(kept: KeptText) -> KeptTextEntry {
         bytes: kept.bytes,
         sender_account: kept.sender.as_ref().map(|s| s.account.clone()),
         sender: kept.sender.map(|s| s.name),
+        sender_display,
     }
 }
 
@@ -185,9 +194,15 @@ pub async fn list(
 ) -> Result<Json<KeptTextsResponse>, ApiError> {
     refuse_anonymous(&state, &identity, &domain).await?;
     let kept = state.engine.kept_texts(&domain, &identity.scope()).await?;
+    let displays = display_names::lookup(
+        &state.auth,
+        kept.iter()
+            .filter_map(|k| k.sender.as_ref().map(|s| s.account.as_str())),
+    )
+    .await;
     Ok(Json(KeptTextsResponse {
         domain,
-        kept: kept.into_iter().map(entry).collect(),
+        kept: kept.into_iter().map(|k| entry(k, &displays)).collect(),
     }))
 }
 
@@ -254,9 +269,14 @@ pub async fn read(
         .kept_text(&domain, &id, &identity.scope())
         .await
         .map_err(|e| kept_error(&domain, e))?;
+    let displays = display_names::lookup(
+        &state.auth,
+        kept.sender.as_ref().map(|s| s.account.as_str()),
+    )
+    .await;
     Ok(Json(KeptTextResponse {
         domain,
-        entry: entry(kept),
+        entry: entry(kept, &displays),
         text,
     }))
 }
@@ -426,16 +446,22 @@ mod tests {
     /// neither when no sender is recorded.
     #[test]
     fn an_entry_carries_the_senders_account() {
-        let named = entry(comment(Some(Sender {
-            account: "vera".to_string(),
-            name: "Rita".to_string(),
-        })));
+        let displays = display_names::Displays::from([("vera".to_string(), "Vera V".to_string())]);
+        let named = entry(
+            comment(Some(Sender {
+                account: "vera".to_string(),
+                name: "Rita".to_string(),
+            })),
+            &displays,
+        );
+        assert_eq!(named.sender_display.as_deref(), Some("Vera V"));
         assert_eq!(named.sender.as_deref(), Some("Rita"));
         assert_eq!(named.sender_account.as_deref(), Some("vera"));
         let json = serde_json::to_value(&named).unwrap();
         assert_eq!(json["sender_account"], "vera");
 
-        let nobody = entry(comment(None));
+        let nobody = entry(comment(None), &displays);
+        assert_eq!(nobody.sender_display, None);
         assert_eq!(nobody.sender, None);
         assert_eq!(nobody.sender_account, None);
         assert!(serde_json::to_value(&nobody).unwrap()["sender_account"].is_null());

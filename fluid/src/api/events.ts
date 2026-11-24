@@ -28,6 +28,8 @@ export interface EngramChange {
   checksum: string | null;
   /** Who changed it, as a label; null for a change found on disk. */
   actor: string | null;
+  /** The display name of `actor`, when it is an account with one. */
+  actorDisplay?: string | null;
   /** Set when the change is somebody's draft: the owner's own sessions only. */
   draftOf: string | null;
 }
@@ -89,6 +91,9 @@ export function readEngramChange(value: unknown): EngramChange | null {
         : null,
     checksum: asString(record?.checksum),
     actor: asString(record?.actor),
+    ...(asString(record?.actor_display) === null
+      ? {}
+      : { actorDisplay: asString(record?.actor_display) }),
     draftOf: asString(record?.draft_of),
   };
 }

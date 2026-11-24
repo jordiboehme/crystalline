@@ -348,7 +348,13 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
                            `draft_owner` naming them: a draft standing where \
                            the team's page stands must never be mistaken for \
                            that page, so a client shows whose work it is. Both \
-                           keys are absent on every ordinary read.",
+                           keys are absent on every ordinary read. \
+                           `draft_owner_display` is the draft owner's display \
+                           name and `actor_display` maps each person's actor \
+                           (`human:<login>`) in the frontmatter's \
+                           `generated.by` and `verified[].by` to theirs; each \
+                           is absent when no such name has a display name \
+                           other than its login.",
             body = Object,
             headers(
                 ("etag" = String, description = "The quoted \
@@ -433,6 +439,7 @@ pub async fn detail(
     // validator for the same engram, which `no-cache` and the per-session
     // auth make harmless.
     let mut value = value;
+    super::display_names::enrich_engram(&state.auth, &mut value).await;
     if super::domains::reads_only(&identity) {
         value["read_only"] = serde_json::json!(true);
     }
@@ -1232,6 +1239,10 @@ pub async fn save(
                     "join_key": Value::Null,
                     "joined": receipt["joined"],
                 });
+                let mut body = body;
+                if let Some(display) = super::display_names::one(&state.auth, &join.owner).await {
+                    body["owner_display"] = Value::String(display);
+                }
                 let mut resp = (StatusCode::OK, Json(body)).into_response();
                 // Versioned the same way the detail route's own ETag is: this
                 // is still a save of an engram, and a header that meant

@@ -267,7 +267,9 @@ export function PeoplePicker({
                   pick(hit);
                 }}
               >
-                <span className="font-medium">{hit.display}</span>
+                <span className="font-medium" title={hit.name}>
+                  {hit.display}
+                </span>
                 {hit.display !== hit.name && (
                   <span className="text-caption font-mono">{hit.name}</span>
                 )}

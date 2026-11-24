@@ -2641,7 +2641,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Every actor holding drafts here, by name and count, ordered by actor. Empty when nobody is.",
+            "description": "Every actor holding drafts here, by name and count, ordered by actor. Empty when nobody is. `actor_display` is the account's display name, absent when it has none other than its login.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2651,6 +2651,7 @@
                   "actors": [
                     {
                       "actor": "ada",
+                      "actor_display": "Ada Lovelace",
                       "entries": 3
                     }
                   ]
@@ -3349,7 +3350,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's own read payload, unchanged.\n\nOn a domain that reviews changes a read answers the caller's own draft of the page where they hold one, and `draft` is true. At a path a draft share-link was minted on, the grantee's read answers the author's draft instead, with `draft` true and `draft_owner` naming them: a draft standing where the team's page stands must never be mistaken for that page, so a client shows whose work it is. Both keys are absent on every ordinary read.",
+            "description": "The engine's own read payload, unchanged.\n\nOn a domain that reviews changes a read answers the caller's own draft of the page where they hold one, and `draft` is true. At a path a draft share-link was minted on, the grantee's read answers the author's draft instead, with `draft` true and `draft_owner` naming them: a draft standing where the team's page stands must never be mistaken for that page, so a client shows whose work it is. Both keys are absent on every ordinary read. `draft_owner_display` is the draft owner's display name and `actor_display` maps each person's actor (`human:<login>`) in the frontmatter's `generated.by` and `verified[].by` to theirs; each is absent when no such name has a display name other than its login.",
             "headers": {
               "cache-control": {
                 "schema": {
@@ -6856,7 +6857,7 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact. A `page_pact_changed` item (a page pact on the page's chain changed, or its stored pact hash no longer matches) carries `pacts`, `chain`, `pact_hash_changed` and `diff`; an `owner_gone` item carries `owner`, `owner_is` (`missing` or `retired`) and `hint`; `link_retired` and `link_broken` (per section) carry `links`, the pages it links that are retired or gone. `stale` items (a page whose freshness ran out) are a run's and never in this queue.",
+            "description": "ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact. A `page_pact_changed` item (a page pact on the page's chain changed, or its stored pact hash no longer matches) carries `pacts`, `chain`, `pact_hash_changed` and `diff`; an `owner_gone` item carries `owner`, `owner_is` (`missing` or `retired`) and `hint`; `link_retired` and `link_broken` (per section) carry `links`, the pages it links that are retired or gone. `stale` items (a page whose freshness ran out) are a run's and never in this queue. `changed_by_display` maps each login in an item's `changed_by` that has a display name other than itself to that name; absent when none has.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7405,7 +7406,7 @@
           "reflection"
         ],
         "summary": "The Reflection home: what waits for review, in counts and by page.",
-        "description": "The cheap cut of the review the Reflection home draws: how many open threads wait for the agent and for people, `updates` (the review queue's `kinds.update`, counted without rendering a diff or looking up a source), `pages_to_update` (the distinct pages those updates are on; an update of no page, such as unreflected engrams or a loose file, is in `updates` only) and the open threads by page. A thread carries its id, its first quote (`null` for a whole section), who it waits on, when it was opened and the people who wrote in it, never its entries. Pages and threads come oldest first. The same rights as the review: a reader without engram rights is not counted any update about engrams that no page cites.",
+        "description": "The cheap cut of the review the Reflection home draws: how many open threads wait for the agent and for people, `updates` (the review queue's `kinds.update`, counted without rendering a diff or looking up a source), `pages_to_update` (the distinct pages those updates are on; an update of no page, such as unreflected engrams or a loose file, is in `updates` only) and the open threads by page. A thread carries its id, its first quote (`null` for a whole section), who it waits on, when it was opened and the people who wrote in it, never its entries (a person in `people` carries `display`, the account's display name, when it has one other than its login). Pages and threads come oldest first. The same rights as the review: a reader without engram rights is not counted any update about engrams that no page cites.",
         "operationId": "get_reflection_summary",
         "parameters": [
           {
@@ -7438,6 +7439,7 @@
                           "people": [
                             {
                               "agent": false,
+                              "display": "Ann Lee",
                               "name": "ann"
                             }
                           ],
@@ -7517,7 +7519,7 @@
         ],
         "responses": {
           "200": {
-            "description": "`{ threads: [ThreadView] }`, oldest first. A thread's `anchor.section` is the section's id, or its heading text for a heading with no id yet; `anchor.state` is `found`, `text_changed` or `section_gone`; `waiting_on` is `agent` when the last entry is a person's and `people` when it is an agent's; `age_secs` counts from the last entry.",
+            "description": "`{ threads: [ThreadView] }`, oldest first. A thread's `anchor.section` is the section's id, or its heading text for a heading with no id yet; `anchor.state` is `found`, `text_changed` or `section_gone`; `waiting_on` is `agent` when the last entry is a person's and `people` when it is an agent's; `age_secs` counts from the last entry. A person's `author` carries `display`, the account's display name, when it has one other than its login.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7538,6 +7540,7 @@
                           "at": "2026-09-30T10:00:00Z",
                           "author": {
                             "agent": false,
+                            "display": "Jordi",
                             "name": "jordi"
                           },
                           "kind": "comment",
@@ -7947,7 +7950,7 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source it can check carries the engram's `status` as written (a `draft`, `proposed`, `idea`, `poc` or `open` engram is tentative); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.",
+            "description": "ReflectionDoc. `markdown` is the whole file for a caller with `engrams_visible`, less the sources in its `reflection:` block that name a domain the caller may not open, and the file without that block for anyone else; `sections` (and their one-based `line`) are computed over the `markdown` answered; `checksum` is always the stored file's. `sections[].sources` is absent, not empty, without `engrams_visible`. A source's `state` is `current`, `changed`, `retired`, `missing` or `unavailable` (its domain cannot be checked here); a source it can check carries the engram's `status` as written (a `draft`, `proposed`, `idea`, `poc` or `open` engram is tentative); a source of another domain than the page's carries `domain`, the local name it is reached by here. `sections[].hidden_sources` counts the sources in a domain the caller may not open, which are never named; absent when there are none. `threads` holds the open threads; `live` is present while a co-editing room is open. A section's `disclosed.by_display` and a thread entry's `author.display` are the account's display name, present when it has one other than its login. `page` (`ReflectionPageView`, for a page, never for `PACT.md` or a page pact) holds the page's `freshness`, `follows` and `status`, its `owner`, its `retired` record, the `chain` of pages it follows with their titles, the `pacts` that apply in order, its own `pact` file and `findings` for what did not read; its clock is `GET /domains/{domain}/reflection/clock`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8647,7 +8650,7 @@
         },
         "responses": {
           "200": {
-            "description": "The plan, for a `direct` body with no `folds` key (`applied` false), or what the change did: `folded` and `discarded` per actor, `rooms_closed` for the co-editing rooms it ended, and `review` naming the mode the domain is in now.",
+            "description": "The plan, for a `direct` body with no `folds` key (`applied` false), or what the change did: `folded` and `discarded` per actor, `rooms_closed` for the co-editing rooms it ended, and `review` naming the mode the domain is in now. Beside an `actor` that is an account with a display name other than its login stands `actor_display`, and beside a list of names `actors` (`contested_paths`, `contested_addresses`) stands `actors_display`, a map from login to display name.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8764,7 +8767,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `may_share` says whether this caller may share here: on a domain GitHub governs, an account that may read the domain gets this report with `may_share` false when it may not share, so a client can say what is missing (often only a GitHub link). In `connection`, `share_identity_reason`, `owner_identity` and `agent_identity` are for an instance admin only; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch. `direct_refused` is null, or names the `branch`, the forge's `message`, `refused_at` and the `line` to show when the branch refused a direct commit made under the GitHub login this session's shares go out on; another login's refusal never shows, nor any on a domain that opens proposals. Show that line as given.\n\nFour keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.\n\n`kept_branches` lists share branches Crystalline keeps upstream instead of deleting them: a merged, declined or withdrawn share's branch that an open pull request is based on or comes from, one whose pull request cannot move because the target branch no longer exists, one GitHub refused to delete and a declined or withdrawn share's branch that a waiting move still needs. Each entry carries `branch`, `number`, `onto`, `why` (`merged`, `declined` or `withdrawn`), `kind` (`base`, `head`, `target_gone`, `delete_refused` or `awaited`), `blocked_by` (the pull request in the way, null when the open pull requests could not be listed or the delete was refused), `reason` (the forge's answer, null when there is none) and `message`, the sentence to show. Always present, empty when nothing is kept.\n\nOn a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.",
+            "description": "The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `may_share` says whether this caller may share here: on a domain GitHub governs, an account that may read the domain gets this report with `may_share` false when it may not share, so a client can say what is missing (often only a GitHub link). In `connection`, `share_identity_reason`, `owner_identity` and `agent_identity` are for an instance admin only; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch. `direct_refused` is null, or names the `branch`, the forge's `message`, `refused_at` and the `line` to show when the branch refused a direct commit made under the GitHub login this session's shares go out on; another login's refusal never shows, nor any on a domain that opens proposals. Show that line as given.\n\nFour keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.\n\n`kept_branches` lists share branches Crystalline keeps upstream instead of deleting them: a merged, declined or withdrawn share's branch that an open pull request is based on or comes from, one whose pull request cannot move because the target branch no longer exists, one GitHub refused to delete and a declined or withdrawn share's branch that a waiting move still needs. Each entry carries `branch`, `number`, `onto`, `why` (`merged`, `declined` or `withdrawn`), `kind` (`base`, `head`, `target_gone`, `delete_refused` or `awaited`), `blocked_by` (the pull request in the way, null when the open pull requests could not be listed or the delete was refused), `reason` (the forge's answer, null when there is none) and `message`, the sentence to show. Always present, empty when nothing is kept.\n\nOn a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's (with `actor_display`, the account's display name, when it has one other than its login), and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14668,6 +14671,13 @@
             "type": "string",
             "description": "Whose draft it is."
           },
+          "owner_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `owner`, when that account has one other than its\nlogin; absent otherwise."
+          },
           "path": {
             "type": "string",
             "description": "The domain-relative path it stands at."
@@ -15859,6 +15869,13 @@
               "null"
             ]
           },
+          "actor_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `actor`, when the actor is an account with one\nother than its login; added as the frame is written, absent\notherwise."
+          },
           "domain": {
             "type": "string"
           }
@@ -15890,6 +15907,14 @@
           "principal": {
             "type": "string",
             "description": "The member's login name, folded by [`normalize_account_name`]."
+          },
+          "principal_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `principal`, when that account has one other than\nits login; absent otherwise. The route adds it as it answers.",
+            "example": "Ada Lovelace"
           },
           "reflection": {
             "$ref": "#/components/schemas/ReflectionLevel",
@@ -16245,6 +16270,13 @@
               "null"
             ],
             "description": "Who made the change, as a display label. Null for a change the watcher\nfound on disk and for a write nobody signed."
+          },
+          "actor_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `actor`, when the actor is an account with one\nother than its login; added as the frame is written, absent\notherwise."
           },
           "checksum": {
             "type": [
@@ -16630,6 +16662,14 @@
             ],
             "description": "The account linked to that GitHub login here, or `null` when nobody\nhere is linked to it."
           },
+          "account_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `account`, when that account has one other than\nits login; absent otherwise. The route adds it as it answers.",
+            "example": "Ada Lovelace"
+          },
           "github_role": {
             "type": "string",
             "description": "Their role on the repository: `admin`, `maintain`, `write`,\n`triage` or `read`."
@@ -16789,6 +16829,14 @@
             "description": "Who made it: the account that linked it, an admin's name, or `jit` for\na link a first sign-in created along with its account.",
             "example": "jit"
           },
+          "linked_by_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `linked_by`, when that account has one other than\nits login; absent otherwise. The route adds it as it answers.",
+            "example": "Ada Lovelace"
+          },
           "subject": {
             "type": "string",
             "description": "The provider's stable identifier for the person.",
@@ -16839,6 +16887,14 @@
             "type": "string",
             "description": "The account that made it.",
             "example": "ada"
+          },
+          "created_by_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `created_by`, when that account has one other than\nits login; absent otherwise. The route adds it as it answers.",
+            "example": "Ada Lovelace"
           },
           "domain": {
             "type": [
@@ -16909,6 +16965,14 @@
               "null"
             ],
             "description": "The account that used it, or `None`."
+          },
+          "used_by_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `used_by`, when that account has one other than\nits login; absent otherwise. The route adds it as it answers.",
+            "example": "Bo Berg"
           }
         }
       },
@@ -17114,6 +17178,14 @@
             ],
             "description": "The account that sent it, the login name the rights match a kept\ncomment's sender on; `null` when no sender is recorded. A client\ncompares it with the signed-in account to tell its own comments\napart: the shown name is not proof of who sent it, the account is.",
             "example": "ada"
+          },
+          "sender_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `sender_account`, when that account has one other\nthan its login; absent otherwise.",
+            "example": "Ada Lovelace"
           }
         }
       },
@@ -17806,6 +17878,14 @@
             "description": "The account that owns this domain, or `null`: a shared domain has no\nowner, a private one whose owner's account was removed has none\neither, and on a domain GitHub governs the owner decides nothing.",
             "example": "ada"
           },
+          "owner_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `owner`, when that account has one other than its\nlogin; absent otherwise. Every account name in this answer carries\none the same way: `principal_display` beside a member's and an\noverridden row's `principal`, `account_display` beside a GitHub\nperson's and a Reflection collaborator's `account`.",
+            "example": "Ada Lovelace"
+          },
           "reflection_collaborators": {
             "type": [
               "array",
@@ -18242,6 +18322,14 @@
             ],
             "description": "The account this link bound itself to, or null while nobody has opened\nit yet. The first account to redeem it is that account for good.",
             "example": "bob"
+          },
+          "grantee_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `grantee`, when that account has one other than\nits login; absent otherwise. Added by the listing route.",
+            "example": "Bob Builder"
           },
           "id": {
             "type": "integer",
@@ -18697,6 +18785,13 @@
             ],
             "description": "Who made the change, as a display label; null for a link that\nfollowed, a room save with no single typist, the machine owner and a\nchange found on disk."
           },
+          "actor_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `actor`, when the actor is an account with one\nother than its login; added as the frame is written, absent\notherwise."
+          },
           "domain": {
             "type": "string"
           },
@@ -18849,6 +18944,14 @@
           "account": {
             "type": "string",
             "description": "The account's login name, folded."
+          },
+          "account_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `account`, when that account has one other than\nits login; absent otherwise. The route adds it as it answers.",
+            "example": "Ada Lovelace"
           },
           "added_at": {
             "type": "string",

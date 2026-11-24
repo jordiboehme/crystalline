@@ -24,6 +24,7 @@ import type { DomainMember, GithubPerson } from "../api/model";
 import { formatDay } from "../format";
 import { reflectionWords } from "./reflectionLevels";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { PersonName } from "./PersonName";
 
 const CAPTION = "text-caption font-semibold text-slate-500 dark:text-slate-400";
 const MUTED = "text-sm text-slate-500 dark:text-slate-400";
@@ -224,7 +225,13 @@ function PeopleOnGithub({ people }: { people: GithubPerson[] }): ReactElement {
                   <td className="px-2 py-2">{person.github_role}</td>
                   <td className="px-2 py-2">{person.level}</td>
                   <td className="px-2 py-2">
-                    {person.account ?? (
+                    {person.account != null ? (
+                      <PersonName
+                        login={person.account}
+                        display={person.account_display}
+                        withLogin
+                      />
+                    ) : (
                       <span className="text-slate-500 dark:text-slate-400">
                         Not linked
                       </span>
@@ -274,7 +281,11 @@ function Overridden({ rows }: { rows: DomainMember[] }): ReactElement {
             {rows.map((row) => (
               <tr key={row.principal} className="align-top">
                 <th scope="row" className="px-2 py-2 font-normal">
-                  {row.principal}
+                  <PersonName
+                    login={row.principal}
+                    display={row.principal_display}
+                    withLogin
+                  />
                 </th>
                 <td className="px-2 py-2">{row.level}</td>
                 <td className="px-2 py-2">

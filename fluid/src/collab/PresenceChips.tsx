@@ -21,6 +21,18 @@ import type { ReactElement } from "react";
 import { inkOn } from "./colors";
 import type { CollabParticipant } from "./useCollabSession";
 
+/**
+ * What a chip's tooltip says: the name shown, with the login beside it when
+ * the participant published one that differs, and "(you)" on your own.
+ */
+function chipTitle(one: CollabParticipant): string {
+  const named =
+    one.login !== undefined && one.login !== one.name
+      ? `${one.name} (${one.login})`
+      : one.name;
+  return one.self ? `${named} (you)` : named;
+}
+
 /** The letter an avatar shows: the name's first letter, or a dot. */
 function initialOf(name: string): string {
   const letter = /\p{L}|\p{N}/u.exec(name)?.[0];
@@ -56,7 +68,7 @@ export function PresenceChips({
           // Two people may share a display name; the position in the room's
           // own ordering is what tells those avatars apart.
           key={`${one.name}:${String(index)}`}
-          title={one.self ? `${one.name} (you)` : one.name}
+          title={chipTitle(one)}
           data-self={one.self ? "true" : undefined}
           className="relative -ml-1.5 flex size-7 items-center justify-center rounded-full text-xs font-semibold ring-2 ring-canvas first:ml-0"
           style={{ backgroundColor: one.color, color: inkOn(one.color) }}

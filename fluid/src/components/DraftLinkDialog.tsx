@@ -28,6 +28,7 @@ import {
   revokeDraftLink,
 } from "../api/draftLinks";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { personLabel } from "../people";
 
 export interface DraftLinkDialogProps {
   /** The domain the draft lives in. */
@@ -154,9 +155,9 @@ export function DraftLinkDialog({
                   key={link.id}
                   className="flex flex-wrap items-center justify-between gap-2 text-sm"
                 >
-                  <span>
+                  <span title={link.grantee ?? undefined}>
                     {link.grantee
-                      ? `Held by ${link.grantee}`
+                      ? `Held by ${personLabel(link.grantee, link.grantee_display)}`
                       : "Not opened yet"}
                   </span>
                   <button

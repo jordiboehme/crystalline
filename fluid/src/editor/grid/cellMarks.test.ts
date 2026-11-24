@@ -376,6 +376,18 @@ describe.each(ROOMS.flatMap((r) => MODES.map((mode) => ({ ...r, mode }))))(
       expect(bytes(main.state)).toBe(text);
     });
 
+    it("a plain cell keeps its Enter and Shift+Enter, not the paragraph's", () => {
+      const text = "| a | b |\n| - | - |\n| 1 | 2 |\n";
+      const main = page(text, { room, mode });
+      const cell = open(main, 0, 0, "end");
+      expect(keys(cell, "Enter")).toBe(true);
+      expect(place(main)).toEqual([1, 0]);
+      expect(bytes(main.state)).toBe(text);
+      const again = open(main, 1, 0, "end");
+      expect(keys(again, "Shift-Enter")).toBe(true);
+      expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1<br> | 2 |\n");
+    });
+
     it("a setting flip switches the open cell in place", () => {
       const main = page(DOC, { room, mode });
       const editor = activeCell(main) ?? null;

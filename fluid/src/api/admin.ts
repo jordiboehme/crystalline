@@ -840,6 +840,8 @@ export interface SyncConflict {
 export interface DraftHolder {
   /** Whose drafts these are. */
   actor: string;
+  /** The display name of `actor`, when it is an account with one. */
+  display?: string | null;
   /** How many they hold, deletions included. */
   entries: number;
 }
@@ -1208,7 +1210,15 @@ function readConflict(value: unknown): SyncConflict | null {
 function readDraftHolder(value: unknown): DraftHolder | null {
   const record = asObject(value);
   const actor = asString(record?.actor);
-  return actor === null ? null : { actor, entries: asCount(record?.entries) };
+  return actor === null
+    ? null
+    : {
+        actor,
+        ...(asString(record?.actor_display) === null
+          ? {}
+          : { display: asString(record?.actor_display) }),
+        entries: asCount(record?.entries),
+      };
 }
 
 /** Read a sync status out of the engine's own per-domain report. */

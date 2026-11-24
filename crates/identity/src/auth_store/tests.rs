@@ -1,6 +1,34 @@
 use super::*;
 use crate::auth_store::db::test_store;
 
+/// The bulk display-name lookup answers each account that has a display
+/// name of its own, keyed as asked, a disabled account included, and nothing
+/// for an agent, an unknown name or an account whose display is its login.
+#[tokio::test]
+async fn display_names_answer_accounts_with_a_display_name() {
+    let (store, _guard) = test_store().await;
+    for (name, display) in [("ada", "Ada Lovelace"), ("bob", "Bob"), ("cy", "Cy")] {
+        store
+            .add_user(name, display, None, Role::Editor, "correct horse")
+            .await
+            .unwrap();
+    }
+    store.set_display("cy", None).await.unwrap();
+    store.set_disabled("bob", true).await.unwrap();
+    let names = store
+        .display_names(["ada", "Ada", "bob", "cy", "claude", "", "two words"])
+        .await
+        .unwrap();
+    assert_eq!(names.get("ada").map(String::as_str), Some("Ada Lovelace"));
+    assert_eq!(names.get("Ada").map(String::as_str), Some("Ada Lovelace"));
+    assert_eq!(names.get("bob").map(String::as_str), Some("Bob"));
+    assert_eq!(names.len(), 3, "{names:?}");
+    store.set_display("ada", Some("Ada King")).await.unwrap();
+    let renamed = store.display_names(["ada"]).await.unwrap();
+    assert_eq!(renamed.get("ada").map(String::as_str), Some("Ada King"));
+    assert!(store.display_names([]).await.unwrap().is_empty());
+}
+
 /// A link 0.33.0 stored with an expiry past the latest instant a date holds
 /// (a caller's "never") stays live after the upgrade; one nobody can read is
 /// still over, and a past one is over.

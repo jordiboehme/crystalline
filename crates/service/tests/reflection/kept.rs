@@ -849,6 +849,7 @@ async fn a_kept_comment_goes_to_its_sender_and_to_editors() {
             .clone()
     };
     let (hers, nobodys) = (id_of("Vera asks.\n"), id_of("Nobody's.\n"));
+    s.auth.set_display("vera", Some("Vera V")).await.unwrap();
 
     let vera = Session::login(s.addr, "vera").await;
     let (status, body) = vera.get("/api/v1/domains/eng/kept").await;
@@ -865,6 +866,9 @@ async fn a_kept_comment_goes_to_its_sender_and_to_editors() {
     let (status, one) = vera.get(&format!("/api/v1/domains/eng/kept/{hers}")).await;
     assert_eq!(status, 200, "{one}");
     assert_eq!(one["sender_account"], "vera");
+    // The account's display name rides beside it, resolved as it answers.
+    assert_eq!(one["sender_display"], "Vera V");
+    assert_eq!(body["kept"][0]["sender_display"], "Vera V");
     let (status, _) = vera
         .get(&format!("/api/v1/domains/eng/kept/{nobodys}"))
         .await;

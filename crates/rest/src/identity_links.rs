@@ -105,7 +105,7 @@ fn store_error(e: anyhow::Error) -> ApiError {
 pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
-) -> Result<Json<IdentityLinksResponse>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let user = identity.require_account()?;
     let links = state
         .auth
@@ -117,10 +117,13 @@ pub async fn list(
         .has_password(&user.name)
         .await
         .map_err(store_error)?;
-    Ok(Json(IdentityLinksResponse {
+    let mut answer = serde_json::to_value(IdentityLinksResponse {
         links,
         has_password,
-    }))
+    })
+    .map_err(|e| ApiError::internal(format!("writing the identity links: {e}")))?;
+    super::display_names::enrich_fields(&state.auth, &mut answer, &["linked_by"]).await;
+    Ok(Json(answer))
 }
 
 /// `DELETE /me/identity-links/{issuer}` - give up one of them.

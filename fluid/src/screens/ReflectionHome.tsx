@@ -21,6 +21,7 @@ import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { removeMember } from "../api/members";
 import type { LoopState } from "../api/automation";
 import type {
+  HomeThreadPerson,
   ReflectionHomeSummary,
   ReflectionSearchMode,
   ReflectionTree,
@@ -64,6 +65,7 @@ import {
 import { RETIRED_CLASS } from "../lifecycle";
 import { stripIdLines } from "../reflectionText";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { personLabel } from "../people";
 
 /** The refusal face, the one `DomainPoliciesCard` announces a problem in. */
 const ALERT =
@@ -343,15 +345,18 @@ function OpenThreads({
       </div>
       <ul aria-label="Pages with open threads" className={ROWS}>
         {groups.map((group) => {
-          const people = new Map<string, boolean>();
+          const people = new Map<string, HomeThreadPerson>();
           for (const thread of group.threads) {
             for (const person of thread.people) {
-              people.set(person.name, person.agent);
+              people.set(person.name, person);
             }
           }
           const quote = group.threads[0]?.quote ?? null;
-          const who = [...people]
-            .map(([name, agent]) => (agent ? `${name} (agent)` : name))
+          const who = [...people.values()]
+            .map(({ name, agent, display }) => {
+              const shown = personLabel(name, display);
+              return agent ? `${shown} (agent)` : shown;
+            })
             .join(", ");
           return (
             <li key={group.path} className={ROW}>
@@ -363,8 +368,13 @@ function OpenThreads({
               </Link>
               <span className={ROW_SIDE}>
                 <span className="flex -space-x-1.5">
-                  {[...people].map(([name, agent]) => (
-                    <Avatar key={name} name={name} agent={agent} />
+                  {[...people.values()].map(({ name, agent, display }) => (
+                    <Avatar
+                      key={name}
+                      name={name}
+                      agent={agent}
+                      display={display}
+                    />
                   ))}
                 </span>
                 {`${String(group.threads.length)} open`}

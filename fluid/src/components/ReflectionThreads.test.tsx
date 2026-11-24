@@ -1115,6 +1115,28 @@ describe("comments on a reflection", () => {
     expect(within(mine).queryByText("Waiting for people")).toBeNull();
   });
 
+  it("names a person by their display name, with the login in the tooltip", async () => {
+    serve([
+      thread("t-00000001", {
+        entries: [
+          {
+            at: "2026-09-30T10:00:00Z",
+            kind: "comment",
+            author: { name: "vera", agent: false, display: "Vera Vale" },
+            text: "Still true?",
+          },
+        ],
+      }),
+    ]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    const card = await screen.findByRole("article", {
+      name: "Thread on Night deploys",
+    });
+    const name = within(card).getByText("Vera Vale");
+    expect(name).toHaveAttribute("title", "vera");
+    expect(within(card).queryByText("vera")).toBeNull();
+  });
+
   it("words who a thread waits on", () => {
     const view = (entries: unknown[], waitingOn: "people" | "agent") =>
       ({
@@ -1152,6 +1174,22 @@ describe("comments on a reflection", () => {
     expect(
       waitingWords(view([person("vera"), agent], "people"), null).words,
     ).toBe("Answered, waiting for vera");
+    // A person with a display name is waited for by it.
+    expect(
+      waitingWords(
+        view(
+          [
+            {
+              ...person("vera"),
+              author: { name: "vera", agent: false, display: "Vera Vale" },
+            },
+            agent,
+          ],
+          "people",
+        ),
+        null,
+      ).words,
+    ).toBe("Answered, waiting for Vera Vale");
     // The same white space as the core: U+0085 splits, a byte order mark
     // does not.
     expect(

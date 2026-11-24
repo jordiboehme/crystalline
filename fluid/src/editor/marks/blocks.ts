@@ -10,9 +10,10 @@
  * here rewrites the buffer: the source number of an ordered list is never
  * touched, and the one write is a task box, which is a one character edit.
  *
- * `listEnter` continues a list item or a quote on Enter and `taskKeymap`
- * flips a task with Mod-Enter. Both belong to the layer, so neither runs in
- * Raw.
+ * `listEnter` continues a list item or a quote on Enter, and in a plain
+ * paragraph Enter writes a new paragraph and Shift+Enter a hard break, so
+ * the page reads as the preview shows it; `taskKeymap` flips a task with
+ * Mod-Enter. All of them belong to the layer, so none runs in Raw.
  */
 
 import { isolateHistory } from "@codemirror/commands";
@@ -42,9 +43,11 @@ import {
   requestElementEdit,
 } from "../elementEdit";
 import { frontmatterRegion } from "../frontmatterRegion";
+import { inMathRegion, mathRegions } from "../mathBlocks";
 import { parkingChanged } from "../parkedSelection";
 import { parseAdvanced } from "../parseProgress";
 import { roomUndo } from "../roomUndo";
+import { markSegment } from "./caret";
 import { PARSE_BUDGET, deadlineIn, viewParsedTo } from "./parse";
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine } from "./hiddenMarks";
@@ -367,6 +370,8 @@ function listWidget(state: EditorState, mark: Mark): WidgetType | null {
   return new MarkerWidget(`${number}${written[2]}`, "cm-list-number");
 }
 
+const HARD_BREAK = Decoration.mark({ class: "cm-hard-break" });
+
 interface Drawn {
   decorations: DecorationSet;
   atoms: DecorationSet;
@@ -433,7 +438,21 @@ function build(view: EditorView): Drawn {
       from,
       to,
       enter: (ref) => {
-        if (ref.name !== "HorizontalRule" || ref.from <= frontmatterEnd) {
+        if (ref.from <= frontmatterEnd) {
+          return;
+        }
+        if (ref.name === "HardBreak") {
+          // The backslash of a hard break is a mark: faded where marks hide,
+          // never taken away, so the caret and Backspace treat it as text.
+          if (
+            doc.sliceString(ref.from, ref.from + 1) === "\\" &&
+            marksHiddenOnLine(state, doc.lineAt(ref.from).number)
+          ) {
+            all.push(HARD_BREAK.range(ref.from, ref.from + 1));
+          }
+          return;
+        }
+        if (ref.name !== "HorizontalRule") {
           return;
         }
         const at = doc.lineAt(ref.from);
@@ -528,6 +547,8 @@ const blockTheme = EditorView.baseTheme({
     boxShadow:
       "inset 3px 0 0 var(--color-slate-300), inset 8px 0 0 var(--color-slate-200), inset 13px 0 0 var(--color-slate-100)",
   },
+  // The backslash that ends a line with a hard break, faded like a mark.
+  ".cm-hard-break": { color: "var(--color-slate-300)" },
   ".cm-hr": {
     display: "inline-block",
     width: "100%",
@@ -683,6 +704,210 @@ function listEnterCommand(view: EditorView): boolean {
   return true;
 }
 
+// -- Enter and Shift+Enter in a paragraph ------------------------------------
+
+/** Inline elements a line break would cut in two: a soft break stays there. */
+const KEPT_WHOLE = new Set([
+  "Link",
+  "Image",
+  "InlineCode",
+  "Autolink",
+  "URL",
+  "HTMLTag",
+  "Comment",
+  "InlineMath",
+  "StatusLabel",
+]);
+
+/** Formats a break may leave at their marks, which `checkedInsert` moves it out of. */
+const FORMATS = new Set(["Emphasis", "StrongEmphasis", "Strikethrough"]);
+
+/** A footnote definition reads as a paragraph to the parser. */
+const FOOTNOTE_DEFINITION = /^ {0,3}\[\^[^\]\s]+\]:/;
+
+/**
+ * Whether the caret `range` stands in a plain paragraph of the page, where
+ * Enter writes a new paragraph: a paragraph at the top of the document (a
+ * list item or a quote is `listEnter`'s), outside the frontmatter, math and
+ * a footnote definition, and not inside a link, code or any other inline
+ * element a break would cut. Inside a bold or italic run only at its marks.
+ */
+function inParagraph(state: EditorState, range: SelectionRange): boolean {
+  if (!range.empty) {
+    return false;
+  }
+  const head = range.head;
+  const tree = syntaxTree(state);
+  let paragraph: SyntaxNode | null = null;
+  for (const side of [-1, 1] as const) {
+    for (
+      let node: SyntaxNode | null = tree.resolveInner(head, side);
+      node;
+      node = node.parent
+    ) {
+      if (node.name === "Paragraph") {
+        paragraph = node;
+        break;
+      }
+    }
+    if (paragraph) {
+      break;
+    }
+  }
+  if (!paragraph || paragraph.parent?.name !== "Document") {
+    return false;
+  }
+  if (head <= (frontmatterRegion(state.doc)?.to ?? -1)) {
+    return false;
+  }
+  if (inMathRegion(mathRegions(state), head)) {
+    return false;
+  }
+  if (
+    FOOTNOTE_DEFINITION.test(state.doc.lineAt(paragraph.from).text) ||
+    // A paragraph lezer reads may still be a footnote's continuation line.
+    FOOTNOTE_DEFINITION.test(state.doc.lineAt(head).text)
+  ) {
+    return false;
+  }
+  // Only the nodes that hold the caret strictly inside them.
+  for (
+    let node: SyntaxNode | null = tree.resolveInner(head, 0);
+    node && node !== paragraph;
+    node = node.parent
+  ) {
+    if (node.from >= head || node.to <= head) {
+      continue;
+    }
+    if (KEPT_WHOLE.has(node.name)) {
+      return false;
+    }
+    if (FORMATS.has(node.name)) {
+      const open = node.firstChild;
+      const close = node.lastChild;
+      const atMarks =
+        (open !== null && head <= open.to) ||
+        (close !== null && close !== open && head >= close.from);
+      if (!atMarks) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether paragraph keys are this view's: a writable page, no completion
+ * waiting for Enter, not a table cell (whose Enter and Shift+Enter are its
+ * own), and every caret in a plain paragraph.
+ */
+function paragraphKeys(view: EditorView): boolean {
+  if (
+    view.state.readOnly ||
+    completionStatus(view.state) === "active" ||
+    view.state.facet(markSegment) !== null
+  ) {
+    return false;
+  }
+  parseKeyLines(view);
+  const { state } = view;
+  return state.selection.ranges.every((range) => inParagraph(state, range));
+}
+
+/** Format marks a caret can stand behind and still be at a line's start. */
+const FORMAT_MARKS = new Set(["EmphasisMark", "StrikethroughMark"]);
+
+/**
+ * Whether only blanks and format marks stand before `head` on its line: the
+ * caret is at the line's start as the person sees it (`**|bold**`).
+ */
+function atLineStart(state: EditorState, head: number): boolean {
+  const line = state.doc.lineAt(head);
+  const tree = syntaxTree(state);
+  for (let at = line.from; at < head; at += 1) {
+    if (/\s/.test(state.doc.sliceString(at, at + 1))) {
+      continue;
+    }
+    if (!FORMAT_MARKS.has(tree.resolveInner(at, 1).name)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Writes `text(range)` at every caret, the caret after it: one undo step.
+ * The blanks right after a caret go, as CodeMirror's own Enter takes them,
+ * so the new line does not start with a space.
+ */
+function writeAtCarets(
+  view: EditorView,
+  text: (range: SelectionRange) => string,
+): void {
+  const { state } = view;
+  view.dispatch(
+    state.update(
+      state.changeByRange((range) => {
+        const insert = text(range);
+        const line = state.doc.lineAt(range.head);
+        const blanks = /^[ \t]*/.exec(
+          state.doc.sliceString(range.head, line.to),
+        )?.[0].length;
+        return {
+          changes: { from: range.head, to: range.head + (blanks ?? 0), insert },
+          range: EditorSelection.cursor(range.head + insert.length),
+        };
+      }),
+      { userEvent: "input", scrollIntoView: true },
+    ),
+  );
+}
+
+/**
+ * Enter in a plain paragraph: a new paragraph, two line breaks, so the blank
+ * line the page needs is written and the page reads as the preview shows.
+ * At the start of a line one break is enough: the line before ends there.
+ */
+function paragraphEnterCommand(view: EditorView): boolean {
+  if (!paragraphKeys(view)) {
+    return false;
+  }
+  const { state } = view;
+  writeAtCarets(view, (range) =>
+    atLineStart(state, range.head)
+      ? state.lineBreak
+      : state.lineBreak + state.lineBreak,
+  );
+  return true;
+}
+
+/**
+ * Shift+Enter in a plain paragraph: a hard break, a backslash and the line
+ * break, which the page shows as a new line in the same paragraph. At the
+ * start of a line it is not handled: a break there has nothing to end.
+ */
+function hardBreakCommand(view: EditorView): boolean {
+  if (!paragraphKeys(view)) {
+    return false;
+  }
+  const { state } = view;
+  const ranges = state.selection.ranges;
+  if (ranges.some((range) => atLineStart(state, range.head))) {
+    return false;
+  }
+  writeAtCarets(view, (range) => {
+    const before = state.doc.sliceString(
+      state.doc.lineAt(range.head).from,
+      range.head,
+    );
+    // An odd run of backslashes before the caret already ends in one that
+    // escapes nothing: one more would escape it, so only the break goes in.
+    const run = /\\*$/.exec(before)?.[0].length ?? 0;
+    return run % 2 === 1 ? state.lineBreak : `\\${state.lineBreak}`;
+  });
+  return true;
+}
+
 /** Mod-Enter on a task line: open to done to open, not applicable to open. */
 function cycleTask(view: EditorView): boolean {
   parseKeyLines(view);
@@ -698,9 +923,17 @@ function cycleTask(view: EditorView): boolean {
   return true;
 }
 
-/** Enter continues a list or a quote; the highest precedence, never in Raw. */
+/**
+ * Enter continues a list or a quote, and in a plain paragraph writes a new
+ * paragraph; Shift+Enter there writes a hard break. The highest precedence,
+ * never in Raw.
+ */
 export const listEnter: Extension = Prec.highest(
-  keymap.of([{ key: "Enter", run: listEnterCommand }]),
+  keymap.of([
+    { key: "Enter", run: listEnterCommand },
+    { key: "Enter", run: paragraphEnterCommand },
+    { key: "Shift-Enter", run: hardBreakCommand },
+  ]),
 );
 
 /** Mod-Enter flips the task on the caret line. */

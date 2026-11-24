@@ -106,6 +106,14 @@ pub struct MembersResponse {
     /// either, and on a domain GitHub governs the owner decides nothing.
     #[schema(example = "ada")]
     pub owner: Option<String>,
+    /// The display name of `owner`, when that account has one other than its
+    /// login; absent otherwise. Every account name in this answer carries
+    /// one the same way: `principal_display` beside a member's and an
+    /// overridden row's `principal`, `account_display` beside a GitHub
+    /// person's and a Reflection collaborator's `account`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub owner_display: Option<String>,
     /// `private` or `shared`.
     #[schema(example = "private")]
     pub visibility: &'static str,
@@ -447,46 +455,58 @@ pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
-) -> Result<Json<MembersResponse>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let answer = members_of(&state, &identity, &domain).await?;
+    let mut value = serde_json::to_value(answer)
+        .map_err(|e| ApiError::internal(format!("writing the member list: {e}")))?;
+    super::display_names::enrich_fields(
+        &state.auth,
+        &mut value,
+        &["owner", "principal", "account"],
+    )
+    .await;
+    Ok(Json(value))
+}
+
+/// What [`list`] answers, before the display names are added.
+async fn members_of(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<MembersResponse, ApiError> {
     // `require_viewer`, not `require_account`: this is a read, and the
     // anonymous tier already reads every shared domain on this instance. It
     // learns nothing here it could not learn from `GET /domains`, because a
     // private domain is filtered out by the gate below and a shared one has
     // no owner and no members to report.
     identity.require_viewer()?;
-    require_domain_read(&state, &identity, &domain).await?;
+    require_domain_read(state, identity, domain).await?;
     let acl = state
         .auth
-        .domain_visibility(&domain)
+        .domain_visibility(domain)
         .await
         .map_err(|e| ApiError::internal(format!("reading this domain's visibility: {e:#}")))?;
     let visibility = if acl.is_some() { "private" } else { "shared" };
-    let governed = state.engine.github_governs(&domain);
+    let governed = state.engine.github_governs(domain);
     // The caller's right, read once: what of the governed half it is shown
     // follows from it.
     let right = state
         .access
-        .right(&identity.scope(), &domain)
+        .right(&identity.scope(), domain)
         .await
         .map_err(|e| {
             ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
         })?;
     let reflection_collaborators =
-        reflection_collaborators_for(&state, &identity, &domain, right).await?;
-    let can_invite = crate::invites_api::can_invite(&state, &identity, &domain).await;
+        reflection_collaborators_for(state, identity, domain, right).await?;
+    let can_invite = crate::invites_api::can_invite(state, identity, domain).await;
     if governed {
         // Who GitHub lists is shown to the people who write here (GitHub
         // write, maintain or admin, or an instance admin), never to a
         // reader: on a public repository every signed-in account reads the
         // domain, and the collaborator list is not public on GitHub.
         let github_people = if right >= DomainRight::Write {
-            Some(
-                state
-                    .engine
-                    .github_people(&domain)
-                    .await
-                    .unwrap_or_default(),
-            )
+            Some(state.engine.github_people(domain).await.unwrap_or_default())
         } else {
             None
         };
@@ -494,7 +514,7 @@ pub async fn list(
         // whatever the visibility, and only a manager sees them.
         let overridden =
             if right >= DomainRight::Manage {
-                state.auth.domain_members(&domain).await.map_err(|e| {
+                state.auth.domain_members(domain).await.map_err(|e| {
                     ApiError::internal(format!("listing this domain's members: {e:#}"))
                 })?
             } else {
@@ -503,7 +523,7 @@ pub async fn list(
         // Only where GitHub governs does the environment fix the switch.
         let visibility_fixed_by = state
             .engine
-            .env_readers_var(&domain)
+            .env_readers_var(domain)
             .map(|var| env_readers_sentence(&var));
         // Only an instance admin gets into a closed domain at all, so only
         // one is told why it is closed.
@@ -511,14 +531,15 @@ pub async fn list(
             .user
             .as_ref()
             .is_some_and(|user| user.role == Role::Admin)
-            .then(|| state.engine.github_closed_reason(&domain))
+            .then(|| state.engine.github_closed_reason(domain))
             .flatten();
         let archived_reason = state
             .engine
-            .github_archived_repo(&domain)
-            .map(|repo| crate::engine::archived_sentence(&domain, &repo));
-        return Ok(Json(MembersResponse {
+            .github_archived_repo(domain)
+            .map(|repo| crate::engine::archived_sentence(domain, &repo));
+        return Ok(MembersResponse {
             owner: None,
+            owner_display: None,
             visibility,
             members: Vec::new(),
             governance: Governance::Github,
@@ -529,11 +550,12 @@ pub async fn list(
             closed_reason,
             archived_reason,
             can_invite,
-        }));
+        });
     }
     let Some(acl) = acl else {
-        return Ok(Json(MembersResponse {
+        return Ok(MembersResponse {
             owner: None,
+            owner_display: None,
             visibility,
             members: Vec::new(),
             governance: Governance::Crystalline,
@@ -544,18 +566,19 @@ pub async fn list(
             closed_reason: None,
             archived_reason: None,
             can_invite,
-        }));
+        });
     };
     let members = state
         .auth
-        .domain_members(&domain)
+        .domain_members(domain)
         .await
         .map_err(|e| ApiError::internal(format!("listing this domain's members: {e:#}")))?;
-    Ok(Json(MembersResponse {
+    Ok(MembersResponse {
         // The store writes `""` for a domain whose owner's account was
         // removed, which is the one value no live account can hold. It reaches
         // a client as `null` rather than as an empty name.
         owner: (!acl.owner.is_empty()).then_some(acl.owner),
+        owner_display: None,
         visibility,
         members,
         governance: Governance::Crystalline,
@@ -566,7 +589,7 @@ pub async fn list(
         closed_reason: None,
         archived_reason: None,
         can_invite,
-    }))
+    })
 }
 
 /// The Reflection collaborators of `domain` when the caller manages it and
@@ -1021,7 +1044,7 @@ pub async fn list_reflection_collaborators(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
-) -> Result<Json<ReflectionCollaboratorsResponse>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     identity.require_account()?;
     require_domain_read(&state, &identity, &domain).await?;
     refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
@@ -1031,7 +1054,10 @@ pub async fn list_reflection_collaborators(
             "listing this domain's Reflection collaborators: {e:#}"
         ))
     })?;
-    Ok(Json(ReflectionCollaboratorsResponse { collaborators }))
+    let mut answer = serde_json::to_value(ReflectionCollaboratorsResponse { collaborators })
+        .map_err(|e| ApiError::internal(format!("writing the collaborators: {e}")))?;
+    super::display_names::enrich_fields(&state.auth, &mut answer, &["account"]).await;
+    Ok(Json(answer))
 }
 
 /// `PUT /domains/{domain}/reflection-collaborators/{account}` - give an

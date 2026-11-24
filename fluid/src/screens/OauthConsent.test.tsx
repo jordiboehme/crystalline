@@ -82,7 +82,11 @@ describe("the consent screen", () => {
 
     expect(await screen.findByText("Claude")).toBeInTheDocument();
     expect(screen.getByText("claude.ai")).toBeInTheDocument();
-    expect(screen.getByText("ada")).toBeInTheDocument();
+    // Your own account, by your display name and with its login.
+    expect(screen.getByText("Ada Lovelace (ada)")).toHaveAttribute(
+      "title",
+      "ada",
+    );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Allow" }));

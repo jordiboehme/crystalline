@@ -50,6 +50,7 @@ import {
   sourceKey,
   unavailableSourcesText,
 } from "../reflectionSources";
+import { displayFrom, personLabel } from "../people";
 
 const LINK =
   "text-link underline decoration-(--link-line) decoration-1 underline-offset-[3px] hover:no-underline";
@@ -416,8 +417,15 @@ function QueueRow({
         <span className="text-caption text-muted">{ageText(item.ageSecs)}</span>
       </div>
       {item.changedBy.length > 0 && (
-        <p className="text-caption mt-1 text-muted">
-          {`changed by ${item.changedBy.join(", ")}`}
+        <p
+          className="text-caption mt-1 text-muted"
+          title={item.changedBy.join(", ")}
+        >
+          {`changed by ${item.changedBy
+            .map((login) =>
+              personLabel(login, displayFrom(item.changedByDisplay, login)),
+            )
+            .join(", ")}`}
         </p>
       )}
       {item.structure.length > 0 && (

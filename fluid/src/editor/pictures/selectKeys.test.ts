@@ -53,9 +53,9 @@ const CASES = [
     from: 2,
     to: 20,
     removed: "a  b",
-    // The editor's Enter after the picture: the space it would leave at
-    // the start of the new line goes (P30).
-    entered: "a ![x](assets/p.png)\nb",
+    // The editor's Enter after the picture, a new paragraph: the space it
+    // would leave at the start of the new line goes (P30).
+    entered: "a ![x](assets/p.png)\n\nb",
   },
   {
     name: "alone on its line",
@@ -63,7 +63,7 @@ const CASES = [
     from: 3,
     to: 21,
     removed: "a\n\nb",
-    entered: "a\n\n![x](assets/p.png)\n\n\nb",
+    entered: "a\n\n![x](assets/p.png)\n\n\n\nb",
   },
 ] as const;
 
@@ -181,7 +181,8 @@ describe.each(SETUPS)(
         expect(keys(view, "Enter")).toBe(true);
         const after = entered;
         expect(bytes(view.state)).toBe(after);
-        expect(selection(view)).toEqual([to + 1, to + 1]);
+        // After the blank line Enter in a paragraph writes.
+        expect(selection(view)).toEqual([to + 2, to + 2]);
         expect(built.other()).toBe(after);
         undoOnce(view);
         expect(bytes(view.state)).toBe(doc);

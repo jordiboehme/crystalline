@@ -123,6 +123,7 @@ import {
   stripProvenance,
 } from "../reflectionText";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
+import { personLabel } from "../people";
 
 /** What a tick on a page that moved underneath says. */
 const PAGE_CHANGED = "The page changed. Try again.";
@@ -1132,8 +1133,8 @@ function useSources(
           </li>
         )}
         {disclosed !== null && (
-          <li className="px-1 py-0.5 text-muted">
-            {`Shared on purpose by ${disclosed.by} on ${disclosed.at.slice(0, 10)}`}
+          <li className="px-1 py-0.5 text-muted" title={disclosed.by}>
+            {`Shared on purpose by ${personLabel(disclosed.by, disclosed.byDisplay)} on ${disclosed.at.slice(0, 10)}`}
           </li>
         )}
       </ul>

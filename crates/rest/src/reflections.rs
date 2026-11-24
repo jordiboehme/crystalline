@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use utoipa::{IntoParams, ToSchema};
 
 use super::auth::Identity;
+use super::display_names;
 use super::{ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, refuse_read_only};
 use crate::engine::{
     ANONYMOUS_COMMENT, ASSET_EXISTS, EngineError, MOVE_ONTO_A_FILE, REFUSED_ELSEWHERE_START,
@@ -429,7 +430,11 @@ pub struct ReflectionDoc {
                            domain the caller may not open, which are never \
                            named; absent when there are none. `threads` holds \
                            the open threads; `live` is present while a \
-                           co-editing room is open. `page` \
+                           co-editing room is open. A section's \
+                           `disclosed.by_display` and a thread entry's \
+                           `author.display` are the account's display name, \
+                           present when it has one other than its login. \
+                           `page` \
                            (`ReflectionPageView`, for a page, never for \
                            `PACT.md` or a page pact) holds the page's \
                            `freshness`, `follows` and `status`, its `owner`, \
@@ -479,12 +484,13 @@ pub async fn read(
     identity: Identity,
     ApiPath((domain, path)): ApiPath<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    state
+    let mut answer = state
         .engine
         .read_reflection(&domain, &path, &caller(&identity))
         .await
-        .map(Json)
-        .map_err(reflection_error)
+        .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 /// What `PUT /domains/{domain}/reflections/{*path}` takes.
@@ -875,7 +881,7 @@ pub async fn disclose(
     // Every caller of this route is a person: the JSON API is reached with a
     // browser session (or a proxy that signed a person in), never with an
     // agent's token, so a confirmation here is that person's.
-    state
+    let mut answer = state
         .engine
         .confirm_reflection_disclosure(
             &domain,
@@ -885,8 +891,9 @@ pub async fn disclose(
             &caller(&identity),
         )
         .await
-        .map(Json)
-        .map_err(reflection_error)
+        .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 /// The query of `GET /domains/{domain}/reflection/threads`.
@@ -918,7 +925,9 @@ pub struct ThreadsQuery {
                            `found`, `text_changed` or `section_gone`; \
                            `waiting_on` is `agent` when the last entry is a \
                            person's and `people` when it is an agent's; \
-                           `age_secs` counts from the last entry.",
+                           `age_secs` counts from the last entry. A person's \
+                           `author` carries `display`, the account's display \
+                           name, when it has one other than its login.",
             body = Object,
             example = json!({ "threads": [ { "id": "t-3f9a2c1b",
                 "path": "guides/deploying.md",
@@ -927,7 +936,8 @@ pub struct ThreadsQuery {
                 "status": "open", "waiting_on": "agent",
                 "opened_at": "2026-09-30T10:00:00Z", "age_secs": 3600,
                 "entries": [ { "at": "2026-09-30T10:00:00Z", "kind": "comment",
-                    "author": { "name": "jordi", "agent": false },
+                    "author": { "name": "jordi", "agent": false,
+                                "display": "Jordi" },
                     "text": "Still at night?" } ] } ] }),
         ),
         (
@@ -951,7 +961,7 @@ pub async fn threads(
     ApiPath(domain): ApiPath<String>,
     ApiQuery(q): ApiQuery<ThreadsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    state
+    let mut answer = state
         .engine
         .list_reflection_threads(
             &domain,
@@ -960,8 +970,9 @@ pub async fn threads(
             &caller(&identity),
         )
         .await
-        .map(Json)
-        .map_err(reflection_error)
+        .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 /// What `POST /domains/{domain}/reflection/threads` takes.
@@ -1061,11 +1072,12 @@ pub async fn open(
         text: Some(body.text),
         ..Default::default()
     };
-    let view = state
+    let mut view = state
         .engine
         .discuss(&p, &caller(&identity))
         .await
         .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut view).await;
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
@@ -1172,12 +1184,13 @@ pub async fn step(
             )));
         }
     };
-    state
+    let mut answer = state
         .engine
         .reflection_thread_entry(&domain, &body.path, &id, kind, &text, &caller(&identity))
         .await
-        .map(Json)
-        .map_err(reflection_error)
+        .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 /// The query of the queue route.
@@ -1265,7 +1278,10 @@ pub struct QueueQuery {
                            `link_broken` (per section) carry `links`, the \
                            pages it links that are retired or gone. `stale` \
                            items (a page whose freshness ran out) are a \
-                           run's and never in this queue.",
+                           run's and never in this queue. \
+                           `changed_by_display` maps each login in an item's \
+                           `changed_by` that has a display name other than \
+                           itself to that name; absent when none has.",
             body = Object,
             example = json!({ "domain": "eng", "total": 1, "page": 1, "limit": 10,
                 "count": 1, "kinds": { "feedback": 0, "update": 1, "review": 0 },
@@ -1297,12 +1313,13 @@ pub async fn queue(
     ApiPath(domain): ApiPath<String>,
     ApiQuery(q): ApiQuery<QueueQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    state
+    let mut answer = state
         .engine
         .reflect_queue(&domain, q.limit, q.page, &caller(&identity))
         .await
-        .map(Json)
-        .map_err(reflection_error)
+        .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 /// `GET /domains/{domain}/reflection/review`
@@ -1348,12 +1365,13 @@ pub async fn review(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    state
+    let mut answer = state
         .engine
         .reflection_review(&domain, &caller(&identity))
         .await
-        .map(Json)
-        .map_err(reflection_error)
+        .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 /// `GET /domains/{domain}/reflection/summary`
@@ -1373,7 +1391,9 @@ pub async fn review(
                    by page. A thread carries its id, its \
                    first quote (`null` for a whole section), who it waits on, \
                    when it was opened and the people who wrote in it, never \
-                   its entries. Pages and threads come oldest first. The same \
+                   its entries (a person in `people` carries `display`, the \
+                   account's display name, when it has one other than its \
+                   login). Pages and threads come oldest first. The same \
                    rights as the review: a reader without engram rights is \
                    not counted any update about engrams that no page cites.",
     params(("domain" = String, Path, description = "The domain.")),
@@ -1393,7 +1413,8 @@ pub async fn review(
                         "quote": "at night",
                         "waiting_on": "agent",
                         "opened_at": "2026-10-14T09:12:00Z",
-                        "people": [ { "name": "ann", "agent": false } ] } ] } ] }),
+                        "people": [ { "name": "ann", "agent": false,
+                                      "display": "Ann Lee" } ] } ] } ] }),
         ),
         (
             status = 404,
@@ -1415,12 +1436,13 @@ pub async fn summary(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    state
+    let mut answer = state
         .engine
         .reflection_summary(&domain, &caller(&identity))
         .await
-        .map(Json)
-        .map_err(reflection_error)
+        .map_err(reflection_error)?;
+    display_names::enrich_reflection(&state.auth, &mut answer).await;
+    Ok(Json(answer))
 }
 
 // A schema type only, never built: the route reads `search_type` as a

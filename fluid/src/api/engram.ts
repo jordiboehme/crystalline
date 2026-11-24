@@ -25,7 +25,14 @@
  */
 
 import { api, engramPath } from "./client";
-import { asArray, asNumber, asObject, asString, asStrings } from "./json";
+import {
+  asArray,
+  asNumber,
+  asObject,
+  asString,
+  asStringMap,
+  asStrings,
+} from "./json";
 
 /** Where a `[[Target]]` points, as the server parsed the brackets. */
 export interface LinkTarget {
@@ -136,6 +143,12 @@ export interface EngramFrontmatter {
    * written before the key existed carries none, and so does a person's.
    */
   generatedModel: string | null;
+  /**
+   * The display names of the people among the actors above, keyed by the
+   * actor as written (`human:<login>`). The server sends it beside the
+   * frontmatter, never inside it; absent where nobody has one.
+   */
+  actorDisplay?: Record<string, string>;
 }
 
 /** One of the capped inbound references the detail payload samples. */
@@ -205,6 +218,8 @@ export interface EngramDetail {
    * not offer to share a page the reader does not own.
    */
   draftOwner: string | null;
+  /** The display name of `draftOwner`, when the account has one. */
+  draftOwnerDisplay?: string | null;
   /**
    * How this page differs from what the team has, on a team domain that
    * takes changes directly: `added` (the team has no such page) or
@@ -365,6 +380,7 @@ function readFrontmatter(
     // The model sits beside the actor inside the same mapping, and is left out
     // of a block whose writer reported none.
     generatedModel: asString(asObject(record?.generated)?.model),
+    actorDisplay: asStringMap(payload?.actor_display),
   };
 }
 
@@ -443,6 +459,7 @@ export function readEngramDetail(
     guidance: asString(record?.guidance),
     draft: record?.draft === true,
     draftOwner: asString(record?.draft_owner),
+    draftOwnerDisplay: asString(record?.draft_owner_display),
     localChange:
       record?.local_change === "added" || record?.local_change === "modified"
         ? record.local_change

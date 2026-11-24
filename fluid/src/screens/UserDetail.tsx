@@ -51,6 +51,7 @@ import { formatDay } from "../format";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
 import type { Notice } from "./accounts";
 import { ROLES, signInWords } from "./accounts";
+import { personLabelWithLogin } from "../people";
 
 const SECONDARY = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.secondary}`;
 const DANGER = `${CONTROL_HEIGHT} whitespace-nowrap ${BUTTON.destructive}`;
@@ -99,6 +100,13 @@ export function UserDetail({
 
   const invalidate = () =>
     refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY });
+
+  // The account as a notice names it: "Display (login)", so the sentence says
+  // who in words and still names the account exactly.
+  const who = personLabelWithLogin(
+    name,
+    account.data?.user.display ?? fromList?.display,
+  );
 
   const patch = useMutation({
     mutationFn: (body: PatchUserBody) => patchUser(name, body),
@@ -153,7 +161,7 @@ export function UserDetail({
     onSuccess: () => {
       onNotice({
         kind: "done",
-        text: `Replaced the password for ${name}. Its sessions and agent connections are signed out.`,
+        text: `Replaced the password for ${who}. Its sessions and agent connections are signed out.`,
       });
       void invalidate();
     },
@@ -168,8 +176,8 @@ export function UserDetail({
       onNotice({
         kind: warning ? "problem" : "done",
         text: warning
-          ? `Unlinked ${name} from GitHub: ${warning}.`
-          : `Unlinked ${name} from GitHub.`,
+          ? `Unlinked ${who} from GitHub: ${warning}.`
+          : `Unlinked ${who} from GitHub.`,
       });
       void invalidate();
     },
@@ -192,8 +200,8 @@ export function UserDetail({
         kind: "done",
         text:
           stored === null
-            ? `Removed the write list of ${name}.`
-            : `Saved the write list of ${name}.`,
+            ? `Removed the write list of ${who}.`
+            : `Saved the write list of ${who}.`,
       });
     },
     onError: (error: Error) => {
@@ -204,7 +212,7 @@ export function UserDetail({
   const remove = useMutation({
     mutationFn: () => deleteUser(name),
     onSuccess: () => {
-      onNotice({ kind: "done", text: `Deleted ${name}.` });
+      onNotice({ kind: "done", text: `Deleted ${who}.` });
       queryClient.removeQueries({ queryKey: userKey(name) });
       void invalidate();
       // Replace, so the back button does not return to the deleted account.

@@ -46,9 +46,10 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use serde_json::Value;
 
 use super::auth::Identity;
-use super::auth_store::{DRAFT_LINK_PREFIX, OverlayGrant, Role};
+use super::auth_store::{DRAFT_LINK_PREFIX, Role};
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, require_domain_read,
     require_domain_write,
@@ -230,6 +231,10 @@ pub struct AcceptedDraft {
     pub path: String,
     /// Whose draft it is.
     pub owner: String,
+    /// The display name of `owner`, when that account has one other than its
+    /// login; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_display: Option<String>,
     /// The address it answers to, which is how a save of it is addressed.
     pub permalink: String,
     /// Whether this account may edit it at all: `write_right` on the domain,
@@ -269,6 +274,7 @@ impl std::fmt::Debug for AcceptedDraft {
             .field("domain", &self.domain)
             .field("path", &self.path)
             .field("owner", &self.owner)
+            .field("owner_display", &self.owner_display)
             .field("permalink", &self.permalink)
             .field("editable", &self.editable)
             .field("reason", &self.reason)
@@ -392,7 +398,7 @@ pub async fn list(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
     ApiQuery(query): ApiQuery<LinksQuery>,
-) -> Result<Json<Vec<OverlayGrant>>, ApiError> {
+) -> Result<Json<Vec<Value>>, ApiError> {
     require_domain_read(&state, &identity, &domain).await?;
     let user = identity.require_account()?;
     if state
@@ -408,7 +414,22 @@ pub async fn list(
         .overlay_grants_of(&user.name, &domain, &query.path)
         .await
         .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-    Ok(Json(grants))
+    let displays = super::display_names::lookup(
+        &state.auth,
+        grants.iter().filter_map(|g| g.grantee.as_deref()),
+    )
+    .await;
+    let rows = grants
+        .into_iter()
+        .map(|grant| {
+            let mut row = serde_json::to_value(grant).unwrap_or(Value::Null);
+            if let Some(obj) = row.as_object_mut() {
+                super::display_names::set_beside(obj, "grantee", &displays);
+            }
+            row
+        })
+        .collect();
+    Ok(Json(rows))
 }
 
 /// `DELETE /draft-links/{id}` - take one link back.
@@ -789,6 +810,7 @@ async fn open_link(
     });
     Ok((
         AcceptedDraft {
+            owner_display: super::display_names::one(&state.auth, &grant.owner).await,
             domain: grant.domain,
             path: grant.path,
             owner: grant.owner,
@@ -868,6 +890,7 @@ mod tests {
             domain: "team".to_string(),
             path: "plan.md".to_string(),
             owner: "alice".to_string(),
+            owner_display: None,
             permalink: "plan".to_string(),
             editable: true,
             reason: None,

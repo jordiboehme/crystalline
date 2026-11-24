@@ -1,3 +1,4 @@
+import { personLabel } from "./people";
 /**
  * Showing a value the API wrote, in the words a reader reads.
  *
@@ -110,10 +111,10 @@ export function relativeTime(value: string, now: Date): string | null {
  * follows it. An actor in none of those conventions is somebody else's
  * convention rather than a malformed one, so it is shown exactly as written.
  */
-export function formatActor(by: string): string {
+export function formatActor(by: string, display?: string | null): string {
   const lower = by.toLowerCase();
   if (lower.startsWith("human:")) {
-    return `${by.slice(6)} (human)`;
+    return `${personLabel(by.slice(6), display)} (human)`;
   }
   if (lower.startsWith("process:")) {
     return `${by.slice(8)} (process)`;
@@ -123,6 +124,17 @@ export function formatActor(by: string): string {
     return `${by.slice(0, slash)} (agent, ${by.slice(slash + 1)})`;
   }
   return by;
+}
+
+/**
+ * The login inside a person's actor (`human:<login>`), for a tooltip beside
+ * the name shown; undefined for an actor that names no person.
+ */
+export function actorLogin(by: string | null | undefined): string | undefined {
+  if (by == null || !by.toLowerCase().startsWith("human:")) {
+    return undefined;
+  }
+  return by.slice(6);
 }
 
 /** The units a stored file is measured in, which is how its ceiling is stated. */

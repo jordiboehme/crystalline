@@ -152,7 +152,10 @@ function Who(): ReactElement {
         {(Array.from(user.display.trim())[0] ?? "?").toUpperCase()}
       </span>
       <DropdownMenu.Label className="min-w-0">
-        <b className="block truncate text-sm font-semibold text-ink">
+        <b
+          className="block truncate text-sm font-semibold text-ink"
+          title={user.name}
+        >
           {user.display}
         </b>
         <span className="block truncate text-[12.5px] text-muted">

@@ -19,6 +19,7 @@ import type {
   KeptTextResponse,
   KeptTextsResponse,
 } from "./model";
+import { personLabel } from "../people";
 
 export type { KeptTextEntry, KeptTextResponse } from "./model";
 
@@ -128,18 +129,36 @@ export function keptKindLabel(kind: string): string {
   }
 }
 
+/** The sender by their display name, or null when no sender is recorded. */
+function senderName(entry: KeptTextEntry): string | null {
+  if (entry.sender == null || entry.sender === "") {
+    return null;
+  }
+  return personLabel(entry.sender, entry.sender_display);
+}
+
+/**
+ * The login the sender's account has, for a tooltip beside the display name;
+ * undefined when no sender is recorded.
+ */
+export function keptSenderLogin(entry: KeptTextEntry): string | undefined {
+  return entry.sender_account ?? undefined;
+}
+
 /** Who the entry came from, when the server knows; null when it does not. */
 export function keptFrom(entry: KeptTextEntry): string | null {
-  if (entry.sender != null && entry.sender !== "") {
-    return `From ${entry.sender}`;
+  const sender = senderName(entry);
+  if (sender !== null) {
+    return `From ${sender}`;
   }
   return entry.draft ? "From your draft" : null;
 }
 
 /** What the editors' note says about one entry. */
 export function keptNoticeSentence(entry: KeptTextEntry): string {
-  if (entry.sender != null && entry.sender !== "") {
-    return `The server kept unsaved text for this page. From ${entry.sender}.`;
+  const sender = senderName(entry);
+  if (sender !== null) {
+    return `The server kept unsaved text for this page. From ${sender}.`;
   }
   return entry.draft
     ? "The server kept unsaved text from your draft."
