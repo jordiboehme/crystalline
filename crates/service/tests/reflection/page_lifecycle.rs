@@ -39,7 +39,7 @@ fn delete(path: &str) -> WriteReflectionParams {
 
 /// An agent of the reflect loop, as its token resolves, with an accounts
 /// store on `fx` that knows it.
-async fn curator_agent(fx: &Fx) -> ReflectionCaller {
+pub(crate) async fn curator_agent(fx: &Fx) -> ReflectionCaller {
     let auth = Arc::new(
         AuthStore::open(&fx.tmp.path().join("web-auth.db"))
             .await
@@ -61,7 +61,7 @@ async fn curator_agent(fx: &Fx) -> ReflectionCaller {
 
 /// The limit of a session that says it is unattended (its registration or
 /// a run header).
-fn unattended() -> Limit {
+pub(crate) fn unattended() -> Limit {
     Limit {
         unattended: true,
         ..Limit::default()

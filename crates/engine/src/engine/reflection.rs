@@ -1159,6 +1159,15 @@ pub(crate) fn unattended_delete_refusal(inner: &str) -> String {
     }
 }
 
+/// The refusal of a page's `freshness` or `follows` change by an unattended
+/// session ([`Engine::is_unattended`]): a curator decides how often a page
+/// is reconciled and which pact it follows.
+pub(crate) fn unattended_settings_refusal(inner: &str) -> String {
+    format!(
+        "an unattended session does not change a page's freshness or follows; send them as they are stored or leave them out of '{inner}', and a curator changes them in Fluid or in an attended session"
+    )
+}
+
 /// A page without its `reflection:` frontmatter block, which names the
 /// source engrams: what a reader who cannot read engrams is answered, what
 /// the search looks at and what a live room holds. The rest of the
@@ -1938,7 +1947,13 @@ impl Engine {
         // The page settings are a curator's: what the write leaves out keeps
         // its stored value, and below curate a different value is refused.
         let incoming = self
-            .settle_page_keys(p, &access, current.as_deref(), &incoming)
+            .settle_page_keys(
+                p,
+                &access,
+                self.is_unattended(caller),
+                current.as_deref(),
+                &incoming,
+            )
             .await?;
         if let Some(owner) = &new_owner {
             let follows = r::read_page_settings(&incoming, &p.path, &r::PageRecord::default())
@@ -2746,11 +2761,14 @@ impl Engine {
     /// name an existing page of this Reflection and close no cycle. Below
     /// curate a key sent with another value than the stored one is refused,
     /// on a new page any key at all; `status` only when the stored or the
-    /// sent value is a retired word.
+    /// sent value is a retired word. An `unattended` writer
+    /// ([`Engine::is_unattended`]) changes no `freshness` and no `follows`,
+    /// whatever its right: sending one as stored is no change.
     async fn settle_page_keys(
         &self,
         p: &WriteReflectionParams,
         access: &ReflectionAccess,
+        unattended: bool,
         current: Option<&str>,
         incoming: &str,
     ) -> Result<String> {
@@ -2768,6 +2786,22 @@ impl Engine {
             return Ok(incoming.to_string());
         }
         let curator = access.right >= ReflectionRight::Curate;
+        // How often a page is reconciled and which pact it follows are a
+        // curator's in person: a run keeps them as they are (Jordi,
+        // 2026-11-24), on a new page too.
+        if unattended {
+            for key in [r::FRESHNESS_KEY, r::FOLLOWS_KEY] {
+                let before = stored.get(key).filter(|v| !v.is_null());
+                let after = match sent.get(key) {
+                    None => before,
+                    Some(value) if value.is_null() => before.filter(|_| !curator),
+                    Some(value) => Some(value),
+                };
+                if after != before {
+                    return Err(EngineError::Forbidden(unattended_settings_refusal(&p.path)));
+                }
+            }
+        }
         let retired = |value: &serde_yaml_ng::Value| {
             value
                 .as_str()

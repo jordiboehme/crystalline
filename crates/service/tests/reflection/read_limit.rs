@@ -12,7 +12,7 @@ use crate::disclosure::{Wire, private_harbor, request};
 const LEGACY: &str = "2025-11-25";
 
 /// A legacy session over `server`, opened.
-async fn session(server: McpServer) -> Wire {
+pub(crate) async fn session(server: McpServer) -> Wire {
     let mut wire = Wire::over(server);
     let opened = wire
         .call(request(
@@ -340,7 +340,7 @@ async fn a_run_answers_a_thread_without_seeing_a_private_domain() {
 }
 
 /// A tool call's answer as text.
-async fn tool(wire: &mut Wire, id: u32, name: &str, arguments: Value) -> Value {
+pub(crate) async fn tool(wire: &mut Wire, id: u32, name: &str, arguments: Value) -> Value {
     wire.call(request(
         id,
         "tools/call",
@@ -349,7 +349,7 @@ async fn tool(wire: &mut Wire, id: u32, name: &str, arguments: Value) -> Value {
     .await
 }
 
-fn refused(answer: &Value) -> String {
+pub(crate) fn refused(answer: &Value) -> String {
     if let Some(message) = answer["error"]["message"].as_str() {
         return message.to_string();
     }
@@ -360,7 +360,7 @@ fn refused(answer: &Value) -> String {
         .to_string()
 }
 
-fn landed(answer: &Value) {
+pub(crate) fn landed(answer: &Value) {
     assert!(
         answer["error"].is_null() && answer["result"]["isError"] != json!(true),
         "{answer}"
