@@ -29,6 +29,7 @@ import type {
 } from "../api/events";
 import {
   REFLECTION_DOMAINS_KEY,
+  isPactFile,
   reflectionDocKey,
   reflectionKeys,
   reflectionStatusKey,
@@ -113,14 +114,17 @@ export function keysForReflection(change: ReflectionChange): QueryKey[] {
  * no file and announces exactly that, once per check, in every open tab;
  * the page's clock (refetched with the prefix) carries the checksum of the
  * file as stored, and the page reads its text again only when that moved
- * (`ReflectionPage`). Threads, a move, a delete and a change of many pages
- * at once (an empty path) spare nothing.
+ * (`ReflectionPage`). Threads, a move, a delete, a change of many pages
+ * at once (an empty path) and a change of a pact (which has no clock)
+ * spare nothing.
  */
 export function sparedBy(event: ChangeEvent): QueryKey | null {
   if (
     event.event !== "reflection" ||
     event.change.kind !== "changed" ||
-    event.change.path === ""
+    event.change.path === "" ||
+    // A pact keeps no clock, so nothing would read its text again.
+    isPactFile(event.change.path)
   ) {
     return null;
   }

@@ -101,6 +101,9 @@ function PageSettings({
   deleting,
 }: PageDetailsProps): ReactElement {
   const changes = curator && lockedReason === undefined;
+  // Held here: a save the server took remounts the form (its key is the
+  // stored settings), and the word must outlive that.
+  const [saved, setSaved] = useState(false);
   return (
     <section aria-label="Page settings" className="flex flex-col gap-3">
       <h2 className={RAIL_LABEL}>Page settings</h2>
@@ -112,6 +115,8 @@ function PageSettings({
           domain={domain}
           path={path}
           page={page}
+          saved={saved}
+          onSaved={setSaved}
         />
       ) : (
         <dl className="flex flex-col">
@@ -193,10 +198,15 @@ function SettingsForm({
   domain,
   path,
   page,
+  saved,
+  onSaved,
 }: {
   domain: string;
   path: string;
   page: PageView;
+  /** Whether the last save landed, said until the next change. */
+  saved: boolean;
+  onSaved: (saved: boolean) => void;
 }): ReactElement {
   const queryClient = useQueryClient();
   const freshnessId = useId();
@@ -213,7 +223,6 @@ function SettingsForm({
   );
   const [custom, setCustom] = useState(choice === CUSTOM ? (stored ?? "") : "");
   const [follows, setFollows] = useState(page.follows ?? "");
-  const [saved, setSaved] = useState(false);
   const tree = useQuery({
     queryKey: reflectionTreeKey(domain),
     queryFn: () => fetchReflectionTree(domain),
@@ -234,10 +243,10 @@ function SettingsForm({
   const save = useMutation({
     mutationFn: () => setReflectionSettings(domain, path, pending),
     onMutate: () => {
-      setSaved(false);
+      onSaved(false);
     },
     onSuccess: () => {
-      setSaved(true);
+      onSaved(true);
       invalidateReflection(queryClient, domain);
     },
   });

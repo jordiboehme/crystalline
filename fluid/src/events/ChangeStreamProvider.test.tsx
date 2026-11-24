@@ -318,6 +318,22 @@ describe("the change stream in one tab", () => {
       }
     });
 
+    it("a changed pact still refetches its text: a pact keeps no clock", async () => {
+      await mount(client);
+      for (const [i, path] of ["PACT.md", "guides/a.pact.md"].entries()) {
+        invalidate.mockClear();
+        act(() => {
+          theSource().emit(
+            "reflection",
+            change("changed", path),
+            `1:${String(i + 1)}`,
+          );
+          vi.advanceTimersByTime(250);
+        });
+        expect(refetches(["reflection", "eng", "doc", path])).toBe(true);
+      }
+    });
+
     it("a change and a thread in one window refetch the text", async () => {
       await mount(client);
       act(() => {
