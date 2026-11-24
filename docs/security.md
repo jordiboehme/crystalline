@@ -86,6 +86,8 @@ With `auth.mcp` off, an agent may set a domain's policies and rule overrides thr
 | `github.enabled` | Turns GitHub team collaboration on; while off, the six collaboration tools are not listed and the daemon does not poll GitHub | `false` |
 | `index.files` | Keeps a generated `index.md` in every folder of a file domain (see below) | `true` |
 | `recall.enabled` | The per-prompt hook hands the agent matching engrams | `true` |
+| `reflection.cite_shared` | `on` lets a Reflection page cite another shared domain even when some of its readers read only the Reflection | `on` |
+| `reflection.backup_sources` | What a page backed up to GitHub may carry from domains the repository's readers may not read: `full` backs it up, `hold_back` keeps it out of the backup, `refuse` refuses the write. With `full` that text reaches every reader of the repository, the whole internet for a public one | `full` |
 | `skills.serve` | Serves the agent skills over MCP; `auto` skips a stdio session whose harness already has them as files | `auto` |
 | `auth.anonymous` | `true` serves JSON API requests with no identity at viewer level | `false` |
 | `service.allowed_hosts` | Extra `Host` header values the MCP endpoint, the JSON API and the OAuth endpoints accept; `*` accepts any | loopback and the host of `service.public_url` |
@@ -237,7 +239,7 @@ Crystalline is licensed under the Mozilla Public License 2.0 (see [LICENSE](../L
 - The generated `index.md` files are rewritten and removed on their own while `index.files` is on.
 - `provision` can register MCP servers, skills and agents that a domain's MANIFEST ships into your harnesses, and the server asks for no confirmation.
 - `add_domain` accepts any folder the daemon's user can read.
-- An agent that may change settings can change every key in the settings registry that is not an operator setting, for example `github.enabled`, `evolve.contradictions` or `recall.enabled`. There is no confirmation step. The operator settings (the network, the database, sign-in, the GitHub server address and OAuth client, the automation settings and the update check) change only with the CLI, `config.yaml` or their `CRYSTALLINE_*` variables.
+- An agent that may change settings can change every key in the settings registry that is not an operator setting, for example `github.enabled`, `evolve.contradictions`, `recall.enabled` or the two `reflection.*` settings, which decide what a Reflection page may carry from other domains. There is no confirmation step. The operator settings (the network, the database, sign-in, the GitHub server address and OAuth client, the automation settings and the update check) change only with the CLI, `config.yaml` or their `CRYSTALLINE_*` variables.
 - There is no server-side allowlist of tools and no read-only flag per local domain. Read-only is daemon-wide.
 - There is no encryption at rest and no built-in TLS.
 - The builds are not reproducible.
