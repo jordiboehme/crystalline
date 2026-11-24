@@ -4050,9 +4050,10 @@ impl McpServer {
     /// Ask this session's person before a `write_reflection` that the reach
     /// rule alone would refuse: its sources name a domain fewer people may
     /// read than the page's, or (under `reflection.backup_sources: refuse`)
-    /// one not shared through GitHub while the page is backed up there ([`Engine::reflection_disclosure_question`]). A yes
-    /// sets [`WriteReflectionParams::disclosed`], the one field the engine
-    /// takes a person's confirmation from, as the basis of the question asked.
+    /// one not shared through GitHub while the page is backed up there
+    /// ([`Engine::reflection_disclosure_question`]). A yes sets
+    /// [`WriteReflectionParams::disclosed`], the one field the engine takes
+    /// a person's confirmation from, as the basis of the question asked.
     ///
     /// Nobody is asked, and the write goes on to be refused as before, when
     /// there is no person behind the session to ask:

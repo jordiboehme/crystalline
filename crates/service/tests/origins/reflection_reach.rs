@@ -809,7 +809,9 @@ async fn under_full_a_narrower_repository_is_cited_and_backed_up() {
 
 /// Under `reflection.backup_sources: hold_back` the write is allowed and
 /// the page is served, but the backup holds it back. The queue names
-/// nothing, and an unattended run may read the source's domain.
+/// nothing. An unattended run may not read the source's domain: its thread
+/// answers and engram writes would reach the repository, and the hold is
+/// for pages only.
 #[tokio::test]
 async fn under_hold_back_a_narrower_repository_is_cited_and_held_back() {
     let tmp = tempfile::tempdir().unwrap();
@@ -821,7 +823,7 @@ async fn under_hold_back_a_narrower_repository_is_cited_and_held_back() {
         .read_limit_for(&Scope::Unrestricted, true, None)
         .await
         .expect("unattended");
-    assert!(limit.hidden.is_empty(), "{:?}", limit.hidden);
+    assert!(limit.hidden.contains("vault"), "{:?}", limit.hidden);
     write(&eng, &cite("kb", ROTA)).await.unwrap();
     assert!(tmp.path().join("kb/reflections/overview.md").exists());
     assert!(too_wide(&eng, "kb").await.is_empty());

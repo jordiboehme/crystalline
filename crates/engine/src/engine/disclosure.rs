@@ -674,11 +674,12 @@ impl Engine {
     /// The question a person is asked before this write lands, when it
     /// needs one: it names sources in a domain fewer people may read than
     /// the page's, or (under `reflection.backup_sources: refuse`) one not
-    /// shared through GitHub while the page is backed up there, that this person has not shared on this page yet (or whose
-    /// sharing no longer holds). The question shows the text the write
-    /// leaves in those sections. `None` when nothing in
-    /// the write needs a person's confirmation, and when `caller` has nobody
-    /// behind it who could give one (the write is then refused as before).
+    /// shared through GitHub while the page is backed up there, that this
+    /// person has not shared on this page yet (or whose sharing no longer
+    /// holds). The question shows the text the write leaves in those
+    /// sections. `None` when nothing in the write needs a person's
+    /// confirmation, and when `caller` has nobody behind it who could give
+    /// one (the write is then refused as before).
     ///
     /// Every other refusal comes first, as the write would give it: it is
     /// worked out by the write itself, stopped before anything is written.
