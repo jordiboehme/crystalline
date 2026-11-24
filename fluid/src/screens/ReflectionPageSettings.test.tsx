@@ -176,6 +176,19 @@ describe("the status lines under the title", () => {
     ).toBeVisible();
   });
 
+  it("stand under the header's title when the text has none of its own", async () => {
+    serve("read", {
+      [DOC]: () => ({ ...doc(), markdown: "Text without a title.\n" }),
+    });
+    renderApp(URL);
+    const status = await screen.findByTestId("page-status");
+    expect(status.closest("header")).not.toBeNull();
+    expect(status.closest("article")).toBeNull();
+    expect(status).toHaveTextContent(
+      "Follows: PACT.md > Architecture overview",
+    );
+  });
+
   it("say since when an overdue page is overdue, in the warning colour, with the loop hint", async () => {
     serve("read", {
       "/domains/eng/reflection/clock": () => ({
