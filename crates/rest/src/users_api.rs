@@ -1012,8 +1012,27 @@ pub async fn bulk(
     Ok(Json(BulkResponse { results }))
 }
 
+/// The sentence a bulk result row carries for a store error on `name`: the
+/// store's own refusal when [`store_error`] reads it as one a person can act
+/// on (no such account, the last admin, a name rule), else one plain
+/// sentence, with the error chain logged instead of shown: the database's
+/// text names tables and paths, not what the admin can do.
+fn bulk_message(e: anyhow::Error, name: &str) -> String {
+    let chain = format!("{e:#}");
+    let api = store_error(e, name);
+    if api.status != StatusCode::INTERNAL_SERVER_ERROR {
+        return api.detail;
+    }
+    tracing::error!("a bulk change of account '{name}' failed: {chain}");
+    format!(
+        "the account '{name}' could not be changed because the accounts store failed; \
+         the server log has the details"
+    )
+}
+
 /// One account of a bulk request: the guard first, then the write, each in the
-/// store's own words. The error is the sentence for the result.
+/// store's own words ([`bulk_message`]). The error is the sentence for the
+/// result.
 async fn bulk_one(
     state: &RestState,
     caller: &Caller,
@@ -1033,7 +1052,7 @@ async fn bulk_one(
              or use `crystalline users` on the server"
         ));
     }
-    let said = |e: anyhow::Error| format!("{e:#}");
+    let said = |e: anyhow::Error| bulk_message(e, name);
     match (action, role) {
         (BulkAction::Deactivate, _) => {
             store
@@ -1828,6 +1847,25 @@ mod tests {
             .await
             .unwrap();
         (dir, store)
+    }
+
+    /// A bulk result row carries the store's refusal when it is one a person
+    /// reads (no such account, the last admin), and one plain sentence for
+    /// anything else: the database's own text stays in the log.
+    #[tokio::test]
+    async fn a_bulk_row_says_one_plain_sentence_for_a_store_failure() {
+        let (_dir, store) = store().await;
+        let missing = store
+            .check_change_of("nobody", "disable", true)
+            .await
+            .unwrap_err();
+        assert_eq!(bulk_message(missing, "nobody"), "no such user: 'nobody'");
+        let failure = anyhow::anyhow!("near \"FROM\": syntax error in SELECT name FROM users")
+            .context("disabling user 'ada'");
+        let message = bulk_message(failure, "ada");
+        assert!(!message.contains("syntax"), "{message}");
+        assert!(!message.contains("SELECT"), "{message}");
+        assert!(message.contains("'ada'"), "{message}");
     }
 
     /// The classifier against the store's real errors rather than against

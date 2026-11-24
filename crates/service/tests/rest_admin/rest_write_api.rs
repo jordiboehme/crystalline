@@ -3283,6 +3283,30 @@ async fn a_bulk_request_is_validated_and_admin_only() {
             .unwrap();
         assert_eq!(resp.status(), 422, "{body}");
     }
+    // At most 500 accounts in one request: 500 are answered per account,
+    // 501 are refused whole.
+    let names = |n: usize| (0..n).map(|i| format!("nobody{i}")).collect::<Vec<_>>();
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+        .json(&serde_json::json!({"names": names(501), "action": "deactivate"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let refused: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        refused["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("at most 500 accounts")),
+        "{refused}"
+    );
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users/bulk", &admin)
+        .json(&serde_json::json!({"names": names(500), "action": "deactivate"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let answered: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(answered["results"].as_array().map(Vec::len), Some(500));
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let resp = as_session(
         fx.addr,
