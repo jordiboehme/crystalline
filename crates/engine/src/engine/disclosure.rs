@@ -24,6 +24,8 @@
 use crystalline_core::reflection as r;
 use serde::{Deserialize, Serialize};
 
+use crystalline_core::config::BackupSources;
+
 use super::sources::{Reach, RepositoryReach, UNKNOWN_READERS_REFUSAL};
 use super::*;
 use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
@@ -227,11 +229,15 @@ pub(crate) fn section_text(page: &str, id: &str) -> Option<String> {
 
 /// Why the backup half of the rule refuses a page's sources: some source is
 /// not on GitHub, and some is on a repository not every reader of the
-/// page's repository reads (or whose readers are not known right now).
+/// page's repository reads (or whose readers are not known right now). Or,
+/// under `reflection.backup_sources: full`, that such a source refuses
+/// nothing and the page goes to the repository in full: its readers are
+/// named among the page's, with no reason of their own.
 #[derive(Debug, Clone, Copy, Default)]
 struct BackupGap {
     not_on_github: bool,
     narrower_repository: bool,
+    backed_up_in_full: bool,
 }
 
 /// The question a person is asked before `texts` (section texts) drawn from
@@ -433,6 +439,14 @@ impl Engine {
         let Some(disclosure) = disclosure else {
             return Ok(false);
         };
+        // Under `hold_back` the backup holds such a page back whoever
+        // agreed: the person was never asked about the repository.
+        if reach == Reach::Backup
+            && self.backup_sources() == BackupSources::HoldBack
+            && self.leaves_repository(page, source).await?
+        {
+            return Ok(false);
+        }
         if self.repository_half_counts(reach)
             && self.leaves_repository(page, source).await?
             && !self.backup_still_confirmed(page, source, disclosure).await
@@ -550,13 +564,19 @@ impl Engine {
         let repository_half = self.repository_half_counts(Reach::Rule);
         for source in sources {
             // Under `full` and `hold_back` the repository half refuses
-            // nothing, so the question names no gap there.
+            // nothing, so the question names no gap there. Under `full`
+            // the page still reaches the repository's readers, so they are
+            // named; under `hold_back` the backup leaves it out.
             if repository_half {
                 if self.on_github(page) && !self.on_github(source) {
                     gap.not_on_github = true;
                 } else if self.leaves_repository(page, source).await? {
                     gap.narrower_repository = true;
                 }
+            } else if self.backup_sources() == BackupSources::Full
+                && self.leaves_repository(page, source).await?
+            {
+                gap.backed_up_in_full = true;
             }
             if let Some(access) = self.domain_access.get() {
                 accounts_wide |= !access
@@ -574,7 +594,7 @@ impl Engine {
             sources,
             readers.as_ref().filter(|_| accounts_wide),
             repo.as_deref()
-                .filter(|_| gap.not_on_github || gap.narrower_repository)
+                .filter(|_| gap.not_on_github || gap.narrower_repository || gap.backed_up_in_full)
                 .map(|repo| (repo, gap)),
             texts,
         );
@@ -901,6 +921,7 @@ mod tests {
                 BackupGap {
                     not_on_github: true,
                     narrower_repository: false,
+                    backed_up_in_full: false,
                 },
             )),
             &["## Team\n\nFive people.".to_string()],
@@ -936,6 +957,7 @@ mod tests {
                 BackupGap {
                     not_on_github: false,
                     narrower_repository: true,
+                    backed_up_in_full: false,
                 },
             )),
             &["## Team\n\nFive people.".to_string()],

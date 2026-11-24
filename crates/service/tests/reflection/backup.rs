@@ -1467,6 +1467,72 @@ async fn a_confirmed_local_source_names_the_repository_and_is_backed_up() {
     assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
 }
 
+/// A private local domain's text shared on purpose onto a page backed up
+/// to GitHub, under `reflection.backup_sources` `full` and `hold_back`. The
+/// accounts half asks the person. Under `full` the question names the
+/// repository too, since the page goes there in full. Under `hold_back` it
+/// does not, and the yes lifts no hold: the page is served and stays off
+/// the backup, with no queue item.
+#[tokio::test]
+async fn a_confirmed_private_local_source_follows_backup_sources() {
+    for sources in [BackupSources::Full, BackupSources::HoldBack] {
+        let mock = Arc::new(MockProvider::new());
+        main_commit(&mock);
+        let (fx, auth) = home_beside_harbor_with(mock.clone(), false, Some(sources)).await;
+        auth.set_domain_visibility("harbor", true, "keeper")
+            .await
+            .unwrap();
+        let ask = fx
+            .engine
+            .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
+            .await
+            .unwrap()
+            .expect("a private source on a shared page is a question");
+        assert_eq!(
+            ask.question.contains("GitHub repository acme/kb"),
+            sources == BackupSources::Full,
+            "{sources:?}: {}",
+            ask.question
+        );
+        assert!(
+            !ask.question.contains("not shared through GitHub"),
+            "{}",
+            ask.question
+        );
+        let mut confirmed = citing_harbor("wide.md");
+        confirmed.disclosed = Some(ask.basis);
+        fx.engine
+            .write_reflection(&confirmed, &agent())
+            .await
+            .unwrap();
+        assert!(fx.root.join("reflections/wide.md").exists());
+        assert!(too_wide_items(&fx).await.is_empty(), "{sources:?}");
+        fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+        fx.engine
+            .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+            .await;
+        let head = mock
+            .branch_commit(BACKUP_BRANCH)
+            .map(|commit| mock.commit_paths(&commit))
+            .unwrap_or_default();
+        let held = sources == BackupSources::HoldBack;
+        assert_eq!(
+            head.contains(&"reflections/wide.md".to_string()),
+            !held,
+            "{sources:?}: {head:?}"
+        );
+        assert_eq!(
+            fx.engine.reflection_backup_held_back("eng"),
+            if held {
+                vec!["wide.md".to_string()]
+            } else {
+                Vec::new()
+            },
+            "{sources:?}"
+        );
+    }
+}
+
 /// Under `reflection.backup_sources: refuse` a run on a domain backed up to
 /// GitHub reads no domain that is not connected to GitHub, though the
 /// accounts would let it: its pages go to a repository whose readers are
