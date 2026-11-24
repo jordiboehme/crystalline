@@ -50,6 +50,8 @@ Every download is verified before it is used, and a failed check stops the updat
 
 Downloads go to `~/.cache/crystalline/updates/<tag>/` on macOS and Linux (`XDG_CACHE_HOME` moves it) and to `%LOCALAPPDATA%\crystalline\updates\<tag>\` on Windows. The folder of the release you install stays until a newer one was downloaded and verified. A lock file in `updates/` keeps two runs apart.
 
+Going back to a version older than 0.35.0 takes a step first, on a workstation too. 0.35.0 raises the index ledger (v32 on Turso, v35 on PostgreSQL), and an older binary refuses that index and its own `crystalline reindex --wipe` refuses it as well. The steps for both backends are under "Going back to an older version" in [Run on PostgreSQL](#run-on-postgresql); on a workstation only the Turso part applies, on `index.db` in the state folder.
+
 ### Homebrew
 
 `crystalline update now` runs `brew upgrade jordiboehme/tap/crystalline` after you said yes, then reads the version Homebrew installed. It says "upgraded to <version>", or fails with "brew did not upgrade (tap not refreshed?)" when `brew upgrade` ended without a new version: run `brew update` and try again. By hand, run the same `brew upgrade` command. The next `crystalline` command or agent session hands the daemon over to the new version ([Daemon lifecycle](#daemon-lifecycle)).
@@ -480,7 +482,7 @@ DELETE FROM auth_schema_migration WHERE version IN (2, 3);
 
 With `database.schema` set, name each table in that schema, for example `team_a.invites` and `team_a.auth_schema_migration`. On Turso an older binary ignores the new tables in `web-auth.db`.
 
-0.35.0 also raises the index ledger, `schema_migration`, to v35 on PostgreSQL and to v32 on Turso. The new table `reflection_reconcile` keeps when each Reflection page was last checked, and `reflection_covered` keeps the engrams a page with a freshness cited and later dropped, which still count as reflected. A binary older than 0.35.0 refuses this index on both backends with "this index was upgraded by a newer Crystalline", and its `crystalline reindex --wipe` refuses it too. To go back, stop every instance, then drop the tables and their ledger rows. Only the last-checked times and the dropped engrams are lost: each page then counts as checked when it last changed, and an engram no page cites now shows as unreflected again.
+0.35.0 also raises the index ledger, `schema_migration`, to v35 on PostgreSQL and to v32 on Turso. The new table `reflection_reconcile` keeps when each Reflection page was last checked, and `reflection_covered` keeps the engrams a page with a freshness cited and later dropped, which still count as reflected. A binary older than 0.35.0 refuses this index on both backends with "this index was upgraded by a newer Crystalline", and its `crystalline reindex --wipe` refuses it too. To go back, stop every instance, then drop the tables and their ledger rows. Only the last-checked times and the dropped engrams are lost: each page then counts as checked when it last changed, and an engram no page cites now shows as unreflected again. A `crystalline reindex --wipe` on 0.35.0 empties both tables in the same way.
 
 ```sql
 DROP TABLE reflection_covered;
