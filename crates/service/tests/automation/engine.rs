@@ -1596,6 +1596,18 @@ async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
         "claude-code/2.0 for agent:curator",
         false,
     );
+    // A pact a person wrote, which the agent's write must leave as it is.
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                markdown: Some("# Pact\n\nPlain words.\n".into()),
+                ..pact.clone()
+            },
+            &ReflectionCaller::owner(),
+        )
+        .await
+        .unwrap();
+    let pact_before = std::fs::read_to_string(fx.root.join("reflections/PACT.md")).unwrap();
     step(&fx, &curator, "answer", &thread, "Yes, still true.").await;
     let written = fx.engine.write_reflection(&page, &curator).await.unwrap();
     assert!(written.get("path").is_some(), "{written}");
@@ -1604,6 +1616,7 @@ async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
         .write_reflection(&pact, &curator)
         .await
         .unwrap_err();
+    assert!(matches!(refused, EngineError::Forbidden(_)), "{refused}");
     assert!(refused.to_string().contains("pact text"), "{refused}");
     // Nothing a person changed waits to be settled, but the right is there:
     // whatever the answer, it is no refusal of the right.
@@ -1612,9 +1625,9 @@ async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
     }
     let text = std::fs::read_to_string(fx.root.join("reflections/d.md")).unwrap();
     assert!(text.contains("runbooks/deploy"), "{text}");
-    let pact_text =
-        std::fs::read_to_string(fx.root.join("reflections/PACT.md")).unwrap_or_default();
-    assert!(!pact_text.contains("Keep it short."), "{pact_text}");
+    let pact_text = std::fs::read_to_string(fx.root.join("reflections/PACT.md"))
+        .expect("PACT.md is still there");
+    assert_eq!(pact_text, pact_before, "PACT.md is as the person wrote it");
 }
 
 /// An agent takes a lease only where its loop has work: nothing due is

@@ -1161,20 +1161,39 @@ pub(crate) fn unattended_delete_refusal(inner: &str) -> String {
 
 /// The refusal of a page's `freshness` or `follows` change by an unattended
 /// session ([`Engine::is_unattended`]): a curator decides how often a page
-/// is reconciled and which pact it follows.
-pub(crate) fn unattended_settings_refusal(inner: &str) -> String {
-    format!(
-        "an unattended session does not change a page's freshness or follows; send them as they are stored or leave them out of '{inner}', and a curator changes them in Fluid or in an attended session"
-    )
+/// is reconciled and which pact it follows. `new` is a page the write
+/// would create, which has nothing stored to send back.
+pub(crate) fn unattended_settings_refusal(inner: &str, new: bool) -> String {
+    if new {
+        format!(
+            "an unattended session does not set freshness or follows on a new page; leave them out of '{inner}', and a curator sets them in Fluid or in an attended session"
+        )
+    } else {
+        format!(
+            "an unattended session does not change a page's freshness or follows; send them as they are stored or leave them out of '{inner}', and a curator changes them in Fluid or in an attended session"
+        )
+    }
 }
 
 /// The refusal of a pact file's write (`PACT.md` or a page pact) by an
 /// unattended session ([`Engine::is_unattended`]): a run answers what asks
-/// for a pact change in its thread, and a curator changes the pact.
-pub(crate) fn unattended_pact_refusal(inner: &str) -> String {
-    format!(
-        "an unattended session does not write pact text; '{inner}' stays as it is: answer the feedback in its thread, and a curator changes the pact in Fluid or in an attended session"
-    )
+/// for a pact change in its thread, and a curator changes the pact. `new`
+/// is a pact file the write would create.
+pub(crate) fn unattended_pact_refusal(inner: &str, new: bool) -> String {
+    if new {
+        let what = if r::pact_page_of(inner).is_some() {
+            "a page pact"
+        } else {
+            "the pact"
+        };
+        format!(
+            "an unattended session does not create {what}, as pact text is a curator's; '{inner}' is not written: ask for it in a thread, and a curator creates it in Fluid or in an attended session"
+        )
+    } else {
+        format!(
+            "an unattended session does not write pact text; '{inner}' stays as it is: answer the feedback in its thread, and a curator changes the pact in Fluid or in an attended session"
+        )
+    }
 }
 
 /// The refusal of a move by an unattended session that would take the
@@ -1818,7 +1837,10 @@ impl Engine {
         // settles a pact and answers its threads, and writes none of it,
         // not even the text it holds.
         if r::is_pact_file(&p.path) && self.is_unattended(caller) {
-            return Err(EngineError::Forbidden(unattended_pact_refusal(&p.path)));
+            let new = !access.abs(&p.path).exists();
+            return Err(EngineError::Forbidden(unattended_pact_refusal(
+                &p.path, new,
+            )));
         }
         // Rule 7: the whole page, one section of it, or (sources alone) the
         // stored page as it stands, curated by the sources named.
@@ -2821,7 +2843,10 @@ impl Engine {
                     Some(value) => Some(value),
                 };
                 if after != before {
-                    return Err(EngineError::Forbidden(unattended_settings_refusal(&p.path)));
+                    return Err(EngineError::Forbidden(unattended_settings_refusal(
+                        &p.path,
+                        current.is_none(),
+                    )));
                 }
             }
         }

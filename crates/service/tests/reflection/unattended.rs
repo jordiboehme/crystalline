@@ -4,6 +4,7 @@
 //! and `follows`. It still writes the page, sets its status, creates owned
 //! pages, retires and restores.
 
+use crystalline_core::reflection as r;
 use crystalline_service::params::{PageSettingsChange, WriteReflectionParams};
 use crystalline_service::read_limit::{Limit, within};
 use crystalline_service::{EngineError, ReflectionCaller};
@@ -138,7 +139,28 @@ async fn an_unattended_session_does_not_change_freshness_or_follows() {
         for (what, path, text) in tries {
             let refused = run.write(&fx, &write(path, &text)).await.unwrap_err();
             settings_refused(&refused, &run, what);
+            // A new page is told so: there is nothing stored to send back.
+            let new = path == "guides/new.md";
+            assert_eq!(
+                refused.to_string().contains("on a new page"),
+                new,
+                "{} {what}: {refused}",
+                run.name()
+            );
         }
+        // An owned page takes no freshness either: the run leaves it out.
+        let refused = run
+            .write(
+                &fx,
+                &WriteReflectionParams {
+                    owner: Some("guides/b.md".into()),
+                    ..write("guides/b/owned.md", &page("freshness: 1d\n"))
+                },
+            )
+            .await
+            .unwrap_err();
+        settings_refused(&refused, &run, "an owned page's freshness");
+        assert!(file(&fx, "guides/b/owned.md").is_none(), "{}", run.name());
         assert_eq!(file(&fx, "guides/a.md").as_deref(), Some(stored.as_str()));
         assert!(file(&fx, "guides/new.md").is_none(), "{}", run.name());
 
@@ -355,13 +377,33 @@ async fn an_unattended_session_does_not_write_pact_text() {
         for (what, p) in tries {
             let refused = run.write(&fx, &p).await.unwrap_err();
             pact_refused(&refused, &run, what);
+            // A new pact is told it is not created; an existing one stays.
+            let new = p.path == "guides/b.pact.md";
+            assert_eq!(
+                refused.to_string().contains("does not create a page pact"),
+                new,
+                "{} {what}: {refused}",
+                run.name()
+            );
         }
         assert!(file(&fx, "guides/b.pact.md").is_none(), "{}", run.name());
         // Another letter case names the pact too, and is refused before
         // anything is read.
-        run.write(&fx, &write("pact.md", "# Pact\n\n## Tone\n\nLoud.\n"))
+        let refused = run
+            .write(&fx, &write("pact.md", "# Pact\n\n## Tone\n\nLoud.\n"))
             .await
             .unwrap_err();
+        assert!(matches!(refused, EngineError::Invalid(_)), "{refused}");
+        assert!(refused.to_string().contains("PACT.md"), "{refused}");
+        let names: Vec<String> = std::fs::read_dir(fx.root.join("reflections"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "pact.md"),
+            "{}: {names:?}",
+            run.name()
+        );
 
         let refused = run
             .write(
@@ -404,6 +446,23 @@ async fn an_unattended_session_settles_and_answers_on_a_pact() {
         run.write(&fx, &act("settle", "PACT.md"))
             .await
             .unwrap_or_else(|e| panic!("{name} settle: {e}"));
+        // Settle with sections too: it writes the bookkeeping, never pact
+        // prose.
+        let tone = r::split_sections(&file(&fx, "guides/a.pact.md").unwrap())
+            .into_iter()
+            .find(|s| s.heading.contains("Tone"))
+            .and_then(|s| s.id)
+            .expect("the Tone section has an id");
+        run.write(
+            &fx,
+            &WriteReflectionParams {
+                sections: vec![tone],
+                outcome: Some("kept".into()),
+                ..act("settle", "guides/a.pact.md")
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name} settle with sections: {e}"));
         let opened = fx
             .engine
             .discuss(
