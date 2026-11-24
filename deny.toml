@@ -19,6 +19,7 @@ unmaintained = "workspace"
 # reason text: { id = "RUSTSEC-YYYY-NNNN", reason = "YYYY-MM-DD: why" }.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "2026-09-30: rsa (Marvin attack) comes in through openidconnect, which uses it only to verify identity provider signatures with public keys; the timing leak needs private-key decryption or signing with rsa on a server, which Crystalline never does (the GitHub App token is signed with aws-lc-rs, not rsa), and the fixed rsa 0.10 is not taken by openidconnect 4.1.0 yet (it still requires rsa 0.9); the test identity provider (dev dependency) already uses the fixed rsa 0.10" },
+    { id = "RUSTSEC-2026-0594", reason = "2026-11-24: cookie comes in through axum-extra's cookie feature with only cookie's default features, so the private (encrypted) cookie code the advisory is about is not compiled, and Crystalline never forks; the only fixed line is cookie 0.19, still a release candidate that axum-extra 0.12 does not take (Jordi's decision)" },
 ]
 
 [licenses]
