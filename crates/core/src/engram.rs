@@ -42,6 +42,7 @@ pub const RECOMMENDED_STATUSES: &[&str] = &[
     "proposed",
     "idea",
     "poc",
+    "open",
     "deprecated",
     "superseded",
     "archived",

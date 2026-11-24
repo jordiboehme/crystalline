@@ -102,8 +102,9 @@ pub struct WriteParams {
     #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
     /// Lifecycle `status`. Defaults to `stable`. Recommended values: stable,
-    /// implemented, draft, proposed, idea, poc, deprecated, superseded, archived,
-    /// legacy (guidance so an agent can tell an idea apart from settled fact).
+    /// implemented, draft, proposed, idea, poc, open, deprecated, superseded,
+    /// archived, legacy (guidance so an agent can tell an idea apart from
+    /// settled fact).
     /// `current` is the legacy alias for `stable` and means the same thing; a
     /// status filter on either word matches engrams carrying either.
     #[serde(default)]

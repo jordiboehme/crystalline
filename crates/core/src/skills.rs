@@ -123,20 +123,26 @@ pub fn skill(name: &str) -> Option<&'static SkillAsset> {
 mod tests {
     use super::*;
 
-    /// The intelligence skill names tentative knowledge and lets the person
-    /// choose, in the approved wording (only the backticks are formatting).
+    /// The approved rule on tentative knowledge, word for word. The skills
+    /// may add backticks around the status words and the categories.
+    const TENTATIVE_RULE: &str = "Knowledge can be tentative: an engram whose status is draft, proposed, idea, poc or open, or whose observations are [idea] or [question]. Tentative knowledge is not decided, but it can be worth building on. When it shapes an answer, a spec or a plan, name it as tentative and let your person choose: build on it, treat it as an option, or leave it out. When you build on it, say so in what you write (for example \"assumes the proposal X\"), so it can be checked again once X is decided or dropped.";
+
+    /// Both skills that carry the read-side behaviour name tentative
+    /// knowledge in the approved wording: the routing skill, which harnesses
+    /// install, and the intelligence skill, which Claude Desktop installs.
     #[test]
-    fn the_intelligence_skill_names_tentative_knowledge() {
-        let body = skill("crystalline-intelligence").unwrap().content;
-        let plain = body.replace('`', "");
-        assert!(
-            plain.contains("Knowledge can be tentative: an engram whose status is draft, proposed, idea, poc or open, or whose observations are [idea] or [question]. Tentative knowledge is not decided, but it can be worth building on. When it shapes an answer, a spec or a plan, name it as tentative and let your person choose: build on it, treat it as an option, or leave it out. When you build on it, say so in what you write (for example \"assumes the proposal X\"), so it can be checked again once X is decided or dropped."),
-            "{body}"
-        );
-        assert!(
-            body.contains("it returns each node's title, type, `status` and `tags`"),
-            "{body}"
-        );
+    fn the_routing_and_intelligence_skills_name_tentative_knowledge() {
+        for name in ["crystalline-routing", "crystalline-intelligence"] {
+            let body = skill(name).unwrap().content;
+            assert!(
+                body.replace('`', "").contains(TENTATIVE_RULE),
+                "{name}: {body}"
+            );
+            assert!(
+                body.contains("each node's title, type, `status` and `tags`"),
+                "{name}: {body}"
+            );
+        }
     }
 
     /// The collaboration skill says what to offer after a refused direct

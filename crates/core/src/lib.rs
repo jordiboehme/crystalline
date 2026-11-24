@@ -159,4 +159,13 @@ mod tests {
         assert!(RECOMMENDED_TYPES.contains(&"engram"));
         assert!(RECOMMENDED_STATUSES.contains(&"current"));
     }
+
+    /// Every tentative status is a recommended one, so the write_engram
+    /// description suggests it and verify's `T002` stays quiet about it.
+    #[test]
+    fn every_tentative_status_is_recommended() {
+        for status in TENTATIVE_STATUSES {
+            assert!(RECOMMENDED_STATUSES.contains(&status), "{status}");
+        }
+    }
 }

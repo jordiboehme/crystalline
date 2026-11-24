@@ -1961,3 +1961,32 @@ fn a_heading_fragment_is_checked_by_its_target_and_quoted_with_it() {
     // A link to a heading of the engram itself is no self-link.
     assert!(messages("L004").is_empty(), "{:#?}", report.issues);
 }
+
+/// `open` is in the recommended status set, so verify notes nothing about
+/// it; a word outside the set still draws the `T002` note.
+#[test]
+fn an_open_status_draws_no_t002() {
+    let dir = tempdir().unwrap();
+    for (name, status) in [("open-question", "open"), ("odd", "pondering")] {
+        write(
+            dir.path(),
+            &format!("{name}.md"),
+            &format!(
+                "---\ntype: engram\ntitle: {name}\npermalink: {name}\ntags:\n- moons\nstatus: {status}\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# {name}\n\nWhich of the two small moons of Mars formed first is not known.\nBoth may be captured asteroids, or debris from one impact.\n"
+            ),
+        );
+    }
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let t002: Vec<String> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule == "T002")
+        .map(|i| i.message.clone())
+        .collect();
+    assert_eq!(
+        t002,
+        ["status `pondering` is outside the recommended set"],
+        "{:#?}",
+        report.issues
+    );
+}
