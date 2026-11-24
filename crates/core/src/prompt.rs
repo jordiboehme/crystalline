@@ -457,7 +457,7 @@ fn render_routing_body(
 ) {
     render_domain_lines(output, bullet_cap, empty_line, out);
     out.push('\n');
-    render_behavior_block(output, out);
+    render_behavior_block(output, false, out);
 }
 
 /// One routing line per domain, bullets joined with `; ` and capped at
@@ -500,16 +500,30 @@ fn render_domain_lines(
     }
 }
 
-/// The fixed `Behavior:` block, identical across both renderers: it drops the
+/// The fixed `Behavior:` block, shared by both renderers: it drops the
 /// write-tools line in read-only mode and always points at
 /// `list_domains include_routing=true` as the mid-session re-fetch, so neither
-/// caller has to restate either rule.
-fn render_behavior_block(output: &PromptOutput, out: &mut String) {
+/// caller has to restate either rule. `budgeted` is the MCP `instructions`
+/// channel, held to [`INSTRUCTIONS_BUDGET`]: it leaves out
+/// [`TENTATIVE_BULLET`], the one rule that would cost the domain lines their
+/// room. Every other rule is the same in both.
+fn render_behavior_block(output: &PromptOutput, budgeted: bool, out: &mut String) {
     out.push_str("Behavior:\n");
     for bullet in behavior_bullets(output.read_only) {
+        if budgeted && bullet == TENTATIVE_BULLET {
+            continue;
+        }
         let _ = writeln!(out, "- {bullet}");
     }
 }
+
+/// The behavior rule on tentative knowledge, in short. It is in the hook
+/// block ([`render_text`]) and in the `list_domains` behavior list, never in
+/// the MCP `instructions` ([`render_instructions`]): there its bytes would
+/// push the domain lines down to the count line for a registry of two
+/// domains. The full rule, with observations and what to write when building
+/// on it, is in the routing and intelligence skills.
+pub const TENTATIVE_BULLET: &str = "Status draft, proposed, idea, poc or open is tentative: name it so and let your person choose.";
 
 /// The behavior rules an agent follows when working with this server's tools,
 /// one string per rule, without the leading `- ` and without a trailing
@@ -529,8 +543,9 @@ fn render_behavior_block(output: &PromptOutput, out: &mut String) {
 /// This is the single source of the rule set: `render_routing_body` renders
 /// it as the Behavior block of both onboarding renderers, and the MCP
 /// `list_domains` response returns it verbatim for remote clients that never
-/// see the initialize instructions. Both paths therefore teach exactly the
-/// same rules and the set can never drift between them.
+/// see the initialize instructions. Both paths therefore teach the same rules
+/// and the set can never drift between them, with one deliberate exception:
+/// the budgeted MCP `instructions` leave out [`TENTATIVE_BULLET`].
 pub fn behavior_bullets(read_only: bool) -> Vec<String> {
     let mut bullets = vec![
         "Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess."
@@ -567,6 +582,7 @@ pub fn behavior_bullets(read_only: bool) -> Vec<String> {
     bullets.push(
         "build_context on a crystalline:// anchor gathers knowledge around a task.".to_string(),
     );
+    bullets.push(TENTATIVE_BULLET.to_string());
     bullets.push(
         "Read a MANIFEST with read_engram only when the routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session."
             .to_string(),
@@ -658,7 +674,7 @@ fn instructions_head(output: &PromptOutput) -> String {
         head.push_str(SKILLS_HINT);
         head.push_str("\n\n");
     }
-    render_behavior_block(output, &mut head);
+    render_behavior_block(output, true, &mut head);
     head.push('\n');
     head.push_str("Domains:\n");
     head
@@ -1249,6 +1265,56 @@ mod tests {
                 .any(|b| b.contains("read-only and curated externally")),
             "the curated sentence follows the two rules: {read_only:?}"
         );
+    }
+
+    /// The tentative rule is in the hook block and the `list_domains` list in
+    /// both modes, and never in the budgeted MCP instructions: a change that
+    /// moves it there (or drops it from the other two) has to look here.
+    #[test]
+    fn the_tentative_rule_is_in_the_hook_block_and_list_domains_but_not_the_instructions() {
+        assert_eq!(
+            TENTATIVE_BULLET,
+            "Status draft, proposed, idea, poc or open is tentative: name it so and let your person choose."
+        );
+        for status in crate::TENTATIVE_STATUSES {
+            assert!(TENTATIVE_BULLET.contains(status), "{status}");
+        }
+        let line = format!("- {TENTATIVE_BULLET}\n");
+        let (_tmp, global) = fixture();
+        for read_only in [false, true] {
+            assert!(
+                behavior_bullets(read_only)
+                    .iter()
+                    .any(|b| b == TENTATIVE_BULLET),
+                "read_only={read_only}: list_domains behavior"
+            );
+            let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+            output.read_only = read_only;
+            let hook = render_text(&output);
+            assert!(hook.contains(&line), "read_only={read_only} hook:\n{hook}");
+            for (channel, text) in [
+                ("render_instructions", render_instructions(&output)),
+                (
+                    "render_counted_instructions",
+                    render_counted_instructions(&output),
+                ),
+            ] {
+                assert!(
+                    !text.contains(TENTATIVE_BULLET),
+                    "read_only={read_only} {channel}:\n{text}"
+                );
+                // Every other rule is there, in the same order.
+                let expected: String = behavior_bullets(read_only)
+                    .iter()
+                    .filter(|b| *b != TENTATIVE_BULLET)
+                    .map(|b| format!("- {b}\n"))
+                    .collect();
+                assert!(
+                    text.contains(&format!("Behavior:\n{expected}")),
+                    "read_only={read_only} {channel}:\n{text}"
+                );
+            }
+        }
     }
 
     /// Scaffold `count` file domains, each with `bullets_per_domain` routing

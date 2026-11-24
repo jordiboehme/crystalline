@@ -18,4 +18,5 @@ Behavior:
 - Check vocabulary for tags and categories in use before inventing one.
 - Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge, raise it when one proves key.
 - build_context on a crystalline:// anchor gathers knowledge around a task.
+- Status draft, proposed, idea, poc or open is tentative: name it so and let your person choose.
 - Read a MANIFEST with read_engram only when the routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session.
