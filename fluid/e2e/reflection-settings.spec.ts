@@ -114,6 +114,10 @@ test("a curator sets a page's freshness, makes its pact, retires, restores and d
     await panel.getByRole("button", { name: "Retire" }).click();
     const banner = page.getByRole("note", { name: "Retired" });
     await expect(banner).toHaveText(/^Retired/);
+    // The pressed button is gone: the focus is on the one that replaced it.
+    await expect(
+      panel.getByRole("button", { name: "Restore", exact: true }),
+    ).toBeFocused();
     await page.goto(`d/${DOMAIN}/reflection`);
     const nav = page.getByRole("navigation", {
       name: `Reflection of ${DOMAIN}`,
@@ -132,6 +136,8 @@ test("a curator sets a page's freshness, makes its pact, retires, restores and d
     await nav.getByRole("link", { name: title }).click();
     await banner.getByRole("button", { name: "Restore", exact: true }).click();
     await expect(banner).toHaveCount(0);
+    // The banner went with its button: the column's Retire takes the focus.
+    await expect(panel.getByRole("button", { name: "Retire" })).toBeFocused();
 
     // Delete: the first press asks, Keep gives the press back, and the
     // second press means it.

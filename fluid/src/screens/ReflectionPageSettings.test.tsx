@@ -281,13 +281,68 @@ describe("the page details column", () => {
     serve("edit");
     renderApp(URL);
     const panel = await details();
+    // In words, as the form says them.
     expect(within(panel).getByText("Freshness").nextSibling).toHaveTextContent(
-      "1d",
+      /^1 day$/,
     );
     expect(within(panel).getByText("Not set")).toBeVisible();
     expect(within(panel).getByText("None")).toBeVisible();
     expect(within(panel).queryByRole("button")).toBeNull();
     expect(within(panel).queryByRole("combobox")).toBeNull();
+    // The section is named once, by its heading.
+    const section = within(panel).getByRole("region", {
+      name: "Page settings",
+    });
+    expect(section).not.toHaveAttribute("aria-label");
+    expect(section).toHaveAttribute(
+      "aria-labelledby",
+      within(section).getByRole("heading", { name: "Page settings" }).id,
+    );
+  });
+
+  it("says a custom freshness in words too", async () => {
+    for (const [written, said] of [
+      ["3m", "3 months"],
+      ["2w", "2 weeks"],
+      ["12h", "12 hours"],
+      ["1y", "1 year"],
+      ["5", "5 days"],
+      ["soon", "soon"],
+    ]) {
+      serve("edit", { [DOC]: () => doc(view({ freshness: written })) });
+      const shown = renderApp(URL);
+      const panel = await details();
+      expect(
+        within(panel).getByText("Freshness").nextSibling,
+      ).toHaveTextContent(new RegExp(`^${said}$`));
+      shown.unmount();
+    }
+  });
+
+  it("keeps the freshness when Custom is picked with an empty field", async () => {
+    serve("curate", {
+      "/domains/eng/reflection/settings": () => ({
+        domain: "eng",
+        path: PAGE,
+        checksum: "c2",
+        page: view(),
+      }),
+    });
+    renderApp(URL);
+    const panel = await details();
+    await userEvent.selectOptions(
+      within(panel).getByRole("combobox", { name: "Freshness" }),
+      "custom",
+    );
+    const save = within(panel).getByRole("button", { name: "Save settings" });
+    expect(save).toHaveAttribute("aria-disabled", "true");
+    await userEvent.type(
+      within(panel).getByRole("textbox", { name: "Custom freshness" }),
+      "  ",
+    );
+    expect(save).toHaveAttribute("aria-disabled", "true");
+    await userEvent.click(save);
+    expect(sent("PATCH", "/domains/eng/reflection/settings")).toEqual([]);
   });
 
   it("lets a curator pick a preset and sends only that", async () => {
@@ -448,6 +503,49 @@ describe("the page details column", () => {
       expect(sent("POST", "/domains/eng/reflection/retire")).toEqual([
         { path: PAGE },
       ]);
+    });
+  });
+
+  it("hands focus to the new button after a retire and after a restore from the banner", async () => {
+    let retired = false;
+    serve("curate", {
+      [DOC]: () =>
+        doc(
+          retired
+            ? view({ retired: { at: null, by: null, was_owned_by: null } })
+            : view(),
+        ),
+      "/domains/eng/reflection/clock": () => ({ clock: null, checksum: "c1" }),
+      "/domains/eng/reflection/retire": () => {
+        retired = true;
+        return { domain: "eng", path: PAGE, retired: true };
+      },
+      "/domains/eng/reflection/restore": () => {
+        retired = false;
+        return { domain: "eng", path: PAGE, restored: true };
+      },
+    });
+    renderApp(URL);
+    const panel = await details();
+    await userEvent.click(
+      within(panel).getByRole("button", { name: "Retire" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(panel).getByRole("button", { name: "Restore" }),
+      ).toHaveFocus();
+    });
+    const banner = screen.getByRole("note", { name: "Retired" });
+    await userEvent.click(
+      within(banner).getByRole("button", { name: "Restore" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("note", { name: "Retired" })).toBeNull();
+    });
+    await waitFor(() => {
+      expect(
+        within(panel).getByRole("button", { name: "Retire" }),
+      ).toHaveFocus();
     });
   });
 

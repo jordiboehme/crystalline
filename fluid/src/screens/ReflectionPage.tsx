@@ -315,6 +315,12 @@ function PageBody({
 }): ReactElement {
   const [deleted, setDeleted] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // After a retire or a restore: the retired state the page will show, so
+  // the details column hands the focus to its new button once it does.
+  const [lifecycleFocus, setLifecycleFocus] = useState<boolean | null>(null);
+  const lifecycleFocused = useCallback(() => {
+    setLifecycleFocus(null);
+  }, []);
   const moreRef = useRef<HTMLButtonElement | null>(null);
   const skipRefocus = useRef(false);
   const confirmRef = useRef<HTMLDivElement | null>(null);
@@ -356,21 +362,7 @@ function PageBody({
       });
     }
   }, [clockNewer, clockChecksum, docChecksum, queryClient, domain, path]);
-  // The clock's seconds are relative to its read: a minute tick ages them,
-  // and asks nothing of the server.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => {
-      setNow(Date.now());
-    }, 60_000);
-    return () => {
-      clearInterval(id);
-    };
-  }, []);
-  const elapsed =
-    clock.dataUpdatedAt === 0
-      ? 0
-      : Math.max(0, Math.floor((now - clock.dataUpdatedAt) / 1000));
+
   useHeadingFocusRequest(doc.data !== undefined);
   usePageTitle(doc.error ? null : doc.data?.title);
   const remove = useMutation({
@@ -605,7 +597,7 @@ function PageBody({
         domain={domain}
         page={page.page}
         clock={clock.data?.clock ?? null}
-        elapsed={elapsed}
+        readAt={clock.dataUpdatedAt}
         curator={curate}
       />
     );
@@ -760,6 +752,7 @@ function PageBody({
               remove.mutate();
             }}
             deleting={remove.isPending}
+            onLifecycleChanged={setLifecycleFocus}
           />
         )}
         {tickProblem !== null && (
@@ -842,6 +835,9 @@ function PageBody({
               remove.mutate();
             }}
             deleting={remove.isPending}
+            focusWhenRetired={lifecycleFocus}
+            onLifecycleChanged={setLifecycleFocus}
+            onLifecycleFocused={lifecycleFocused}
           />
         )}
         <ReflectionThreads

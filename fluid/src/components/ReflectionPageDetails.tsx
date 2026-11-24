@@ -21,7 +21,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ReactElement, ReactNode } from "react";
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
@@ -65,6 +65,29 @@ export const CUSTOM_FRESHNESS_HELP =
 
 const STEP = `rounded underline-offset-[3px] ${CHROME_LINK} ${FOCUS_RING}`;
 
+const UNITS: Readonly<Record<string, readonly [string, string]>> = {
+  h: ["hour", "hours"],
+  d: ["day", "days"],
+  w: ["week", "weeks"],
+  m: ["month", "months"],
+  y: ["year", "years"],
+};
+
+/**
+ * A freshness in words, as the form's presets say them: "1 day", "6 hours",
+ * "3 months" (`m` is months), a bare number in days. Anything else as
+ * written.
+ */
+function freshnessWords(value: string): string {
+  const read = /^\s*(\d+)\s*([hdwmy])?\s*$/i.exec(value);
+  const unit = UNITS[(read?.[2] ?? "d").toLowerCase()];
+  if (read === null || unit === undefined) {
+    return value;
+  }
+  const count = Number(read[1]);
+  return `${String(count)} ${count === 1 ? unit[0] : unit[1]}`;
+}
+
 export interface PageDetailsProps {
   domain: string;
   path: string;
@@ -77,6 +100,16 @@ export interface PageDetailsProps {
   /** Delete the page; the page screen owns that mutation and where it leads. */
   onDelete: () => void;
   deleting: boolean;
+  /**
+   * After a retire or a restore (here or in the banner): the retired state
+   * the page will show, so the column's new button takes the focus once it
+   * does. Null when nothing waits for it.
+   */
+  focusWhenRetired?: boolean | null;
+  /** Told when a retire or a restore landed, with the state it leads to. */
+  onLifecycleChanged?: (retired: boolean) => void;
+  /** Told when the focus was handed over. */
+  onLifecycleFocused?: () => void;
 }
 
 export function ReflectionPageDetails(props: PageDetailsProps): ReactElement {
@@ -99,14 +132,20 @@ function PageSettings({
   lockedReason,
   onDelete,
   deleting,
+  focusWhenRetired = null,
+  onLifecycleChanged,
+  onLifecycleFocused,
 }: PageDetailsProps): ReactElement {
   const changes = curator && lockedReason === undefined;
+  const headingId = useId();
   // Held here: a save the server took remounts the form (its key is the
   // stored settings), and the word must outlive that.
   const [saved, setSaved] = useState(false);
   return (
-    <section aria-label="Page settings" className="flex flex-col gap-3">
-      <h2 className={RAIL_LABEL}>Page settings</h2>
+    <section aria-labelledby={headingId} className="flex flex-col gap-3">
+      <h2 id={headingId} className={RAIL_LABEL}>
+        Page settings
+      </h2>
       {changes && page.retired === null ? (
         <SettingsForm
           // A fresh form for each stored state: a save the server took
@@ -121,7 +160,11 @@ function PageSettings({
       ) : (
         <dl className="flex flex-col">
           {page.owner === null && (
-            <Row label="Freshness">{page.freshness ?? "None"}</Row>
+            <Row label="Freshness">
+              {page.freshness === null
+                ? "None"
+                : freshnessWords(page.freshness)}
+            </Row>
           )}
           <Row label="Follows">
             {page.follows === null ? (
@@ -149,6 +192,13 @@ function PageSettings({
           page={page}
           onDelete={onDelete}
           deleting={deleting}
+          focusWhenRetired={focusWhenRetired}
+          {...(onLifecycleChanged === undefined
+            ? {}
+            : { onChanged: onLifecycleChanged })}
+          {...(onLifecycleFocused === undefined
+            ? {}
+            : { onFocused: onLifecycleFocused })}
         />
       )}
     </section>
@@ -231,8 +281,12 @@ function SettingsForm({
   if (page.follows !== null && !options.some((o) => o.path === page.follows)) {
     options.unshift({ path: page.follows, title: page.follows });
   }
+  // Custom with nothing typed yet changes nothing: only None clears.
+  const keepFreshness = owned || (choice === CUSTOM && custom.trim() === "");
   const wanted = {
-    ...(owned ? {} : { freshness: choice === CUSTOM ? custom : choice }),
+    ...(keepFreshness
+      ? {}
+      : { freshness: choice === CUSTOM ? custom : choice }),
     follows,
   };
   const pending = settingsChanges(
@@ -442,14 +496,34 @@ export function PageLifecycle({
   page,
   onDelete,
   deleting,
+  focusWhenRetired = null,
+  onChanged,
+  onFocused,
 }: {
   domain: string;
   path: string;
   page: PageView;
   onDelete: () => void;
   deleting: boolean;
+  /** Take the focus onto the new button once the page shows this state. */
+  focusWhenRetired?: boolean | null;
+  onChanged?: (retired: boolean) => void;
+  onFocused?: () => void;
 }): ReactElement {
   const queryClient = useQueryClient();
+  const retireRef = useRef<HTMLButtonElement | null>(null);
+  const restoreRef = useRef<HTMLButtonElement | null>(null);
+  const isRetired = page.retired !== null;
+  // The pressed button goes with the state it changed (and the banner's
+  // with the banner), so the focus lands on the button that replaced it
+  // in the column rather than on the page's body.
+  useEffect(() => {
+    if (focusWhenRetired === null || focusWhenRetired !== isRetired) {
+      return;
+    }
+    (isRetired ? restoreRef : retireRef).current?.focus();
+    onFocused?.();
+  }, [focusWhenRetired, isRetired, onFocused]);
   const change = useMutation({
     mutationFn: (
       act: { kind: "retire" } | { kind: "restore"; owner?: string },
@@ -457,7 +531,8 @@ export function PageLifecycle({
       act.kind === "retire"
         ? retireReflection(domain, path)
         : restoreReflection(domain, path, act.owner),
-    onSuccess: () => {
+    onSuccess: (_, act) => {
+      onChanged?.(act.kind === "retire");
       invalidateReflection(queryClient, domain);
     },
   });
@@ -467,6 +542,7 @@ export function PageLifecycle({
       <div className="flex flex-wrap items-center gap-2">
         {page.retired === null ? (
           <button
+            ref={retireRef}
             type="button"
             disabled={change.isPending}
             onClick={() => {
@@ -479,6 +555,7 @@ export function PageLifecycle({
         ) : (
           <>
             <button
+              ref={restoreRef}
               type="button"
               disabled={change.isPending}
               onClick={() => {
@@ -533,6 +610,7 @@ export function RetiredBanner({
   curator,
   onDelete,
   deleting,
+  onLifecycleChanged,
 }: {
   domain: string;
   path: string;
@@ -540,6 +618,8 @@ export function RetiredBanner({
   curator: boolean;
   onDelete: () => void;
   deleting: boolean;
+  /** Told when a restore landed, so the column takes the focus. */
+  onLifecycleChanged?: (retired: boolean) => void;
 }): ReactElement | null {
   if (page.retired === null) {
     return null;
@@ -563,6 +643,9 @@ export function RetiredBanner({
           page={page}
           onDelete={onDelete}
           deleting={deleting}
+          {...(onLifecycleChanged === undefined
+            ? {}
+            : { onChanged: onLifecycleChanged })}
         />
       )}
     </aside>

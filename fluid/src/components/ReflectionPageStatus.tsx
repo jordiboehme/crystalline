@@ -15,6 +15,7 @@
  */
 
 import type { ReactElement } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 
 import type { PageClock, PageView } from "../api/reflectionPage";
@@ -33,17 +34,33 @@ export function ReflectionPageStatus({
   domain,
   page,
   clock,
-  elapsed,
+  readAt,
   curator,
 }: {
   domain: string;
   page: PageView;
   /** The page clock; null while it loads and for a page that has none. */
   clock: PageClock | null;
-  /** Seconds since the clock was read. */
-  elapsed: number;
+  /**
+   * When the clock was read (ms since the epoch, the query's
+   * `dataUpdatedAt`); 0 before it was.
+   */
+  readAt: number;
   curator: boolean;
 }): ReactElement {
+  // The clock's seconds are relative to its read: a minute tick here ages
+  // them, asks nothing of the server and redraws only these lines.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => {
+      setNow(Date.now());
+    }, 60_000);
+    return () => {
+      clearInterval(id);
+    };
+  }, []);
+  const elapsed =
+    readAt === 0 ? 0 : Math.max(0, Math.floor((now - readAt) / 1000));
   const line = page.retired === null ? freshnessLine(clock, elapsed) : null;
   const skipped = page.retired === null ? skippedNote(clock) : null;
   const unscheduled =
