@@ -10,11 +10,12 @@
  * in place.
  */
 
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "../api/client";
+import type { MeResponse } from "../api/model";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
@@ -35,7 +36,7 @@ const apiMock = vi.mocked(api);
 function serveAs(
   role: "admin" | "editor",
   routes: Record<string, Answer> = {},
-  probe: { update_available?: string | null; version?: string } = {},
+  probe: Parameters<typeof meResponse>[0] = {},
 ) {
   apiMock.mockImplementation(
     answersFor({
@@ -82,7 +83,11 @@ describe("the Administration area", () => {
       ).not.toHaveAttribute("aria-current");
     }
     expect(screen.getByText("Crystalline 0.35.0")).toBeInTheDocument();
-    expect(screen.getByText(/No newer release is known/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "The server did not say whether its update check is on.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText(`${window.location.origin}/`)).toBeInTheDocument();
     expect(document.title).toBe("Administration - Fluid");
   });
@@ -123,7 +128,6 @@ describe("the Administration area", () => {
     );
     expect(screen.getByText("crystalline update now")).toBeInTheDocument();
   });
-
   it("moves between its pages from the navigation", async () => {
     serveAs("admin");
     renderApp("/admin/general");
@@ -205,6 +209,229 @@ describe("the Administration area", () => {
       expect(callsTo("/users")).toHaveLength(0);
       expect(callsTo("/settings/github")).toHaveLength(0);
       expect(document.title).toBe("Fluid");
+    },
+  );
+});
+
+/** The probe's `update_check`, on by default and last run three hours ago. */
+function checkState(
+  overrides: Partial<NonNullable<MeResponse["update_check"]>> = {},
+): NonNullable<MeResponse["update_check"]> {
+  return {
+    on: true,
+    off_reason: null,
+    install: "tarball",
+    last_checked: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
+    last_check: "up_to_date",
+    ...overrides,
+  };
+}
+
+/** The Updates row's text, once the page is drawn. */
+async function updatesRow(): Promise<HTMLElement> {
+  const term = await screen.findByText("Updates", { selector: "dt" });
+  const row = term.parentElement;
+  if (row === null) {
+    throw new Error("the Updates term has no row");
+  }
+  return row;
+}
+
+describe("the Updates row of the General page", () => {
+  it("says the check is on, when it last ran and that nothing is newer", async () => {
+    serveAs("admin", {}, { update_check: checkState() });
+    renderApp("/admin/general");
+
+    expect(await updatesRow()).toHaveTextContent(
+      "Update check on. Last checked 3 hours ago. No newer release.",
+    );
+  });
+
+  it("says a check that is on has not run yet", async () => {
+    serveAs(
+      "admin",
+      {},
+      {
+        update_check: checkState({ last_checked: null, last_check: null }),
+      },
+    );
+    renderApp("/admin/general");
+
+    expect(await updatesRow()).toHaveTextContent(
+      "Update check on. It has not checked yet.",
+    );
+  });
+
+  it("says when the check ran when the server sent a result it does not know", async () => {
+    serveAs(
+      "admin",
+      {},
+      // A result word from a newer server, which this page does not know.
+      { update_check: checkState({ last_check: "later" as never }) },
+    );
+    renderApp("/admin/general");
+
+    const row = await updatesRow();
+    expect(row).toHaveTextContent("Update check on. Last checked 3 hours ago.");
+    expect(row).not.toHaveTextContent("has not checked");
+    expect(row).not.toHaveTextContent("newer release");
+    expect(row).not.toHaveTextContent("failed");
+  });
+
+  it("says the last check failed", async () => {
+    serveAs(
+      "admin",
+      {},
+      { update_check: checkState({ last_check: "failed" }) },
+    );
+    renderApp("/admin/general");
+
+    expect(await updatesRow()).toHaveTextContent(
+      "Update check on. Last checked 3 hours ago. The check failed.",
+    );
+  });
+
+  it("keeps the release, its notes and its command when one is offered", async () => {
+    serveAs(
+      "admin",
+      {},
+      {
+        update_available: "0.36.0",
+        update_check: checkState({ last_check: "newer" }),
+      },
+    );
+    renderApp("/admin/general");
+
+    const row = await updatesRow();
+    expect(row).toHaveTextContent("Update check on. Last checked 3 hours ago.");
+    expect(row).not.toHaveTextContent("does not offer");
+    expect(within(row).getByText("0.36.0 is available.")).toBeInTheDocument();
+    expect(
+      within(row).getByRole("link", { name: /Release notes/ }),
+    ).toHaveAttribute(
+      "href",
+      "https://github.com/jordiboehme/crystalline/releases/tag/v0.36.0",
+    );
+    expect(within(row).getByText("crystalline update now")).toBeInTheDocument();
+  });
+
+  it("says a newer release is out but not offered, and how to see why", async () => {
+    serveAs("admin", {}, { update_check: checkState({ last_check: "newer" }) });
+    renderApp("/admin/general");
+
+    const row = await updatesRow();
+    expect(row).toHaveTextContent(
+      "A newer release is out, but this server does not offer it yet.",
+    );
+    expect(within(row).getByText("crystalline status")).toBeInTheDocument();
+    expect(within(row).queryByText(/is available/)).not.toBeInTheDocument();
+  });
+
+  it("says a check that is not turned on is off, with the command to copy", async () => {
+    const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+      Promise.resolve(),
+    );
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    serveAs(
+      "admin",
+      {},
+      {
+        update_check: checkState({
+          on: false,
+          off_reason: "not_turned_on",
+          last_checked: null,
+          last_check: null,
+        }),
+      },
+    );
+    renderApp("/admin/general");
+
+    const row = await updatesRow();
+    expect(row).toHaveTextContent(
+      /Update check off\.\s*Turn it on on the server:\s*crystalline update auto on/,
+    );
+    expect(row).not.toHaveTextContent("/etc/default/crystalline");
+    // No switch: the check is changed on the server only.
+    expect(within(row).queryByRole("switch")).not.toBeInTheDocument();
+    expect(within(row).queryByRole("checkbox")).not.toBeInTheDocument();
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Copy the command" }),
+    );
+    expect(writeText).toHaveBeenCalledWith("crystalline update auto on");
+    await waitFor(() => {
+      expect(within(row).getByRole("status")).toHaveTextContent("Copied");
+    });
+  });
+
+  it("names /etc/default/crystalline for a .deb install", async () => {
+    serveAs(
+      "admin",
+      {},
+      {
+        update_check: checkState({
+          on: false,
+          off_reason: "not_turned_on",
+          install: "deb",
+          last_checked: null,
+          last_check: null,
+        }),
+      },
+    );
+    renderApp("/admin/general");
+
+    const row = await updatesRow();
+    expect(row).toHaveTextContent("crystalline update auto on");
+    expect(row).toHaveTextContent(
+      "The crystalline service of a .deb install reads its settings from /etc/default/crystalline: set CRYSTALLINE_UPDATE_CHECK=true there, then run: sudo systemctl restart crystalline",
+    );
+  });
+
+  it.each([
+    [
+      "no_update_notifier",
+      "Update check off: NO_UPDATE_NOTIFIER is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check. If that is off too, turn it on with: crystalline update auto on",
+    ],
+    [
+      "ci",
+      "Update check off: CI is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check. If that is off too, turn it on with: crystalline update auto on",
+    ],
+    [
+      "docker",
+      "Update check off: this server runs in Docker. To update, pull the new image and start the container again.",
+    ],
+    [
+      "desktop_extension",
+      "Update check off: this is the Claude Desktop-only bundle. To update, open the newer .mcpb file by hand.",
+    ],
+    [
+      "no_state_folder",
+      "Update check off: the server has no state folder to keep a check in.",
+    ],
+  ] as const)(
+    "says why a check forced off is off: %s",
+    async (reason, text) => {
+      serveAs(
+        "admin",
+        {},
+        {
+          update_check: checkState({
+            on: false,
+            off_reason: reason,
+            last_checked: null,
+            last_check: null,
+          }),
+        },
+      );
+      renderApp("/admin/general");
+
+      const row = await updatesRow();
+      expect(row).toHaveTextContent(text);
+      expect(
+        within(row).queryByRole("button", { name: "Copy the command" }),
+      ).not.toBeInTheDocument();
     },
   );
 });

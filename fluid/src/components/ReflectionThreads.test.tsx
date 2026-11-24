@@ -675,6 +675,73 @@ describe("comments on a reflection", () => {
     expect(screen.getByRole("heading", { name: "Threads" })).toHaveFocus();
   });
 
+  it("resolves without an outcome and shows it as resolved", async () => {
+    const steps: { url: string; body: unknown }[] = [];
+    let status: "open" | "resolved" = "open";
+    const resolvedThread = thread("t-00000001", {
+      status: "resolved",
+      entries: [
+        {
+          at: "2026-09-30T10:00:00Z",
+          kind: "comment",
+          author: { name: "vera", agent: false },
+          text: "Still true?",
+        },
+        {
+          at: "2026-09-30T11:00:00Z",
+          kind: "resolve",
+          author: { name: "vera", agent: false },
+          text: "",
+        },
+      ],
+    });
+    const docRoute = docWith(() =>
+      status === "open" ? [thread("t-00000001")] : [],
+    );
+    serve([], {
+      "/domains/eng/reflections/guides/deploying.md": docRoute,
+      "/domains/eng/reflection/threads/t-00000001/resolve": (url, init) => {
+        steps.push({ url, body: bodyOf(init) });
+        status = "resolved";
+        return resolvedThread;
+      },
+      "/domains/eng/reflection/threads": () => ({
+        threads: status === "resolved" ? [resolvedThread] : [],
+      }),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    const card = await screen.findByRole("article", {
+      name: "Thread on Night deploys",
+    });
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Resolve" }),
+    );
+    expect(
+      within(card).getByRole("textbox", { name: "Outcome" }),
+    ).toHaveAttribute("placeholder", "Optional");
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Resolve" }),
+    );
+    await waitFor(() => {
+      expect(steps[0]).toEqual({
+        url: "/domains/eng/reflection/threads/t-00000001/resolve",
+        body: { path: "guides/deploying.md", outcome: "" },
+      });
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("article", { name: "Thread on Night deploys" }),
+      ).toBeNull();
+    });
+    await userEvent.click(
+      screen.getByRole("switch", { name: "Show resolved threads" }),
+    );
+    const resolved = await screen.findByText("Resolved", { selector: "p" });
+    const resolvedCard = resolved.closest("article") as HTMLElement;
+    expect(resolvedCard).toHaveAccessibleName("Thread on Night deploys");
+    expect(within(resolvedCard).queryByText(/^Resolved:/)).toBeNull();
+  });
+
   it("answers with the text and reads the page again", async () => {
     const answered = vi.fn((_path: string, _init?: RequestInit) =>
       thread("t-00000001"),

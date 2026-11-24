@@ -4,30 +4,42 @@
  * column beside the page on wide screens, under it on narrow ones, quiet
  * labels over values and hairline rules between the sections.
  *
- * Its first section is the page settings (design 4): the page's freshness,
- * the page it follows, its own pact file, and its life (retire, restore,
- * delete). A curator changes them here; everybody else reads them. Later
- * sections (tags, links) go under it.
+ * Its first section is the page settings (design 4), a read-only view for
+ * everybody: the page's freshness, the page it follows ("No page, only
+ * PACT.md" when it follows none), its status when set, and its own pact
+ * file (a link, or "None" with a Create action for a curator). A curator on
+ * a page that is not retired, on an instance and a domain that take writes,
+ * gets an Edit action beside the heading: it swaps the view for the form
+ * with Save and Cancel, its first field focused. Escape cancels, but not
+ * one that ends a composition; an Escape that closes a native select's
+ * list mostly never reaches the page, so it is not told apart. After a
+ * save the server took, or a cancel, the view comes back and the focus
+ * returns to Edit; a save is also said as "Saved" in a status beside the
+ * heading, until the next Edit. A retire or a lock closes the form, and it
+ * stays closed after a restore. Later sections (tags, links) go under it.
  *
  * Every refusal is the server's: a freshness under 1 hour, a `follows` that
- * closes a cycle, a page that is no longer retired. Its sentence is shown as
- * it comes. A setting is sent only when it changed, and a cleared one as an
- * empty value (the route keeps a key it is not sent).
+ * closes a cycle. Its sentence is shown in the form, which stays open. A
+ * setting is sent only when the person changed it from what the page held
+ * when the form opened, so a save never undoes what another curator saved
+ * in the meantime. A cleared one is sent as an empty value (the route
+ * keeps a key it is not sent).
  *
- * The retired banner over a retired page carries the same restore and delete
- * ({@link RetiredBanner}), so a curator who meets the banner first need not
- * look for the column.
+ * The column holds no lifecycle buttons: Retire and Delete are in the
+ * page's More actions menu, and a retired page shows the retired banner
+ * ({@link RetiredBanner}) with Restore and Delete.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ReactElement, ReactNode } from "react";
+import type { KeyboardEvent, ReactElement, ReactNode } from "react";
 import { useEffect, useId, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
-import type { TreeNode } from "../api/reflection";
+import type { ReflectionDoc, TreeNode } from "../api/reflection";
 import {
   fetchReflectionTree,
+  reflectionDocKey,
   reflectionTreeKey,
   saveReflection,
 } from "../api/reflection";
@@ -35,7 +47,6 @@ import { invalidateReflection } from "../api/reflectionDomains";
 import type { PageView } from "../api/reflectionPage";
 import {
   restoreReflection,
-  retireReflection,
   setReflectionSettings,
   settingsChanges,
 } from "../api/reflectionPage";
@@ -64,6 +75,12 @@ export const CUSTOM_FRESHNESS_HELP =
   "A number and a unit: h hours, d days, w weeks, m months, y years. m means months, not minutes. A bare number is days. At least 1 hour.";
 
 const STEP = `rounded underline-offset-[3px] ${CHROME_LINK} ${FOCUS_RING}`;
+
+/** A small text action beside a heading or a value: Edit, Create. */
+const SMALL_ACTION = `rounded text-caption underline underline-offset-[3px] disabled:opacity-50 ${CHROME_LINK} ${FOCUS_RING}`;
+
+/** What the view and the form say for a page that follows no page. */
+const NO_FOLLOWS = "No page, only PACT.md";
 
 const UNITS: Readonly<Record<string, readonly [string, string]>> = {
   h: ["hour", "hours"],
@@ -98,19 +115,6 @@ export interface PageDetailsProps {
   curator: boolean;
   /** Why nothing can be changed here (read only, a locked domain); undefined when it can. */
   lockedReason?: string | undefined;
-  /** Delete the page; the page screen owns that mutation and where it leads. */
-  onDelete: () => void;
-  deleting: boolean;
-  /**
-   * After a retire or a restore (here or in the banner): the retired state
-   * the page will show, so the column's new button takes the focus once it
-   * does. Null when nothing waits for it.
-   */
-  focusWhenRetired?: boolean | null;
-  /** Told when a retire or a restore landed, with the state it leads to. */
-  onLifecycleChanged?: (retired: boolean) => void;
-  /** Told when the focus was handed over. */
-  onLifecycleFocused?: () => void;
 }
 
 export function ReflectionPageDetails(props: PageDetailsProps): ReactElement {
@@ -131,33 +135,61 @@ function PageSettings({
   page,
   curator,
   lockedReason,
-  onDelete,
-  deleting,
-  focusWhenRetired = null,
-  onLifecycleChanged,
-  onLifecycleFocused,
 }: PageDetailsProps): ReactElement {
   const changes = curator && lockedReason === undefined;
+  const editable = changes && page.retired === null;
   const headingId = useId();
-  // Held here: a save the server took remounts the form (its key is the
-  // stored settings), and the word must outlive that.
+  const [editing, setEditing] = useState(false);
   const [saved, setSaved] = useState(false);
+  // A retire or a lock ends the editing and the "Saved" it may have left,
+  // so a restore neither opens the form again nor says an old save.
+  if (!editable && (editing || saved)) {
+    setEditing(false);
+    setSaved(false);
+  }
+  const editRef = useRef<HTMLButtonElement | null>(null);
+  // Set when the form closes, so Edit takes the focus back once it shows.
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (!editing && refocus.current) {
+      refocus.current = false;
+      editRef.current?.focus();
+    }
+  }, [editing]);
+  const close = (didSave: boolean): void => {
+    refocus.current = true;
+    setSaved(didSave);
+    setEditing(false);
+  };
+  const open = editing && editable;
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-3">
-      <h2 id={headingId} className={RAIL_LABEL}>
-        Page settings
-      </h2>
-      {changes && page.retired === null ? (
-        <SettingsForm
-          // A fresh form for each stored state: a save the server took
-          // comes back as new settings, and the form starts from those.
-          key={`${page.freshness ?? ""}\u0000${page.follows ?? ""}`}
-          domain={domain}
-          path={path}
-          page={page}
-          saved={saved}
-          onSaved={setSaved}
-        />
+      <div className="flex items-baseline justify-between gap-2">
+        <h2 id={headingId} className={RAIL_LABEL}>
+          Page settings
+        </h2>
+        <div className="flex items-baseline gap-2">
+          <span role="status" className="text-caption text-muted">
+            {saved ? "Saved" : ""}
+          </span>
+          {editable && !open && (
+            <button
+              ref={editRef}
+              type="button"
+              aria-label="Edit page settings"
+              onClick={() => {
+                setSaved(false);
+                setEditing(true);
+              }}
+              className={SMALL_ACTION}
+            >
+              Edit
+            </button>
+          )}
+        </div>
+      </div>
+      {open ? (
+        <SettingsForm domain={domain} path={path} page={page} onDone={close} />
       ) : (
         <dl className="flex flex-col">
           {page.owner === null && (
@@ -169,7 +201,7 @@ function PageSettings({
           )}
           <Row label="Follows">
             {page.follows === null ? (
-              "Not set"
+              NO_FOLLOWS
             ) : (
               <Link
                 to={reflectionPageRoute(domain, page.follows)}
@@ -182,26 +214,17 @@ function PageSettings({
             )}
           </Row>
           {page.status !== null && <Row label="Status">{page.status}</Row>}
+          <Row label="Page pact">
+            <PactValue
+              domain={domain}
+              title={title}
+              page={page}
+              mayCreate={changes}
+            />
+          </Row>
         </dl>
       )}
       <Findings page={page} />
-      <PactRow domain={domain} title={title} page={page} mayCreate={changes} />
-      {changes && (
-        <PageLifecycle
-          domain={domain}
-          path={path}
-          page={page}
-          onDelete={onDelete}
-          deleting={deleting}
-          focusWhenRetired={focusWhenRetired}
-          {...(onLifecycleChanged === undefined
-            ? {}
-            : { onChanged: onLifecycleChanged })}
-          {...(onLifecycleFocused === undefined
-            ? {}
-            : { onFocused: onLifecycleFocused })}
-        />
-      )}
     </section>
   );
 }
@@ -249,22 +272,31 @@ function SettingsForm({
   domain,
   path,
   page,
-  saved,
-  onSaved,
+  onDone,
 }: {
   domain: string;
   path: string;
   page: PageView;
-  /** Whether the last save landed, said until the next change. */
-  saved: boolean;
-  onSaved: (saved: boolean) => void;
+  /** Close the form: with true after a save the server took, with false on Cancel. */
+  onDone: (saved: boolean) => void;
 }): ReactElement {
   const queryClient = useQueryClient();
+  const formRef = useRef<HTMLFormElement | null>(null);
+  // Edit goes away when the form opens: its first field takes the focus.
+  useEffect(() => {
+    formRef.current?.querySelector<HTMLElement>("select, input")?.focus();
+  }, []);
   const freshnessId = useId();
   const customId = useId();
   const followsId = useId();
   const owned = page.owner !== null;
-  const stored = storedFreshness(page, path);
+  // The settings as they were when the form opened: what the person changes
+  // is told apart from these, not from a page read again since.
+  const [base] = useState(() => ({
+    freshness: storedFreshness(page, path),
+    follows: page.follows,
+  }));
+  const stored = base.freshness;
   const [choice, setChoice] = useState(() =>
     stored === null
       ? ""
@@ -273,14 +305,15 @@ function SettingsForm({
         : CUSTOM,
   );
   const [custom, setCustom] = useState(choice === CUSTOM ? (stored ?? "") : "");
-  const [follows, setFollows] = useState(page.follows ?? "");
+  const [follows, setFollows] = useState(base.follows ?? "");
   const tree = useQuery({
     queryKey: reflectionTreeKey(domain),
     queryFn: () => fetchReflectionTree(domain),
   });
   const options = followable(tree.data?.nodes ?? [], path);
-  if (page.follows !== null && !options.some((o) => o.path === page.follows)) {
-    options.unshift({ path: page.follows, title: page.follows });
+  const opened = base.follows;
+  if (opened !== null && !options.some((o) => o.path === opened)) {
+    options.unshift({ path: opened, title: opened });
   }
   // Custom with nothing typed yet changes nothing: only None clears.
   const keepFreshness = owned || (choice === CUSTOM && custom.trim() === "");
@@ -290,28 +323,48 @@ function SettingsForm({
       : { freshness: choice === CUSTOM ? custom : choice }),
     follows,
   };
-  const pending = settingsChanges(
-    { freshness: stored, follows: page.follows },
-    wanted,
-  );
+  const pending = settingsChanges(base, wanted);
   const dirty = Object.keys(pending).length > 0;
   const save = useMutation({
     mutationFn: () => setReflectionSettings(domain, path, pending),
-    onMutate: () => {
-      onSaved(false);
-    },
-    onSuccess: () => {
-      onSaved(true);
+    onSuccess: (receipt) => {
+      // The view shows the stored settings at once; the refetch below
+      // brings the rest of the page (and its checksum) in line.
+      if (receipt.page !== null) {
+        const next = receipt.page;
+        queryClient.setQueryData<ReflectionDoc>(
+          reflectionDocKey(domain, path),
+          (old) => (old === undefined ? old : { ...old, page: next }),
+        );
+      }
       invalidateReflection(queryClient, domain);
+      onDone(true);
     },
   });
   return (
     <form
+      ref={formRef}
+      aria-label="Page settings"
       className="flex flex-col gap-3"
       onSubmit={(event) => {
         event.preventDefault();
         if (dirty && !save.isPending) {
           save.mutate();
+        }
+      }}
+      onKeyDown={(event: KeyboardEvent<HTMLFormElement>) => {
+        if (
+          event.key === "Escape" &&
+          !event.nativeEvent.isComposing &&
+          // Safari ends a composition before the key event that ended it,
+          // and marks that event only with the IME key code.
+          event.keyCode !== 229 &&
+          !event.defaultPrevented &&
+          !save.isPending
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+          onDone(false);
         }
       }}
     >
@@ -378,7 +431,7 @@ function SettingsForm({
           }}
           className={FIELD}
         >
-          <option value="">Not set</option>
+          <option value="">{NO_FOLLOWS}</option>
           {options.map((o) => (
             <option key={o.path} value={o.path}>
               {o.title}
@@ -392,11 +445,18 @@ function SettingsForm({
           aria-disabled={!dirty || save.isPending}
           className={`${BUTTON.secondary} aria-disabled:cursor-default aria-disabled:opacity-50`}
         >
-          Save settings
+          Save
         </button>
-        <span role="status" className="text-caption text-muted">
-          {saved && !dirty ? "Saved" : ""}
-        </span>
+        <button
+          type="button"
+          disabled={save.isPending}
+          onClick={() => {
+            onDone(false);
+          }}
+          className={BUTTON.secondary}
+        >
+          Cancel
+        </button>
       </div>
       {save.error && (
         <p
@@ -426,8 +486,12 @@ function Findings({ page }: { page: PageView }): ReactElement | null {
   );
 }
 
-/** The page's own pact file: open it, or create it for a curator. */
-function PactRow({
+/**
+ * The page's own pact file: a link named by its file name, or "None" with
+ * a Create action for a curator, which makes the file and opens it in the
+ * editor.
+ */
+function PactValue({
   domain,
   title,
   page,
@@ -450,90 +514,82 @@ function PactRow({
       void navigate(reflectionEditRoute(domain, page.pact.path));
     },
   });
+  if (page.pact.exists) {
+    return (
+      <Link to={reflectionPageRoute(domain, page.pact.path)} className={STEP}>
+        {page.pact.path.slice(page.pact.path.lastIndexOf("/") + 1)}
+      </Link>
+    );
+  }
   return (
-    <div className="flex flex-col gap-1">
-      <span className="text-muted">Page pact</span>
-      {page.pact.exists ? (
-        <Link
-          to={reflectionPageRoute(domain, page.pact.path)}
-          className={`self-start ${STEP}`}
-        >
-          Open the page pact
-        </Link>
-      ) : mayCreate ? (
-        <button
-          type="button"
-          disabled={create.isPending}
-          onClick={() => {
-            create.mutate();
-          }}
-          className={`self-start ${BUTTON.secondary}`}
-        >
-          Create the page pact
-        </button>
-      ) : (
-        <span>None</span>
-      )}
+    <span className="flex flex-col gap-1">
+      <span className="flex flex-wrap items-baseline gap-2">
+        None
+        {mayCreate && (
+          <button
+            type="button"
+            aria-label="Create the page pact"
+            disabled={create.isPending}
+            onClick={() => {
+              create.mutate();
+            }}
+            className={SMALL_ACTION}
+          >
+            Create
+          </button>
+        )}
+      </span>
       {create.error && (
-        <p
+        <span
           role="alert"
           className="rounded bg-red-50 px-2 py-1 text-red-800 dark:bg-red-950 dark:text-red-200"
         >
           {problemDetail(create.error)}
-        </p>
+        </span>
       )}
-    </div>
+    </span>
   );
 }
 
 /**
- * Retire a page, or restore a retired one (on its own, or back under the
- * page it was part of while that page is still there), and delete it with
- * the app's two-step confirm.
+ * Restore a retired page (on its own, or back under the page it was part
+ * of while that page is still there), and delete it with the app's
+ * two-step confirm. Drawn in the retired banner only.
  */
-export function PageLifecycle({
+function PageLifecycle({
   domain,
   path,
   page,
   onDelete,
   deleting,
-  focusWhenRetired = null,
-  onChanged,
-  onFocused,
+  focusRestore = false,
+  onRestoreFocused,
+  onRestored,
 }: {
   domain: string;
   path: string;
   page: PageView;
   onDelete: () => void;
   deleting: boolean;
-  /** Take the focus onto the new button once the page shows this state. */
-  focusWhenRetired?: boolean | null;
-  onChanged?: (retired: boolean) => void;
-  onFocused?: () => void;
+  /** Take the focus onto Restore (after a retire from the menu). */
+  focusRestore?: boolean;
+  onRestoreFocused?: () => void;
+  onRestored?: () => void;
 }): ReactElement {
   const queryClient = useQueryClient();
-  const retireRef = useRef<HTMLButtonElement | null>(null);
   const restoreRef = useRef<HTMLButtonElement | null>(null);
-  const isRetired = page.retired !== null;
-  // The pressed button goes with the state it changed (and the banner's
-  // with the banner), so the focus lands on the button that replaced it
-  // in the column rather than on the page's body.
   useEffect(() => {
-    if (focusWhenRetired === null || focusWhenRetired !== isRetired) {
+    if (!focusRestore) {
       return;
     }
-    (isRetired ? restoreRef : retireRef).current?.focus();
-    onFocused?.();
-  }, [focusWhenRetired, isRetired, onFocused]);
-  const change = useMutation({
-    mutationFn: (
-      act: { kind: "retire" } | { kind: "restore"; owner?: string },
-    ) =>
-      act.kind === "retire"
-        ? retireReflection(domain, path)
-        : restoreReflection(domain, path, act.owner),
-    onSuccess: (_, act) => {
-      onChanged?.(act.kind === "retire");
+    restoreRef.current?.focus();
+    onRestoreFocused?.();
+  }, [focusRestore, onRestoreFocused]);
+  const restore = useMutation({
+    mutationFn: (owner: string | undefined) =>
+      restoreReflection(domain, path, owner),
+    onSuccess: () => {
+      onRestored?.();
       invalidateReflection(queryClient, domain);
     },
   });
@@ -541,44 +597,28 @@ export function PageLifecycle({
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
-        {page.retired === null ? (
+        <button
+          ref={restoreRef}
+          type="button"
+          disabled={restore.isPending}
+          onClick={() => {
+            restore.mutate(undefined);
+          }}
+          className={BUTTON.secondary}
+        >
+          Restore
+        </button>
+        {owner?.exists === true && (
           <button
-            ref={retireRef}
             type="button"
-            disabled={change.isPending}
+            disabled={restore.isPending}
             onClick={() => {
-              change.mutate({ kind: "retire" });
+              restore.mutate(owner.path);
             }}
             className={BUTTON.secondary}
           >
-            Retire
+            {`Restore under ${owner.title}`}
           </button>
-        ) : (
-          <>
-            <button
-              ref={restoreRef}
-              type="button"
-              disabled={change.isPending}
-              onClick={() => {
-                change.mutate({ kind: "restore" });
-              }}
-              className={BUTTON.secondary}
-            >
-              Restore
-            </button>
-            {owner?.exists === true && (
-              <button
-                type="button"
-                disabled={change.isPending}
-                onClick={() => {
-                  change.mutate({ kind: "restore", owner: owner.path });
-                }}
-                className={BUTTON.secondary}
-              >
-                {`Restore under ${owner.title}`}
-              </button>
-            )}
-          </>
         )}
         <DestructiveAction
           label="Delete"
@@ -587,12 +627,12 @@ export function PageLifecycle({
           onConfirm={onDelete}
         />
       </div>
-      {change.error && (
+      {restore.error && (
         <p
           role="alert"
           className="rounded bg-red-50 px-2 py-1 text-red-800 dark:bg-red-950 dark:text-red-200"
         >
-          {problemDetail(change.error)}
+          {problemDetail(restore.error)}
         </p>
       )}
     </div>
@@ -602,7 +642,8 @@ export function PageLifecycle({
 /**
  * Over a retired page: "Retired: no longer part of Architecture overview",
  * or just "Retired" for a page that was on its own, with restore and delete
- * for a curator.
+ * for a curator. After a retire from the page's menu, Restore takes the
+ * focus.
  */
 export function RetiredBanner({
   domain,
@@ -611,7 +652,9 @@ export function RetiredBanner({
   curator,
   onDelete,
   deleting,
-  onLifecycleChanged,
+  focusRestore = false,
+  onRestoreFocused,
+  onRestored,
 }: {
   domain: string;
   path: string;
@@ -619,8 +662,12 @@ export function RetiredBanner({
   curator: boolean;
   onDelete: () => void;
   deleting: boolean;
-  /** Told when a restore landed, so the column takes the focus. */
-  onLifecycleChanged?: (retired: boolean) => void;
+  /** Take the focus onto Restore once the banner shows. */
+  focusRestore?: boolean;
+  /** Told when Restore took the focus. */
+  onRestoreFocused?: () => void;
+  /** Told when a restore landed, so the page can place the focus. */
+  onRestored?: () => void;
 }): ReactElement | null {
   if (page.retired === null) {
     return null;
@@ -644,9 +691,9 @@ export function RetiredBanner({
           page={page}
           onDelete={onDelete}
           deleting={deleting}
-          {...(onLifecycleChanged === undefined
-            ? {}
-            : { onChanged: onLifecycleChanged })}
+          focusRestore={focusRestore}
+          {...(onRestoreFocused === undefined ? {} : { onRestoreFocused })}
+          {...(onRestored === undefined ? {} : { onRestored })}
         />
       )}
     </aside>

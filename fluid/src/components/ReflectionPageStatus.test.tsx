@@ -64,3 +64,65 @@ describe("the status lines", () => {
     ).toBeVisible();
   });
 });
+
+describe("the pacts line", () => {
+  function pactsLine(page: PageView): HTMLElement {
+    render(
+      <MemoryRouter>
+        <ReflectionPageStatus
+          domain="eng"
+          page={page}
+          clock={null}
+          readAt={0}
+          curator={false}
+        />
+      </MemoryRouter>,
+    );
+    return screen.getByText(/^Pacts:/);
+  }
+
+  it("names each pact file by its file name and links to it, the page's own pact last", () => {
+    const line = pactsLine({
+      ...PAGE,
+      chain: [{ path: "arch/overview.md", title: "Architecture overview" }],
+      pacts: ["PACT.md", "arch/overview.pact.md", "arch/overview/db.pact.md"],
+      pact: { path: "arch/overview/db.pact.md", exists: true },
+    });
+    expect(line).toHaveTextContent(
+      "Pacts: PACT.md > overview.pact.md > db.pact.md",
+    );
+    expect(
+      screen.getByRole("link", { name: "overview.pact.md" }),
+    ).toHaveAttribute("href", "/d/eng/reflection/arch/overview.pact.md");
+    expect(screen.getByRole("link", { name: "db.pact.md" })).toHaveAttribute(
+      "href",
+      "/d/eng/reflection/arch/overview/db.pact.md",
+    );
+  });
+
+  it("leaves out the page's own pact while it does not exist", () => {
+    const line = pactsLine({
+      ...PAGE,
+      chain: [{ path: "arch/overview.md", title: "Architecture overview" }],
+      pacts: ["PACT.md", "arch/overview.pact.md"],
+      pact: { path: "arch/overview/db.pact.md", exists: false },
+    });
+    expect(line).toHaveTextContent(/^Pacts: PACT\.md > overview\.pact\.md$/);
+    expect(screen.queryByRole("link", { name: "db.pact.md" })).toBeNull();
+  });
+
+  it("is left out when no pact file exists", () => {
+    render(
+      <MemoryRouter>
+        <ReflectionPageStatus
+          domain="eng"
+          page={{ ...PAGE, pacts: [] }}
+          clock={null}
+          readAt={0}
+          curator={false}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByText(/^Pacts:/)).toBeNull();
+  });
+});

@@ -10,6 +10,7 @@
 import { createContext, use } from "react";
 
 import type { Role, User } from "../api/model";
+import type { UpdateCheckState } from "./updateNote";
 
 /**
  * What this session may do, resolved once so no screen has to re-derive it
@@ -67,6 +68,13 @@ export interface Capabilities {
    * missing field (an older server) and any other shape read as null (S30).
    */
   updateAvailable: string | null;
+  /**
+   * Whether the server's daily update check is on, why it is off and what
+   * its last run found, or null. Named to an admin only, like
+   * `updateAvailable`; a missing field (an older server) and any other shape
+   * read as null.
+   */
+  updateCheck: UpdateCheckState | null;
 }
 
 /** The auth surface every screen sees. */

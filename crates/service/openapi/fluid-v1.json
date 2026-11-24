@@ -739,7 +739,7 @@
           "auth"
         ],
         "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, whether it has any accounts at all, whether this session may\ndrive the share surfaces, and which server version it is talking to, so a\nmismatched UI can say so instead of failing later.",
-        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`, the default with a GitHub App), and which server version it is talking to, and, for an admin only, a newer release the server's update check found (`update_available`). Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and an identity a proxy asserts (`auth.trusted_header` or `auth.proxy_headers`) is minted a session on the first call, which is the only way those modes obtain a token.",
+        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`, the default with a GitHub App), and which server version it is talking to, and, for an admin only, a newer release the server's update check found (`update_available`) and whether that check is on, why it is off and when it last ran (`update_check`). Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and an identity a proxy asserts (`auth.trusted_header` or `auth.proxy_headers`) is minted a session on the first call, which is the only way those modes obtain a token.",
         "operationId": "get_me",
         "responses": {
           "200": {
@@ -7826,7 +7826,7 @@
             }
           },
           "422": {
-            "description": "An answer with no text, or a resolve with no outcome (an empty one included).",
+            "description": "An answer with no text.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -17677,6 +17677,17 @@
             "description": "A newer stable release this server's daily update check found, as\n`major.minor.patch`, or null.\n\nOnly an admin is told, by the same check the admin routes use; every\nother caller gets null. Null as well when the check is off, its last\nrun failed or is more than 48 hours old, the release is younger than\n`update.min_age_hours`, the version is not newer or not a stable\nrelease, the build is not an official one, or `crystalline update now`\nwould not act for how this server was installed. Read-only: nothing\non this surface updates the server.",
             "example": "0.35.0"
           },
+          "update_check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UpdateCheck",
+                "description": "Whether this server's daily update check is on, why it is off, and\nwhat its last run found, or null.\n\nTold to an admin alone, by the same rule as `update_available`; every\nother caller gets null, and so does an admin of a server with no\ndaemon behind it. Read-only: the check is turned on or off on the\nserver, never through this API."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "user": {
             "oneOf": [
               {
@@ -19931,7 +19942,7 @@
               "string",
               "null"
             ],
-            "description": "resolve: the short outcome, required."
+            "description": "resolve: the short outcome, optional."
           },
           "path": {
             "type": "string",
@@ -20050,6 +20061,89 @@
             "example": "Bearer"
           }
         }
+      },
+      "UpdateCheck": {
+        "type": "object",
+        "description": "The state of a server's daily update check, as `crystalline status` says\nit: on, or off and why, and with the check on what its last run found.\nWith the check off nothing from its last run is told, since a check run by\nhand writes that whatever the setting is.",
+        "required": [
+          "on",
+          "install"
+        ],
+        "properties": {
+          "install": {
+            "$ref": "#/components/schemas/UpdateInstall",
+            "description": "How this server was installed, as the server detected it at start.\nSays where the check is turned on: a .deb install running as the\n`crystalline` service reads its settings from\n`/etc/default/crystalline`."
+          },
+          "last_check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UpdateLastCheck",
+                "description": "What the last check found, or null when the check is off or has not\nrun yet. Also null when the last check found a release but this\nserver cannot read its own version to compare it with."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_checked": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the last check ran, in RFC 3339, or null when the check is off\nor has not run yet.",
+            "example": "2026-11-24T09:00:00Z"
+          },
+          "off_reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UpdateCheckOff",
+                "description": "Why the check is off; null when it is on."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "on": {
+            "type": "boolean",
+            "description": "Whether the daily check runs."
+          }
+        }
+      },
+      "UpdateCheckOff": {
+        "type": "string",
+        "description": "Why a server's daily update check is off.",
+        "enum": [
+          "not_turned_on",
+          "no_update_notifier",
+          "ci",
+          "docker",
+          "desktop_extension",
+          "no_state_folder"
+        ]
+      },
+      "UpdateInstall": {
+        "type": "string",
+        "description": "How a server was installed, as its update check detected it.",
+        "enum": [
+          "homebrew",
+          "deb",
+          "msi",
+          "zip",
+          "tarball",
+          "docker",
+          "mcpb",
+          "unknown"
+        ]
+      },
+      "UpdateLastCheck": {
+        "type": "string",
+        "description": "What a server's last update check found.",
+        "enum": [
+          "up_to_date",
+          "newer",
+          "failed"
+        ]
       },
       "UploadedAttachment": {
         "type": "object",

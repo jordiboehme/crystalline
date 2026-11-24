@@ -2070,6 +2070,7 @@ export type MeResponse = {
      * on this surface updates the server.
      */
     update_available?: string | null;
+    update_check?: UpdateCheck | null;
     user?: User | null;
     /**
      * The server version, so a mismatched UI can say so.
@@ -3626,7 +3627,7 @@ export type TagAliasesView = {
  */
 export type ThreadStepBody = {
     /**
-     * resolve: the short outcome, required.
+     * resolve: the short outcome, optional.
      */
     outcome?: string | null;
     /**
@@ -3725,6 +3726,48 @@ export type TokenResponse = {
      */
     token_type: string;
 };
+
+/**
+ * The state of a server's daily update check, as `crystalline status` says
+ * it: on, or off and why, and with the check on what its last run found.
+ * With the check off nothing from its last run is told, since a check run by
+ * hand writes that whatever the setting is.
+ */
+export type UpdateCheck = {
+    /**
+     * How this server was installed, as the server detected it at start.
+     * Says where the check is turned on: a .deb install running as the
+     * `crystalline` service reads its settings from
+     * `/etc/default/crystalline`.
+     */
+    install: UpdateInstall;
+    last_check?: UpdateLastCheck | null;
+    /**
+     * When the last check ran, in RFC 3339, or null when the check is off
+     * or has not run yet.
+     */
+    last_checked?: string | null;
+    off_reason?: UpdateCheckOff | null;
+    /**
+     * Whether the daily check runs.
+     */
+    on: boolean;
+};
+
+/**
+ * Why a server's daily update check is off.
+ */
+export type UpdateCheckOff = 'not_turned_on' | 'no_update_notifier' | 'ci' | 'docker' | 'desktop_extension' | 'no_state_folder';
+
+/**
+ * How a server was installed, as its update check detected it.
+ */
+export type UpdateInstall = 'homebrew' | 'deb' | 'msi' | 'zip' | 'tarball' | 'docker' | 'mcpb' | 'unknown';
+
+/**
+ * What a server's last update check found.
+ */
+export type UpdateLastCheck = 'up_to_date' | 'newer' | 'failed';
 
 /**
  * The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry.
@@ -7794,7 +7837,7 @@ export type StepReflectionThreadErrors = {
      */
     409: ProblemDetail;
     /**
-     * An answer with no text, or a resolve with no outcome (an empty one included).
+     * An answer with no text.
      */
     422: ProblemDetail;
 };

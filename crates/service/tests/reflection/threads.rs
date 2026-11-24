@@ -58,19 +58,17 @@ async fn a_viewer_opens_answers_resolves_and_reopens() {
         .await
         .unwrap();
     assert_eq!(answered["waiting_on"], "people");
-    let empty = fx
+    let resolved = fx
         .engine
         .discuss(&step("resolve", &id, "  "), &viewer)
         .await
-        .unwrap_err();
-    assert!(
-        matches!(empty, crystalline_service::EngineError::Invalid(_)),
-        "a resolve needs its outcome: {empty:?}"
+        .expect("a resolve needs no outcome");
+    assert_eq!(resolved["status"], "resolved");
+    assert_eq!(resolved["entries"][2]["kind"], "resolve");
+    assert_eq!(
+        resolved["entries"][2]["text"], "",
+        "a resolve without an outcome has no text"
     );
-    fx.engine
-        .discuss(&step("resolve", &id, "Confirmed."), &viewer)
-        .await
-        .unwrap();
     let reopened = fx
         .engine
         .discuss(&step("reopen", &id, "It changed again."), &viewer)

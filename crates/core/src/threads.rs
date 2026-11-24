@@ -238,7 +238,7 @@ fn render_entry(entry: &Entry) -> String {
         entry.kind.as_str(),
         sanitize_name(&entry.author.name)
     );
-    if !first.is_empty() {
+    if !first.trim().is_empty() {
         out.push_str(": ");
         out.push_str(first);
     }
@@ -424,7 +424,7 @@ pub fn open_thread(file: &str, thread: &Thread) -> String {
 }
 
 /// `file` with `entry` appended to thread `id`. A resolve sets the status to
-/// resolved and needs an outcome; a reopen sets it to open; a comment needs
+/// resolved, with or without an outcome; a reopen sets it to open; a comment needs
 /// the thread open. The only existing byte that changes is the value on the
 /// `status:` line of that thread's yaml block (a comment after it is kept).
 /// The file comes back as LF.
@@ -441,9 +441,6 @@ pub fn append_entry(file: &str, id: &str, entry: &Entry) -> Result<String, Threa
         (EntryKind::Comment, ThreadStatus::Open) => None,
         (EntryKind::Comment, ThreadStatus::Resolved) => {
             return refused(format!("thread {id} is resolved; reopen it to answer"));
-        }
-        (EntryKind::Resolve, ThreadStatus::Open) if entry.text.trim().is_empty() => {
-            return refused("resolving a thread needs a short outcome".to_string());
         }
         (EntryKind::Resolve, ThreadStatus::Open) => Some(ThreadStatus::Resolved),
         (EntryKind::Resolve, ThreadStatus::Resolved) => {
@@ -865,15 +862,35 @@ mod tests {
             "an unknown thread is its own error, so the engine answers it as not found"
         );
         let canonical = open_thread("", &thread(None, 1));
-        assert!(
-            append_entry(
-                &canonical,
-                "t-3f9a2c1b",
-                &agent("", EntryKind::Resolve, "t")
-            )
-            .is_err(),
-            "an outcome is required"
-        );
+        let resolved = append_entry(
+            &canonical,
+            "t-3f9a2c1b",
+            &agent("", EntryKind::Resolve, "t"),
+        )
+        .expect("an outcome is optional");
+        let read = &parse_threads(&resolved)[0];
+        assert_eq!(read.status, ThreadStatus::Resolved);
+        let last = read.entries.last().unwrap();
+        assert_eq!((last.kind, last.text.as_str()), (EntryKind::Resolve, ""));
+    }
+
+    /// A resolve with no outcome is one line with no colon after the author,
+    /// and it reads back as a resolve with empty text; so does one whose
+    /// outcome is only spaces.
+    #[test]
+    fn a_resolve_without_an_outcome_round_trips() {
+        for text in ["", "   "] {
+            let entry = person(text, EntryKind::Resolve, "2026-09-30T11:00:00Z");
+            let line = render_entry(&entry);
+            assert_eq!(
+                line, "- 2026-09-30T11:00:00Z, resolve by jordi (person)\n",
+                "{text:?}"
+            );
+            let read = parse_entry(line.trim_end_matches('\n')).unwrap();
+            assert_eq!(read.kind, EntryKind::Resolve);
+            assert_eq!(read.text, "");
+            assert_eq!(read.author, entry.author);
+        }
     }
 
     /// A quoted passage ahead of the status line, and blank lines between

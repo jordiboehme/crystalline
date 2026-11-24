@@ -250,17 +250,34 @@ mod tests {
         );
     }
 
-    /// The presentation skill puts the PACT first, names where an element is
-    /// required (the benchmark agent wrote numbered lists and bullets there),
-    /// balances that with restraint and carries the syntax sheet, and the two
-    /// skills an agent writes with point to it (a novel skill is found
-    /// through skill text, AGENTS.md).
+    /// The presentation skill puts the PACT first, writes Reflection pages
+    /// for people in plain language, names where an element is required (the
+    /// benchmark agent wrote numbered lists and bullets there), shows the
+    /// shape of the content with one status colour scheme, keeps every
+    /// element to content, leaves engrams to the model and carries the syntax
+    /// sheet, and the two skills an agent writes with point to it (a novel
+    /// skill is found through skill text, AGENTS.md).
     #[test]
-    fn the_presentation_skill_teaches_triggers_restraint_the_pact_and_the_dialect() {
+    fn the_presentation_skill_teaches_readers_the_shape_the_pact_and_the_dialect() {
         let p = skill("crystalline-presentation").unwrap().content;
         for needle in [
             "## Presentation",
-            "When in doubt, prose",
+            "## Readers and language",
+            "Explain every term, acronym and coined name",
+            "delve, robust, crucial, pivotal, leverage, landscape, showcase",
+            "Use no em dash and no en dash",
+            "End on the last fact",
+            "## Show the shape",
+            "when the content has a shape, show it",
+            "Content, never decoration",
+            "**green**: done, decided, stable, recommended",
+            "**blue**: in progress, in review",
+            "**yellow**: at risk, partial, needs attention",
+            "**red**: blocked, failed, not recommended, deprecated",
+            "**purple**: proposed, idea, draft",
+            "**grey**: not started, unknown, retired",
+            "`:status[Proposed]{purple}`",
+            "whatever form serves the model best",
             "[!WARNING]",
             "[!DETAILS]-",
             ":status[",
@@ -272,16 +289,27 @@ mod tests {
             "inside the section that describes that action",
             "Never in the page lead",
             "Check before you write each section",
-            "Everywhere else prose wins",
             "expected_checksum",
             "never inside a callout",
             "same section",
             "markdown_findings",
             "never write them into the page as HTML comments or text",
             "https://github.com/jordiboehme/crystalline/blob/main/docs/markdown.md",
+            "A status chip is text, so it stays allowed there, unless the PACT says no chips.",
+            "Never add a fact that is not in the sources.",
+            "In running text a hyphen belongs only in compound words",
+            "Any other engram status gets no chip.",
+            "cannot be undone, or a risky one? Put the callout here",
         ] {
             assert!(p.contains(needle), "presentation skill lacks {needle}");
         }
+        for gone in ["When in doubt, prose", "Everywhere else prose wins"] {
+            assert!(!p.contains(gone), "presentation skill still says {gone}");
+        }
+        assert!(
+            !p.contains('\u{2014}') && !p.contains('\u{2013}'),
+            "presentation skill holds a long dash"
+        );
         assert_eq!(skill("crystalline-presentation").unwrap().since, "0.28.0");
         let i = skill("crystalline-intelligence").unwrap().content;
         assert!(i.contains("`crystalline-presentation`"));

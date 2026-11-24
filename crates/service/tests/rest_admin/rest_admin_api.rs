@@ -6018,3 +6018,207 @@ async fn the_daemon_loads_the_cache_at_start() {
         newer_version().as_str()
     );
 }
+
+/// `update_check` off the probe, asked as `session` or anonymously.
+async fn update_check(
+    addr: std::net::SocketAddr,
+    session: Option<&(String, String)>,
+) -> serde_json::Value {
+    let request = match session {
+        Some(session) => as_session(addr, reqwest::Method::GET, "/api/v1/auth/me", session),
+        None => client().get(format!("http://{addr}/api/v1/auth/me")),
+    };
+    let me: serde_json::Value = request.send().await.unwrap().json().await.unwrap();
+    let object = me.as_object().expect("the probe is an object");
+    assert!(
+        object.contains_key("update_check"),
+        "the field is always there, null when nothing is told: {me}"
+    );
+    me["update_check"].clone()
+}
+
+/// Only an admin is told the state of the update check, by the same rule as
+/// `update_available`: an editor, a viewer and the anonymous viewer get null,
+/// and the role is read on every request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_update_check_is_admin_only() {
+    let fx = serve(Options {
+        anonymous: true,
+        update_check: true,
+        update: Some(open_update_facts(&newer_tag())),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let told = update_check(fx.addr, Some(&admin)).await;
+    assert_eq!(told["on"], true, "{told}");
+    assert_eq!(told["off_reason"], serde_json::Value::Null, "{told}");
+    assert_eq!(told["install"], "tarball", "{told}");
+    assert_eq!(told["last_check"], "newer", "{told}");
+    assert!(told["last_checked"].is_string(), "{told}");
+    for (who, session) in [
+        ("editor", Some(&eddy)),
+        ("viewer", Some(&vera)),
+        ("anonymous", None),
+    ] {
+        assert_eq!(
+            update_check(fx.addr, session).await,
+            serde_json::Value::Null,
+            "{who}"
+        );
+    }
+
+    for (role, told) in [("admin", true), ("editor", false)] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::PATCH,
+            "/api/v1/users/eddy",
+            &admin,
+        )
+        .json(&serde_json::json!({ "role": role }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        assert_eq!(
+            update_check(fx.addr, Some(&eddy)).await.is_object(),
+            told,
+            "{role}"
+        );
+    }
+}
+
+/// A router with no daemon behind it tells an admin nothing about the
+/// check, and a daemon's facts tell `update.check` as it is now: the
+/// setting is read live on every probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_update_check_is_null_without_a_source_and_follows_the_setting() {
+    let fx = serve(Options {
+        update_check: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    assert_eq!(
+        update_check(fx.addr, Some(&admin)).await,
+        serde_json::Value::Null
+    );
+
+    let off = serve(Options {
+        update: Some(open_update_facts(&newer_tag())),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(off.addr, "root", "rootpw").await;
+    assert_eq!(
+        update_check(off.addr, Some(&admin)).await,
+        serde_json::json!({
+            "on": false,
+            "off_reason": "not_turned_on",
+            "install": "tarball",
+            "last_checked": null,
+            "last_check": null,
+        }),
+        "update.check is off, so nothing of the last check is told"
+    );
+}
+
+/// Each state of the check reaches an admin as `crystalline status` says it:
+/// on with no check yet, up to date, a failed check, a newer release, and
+/// off for every reason, a forced one with the install it comes from. With
+/// the check off nothing of its last run is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_update_check_says_each_state() {
+    use crystalline_core::update::{
+        CheckOutcome, CheckState, InstallMethod, OffReason, UpdateFacts,
+    };
+    let facts = Arc::new(std::sync::Mutex::new(None::<UpdateFacts>));
+    let source: crystalline_service::rest::UpdateFactsSource = {
+        let facts = facts.clone();
+        Arc::new(move |_| facts.lock().unwrap().clone().expect("facts are set"))
+    };
+    let fx = serve(Options {
+        update_check: true,
+        update: Some(source),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let up_to_date = update_cache(&current);
+    let checked = up_to_date.checked_at.rfc3339_secs_z();
+    let failed = crystalline_core::update::UpdateCache {
+        outcome: CheckOutcome::Failed {
+            reason: "the check failed".to_string(),
+        },
+        ..update_cache(&current)
+    };
+    let newer = update_cache(&newer_tag());
+    let on = |method, cache| UpdateFacts {
+        method,
+        official: true,
+        refusal: None,
+        check: CheckState::On,
+        cache,
+    };
+    let off = |method, reason| UpdateFacts {
+        method,
+        official: true,
+        refusal: None,
+        check: CheckState::Off(reason),
+        cache: Some(newer.clone()),
+    };
+    let cases = [
+        (
+            on(InstallMethod::Tarball, None),
+            serde_json::json!({"on": true, "off_reason": null, "install": "tarball", "last_checked": null, "last_check": null}),
+        ),
+        (
+            on(InstallMethod::Homebrew, Some(up_to_date.clone())),
+            serde_json::json!({"on": true, "off_reason": null, "install": "homebrew", "last_checked": checked, "last_check": "up_to_date"}),
+        ),
+        (
+            on(InstallMethod::Deb, Some(failed)),
+            serde_json::json!({"on": true, "off_reason": null, "install": "deb", "last_checked": checked, "last_check": "failed"}),
+        ),
+        (
+            on(InstallMethod::Msi, Some(newer.clone())),
+            serde_json::json!({"on": true, "off_reason": null, "install": "msi", "last_checked": checked, "last_check": "newer"}),
+        ),
+        (
+            off(InstallMethod::Deb, OffReason::NotTurnedOn),
+            serde_json::json!({"on": false, "off_reason": "not_turned_on", "install": "deb", "last_checked": null, "last_check": null}),
+        ),
+        (
+            off(InstallMethod::Tarball, OffReason::NoUpdateNotifier),
+            serde_json::json!({"on": false, "off_reason": "no_update_notifier", "install": "tarball", "last_checked": null, "last_check": null}),
+        ),
+        (
+            off(InstallMethod::Zip, OffReason::Ci),
+            serde_json::json!({"on": false, "off_reason": "ci", "install": "zip", "last_checked": null, "last_check": null}),
+        ),
+        (
+            off(InstallMethod::Docker, OffReason::Docker),
+            serde_json::json!({"on": false, "off_reason": "docker", "install": "docker", "last_checked": null, "last_check": null}),
+        ),
+        (
+            off(InstallMethod::Mcpb, OffReason::DesktopExtension),
+            serde_json::json!({"on": false, "off_reason": "desktop_extension", "install": "mcpb", "last_checked": null, "last_check": null}),
+        ),
+        (
+            off(InstallMethod::Unknown, OffReason::NoStateFolder),
+            serde_json::json!({"on": false, "off_reason": "no_state_folder", "install": "unknown", "last_checked": null, "last_check": null}),
+        ),
+    ];
+    for (given, expected) in cases {
+        *facts.lock().unwrap() = Some(given.clone());
+        assert_eq!(
+            update_check(fx.addr, Some(&admin)).await,
+            expected,
+            "{given:?}"
+        );
+    }
+}

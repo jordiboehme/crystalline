@@ -833,8 +833,9 @@ pub struct DiscussParams {
     /// answer, resolve, reopen: the thread id (t-...).
     #[serde(default)]
     pub thread: Option<String>,
-    /// What you say. For resolve it is the short outcome, and it is
-    /// required. Write it in plain words for people: no engram links.
+    /// What you say. For resolve it is the short outcome where there is
+    /// one, and it may be left out. Write it in plain words for people: no
+    /// engram links.
     #[serde(default)]
     pub text: Option<String>,
     /// open: this thread answers a person's change to the section (a feedback

@@ -1,9 +1,11 @@
 /**
  * A Reflection page's details column against a real daemon (design 4): a
- * curator sets a freshness from a preset and a custom value, the line under
- * the title reads the page clock, the page pact is created, the page is
- * retired (the banner says so and the navigation hides it behind its
- * switch), restored from the banner, and deleted with the two-step confirm.
+ * curator opens the settings behind Edit and sets a freshness from a preset
+ * and a custom value, the line under the title reads the page clock and
+ * names the pacts, the page pact is created and joins that line, the page
+ * is retired from the More actions menu (the banner says so and the
+ * navigation hides it behind its switch), restored from the banner, and
+ * deleted from the menu with the two-step confirm.
  *
  * WebKit runs it too: the confirm closes itself when focus leaves it, and
  * Safari does not focus a button on a click (see `focusLeft.ts`), so only
@@ -55,7 +57,7 @@ async function pageView(
   ).page;
 }
 
-test("a curator sets a page's freshness, makes its pact, retires, restores and deletes it", async ({
+test("a curator edits a page's settings, makes its pact, retires, restores and deletes it", async ({
   page,
 }, info) => {
   await signIn(page);
@@ -72,32 +74,52 @@ test("a curator sets a page's freshness, makes its pact, retires, restores and d
     const panel = page.getByRole("complementary", { name: "Page details" });
     await expect(panel).toBeVisible();
     const status = page.getByTestId("page-status");
-    await expect(status).toContainText("Follows: PACT.md");
+    await expect(panel).toContainText("No page, only PACT.md");
+    const edit = panel.getByRole("button", { name: "Edit page settings" });
 
-    // A preset: the line under the title reads the clock.
+    // A preset: the line under the title reads the clock, and the view
+    // comes back with the focus on Edit.
+    await edit.click();
     await panel.getByRole("combobox", { name: "Freshness" }).selectOption("6h");
-    await panel.getByRole("button", { name: "Save settings" }).click();
+    await panel.getByRole("button", { name: "Save", exact: true }).click();
     await expect(status).toContainText(/Last checked .*, due again in /);
+    await expect(edit).toBeFocused();
+    await expect(panel.getByRole("status")).toHaveText("Saved");
+    await expect(panel).toContainText("6 hours");
     await expect
       .poll(async () => (await pageView(page, path)).freshness)
       .toBe("6h");
 
-    // A custom value, with the note that m means months.
+    // A custom value, with the note that m means months. A refusal keeps
+    // the form open.
+    await edit.click();
     await panel
       .getByRole("combobox", { name: "Freshness" })
       .selectOption("custom");
     const custom = panel.getByRole("textbox", { name: "Custom freshness" });
     await expect(custom).toHaveAccessibleDescription(/m means months/);
     await custom.fill("0h");
-    await panel.getByRole("button", { name: "Save settings" }).click();
+    await panel.getByRole("button", { name: "Save", exact: true }).click();
     await expect(panel.getByRole("alert")).toBeVisible();
     await custom.fill("2w");
-    await panel.getByRole("button", { name: "Save settings" }).click();
+    await panel.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(edit).toBeFocused();
     await expect
       .poll(async () => (await pageView(page, path)).freshness)
       .toBe("2w");
 
-    // The page pact: made and opened in the editor.
+    // Cancel and Escape leave the settings as they are.
+    await edit.click();
+    await panel.getByRole("combobox", { name: "Freshness" }).selectOption("1d");
+    await panel.getByRole("button", { name: "Cancel" }).click();
+    await expect(edit).toBeFocused();
+    await edit.click();
+    await page.keyboard.press("Escape");
+    await expect(edit).toBeFocused();
+    await expect(panel).toContainText("2 weeks");
+
+    // The page pact: made and opened in the editor, then named last in the
+    // line under the title.
     await panel.getByRole("button", { name: "Create the page pact" }).click();
     await expect(page).toHaveURL(
       (url) =>
@@ -106,17 +128,24 @@ test("a curator sets a page's freshness, makes its pact, retires, restores and d
     );
     await page.goto(`d/${DOMAIN}/reflection/${path}`);
     await expect(
-      panel.getByRole("link", { name: "Open the page pact" }),
+      panel.getByRole("link", { name: `${name}.pact.md` }),
     ).toBeVisible();
+    // The fixture domain may have no PACT.md: the line names only the pact
+    // files that exist, so the page's own pact is last either way.
+    await expect(status).toContainText(
+      new RegExp(`Pacts: (PACT\\.md > )?${name}\\.pact\\.md`),
+    );
 
-    // Retire: the banner says so, the navigation hides the page behind its
-    // switch, and the banner restores it.
-    await panel.getByRole("button", { name: "Retire" }).click();
+    // Retire from the menu: the banner says so, the navigation hides the
+    // page behind its switch, and the banner restores it.
+    const more = page.getByRole("button", { name: "More actions" });
+    await more.click();
+    await page.getByRole("menuitem", { name: "Retire" }).click();
     const banner = page.getByRole("note", { name: "Retired" });
     await expect(banner).toHaveText(/^Retired/);
-    // The pressed button is gone: the focus is on the one that replaced it.
+    // The focus goes to the banner's Restore.
     await expect(
-      panel.getByRole("button", { name: "Restore", exact: true }),
+      banner.getByRole("button", { name: "Restore", exact: true }),
     ).toBeFocused();
     await page.goto(`d/${DOMAIN}/reflection`);
     const nav = page.getByRole("navigation", {
@@ -136,20 +165,22 @@ test("a curator sets a page's freshness, makes its pact, retires, restores and d
     await nav.getByRole("link", { name: title }).click();
     await banner.getByRole("button", { name: "Restore", exact: true }).click();
     await expect(banner).toHaveCount(0);
-    // The banner went with its button: the column's Retire takes the focus.
-    await expect(panel.getByRole("button", { name: "Retire" })).toBeFocused();
+    // The banner went with its button: More actions, where Retire lives,
+    // takes the focus.
+    await expect(more).toBeFocused();
 
-    // Delete: the first press asks, Keep gives the press back, and the
-    // second press means it.
-    const del = panel.getByRole("button", { name: "Delete", exact: true });
-    await del.click();
-    await panel.getByRole("button", { name: "Keep" }).click();
-    await expect(del).toBeFocused();
+    // Delete from the menu: the first press asks, Keep gives the press
+    // back, and the second press means it.
+    await more.click();
+    await page.getByRole("menuitem", { name: "Delete" }).click();
+    await page.getByRole("button", { name: "Keep" }).click();
+    await expect(more).toBeFocused();
     await expect(
-      panel.getByRole("button", { name: "Confirm delete" }),
+      page.getByRole("button", { name: "Confirm delete" }),
     ).toHaveCount(0);
-    await del.click();
-    await panel.getByRole("button", { name: "Confirm delete" }).click();
+    await more.click();
+    await page.getByRole("menuitem", { name: "Delete" }).click();
+    await page.getByRole("button", { name: "Confirm delete" }).click();
     await expect(page).toHaveURL(
       (url) => url.pathname === `${BASE_PATH}/d/${DOMAIN}/reflection`,
     );

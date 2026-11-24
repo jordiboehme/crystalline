@@ -122,6 +122,8 @@ Once a day (after a failed check, after four hours) Crystalline asks GitHub for 
 
 The check stays off, whatever `update.check` says, when `NO_UPDATE_NOTIFIER` or `CI` is set to a value in the daemon's environment, in a Docker install and in the Claude Desktop-only bundle. A systemd service reads its settings from `/etc/default/crystalline`: add `CRYSTALLINE_UPDATE_CHECK=true` there and restart the service. `crystalline update auto on` says so on a machine with the .deb and its unit.
 
+An admin sees the state of the check in Fluid, on the General page of the Administration area (Updates): on, with when it last ran and what it found, or off and why, with what to do instead (the command to turn it on, `/etc/default/crystalline` for a .deb install, pulling the new image for Docker). The page only shows the state; the check is turned on or off on the server.
+
 When a check finds a newer release that passed the age gate, it shows in these places:
 
 - `crystalline status` and `crystalline doctor` show how this binary was installed, whether it is an official build and what the last check found, for example "update check on; Crystalline 0.35.0 is available (this is 0.34.0); run: crystalline update now". With the check off they say "update check off" and why.
@@ -134,7 +136,7 @@ When a check finds a newer release that passed the age gate, it shows in these p
   ```
 
   The last line names what to run for the install method: `update now --yes` for Homebrew and tar.gz, `update now` and the apt command it prints for the .deb, `update now` and the steps it prints for the MSI and the zip. The block reads only the cached result: no network, no daemon call, no wait.
-- In Fluid, an admin sees a small note in the avatar menu ([Web UI from the daemon](#web-ui-from-the-daemon)). Nobody else sees it.
+- In Fluid, an admin sees a small note in the avatar menu ([Web UI from the daemon](#web-ui-from-the-daemon)) and the release, its notes and the command on the General page of the Administration area. Nobody else sees them.
 
 ```mermaid
 flowchart LR

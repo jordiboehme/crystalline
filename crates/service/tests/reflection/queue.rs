@@ -102,7 +102,11 @@ async fn the_queue_guidance_names_a_section_from_tentative_engrams() {
         .unwrap();
     let guidance = queue["guidance"].as_str().unwrap();
     assert!(
-        guidance.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) says so in its text, for example \"proposed:\" or \"not decided yet\"."),
+        guidance.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) shows a status chip, for example :status[Proposed]{purple}."),
+        "{guidance}"
+    );
+    assert!(
+        guidance.contains("A chip is text, so it stays on a page whose PACT allows only plain text and tables, unless the PACT says no chips."),
         "{guidance}"
     );
 }
