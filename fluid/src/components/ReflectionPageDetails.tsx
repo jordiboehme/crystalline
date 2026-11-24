@@ -76,11 +76,12 @@ const UNITS: Readonly<Record<string, readonly [string, string]>> = {
 /**
  * A freshness in words, as the form's presets say them: "1 day", "6 hours",
  * "3 months" (`m` is months), a bare number in days. Anything else as
- * written.
+ * written, a unit in capitals too: the server reads the units in lower case
+ * only, so "3M" is no freshness and must not read as one.
  */
 function freshnessWords(value: string): string {
-  const read = /^\s*(\d+)\s*([hdwmy])?\s*$/i.exec(value);
-  const unit = UNITS[(read?.[2] ?? "d").toLowerCase()];
+  const read = /^\s*(\d+)\s*([hdwmy])?\s*$/.exec(value);
+  const unit = UNITS[read?.[2] ?? "d"];
   if (read === null || unit === undefined) {
     return value;
   }

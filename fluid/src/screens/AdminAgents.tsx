@@ -18,7 +18,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 
 import {
   AGENTS_KEY,
@@ -92,6 +92,9 @@ export default function AdminAgents() {
   }
 
   const rows = agents.data?.agents ?? [];
+  // A removed agent's card goes with the buttons that removed it, so the
+  // focus goes to the list's heading instead of falling to the page body.
+  const listHeading = useRef<HTMLHeadingElement | null>(null);
 
   return (
     <div className="flex max-w-4xl flex-col gap-6">
@@ -151,7 +154,12 @@ export default function AdminAgents() {
       />
 
       <section aria-labelledby="agents-list" className="flex flex-col gap-4">
-        <h2 id="agents-list" className="text-section">
+        <h2
+          id="agents-list"
+          ref={listHeading}
+          tabIndex={-1}
+          className="text-section focus:outline-none"
+        >
           Agents on this instance
         </h2>
         {agents.error && (
@@ -185,6 +193,7 @@ export default function AdminAgents() {
                   }}
                   onRemoved={() => {
                     setNotice({ kind: "done", text: `Removed ${agent.name}.` });
+                    listHeading.current?.focus();
                     if (revealed?.agent === agent.name) setRevealed(null);
                     void refresh();
                   }}
@@ -412,10 +421,16 @@ function AgentCard({
     },
     onError: onProblem,
   });
+  // A revoked token keeps its row but loses its buttons, so the focus goes
+  // to the agent's heading instead of falling to the page body.
+  const heading = useRef<HTMLHeadingElement | null>(null);
   const revoke = useMutation({
     mutationFn: (token: AgentToken) =>
       revokeAgentToken(agent.name, token.id).then(() => token.label),
-    onSuccess: onRevoked,
+    onSuccess: (revoked) => {
+      heading.current?.focus();
+      onRevoked(revoked);
+    },
     onError: onProblem,
   });
   const remove = useMutation({
@@ -433,7 +448,12 @@ function AgentCard({
       className="flex flex-col gap-3 rounded border border-slate-200 p-4 dark:border-slate-800"
     >
       <header className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <h3 id={`${ids}-name`} className="text-base font-semibold break-words">
+        <h3
+          id={`${ids}-name`}
+          ref={heading}
+          tabIndex={-1}
+          className="text-base font-semibold break-words focus:outline-none"
+        >
           {agent.display}
         </h3>
         <code className="font-mono text-sm break-all text-ink-3">

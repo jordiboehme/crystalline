@@ -308,6 +308,9 @@ describe("the page details column", () => {
       ["1y", "1 year"],
       ["5", "5 days"],
       ["soon", "soon"],
+      // The server reads units in lower case only: these are no freshness.
+      ["3M", "3M"],
+      ["1D", "1D"],
     ]) {
       serve("edit", { [DOC]: () => doc(view({ freshness: written })) });
       const shown = renderApp(URL);

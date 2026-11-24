@@ -101,6 +101,7 @@ import { FOCUS_HEADING, useHeadingFocusRequest } from "../focusHeading";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import { saveBlob } from "../components/downloads";
 import { lazyChunk } from "../lazyChunk";
+import { useLapsingState } from "../useLapsingState";
 import { discardPageDrafts } from "../reflectionPageDrafts";
 import { CHECKING_LOCK, useDomainWritable } from "../domainWritable";
 import { tickAt } from "../taskTick";
@@ -124,6 +125,12 @@ import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** What a tick on a page that moved underneath says. */
 const PAGE_CHANGED = "The page changed. Try again.";
+
+/**
+ * How long a retire or a restore waits for the page to show its new state
+ * before the focus it would hand on lapses.
+ */
+const LIFECYCLE_FOCUS_LAPSE_MS = 10_000;
 
 const MoveReflectionDialog = lazyChunk(() =>
   import("../components/MoveReflectionDialog").then((m) => ({
@@ -316,11 +323,18 @@ function PageBody({
   const [deleted, setDeleted] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   // After a retire or a restore: the retired state the page will show, so
-  // the details column hands the focus to its new button once it does.
-  const [lifecycleFocus, setLifecycleFocus] = useState<boolean | null>(null);
+  // the details column hands the focus to its new button once it does. It
+  // lapses when the page never shows that state in time, and goes with the
+  // page, so a later change cannot pull the focus away from the person.
+  const [lifecycleFocus, setLifecycleFocus] = useLapsingState<boolean>(
+    LIFECYCLE_FOCUS_LAPSE_MS,
+  );
   const lifecycleFocused = useCallback(() => {
     setLifecycleFocus(null);
-  }, []);
+  }, [setLifecycleFocus]);
+  useEffect(() => {
+    setLifecycleFocus(null);
+  }, [domain, path, setLifecycleFocus]);
   const moreRef = useRef<HTMLButtonElement | null>(null);
   const skipRefocus = useRef(false);
   const confirmRef = useRef<HTMLDivElement | null>(null);

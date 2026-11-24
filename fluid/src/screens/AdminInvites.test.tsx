@@ -292,6 +292,13 @@ describe("the invites page", () => {
     expect(await screen.findByRole("status")).toHaveTextContent(
       "Revoked for Pia.",
     );
+    // The row and its buttons are gone: the focus goes to the list's
+    // heading, not to the page body.
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Invite links" }),
+      ).toHaveFocus();
+    });
   });
   it("shows only the link being revoked as pending", async () => {
     apiMock.mockImplementation(

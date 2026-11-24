@@ -342,6 +342,12 @@ describe("the agents page", () => {
     expect(await screen.findByRole("status")).toHaveTextContent(
       "Revoked soon of nightly.",
     );
+    // Its buttons are gone: the focus goes to the agent's heading.
+    await waitFor(() => {
+      expect(
+        within(card).getByRole("heading", { name: "Nightly runner" }),
+      ).toHaveFocus();
+    });
   });
 
   it("keeps the agent when the person steps back from the remove", async () => {
@@ -379,6 +385,12 @@ describe("the agents page", () => {
     expect(await screen.findByRole("status")).toHaveTextContent(
       "Removed nightly.",
     );
+    // The card is gone: the focus goes to the list's heading.
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Agents on this instance" }),
+      ).toHaveFocus();
+    });
   });
 
   it("marks a token by the exact time left, so 13.2 days counts", async () => {

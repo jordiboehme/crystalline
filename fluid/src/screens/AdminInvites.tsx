@@ -19,7 +19,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -79,10 +79,14 @@ export default function AdminInvites() {
     setNotice({ kind: "problem", text: problemDetail(error) });
   }
 
+  // A revoked link leaves the list with the buttons that revoked it, so the
+  // focus goes to the list's heading instead of falling to the page body.
+  const listHeading = useRef<HTMLHeadingElement | null>(null);
   const revoke = useMutation({
     mutationFn: (invite: Invite) => revokeInvite(invite.id).then(() => invite),
     onSuccess: (invite) => {
       setNotice({ kind: "done", text: `Revoked ${inviteName(invite)}.` });
+      listHeading.current?.focus();
       void refresh();
     },
     onError: problem,
@@ -145,7 +149,12 @@ export default function AdminInvites() {
 
       <section aria-labelledby="invites-list" className="flex flex-col gap-4">
         <div className="flex flex-wrap items-end justify-between gap-3">
-          <h2 id="invites-list" className="text-section">
+          <h2
+            id="invites-list"
+            ref={listHeading}
+            tabIndex={-1}
+            className="text-section focus:outline-none"
+          >
             Invite links
           </h2>
           <Labelled label="Show">
