@@ -392,6 +392,24 @@ mod tests {
         );
     }
 
+    /// A headless run leaves pact text, a page with its own pact and a
+    /// page's freshness and follows to a curator, and only a session with a
+    /// person adds a bullet to the PACT's `## Pages`.
+    #[test]
+    fn the_intelligence_skill_keeps_a_run_off_pact_text_and_page_settings() {
+        let intelligence = skill("crystalline-intelligence").unwrap().content;
+        for needle in [
+            "Such a run writes no pact text, moves no page that has its own page pact",
+            "`freshness` or `follows`",
+            "When a person asks you for a page or space in a session with them",
+        ] {
+            assert!(
+                intelligence.contains(needle),
+                "intelligence skill lacks {needle}"
+            );
+        }
+    }
+
     #[test]
     fn the_capture_skill_guards_a_whole_engram_overwrite_too() {
         let capture = skill("crystalline-capture").unwrap().content;
