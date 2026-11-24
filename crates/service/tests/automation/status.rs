@@ -751,6 +751,31 @@ async fn the_next_stale_time_never_waits_for_the_writer_lock() {
     drop(held);
 }
 
+/// The leases an MCP call's agent gate reads (`run_leases`, asked for every
+/// tool call, resource read and prompt) come through the read connections:
+/// on a turso file they answer while a test holds the writer lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_run_leases_never_wait_for_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TursoStore::open(&dir.path().join("index.db"))
+        .await
+        .unwrap();
+    let fx = rolling_page_on(Arc::new(Mutex::new(store)), "2026-10-21T10:00:00+00:00").await;
+    now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
+    fx.engine
+        .automation_lease_take(Loop::Reflect, "eng", "cron", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let store = fx.engine.store();
+    let held = store.lock().await;
+    let leases = tokio::time::timeout(PATIENCE, fx.engine.run_leases(&Scope::Unrestricted))
+        .await
+        .expect("the run leases waited for the writer lock")
+        .unwrap();
+    assert_eq!(leases, [(Loop::Reflect, "eng".to_string())]);
+    drop(held);
+}
+
 /// The page clocks read the page texts in one query when nothing is
 /// remembered (the first status after a start), and then only the text of
 /// a page whose checksum moved.

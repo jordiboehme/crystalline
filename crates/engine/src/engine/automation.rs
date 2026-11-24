@@ -1876,11 +1876,16 @@ impl Engine {
 
     /// The live leases `scope` holds, as (loop, domain), sorted by domain:
     /// [`Engine::run_domains`] with the loop each one runs.
+    ///
+    /// Asked for every MCP tool call, resource read and prompt (the agent
+    /// gate), so it reads through [`Engine::reader`], never the writer lock,
+    /// as `loop_status` does: a lease take has committed before it answered,
+    /// so the next call sees it.
     pub async fn run_leases(&self, scope: &Scope) -> Result<Vec<(Loop, String)>> {
         let (_, stale_before) = self.automation_window();
         let mut domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
         domains.sort();
-        let store = self.store.lock().await;
+        let store = self.reader();
         let mut out = Vec::new();
         for domain in domains {
             let Some(id) = store.domain_id(&domain).await? else {
