@@ -456,6 +456,87 @@ impl Engine {
         Ok(out)
     }
 
+    /// The pages of `domain` among `files` (a backup's collected files) that
+    /// go to the backup branch only because `reflection.backup_sources` is
+    /// `full`: not in `held`, and citing a domain the readers of the page's
+    /// repository may not read ([`Engine::leaves_repository`]) that no
+    /// person's confirmation of that repository covers. Under `refuse` the
+    /// backup would hold each of them back. Empty under any other setting,
+    /// so it costs nothing there.
+    pub(crate) async fn sent_only_under_full(
+        &self,
+        domain: &str,
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
+        held: &[String],
+    ) -> Result<Vec<String>> {
+        if self.backup_sources() != crystalline_core::config::BackupSources::Full {
+            return Ok(Vec::new());
+        }
+        let Some(id) = self.store.lock().await.domain_id(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let disclosures = self.reflection_disclosures(id).await?;
+        let table = self.name_table_now().await;
+        let mut leaves: HashMap<String, bool> = HashMap::new();
+        let mut out = Vec::new();
+        for (inner, bytes) in reflection_files(spec, files) {
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
+                continue;
+            };
+            if held.contains(&page) {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            let mut wide = false;
+            'records: for record in r::read_provenance(text).into_values() {
+                for src in &record.sources {
+                    let Some(name) = src.domain.as_deref() else {
+                        continue;
+                    };
+                    let Some(local) = self.checkable_domain(&table, name) else {
+                        continue;
+                    };
+                    if local == domain {
+                        continue;
+                    }
+                    let leaves_here = match leaves.get(&local) {
+                        Some(leaves_here) => *leaves_here,
+                        None => {
+                            let leaves_here = self.leaves_repository(domain, &local).await?;
+                            leaves.insert(local.clone(), leaves_here);
+                            leaves_here
+                        }
+                    };
+                    if !leaves_here {
+                        continue;
+                    }
+                    let mut confirmed = false;
+                    for disclosure in disclosures.of(&page, name) {
+                        if self
+                            .backup_still_confirmed(domain, &local, disclosure)
+                            .await
+                        {
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                    if !confirmed {
+                        wide = true;
+                        break 'records;
+                    }
+                }
+            }
+            if wide {
+                out.push(page);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Every open item of one domain's Reflection, unranked, as `scope`
     /// may see them: a source in a domain it may not open is counted on its
     /// item and never named. `threads` is [`Engine::all_threads`] of the

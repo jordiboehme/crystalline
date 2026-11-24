@@ -2821,6 +2821,36 @@ mod tests {
         );
     }
 
+    /// A Reflection collaborator (a per-domain page grant) reads the page
+    /// and not its engrams, like a Reflection-only reader: with
+    /// `reflection.cite_shared` on it does not keep a shared page from
+    /// covering another shared domain, with it off it does.
+    #[tokio::test]
+    async fn cite_shared_on_skips_a_reflection_collaborator_like_a_reflection_only_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        auth.add_user("gina", "gina", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("shared", "gina", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth.clone());
+        assert!(
+            !access
+                .readers_cover("shared", "other", CiteShared::Off)
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .readers_cover("shared", "other", CiteShared::On)
+                .await
+                .unwrap()
+        );
+    }
+
     /// With `reflection.cite_shared` on, a member of a private page's domain
     /// at knowledge `none` with a Reflection level there does not keep the
     /// page from covering a shared source. A member who reads the page's

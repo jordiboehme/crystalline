@@ -62,6 +62,12 @@ pub struct DisclosureAsk {
 pub(crate) struct Asked {
     pub ask: DisclosureAsk,
     pub repo_readers: Option<RepositoryReaders>,
+    /// Whether the question named the page's repository and its readers. A
+    /// confirmation of a question that did not (under
+    /// `reflection.backup_sources: hold_back`, or when only the accounts
+    /// rule was broken) records no repository, so it never stands for the
+    /// GitHub half later, after a switch to `refuse` for one.
+    pub repo_named: bool,
 }
 
 /// What a write would put on a page, worked out without writing it: the page
@@ -357,7 +363,7 @@ impl Engine {
     /// GitHub App, nobody reads that repository now who did not then and
     /// may not read the source's repository. Without an App the repository's
     /// name is all that is compared, as the rule compares nothing more.
-    async fn backup_still_confirmed(
+    pub(super) async fn backup_still_confirmed(
         &self,
         page: &str,
         source: &str,
@@ -588,13 +594,15 @@ impl Engine {
         let readers = self.page_readers_now(page).await?;
         let repo = self.page_repo(page);
         let repo_readers = self.page_repository_readers_now(page).await;
+        let repo_named = repo.is_some()
+            && (gap.not_on_github || gap.narrower_repository || gap.backed_up_in_full);
         let question = question(
             page,
             path,
             sources,
             readers.as_ref().filter(|_| accounts_wide),
             repo.as_deref()
-                .filter(|_| gap.not_on_github || gap.narrower_repository || gap.backed_up_in_full)
+                .filter(|_| repo_named)
                 .map(|repo| (repo, gap)),
             texts,
         );
@@ -613,6 +621,7 @@ impl Engine {
         Ok(Asked {
             ask: DisclosureAsk { question, basis },
             repo_readers,
+            repo_named,
         })
     }
 
@@ -703,8 +712,9 @@ impl Engine {
     /// Record, after a write of page `path` landed with `text`, the
     /// confirmations it carries (`confirmed`: stored source domains, by
     /// `by`), one per person and domain, and drop every recorded one whose
-    /// domain the page no longer cites anywhere. `repo_readers` are the
-    /// readers of the page's repository the person's question named (the
+    /// domain the page no longer cites anywhere. `repo` is what the person's
+    /// question said of the page's repository: `None` when it named none,
+    /// and then no repository is recorded, else the readers it named (the
     /// basis check read them), never a later read. Called under the page's
     /// lock.
     #[allow(clippy::too_many_arguments)]
@@ -716,7 +726,7 @@ impl Engine {
         text: &str,
         confirmed: &[String],
         by: Option<&str>,
-        repo_readers: Option<RepositoryReaders>,
+        repo: Option<Option<RepositoryReaders>>,
     ) -> Result<()> {
         let mut list = self
             .reflection_disclosures(id)
@@ -732,7 +742,12 @@ impl Engine {
         list.retain(|d| cited.contains(&d.source));
         if let (Some(by), false) = (by, confirmed.is_empty()) {
             let readers = self.page_readers_now(domain).await?;
-            let repo = self.page_repo(domain);
+            // A question that named no repository records none: the person
+            // agreed to no reader of it.
+            let (repo, repo_readers) = match repo {
+                Some(repo_readers) => (self.page_repo(domain), repo_readers),
+                None => (None, None),
+            };
             let at = time::now().rfc3339_secs_z();
             for source in confirmed {
                 list.retain(|d| !(d.source == *source && d.by == by));
@@ -876,7 +891,7 @@ impl Engine {
             &text,
             &wide,
             Some(&by),
-            asked.repo_readers,
+            asked.repo_named.then_some(asked.repo_readers),
         )
         .await?;
         // The page may go to the backup branch now.

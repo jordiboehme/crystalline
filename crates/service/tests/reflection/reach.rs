@@ -521,3 +521,84 @@ async fn the_page_save_and_the_live_editor_cannot_set_a_source() {
     let (items, queue) = too_wide(&s.fx, &agent()).await;
     assert!(items.is_empty(), "{queue}");
 }
+
+/// Set `reflection.cite_shared` to `value` the way the operator does.
+async fn set_cite_shared(fx: &Fx, value: &str) {
+    fx.engine
+        .configure_as_operator(&crystalline_service::engine::ConfigureAction::Set {
+            key: "reflection.cite_shared".into(),
+            value: value.into(),
+        })
+        .await
+        .unwrap();
+}
+
+/// What a reflect run on `eng` may not read.
+async fn run_hidden(fx: &Fx) -> std::collections::HashSet<String> {
+    fx.engine
+        .read_limit_for(&Scope::Unrestricted, true, Some("eng"))
+        .await
+        .expect("a marked session is limited")
+        .hidden
+}
+
+/// `reflection.cite_shared` with a Reflection-only reader on the server
+/// (nora: instance knowledge `none` with an instance Reflection level).
+/// Under `on` (the default) the shared page cites the other shared domain,
+/// the queue names nothing and a run on it may read the source. Under `off`
+/// the write is refused, the existing page gets its `source_too_wide` item
+/// and the run may not read the source. Each change applies at once,
+/// without a restart.
+#[tokio::test]
+async fn cite_shared_decides_whether_a_reflection_only_reader_counts() {
+    let (fx, auth) = reach().await;
+    auth.add_user("nora", "nora", None, Role::None, "pw12345678")
+        .await
+        .unwrap();
+    auth.set_reflection_level("nora", ReflectionLevel::Reader)
+        .await
+        .unwrap();
+    fx.engine
+        .automation_lease_take(
+            crystalline_core::automation::Loop::Reflect,
+            "eng",
+            "cli",
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    // on (the default)
+    fx.engine
+        .write_reflection(&cite(&[TEAM]), &agent())
+        .await
+        .unwrap();
+    let (items, queue) = too_wide(&fx, &agent()).await;
+    assert!(items.is_empty(), "{queue}");
+    assert!(!run_hidden(&fx).await.contains("harbor"));
+
+    // off
+    set_cite_shared(&fx, "off").await;
+    let err = fx
+        .engine
+        .write_reflection(&cite(&[ROTA]), &agent())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(TOO_WIDE), "{err}");
+    let (items, queue) = too_wide(&fx, &agent()).await;
+    assert_eq!(items.len(), 1, "{queue}");
+    assert_eq!(items[0]["path"], "overview.md", "{queue}");
+    assert_eq!(items[0]["sources"][0]["domain"], "harbor", "{queue}");
+    assert!(run_hidden(&fx).await.contains("harbor"));
+
+    // on again
+    set_cite_shared(&fx, "on").await;
+    let (items, queue) = too_wide(&fx, &agent()).await;
+    assert!(items.is_empty(), "{queue}");
+    assert!(!run_hidden(&fx).await.contains("harbor"));
+    fx.engine
+        .write_reflection(&cite(&[ROTA]), &agent())
+        .await
+        .unwrap();
+}

@@ -53,7 +53,6 @@ impl Engine {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
-                let reach_before = self.reach_settings();
                 // The inner block scopes the lock guards, so they are released
                 // before the announcement below awaits.
                 let view = {
@@ -74,7 +73,6 @@ impl Engine {
                     view
                 };
                 self.contradiction_setting_touched(key);
-                self.reach_setting_touched(reach_before);
                 self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
@@ -83,7 +81,6 @@ impl Engine {
                     return Err(EngineError::ReadOnly);
                 }
                 let github_before = self.github_enabled();
-                let reach_before = self.reach_settings();
                 let view = {
                     // Same write-lock-first discipline and lock order as Set above.
                     let mut file_guard = self.file_config.write().unwrap();
@@ -94,7 +91,6 @@ impl Engine {
                     view
                 };
                 self.contradiction_setting_touched(key);
-                self.reach_setting_touched(reach_before);
                 self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
@@ -112,10 +108,13 @@ impl Engine {
         (self.cite_shared(), self.backup_sources())
     }
 
-    /// Mark every Reflection for a backup when a settings write changed what
-    /// the backup holds back (`reach_before` against now): a page the new
-    /// setting lets go goes out at the next pass, and one it holds back
-    /// leaves the branch, without waiting for a change to the page.
+    /// Mark every Reflection for a backup when a change of the configuration
+    /// changed what the backup holds back (`reach_before` against now): a
+    /// page the new setting lets go goes out at the next pass, and one it
+    /// holds back leaves the branch, without waiting for a change to the
+    /// page. Called wherever the effective configuration is swapped
+    /// ([`Engine::commit_config`], [`Engine::adopt_config`]), so a
+    /// configuration adopted from the store marks them too.
     fn reach_setting_touched(
         &self,
         reach_before: (
@@ -384,8 +383,10 @@ impl Engine {
     /// both move to it.
     pub(super) fn adopt_config(&self, held: &mut GlobalConfig, file: GlobalConfig) -> Result<()> {
         let effective = self.effective_of(&file)?;
+        let reach_before = self.reach_settings();
         *held = file;
         *self.config.write().unwrap() = effective;
+        self.reach_setting_touched(reach_before);
         Ok(())
     }
 
@@ -397,8 +398,10 @@ impl Engine {
     pub(super) fn commit_config(&self, held: &mut GlobalConfig, file: GlobalConfig) -> Result<()> {
         let effective = self.effective_of(&file)?;
         self.persist_config(held, &file)?;
+        let reach_before = self.reach_settings();
         *held = file;
         *self.config.write().unwrap() = effective;
+        self.reach_setting_touched(reach_before);
         Ok(())
     }
 
@@ -488,8 +491,10 @@ impl Engine {
         let effective = self
             .effective_of(&stored)
             .map_err(|e| unknown(e.to_string()))?;
+        let reach_before = self.reach_settings();
         *held = stored;
         *self.config.write().unwrap() = effective;
+        self.reach_setting_touched(reach_before);
         self.mark_names_stale();
         if landed {
             tracing::warn!(

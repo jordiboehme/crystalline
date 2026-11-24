@@ -17,17 +17,21 @@ use super::reflection::EngramFact;
 use super::*;
 use crate::scope::Scope;
 
-/// Which decision a reach check serves: the rule every write, the queue and
-/// the unattended read limit share, or what the Reflection backup leaves
-/// out. They differ only under `reflection.backup_sources: hold_back`, where
-/// the GitHub half no longer refuses a write but still keeps the page out
-/// of the backup.
+/// Which decision a reach check serves: the rule every write and the queue
+/// share, what the Reflection backup leaves out, or what an unattended run
+/// may read. They differ only under `reflection.backup_sources: hold_back`,
+/// where the GitHub half no longer refuses a write but still keeps the page
+/// out of the backup, and still narrows what a run reads: a run's thread
+/// answers, unsourced sentences and engram writes reach the backup too,
+/// and nothing holds them back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reach {
-    /// The rule: a write, the queue's `source_too_wide`, the read limit.
+    /// The rule: a write, the queue's `source_too_wide`.
     Rule,
     /// The Reflection backup: which pages it holds back.
     Backup,
+    /// The unattended read limit (`Engine::read_limit_for`).
+    ReadLimit,
 }
 
 /// What a queue item says about sources in a domain the caller cannot
@@ -273,11 +277,11 @@ impl Engine {
 
     /// Whether the GitHub half of the reach rule ([`Engine::leaves_repository`])
     /// counts for `reach`: for every decision under `refuse`, for the backup
-    /// alone under `hold_back`, and never under `full`.
+    /// and the read limit under `hold_back`, and never under `full`.
     pub(crate) fn repository_half_counts(&self, reach: Reach) -> bool {
         match self.backup_sources() {
             BackupSources::Refuse => true,
-            BackupSources::HoldBack => reach == Reach::Backup,
+            BackupSources::HoldBack => reach != Reach::Rule,
             BackupSources::Full => false,
         }
     }
