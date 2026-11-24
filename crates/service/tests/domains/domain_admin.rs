@@ -943,6 +943,45 @@ async fn adding_through_the_engine_sees_a_domain_registered_after_startup() {
     assert_eq!(report["adopted"], true, "{report}");
 }
 
+/// A configuration adopted from the file without a settings write (here a
+/// virtual domain the CLI registered after startup, beside a changed
+/// `reflection.backup_sources`) marks every Reflection for a backup when it
+/// changes a reach setting, as a settings write does: the next backup sends
+/// or holds back the pages the new setting decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adopted_reach_setting_marks_every_reflection_for_a_backup() {
+    let (tmp, engine) = engine().await;
+    std::fs::write(
+        tmp.path().join("eng/MANIFEST.md"),
+        MANIFEST.replace("status: current\n", "status: current\nreflection: on\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        engine.reflection_switch("eng"),
+        crystalline_core::ReflectionSwitch::On
+    );
+    engine.take_reflection_backup_marks();
+    let config_path = tmp.path().join("config.yaml");
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    file.domains
+        .insert("side".to_string(), DomainEntry::virtual_domain());
+    file.reflection = Some(crystalline_core::config::ReflectionConfig {
+        backup_sources: Some(crystalline_core::config::BackupSources::HoldBack),
+        ..Default::default()
+    });
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    engine.domain_add_virtual("side").await.unwrap();
+    assert_eq!(
+        engine.config().reflection_backup_sources(),
+        crystalline_core::config::BackupSources::HoldBack
+    );
+    assert_eq!(
+        engine.take_reflection_backup_marks(),
+        vec!["eng".to_string()]
+    );
+}
+
 /// A new name is checked before anything touches the disk: the default folder
 /// is `<domains_root>/<name>`, so `../up` would otherwise create a folder
 /// beside the root before any refusal.

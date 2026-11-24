@@ -8,6 +8,10 @@
 //! widening of the page repository's readers names the page in the queue
 //! and asks a person who shared the source on purpose again.
 //!
+//! All of that is `reflection.backup_sources: refuse`, which [`setup`] sets
+//! unless a test names the setting itself; the tests at the end show
+//! `full` (the default) and `hold_back`.
+//!
 //! The forge is the one `origins::github_app` serves, with its collaborator
 //! listing and repository visibility routes.
 
@@ -70,11 +74,28 @@ async fn setup(tmp: &Path, env: &[(&str, &str)]) -> (Arc<Forge>, Arc<Engine>, Ar
     (forge, eng, auth)
 }
 
+/// The variable of `reflection.backup_sources`.
+const BACKUP_SOURCES: &str = "CRYSTALLINE_REFLECTION_BACKUP_SOURCES";
+
+/// `env` with `reflection.backup_sources` set to `value`.
+fn with_sources<'a>(env: &[(&'a str, &'a str)], value: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut env = env.to_vec();
+    env.push((BACKUP_SOURCES, value));
+    env
+}
+
 /// [`setup`], with the repository `acme/kb` as the forge holds it.
+/// `reflection.backup_sources` is `refuse` unless `env` names it.
 async fn setup_with_page_repo(
     tmp: &Path,
     env: &[(&str, &str)],
 ) -> (Arc<Forge>, Arc<Engine>, Arc<AuthStore>, Arc<MockProvider>) {
+    let env = if env.iter().any(|(name, _)| *name == BACKUP_SOURCES) {
+        env.to_vec()
+    } else {
+        with_sources(env, "refuse")
+    };
+    let env = env.as_slice();
     let kb = repo(&[""]);
     let (forge, url) = spawn_forge(
         &[("acme/kb", kb.clone()), ("acme/vault", repo(&[""]))],
@@ -755,5 +776,66 @@ async fn an_earlier_pushed_baseline_leaves_the_head() {
     assert!(
         kb.commit_paths(&second)
             .contains(&"reflections/.reflected/a.md".to_string())
+    );
+}
+
+/// Under `reflection.backup_sources: full` (the default) a page may cite a
+/// domain whose repository fewer people read: the queue names nothing, the
+/// page is backed up in full, and an unattended run on the page's domain
+/// may read that domain.
+#[tokio::test]
+async fn under_full_a_narrower_repository_is_cited_and_backed_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = with_sources(&app_env(), "full");
+    let (forge, eng, _, kb) = setup_with_page_repo(tmp.path(), &env).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    let limit = eng
+        .read_limit_for(&Scope::Unrestricted, true, None)
+        .await
+        .expect("unattended");
+    assert!(limit.hidden.is_empty(), "{:?}", limit.hidden);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    assert!(too_wide(&eng, "kb").await.is_empty());
+    eng.reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    let head = kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(
+        head.contains(&"reflections/overview.md".to_string()),
+        "{head:?}"
+    );
+    assert!(eng.reflection_backup_held_back("kb").is_empty());
+}
+
+/// Under `reflection.backup_sources: hold_back` the write is allowed and
+/// the page is served, but the backup holds it back. The queue names
+/// nothing. An unattended run may not read the source's domain: its thread
+/// answers and engram writes would reach the repository, and the hold is
+/// for pages only.
+#[tokio::test]
+async fn under_hold_back_a_narrower_repository_is_cited_and_held_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = with_sources(&app_env(), "hold_back");
+    let (forge, eng, _, kb) = setup_with_page_repo(tmp.path(), &env).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    let limit = eng
+        .read_limit_for(&Scope::Unrestricted, true, None)
+        .await
+        .expect("unattended");
+    assert!(limit.hidden.contains("vault"), "{:?}", limit.hidden);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    assert!(tmp.path().join("kb/reflections/overview.md").exists());
+    assert!(too_wide(&eng, "kb").await.is_empty());
+    eng.reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    let head = kb
+        .branch_commit(BACKUP_BRANCH)
+        .map(|commit| kb.commit_paths(&commit))
+        .unwrap_or_default();
+    assert!(!head.iter().any(|p| p.contains("overview.md")), "{head:?}");
+    assert_eq!(
+        eng.reflection_backup_held_back("kb"),
+        vec!["overview.md".to_string()]
     );
 }

@@ -10,7 +10,7 @@ use crystalline_core::threads::{self as th, SectionRef, ThreadStatus, Waiting};
 use super::reflection::{
     EngramFact, ReflectionAccess, reflection_abs, source_state, source_view, thread_view,
 };
-use super::sources::{HIDDEN_SOURCE_NOTE, TOO_WIDE_NOTE, unavailable_note};
+use super::sources::{HIDDEN_SOURCE_NOTE, Reach, TOO_WIDE_NOTE, unavailable_note};
 use super::*;
 use crate::scope::{ReflectionCaller, ReflectionRight, Scope};
 
@@ -356,9 +356,12 @@ impl Engine {
     }
 
     /// Schedule a backup of every Reflection this instance backs up that has
-    /// a page newly citing a domain fewer people may read (or one not shared
-    /// through GitHub): a page its last backup did not hold back. Answers
-    /// the domains marked, sorted.
+    /// a page newly citing a domain fewer people may read (or, under
+    /// `reflection.backup_sources` `hold_back` or `refuse`, one its
+    /// repository's readers may not read): a page its last backup did not
+    /// hold back. Answers the domains marked, sorted. A change of either
+    /// `reflection.*` setting marks every Reflection on its own
+    /// ([`Engine::configure`]), so a page it lets go goes out too.
     ///
     /// Who may read a domain changes in the accounts store (a domain made
     /// private, a member removed, a role lowered), often from another
@@ -392,11 +395,13 @@ impl Engine {
         marked
     }
 
-    /// The pages of `domain` (by path inside `reflections/`, sorted) with a
-    /// section that cites a domain fewer people may read than `domain`: the
-    /// pages the queue names with `source_too_wide`, for every source, seen
-    /// by whom or not. A source whose domain cannot be checked here is not
-    /// counted, as in the queue.
+    /// The pages of `domain` (by path inside `reflections/`, sorted) the
+    /// Reflection backup holds back: each has a section that cites a domain
+    /// fewer people may read than `domain` (the pages the queue names with
+    /// `source_too_wide`, for every source, seen by whom or not), or, under
+    /// `reflection.backup_sources: hold_back`, one the readers of its
+    /// repository may not read ([`Reach::Backup`]). A source whose domain
+    /// cannot be checked here is not counted, as in the queue.
     pub(crate) async fn too_wide_pages(&self, domain: &str) -> Result<Vec<String>> {
         let (rows, id) = {
             let store = self.store.lock().await;
@@ -443,6 +448,87 @@ impl Engine {
                 Ok(text) => check.text(&page, text).await?,
                 Err(_) => true,
             };
+            if wide {
+                out.push(page);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The pages of `domain` among `files` (a backup's collected files) that
+    /// go to the backup branch only because `reflection.backup_sources` is
+    /// `full`: not in `held`, and citing a domain the readers of the page's
+    /// repository may not read ([`Engine::leaves_repository`]) that no
+    /// person's confirmation of that repository covers. Under `refuse` the
+    /// backup would hold each of them back. Empty under any other setting,
+    /// so it costs nothing there.
+    pub(crate) async fn sent_only_under_full(
+        &self,
+        domain: &str,
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
+        held: &[String],
+    ) -> Result<Vec<String>> {
+        if self.backup_sources() != crystalline_core::config::BackupSources::Full {
+            return Ok(Vec::new());
+        }
+        let Some(id) = self.store.lock().await.domain_id(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let disclosures = self.reflection_disclosures(id).await?;
+        let table = self.name_table_now().await;
+        let mut leaves: HashMap<String, bool> = HashMap::new();
+        let mut out = Vec::new();
+        for (inner, bytes) in reflection_files(spec, files) {
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
+                continue;
+            };
+            if held.contains(&page) {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            let mut wide = false;
+            'records: for record in r::read_provenance(text).into_values() {
+                for src in &record.sources {
+                    let Some(name) = src.domain.as_deref() else {
+                        continue;
+                    };
+                    let Some(local) = self.checkable_domain(&table, name) else {
+                        continue;
+                    };
+                    if local == domain {
+                        continue;
+                    }
+                    let leaves_here = match leaves.get(&local) {
+                        Some(leaves_here) => *leaves_here,
+                        None => {
+                            let leaves_here = self.leaves_repository(domain, &local).await?;
+                            leaves.insert(local.clone(), leaves_here);
+                            leaves_here
+                        }
+                    };
+                    if !leaves_here {
+                        continue;
+                    }
+                    let mut confirmed = false;
+                    for disclosure in disclosures.of(&page, name) {
+                        if self
+                            .backup_still_confirmed(domain, &local, disclosure)
+                            .await
+                        {
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                    if !confirmed {
+                        wide = true;
+                        break 'records;
+                    }
+                }
+            }
             if wide {
                 out.push(page);
             }
@@ -1792,7 +1878,9 @@ impl<'a> TooWide<'a> {
                 let covered = match self.covers.get(&local) {
                     Some(covered) => *covered,
                     None => {
-                        let covered = engine.readers_cover(domain, &local).await?;
+                        let covered = engine
+                            .readers_cover_in(domain, &local, Reach::Backup)
+                            .await?;
                         self.covers.insert(local.clone(), covered);
                         covered
                     }
@@ -1801,7 +1889,14 @@ impl<'a> TooWide<'a> {
                 // repository the page has now (`source_covered`).
                 let covered = covered
                     || engine
-                        .source_covered_on_page(domain, path, &local, name, &self.disclosures)
+                        .source_covered_on_page_in(
+                            domain,
+                            path,
+                            &local,
+                            name,
+                            &self.disclosures,
+                            Reach::Backup,
+                        )
                         .await?;
                 if !covered {
                     return Ok(true);

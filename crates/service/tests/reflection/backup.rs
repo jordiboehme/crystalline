@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crystalline_core::config::{GitHubConfig, OriginConfig, ServiceConfig};
+use crystalline_core::config::{
+    BackupSources, GitHubConfig, OriginConfig, ReflectionConfig, ServiceConfig,
+};
 use crystalline_remote::reflections_backup::{BACKUP_BRANCH, BackupOutcome};
 use crystalline_service::engine::ConfigureAction;
 use crystalline_service::reflection_backup::BackupCause;
@@ -818,6 +820,16 @@ async fn home_beside_harbor(
     mock: Arc<MockProvider>,
     harbor_on_github: bool,
 ) -> (Fx, Arc<crystalline_service::rest::AuthStore>) {
+    home_beside_harbor_with(mock, harbor_on_github, None).await
+}
+
+/// [`home_beside_harbor`] with `reflection.backup_sources` set to `sources`
+/// (`None`: the default, `full`).
+async fn home_beside_harbor_with(
+    mock: Arc<MockProvider>,
+    harbor_on_github: bool,
+    sources: Option<BackupSources>,
+) -> (Fx, Arc<crystalline_service::rest::AuthStore>) {
     let fx = fixture_with(
         &[
             (
@@ -866,6 +878,10 @@ async fn home_beside_harbor(
                 });
             }
             cfg.domains.insert("harbor".into(), entry);
+            cfg.reflection = sources.map(|sources| ReflectionConfig {
+                backup_sources: Some(sources),
+                ..Default::default()
+            });
         },
     )
     .await;
@@ -974,15 +990,15 @@ fn citing_harbor(path: &str) -> crystalline_service::params::WriteReflectionPara
     p
 }
 
-/// A page of a domain backed up to a GitHub repository may not cite a
-/// domain that is not connected to GitHub, even when the accounts allow it
-/// (both domains are shared here): personal knowledge never reaches a
-/// repository.
+/// Under `reflection.backup_sources: refuse` a page of a domain backed up
+/// to a GitHub repository may not cite a domain that is not connected to
+/// GitHub, even when the accounts allow it (both domains are shared here):
+/// personal knowledge never reaches a repository.
 #[tokio::test]
-async fn a_github_page_cannot_cite_a_local_domain() {
+async fn a_github_page_cannot_cite_a_local_domain_under_refuse() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
-    let (fx, _) = home_beside_harbor(mock, false).await;
+    let (fx, _) = home_beside_harbor_with(mock, false, Some(BackupSources::Refuse)).await;
     let err = fx
         .engine
         .write_reflection(&citing_harbor("wide.md"), &agent())
@@ -1007,13 +1023,14 @@ async fn a_github_page_can_cite_another_github_domain() {
         .unwrap();
 }
 
-/// A page that cites a local domain from a GitHub domain anyway (here
-/// edited on disk) is named in the queue and held back from the backup.
+/// Under `reflection.backup_sources: refuse` a page that cites a local
+/// domain from a GitHub domain anyway (here edited on disk) is named in the
+/// queue and held back from the backup.
 #[tokio::test]
-async fn an_existing_github_page_citing_a_local_domain_is_named_and_held_back() {
+async fn an_existing_github_page_citing_a_local_domain_is_named_and_held_back_under_refuse() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
-    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    let (fx, _) = home_beside_harbor_with(mock.clone(), false, Some(BackupSources::Refuse)).await;
     fx.engine
         .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
         .await
@@ -1423,7 +1440,7 @@ async fn a_held_page_goes_back_after_the_recheck_once_nothing_holds_it() {
 async fn a_confirmed_local_source_names_the_repository_and_is_backed_up() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
-    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    let (fx, _) = home_beside_harbor_with(mock.clone(), false, Some(BackupSources::Refuse)).await;
     let ask = fx
         .engine
         .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
@@ -1450,23 +1467,411 @@ async fn a_confirmed_local_source_names_the_repository_and_is_backed_up() {
     assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
 }
 
-/// A run on a domain backed up to GitHub reads no domain that is not
-/// connected to GitHub, though the accounts would let it: its pages go to a
-/// repository whose readers are not the accounts here.
+/// A private local domain's text shared on purpose onto a page backed up
+/// to GitHub, under `reflection.backup_sources` `full` and `hold_back`. The
+/// accounts half asks the person. Under `full` the question names the
+/// repository too, since the page goes there in full. Under `hold_back` it
+/// does not, and the yes lifts no hold: the page is served and stays off
+/// the backup, with no queue item.
 #[tokio::test]
-async fn a_run_on_a_github_domain_reads_no_local_domain() {
+async fn a_confirmed_private_local_source_follows_backup_sources() {
+    for sources in [BackupSources::Full, BackupSources::HoldBack] {
+        let mock = Arc::new(MockProvider::new());
+        main_commit(&mock);
+        let (fx, auth) = home_beside_harbor_with(mock.clone(), false, Some(sources)).await;
+        auth.set_domain_visibility("harbor", true, "keeper")
+            .await
+            .unwrap();
+        let ask = fx
+            .engine
+            .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
+            .await
+            .unwrap()
+            .expect("a private source on a shared page is a question");
+        assert_eq!(
+            ask.question.contains("GitHub repository acme/kb"),
+            sources == BackupSources::Full,
+            "{sources:?}: {}",
+            ask.question
+        );
+        assert!(
+            !ask.question.contains("not shared through GitHub"),
+            "{}",
+            ask.question
+        );
+        let mut confirmed = citing_harbor("wide.md");
+        confirmed.disclosed = Some(ask.basis);
+        fx.engine
+            .write_reflection(&confirmed, &agent())
+            .await
+            .unwrap();
+        assert!(fx.root.join("reflections/wide.md").exists());
+        assert!(too_wide_items(&fx).await.is_empty(), "{sources:?}");
+        fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+        fx.engine
+            .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+            .await;
+        let head = mock
+            .branch_commit(BACKUP_BRANCH)
+            .map(|commit| mock.commit_paths(&commit))
+            .unwrap_or_default();
+        let held = sources == BackupSources::HoldBack;
+        assert_eq!(
+            head.contains(&"reflections/wide.md".to_string()),
+            !held,
+            "{sources:?}: {head:?}"
+        );
+        assert_eq!(
+            fx.engine.reflection_backup_held_back("eng"),
+            if held {
+                vec!["wide.md".to_string()]
+            } else {
+                Vec::new()
+            },
+            "{sources:?}"
+        );
+    }
+}
+
+/// Under `reflection.backup_sources` `refuse` and `hold_back` a run on a
+/// domain backed up to GitHub reads no domain that is not connected to
+/// GitHub, though the accounts would let it: its thread answers and engram
+/// writes reach a repository whose readers are not the accounts here, and
+/// `hold_back` holds back only pages. Under `full` it reads it, since all of
+/// that goes to the repository anyway.
+#[tokio::test]
+async fn a_run_on_a_github_domain_reads_a_local_domain_only_under_full() {
+    for (sources, hidden) in [
+        (Some(BackupSources::Refuse), true),
+        (Some(BackupSources::HoldBack), true),
+        (None, false),
+    ] {
+        let mock = Arc::new(MockProvider::new());
+        main_commit(&mock);
+        let (fx, _) = home_beside_harbor_with(mock, false, sources).await;
+        let owner = crystalline_service::Scope::Unrestricted;
+        let limit = fx
+            .engine
+            .read_limit_for(&owner, true, Some("eng"))
+            .await
+            .unwrap()
+            .hidden;
+        assert_eq!(limit.contains("harbor"), hidden, "{sources:?}: {limit:?}");
+        assert!(!limit.contains("eng"), "{limit:?}");
+    }
+}
+
+/// Set `reflection.backup_sources` to `value` the way the operator does.
+async fn set_backup_sources(fx: &Fx, value: &str) {
+    fx.engine
+        .configure_as_operator(&ConfigureAction::Set {
+            key: "reflection.backup_sources".into(),
+            value: value.into(),
+        })
+        .await
+        .unwrap();
+}
+
+/// The paths the backup branch head holds, none before the first backup.
+fn head_of(mock: &MockProvider) -> Vec<String> {
+    mock.branch_commit(BACKUP_BRANCH)
+        .map(|commit| mock.commit_paths(&commit))
+        .unwrap_or_default()
+}
+
+/// A page sent in full under `full` leaves the branch head at the next pass
+/// once the setting moves to `hold_back` or `refuse`, without a change to
+/// the page. Only `refuse` names it in the queue.
+#[tokio::test]
+async fn switching_from_full_takes_a_page_off_the_branch_head() {
+    for (to, queued) in [("hold_back", false), ("refuse", true)] {
+        let mock = Arc::new(MockProvider::new());
+        main_commit(&mock);
+        let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+        fx.engine
+            .write_reflection(&citing_harbor("wide.md"), &agent())
+            .await
+            .unwrap();
+        fx.engine
+            .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+            .await;
+        assert!(
+            head_of(&mock).contains(&"reflections/wide.md".to_string()),
+            "{to}"
+        );
+
+        set_backup_sources(&fx, to).await;
+        fx.engine
+            .reflection_backup_tick(Instant::now() + Duration::from_secs(240))
+            .await;
+        let head = head_of(&mock);
+        assert!(
+            !head.iter().any(|p| p.contains("wide.md")),
+            "{to}: {head:?}"
+        );
+        assert_eq!(
+            fx.engine.reflection_backup_held_back("eng"),
+            vec!["wide.md".to_string()],
+            "{to}"
+        );
+        assert_eq!(too_wide_items(&fx).await.len(), usize::from(queued), "{to}");
+    }
+}
+
+/// A confirmation given under `hold_back` was never asked about the
+/// repository, so it records none: after a switch to `refuse` it does not
+/// stand for the GitHub half, and the page is held back with a queue item.
+#[tokio::test]
+async fn a_hold_back_confirmation_does_not_count_for_the_repository_under_refuse() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
-    let (fx, _) = home_beside_harbor(mock, false).await;
-    let owner = crystalline_service::Scope::Unrestricted;
-    let limit = fx
+    let (fx, auth) =
+        home_beside_harbor_with(mock.clone(), false, Some(BackupSources::HoldBack)).await;
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    let ask = fx
         .engine
-        .read_limit_for(&owner, true, Some("eng"))
+        .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
         .await
         .unwrap()
-        .hidden;
-    assert!(limit.contains("harbor"), "{limit:?}");
-    assert!(!limit.contains("eng"), "{limit:?}");
+        .expect("a private source on a shared page is a question");
+    assert!(
+        !ask.question.contains("GitHub repository"),
+        "{}",
+        ask.question
+    );
+    let mut confirmed = citing_harbor("wide.md");
+    confirmed.disclosed = Some(ask.basis);
+    fx.engine
+        .write_reflection(&confirmed, &agent())
+        .await
+        .unwrap();
+    assert!(too_wide_items(&fx).await.is_empty());
+
+    set_backup_sources(&fx, "refuse").await;
+    let items = too_wide_items(&fx).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["path"], "wide.md", "{items:?}");
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    assert!(
+        !head_of(&mock).iter().any(|p| p.contains("wide.md")),
+        "{:?}",
+        head_of(&mock)
+    );
+    assert_eq!(
+        fx.engine.reflection_backup_held_back("eng"),
+        vec!["wide.md".to_string()]
+    );
+}
+
+/// A confirmation given under `refuse` names the repository and sends the
+/// page to the backup there. It does not lift a `hold_back` hold: after a
+/// switch to `hold_back` the page leaves the branch head, with no queue
+/// item.
+#[tokio::test]
+async fn a_refuse_confirmation_does_not_lift_a_hold_back_hold() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor_with(mock.clone(), false, Some(BackupSources::Refuse)).await;
+    let ask = fx
+        .engine
+        .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap()
+        .expect("a local source on a GitHub page is a question under refuse");
+    assert!(
+        ask.question.contains("GitHub repository acme/kb"),
+        "{}",
+        ask.question
+    );
+    let mut confirmed = citing_harbor("wide.md");
+    confirmed.disclosed = Some(ask.basis);
+    fx.engine
+        .write_reflection(&confirmed, &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    assert!(head_of(&mock).contains(&"reflections/wide.md".to_string()));
+
+    set_backup_sources(&fx, "hold_back").await;
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(240))
+        .await;
+    assert!(
+        !head_of(&mock).iter().any(|p| p.contains("wide.md")),
+        "{:?}",
+        head_of(&mock)
+    );
+    assert_eq!(
+        fx.engine.reflection_backup_held_back("eng"),
+        vec!["wide.md".to_string()]
+    );
+    assert!(too_wide_items(&fx).await.is_empty());
+}
+
+/// Under `full` a pass that sends a page `refuse` would hold back for the
+/// GitHub half says so at warn, naming the domain, the page and the
+/// setting, once per page: an upgrade from 0.35, where such a page was held
+/// back, shows the operator what reached the repository.
+#[tokio::test]
+async fn a_page_sent_only_under_full_is_logged_once() {
+    let (logs, _guard) = crate::support::capture_logs();
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    assert!(head_of(&mock).contains(&"reflections/wide.md".to_string()));
+    let said = |logs: &crate::support::CapturedLogs| {
+        logs.lines()
+            .into_iter()
+            .filter(|l| l.contains("reflection.backup_sources is full"))
+            .collect::<Vec<_>>()
+    };
+    let lines = said(&logs);
+    assert_eq!(lines.len(), 1, "{:?}", logs.lines());
+    assert!(
+        lines[0].contains("wide.md") && lines[0].contains("eng"),
+        "{lines:?}"
+    );
+    assert!(!lines[0].contains("a.md"), "{lines:?}");
+
+    // The next pass sends it again and says nothing new.
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(240))
+        .await;
+    assert_eq!(said(&logs).len(), 1, "{:?}", logs.lines());
+}
+
+/// The `source_too_wide` items of `eng`'s queue as the agent gets them.
+async fn too_wide_items(fx: &Fx) -> Vec<serde_json::Value> {
+    let queue = fx
+        .engine
+        .reflect(
+            &crystalline_service::params::ReflectParams {
+                domains: vec!["eng".into()],
+                limit: Some(100),
+                ..Default::default()
+            },
+            &agent(),
+        )
+        .await
+        .unwrap();
+    queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["what"] == "source_too_wide")
+        .cloned()
+        .collect()
+}
+
+/// Under `reflection.backup_sources: full` (the default) a page of a GitHub
+/// domain may cite a local domain the accounts let it cite. Nothing is
+/// asked, the queue names nothing, and the page is backed up in full.
+#[tokio::test]
+async fn under_full_a_github_page_cites_a_local_domain_and_is_backed_up() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    assert!(
+        fx.engine
+            .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    assert!(too_wide_items(&fx).await.is_empty());
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    let head = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(
+        head.contains(&"reflections/wide.md".to_string()),
+        "{head:?}"
+    );
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}
+
+/// Under `reflection.backup_sources: hold_back` the write is allowed and
+/// the page is served here, but the backup holds it back, with the files
+/// only it links. The queue names nothing: nothing is wrong on the server.
+#[tokio::test]
+async fn under_hold_back_a_github_page_cites_a_local_domain_and_is_held_back() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor_with(mock.clone(), false, Some(BackupSources::HoldBack)).await;
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    let mut page = citing_harbor("wide.md");
+    page.markdown = Some(
+        "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n\n![crew](assets/crew.png)\n".into(),
+    );
+    fx.engine
+        .reflection_asset_write(
+            "eng",
+            "assets/crew.png",
+            crate::assets::PNG.to_vec(),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    fx.engine.write_reflection(&page, &agent()).await.unwrap();
+    assert!(fx.root.join("reflections/wide.md").exists());
+    assert!(too_wide_items(&fx).await.is_empty());
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    let head = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head.contains(&"reflections/a.md".to_string()), "{head:?}");
+    assert!(!head.iter().any(|p| p.contains("wide.md")), "{head:?}");
+    assert!(!head.iter().any(|p| p.contains("crew.png")), "{head:?}");
+    assert_eq!(
+        fx.engine.reflection_backup_held_back("eng"),
+        vec!["wide.md".to_string()]
+    );
+
+    // Switched to full, the held page goes out at the next pass without a
+    // change to the page.
+    fx.engine
+        .configure(&ConfigureAction::Set {
+            key: "reflection.backup_sources".into(),
+            value: "full".into(),
+        })
+        .await
+        .unwrap();
+    fx.engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(240))
+        .await;
+    let head = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(
+        head.contains(&"reflections/wide.md".to_string()),
+        "{head:?}"
+    );
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
 }
 
 /// A new home (or one that lost its backup state) knows nothing of what the
@@ -1477,7 +1882,7 @@ async fn a_run_on_a_github_domain_reads_no_local_domain() {
 async fn a_lost_state_removes_held_pages_and_baselines_from_the_head() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
-    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    let (fx, _) = home_beside_harbor_with(mock.clone(), false, Some(BackupSources::Refuse)).await;
     fx.engine
         .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
         .await

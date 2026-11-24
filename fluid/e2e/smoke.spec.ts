@@ -93,17 +93,12 @@ function engramTitle(page: Page) {
   return page.locator("h1#engram-title");
 }
 
-/** Open one engram of the fixture domain, from the home screen. */
+/** Open one engram of the fixture domain, by its address. */
 async function openEngram(page: Page, title: string): Promise<void> {
-  await page
-    .locator("main")
-    .getByRole("link", { name: DOMAIN, exact: true })
-    .click();
-  await expect(
-    page.getByRole("heading", { name: DOMAIN, level: 1 }),
-  ).toBeVisible();
-
-  await page.getByRole("link", { name: new RegExp(`^${title}, `) }).click();
+  // By address, not through the home's recent list: specs that ran earlier in
+  // the same daemon edit other engrams and push this one off that list.
+  const permalink = title.toLowerCase().replace(/\s+/g, "-");
+  await page.goto(`d/${DOMAIN}/e/${permalink}`);
   await expect(engramTitle(page)).toHaveText(title);
 }
 

@@ -97,6 +97,36 @@ impl Engine {
         }
     }
 
+    /// `reflection.cite_shared` and `reflection.backup_sources` as they read
+    /// now, to compare after a settings write.
+    fn reach_settings(
+        &self,
+    ) -> (
+        crystalline_core::config::CiteShared,
+        crystalline_core::config::BackupSources,
+    ) {
+        (self.cite_shared(), self.backup_sources())
+    }
+
+    /// Mark every Reflection for a backup when a change of the configuration
+    /// changed what the backup holds back (`reach_before` against now): a
+    /// page the new setting lets go goes out at the next pass, and one it
+    /// holds back leaves the branch, without waiting for a change to the
+    /// page. Called wherever the effective configuration is swapped
+    /// ([`Engine::commit_config`], [`Engine::adopt_config`]), so a
+    /// configuration adopted from the store marks them too.
+    fn reach_setting_touched(
+        &self,
+        reach_before: (
+            crystalline_core::config::CiteShared,
+            crystalline_core::config::BackupSources,
+        ),
+    ) {
+        if self.reach_settings() != reach_before {
+            self.mark_every_reflection_for_backup();
+        }
+    }
+
     /// Announce a moved `tools/list` on every open subscription stream, when
     /// the write that just landed changed what `github.enabled` effectively
     /// reads.
@@ -353,8 +383,10 @@ impl Engine {
     /// both move to it.
     pub(super) fn adopt_config(&self, held: &mut GlobalConfig, file: GlobalConfig) -> Result<()> {
         let effective = self.effective_of(&file)?;
+        let reach_before = self.reach_settings();
         *held = file;
         *self.config.write().unwrap() = effective;
+        self.reach_setting_touched(reach_before);
         Ok(())
     }
 
@@ -366,8 +398,10 @@ impl Engine {
     pub(super) fn commit_config(&self, held: &mut GlobalConfig, file: GlobalConfig) -> Result<()> {
         let effective = self.effective_of(&file)?;
         self.persist_config(held, &file)?;
+        let reach_before = self.reach_settings();
         *held = file;
         *self.config.write().unwrap() = effective;
+        self.reach_setting_touched(reach_before);
         Ok(())
     }
 
@@ -457,8 +491,10 @@ impl Engine {
         let effective = self
             .effective_of(&stored)
             .map_err(|e| unknown(e.to_string()))?;
+        let reach_before = self.reach_settings();
         *held = stored;
         *self.config.write().unwrap() = effective;
+        self.reach_setting_touched(reach_before);
         self.mark_names_stale();
         if landed {
             tracing::warn!(

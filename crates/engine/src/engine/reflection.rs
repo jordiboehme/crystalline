@@ -2380,7 +2380,7 @@ impl Engine {
                     super::disclosure::DISCLOSURE_CHANGED.into(),
                 ));
             }
-            asked_repo_readers = asked.repo_readers;
+            asked_repo_readers = asked.repo_named.then_some(asked.repo_readers);
         }
         let mut confirmed: Vec<String> = if by.is_some() {
             needs.into_iter().map(|(_, source)| source).collect()

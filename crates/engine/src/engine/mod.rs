@@ -1325,6 +1325,10 @@ pub struct Engine {
     // The domains whose Reflection backup was skipped because their GitHub
     // repository is archived, so the tick says so once per process.
     backup_archived_logged: std::sync::Mutex<HashSet<String>>,
+    // The pages (domain, page) a backup sent only because
+    // `reflection.backup_sources` is `full`, so the tick warns once per page
+    // per process (`Engine::sent_only_under_full`).
+    backup_full_logged: std::sync::Mutex<HashSet<(String, String)>>,
     /// What the last complete walk of each domain saw of its Reflection:
     /// `None` when it was not in effect, else its threads files by page,
     /// with the checksum last seen or written. The next complete walk
@@ -2755,6 +2759,7 @@ impl Engine {
             backup_marks: Default::default(),
             backup_held: Default::default(),
             backup_archived_logged: Default::default(),
+            backup_full_logged: Default::default(),
             reflection_walks: Default::default(),
             page_facts: Default::default(),
             origins_dir_override: None,
@@ -4859,9 +4864,11 @@ impl Engine {
 
     /// The pages of `domain` its last backup held back, sorted: each cites
     /// a domain fewer people may read than `domain` (a `source_too_wide`
-    /// item in the queue), so it stays off the backup branch, whose head
-    /// loses the copy it had, until a curator settles it. Empty when nothing
-    /// was held back or no backup ran.
+    /// item in the queue) or, under `reflection.backup_sources: hold_back`,
+    /// one the readers of its repository may not read (no queue item: the
+    /// page is fine here), so it stays off the backup branch, whose head
+    /// loses the copy it had, until a curator settles it or the setting
+    /// changes. Empty when nothing was held back or no backup ran.
     pub fn reflection_backup_held_back(&self, domain: &str) -> Vec<String> {
         self.backup_held
             .lock()
@@ -4960,6 +4967,7 @@ impl Engine {
             // it links: the branch is read by the repository's people, not
             // by this domain's readers.
             let mut held_pages: Vec<String> = Vec::new();
+            let mut sent_under_full: Vec<String> = Vec::new();
             let attempt: Result<crystalline_remote::reflections_backup::BackupOutcome> = async {
                 let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
                 // Decided from the bytes that go out as well as from the
@@ -4970,6 +4978,17 @@ impl Engine {
                     self.too_wide_pages(&domain).await?.into_iter().collect();
                 pages.extend(self.too_wide_in_files(&domain, &spec, &files).await?);
                 held_pages = pages.into_iter().collect();
+                // What `refuse` would hold back and `full` sends: said once
+                // per page below, so an operator sees what reached the
+                // repository (pages held back under 0.35 go out after an
+                // upgrade). A failed check never stops the backup.
+                sent_under_full = self
+                    .sent_only_under_full(&domain, &spec, &files, &held_pages)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(domain = %domain, "reflection backup: the full check failed: {e}");
+                        Vec::new()
+                    });
                 let assets = self
                     .held_assets(&domain, &held_pages, &spec, &files)
                     .await?;
@@ -5000,6 +5019,20 @@ impl Engine {
             match &attempt {
                 Ok(_) => {
                     self.backup_marks.clear_if_unchanged(&domain, now);
+                    for page in sent_under_full {
+                        let new = self
+                            .backup_full_logged
+                            .lock()
+                            .expect("backup full logged")
+                            .insert((domain.clone(), page.clone()));
+                        if new {
+                            tracing::warn!(
+                                domain = %domain,
+                                page = %page,
+                                "reflection backup: sent {page} of {domain} to the backup branch although it cites a domain some reader of its GitHub repository may not read, because reflection.backup_sources is full; set it to hold_back or refuse to keep such pages off the branch (its history keeps what was sent)"
+                            );
+                        }
+                    }
                     let before = self
                         .backup_held
                         .lock()
@@ -5011,7 +5044,7 @@ impl Engine {
                         if before != held_pages {
                             tracing::warn!(
                                 domain = %domain,
-                                "reflection backup: held back {} because they cite a domain fewer people may read; they go out once a curator settles them",
+                                "reflection backup: held back {} because they cite a domain fewer people may read than the page or its repository (see reflection.backup_sources); they go out once a curator settles them or the setting lets them",
                                 held_pages.join(", ")
                             );
                         }

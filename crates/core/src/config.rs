@@ -137,6 +137,10 @@ pub struct GlobalConfig {
     /// untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateConfig>,
+    /// What a Reflection page may draw on from other domains. Absent means
+    /// [`CiteShared::On`] and [`BackupSources::Full`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<ReflectionConfig>,
 }
 
 impl GlobalConfig {
@@ -312,6 +316,26 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|s| s.serve)
             .unwrap_or(SkillsServe::Auto)
+    }
+
+    /// Whether a page of a domain may cite another shared domain whatever
+    /// its Reflection-only readers read, from `reflection.cite_shared`.
+    /// Absent means [`CiteShared::On`].
+    pub fn reflection_cite_shared(&self) -> CiteShared {
+        self.reflection
+            .as_ref()
+            .and_then(|r| r.cite_shared)
+            .unwrap_or_default()
+    }
+
+    /// How the GitHub half of the source rule applies to a page backed up
+    /// to GitHub, from `reflection.backup_sources`. Absent means
+    /// [`BackupSources::Full`].
+    pub fn reflection_backup_sources(&self) -> BackupSources {
+        self.reflection
+            .as_ref()
+            .and_then(|r| r.backup_sources)
+            .unwrap_or_default()
     }
 
     /// Whether a file domain keeps a generated `index.md` in every folder that
@@ -1391,6 +1415,91 @@ pub struct UpdateConfig {
     /// Absent means 24.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_age_hours: Option<u32>,
+}
+
+/// The `reflection` block: what a Reflection page may draw on from other
+/// domains.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReflectionConfig {
+    /// `reflection.cite_shared`. Absent means [`CiteShared::On`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cite_shared: Option<CiteShared>,
+    /// `reflection.backup_sources`. Absent means [`BackupSources::Full`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_sources: Option<BackupSources>,
+}
+
+/// `reflection.cite_shared`: whether the readers who read a domain's
+/// Reflection but not its engrams (an account at knowledge `none` with a
+/// Reflection level) keep a page of it from citing a shared domain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiteShared {
+    /// They do not: a page is a curated view those readers are meant to
+    /// see, so a page covers a shared domain every reader of its engrams
+    /// reads.
+    #[default]
+    On,
+    /// They do: every reader of the page must read the source's engrams.
+    Off,
+}
+
+impl CiteShared {
+    /// The setting's spelling, `on` or `off`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CiteShared::On => "on",
+            CiteShared::Off => "off",
+        }
+    }
+
+    /// Parse the setting's spelling, or `None` for anything else.
+    pub fn parse(value: &str) -> Option<CiteShared> {
+        match value {
+            "on" => Some(CiteShared::On),
+            "off" => Some(CiteShared::Off),
+            _ => None,
+        }
+    }
+}
+
+/// `reflection.backup_sources`: what happens to a page backed up to a
+/// GitHub repository that cites a domain some reader of that repository
+/// may not read (a local or a virtual domain, or a repository with readers
+/// the page's repository lacks).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupSources {
+    /// The write is allowed and the page is backed up like any other.
+    #[default]
+    Full,
+    /// The write is allowed and the page is served, but the backup leaves
+    /// it out.
+    HoldBack,
+    /// The write is refused, and a page that cites such a domain anyway is
+    /// held back from the backup and named in the queue.
+    Refuse,
+}
+
+impl BackupSources {
+    /// The setting's spelling, `full`, `hold_back` or `refuse`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackupSources::Full => "full",
+            BackupSources::HoldBack => "hold_back",
+            BackupSources::Refuse => "refuse",
+        }
+    }
+
+    /// Parse the setting's spelling, or `None` for anything else.
+    pub fn parse(value: &str) -> Option<BackupSources> {
+        match value {
+            "full" => Some(BackupSources::Full),
+            "hold_back" => Some(BackupSources::HoldBack),
+            "refuse" => Some(BackupSources::Refuse),
+            _ => None,
+        }
+    }
 }
 
 /// `automation.evolve_threshold`'s default: the number of open maintenance

@@ -24,7 +24,9 @@
 use crystalline_core::reflection as r;
 use serde::{Deserialize, Serialize};
 
-use super::sources::{RepositoryReach, UNKNOWN_READERS_REFUSAL};
+use crystalline_core::config::BackupSources;
+
+use super::sources::{Reach, RepositoryReach, UNKNOWN_READERS_REFUSAL};
 use super::*;
 use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
 
@@ -60,6 +62,12 @@ pub struct DisclosureAsk {
 pub(crate) struct Asked {
     pub ask: DisclosureAsk,
     pub repo_readers: Option<RepositoryReaders>,
+    /// Whether the question named the page's repository and its readers. A
+    /// confirmation of a question that did not (under
+    /// `reflection.backup_sources: hold_back`, or when only the accounts
+    /// rule was broken) records no repository, so it never stands for the
+    /// GitHub half later, after a switch to `refuse` for one.
+    pub repo_named: bool,
 }
 
 /// What a write would put on a page, worked out without writing it: the page
@@ -227,11 +235,15 @@ pub(crate) fn section_text(page: &str, id: &str) -> Option<String> {
 
 /// Why the backup half of the rule refuses a page's sources: some source is
 /// not on GitHub, and some is on a repository not every reader of the
-/// page's repository reads (or whose readers are not known right now).
+/// page's repository reads (or whose readers are not known right now). Or,
+/// under `reflection.backup_sources: full`, that such a source refuses
+/// nothing and the page goes to the repository in full: its readers are
+/// named among the page's, with no reason of their own.
 #[derive(Debug, Clone, Copy, Default)]
 struct BackupGap {
     not_on_github: bool,
     narrower_repository: bool,
+    backed_up_in_full: bool,
 }
 
 /// The question a person is asked before `texts` (section texts) drawn from
@@ -351,7 +363,7 @@ impl Engine {
     /// GitHub App, nobody reads that repository now who did not then and
     /// may not read the source's repository. Without an App the repository's
     /// name is all that is compared, as the rule compares nothing more.
-    async fn backup_still_confirmed(
+    pub(super) async fn backup_still_confirmed(
         &self,
         page: &str,
         source: &str,
@@ -414,13 +426,35 @@ impl Engine {
         source: &str,
         disclosure: Option<&Disclosure>,
     ) -> Result<bool> {
-        if self.readers_cover(page, source).await? {
+        self.source_covered_in(page, source, disclosure, Reach::Rule)
+            .await
+    }
+
+    /// [`Engine::source_covered`] for `reach`: the GitHub half counts as
+    /// [`Engine::repository_half_counts`] says.
+    pub(crate) async fn source_covered_in(
+        &self,
+        page: &str,
+        source: &str,
+        disclosure: Option<&Disclosure>,
+        reach: Reach,
+    ) -> Result<bool> {
+        if self.readers_cover_in(page, source, reach).await? {
             return Ok(true);
         }
         let Some(disclosure) = disclosure else {
             return Ok(false);
         };
-        if self.leaves_repository(page, source).await?
+        // Under `hold_back` the backup holds such a page back whoever
+        // agreed: the person was never asked about the repository.
+        if reach == Reach::Backup
+            && self.backup_sources() == BackupSources::HoldBack
+            && self.leaves_repository(page, source).await?
+        {
+            return Ok(false);
+        }
+        if self.repository_half_counts(reach)
+            && self.leaves_repository(page, source).await?
             && !self.backup_still_confirmed(page, source, disclosure).await
         {
             return Ok(false);
@@ -428,9 +462,10 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(self.readers_unknown().is_none());
         };
+        let cite = self.cite_shared();
         let covered = match &disclosure.readers {
-            Some(readers) => access.readers_cover_for(page, source, readers).await,
-            None => access.readers_cover(page, source).await,
+            Some(readers) => access.readers_cover_for(page, source, readers, cite).await,
+            None => access.readers_cover(page, source, cite).await,
         };
         covered.map_err(|e| EngineError::Internal(e.to_string()))
     }
@@ -446,11 +481,28 @@ impl Engine {
         stored: &str,
         recorded: &Disclosures,
     ) -> Result<bool> {
-        if self.readers_cover(page, source).await? {
+        self.source_covered_on_page_in(page, path, source, stored, recorded, Reach::Rule)
+            .await
+    }
+
+    /// [`Engine::source_covered_on_page`] for `reach`.
+    pub(crate) async fn source_covered_on_page_in(
+        &self,
+        page: &str,
+        path: &str,
+        source: &str,
+        stored: &str,
+        recorded: &Disclosures,
+        reach: Reach,
+    ) -> Result<bool> {
+        if self.readers_cover_in(page, source, reach).await? {
             return Ok(true);
         }
         for disclosure in recorded.of(path, stored) {
-            if self.source_covered(page, source, Some(disclosure)).await? {
+            if self
+                .source_covered_in(page, source, Some(disclosure), reach)
+                .await?
+            {
                 return Ok(true);
             }
         }
@@ -515,15 +567,26 @@ impl Engine {
     ) -> Result<Asked> {
         let mut accounts_wide = false;
         let mut gap = BackupGap::default();
+        let repository_half = self.repository_half_counts(Reach::Rule);
         for source in sources {
-            if self.on_github(page) && !self.on_github(source) {
-                gap.not_on_github = true;
-            } else if self.leaves_repository(page, source).await? {
-                gap.narrower_repository = true;
+            // Under `full` and `hold_back` the repository half refuses
+            // nothing, so the question names no gap there. Under `full`
+            // the page still reaches the repository's readers, so they are
+            // named; under `hold_back` the backup leaves it out.
+            if repository_half {
+                if self.on_github(page) && !self.on_github(source) {
+                    gap.not_on_github = true;
+                } else if self.leaves_repository(page, source).await? {
+                    gap.narrower_repository = true;
+                }
+            } else if self.backup_sources() == BackupSources::Full
+                && self.leaves_repository(page, source).await?
+            {
+                gap.backed_up_in_full = true;
             }
             if let Some(access) = self.domain_access.get() {
                 accounts_wide |= !access
-                    .readers_cover(page, source)
+                    .readers_cover(page, source, self.cite_shared())
                     .await
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
             }
@@ -531,13 +594,15 @@ impl Engine {
         let readers = self.page_readers_now(page).await?;
         let repo = self.page_repo(page);
         let repo_readers = self.page_repository_readers_now(page).await;
+        let repo_named = repo.is_some()
+            && (gap.not_on_github || gap.narrower_repository || gap.backed_up_in_full);
         let question = question(
             page,
             path,
             sources,
             readers.as_ref().filter(|_| accounts_wide),
             repo.as_deref()
-                .filter(|_| gap.not_on_github || gap.narrower_repository)
+                .filter(|_| repo_named)
                 .map(|repo| (repo, gap)),
             texts,
         );
@@ -556,6 +621,7 @@ impl Engine {
         Ok(Asked {
             ask: DisclosureAsk { question, basis },
             repo_readers,
+            repo_named,
         })
     }
 
@@ -569,8 +635,9 @@ impl Engine {
         page: &str,
         repo_readers: Option<&RepositoryReaders>,
     ) -> Result<()> {
-        let governed =
-            self.on_github(page) && !matches!(self.repository_reach(), RepositoryReach::NoApp);
+        let governed = self.repository_half_counts(Reach::Rule)
+            && self.on_github(page)
+            && !matches!(self.repository_reach(), RepositoryReach::NoApp);
         if governed && repo_readers.is_none() {
             return Err(EngineError::Invalid(REPO_READERS_UNKNOWN.into()));
         }
@@ -606,12 +673,13 @@ impl Engine {
 
     /// The question a person is asked before this write lands, when it
     /// needs one: it names sources in a domain fewer people may read than
-    /// the page's, or one not shared through GitHub while the page is backed
-    /// up there, that this person has not shared on this page yet (or whose
-    /// sharing no longer holds). The question shows the text the write
-    /// leaves in those sections. `None` when nothing in
-    /// the write needs a person's confirmation, and when `caller` has nobody
-    /// behind it who could give one (the write is then refused as before).
+    /// the page's, or (under `reflection.backup_sources: refuse`) one not
+    /// shared through GitHub while the page is backed up there, that this
+    /// person has not shared on this page yet (or whose sharing no longer
+    /// holds). The question shows the text the write leaves in those
+    /// sections. `None` when nothing in the write needs a person's
+    /// confirmation, and when `caller` has nobody behind it who could give
+    /// one (the write is then refused as before).
     ///
     /// Every other refusal comes first, as the write would give it: it is
     /// worked out by the write itself, stopped before anything is written.
@@ -645,8 +713,9 @@ impl Engine {
     /// Record, after a write of page `path` landed with `text`, the
     /// confirmations it carries (`confirmed`: stored source domains, by
     /// `by`), one per person and domain, and drop every recorded one whose
-    /// domain the page no longer cites anywhere. `repo_readers` are the
-    /// readers of the page's repository the person's question named (the
+    /// domain the page no longer cites anywhere. `repo` is what the person's
+    /// question said of the page's repository: `None` when it named none,
+    /// and then no repository is recorded, else the readers it named (the
     /// basis check read them), never a later read. Called under the page's
     /// lock.
     #[allow(clippy::too_many_arguments)]
@@ -658,7 +727,7 @@ impl Engine {
         text: &str,
         confirmed: &[String],
         by: Option<&str>,
-        repo_readers: Option<RepositoryReaders>,
+        repo: Option<Option<RepositoryReaders>>,
     ) -> Result<()> {
         let mut list = self
             .reflection_disclosures(id)
@@ -674,7 +743,12 @@ impl Engine {
         list.retain(|d| cited.contains(&d.source));
         if let (Some(by), false) = (by, confirmed.is_empty()) {
             let readers = self.page_readers_now(domain).await?;
-            let repo = self.page_repo(domain);
+            // A question that named no repository records none: the person
+            // agreed to no reader of it.
+            let (repo, repo_readers) = match repo {
+                Some(repo_readers) => (self.page_repo(domain), repo_readers),
+                None => (None, None),
+            };
             let at = time::now().rfc3339_secs_z();
             for source in confirmed {
                 list.retain(|d| !(d.source == *source && d.by == by));
@@ -818,7 +892,7 @@ impl Engine {
             &text,
             &wide,
             Some(&by),
-            asked.repo_readers,
+            asked.repo_named.then_some(asked.repo_readers),
         )
         .await?;
         // The page may go to the backup branch now.
@@ -863,6 +937,7 @@ mod tests {
                 BackupGap {
                     not_on_github: true,
                     narrower_repository: false,
+                    backed_up_in_full: false,
                 },
             )),
             &["## Team\n\nFive people.".to_string()],
@@ -898,6 +973,7 @@ mod tests {
                 BackupGap {
                     not_on_github: false,
                     narrower_repository: true,
+                    backed_up_in_full: false,
                 },
             )),
             &["## Team\n\nFive people.".to_string()],

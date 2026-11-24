@@ -11,9 +11,28 @@
 use crystalline_core::names::NameTable;
 use crystalline_core::reflection as r;
 
+use crystalline_core::config::{BackupSources, CiteShared};
+
 use super::reflection::EngramFact;
 use super::*;
 use crate::scope::Scope;
+
+/// Which decision a reach check serves: the rule every write and the queue
+/// share, what the Reflection backup leaves out, or what an unattended run
+/// may read. They differ only under `reflection.backup_sources: hold_back`,
+/// where the GitHub half no longer refuses a write but still keeps the page
+/// out of the backup, and still narrows what a run reads: a run's thread
+/// answers, unsourced sentences and engram writes reach the backup too,
+/// and nothing holds them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// The rule: a write, the queue's `source_too_wide`.
+    Rule,
+    /// The Reflection backup: which pages it holds back.
+    Backup,
+    /// The unattended read limit (`Engine::read_limit_for`).
+    ReadLimit,
+}
 
 /// What a queue item says about sources in a domain the caller cannot
 /// open. One sentence whatever their state, so the item tells nothing of
@@ -31,9 +50,10 @@ pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer peop
 
 /// What a write is refused with when its page is in a domain connected to
 /// GitHub and the source is in one that is not (a local or a virtual
-/// domain): the page is backed up to the repository, whose readers are not
-/// the accounts here, so personal knowledge would reach a repository.
-pub(crate) const NOT_ON_GITHUB_REFUSAL: &str = "this source is in a domain that is not shared through GitHub, and this page is backed up to a GitHub repository; leave out the source and every sentence drawn from it, or cite it from a page in that domain instead";
+/// domain), under `reflection.backup_sources: refuse`: the page is backed
+/// up to the repository, whose readers are not the accounts here, so
+/// personal knowledge would reach a repository.
+pub(crate) const NOT_ON_GITHUB_REFUSAL: &str = "this source is in a domain that is not shared through GitHub, and this page is backed up to a GitHub repository while reflection.backup_sources is refuse; leave out the source and every sentence drawn from it, or cite it from a page in that domain instead";
 
 /// Whether every reader of a repository whose readers are `page` also
 /// reads one whose readers are `source`: a public source repository is read
@@ -71,7 +91,7 @@ pub(crate) const UNKNOWN_READERS_REFUSAL: &str = "who may read each domain is un
 
 /// What a `source_too_wide` item says to a caller who may open every
 /// domain the item is about.
-pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, or one not shared through GitHub, or one on a GitHub repository not every reader of this page's repository may read, while this page is backed up there, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
+pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, or (while reflection.backup_sources is refuse) one not shared through GitHub, or one on a GitHub repository not every reader of this page's repository may read, while this page is backed up there, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
 
 /// What a `source_unavailable` item says to a caller who may open the
 /// domain, with how to clear it.
@@ -195,8 +215,8 @@ pub(crate) struct NamedSource {
     pub permalink: String,
     /// Whether the page may carry this source only because a person shares
     /// it on purpose ([`super::disclosure`]): its domain is one fewer
-    /// people may read, or one not shared through GitHub while the page is
-    /// backed up there.
+    /// people may read, or (under `reflection.backup_sources: refuse`) one
+    /// not shared through GitHub while the page is backed up there.
     pub disclose: bool,
 }
 
@@ -245,13 +265,37 @@ impl Engine {
             .then(|| local.to_string())
     }
 
+    /// `reflection.cite_shared` as this engine reads it now.
+    pub(crate) fn cite_shared(&self) -> CiteShared {
+        self.config.read().unwrap().reflection_cite_shared()
+    }
+
+    /// `reflection.backup_sources` as this engine reads it now.
+    pub(crate) fn backup_sources(&self) -> BackupSources {
+        self.config.read().unwrap().reflection_backup_sources()
+    }
+
+    /// Whether the GitHub half of the reach rule ([`Engine::leaves_repository`])
+    /// counts for `reach`: for every decision under `refuse`, for the backup
+    /// and the read limit under `hold_back`, and never under `full`.
+    pub(crate) fn repository_half_counts(&self, reach: Reach) -> bool {
+        match self.backup_sources() {
+            BackupSources::Refuse => true,
+            BackupSources::HoldBack => reach != Reach::Rule,
+            BackupSources::Full => false,
+        }
+    }
+
     /// Whether a page of domain `page` may carry text drawn from domain
     /// `source` (both local names): whether every reader of the page may
-    /// read text drawn from `source` anyway. Two halves: the page's GitHub
-    /// repository, whose backup branch its readers on GitHub read
-    /// ([`Engine::leaves_repository`]), and the accounts here, whose rule
-    /// and whose idea of a reader are
-    /// [`crate::scope::DomainAccess::readers_cover`]'s.
+    /// read text drawn from `source` anyway. Two halves: the accounts here,
+    /// whose rule and whose idea of a reader are
+    /// [`crate::scope::DomainAccess::readers_cover`]'s (with
+    /// `reflection.cite_shared`), and, under `reflection.backup_sources:
+    /// refuse` only, the page's GitHub repository, whose backup branch its
+    /// readers on GitHub read ([`Engine::leaves_repository`]). What the
+    /// backup leaves out is [`Engine::readers_cover_in`] with
+    /// [`Reach::Backup`].
     ///
     /// It never looks at who asks: the machine owner, who reads every
     /// domain, is held to it too, since the page's readers are the ones the
@@ -263,7 +307,18 @@ impl Engine {
     /// no accounts store is in play) answers that every page covers every
     /// domain.
     pub(crate) async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
-        if self.leaves_repository(page, source).await? {
+        self.readers_cover_in(page, source, Reach::Rule).await
+    }
+
+    /// [`Engine::readers_cover`] for `reach`: the GitHub half counts as
+    /// [`Engine::repository_half_counts`] says.
+    pub(crate) async fn readers_cover_in(
+        &self,
+        page: &str,
+        source: &str,
+        reach: Reach,
+    ) -> Result<bool> {
+        if self.repository_half_counts(reach) && self.leaves_repository(page, source).await? {
             return Ok(false);
         }
         let Some(access) = self.domain_access.get() else {
@@ -272,7 +327,7 @@ impl Engine {
             return Ok(self.readers_unknown().is_none());
         };
         access
-            .readers_cover(page, source)
+            .readers_cover(page, source, self.cite_shared())
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))
     }
@@ -443,7 +498,11 @@ impl Engine {
                 // (`super::disclosure`): one confirmation per person, page
                 // and source domain.
                 let shared_here = shared.contains(local);
-                if self.on_github(own) && !self.on_github(local) && !shared_here {
+                if self.repository_half_counts(Reach::Rule)
+                    && self.on_github(own)
+                    && !self.on_github(local)
+                    && !shared_here
+                {
                     if !may_disclose {
                         return Err(EngineError::Invalid(format!(
                             "'{name}': {NOT_ON_GITHUB_REFUSAL}"

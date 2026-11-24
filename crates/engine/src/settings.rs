@@ -11,11 +11,12 @@ use std::path::PathBuf;
 
 use crystalline_core::base::{BasePath, PathProblem, PublicBase};
 use crystalline_core::config::{
-    AuthConfig, AutomationConfig, CaptureConfig, DatabaseBackend, DatabaseConfig,
-    EffectiveShareIdentity, EvolveConfig, GitHubConfig, GithubAppPresence, GlobalConfig,
-    HttpSetting, IdentityConfig, IndexConfig, InvitesConfig, LoginConfig, MAX_UPDATE_MIN_AGE_HOURS,
-    OidcConfig, RecallConfig, RemoteConfig, ResponseFormat, SearchConfig, ServiceConfig,
-    ShareIdentityMode, SkillsConfig, SkillsServe, UpdateConfig, WebhookConfig,
+    AuthConfig, AutomationConfig, BackupSources, CaptureConfig, CiteShared, DatabaseBackend,
+    DatabaseConfig, EffectiveShareIdentity, EvolveConfig, GitHubConfig, GithubAppPresence,
+    GlobalConfig, HttpSetting, IdentityConfig, IndexConfig, InvitesConfig, LoginConfig,
+    MAX_UPDATE_MIN_AGE_HOURS, OidcConfig, RecallConfig, ReflectionConfig, RemoteConfig,
+    ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
+    UpdateConfig, WebhookConfig,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -104,7 +105,8 @@ pub struct SettingSpec {
     /// per key and a matching list somewhere else.
     pub secret: bool,
     /// Whether this is an operator setting: the instance's network, its
-    /// database or its sign-in. An operator key is changed only with the
+    /// database, its sign-in, or who may read what (the two
+    /// `reflection.*` reach settings). An operator key is changed only with the
     /// crystalline CLI (`crystalline config set`), `config.yaml` or its
     /// `CRYSTALLINE_*` variable. The MCP `configure` tool neither lists nor
     /// changes it, so an agent cannot open the instance up, point the index
@@ -715,6 +717,28 @@ pub fn registry() -> &'static [SettingSpec] {
             clear: clear_update_min_age_hours,
             effective: update_min_age_hours_effective,
         },
+        SettingSpec {
+            key: "reflection.cite_shared",
+            doc: "Whether a Reflection page may cite another shared domain on this server even when some of its readers read only the Reflection (an account at knowledge none with a Reflection level): on (default) or off. off keeps the stricter rule, where every reader of the page must read the source's engrams. A private source always needs that",
+            kind: SettingKind::String,
+            startup_effective: false,
+            secret: false,
+            operator_only: true,
+            apply: set_cite_shared,
+            clear: clear_cite_shared,
+            effective: cite_shared_effective,
+        },
+        SettingSpec {
+            key: "reflection.backup_sources",
+            doc: "What happens to a page backed up to GitHub that cites a domain some reader of its repository may not read (a local or virtual domain, or another repository): full (default) backs it up like any other page, hold_back serves it here but leaves it out of the backup, refuse refuses the write. With full, text drawn from other domains reaches everyone who may read the page's repository, the whole internet for a public one, and so do an unattended run's thread answers and engram writes, which may draw on those domains too; switching away from full takes such a page off the branch head, but the branch history keeps it. hold_back and refuse are the stricter choices, and under both an unattended run reads no such domain",
+            kind: SettingKind::String,
+            startup_effective: false,
+            secret: false,
+            operator_only: true,
+            apply: set_backup_sources,
+            clear: clear_backup_sources,
+            effective: backup_sources_effective,
+        },
     ]
 }
 
@@ -895,6 +919,12 @@ fn drop_database_if_empty(config: &mut GlobalConfig) {
 /// Drop the `skills` block entirely once every field in it has been cleared,
 /// so an unset config round-trips to exactly the pre-feature shape (no empty
 /// `skills: {}` line).
+fn drop_reflection_if_empty(config: &mut GlobalConfig) {
+    if config.reflection.as_ref() == Some(&ReflectionConfig::default()) {
+        config.reflection = None;
+    }
+}
+
 fn drop_skills_if_empty(config: &mut GlobalConfig) {
     if config.skills.as_ref() == Some(&SkillsConfig::default()) {
         config.skills = None;
@@ -1600,6 +1630,72 @@ fn clear_skills_serve(config: &mut GlobalConfig) {
 fn skills_serve_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.skills.as_ref().and_then(|s| s.serve).is_none();
     (config.skills_serve().as_str().to_string(), is_default)
+}
+
+// --- reflection.cite_shared and reflection.backup_sources --------------------
+
+fn set_cite_shared(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed = CiteShared::parse(value.trim()).ok_or_else(|| {
+        SettingsError(format!(
+            "reflection.cite_shared must be on or off, got '{value}'"
+        ))
+    })?;
+    config
+        .reflection
+        .get_or_insert_with(ReflectionConfig::default)
+        .cite_shared = Some(parsed);
+    Ok(())
+}
+
+fn clear_cite_shared(config: &mut GlobalConfig) {
+    if let Some(r) = config.reflection.as_mut() {
+        r.cite_shared = None;
+    }
+    drop_reflection_if_empty(config);
+}
+
+fn cite_shared_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .reflection
+        .as_ref()
+        .and_then(|r| r.cite_shared)
+        .is_none();
+    (
+        config.reflection_cite_shared().as_str().to_string(),
+        is_default,
+    )
+}
+
+fn set_backup_sources(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed = BackupSources::parse(value.trim()).ok_or_else(|| {
+        SettingsError(format!(
+            "reflection.backup_sources must be full, hold_back or refuse, got '{value}'"
+        ))
+    })?;
+    config
+        .reflection
+        .get_or_insert_with(ReflectionConfig::default)
+        .backup_sources = Some(parsed);
+    Ok(())
+}
+
+fn clear_backup_sources(config: &mut GlobalConfig) {
+    if let Some(r) = config.reflection.as_mut() {
+        r.backup_sources = None;
+    }
+    drop_reflection_if_empty(config);
+}
+
+fn backup_sources_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .reflection
+        .as_ref()
+        .and_then(|r| r.backup_sources)
+        .is_none();
+    (
+        config.reflection_backup_sources().as_str().to_string(),
+        is_default,
+    )
 }
 
 // --- service.response_format ------------------------------------------------
@@ -3105,7 +3201,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_forty_nine_keys_in_order() {
+    fn registry_lists_exactly_the_fifty_one_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -3159,13 +3255,17 @@ mod tests {
                 "automation.evolve_threshold",
                 "update.check",
                 "update.min_age_hours",
+                "reflection.cite_shared",
+                "reflection.backup_sources",
             ]
         );
     }
 
     /// The operator keys are the instance's network, database and sign-in:
     /// every `auth.*`, `database.*` and `service.*` key plus the two GitHub
-    /// keys that decide which GitHub this instance talks to and as which app.
+    /// keys that decide which GitHub this instance talks to and as which app,
+    /// and the two `reflection.*` keys that decide what a Reflection page may
+    /// carry from other domains (and so what an unattended run may read).
     /// No surface outside the CLI lists, reads back or sets one of these.
     #[test]
     fn the_operator_keys_are_the_network_the_database_and_sign_in() {
@@ -3209,6 +3309,8 @@ mod tests {
                 "automation.evolve_threshold",
                 "update.check",
                 "update.min_age_hours",
+                "reflection.cite_shared",
+                "reflection.backup_sources",
             ]
         );
         // The rule, not only the list: a key added under one of the three
@@ -3220,7 +3322,9 @@ mod tests {
                 || spec.key == "github.api_url"
                 || spec.key == "github.oauth_client_id"
                 || spec.key.starts_with("automation.")
-                || spec.key.starts_with("update.");
+                || spec.key.starts_with("update.")
+                || spec.key == "reflection.cite_shared"
+                || spec.key == "reflection.backup_sources";
             assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
             assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
             assert!(is_known_key(spec.key), "{}", spec.key);
@@ -3394,8 +3498,58 @@ mod tests {
                     "update.min_age_hours",
                     "CRYSTALLINE_UPDATE_MIN_AGE_HOURS".to_string()
                 ),
+                (
+                    "reflection.cite_shared",
+                    "CRYSTALLINE_REFLECTION_CITE_SHARED".to_string()
+                ),
+                (
+                    "reflection.backup_sources",
+                    "CRYSTALLINE_REFLECTION_BACKUP_SOURCES".to_string()
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn reflection_settings_round_trip_and_unset_back_to_nothing() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.reflection_cite_shared(), CiteShared::On);
+        assert_eq!(cfg.reflection_backup_sources(), BackupSources::Full);
+        let spec = |key| registry().iter().find(|s| s.key == key).unwrap();
+        assert_eq!(
+            spec("reflection.cite_shared").display(&cfg),
+            ("on".to_string(), true)
+        );
+        assert_eq!(
+            spec("reflection.backup_sources").display(&cfg),
+            ("full".to_string(), true)
+        );
+
+        apply(&mut cfg, "reflection.cite_shared", "off").unwrap();
+        apply(&mut cfg, "reflection.backup_sources", "hold_back").unwrap();
+        assert_eq!(cfg.reflection_cite_shared(), CiteShared::Off);
+        assert_eq!(cfg.reflection_backup_sources(), BackupSources::HoldBack);
+        assert_eq!(
+            spec("reflection.backup_sources").display(&cfg),
+            ("hold_back".to_string(), false)
+        );
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("cite_shared: off"), "{yaml}");
+        assert!(yaml.contains("backup_sources: hold_back"), "{yaml}");
+
+        let err = apply(&mut cfg, "reflection.backup_sources", "maybe").unwrap_err();
+        assert!(
+            err.to_string().contains("full, hold_back or refuse"),
+            "{err}"
+        );
+        let err = apply(&mut cfg, "reflection.cite_shared", "yes").unwrap_err();
+        assert!(err.to_string().contains("on or off"), "{err}");
+
+        unset(&mut cfg, "reflection.cite_shared").unwrap();
+        unset(&mut cfg, "reflection.backup_sources").unwrap();
+        assert_eq!(cfg.reflection, None);
+        assert!(is_operator_key("reflection.cite_shared"));
+        assert!(is_operator_key("reflection.backup_sources"));
     }
 
     #[test]
@@ -3894,7 +4048,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 50);
+        assert_eq!(views.len(), 52);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -3948,6 +4102,8 @@ mod tests {
                 "automation.evolve_threshold",
                 "update.check",
                 "update.min_age_hours",
+                "reflection.cite_shared",
+                "reflection.backup_sources",
             ]
         );
 
