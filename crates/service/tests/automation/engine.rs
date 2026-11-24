@@ -1532,8 +1532,9 @@ async fn an_agent_sees_the_loops_as_the_machines_run_does() {
 
 /// A reflect-only agent reads the knowledge and writes none, yet curates the
 /// Reflection all the way: it answers a thread, writes a page with a section
-/// citing an engram, settles a section and edits PACT.md. An evolve-only agent,
-/// which writes the knowledge, curates none of it.
+/// citing an engram and settles a section. It never writes
+/// pact text, which a curator changes in person (2026-11-24). An evolve-only
+/// agent, which writes the knowledge, curates none of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
     use crystalline_service::rest::AgentLoops;
@@ -1598,7 +1599,12 @@ async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
     step(&fx, &curator, "answer", &thread, "Yes, still true.").await;
     let written = fx.engine.write_reflection(&page, &curator).await.unwrap();
     assert!(written.get("path").is_some(), "{written}");
-    fx.engine.write_reflection(&pact, &curator).await.unwrap();
+    let refused = fx
+        .engine
+        .write_reflection(&pact, &curator)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("pact text"), "{refused}");
     // Nothing a person changed waits to be settled, but the right is there:
     // whatever the answer, it is no refusal of the right.
     if let Err(e) = fx.engine.write_reflection(&settle, &curator).await {
@@ -1606,8 +1612,9 @@ async fn a_reflect_only_agent_curates_what_a_reflect_run_curates() {
     }
     let text = std::fs::read_to_string(fx.root.join("reflections/d.md")).unwrap();
     assert!(text.contains("runbooks/deploy"), "{text}");
-    let pact_text = std::fs::read_to_string(fx.root.join("reflections/PACT.md")).unwrap();
-    assert!(pact_text.contains("Keep it short."), "{pact_text}");
+    let pact_text =
+        std::fs::read_to_string(fx.root.join("reflections/PACT.md")).unwrap_or_default();
+    assert!(!pact_text.contains("Keep it short."), "{pact_text}");
 }
 
 /// An agent takes a lease only where its loop has work: nothing due is
