@@ -890,9 +890,10 @@ impl EngramFacts {
     }
 
     /// Whether the status says the knowledge was never asserted in the first
-    /// place, which exempts it from the lifecycle rules.
+    /// place, which exempts it from the lifecycle rules. Core's tentative
+    /// check ([`crystalline_core::is_tentative_status`]), so case is ignored.
     pub fn is_speculative(&self) -> bool {
-        SPECULATIVE_STATUSES.contains(&self.status.as_str())
+        crystalline_core::is_tentative_status(&self.status)
     }
 
     /// Days between `recorded_at` and `today`, or `None` when the engram
@@ -1980,7 +1981,11 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             ));
         }
 
-        if fact.is_speculative() {
+        // A tentative engram is exempt from what follows, with one narrow
+        // exception: an `open` question still draws V002, because an author
+        // who set a review date on an open question wants the nudge. (V006
+        // below asks for a current status, which `open` never is.)
+        if fact.is_speculative() && !fact.status.trim().eq_ignore_ascii_case("open") {
             continue;
         }
 

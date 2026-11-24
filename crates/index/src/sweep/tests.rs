@@ -413,9 +413,17 @@ fn speculative_statuses_are_exempt_from_v001_v002_and_v003() {
         speculative.valid_to = Some(day("2025-01-01"));
         speculative.stale_on = Some(day("2025-06-01"));
 
+        // An open question keeps V002 alone (see
+        // `an_open_engram_still_draws_v002_and_a_draft_does_not`).
+        let expected: Vec<&str> = if status == "open" {
+            vec!["V002"]
+        } else {
+            vec![]
+        };
         let report = detect(&input(vec![speculative]));
-        assert!(
-            fired(&report).is_empty(),
+        assert_eq!(
+            fired(&report),
+            expected,
             "status {status} drew {:?}",
             fired(&report)
         );
@@ -4324,20 +4332,39 @@ fn the_speculative_list_is_cores_tentative_list() {
     );
 }
 
-/// `open` joined the tentative list: an open engram is not asserted yet,
-/// so an elapsed review date does not draw `V002`.
+/// `open` is tentative, yet an open engram still draws `V002` once its
+/// review date passed: an author who set `stale_after` on an open question
+/// wants the nudge. The other tentative statuses keep their exemption.
 #[test]
-fn an_open_engram_draws_no_v002() {
+fn an_open_engram_still_draws_v002_and_a_draft_does_not() {
     let mut open = fact(1, "open-question");
     open.status = "open".to_string();
     open.stale_on = Some(day("2026-06-01"));
-
     let report = detect(&input(vec![open]));
-    assert!(
-        !fired(&report).contains(&"V002"),
-        "open drew {:?}",
-        fired(&report)
-    );
+    assert_eq!(fired(&report), ["V002"], "open drew {:?}", fired(&report));
+
+    for status in ["draft", "proposed", "idea", "poc"] {
+        let mut tentative = fact(1, "half-baked-idea");
+        tentative.status = status.to_string();
+        tentative.stale_on = Some(day("2026-06-01"));
+        let report = detect(&input(vec![tentative]));
+        assert!(
+            fired(&report).is_empty(),
+            "{status} drew {:?}",
+            fired(&report)
+        );
+    }
+}
+
+/// The sweep decides "tentative" with core's check, which ignores case, so a
+/// hand-written `Draft` is speculative like `draft`.
+#[test]
+fn a_capitalised_tentative_status_is_speculative() {
+    let mut draft = fact(1, "draft-runbook");
+    draft.status = "Draft".to_string();
+    assert!(draft.is_speculative());
+    draft.status = "stable".to_string();
+    assert!(!draft.is_speculative());
 }
 
 /// `open` joined the tentative list: an open engram is no twin of a stable

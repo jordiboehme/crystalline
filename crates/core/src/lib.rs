@@ -160,6 +160,18 @@ mod tests {
         assert!(RECOMMENDED_STATUSES.contains(&"current"));
     }
 
+    /// The tentative check ignores case and surrounding blanks, since a
+    /// status is free form and `Proposed` says what `proposed` says.
+    #[test]
+    fn the_tentative_check_ignores_case() {
+        for status in ["proposed", "Proposed", "OPEN", " poc ", "Idea", "draft"] {
+            assert!(is_tentative_status(status), "{status:?}");
+        }
+        for status in ["stable", "Stable", "deprecated", "", "drafted", "opened"] {
+            assert!(!is_tentative_status(status), "{status:?}");
+        }
+    }
+
     /// Every tentative status is a recommended one, so the write_engram
     /// description suggests it and verify's `T002` stays quiet about it.
     #[test]
