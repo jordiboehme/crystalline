@@ -394,10 +394,10 @@ impl AuthStore {
 
     /// One `COUNT(*)` answer. The caller holds the guard.
     ///
-    /// An answer that is not a number is an error rather than a zero: both
-    /// callers are caps, and a cap that read nothing as zero would let
-    /// everything through.
-    async fn count(&self, sql: &str, params: Vec<Value>) -> Result<i64> {
+    /// An answer that is not a number is an error rather than a zero: every
+    /// caller is a cap (the invite caps, an agent's live tokens), and a cap
+    /// that read nothing as zero would let everything through.
+    pub(super) async fn count(&self, sql: &str, params: Vec<Value>) -> Result<i64> {
         match self
             .db
             .query_first(sql, params)
@@ -406,7 +406,7 @@ impl AuthStore {
         {
             Some(Ok(Value::Integer(n))) => Ok(n),
             _ => Err(anyhow::anyhow!(
-                "counting for an invite cap gave no number, so the cap cannot be checked"
+                "counting for a cap gave no number, so the cap cannot be checked"
             )),
         }
     }

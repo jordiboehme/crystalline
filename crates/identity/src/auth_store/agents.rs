@@ -526,9 +526,10 @@ impl AuthStore {
             .with_context(|| format!("issuing a token for agent '{name}'"))?;
         let result = async {
             self.require_agent(&name).await?;
-            let live = match self
-                .db
-                .query_first(
+            // An unreadable count is an error, never a zero: a cap that
+            // read nothing as zero would let every token through.
+            let live = self
+                .count(
                     "SELECT COUNT(*) FROM agent_tokens
                      WHERE agent = ?1 AND revoked_at IS NULL AND expires_at > ?2",
                     vec![
@@ -536,12 +537,7 @@ impl AuthStore {
                         Value::Integer(now.unix_seconds()),
                     ],
                 )
-                .await?
-                .map(|row| row.get_value(0))
-            {
-                Some(Ok(Value::Integer(n))) => n,
-                _ => 0,
-            };
+                .await?;
             if live >= AGENT_LIVE_TOKENS_MAX {
                 return Err(refuse(
                     RefusalKind::AgentTokenLimit,

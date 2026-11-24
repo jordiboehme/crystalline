@@ -7637,6 +7637,26 @@ async fn agent_tokens_expire() {
     );
 }
 
+/// The count every cap reads (the invite caps and an agent's live tokens)
+/// is an error when the answer is not a number, never a zero that would let
+/// everything through.
+#[tokio::test]
+async fn a_cap_count_that_reads_no_number_is_an_error() {
+    let (store, _guard) = test_store().await;
+    let err = store.count("SELECT NULL", vec![]).await.unwrap_err();
+    assert!(
+        format!("{err}").contains("the cap cannot be checked"),
+        "{err}"
+    );
+    assert_eq!(
+        store
+            .count("SELECT COUNT(*) FROM users", vec![])
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 /// At most two live tokens at once; an expired or revoked one does not
 /// count.
 #[tokio::test]
