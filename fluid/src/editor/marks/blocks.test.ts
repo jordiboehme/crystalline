@@ -410,10 +410,11 @@ describe("Enter in a list or a quote", () => {
   });
 
   it("leaves other lines to the default Enter", () => {
-    const view = markView("plain");
-    setCaret(view, 5);
+    // A paragraph's Enter is in `paragraphEnter.test.ts`.
+    const view = markView("# Title");
+    setCaret(view, 7);
     expect(keys(view, "Enter")).toBe(true);
-    expect(bytes(view.state)).toBe("plain\n");
+    expect(bytes(view.state)).toBe("# Title\n");
   });
 
   it("uses the document's line ending", () => {

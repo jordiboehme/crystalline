@@ -267,6 +267,18 @@ function LocationProbe() {
 }
 
 describe("the markdown renderer", () => {
+  it("joins a soft break, breaks at a backslash and parts at a blank line", async () => {
+    // What the editor writes: Shift+Enter a backslash and a line break,
+    // Enter a blank line. A single line break stays a soft one, as on GitHub.
+    const { container } = await renderMarkdown("one\ntwo\\\nthree\n\nfour");
+    const paragraphs = container.querySelectorAll("p");
+    expect(paragraphs).toHaveLength(2);
+    const first = paragraphs[0];
+    expect(first?.querySelectorAll("br")).toHaveLength(1);
+    expect(first?.textContent).toBe("one\ntwo\nthree");
+    expect(paragraphs[1]?.textContent).toBe("four");
+  });
+
   it("never turns raw HTML into elements", async () => {
     const { container } = await renderMarkdown(
       [

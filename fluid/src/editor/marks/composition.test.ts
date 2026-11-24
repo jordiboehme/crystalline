@@ -342,7 +342,7 @@ describe.each([false, true])(
       keyboard.end(false);
       keys(view, "Enter");
       vi.advanceTimersByTime(60);
-      expect(bytes(view.state)).toBe("ab**cd**\n");
+      expect(bytes(view.state)).toBe("ab**cd**\n\n");
     });
 
     it("keeps Bold for a Korean syllable whose space comes with the commit", () => {
