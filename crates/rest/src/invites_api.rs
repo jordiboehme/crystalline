@@ -279,7 +279,7 @@ pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
     ApiQuery(query): ApiQuery<ListInvitesQuery>,
-) -> Result<Json<InvitesResponse>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let user = identity.require_account()?;
     let creator = (user.role != Role::Admin).then_some(user.name.as_str());
     let invites = state
@@ -287,10 +287,14 @@ pub async fn list(
         .invites(creator, query.state)
         .await
         .map_err(store_error)?;
-    Ok(Json(InvitesResponse {
+    let mut answer = serde_json::to_value(InvitesResponse {
         invites,
         sign_in: offered_sign_in(&state),
-    }))
+    })
+    .map_err(|e| ApiError::internal(format!("writing the invite list: {e}")))?;
+    super::display_names::enrich_fields(&state.auth, &mut answer, &["created_by", "used_by"])
+        .await;
+    Ok(Json(answer))
 }
 
 /// `POST /invites` - make an invite link, answering 201 with it, its token

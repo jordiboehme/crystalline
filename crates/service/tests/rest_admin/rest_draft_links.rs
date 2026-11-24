@@ -369,6 +369,8 @@ async fn the_author_mints_and_a_stranger_binds() {
     let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    f.auth.set_display("alice", Some("Alice A")).await.unwrap();
+    f.auth.set_display("bob", Some("Bob B")).await.unwrap();
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
     let carol = login(f.addr, "carol").await;
@@ -399,6 +401,7 @@ async fn the_author_mints_and_a_stranger_binds() {
         .await
         .unwrap();
     assert_eq!(accepted["owner"], serde_json::json!("alice"), "{accepted}");
+    assert_eq!(accepted["owner_display"], "Alice A", "{accepted}");
     assert_eq!(accepted["path"], serde_json::json!(path), "{accepted}");
     assert_eq!(accepted["editable"], serde_json::json!(true), "{accepted}");
     assert!(
@@ -436,6 +439,7 @@ async fn the_author_mints_and_a_stranger_binds() {
         .await
         .unwrap();
     assert_eq!(listed[0]["grantee"], serde_json::json!("bob"), "{listed}");
+    assert_eq!(listed[0]["grantee_display"], "Bob B", "{listed}");
     assert!(
         listed[0].get("token").is_none(),
         "and the link itself is never readable again: {listed}"

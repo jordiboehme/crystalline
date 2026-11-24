@@ -572,6 +572,37 @@ async fn a_draft_frame_reaches_its_author_and_nobody_else() {
     assert!(heard.is_empty(), "not even as an invalidation: {heard:?}");
 }
 
+/// A frame names its actor by login and carries the account's display name
+/// beside it, resolved as the frame is written, so a rename shows on the
+/// next event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_engram_frame_carries_the_actors_display_name() {
+    let fx = serve(false, false).await;
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let mut stream = open(fx.addr, Some(&vera), None).await;
+    let as_ada = crystalline_service::Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    fx.engine
+        .edit_engram_as(&edit("eng", "alpha", "one line"), None, &as_ada)
+        .await
+        .unwrap();
+    let heard = read_frames(&mut stream, 1, Duration::from_secs(3)).await;
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let data: serde_json::Value = serde_json::from_str(&heard[0].data).unwrap();
+    assert_eq!(data["actor"], "ada");
+    assert_eq!(data["actor_display"], "Ada");
+    fx.auth.set_display("ada", Some("Ada King")).await.unwrap();
+    fx.engine
+        .edit_engram_as(&edit("eng", "alpha", "two lines"), None, &as_ada)
+        .await
+        .unwrap();
+    let heard = read_frames(&mut stream, 1, Duration::from_secs(3)).await;
+    let data: serde_json::Value = serde_json::from_str(&heard[0].data).unwrap();
+    assert_eq!(data["actor_display"], "Ada King");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_last_event_id_replays_what_the_ring_holds_after_it() {
     let fx = serve(false, false).await;

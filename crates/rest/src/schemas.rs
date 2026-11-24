@@ -109,6 +109,11 @@ pub struct IdentityLink {
     /// a link a first sign-in created along with its account.
     #[schema(example = "jit")]
     pub linked_by: String,
+    /// The display name of `linked_by`, when that account has one other than
+    /// its login; absent otherwise. The route adds it as it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub linked_by_display: Option<String>,
 }
 
 /// One share-link on one draft, as the store holds it. Never carries the token:
@@ -134,6 +139,11 @@ pub struct OverlayGrant {
     /// it yet. The first account to redeem it is that account for good.
     #[schema(example = "bob")]
     pub grantee: Option<String>,
+    /// The display name of `grantee`, when that account has one other than
+    /// its login; absent otherwise. Added by the listing route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Bob Builder")]
+    pub grantee_display: Option<String>,
     /// RFC 3339, when the link was minted.
     pub created_at: String,
     /// RFC 3339, when the link stops working on its own, or null for one that
@@ -270,6 +280,11 @@ pub enum ReflectionLevel {
 pub struct DomainMember {
     /// The member's login name, folded by [`normalize_account_name`].
     pub principal: String,
+    /// The display name of `principal`, when that account has one other than
+    /// its login; absent otherwise. The route adds it as it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub principal_display: Option<String>,
     /// What this member may do here.
     pub level: MemberLevel,
     /// The Reflection level on this domain.
@@ -289,6 +304,11 @@ pub struct DomainMember {
 pub struct ReflectionGrant {
     /// The account's login name, folded.
     pub account: String,
+    /// The display name of `account`, when that account has one other than
+    /// its login; absent otherwise. The route adds it as it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub account_display: Option<String>,
     /// `reader` or `contributor`.
     pub level: ReflectionLevel,
     /// Who added or last changed this grant.
@@ -310,6 +330,11 @@ pub struct GithubPerson {
     /// The account linked to that GitHub login here, or `null` when nobody
     /// here is linked to it.
     pub account: Option<String>,
+    /// The display name of `account`, when that account has one other than
+    /// its login; absent otherwise. The route adds it as it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub account_display: Option<String>,
 }
 
 /// A domain closed because the GitHub App is not installed on its
@@ -363,6 +388,11 @@ pub struct EngramChanged {
     /// Who made the change, as a display label. Null for a change the watcher
     /// found on disk and for a write nobody signed.
     pub actor: Option<String>,
+    /// The display name of `actor`, when the actor is an account with one
+    /// other than its login; added as the frame is written, absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_display: Option<String>,
     /// Set when the change landed in this actor's draft overlay. Delivered to
     /// that actor's own sessions and to nobody else.
     pub draft_of: Option<String>,
@@ -401,6 +431,11 @@ pub enum DomainAudience {
 pub struct DomainChanged {
     pub domain: String,
     pub actor: Option<String>,
+    /// The display name of `actor`, when the actor is an account with one
+    /// other than its login; added as the frame is written, absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_display: Option<String>,
     /// `Some`, resolved eagerly, only for a rename's old name and a removal:
     /// that name's privacy record leaves with the change, so the route must
     /// filter against this snapshot rather than a session's own lazy check.
@@ -446,6 +481,11 @@ pub struct ReflectionChanged {
     /// followed, a room save with no single typist, the machine owner and a
     /// change found on disk.
     pub actor: Option<String>,
+    /// The display name of `actor`, when the actor is an account with one
+    /// other than its login; added as the frame is written, absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_display: Option<String>,
 }
 
 /// The kind of a draft conflict: a copy of the engine's `DraftConflictKind`,
@@ -716,6 +756,11 @@ pub struct Invite {
     /// The account that made it.
     #[schema(example = "ada")]
     pub created_by: String,
+    /// The display name of `created_by`, when that account has one other than
+    /// its login; absent otherwise. The route adds it as it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub created_by_display: Option<String>,
     /// When it was made, RFC 3339.
     pub created_at: String,
     /// When it stops working, RFC 3339.
@@ -724,6 +769,11 @@ pub struct Invite {
     pub used_at: Option<String>,
     /// The account that used it, or `None`.
     pub used_by: Option<String>,
+    /// The display name of `used_by`, when that account has one other than
+    /// its login; absent otherwise. The route adds it as it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Bo Berg")]
+    pub used_by_display: Option<String>,
     /// When it was revoked, RFC 3339, or `None`.
     pub revoked_at: Option<String>,
     /// Pending, used, revoked or expired, as of the read.
@@ -756,6 +806,18 @@ mod tests {
     }
 
     /// The keys (or, for an enum, the spellings) a store value serializes to.
+    /// The published names less `field`, a display name a route adds beside
+    /// a login as it answers, which the store's or the bus's own value never
+    /// carries.
+    fn but(mut names: Vec<String>, field: &str) -> Vec<String> {
+        names.retain(|n| n != field);
+        names
+    }
+
+    fn but_actor_display(names: Vec<String>) -> Vec<String> {
+        but(names, "actor_display")
+    }
+
     fn keys<T: serde::Serialize>(values: impl IntoIterator<Item = T>) -> Vec<String> {
         let mut keys: Vec<String> = Vec::new();
         for value in values {
@@ -873,7 +935,7 @@ mod tests {
                 revoked_at: None,
                 state: auth_store::InviteState::Pending,
             }]),
-            published::<super::Invite>()
+            but(but(published::<super::Invite>(), "created_by_display"), "used_by_display")
         );
         assert_eq!(
             keys([
@@ -891,7 +953,7 @@ mod tests {
                 linked_at: s(),
                 linked_by: s(),
             }]),
-            published::<super::IdentityLink>()
+            but(published::<super::IdentityLink>(), "linked_by_display")
         );
         assert_eq!(
             keys([auth_store::OverlayGrant {
@@ -904,7 +966,7 @@ mod tests {
                 expires_at: None,
                 revoked_at: None,
             }]),
-            published::<super::OverlayGrant>()
+            but(published::<super::OverlayGrant>(), "grantee_display")
         );
         assert_eq!(
             keys([auth_store::OauthGrantInfo {
@@ -952,7 +1014,7 @@ mod tests {
                 added_by: s(),
                 added_at: s(),
             }]),
-            published::<super::DomainMember>()
+            but(published::<super::DomainMember>(), "principal_display")
         );
         assert_eq!(
             keys([auth_store::ReflectionGrant {
@@ -961,7 +1023,7 @@ mod tests {
                 added_by: s(),
                 added_at: s(),
             }]),
-            published::<super::ReflectionGrant>()
+            but(published::<super::ReflectionGrant>(), "account_display")
         );
         assert_eq!(
             keys([crystalline_engine::engine::GithubPerson {
@@ -970,7 +1032,7 @@ mod tests {
                 level: MemberLevel::Viewer,
                 account: None,
             }]),
-            published::<super::GithubPerson>()
+            but(published::<super::GithubPerson>(), "account_display")
         );
         assert_eq!(
             keys([crystalline_engine::engine::ClosedDomain {
@@ -1035,7 +1097,7 @@ mod tests {
                 draft_of: None,
                 audience: None,
             }]),
-            published::<super::EngramChanged>()
+            but_actor_display(published::<super::EngramChanged>())
         );
         assert_eq!(
             keys([bus::DomainChanged {
@@ -1043,7 +1105,7 @@ mod tests {
                 actor: None,
                 audience: None
             }]),
-            published::<super::DomainChanged>()
+            but_actor_display(published::<super::DomainChanged>())
         );
         assert_eq!(
             keys([
@@ -1066,7 +1128,7 @@ mod tests {
                 checksum: None,
                 audience: None,
             }]),
-            published::<super::ReflectionChanged>()
+            but_actor_display(published::<super::ReflectionChanged>())
         );
     }
 }
