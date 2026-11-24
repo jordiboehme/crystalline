@@ -171,8 +171,8 @@ function Command({ children }: { children: ReactNode }) {
 /** Why a check that is off is off, and what to do instead, per reason. */
 const OFF_TEXT: Record<Exclude<UpdateCheckOff, "not_turned_on">, string> = {
   no_update_notifier:
-    "Update check off: NO_UPDATE_NOTIFIER is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
-  ci: "Update check off: CI is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
+    "Update check off: NO_UPDATE_NOTIFIER is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check. If that is off too, turn it on with: crystalline update auto on",
+  ci: "Update check off: CI is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check. If that is off too, turn it on with: crystalline update auto on",
   docker:
     "Update check off: this server runs in Docker. To update, pull the new image and start the container again.",
   desktop_extension:

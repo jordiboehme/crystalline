@@ -17,7 +17,7 @@ Engrams are different. They are your own knowledge as an agent, and you write th
 
 ## The PACT first
 
-Before you write a page, read the domain's `PACT.md` with `read_reflection`. Its `## Presentation` section says which diagrams, callouts and tables help these readers and what to avoid. It narrows or extends the defaults in this skill, and where the two differ, the PACT wins. A PACT that says "no diagrams" means no diagrams, even where this skill requires one. A PACT that asks for plain text and tables only means no callouts and no diagrams, not even a caution before an irreversible step: say the warning in a sentence.
+Before you write a page, read the domain's `PACT.md` with `read_reflection`. Its `## Presentation` section says which diagrams, callouts and tables help these readers and what to avoid. It narrows or extends the defaults in this skill, and where the two differ, the PACT wins. A PACT that says "no diagrams" means no diagrams, even where this skill requires one. A PACT that asks for plain text and tables only means no callouts and no diagrams, not even a caution before an irreversible step: say the warning in a sentence. A status chip is text, so it stays allowed there, unless the PACT says no chips.
 
 When the PACT has no `## Presentation` section, use the defaults below. If you see a pattern the readers would want written down, propose it: write it into `PACT.md` when you may curate and a person is in the session, otherwise open a thread with `discuss`.
 
@@ -39,7 +39,8 @@ Many readers do not speak English as their first language. Some readers cannot s
 - **Use verbs, not nouns made from verbs.** Before: "The implementation of caching is done by the gateway." After: "The gateway caches responses."
 - **Make definite claims.** Mark knowledge that is not settled with a status chip, not with soft words. Before: "It may perhaps be advisable to retry." After: ":status[Proposed]{purple} Retry twice, then fail."
 - **Avoid the words readers link with machine-written text:** delve, robust, crucial, pivotal, leverage, landscape, showcase, "it's important to note", "worth noting", "let's dive in". Before: "Let's delve into this robust design." After: "The design has three parts."
-- **Use no em dash and no en dash.** Use a full stop or a colon. A hyphen belongs only in compound words such as "read-only". Before: "The store is the record, nothing else is" written with a long dash. After: "The store is the record. Nothing else is."
+- **Use no em dash and no en dash.** Use a full stop or a colon. In running text a hyphen belongs only in compound words such as "read-only". A list bullet, a range such as 3-5, a negative number and a flag such as `--force` are fine. Before: "The store is the record, nothing else is" written with a long dash. After: "The store is the record. Nothing else is."
+- **Never add a fact that is not in the sources.** Every name, number, date, step and reason on the page comes from an engram you name in `sources`, or from the PACT. When the reader needs a fact that no source holds, leave it out or ask your person.
 - **End on the last fact.** No closing summary and no closing wish. Before: "In summary, the export is faster. I hope this helps." After: "Exports now finish in 8 seconds."
 
 Shape the page around the questions the reader brings, not around the order you learned things in. Start with a lead paragraph above the first `##`: what the page is for and who it is for. Use the PACT's terms, and use each term the same way everywhere.
@@ -70,7 +71,7 @@ These shapes need their element. A numbered list or a paragraph is not enough fo
 | Priorities, effort against value | a `quadrantChart` |
 | A map of a topic and its parts | a `mindmap` |
 | A data model, entities and how they relate | an `erDiagram` |
-| The key point the page leads with | a `> [!IMPORTANT]` or `> [!NOTE]` box in the lead |
+| The one point the reader must not miss, only on a page that has one | a `> [!IMPORTANT]` or `> [!NOTE]` box in the lead. Most pages need none. |
 | A prerequisite the reader must not miss | a `> [!IMPORTANT]` callout |
 | A shortcut or a better way | a `> [!TIP]` callout |
 | Long reference detail or optional steps | a folded `> [!DETAILS]-` callout |
@@ -84,7 +85,7 @@ Every element carries content. A table with no rows, a diagram with one box or a
 
 - Put a sentence before each diagram that says what it shows. One diagram per idea, about a dozen nodes at most.
 - Use the reader's words for labels, in diagrams, tables and chips.
-- Never two callouts in a row, and never a callout inside a callout.
+- Never two callouts in a row, and never a callout inside a callout. At most three callouts on a page.
 - Never fold a warning or a caution: a risk the reader has to open is a risk the reader misses.
 - Do not set colours or a theme inside a mermaid diagram. The page sets them for light, dark and print.
 - A status chip always carries a word ("Blocked", "Done"), not only a colour.
@@ -106,10 +107,12 @@ A section built from an engram that is not settled yet shows that with a chip. M
 
 | Engram status | Chip |
 | --- | --- |
-| draft, proposed, idea, poc, open | purple, for example `:status[Proposed]{purple}` or `:status[Idea]{purple}` |
+| draft, proposed, idea, poc, open | purple, for example `:status[Proposed]{purple}`, `:status[Idea]{purple}`, `:status[Proof of concept]{purple}` or `:status[Open]{purple}` |
 | deprecated | red, for example `:status[Deprecated]{red}` |
 | archived, superseded, legacy | grey, for example `:status[Retired]{grey}` |
-| active, stable, decided | no chip needed, unless the content has a status of its own |
+| active, stable, decided, implemented, current | no chip needed, unless the content has a status of its own |
+
+Any other engram status gets no chip.
 
 Put the chip at the start of the section's first paragraph, or in the row the engram fills. Then write the text as a definite claim.
 
@@ -121,22 +124,21 @@ Put the chip at the start of the section's first paragraph, or in the row the en
 4. Do I compare three or more options, or list attributes? Write a table.
 5. Does something here have a status, or come from an engram that is not settled? Add a status chip in the scheme colour.
 6. Are there dates, numbers over time, shares or priorities? Use the chart from the More shapes table.
-7. Does this section describe a step that cannot be undone? Put the callout here, at that step.
+7. Does this section describe a step that cannot be undone, or a risky one? Put the callout here, at that step.
 8. What is left is prose: short sentences that say why and lead into the elements.
 
 ## Example
 
-Four engrams. `orders-db-move` (status active) holds the steps of a database move, who owns each and how far each is. `orders-db-switch` (status active) says reads move to the new database once its lag is under one second, and otherwise wait an hour and check again. `orders-db-shutdown` (status active) says the shutdown deletes the old database and cannot be undone. `orders-db-copy` (status idea) says a read-only copy of the old database could stay for one year.
+The domain's PACT says the pages are for the on-call team. Four engrams. `orders-db-move` (status active) says the orders database moves to a new cluster, and holds the steps of the move, who owns each and how far each is. `orders-db-switch` (status active) says reads move to the new database once its lag is under one second, and otherwise wait an hour and check again. The lag is how far the new database is behind the old one. `orders-db-shutdown` (status active) says the Platform team starts the shutdown after reads have switched, and that the shutdown deletes the old database and cannot be undone. `orders-db-copy` (status idea) says a read-only copy of the old database could stay for one year.
+
+Every fact on the page comes from these engrams or the PACT. The page has no box in the lead: no single point stands above the rest.
 
 The page they become:
 
 ````markdown
 # Moving the orders database
 
-The orders database moves to a new cluster this quarter. This page is for the on-call team. It shows where the move stands and what each step needs.
-
-> [!IMPORTANT] Reports still read from the old database
-> Until the switch, every report reads from the old cluster.
+The orders database moves to a new cluster. This page is for the on-call team. It shows where the move stands and what each step needs.
 
 ## Where the move stands
 
@@ -161,16 +163,14 @@ flowchart TD
 
 ## Shutting down the old database
 
-Shut it down one week after the switch.
+The Platform team starts the shutdown after reads have switched.
 
 > [!CAUTION] The shutdown deletes the old database
-> It cannot be undone. Take a last backup first.
-
-Then start the shutdown from the cluster console.
+> It cannot be undone.
 
 ## A copy of the old database
 
-:status[Idea]{purple} A read-only copy of the old database stays for one year, for audits.
+:status[Idea]{purple} A read-only copy of the old database stays for one year.
 ````
 
 ## Pictures

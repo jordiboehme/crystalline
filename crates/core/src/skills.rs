@@ -295,6 +295,11 @@ mod tests {
             "markdown_findings",
             "never write them into the page as HTML comments or text",
             "https://github.com/jordiboehme/crystalline/blob/main/docs/markdown.md",
+            "A status chip is text, so it stays allowed there, unless the PACT says no chips.",
+            "Never add a fact that is not in the sources.",
+            "In running text a hyphen belongs only in compound words",
+            "Any other engram status gets no chip.",
+            "cannot be undone, or a risky one? Put the callout here",
         ] {
             assert!(p.contains(needle), "presentation skill lacks {needle}");
         }

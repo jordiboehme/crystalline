@@ -39,6 +39,9 @@ Classes, each reading an optional ``expect[<class>]`` object with a
   callout, no page has two callouts in a row, and no page holds an element
   without content: an empty or type-only mermaid fence, a callout with no
   title and no body, an empty status chip or a table with no body rows.
+  Nor does a page decorate: no mermaid diagram of one node and no edge,
+  no callout whose body repeats the sentence right before it, and no more
+  than three callouts on one page.
 - ``pact_override``: a page covers the handshake, and no mermaid fence
   and no callout stands anywhere under the domain's reflections/ (the
   PACT said plain text and tables only).
@@ -241,6 +244,47 @@ def empty_elements(text: str) -> list[str]:
     return found
 
 
+# An edge in any diagram type: a flowchart or state arrow, a sequence
+# message, an ER or class relation, a link with no arrow, a C4 relation.
+_EDGE = re.compile(r"--|->|==|-\.|\.\.|~~~|\bRel\w*\(")
+
+MAX_CALLOUTS = 3
+
+
+def _plain(text: str) -> str:
+    """Text reduced to its words, for comparing a callout with a sentence."""
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
+def decorated_elements(text: str) -> list[str]:
+    """Every element that has content but adds nothing: a mermaid diagram
+    of one node and no edge, a callout that says again the sentence right
+    before it, and more than ``MAX_CALLOUTS`` callouts on one page."""
+    found: list[str] = []
+    for f in mermaid_fences(text):
+        body = [ln for ln in f.lines if ln.strip()][1:]
+        if len(body) == 1 and not _EDGE.search(body[0]):
+            found.append(f"a mermaid diagram with one node ({f.first_word})")
+    previous: list[str] | None = None
+    for lines in _blocks(text):
+        heads = [i for i, ln in enumerate(lines) if _CALLOUT.match(ln)]
+        if heads and heads[0] == 0 and previous and previous[0] != "```" \
+                and not previous[0].startswith("#") and not _CALLOUT.match(previous[0]):
+            m = _CALLOUT.match(lines[0])
+            stop = heads[1] if len(heads) > 1 else len(lines)
+            body = " ".join(ln.strip().lstrip(">").strip() for ln in lines[1:stop])
+            said = body.strip() or lines[0][m.end():].strip()
+            sentences = re.split(r"(?<=[.!?:])\s+", " ".join(ln.strip() for ln in previous))
+            last = sentences[-1] if sentences else ""
+            if _plain(said) and _plain(said) == _plain(last):
+                found.append(f"a {m.group(1).upper()} callout that repeats the sentence before it")
+        previous = lines
+    count = len(callouts(text))
+    if count > MAX_CALLOUTS:
+        found.append(f"{count} callouts on one page (at most {MAX_CALLOUTS})")
+    return found
+
+
 def table_body_rows(text: str) -> list[int]:
     """The body-row count of every GFM table outside code fences."""
     counts = []
@@ -375,7 +419,7 @@ def score_status_chip(ev: Evidence, spec: dict) -> list[Check]:
         label.strip()
         for label, colour in found
         if "recommended" in label.lower()
-        and colour != ("red" if "not" in label.lower().split() else "green")
+        and colour != ("red" if re.search(r"\bnot\b", label.lower()) else "green")
     })
     return [
         (
@@ -413,6 +457,11 @@ def score_no_decoration(ev: Evidence, spec: dict) -> list[Check]:
     checks.append((
         not empty,
         f"every element carries content, never decoration: found {empty}",
+    ))
+    extra = sorted({e for p, t in pages.items() if p != "PACT.md" for e in decorated_elements(t)})
+    checks.append((
+        not extra,
+        f"every element adds something the text does not say: found {extra}",
     ))
     return checks
 
@@ -565,7 +614,9 @@ _DESCRIPTIONS = {
         "Every element carries content, never decoration. The one-line "
         "restart how-to may stay short (no diagram, at most one callout), "
         "no page holds two callouts in a row, and no page holds an empty "
-        "diagram, callout, status chip or table."
+        "diagram, callout, status chip or table, a diagram of one node, a "
+        "callout that repeats the sentence before it or more than three "
+        "callouts."
     ),
     "pact_override": (
         "The domain's PACT Presentation section says no diagrams, and the "

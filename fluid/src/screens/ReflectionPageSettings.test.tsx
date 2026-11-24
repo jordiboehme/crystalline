@@ -656,6 +656,12 @@ describe("the page details column", () => {
       { key: "Escape", isComposing: true },
     );
     expect(within(panel).getByRole("form")).toBeInTheDocument();
+    // Safari: the composition has ended, but the key code still says IME.
+    fireEvent.keyDown(
+      within(form).getByRole("combobox", { name: "Freshness" }),
+      { key: "Escape", keyCode: 229 },
+    );
+    expect(within(panel).getByRole("form")).toBeInTheDocument();
   });
 
   it("closes the form on a retire, and leaves it closed after a restore", async () => {
@@ -699,6 +705,60 @@ describe("the page details column", () => {
         screen.getByRole("button", { name: "More actions" }),
       ).toHaveFocus();
     });
+  });
+
+  it("says no old save after a retire and a restore", async () => {
+    let retired = false;
+    let freshness = "1d";
+    serve("curate", {
+      [DOC]: () =>
+        doc(
+          retired
+            ? view({
+                freshness,
+                retired: { at: null, by: null, was_owned_by: null },
+              })
+            : view({ freshness }),
+        ),
+      "/domains/eng/reflection/clock": () => ({ clock: null, checksum: "c1" }),
+      "/domains/eng/reflection/settings": () => {
+        freshness = "6h";
+        return {
+          domain: "eng",
+          path: PAGE,
+          checksum: "c2",
+          page: view({ freshness }),
+        };
+      },
+      "/domains/eng/reflection/retire": () => {
+        retired = true;
+        return { domain: "eng", path: PAGE, retired: true };
+      },
+      "/domains/eng/reflection/restore": () => {
+        retired = false;
+        return { domain: "eng", path: PAGE, restored: true };
+      },
+    });
+    renderApp(URL);
+    const panel = await details();
+    const form = await edit(panel);
+    await userEvent.selectOptions(
+      within(form).getByRole("combobox", { name: "Freshness" }),
+      "6h",
+    );
+    await userEvent.click(within(form).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(within(panel).getByRole("status")).toHaveTextContent(/^Saved$/);
+    });
+    await moreActions();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Retire" }));
+    const banner = await screen.findByRole("note", { name: "Retired" });
+    expect(within(panel).getByRole("status")).toHaveTextContent(/^$/);
+    await userEvent.click(
+      within(banner).getByRole("button", { name: "Restore" }),
+    );
+    await within(panel).findByRole("button", { name: "Edit page settings" });
+    expect(within(panel).getByRole("status")).toHaveTextContent(/^$/);
   });
 
   it("offers no Edit on a retired page", async () => {

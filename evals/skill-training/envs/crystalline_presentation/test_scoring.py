@@ -153,6 +153,15 @@ def test_status_chip_fails_on_words_only_wrong_colour_or_other_section(tmp_path)
     assert not ok(s.score_status_chip(ev(tmp_path), {}))  # not the transport section
 
 
+def test_status_chip_reads_not_with_a_hyphen(tmp_path):
+    cites = {"33333333": ["transport-options"]}
+    hyphen = CHIPS.replace("Data centre only]{Yellow}", "Not-recommended]{red}")
+    put(tmp_path, page(("33333333", "Transports", hyphen), cites=cites))
+    assert ok(s.score_status_chip(ev(tmp_path), {}))
+    put(tmp_path, page(("33333333", "Transports", hyphen.replace("{red}", "{green}")), cites=cites))
+    assert not ok(s.score_status_chip(ev(tmp_path), {}))  # not recommended is red
+
+
 # ── no_decoration ─────────────────────────────────────────────────────────
 
 COVER = {"44444444": ["restart-the-relay"], "22222222": ["tenant-purge"]}
@@ -208,6 +217,41 @@ def test_no_decoration_fails_on_a_contentless_element(tmp_path):
             cites=COVER,
         ))
         assert not ok(s.score_no_decoration(ev(tmp_path), {})), empty
+
+
+def test_decorated_elements_names_each_element_that_adds_nothing():
+    assert s.decorated_elements(SEQ + "\nA sentence.\n\n" + WARN + TABLE) == []
+    one = "```mermaid\nflowchart TD\n    A[Restart the relay]\n```\n"
+    assert s.decorated_elements(one) == ["a mermaid diagram with one node (flowchart)"]
+    assert s.decorated_elements("```mermaid\nflowchart TD\n    A --> B\n```\n") == []
+    assert s.decorated_elements("```mermaid\nflowchart TD\n    A[One]\n    B[Two]\n```\n") == []
+    assert s.decorated_elements("```mermaid\npie\n    \"All\" : 100\n```\n") == [
+        "a mermaid diagram with one node (pie)"
+    ]
+    echo = "Run it once. A purge cannot be undone.\n\n> [!WARNING]\n> A purge cannot be undone!\n"
+    assert s.decorated_elements(echo) == ["a WARNING callout that repeats the sentence before it"]
+    titled = "A purge cannot be undone.\n\n> [!WARNING] A purge cannot be undone\n"
+    assert s.decorated_elements(titled) == ["a WARNING callout that repeats the sentence before it"]
+    assert s.decorated_elements("A purge cannot be undone.\n\n" + WARN) == []
+    assert s.decorated_elements("## A purge cannot be undone\n\n> [!NOTE]\n> A purge cannot be undone.\n") == []
+    four = "\n\nText.\n\n".join([WARN] * 4)
+    assert s.decorated_elements(four) == ["4 callouts on one page (at most 3)"]
+    assert s.decorated_elements("\n\nText.\n\n".join([WARN] * 3)) == []
+    assert s.decorated_elements("```text\nflowchart TD\n    A\n```\n") == []
+
+
+def test_no_decoration_fails_on_an_element_that_adds_nothing(tmp_path):
+    for extra in (
+        "```mermaid\nflowchart LR\n    A[Purge]\n```\n",
+        "Export the tenant first.\n\n> [!TIP]\n> Export the tenant first.\n",
+        "\n\nText.\n\n".join([WARN] * 3),
+    ):
+        put(tmp_path, page(
+            ("44444444", "Restart", "Run it."),
+            ("22222222", "Purge", WARN + "\nA sentence.\n\n" + extra),
+            cites=COVER,
+        ))
+        assert not ok(s.score_no_decoration(ev(tmp_path), {})), extra
 
 
 # ── pact_override ─────────────────────────────────────────────────────────

@@ -140,12 +140,13 @@ function PageSettings({
   const editable = changes && page.retired === null;
   const headingId = useId();
   const [editing, setEditing] = useState(false);
-  // A retire or a lock ends the editing, so a restore does not open the
-  // form again by itself.
-  if (editing && !editable) {
-    setEditing(false);
-  }
   const [saved, setSaved] = useState(false);
+  // A retire or a lock ends the editing and the "Saved" it may have left,
+  // so a restore neither opens the form again nor says an old save.
+  if (!editable && (editing || saved)) {
+    setEditing(false);
+    setSaved(false);
+  }
   const editRef = useRef<HTMLButtonElement | null>(null);
   // Set when the form closes, so Edit takes the focus back once it shows.
   const refocus = useRef(false);
@@ -355,6 +356,9 @@ function SettingsForm({
         if (
           event.key === "Escape" &&
           !event.nativeEvent.isComposing &&
+          // Safari ends a composition before the key event that ended it,
+          // and marks that event only with the IME key code.
+          event.keyCode !== 229 &&
           !event.defaultPrevented &&
           !save.isPending
         ) {

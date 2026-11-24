@@ -732,6 +732,10 @@ mod tests {
             updates.contains("A section built from tentative engrams (status draft, proposed, idea, poc or open) shows a status chip, for example `:status[Proposed]{purple}`."),
             "{updates}"
         );
+        assert!(
+            updates.contains("A chip is text, so it stays on a page whose PACT allows only plain text and tables, unless the PACT says no chips."),
+            "{updates}"
+        );
     }
 
     /// Reflection pages are read by people: every section is written and

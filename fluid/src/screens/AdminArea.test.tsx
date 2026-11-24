@@ -392,11 +392,11 @@ describe("the Updates row of the General page", () => {
   it.each([
     [
       "no_update_notifier",
-      "Update check off: NO_UPDATE_NOTIFIER is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
+      "Update check off: NO_UPDATE_NOTIFIER is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check. If that is off too, turn it on with: crystalline update auto on",
     ],
     [
       "ci",
-      "Update check off: CI is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check: crystalline update auto on turns it on.",
+      "Update check off: CI is set on the server. It keeps the check off whatever update.check says. Once it is removed, the check follows update.check. If that is off too, turn it on with: crystalline update auto on",
     ],
     [
       "docker",
