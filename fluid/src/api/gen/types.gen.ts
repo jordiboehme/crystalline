@@ -3627,7 +3627,7 @@ export type TagAliasesView = {
  */
 export type ThreadStepBody = {
     /**
-     * resolve: the short outcome, required.
+     * resolve: the short outcome, optional.
      */
     outcome?: string | null;
     /**
@@ -7837,7 +7837,7 @@ export type StepReflectionThreadErrors = {
      */
     409: ProblemDetail;
     /**
-     * An answer with no text, or a resolve with no outcome (an empty one included).
+     * An answer with no text.
      */
     422: ProblemDetail;
 };

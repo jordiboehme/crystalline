@@ -409,23 +409,17 @@ async fn the_rights_per_route() {
         .await;
     assert_eq!(status, 201, "a viewer comments: {thread}");
     let id = thread["id"].as_str().unwrap();
-    let (status, err) = vera
+    let (status, resolved) = vera
         .send(
             reqwest::Method::POST,
             &format!("/api/v1/domains/eng/reflection/threads/{id}/resolve"),
             Some(json!({ "path": "guides/deploying.md", "outcome": "" })),
         )
         .await;
-    assert_eq!(status, 422, "a resolve needs its outcome: {err}");
-    let (status, resolved) = vera
-        .send(
-            reqwest::Method::POST,
-            &format!("/api/v1/domains/eng/reflection/threads/{id}/resolve"),
-            Some(json!({ "path": "guides/deploying.md", "outcome": "Yes." })),
-        )
-        .await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "a resolve needs no outcome: {resolved}");
     assert_eq!(resolved["status"], "resolved");
+    assert_eq!(resolved["entries"][1]["kind"], "resolve", "{resolved}");
+    assert_eq!(resolved["entries"][1]["text"], "", "{resolved}");
     let (_, listed) = vera
         .get("/api/v1/domains/eng/reflection/threads?status=all")
         .await;

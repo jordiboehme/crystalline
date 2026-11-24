@@ -12,7 +12,7 @@ import type { PrintNote } from "../printNotes";
 /** What a thread entry says, as the thread card words it. */
 function entryText(entry: PrintNote["thread"]["entries"][number]): string {
   if (entry.kind === "resolve") {
-    return `Resolved: ${entry.text}`;
+    return entry.text === "" ? "Resolved" : `Resolved: ${entry.text}`;
   }
   if (entry.kind === "reopen") {
     return entry.text === "" ? "Reopened" : `Reopened: ${entry.text}`;

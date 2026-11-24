@@ -1077,7 +1077,7 @@ pub struct ThreadStepBody {
     /// answer: the text, required; reopen: optional.
     #[serde(default)]
     pub text: Option<String>,
-    /// resolve: the short outcome, required.
+    /// resolve: the short outcome, optional.
     #[serde(default)]
     pub outcome: Option<String>,
 }
@@ -1144,8 +1144,7 @@ pub struct ThreadStepBody {
         ),
         (
             status = 422,
-            description = "An answer with no text, or a resolve with no outcome \
-                           (an empty one included).",
+            description = "An answer with no text.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

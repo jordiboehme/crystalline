@@ -7826,7 +7826,7 @@
             }
           },
           "422": {
-            "description": "An answer with no text, or a resolve with no outcome (an empty one included).",
+            "description": "An answer with no text.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -19942,7 +19942,7 @@
               "string",
               "null"
             ],
-            "description": "resolve: the short outcome, required."
+            "description": "resolve: the short outcome, optional."
           },
           "path": {
             "type": "string",

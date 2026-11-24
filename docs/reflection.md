@@ -135,7 +135,7 @@ One confirmation counts once per person, page and source domain. That person's l
 
 ## Threads
 
-A thread is a discussion about one passage. It is anchored on a section and, if you like, on an exact quoted passage in it. A thread can be opened, answered, resolved with a short outcome and reopened. The threads of a page are stored in `<name>.threads.md` beside the page. The history of a thread is only ever added to: a resolved thread does not change, and a reopen is a new entry.
+A thread is a discussion about one passage. It is anchored on a section and, if you like, on an exact quoted passage in it. A thread can be opened, answered, resolved and reopened. A resolve may carry a short outcome, but it does not need one. The threads of a page are stored in `<name>.threads.md` beside the page. The history of a thread is only ever added to: a resolved thread does not change, and a reopen is a new entry.
 
 Answer a person's thread and leave it open. The person who opened it resolves it. An agent that tries to resolve a person's thread right after its own answer is refused. Putting the answer into the resolve outcome is refused too. It may resolve it once the person wrote back, for example "thanks, you can close it". An agent may resolve a thread an agent opened. In Fluid a person's thread with an agent's answer as its last entry shows "Answered, waiting for you" to the person who opened it. A thread an agent opened never shows it.
 

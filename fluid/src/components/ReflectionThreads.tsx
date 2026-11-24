@@ -242,7 +242,9 @@ function EntryWords({ entry }: { entry: ThreadView["entries"][number] }) {
     return (
       <p className={words}>
         {entry.kind === "resolve"
-          ? `Resolved: ${entry.text}`
+          ? entry.text === ""
+            ? "Resolved"
+            : `Resolved: ${entry.text}`
           : entry.kind === "reopen"
             ? entry.text === ""
               ? "Reopened"
@@ -1651,12 +1653,14 @@ function CommentForm({
 
 /**
  * One labelled field, its send button and Cancel, for a step that takes
- * words. The field takes focus when the form opens.
+ * words. The field takes focus when the form opens. An optional field (a
+ * resolve's outcome) sends empty too.
  */
 function StepForm({
   keep,
   label,
   labelled = false,
+  optional = false,
   button,
   pending,
   error,
@@ -1668,6 +1672,8 @@ function StepForm({
   label: string;
   /** Whether the words may carry a conventional comment label (a reply). */
   labelled?: boolean;
+  /** Whether the step may be sent with no words. */
+  optional?: boolean;
   button: string;
   pending: boolean;
   error: Error | null;
@@ -1687,7 +1693,7 @@ function StepForm({
       className="flex w-full flex-col gap-1"
       onSubmit={(event) => {
         event.preventDefault();
-        if (value.trim() !== "" && !pending) {
+        if ((optional || value.trim() !== "") && !pending) {
           onSend(composeComment(labelled ? head.head : null, value));
         }
       }}
@@ -1707,6 +1713,7 @@ function StepForm({
             setValue(event.target.value);
           }
         }}
+        placeholder={optional ? "Optional" : undefined}
         className={`min-w-0 ${FIELD}`}
       />
       {error && (
@@ -1828,6 +1835,7 @@ function OpenActions({
       <StepForm
         keep={`${thread.id}:resolve`}
         label="Outcome"
+        optional
         button="Resolve"
         pending={resolve.isPending}
         error={resolve.error}
