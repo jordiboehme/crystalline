@@ -735,6 +735,12 @@ async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
             && write.contains("The `reflection:` frontmatter key is Crystalline's bookkeeping; never write it (pass `sources` instead)."),
         "{write}"
     );
+    // A freshness in `m` is months, the one grammar build_context shares;
+    // the write says so, as Fluid's custom freshness note does.
+    assert!(
+        write.contains("m means months and there is no minute unit"),
+        "{write}"
+    );
     // The skills tool is found when an agent is about to present a page.
     let skills = description("skills");
     assert!(
