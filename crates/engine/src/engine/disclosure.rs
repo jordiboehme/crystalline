@@ -743,7 +743,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(path).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, path).await?;
         if let Some(why) = self.readers_unknown() {
             return Err(EngineError::Invalid(format!(
                 "{UNKNOWN_READERS_REFUSAL} ({why})"

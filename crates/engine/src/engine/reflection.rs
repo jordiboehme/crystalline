@@ -1778,6 +1778,32 @@ impl Engine {
 }
 
 impl Engine {
+    /// A Reflection path as a caller names it (a write, a read, a move, a
+    /// settle, a thread): the rules of [`r::validate_reflection_path`], and
+    /// no segment shaped like a Windows short name ([`r::short_name_refusal`])
+    /// unless the index holds a page at exactly that path. On an NTFS volume
+    /// with short names `arch/OVERVI~1.md` can be the file of
+    /// `arch/overview.pact.md`, so a write by that name would land in the
+    /// pact; the sync only meets the names files really have, so a file that
+    /// really is called `draft~2.md` has its row and stays a page.
+    pub(crate) async fn validate_named_reflection_path(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<()> {
+        r::validate_reflection_path(path).map_err(EngineError::Invalid)?;
+        let Some(refusal) = r::short_name_refusal(path) else {
+            return Ok(());
+        };
+        let reader = self.reader();
+        if let Some(id) = reader.domain_id(domain).await?
+            && reader.get_reflection(id, path).await?.is_some()
+        {
+            return Ok(());
+        }
+        Err(EngineError::Invalid(refusal))
+    }
+
     /// `write_reflection`: dispatch on the action.
     pub async fn write_reflection(
         &self,
@@ -1883,7 +1909,8 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(&p.domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(&p.path).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(&p.domain, &p.path)
+            .await?;
         // Pact text is a curator's in person (Jordi, 2026-11-24): a run
         // settles a pact and answers its threads, and writes none of it,
         // not even the text it holds.
@@ -3133,7 +3160,7 @@ impl Engine {
         let access = self
             .require_reflection(domain, caller, ReflectionRight::Read)
             .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         Ok(read_opt(&access.abs(inner))?.map(|text| sha256_hex(text.as_bytes())))
     }
 
@@ -3147,7 +3174,7 @@ impl Engine {
         let access = self
             .require_reflection(domain, caller, ReflectionRight::Read)
             .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         let text = read_opt(&access.abs(inner))?.ok_or_else(|| {
             EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"))
         })?;
@@ -3571,7 +3598,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(from).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, from).await?;
         r::validate_new_reflection_path(to).map_err(EngineError::Invalid)?;
         if from == r::PACT_FILE || to == r::PACT_FILE {
             return Err(EngineError::Invalid(
@@ -4186,7 +4213,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         // A page's pact goes with it, so deleting a page that has one is a
         // curator's, as deleting the pact alone is.
         let pact = (!r::is_pact_file(inner))
@@ -4304,7 +4331,7 @@ impl Engine {
             .await?;
         // After the gate, so a caller without the right learns nothing about
         // the path; before any file is touched.
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         let abs = access.abs(inner);
         let baseline_abs = access.abs(&r::baseline_path(inner));
         let _lock = self.lock_file(&abs).await;

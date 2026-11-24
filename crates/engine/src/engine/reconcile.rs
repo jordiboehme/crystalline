@@ -213,7 +213,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         if !is_page(inner) {
             return Err(EngineError::Invalid(format!(
                 "'{inner}' is no page: only a page is reconciled, never PACT.md or a page pact"

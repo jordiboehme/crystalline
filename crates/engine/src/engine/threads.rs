@@ -79,7 +79,7 @@ impl Engine {
                 let access = self
                     .require_reflection_to_write(domain, caller, need)
                     .await?;
-                r::validate_reflection_path(path).map_err(EngineError::Invalid)?;
+                self.validate_named_reflection_path(domain, path).await?;
                 Ok(TargetAccess::Reflection(access))
             }
         }

@@ -364,7 +364,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         if r::is_pact_file(inner) {
             return Err(EngineError::Invalid(format!(
                 "'{inner}' is a pact file, no page: only a page has settings"
@@ -410,7 +410,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        r::validate_reflection_path(inner).map_err(EngineError::Invalid)?;
+        self.validate_named_reflection_path(domain, inner).await?;
         if r::is_pact_file(inner) {
             return Err(EngineError::Invalid(format!(
                 "'{inner}' is a pact file, no page: only a page is retired or restored"

@@ -74,10 +74,24 @@ fn is_short_name(segment: &str) -> bool {
     })
 }
 
+/// Why a path a caller names cannot be taken as written, when one of its
+/// segments has the shape of a Windows short name (a `~` and digits that end
+/// the segment or come before a `.`): on an
+/// NTFS volume with short names the file system may resolve it to another
+/// file, a pact among them. Checked where a caller names a path (a write, a
+/// create, a move, a read), never by the sync or the tree walk, which only
+/// meet the names files really have: an existing `draft~2.md` stays a page.
+/// Textual, so it answers alike on every system.
+pub fn short_name_refusal(path: &str) -> Option<String> {
+    let segment = path.split('/').find(|segment| is_short_name(segment))?;
+    Some(format!(
+        "'{path}' has a segment shaped like a Windows short name ('{segment}'), which the file system can resolve to another file, a pact among them; name the file by its full name, or choose a name without '~' and digits before the extension"
+    ))
+}
+
 /// Why `path` cannot name a reflection, or `Ok`. A reflection path is
 /// relative to `reflections/`, forward-slashed, ends in `.md`, has no empty,
-/// `.` or `..` segment, no hidden segment, no segment shaped like a Windows
-/// short name, no backslash, is not a threads
+/// `.` or `..` segment, no hidden segment, no backslash, is not a threads
 /// file, does not take an OKF reserved name and does not spell the pact in
 /// another case.
 pub fn validate_reflection_path(path: &str) -> Result<(), String> {
@@ -111,11 +125,6 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
                 "'{path}' has a hidden segment; those are Crystalline's own"
             ));
         }
-        if is_short_name(segment) {
-            return Err(format!(
-                "'{path}' has a segment shaped like a Windows short name ('{segment}'), which can be another name of a pact or a hidden file; choose a name without '~' and digits before the extension"
-            ));
-        }
     }
     let name = path.rsplit('/').next().unwrap_or(path);
     if crate::is_reserved_file(name) {
@@ -140,7 +149,8 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
 }
 
 /// Why `path` cannot name a new reflection, or `Ok`: the rules of
-/// [`validate_reflection_path`], and no first segment that repeats the
+/// [`validate_reflection_path`], no segment shaped like a Windows short name
+/// ([`short_name_refusal`]), and no first segment that repeats the
 /// `reflections/` folder (ASCII case folded, as the folder is matched). The
 /// path is inside the folder already, so `reflections/guides/a.md` would put
 /// the page at `reflections/reflections/guides/a.md`, outside the pact's
@@ -149,6 +159,9 @@ pub fn validate_reflection_path(path: &str) -> Result<(), String> {
 /// be read, edited and moved out.
 pub fn validate_new_reflection_path(path: &str) -> Result<(), String> {
     validate_reflection_path(path)?;
+    if let Some(refusal) = short_name_refusal(path) {
+        return Err(refusal);
+    }
     if is_under_reflections(path) {
         let rest = path.split_once('/').map_or("", |(_, rest)| rest);
         return Err(format!(
@@ -511,11 +524,17 @@ mod tests {
             "PROGRA~1/a.md",
             "a/B~3/c.md",
         ] {
-            let err = validate_reflection_path(bad).unwrap_err();
+            let err = short_name_refusal(bad).unwrap();
             assert!(err.contains("short name"), "{bad}: {err}");
+            assert!(validate_new_reflection_path(bad).is_err(), "{bad}");
+            // A file that really has such a name is still a page to the
+            // sync and the tree walk.
+            assert!(validate_reflection_path(bad).is_ok(), "{bad}");
+            assert_eq!(classify(bad), ReflectionFile::Page(bad.to_string()));
         }
         for ok in ["a~b.md", "notes~.md", "x/~1a.md", "v~2b/c.md"] {
-            assert!(validate_reflection_path(ok).is_ok(), "{ok}");
+            assert_eq!(short_name_refusal(ok), None, "{ok}");
+            assert!(validate_new_reflection_path(ok).is_ok(), "{ok}");
         }
     }
 

@@ -800,3 +800,78 @@ async fn by_hand(fx: &Fx, path: &str, text: &str) {
     std::fs::write(&abs, text).unwrap();
     fx.engine.sync(None).await.unwrap();
 }
+
+/// A path shaped like a Windows short name is refused where a caller names
+/// it, so a write cannot reach a pact by its short name; a file that really
+/// has such a name stays a page: indexed, in the tree and in search, and
+/// read, written and moved by its own name.
+#[tokio::test]
+async fn a_short_name_is_refused_when_named_and_a_real_one_stays_a_page() {
+    let fx = reflecting().await;
+    put(&fx, "arch/overview.md", "# Overview\n").await;
+    put(&fx, "arch/overview.pact.md", "# Pact of overview\n").await;
+    // What an NTFS volume with short names does, as a link: the short name
+    // reaches the pact's file.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "overview.pact.md",
+        fx.root.join("reflections/arch/OVERVI~1.md"),
+    )
+    .unwrap();
+    let pact = file(&fx, "arch/overview.pact.md").unwrap();
+    for path in ["arch/OVERVI~1.md", "arch/overvi~2.md"] {
+        let e = fx
+            .engine
+            .write_reflection(&write(path, "# Not the pact\n"), &person())
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("short name"), "{path}: {e}");
+    }
+    assert_eq!(
+        file(&fx, "arch/overview.pact.md").unwrap(),
+        pact,
+        "the pact is as the curator wrote it"
+    );
+    assert!(file(&fx, "arch/overvi~2.md").is_none());
+
+    by_hand(
+        &fx,
+        "notes/draft~2.md",
+        "# Draft two\n\n## One\n\nHarbour cranes.\n",
+    )
+    .await;
+    let tree = fx
+        .engine
+        .read_reflection_tree("eng", &person())
+        .await
+        .unwrap();
+    assert!(tree.to_string().contains("notes/draft~2.md"), "{tree}");
+    let hits = fx
+        .engine
+        .search_reflection(
+            "eng",
+            &ReflectionSearch {
+                query: "Harbour",
+                search_type: Some("text"),
+                limit: 10,
+                page: 1,
+            },
+            &person(),
+        )
+        .await
+        .unwrap();
+    assert!(hits.to_string().contains("notes/draft~2.md"), "{hits}");
+    let read = fx
+        .engine
+        .read_reflection("eng", "notes/draft~2.md", &person())
+        .await
+        .unwrap();
+    assert!(read.to_string().contains("Harbour cranes"), "{read}");
+    put(
+        &fx,
+        "notes/draft~2.md",
+        "# Draft two\n\n## One\n\nHarbour cranes, changed.\n",
+    )
+    .await;
+    assert!(file(&fx, "notes/draft~2.md").unwrap().contains("changed."));
+}
