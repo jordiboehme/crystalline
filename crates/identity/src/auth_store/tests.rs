@@ -8483,6 +8483,37 @@ async fn a_redemption_checks_the_creator_again() {
     assert!(store.user("nina").await.unwrap().is_none());
 }
 
+/// A used link is pending again once its redemption is taken back, and only
+/// for the account that used it.
+#[tokio::test]
+async fn a_taken_back_redemption_reopens_its_link() {
+    let (store, _guard) = redemption_store().await;
+    let issued = store
+        .create_invite(&domain_invite("ada"), ROOMY)
+        .await
+        .unwrap();
+    let done = store
+        .redeem_invite(&issued.token, local("nina"), 100)
+        .await
+        .unwrap();
+    assert!(!store.reopen_invite(done.invite.id, "other").await.unwrap());
+    store.remove_user_force("nina").await.unwrap();
+    assert!(store.reopen_invite(done.invite.id, "nina").await.unwrap());
+    let link = store
+        .invites(None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == done.invite.id)
+        .unwrap();
+    assert_eq!(link.state, InviteState::Pending);
+    assert_eq!(link.used_by, None);
+    store
+        .redeem_invite(&issued.token, local("nina"), 100)
+        .await
+        .unwrap();
+}
+
 /// A sign-on identity seen for the first time gets an account with the
 /// link's role, a name of its own and the link, in the same transaction.
 #[tokio::test]

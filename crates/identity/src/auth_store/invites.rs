@@ -477,6 +477,25 @@ impl AuthStore {
         Ok(changed > 0)
     }
 
+    /// Put the link `id` back to pending after its redemption by `used_by`
+    /// was taken back (the account it made under another name than the one
+    /// cleared was removed again): the person follows the same link once
+    /// more. `false` when the link is not used by `used_by` (another
+    /// redemption, a revoke).
+    pub async fn reopen_invite(&self, id: i64, used_by: &str) -> Result<bool> {
+        let _guard = self.lock().await;
+        let changed = self
+            .db
+            .execute(
+                "UPDATE invites SET used_at = NULL, used_by = NULL
+                 WHERE id = ?1 AND used_by = ?2 AND revoked_at IS NULL",
+                vec![Value::Integer(id), Value::Text(used_by.to_string())],
+            )
+            .await
+            .context("opening an invite link again")?;
+        Ok(changed > 0)
+    }
+
     /// Revoke every unused link to `domain`, inside the caller's
     /// transaction: the domain went shared or is gone, so no link may give
     /// membership of it, nor of a later domain that takes its name.

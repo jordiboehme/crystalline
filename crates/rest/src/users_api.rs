@@ -566,6 +566,11 @@ pub(crate) fn account_cap_refusal(err: &anyhow::Error) -> ApiError {
 pub(crate) trait Provisioned {
     /// The account that was made.
     fn account(&self) -> &User;
+
+    /// The id of the invite link it used, if any.
+    fn invite_id(&self) -> Option<i64> {
+        None
+    }
 }
 
 impl Provisioned for User {
@@ -578,12 +583,19 @@ impl Provisioned for crate::auth_store::RedeemedInvite {
     fn account(&self) -> &User {
         &self.user
     }
+
+    fn invite_id(&self) -> Option<i64> {
+        Some(self.invite.id)
+    }
 }
 
 /// A first sign-in's provisioning with the same step before it. The store picks
 /// the first free name from `desired`, so the step asks about that name. When
 /// another account took it in between, the store picks a later one, which was not
 /// asked about: that account is taken back out and the person signs in again.
+/// An invite link the provisioning used is pending again, so the person
+/// follows the same link once more; when it cannot be, they are told to ask
+/// for a new one.
 pub(crate) async fn provision_clear<T: Provisioned>(
     state: &RestState,
     desired: &str,
@@ -603,15 +615,36 @@ pub(crate) async fn provision_clear<T: Provisioned>(
             let user = made.account();
             // A sign-in that found an account of its own never reaches here: the
             // caller asks for the linked account first.
-            if let Err(e) = state.auth.remove_user_force(&user.name).await {
-                tracing::warn!(
-                    "the account '{}' could not be taken back out: {e:#}",
-                    user.name
-                );
-            }
-            Err(ApiError::conflict(
-                "Another account took this name just now. Sign in again.",
-            ))
+            let removed = match state.auth.remove_user_force(&user.name).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        "the account '{}' could not be taken back out: {e:#}",
+                        user.name
+                    );
+                    false
+                }
+            };
+            let Some(id) = made.invite_id() else {
+                return Err(ApiError::conflict(
+                    "Another account took this name just now. Sign in again.",
+                ));
+            };
+            // The link was spent on an account that is gone again: it is the
+            // person's still. Left used only when the account stays.
+            let reopened = removed
+                && match state.auth.reopen_invite(id, &user.name).await {
+                    Ok(reopened) => reopened,
+                    Err(e) => {
+                        tracing::warn!("the invite link {id} could not be opened again: {e:#}");
+                        false
+                    }
+                };
+            Err(ApiError::conflict(if reopened {
+                "Another account took this name just now. Open the invite link again."
+            } else {
+                "Another account took this name just now, and the invite link could not be used again. Ask the person who sent it for a new link."
+            }))
         }
         other => Ok(other),
     }
@@ -1858,6 +1891,82 @@ mod tests {
             .await
             .unwrap();
         (dir, store)
+    }
+
+    /// A first sign-in through an invite link whose name another account
+    /// took between the check and the redemption is taken back out, and the
+    /// link it used is pending again, so the person follows it once more
+    /// instead of asking for a new one.
+    #[tokio::test]
+    async fn a_taken_back_redemption_leaves_the_link_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(crate::engine::Engine::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crystalline_index::TursoStore::open_in_memory()
+                    .await
+                    .unwrap(),
+            )),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            None,
+        ));
+        let auth = std::sync::Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        auth.add_user("root", "Root", None, Role::Admin, "pw12345678")
+            .await
+            .unwrap();
+        let state = RestState::new(engine, auth.clone(), &[]).unwrap();
+        let issued = auth
+            .create_invite(
+                &crate::auth_store::NewInvite {
+                    role: Role::Editor,
+                    domain: None,
+                    level: None,
+                    label: None,
+                    local_account: false,
+                    created_by: "root",
+                    ttl_secs: 86_400,
+                },
+                crate::auth_store::InviteLimits {
+                    per_creator: 10,
+                    max_users: 100,
+                },
+            )
+            .await
+            .unwrap();
+        let redeem = async {
+            // Another account takes the name after it was checked.
+            auth.add_user("vera", "Vera", None, Role::Viewer, "pw12345678")
+                .await
+                .unwrap();
+            auth.redeem_invite(
+                &issued.token,
+                crate::auth_store::InviteRedeemer::Linked {
+                    issuer: "https://idp.example",
+                    subject: "s-1",
+                    desired_name: "vera",
+                    display: None,
+                    email: None,
+                },
+                100,
+            )
+            .await
+        };
+        let err = provision_clear(&state, "vera", redeem).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.detail.contains("invite link again"), "{}", err.detail);
+        assert!(auth.user("vera-2").await.unwrap().is_none());
+        let invites = auth.invites(None, None).await.unwrap();
+        assert_eq!(
+            invites[0].state,
+            crate::auth_store::InviteState::Pending,
+            "{:?}",
+            invites[0]
+        );
+        assert_eq!(invites[0].used_by, None);
     }
 
     /// A bulk result row carries the store's refusal when it is one a person
