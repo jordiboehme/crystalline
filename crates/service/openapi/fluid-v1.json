@@ -1570,7 +1570,7 @@
                       "name": "eng",
                       "name_origin": "derived",
                       "observations": 12,
-                      "path": "/Users/ada/Documents/Crystalline/eng",
+                      "path": "/Users/ada/.crystalline/eng",
                       "private": false,
                       "relations": 3,
                       "rename_pending": null,
@@ -1637,7 +1637,7 @@
                   "domain": "notes",
                   "kind": "file",
                   "manifest_created": true,
-                  "root": "/Users/ada/Documents/Crystalline/notes"
+                  "root": "/Users/ada/.crystalline/notes"
                 }
               }
             }

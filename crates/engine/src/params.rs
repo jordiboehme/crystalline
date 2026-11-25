@@ -970,7 +970,7 @@ pub struct AddDomainParams {
     /// domain lives on this machine; created and given a starter `MANIFEST.md`
     /// when empty, adopted in place when it already holds engrams. Defaults to
     /// the configured domains root at `<root>/<domain>` (root default
-    /// `~/Documents/Crystalline`). The default mode when neither `repo` nor
+    /// `~/.crystalline`). The default mode when neither `repo` nor
     /// `virtual` is given.
     #[serde(default)]
     pub folder: Option<String>,

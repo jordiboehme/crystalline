@@ -67,7 +67,7 @@ async fn serve(opts: Options) -> Fixture {
         // Defense in depth: the matrix's domain-create row is mode `virtual`
         // and touches no disk, but a pin costs nothing and a later row that
         // creates a local domain would otherwise scaffold folders into the
-        // developer's real `~/Documents/Crystalline`.
+        // developer's real `~/.crystalline`.
         domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),

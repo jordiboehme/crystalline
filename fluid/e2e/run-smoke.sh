@@ -219,10 +219,10 @@ trap finish EXIT
 # rather than merely fixed, for pnpm's store and anything else reading XDG too.
 #
 # The domains root is the one path here that is NOT an XDG one: it defaults to
-# ~/Documents/Crystalline, in the daemon's own home, and it is where a local
+# ~/.crystalline, in the daemon's own home, and it is where a local
 # domain registered from the app lands. The domain-administration journey
 # registers one, so without this line a smoke run would leave a real folder in
-# the developer's Documents rather than in the scratch directory the trap above
+# the developer's home rather than in the scratch directory the trap above
 # removes.
 isolated=(
     env

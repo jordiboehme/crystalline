@@ -1502,7 +1502,7 @@ enum DomainCommand {
         name: Option<String>,
         /// The domain root directory. Omitted for a virtual domain. For a
         /// file domain, defaults to <domains_root>/<name>
-        /// (~/Documents/Crystalline/<name> unless configured) when a name is
+        /// (~/.crystalline/<name> unless configured) when a name is
         /// given and this is omitted; with `--origin` this is where the team
         /// domain lives on this machine, and existing files there are kept.
         /// A lone argument on the command line is always the NAME: use

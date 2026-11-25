@@ -94,7 +94,7 @@ use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
                 "domains": [{
                     "name": "eng",
                     "kind": "file",
-                    "path": "/Users/ada/Documents/Crystalline/eng",
+                    "path": "/Users/ada/.crystalline/eng",
                     "engrams": 4,
                     "observations": 12,
                     "relations": 3,
