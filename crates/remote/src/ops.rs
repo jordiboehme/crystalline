@@ -2091,7 +2091,7 @@ pub enum TipSource {
     },
 }
 
-/// A chain tip with the source of every stamp: what [`tip_sources_over`]
+/// A chain tip with the source of every stamp: what `tip_sources_over`
 /// builds, so the base a detection runs against and the content a discard
 /// restores always come from one walk and can never disagree.
 pub type TipSources = BTreeMap<String, (BaseStamp, TipSource)>;
@@ -5849,7 +5849,7 @@ impl Unrestorable {
 #[derive(Debug, Clone, Copy)]
 pub struct DiscardBase<'a> {
     /// The tip the changes were detected against, with the source of every
-    /// stamp ([`unshared_sources`], or [`tip_sources_over`] in a revert).
+    /// stamp ([`unshared_sources`], or the tip below a withdrawn layer in a revert).
     pub sources: &'a TipSources,
     /// The fetches that failed, by digest ([`fetch_proposed_copies`]).
     pub unrestorable: &'a BTreeMap<String, Unrestorable>,

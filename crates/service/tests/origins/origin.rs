@@ -8700,8 +8700,11 @@ async fn a_discard_that_needs_no_fetch_resolves_no_credential() {
     let refused = eng
         .origin_share("kb", None, None, None, None, ShareActor::Owner)
         .await;
+    let refused = refused.expect_err("the discard left the seam armed");
     assert!(
-        refused.is_err(),
-        "the discard left the seam armed: {refused:?}"
+        refused
+            .to_string()
+            .contains("This instance shares with personal GitHub identities"),
+        "the personal-token refusal, not another failure: {refused}"
     );
 }
