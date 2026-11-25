@@ -1984,6 +1984,59 @@ async fn a_discard_on_an_open_proposal_restores_the_proposals_content() {
     assert_eq!(std::fs::read(kb_root.join("shared.md")).unwrap(), again);
 }
 
+/// An amend whose push did not finish leaves the proposal's content unknown
+/// here, so the route refuses the path as `share_pending` and names the
+/// proposal to share into again, and the file stays as it stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discard_after_an_unfinished_amend_names_the_proposal() {
+    let (fx, mock) = serve_team_with_mock().await;
+    mock.enable_stacks();
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let proposed = b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nThe proposed rule.\n";
+    let again = b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nAn amend that did not finish.\n";
+    std::fs::write(kb_root.join("shared.md"), proposed).unwrap();
+    let shared = share_kb(&fx, &admin).await;
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    let number = shared["number"].as_u64().expect("the proposal number");
+    let branch = shared["branch"].as_str().expect("the proposal branch");
+    std::fs::write(kb_root.join("shared.md"), again).unwrap();
+    mock.protect_branch(branch, "no pushes");
+    let amend = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({ "proposal": number }))
+    .send()
+    .await
+    .unwrap();
+    assert_ne!(amend.status(), 200, "the amend's push is refused");
+
+    let report: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/changes/discard",
+        &admin,
+    )
+    .json(&serde_json::json!({ "paths": [{ "path": "shared.md", "sha": null }] }))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report["refused"],
+        serde_json::json!([{ "path": "shared.md", "reason": "share_pending", "proposal": number }]),
+        "{report}"
+    );
+    assert_eq!(std::fs::read(kb_root.join("shared.md")).unwrap(), again);
+}
+
 /// Removing a team domain takes the local copies of its proposed files with
 /// it: they hold content nobody shared into the team copy yet, and the domain
 /// that would restore from them is gone. The base snapshot stays, as it
