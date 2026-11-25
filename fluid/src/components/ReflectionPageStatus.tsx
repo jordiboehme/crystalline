@@ -22,6 +22,8 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 
 import type { PageClock, PageView } from "../api/reflectionPage";
+import { formatInstant } from "../format";
+import { personLabel } from "../people";
 import { reflectionPageRoute } from "../paths";
 import {
   freshnessLine,
@@ -70,6 +72,12 @@ export function ReflectionPageStatus({
     readAt === 0 ? 0 : Math.max(0, Math.floor((now - readAt) / 1000));
   const line = page.retired === null ? freshnessLine(clock, elapsed) : null;
   const skipped = page.retired === null ? skippedNote(clock) : null;
+  const mark =
+    page.retired === null
+      ? clock === null
+        ? page.refreshRequested
+        : clock.refreshRequested
+      : null;
   const unscheduled =
     curator && page.retired === null ? noFreshnessNote(clock) : null;
   return (
@@ -118,6 +126,9 @@ export function ReflectionPageStatus({
         </p>
       )}
       {line?.kind === "overdue" && line.hint !== null && <p>{line.hint}</p>}
+      {mark !== null && (
+        <p>{`Not fresh: marked by ${personLabel(mark.by, mark.byDisplay)} at ${formatInstant(mark.at)}`}</p>
+      )}
       {skipped !== null && <p>{skipped}</p>}
       {unscheduled !== null && <p>{unscheduled}</p>}
     </div>

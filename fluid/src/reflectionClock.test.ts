@@ -19,6 +19,7 @@ function clock(over: Partial<PageClock> = {}): PageClock {
     waiting: false,
     partOf: null,
     clockOf: "a.md",
+    refreshRequested: null,
     ...over,
   };
 }

@@ -32,6 +32,13 @@ export interface PageRetirement {
   wasOwnedBy: PageRef | null;
 }
 
+/** A person's request that the next reflect run checks the page again. */
+export interface RefreshRequested {
+  at: string;
+  by: string;
+  byDisplay: string | null;
+}
+
 export interface PageFinding {
   page: string;
   key: string;
@@ -46,6 +53,8 @@ export interface PageView {
   status: string | null;
   owner: PageRef | null;
   retired: PageRetirement | null;
+  /** The not-fresh mark; null when none is set. */
+  refreshRequested: RefreshRequested | null;
   /** The pages it follows, top down; empty means it follows PACT.md only. */
   chain: { path: string; title: string }[];
   /** The pact files it follows, in order. */
@@ -68,6 +77,7 @@ export interface PageClock {
   waiting: boolean;
   partOf: { path: string; title: string } | null;
   clockOf: string | null;
+  refreshRequested: RefreshRequested | null;
 }
 
 export interface ClockAnswer {
@@ -87,6 +97,16 @@ function readRef(value: unknown): PageRef | null {
     title: asString(r?.title) ?? path,
     exists: r?.exists === true,
   };
+}
+
+function readRefresh(value: unknown): RefreshRequested | null {
+  const r = asObject(value);
+  const at = asString(r?.at);
+  const by = asString(r?.by);
+  if (at === null || by === null) {
+    return null;
+  }
+  return { at, by, byDisplay: asString(r?.by_display) };
 }
 
 function readTitled(value: unknown): { path: string; title: string } | null {
@@ -116,6 +136,7 @@ export function readPageView(value: unknown): PageView | null {
             by: asString(retired.by),
             wasOwnedBy: readRef(retired.was_owned_by),
           },
+    refreshRequested: readRefresh(r.refresh_requested),
     chain: asArray(r.chain).flatMap((c) => {
       const page = readTitled(c);
       return page === null ? [] : [page];
@@ -163,6 +184,7 @@ export function readClockAnswer(payload: unknown): ClockAnswer {
             waiting: c.waiting === true,
             partOf: readTitled(c.part_of),
             clockOf: asString(c.clock_of),
+            refreshRequested: readRefresh(r?.refresh_requested),
           },
   };
 }
@@ -246,6 +268,17 @@ export async function retireReflection(
   path: string,
 ): Promise<void> {
   await api(`${base(domain)}/retire`, {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+}
+
+/** Mark a page not fresh: the next reflect run checks it again. */
+export async function markReflectionStale(
+  domain: string,
+  path: string,
+): Promise<void> {
+  await api(`${base(domain)}/mark-stale`, {
     method: "POST",
     body: JSON.stringify({ path }),
   });

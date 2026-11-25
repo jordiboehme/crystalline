@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -11,6 +11,7 @@ const PAGE: PageView = {
   status: null,
   owner: null,
   retired: null,
+  refreshRequested: null,
   chain: [],
   pacts: ["PACT.md"],
   pact: { path: "a.pact.md", exists: false },
@@ -30,6 +31,7 @@ const CLOCK: PageClock = {
   waiting: false,
   partOf: null,
   clockOf: "a.md",
+  refreshRequested: null,
 };
 
 beforeEach(() => {
@@ -124,5 +126,68 @@ describe("the pacts line", () => {
       </MemoryRouter>,
     );
     expect(screen.queryByText(/^Pacts:/)).toBeNull();
+  });
+});
+
+describe("the not fresh line", () => {
+  function status(page: PageView, clock: PageClock | null): void {
+    render(
+      <MemoryRouter>
+        <ReflectionPageStatus
+          domain="eng"
+          page={page}
+          clock={clock}
+          readAt={0}
+          curator={false}
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  it("says who marked the page, by display name, from the clock", () => {
+    status(PAGE, {
+      ...CLOCK,
+      refreshRequested: {
+        at: "2026-11-20T10:00:00Z",
+        by: "ann",
+        byDisplay: "Ann Lee",
+      },
+    });
+    expect(screen.getByText(/^Not fresh: marked by Ann Lee at /)).toBeVisible();
+  });
+
+  it("falls back to the page view while the clock loads, and to the name", () => {
+    status(
+      {
+        ...PAGE,
+        refreshRequested: {
+          at: "2026-11-20T10:00:00Z",
+          by: "ann",
+          byDisplay: null,
+        },
+      },
+      null,
+    );
+    expect(screen.getByText(/^Not fresh: marked by ann at /)).toBeVisible();
+  });
+
+  it("is gone once the clock shows no mark, and on a retired page", () => {
+    const mark = {
+      at: "2026-11-20T10:00:00Z",
+      by: "ann",
+      byDisplay: null,
+    };
+    status({ ...PAGE, refreshRequested: mark }, CLOCK);
+    expect(screen.queryByText(/Not fresh/)).toBeNull();
+    cleanup();
+    status(
+      {
+        ...PAGE,
+        refreshRequested: mark,
+        retired: { at: null, by: null, wasOwnedBy: null },
+      },
+      { ...CLOCK, refreshRequested: mark },
+    );
+    expect(screen.queryByText(/Not fresh/)).toBeNull();
   });
 });

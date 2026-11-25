@@ -26,7 +26,14 @@ import {
   useRef,
   useState,
 } from "react";
-import { Archive, Download, FolderInput, Layers, Trash2 } from "lucide-react";
+import {
+  Archive,
+  Download,
+  FolderInput,
+  Layers,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
@@ -60,6 +67,7 @@ import {
 import {
   fetchReflectionClock,
   reflectionClockKey,
+  markReflectionStale,
   retireReflection,
 } from "../api/reflectionPage";
 import { useAuth } from "../auth/AuthContext";
@@ -413,6 +421,17 @@ function PageBody({
       invalidateReflection(queryClient, domain);
     },
   });
+  const markStale = useMutation({
+    mutationFn: () => markReflectionStale(domain, path),
+    onSuccess: () => {
+      invalidateReflection(queryClient, domain);
+    },
+  });
+  const markOnClose = useRef(false);
+  const resetMark = markStale.reset;
+  useEffect(() => {
+    resetMark();
+  }, [domain, path, resetMark]);
   const pageRetired =
     doc.data?.page === undefined || doc.data.page === null
       ? null
@@ -663,6 +682,13 @@ function PageBody({
     page.page.retired === null &&
     !retire.isPending &&
     lifecycleFocus !== true;
+  // Mark as not fresh asks the next reflect run to check the page again.
+  const markable =
+    atLeast(right, "edit") &&
+    settingsLocked === undefined &&
+    page.page !== null &&
+    page.page.retired === null &&
+    !markStale.isPending;
   // A Reflection page has no `crystalline://` name: on paper it is known by
   // its page in this app.
   const address = absoluteUrl(reflectionPageRoute(domain, path));
@@ -717,6 +743,12 @@ function PageBody({
                       retire.mutate();
                     }
                   }
+                  if (markOnClose.current) {
+                    markOnClose.current = false;
+                    if (!markStale.isPending) {
+                      markStale.mutate();
+                    }
+                  }
                   // Delete hands focus to its confirmation, not back here.
                   if (skipRefocus.current) {
                     skipRefocus.current = false;
@@ -737,13 +769,22 @@ function PageBody({
                     window.print();
                   }}
                 />
-                {(movable || retirable) && <ActionSeparator />}
+                {(movable || retirable || markable) && <ActionSeparator />}
                 {movable && (
                   <ActionItem
                     label="Move"
                     icon={FolderInput}
                     onSelect={() => {
                       onMove(page.title);
+                    }}
+                  />
+                )}
+                {markable && (
+                  <ActionItem
+                    label="Mark as not fresh"
+                    icon={RefreshCw}
+                    onSelect={() => {
+                      markOnClose.current = true;
                     }}
                   />
                 )}
@@ -807,6 +848,19 @@ function PageBody({
               className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
             >
               {problemDetail(retire.error)}
+            </p>
+          )}
+          {markStale.error && (
+            <p
+              role="alert"
+              className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+            >
+              {problemDetail(markStale.error)}
+            </p>
+          )}
+          {markStale.isSuccess && (
+            <p role="status" className="text-sm text-ink-3">
+              Marked as not fresh. The next reflect run checks it again.
             </p>
           )}
           {!ownTitle && <h1 className="text-display">{page.title}</h1>}
