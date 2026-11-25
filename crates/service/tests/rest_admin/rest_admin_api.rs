@@ -1984,6 +1984,46 @@ async fn a_discard_on_an_open_proposal_restores_the_proposals_content() {
     assert_eq!(std::fs::read(kb_root.join("shared.md")).unwrap(), again);
 }
 
+/// Removing a team domain takes the local copies of its proposed files with
+/// it: they hold content nobody shared into the team copy yet, and the domain
+/// that would restore from them is gone. The base snapshot stays, as it
+/// always has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_team_domain_drops_the_copies_of_its_proposed_files() {
+    let (fx, mock) = serve_team_with_mock().await;
+    mock.enable_stacks();
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    std::fs::write(
+        kb_root.join("shared.md"),
+        b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nThe proposed rule.\n",
+    )
+    .unwrap();
+    let shared = share_kb(&fx, &admin).await;
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    let state_dir = fx._tmp.path().join("origins").join("kb");
+    assert!(state_dir.join("proposed").is_dir(), "the share kept a copy");
+    assert!(state_dir.join("base").is_dir());
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/kb",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    assert!(
+        std::fs::symlink_metadata(state_dir.join("proposed")).is_err(),
+        "the copies went with the domain"
+    );
+    assert!(state_dir.join("base").is_dir(), "the base snapshot stays");
+}
+
 /// The discard is a write: refused read-only, refused to a viewer, and it
 /// needs the CSRF token like every mutating route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
