@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use crystalline_core::reflection as r;
 use crystalline_service::params::{MarkPages, MarkStale, ReflectParams, WriteReflectionParams};
+use crystalline_service::read_limit::within;
 use crystalline_service::rest::{AuthStore, ReflectionLevel, Role};
 use crystalline_service::{DomainAccess, EngineError, ReflectionCaller, Scope};
 use serde_json::Value;
@@ -480,4 +481,414 @@ async fn write_reflection_marks_one_page() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("mark_stale"), "{e}");
+}
+
+// ---- The queue and the reconcile (M2b) ----
+
+fn eng() -> ReflectParams {
+    ReflectParams {
+        domains: vec!["eng".into()],
+        limit: Some(100),
+        ..Default::default()
+    }
+}
+
+fn with_stale() -> ReflectParams {
+    ReflectParams {
+        stale: Some(true),
+        ..eng()
+    }
+}
+
+async fn queue(fx: &Fx) -> Value {
+    fx.engine.reflect(&with_stale(), &agent()).await.unwrap()
+}
+
+fn stale_items(q: &Value) -> Vec<Value> {
+    q["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["what"] == "stale")
+        .cloned()
+        .collect()
+}
+
+fn stale_of(q: &Value, path: &str) -> Option<Value> {
+    stale_items(q).into_iter().find(|i| i["path"] == path)
+}
+
+fn reconciled(path: &str, outcome: &str, version: &str) -> WriteReflectionParams {
+    WriteReflectionParams {
+        outcome: Some(outcome.into()),
+        version: Some(version.into()),
+        ..act("reconciled", path)
+    }
+}
+
+async fn reconcile(fx: &Fx, path: &str, version: &str) -> Result<Value, EngineError> {
+    fx.engine
+        .write_reflection(&reconciled(path, "updated", version), &agent())
+        .await
+}
+
+const DAY: i64 = 86_400;
+
+/// Move the recorded reconcile of `path` `ago` seconds into the past.
+async fn backdate(fx: &Fx, path: &str, ago: i64) {
+    let store = fx.engine.store();
+    let store = store.lock().await;
+    let id = store.domain_id("eng").await.unwrap().unwrap();
+    let mut state = store
+        .reflection_reconcile(id, path)
+        .await
+        .unwrap()
+        .expect("a recorded reconcile");
+    let at = crystalline_core::time::now()
+        .saturating_sub(crystalline_core::time::saturating_seconds(ago));
+    state.last_reconciled = at.rfc3339();
+    store.set_reflection_reconcile(id, &state).await.unwrap();
+}
+
+/// A marked page is a `stale` item for a run and on request, never by
+/// default for an interactive session; a page never reconciled is due as
+/// soon as it is marked. Its item names the mark, has no freshness, and a
+/// version with the mark part. The reconcile that answers it takes the
+/// mark off the file (keeping the modified time) and the page is no longer
+/// due.
+#[tokio::test]
+async fn a_marked_page_is_stale_work_until_the_reconcile_takes_the_mark_off() {
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    assert!(stale_of(&queue(&fx).await, "guides/a.md").is_none());
+    let answer = mark(&fx, &one("guides/a.md"), &person()).await.unwrap();
+    let at = answer["at"].as_str().unwrap().to_string();
+
+    let interactive = fx.engine.reflect(&eng(), &agent()).await.unwrap();
+    assert!(stale_items(&interactive).is_empty(), "{interactive}");
+    let run = within(
+        Some(crate::page_lifecycle::unattended()),
+        fx.engine.reflect(&eng(), &agent()),
+    )
+    .await
+    .unwrap();
+    assert!(stale_of(&run, "guides/a.md").is_some(), "{run}");
+
+    let q = queue(&fx).await;
+    let item = stale_of(&q, "guides/a.md").expect("a stale item");
+    assert_eq!(item["refresh_requested"]["at"], at.as_str(), "{item}");
+    assert_eq!(item["refresh_requested"]["by"], "jordi");
+    assert!(item["freshness"].is_null(), "{item}");
+    assert_eq!(item["owned_marked"], serde_json::json!([]));
+    let version = item["version"].as_str().unwrap().to_string();
+    let parts: Vec<&str> = version.split(':').collect();
+    assert_eq!(parts.len(), 4, "{version}");
+    let at_ms = crystalline_core::time::parse_rfc3339(&at)
+        .unwrap()
+        .stamp()
+        .unix_millis();
+    assert_eq!(parts[2], at_ms.to_string());
+
+    let abs = fx.root.join("reflections/guides/a.md");
+    let modified = std::fs::metadata(&abs).unwrap().modified().unwrap();
+    let receipt = reconcile(&fx, "guides/a.md", &version).await.unwrap();
+    assert_eq!(receipt["still_marked"], serde_json::json!([]), "{receipt}");
+    assert!(receipt["refresh_requested"].is_null(), "{receipt}");
+    assert!(!file(&fx, "guides/a.md").contains("refresh_requested"));
+    assert_eq!(
+        std::fs::metadata(&abs).unwrap().modified().unwrap(),
+        modified
+    );
+    assert!(stale_of(&queue(&fx).await, "guides/a.md").is_none());
+    assert!(page_of(&fx, "guides/a.md").await["refresh_requested"].is_null());
+    assert!(
+        fx.engine
+            .reflection_page_mark("eng", "guides/a.md", &person())
+            .await
+            .unwrap()
+            .is_null()
+    );
+}
+
+/// A mark written after the item was handed out survives that item's
+/// reconcile, also by an unattended run: the receipt names it in
+/// `still_marked`, and the page is due again with a new version.
+#[tokio::test]
+async fn an_unattended_run_cannot_cover_a_later_mark() {
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    mark(&fx, &one("guides/a.md"), &person()).await.unwrap();
+    let version = stale_of(&queue(&fx).await, "guides/a.md").unwrap()["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let again = mark(&fx, &one("guides/a.md"), &person()).await.unwrap();
+    let receipt = within(
+        Some(crate::page_lifecycle::unattended()),
+        fx.engine
+            .write_reflection(&reconciled("guides/a.md", "unchanged", &version), &agent()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receipt["still_marked"],
+        serde_json::json!([{ "path": "guides/a.md", "at": again["at"], "by": "jordi" }]),
+        "{receipt}"
+    );
+    assert_eq!(receipt["refresh_requested"]["at"], again["at"]);
+    assert_eq!(
+        record(&fx, "guides/a.md").refresh_requested.as_deref(),
+        again["at"].as_str()
+    );
+    let item = stale_of(&queue(&fx).await, "guides/a.md").expect("due again");
+    assert_ne!(item["version"].as_str().unwrap(), version);
+}
+
+/// A version whose mark part is newer than every mark of the set answers
+/// no item the queue handed out: refused, nothing recorded, nothing
+/// cleared. A 3-part version clears nothing.
+#[tokio::test]
+async fn a_made_up_mark_part_is_refused() {
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    mark(&fx, &one("guides/a.md"), &person()).await.unwrap();
+    let version = stale_of(&queue(&fx).await, "guides/a.md").unwrap()["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let parts: Vec<&str> = version.split(':').collect();
+    let later = parts[2].parse::<i64>().unwrap() + 1;
+    let made_up = format!("{}:{}:{later}:{}", parts[0], parts[1], parts[3]);
+    let e = reconcile(&fx, "guides/a.md", &made_up).await.unwrap_err();
+    assert!(matches!(e, EngineError::Invalid(_)), "{e}");
+    assert!(e.to_string().contains("mark part"), "{e}");
+    assert!(
+        fx.engine
+            .reflection_reconcile("eng", "guides/a.md")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .is_none(),
+        "nothing recorded"
+    );
+    assert!(file(&fx, "guides/a.md").contains("refresh_requested"));
+
+    // A page with no mark at all refuses any mark part.
+    put(&fx, "guides/b.md", PAGE).await;
+    let e = reconcile(&fx, "guides/b.md", &made_up).await.unwrap_err();
+    assert!(e.to_string().contains("mark part"), "{e}");
+
+    // A version without a mark part records and clears nothing.
+    let three = format!("{}:{}:{}", parts[0], parts[1], parts[3]);
+    let receipt = reconcile(&fx, "guides/a.md", &three).await.unwrap();
+    assert_eq!(receipt["still_marked"].as_array().unwrap().len(), 1);
+    assert!(file(&fx, "guides/a.md").contains("refresh_requested"));
+}
+
+/// While a marked page has an item of its own, `reconciled` needs its
+/// version; an owned page under a due owner records without one, and the
+/// owner's record takes the owned pages' marks off.
+#[tokio::test]
+async fn the_owner_record_takes_the_owned_marks_off() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    owned(&fx, "arch/db.md", "arch.md").await;
+    owned(&fx, "arch/api.md", "arch.md").await;
+    mark(&fx, &one("arch.md"), &person()).await.unwrap();
+
+    let q = queue(&fx).await;
+    assert_eq!(stale_items(&q).len(), 1, "one item for the set: {q}");
+    let item = stale_of(&q, "arch.md").unwrap();
+    assert_eq!(item["owned_marked"], item["owned"], "{item}");
+    assert_eq!(item["owned"].as_array().unwrap().len(), 2, "{item}");
+    let version = item["version"].as_str().unwrap().to_string();
+
+    let e = reconcile(&fx, "arch.md", "").await.unwrap_err();
+    assert!(e.to_string().contains("marked not fresh"), "{e}");
+    let e = reconcile(&fx, "arch.md", &version).await.unwrap_err();
+    assert!(
+        e.to_string().contains("arch/db.md"),
+        "owned pages first: {e}"
+    );
+    for child in ["arch/db.md", "arch/api.md"] {
+        let receipt = reconcile(&fx, child, "").await.unwrap();
+        assert_eq!(receipt["still_marked"], serde_json::json!([]));
+        assert!(
+            file(&fx, child).contains("refresh_requested"),
+            "kept for the owner"
+        );
+    }
+    let receipt = reconcile(&fx, "arch.md", &version).await.unwrap();
+    assert_eq!(receipt["still_marked"], serde_json::json!([]), "{receipt}");
+    for page in ["arch.md", "arch/db.md", "arch/api.md"] {
+        assert!(!file(&fx, page).contains("refresh_requested"), "{page}");
+    }
+    assert!(stale_items(&queue(&fx).await).is_empty());
+}
+
+/// A child marked on its own while its owner is not due gets an item of
+/// its own; once the owner is due by its freshness, the child folds into
+/// the owner's item, `owned_marked` names it and the owner's version
+/// carries its mark, so the owner's record takes it off.
+#[tokio::test]
+async fn a_marked_child_has_its_own_item_until_its_owner_is_due() {
+    let fx = reflecting().await;
+    put(&fx, "week.md", "---\nfreshness: 1d\n---\n# Week\n").await;
+    owned(&fx, "week/mon.md", "week.md").await;
+    fx.engine
+        .write_reflection(&reconciled("week/mon.md", "updated", ""), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&reconciled("week.md", "updated", ""), &agent())
+        .await
+        .unwrap();
+    mark(&fx, &one("week/mon.md"), &person()).await.unwrap();
+    let q = queue(&fx).await;
+    let child = stale_of(&q, "week/mon.md").expect("the child's own item");
+    assert!(stale_of(&q, "week.md").is_none(), "{q}");
+    let e = reconcile(&fx, "week/mon.md", "").await.unwrap_err();
+    assert!(e.to_string().contains("version"), "{e}");
+    assert!(child["version"].as_str().unwrap().split(':').count() == 4);
+
+    backdate(&fx, "week.md", 2 * DAY).await;
+    let q = queue(&fx).await;
+    assert!(stale_of(&q, "week/mon.md").is_none(), "folded: {q}");
+    let owner = stale_of(&q, "week.md").expect("the owner's item");
+    assert_eq!(owner["freshness"], "1d");
+    assert_eq!(owner["owned_marked"], serde_json::json!(["week/mon.md"]));
+    assert!(owner["refresh_requested"].is_null());
+    let version = owner["version"].as_str().unwrap().to_string();
+    assert_eq!(version.split(':').count(), 4, "{version}");
+    // The child was reconciled before its mark: it is not done.
+    assert_eq!(owner["owned_reconciled"], serde_json::json!([]));
+    let e = reconcile(&fx, "week.md", &version).await.unwrap_err();
+    assert!(e.to_string().contains("week/mon.md"), "{e}");
+    reconcile(&fx, "week/mon.md", "").await.unwrap();
+    reconcile(&fx, "week.md", &version).await.unwrap();
+    assert!(!file(&fx, "week/mon.md").contains("refresh_requested"));
+}
+
+/// `only_page` on an owner marks only the owner; its owned pages are still
+/// reconciled before it (a normal reconcile, not in `owned_marked`), also
+/// when they were reconciled after the owner's last record but before the
+/// mark.
+#[tokio::test]
+async fn only_the_page_on_an_owner_still_reconciles_its_owned_pages_first() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    owned(&fx, "arch/db.md", "arch.md").await;
+    reconcile(&fx, "arch.md", "").await.unwrap();
+    reconcile(&fx, "arch/db.md", "").await.unwrap();
+    mark(
+        &fx,
+        &MarkStale {
+            pages: MarkPages::One("arch.md".into()),
+            only_page: true,
+        },
+        &person(),
+    )
+    .await
+    .unwrap();
+    let item = stale_of(&queue(&fx).await, "arch.md").unwrap();
+    assert_eq!(item["owned"], serde_json::json!(["arch/db.md"]));
+    assert_eq!(item["owned_marked"], serde_json::json!([]));
+    assert_eq!(item["owned_reconciled"], serde_json::json!([]), "{item}");
+    let version = item["version"].as_str().unwrap().to_string();
+    let e = reconcile(&fx, "arch.md", &version).await.unwrap_err();
+    assert!(e.to_string().contains("arch/db.md"), "{e}");
+    reconcile(&fx, "arch/db.md", "").await.unwrap();
+    let item = stale_of(&queue(&fx).await, "arch.md").unwrap();
+    assert_eq!(item["owned_reconciled"], serde_json::json!(["arch/db.md"]));
+    reconcile(&fx, "arch.md", &version).await.unwrap();
+    assert!(stale_items(&queue(&fx).await).is_empty());
+}
+
+/// A never-reconciled page with a freshness of its own keeps its period and
+/// age through a mark (the mark keeps the file's modified time): its item
+/// is due by both, with the freshness and the freshness period.
+#[tokio::test]
+async fn a_never_reconciled_page_keeps_its_freshness_clock_through_a_mark() {
+    let fx = reflecting().await;
+    put(&fx, "week.md", "---\nfreshness: 1d\n---\n# Week\n").await;
+    let abs = fx.root.join("reflections/week.md");
+    std::fs::File::options()
+        .write(true)
+        .open(&abs)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3 * DAY as u64))
+        .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    let before = stale_of(&queue(&fx).await, "week.md").expect("due by freshness");
+    mark(&fx, &one("week.md"), &person()).await.unwrap();
+    let after = stale_of(&queue(&fx).await, "week.md").expect("due by both");
+    assert_eq!(after["freshness"], "1d");
+    assert_eq!(after["last_reconciled"], before["last_reconciled"]);
+    let period = |v: &Value| {
+        v["version"]
+            .as_str()
+            .unwrap()
+            .split(':')
+            .nth(1)
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(period(&after), period(&before));
+    assert!(
+        after["age_secs"].as_i64().unwrap() >= before["age_secs"].as_i64().unwrap(),
+        "{before} {after}"
+    );
+}
+
+/// Sources are engrams, never pages, so no page cites a marked page: a page
+/// that links to it gets no `source_changed` from the mark or from the
+/// reconcile that takes the mark off, and naming a page as a source is
+/// refused.
+#[tokio::test]
+async fn a_mark_and_its_clearing_raise_nothing_on_other_pages() {
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    let mut p = write(
+        "guides/b.md",
+        "# B\n\n## Deploys\n\nSee [A](a.md). Deploys run at night.\n",
+    );
+    p.sources = [("Deploys".to_string(), vec!["runbooks/deploy".to_string()])].into();
+    fx.engine.write_reflection(&p, &agent()).await.unwrap();
+    let mut cite = write("guides/c.md", "# C\n\n## Pages\n\nText.\n");
+    cite.sources = [("Pages".to_string(), vec!["guides/a".to_string()])].into();
+    let e = fx
+        .engine
+        .write_reflection(&cite, &agent())
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("no engram"), "{e}");
+
+    let without_stale = |q: &Value| -> Vec<Value> {
+        q["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["what"] != "stale")
+            .cloned()
+            .collect()
+    };
+    let before = without_stale(&queue(&fx).await);
+    mark(&fx, &one("guides/a.md"), &person()).await.unwrap();
+    assert_eq!(without_stale(&queue(&fx).await), before);
+    let version = stale_of(&queue(&fx).await, "guides/a.md").unwrap()["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    reconcile(&fx, "guides/a.md", &version).await.unwrap();
+    let after = queue(&fx).await;
+    assert_eq!(without_stale(&after), before, "{after}");
+    assert!(
+        !after["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["what"] == "source_changed"),
+        "{after}"
+    );
 }
