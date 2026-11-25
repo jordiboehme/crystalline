@@ -7527,6 +7527,14 @@ fn a_daemon_pins_the_old_root_before_it_serves() {
     let mut c1 = Mcp::spawn(&env);
     c1.initialize();
     env.wait_ready();
+    // Pinned by the start itself, before anything adds a domain: the add
+    // below would pin too, so it cannot be what proves the start did.
+    let started: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert_eq!(
+        started.domains_root.as_deref(),
+        Some(Path::new("~/Documents/Crystalline")),
+        "the start pins"
+    );
     c1.send_call("add_domain", json!({ "domain": "fresh" }));
     let r = c1.read_tool_value();
     let root = PathBuf::from(r["root"].as_str().unwrap_or_default());

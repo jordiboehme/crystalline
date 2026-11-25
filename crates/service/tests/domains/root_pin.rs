@@ -530,3 +530,82 @@ async fn a_due_pin_that_cannot_be_saved_still_lets_a_re_add_through() {
     assert_eq!(pinned_root(&f.on_disk()), None);
     assert_eq!(f.recorded(), None);
 }
+
+/// Document mode: the pin lands in the document, the read-only base file
+/// is left as it is, and the record is keyed `document`.
+#[tokio::test]
+async fn a_document_install_is_pinned_in_the_document() {
+    use crystalline_core::config::root_pin::DOCUMENT_KEY;
+    use crystalline_engine::persisted::{MemoryDocument, PersistedConfig};
+    let f = Fixture::new();
+    let base = legacy(&f.documents_domain("pin-document"));
+    f.save(&base);
+    let before = std::fs::read(f.config_path()).unwrap();
+    let doc = Arc::new(MemoryDocument::default());
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        GlobalConfig::default(),
+        None,
+        Some(f.config_path()),
+    )
+    .with_state_dir(f.state_dir())
+    .with_persisted(
+        PersistedConfig::Document {
+            doc: doc.clone(),
+            base: Some(f.config_path()),
+        },
+        Some(base),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
+        Some(true)
+    );
+    let stored = doc.stored().expect("the document was saved");
+    assert_eq!(
+        stored["domains_root"], "~/Documents/Crystalline",
+        "{stored}"
+    );
+    assert_eq!(std::fs::read(f.config_path()).unwrap(), before);
+    let (record, _) = PinRecord::load(&f.state_dir());
+    assert!(
+        record
+            .checked
+            .iter()
+            .any(|c| c.config == DOCUMENT_KEY && c.pinned),
+        "{record:?}"
+    );
+    assert_eq!(f.recorded(), None, "the base file is not keyed");
+    assert_eq!(
+        engine.config().domains_root(),
+        f.home.join("Documents/Crystalline")
+    );
+}
+
+/// The pin rewrites `config.yaml` through serde, as every configuration
+/// save does: a key this version does not know is dropped, and so is a
+/// comment (the release notes say both), the known keys are kept.
+#[tokio::test]
+async fn the_pin_drops_keys_it_does_not_know() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("pin-unknown"));
+    f.save(&cfg);
+    let mut text = std::fs::read_to_string(f.config_path()).unwrap();
+    text.push_str("# a comment\nfuture_key: 1\n");
+    std::fs::write(f.config_path(), &text).unwrap();
+    let engine = f.engine(cfg).await;
+    assert_eq!(
+        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
+        Some(true)
+    );
+    let after = std::fs::read_to_string(f.config_path()).unwrap();
+    assert!(!after.contains("future_key"), "{after}");
+    assert!(!after.contains("# a comment"), "{after}");
+    assert!(after.contains("pin-unknown"), "{after}");
+    assert!(
+        after.contains("domains_root: ~/Documents/Crystalline"),
+        "{after}"
+    );
+}
