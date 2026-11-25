@@ -485,7 +485,9 @@ export default function EngramPage() {
         (entry) => entry.path === changePath,
       );
       if (refusal) {
-        setDiscardProblem(refusalSentence(refusal.reason, refusal.detail, refusal.proposal));
+        setDiscardProblem(
+          refusalSentence(refusal.reason, refusal.detail, refusal.proposal),
+        );
         void queryClient.invalidateQueries({
           queryKey: engramDetailKey(domain, permalink),
         });
