@@ -8517,3 +8517,191 @@ async fn env_readers_quietly_take_no_write_on_a_domain_already_private() {
         .expect("the second run waited for the write lock")
         .unwrap();
 }
+
+// A discard on a domain with an open stacked proposal puts a file back to
+// what the proposal carries. A share from this version keeps a local copy of
+// it; a proposal shared before has none, and only then is the blob read from
+// GitHub.
+
+/// A team engine over a stack-serving mock with one open proposal that
+/// changed `notes/a.md` to "alpha v2". `notes/c.md` is a team file nobody
+/// shared a change of. Returns the engine, the mock, the working tree root
+/// and the origin state directory.
+async fn engine_with_an_open_proposal(
+    tmp: &tempfile::TempDir,
+) -> (
+    Engine,
+    Arc<MockProvider>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let mock = Arc::new(MockProvider::new());
+    mock.enable_stacks();
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "alpha")),
+        ("notes/c.md", engram("Gamma", "notes/c", "gamma")),
+    ]));
+    mock.set_branch("main", &commit);
+    let origins_dir = tmp.path().join("origins");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &origins_dir,
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let root = tmp.path().join("kb");
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+        None,
+    )
+    .await
+    .unwrap();
+    std::fs::write(root.join("notes/a.md"), alpha_v(2)).unwrap();
+    let shared = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    (eng, mock, root, origins_dir.join("kb"))
+}
+
+fn alpha_v(n: u32) -> Vec<u8> {
+    engram("Alpha", "notes/a", &format!("alpha v{n}"))
+}
+
+async fn discard_paths(eng: &Engine, paths: &[&str]) -> serde_json::Value {
+    let targets: Vec<crystalline_remote::ops::DiscardTarget> = paths
+        .iter()
+        .map(|p| crystalline_remote::ops::DiscardTarget {
+            path: p.to_string(),
+            sha256: None,
+        })
+        .collect();
+    eng.discard_local_changes("kb", &targets, &ShareActor::Owner)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_discard_on_an_open_proposal_restores_the_proposals_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, _) = engine_with_an_open_proposal(&tmp).await;
+    std::fs::write(root.join("notes/a.md"), alpha_v(3)).unwrap();
+
+    let detail = eng
+        .local_change("kb", "notes/a.md", &ShareActor::Owner, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["base"].as_str().map(str::as_bytes),
+        Some(alpha_v(2).as_slice()),
+        "the diff's base side is the proposal's content: {detail}"
+    );
+
+    let report = discard_paths(&eng, &["notes/a.md"]).await;
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["notes/a.md"]),
+        "{report}"
+    );
+    assert_eq!(report["refused"], serde_json::json!([]), "{report}");
+    assert_eq!(std::fs::read(root.join("notes/a.md")).unwrap(), alpha_v(2));
+    let listed = eng.local_changes("kb", &ShareActor::Owner).await.unwrap();
+    assert_eq!(listed["changes"], serde_json::json!([]), "{listed}");
+    assert!(mock.blob_reads().is_empty(), "the local copy was enough");
+}
+
+#[tokio::test]
+async fn a_discard_of_a_proposal_shared_before_the_upgrade_fetches_its_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, state_dir) = engine_with_an_open_proposal(&tmp).await;
+    std::fs::remove_dir_all(state_dir.join("proposed")).unwrap();
+    std::fs::write(root.join("notes/a.md"), alpha_v(3)).unwrap();
+
+    let report = discard_paths(&eng, &["notes/a.md"]).await;
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["notes/a.md"]),
+        "{report}"
+    );
+    assert_eq!(std::fs::read(root.join("notes/a.md")).unwrap(), alpha_v(2));
+    assert_eq!(mock.blob_reads(), vec![sha256_hex(&alpha_v(2))]);
+
+    std::fs::write(root.join("notes/a.md"), alpha_v(4)).unwrap();
+    let again = discard_paths(&eng, &["notes/a.md"]).await;
+    assert_eq!(
+        again["restored"],
+        serde_json::json!(["notes/a.md"]),
+        "{again}"
+    );
+    assert_eq!(mock.blob_reads().len(), 1, "the fetched copy was kept");
+}
+
+#[tokio::test]
+async fn a_discard_whose_fetch_fails_refuses_with_a_detail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, state_dir) = engine_with_an_open_proposal(&tmp).await;
+    std::fs::remove_dir_all(state_dir.join("proposed")).unwrap();
+    mock.fail_blob(&sha256_hex(&alpha_v(2)));
+    std::fs::write(root.join("notes/a.md"), alpha_v(3)).unwrap();
+    std::fs::write(
+        root.join("notes/c.md"),
+        engram("Gamma", "notes/c", "gamma v2"),
+    )
+    .unwrap();
+
+    let report = discard_paths(&eng, &["notes/a.md", "notes/c.md"]).await;
+    assert_eq!(
+        report["refused"],
+        serde_json::json!([{ "path": "notes/a.md", "reason": "no_base_copy", "detail": "fetch_failed" }]),
+        "{report}"
+    );
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["notes/c.md"]),
+        "{report}"
+    );
+    assert_eq!(std::fs::read(root.join("notes/a.md")).unwrap(), alpha_v(3));
+    assert_eq!(
+        std::fs::read(root.join("notes/c.md")).unwrap(),
+        engram("Gamma", "notes/c", "gamma")
+    );
+}
+
+#[tokio::test]
+async fn a_discard_that_needs_no_fetch_resolves_no_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, _) = engine_with_an_open_proposal(&tmp).await;
+    std::fs::write(root.join("notes/a.md"), alpha_v(3)).unwrap();
+    std::fs::write(
+        root.join("notes/c.md"),
+        engram("Gamma", "notes/c", "gamma v2"),
+    )
+    .unwrap();
+    eng.refuse_next_personal_credential();
+
+    let report = discard_paths(&eng, &["notes/a.md", "notes/c.md"]).await;
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["notes/a.md", "notes/c.md"]),
+        "{report}"
+    );
+    assert!(mock.blob_reads().is_empty());
+
+    // The seam is still armed: the next verb that resolves a provider meets it.
+    std::fs::write(root.join("notes/d.md"), engram("Delta", "notes/d", "delta")).unwrap();
+    let refused = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await;
+    assert!(
+        refused.is_err(),
+        "the discard left the seam armed: {refused:?}"
+    );
+}

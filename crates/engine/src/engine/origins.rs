@@ -4135,10 +4135,14 @@ impl Engine {
     }
 
     /// Put the named paths back the way the team has them: `{ domain,
-    /// restored, deleted, cleared: [{ path, kind }], refused: [{ path, reason }],
-    /// reindexed }`. Under the domain's origin lock like a withdrawal, so it
-    /// never interleaves with a share's pull; refuses on a read-only instance.
-    /// A team domain restores from the base copy and re-indexes exactly the
+    /// restored, deleted, cleared: [{ path, kind }], refused: [{ path, reason,
+    /// detail? }], reindexed }`. Under the domain's origin lock like a
+    /// withdrawal, so it never interleaves with a share's pull; refuses on a
+    /// read-only instance. A team domain restores each path to what its
+    /// unshared change is measured against (`ops::unshared_sources`): the base
+    /// copy, or the local copy of what an open proposal carries; only for a
+    /// proposal shared by an older version, which kept no copy, does it
+    /// resolve a provider and read that one blob. It re-indexes exactly the
     /// touched paths; a reviewing domain clears the acting actor's own drafts
     /// through `DomainView::drop` and `overlay_files::clear` and moves
     /// nothing in the folder. One refused path never stops the others.
@@ -4168,7 +4172,46 @@ impl Engine {
         let (root, state_dir, sources, local) =
             self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let targets = fill_unguarded(targets, &local);
-        let unrestorable = BTreeMap::new();
+        // A path whose content an open proposal carries is restored from the
+        // local copy a share keeps. Only a proposal shared by an older
+        // version has none, and only then is a provider resolved, to read
+        // that one blob; any way that fails refuses the path, not the call.
+        let missing = ops::missing_proposed_copies(&state_dir, &sources, &local, &targets)?;
+        let mut unrestorable = BTreeMap::new();
+        if !missing.is_empty() {
+            if missing.iter().any(|m| m.blob_sha.is_some()) {
+                let (spec, _, _) = self.origin_spec_for_domain(domain)?;
+                match self.resolve_share_provider(actor, &spec.repo).await {
+                    Ok((provider, _)) => {
+                        let fetched = ops::fetch_proposed_copies(
+                            provider.as_ref(),
+                            &spec,
+                            &state_dir,
+                            &missing,
+                        )
+                        .await;
+                        if fetched.auth_expired {
+                            self.drop_github_credential_on_auth(&RemoteError::AuthExpired);
+                        }
+                        unrestorable = fetched.unrestorable;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "discarding in '{domain}' without fetching a proposal's copy: {e}"
+                        );
+                    }
+                }
+            }
+            for copy in &missing {
+                unrestorable
+                    .entry(copy.sha256.clone())
+                    .or_insert(if copy.blob_sha.is_none() {
+                        ops::Unrestorable::NoBlobRecorded
+                    } else {
+                        ops::Unrestorable::NotFetched
+                    });
+            }
+        }
         let base = ops::DiscardBase {
             sources: &sources,
             unrestorable: &unrestorable,
@@ -4196,7 +4239,13 @@ impl Engine {
         let refused: Vec<Value> = report
             .refused
             .iter()
-            .map(|(path, reason)| json!({ "path": path, "reason": reason.code() }))
+            .map(|(path, reason)| {
+                let mut entry = json!({ "path": path, "reason": reason.code() });
+                if let Some(detail) = reason.detail() {
+                    entry["detail"] = json!(detail);
+                }
+                entry
+            })
             .collect();
         Ok(json!({
             "domain": domain,

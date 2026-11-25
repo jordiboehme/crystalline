@@ -18,13 +18,13 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::support::{MockProvider, StubConnectAuth, device_flow_start, fake_auth};
+use crate::support::{MockProvider, StubConnectAuth, device_flow_start, fake_auth, sha256_hex};
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::{RemoteError, StoredToken, TokenStore};
 use crystalline_service::Engine;
 use crystalline_service::EnvOverlay;
-use crystalline_service::engine::EngineError;
+use crystalline_service::engine::{EngineError, ShareActor};
 use crystalline_service::mcp::McpServer;
 use rmcp::model::{CallToolRequestParams, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, Peer, RunningService};
@@ -2239,6 +2239,64 @@ async fn discard_changes_wires_through_and_honours_the_expected_digests() {
             { "path": "nowhere.md", "reason": "unknown_path" },
             { "path": "index.md", "reason": "unknown_path" },
         ]),
+        "{out}"
+    );
+}
+
+/// A refused `no_base_copy` carries its detail on this surface too: here an
+/// open proposal shared with no local copy kept, whose blob GitHub does not
+/// give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_changes_names_why_a_proposals_copy_is_not_at_hand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    mock.enable_stacks();
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(
+        engine_with_provider(&tmp.path().join("config.yaml"), &origins_dir, mock.clone()).await,
+    );
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+        None,
+    )
+    .await
+    .unwrap();
+    let shared = engram("Alpha", "notes/a", "alpha v2");
+    std::fs::write(root.join("notes/a.md"), &shared).unwrap();
+    let out = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], "proposed", "{out}");
+    std::fs::remove_dir_all(origins_dir.join("brand").join("proposed")).unwrap();
+    mock.fail_blob(&sha256_hex(&shared));
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha v3"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let out = call(
+        client.peer(),
+        "discard_changes",
+        json!({ "domain": "brand", "paths": ["notes/a.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["refused"],
+        json!([{ "path": "notes/a.md", "reason": "no_base_copy", "detail": "fetch_failed" }]),
         "{out}"
     );
 }

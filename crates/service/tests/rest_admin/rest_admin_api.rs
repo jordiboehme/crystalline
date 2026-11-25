@@ -1921,6 +1921,69 @@ async fn a_discard_restores_the_teams_copy_and_reindexes_it() {
     );
 }
 
+/// On a domain with an open stacked proposal, the route puts a file back to
+/// what the proposal carries, not to the team's older copy, and the engram
+/// page stops naming it as a change. When the proposal's copy is not at hand
+/// and GitHub does not give it, the refusal carries why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discard_on_an_open_proposal_restores_the_proposals_content() {
+    let (fx, mock) = serve_team_with_mock().await;
+    mock.enable_stacks();
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let proposed = b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nThe proposed rule.\n";
+    let again = b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nAn edit after the share.\n";
+    std::fs::write(kb_root.join("shared.md"), proposed).unwrap();
+    let shared = share_kb(&fx, &admin).await;
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    std::fs::write(kb_root.join("shared.md"), again).unwrap();
+    let discard = |fx: &Fixture| {
+        as_session(
+            fx.addr,
+            reqwest::Method::POST,
+            "/api/v1/domains/kb/changes/discard",
+            &admin,
+        )
+        .json(&serde_json::json!({ "paths": [{ "path": "shared.md", "sha": null }] }))
+        .send()
+    };
+
+    let report: serde_json::Value = discard(&fx).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["shared.md"]),
+        "{report}"
+    );
+    assert_eq!(std::fs::read(kb_root.join("shared.md")).unwrap(), proposed);
+    let page: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/engrams/shared",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(page.get("local_change").is_none(), "{page}");
+
+    // A proposal shared by an older version kept no copy here.
+    let state_dir = fx._tmp.path().join("origins").join("kb");
+    std::fs::remove_dir_all(state_dir.join("proposed")).unwrap();
+    mock.fail_blob(&crate::support::sha256_hex(proposed));
+    std::fs::write(kb_root.join("shared.md"), again).unwrap();
+    let report: serde_json::Value = discard(&fx).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        report["refused"],
+        serde_json::json!([{ "path": "shared.md", "reason": "no_base_copy", "detail": "fetch_failed" }]),
+        "{report}"
+    );
+    assert_eq!(std::fs::read(kb_root.join("shared.md")).unwrap(), again);
+}
+
 /// The discard is a write: refused read-only, refused to a viewer, and it
 /// needs the CSRF token like every mutating route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
