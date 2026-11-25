@@ -6617,7 +6617,7 @@ export type GetDomainManifestData = {
     body?: never;
     headers?: {
         /**
-         * The quoted tag of a version already held: the bare checksum, or `"{checksum}-{version}"`. A match against the CURRENT tag answers 304 with no body.
+         * The quoted tag of a version already held: the bare checksum, `"{checksum}-{version}"`, or that tag with the listing hash after one more `-`. A match against the CURRENT tag answers 304 with no body.
          */
         'If-None-Match'?: string | null;
     };
@@ -6707,7 +6707,7 @@ export type SaveDomainManifestData = {
     body: SaveManifestBody;
     headers: {
         /**
-         * The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum or `"{checksum}-{version}"`, either way compared by checksum only.
+         * The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum, `"{checksum}-{version}"` or that tag with the listing hash, every form compared by checksum only.
          */
         'If-Match': string;
     };

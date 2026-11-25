@@ -372,9 +372,10 @@ pub async fn tree(
             "If-None-Match" = Option<String>,
             Header,
             description = "The quoted tag of a version already held: the \
-                           bare checksum, or `\"{checksum}-{version}\"`. A \
-                           match against the CURRENT tag answers 304 with \
-                           no body.",
+                           bare checksum, `\"{checksum}-{version}\"`, or \
+                           that tag with the listing hash after one more \
+                           `-`. A match against the CURRENT tag answers 304 \
+                           with no body.",
             example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
@@ -385,8 +386,10 @@ pub async fn tree(
             body = ManifestResponse,
             headers(
                 ("etag" = String, description = "The quoted \
-                 `\"{checksum}-{version}\"` of the manifest as read, the \
-                 token a later `PUT` carries in `If-Match`."),
+                 `\"{checksum}-{version}\"` of the manifest as read, \
+                 followed by `-` and a short hash of the artifact listing \
+                 when the provisioning folders list any; the token a later \
+                 `PUT` carries in `If-Match`."),
                 ("cache-control" = String, description = "Always `no-cache`: \
                  store it, but revalidate before every use."),
             ),
@@ -854,9 +857,10 @@ pub struct SaveManifestBody {
             "If-Match" = String,
             Header,
             description = "The quoted `ETag` of the version being replaced, \
-                           from the manifest read: the bare checksum or \
-                           `\"{checksum}-{version}\"`, either way compared \
-                           by checksum only.",
+                           from the manifest read: the bare checksum, \
+                           `\"{checksum}-{version}\"` or that tag with the \
+                           listing hash, every form compared by checksum \
+                           only.",
             example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
@@ -868,7 +872,9 @@ pub struct SaveManifestBody {
             body = ManifestResponse,
             headers(("etag" = String, description = "The quoted \
                      `\"{checksum}-{version}\"` of the manifest as saved, \
-                     the token the next save carries.")),
+                     followed by `-` and a short hash of the artifact \
+                     listing when there is one; the token the next save \
+                     carries.")),
             example = json!({
                 "domain": "eng",
                 "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
@@ -1027,7 +1033,7 @@ pub async fn save_manifest(
             let checksum = manifest_checksum(&current);
             Ok(precondition_failed(
                 message,
-                &versioned_etag(&checksum),
+                &manifest_etag(&checksum, &state.engine.provision_listing(&domain)),
                 crystalline_core::to_lf(&current).into_owned(),
             ))
         }
@@ -1082,7 +1088,7 @@ pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
                            a domain connected to GitHub: \"share changes\" then offers \
                            the files in `reflections/` as engram changes.",
             body = ManifestResponse,
-            headers(("etag" = String, description = "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads.")),
+            headers(("etag" = String, description = "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads, followed by `-` and a short hash of the artifact listing when there is one.")),
             example = json!({
                 "domain": "kb",
                 "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
@@ -1201,8 +1207,9 @@ pub async fn set_domain_policies(
 const STALE_EDIT: &str = "stale edit";
 
 /// The manifest response both the GET and the PUT answer with: the domain,
-/// the markdown, its checksum, and the same checksum again - versioned, see
-/// [`versioned_etag`] - as a quoted `ETag` header. One shape for a manifest on
+/// the markdown, its checksum, and the same checksum again - versioned and
+/// covering the artifact listing, see [`manifest_etag`] - as a quoted `ETag`
+/// header. One shape for a manifest on
 /// this surface, so a client that has just saved one holds what the GET route
 /// would have given it.
 ///

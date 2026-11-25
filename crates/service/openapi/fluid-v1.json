@@ -4791,7 +4791,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "The quoted tag of a version already held: the bare checksum, or `\"{checksum}-{version}\"`. A match against the CURRENT tag answers 304 with no body.",
+            "description": "The quoted tag of a version already held: the bare checksum, `\"{checksum}-{version}\"`, or that tag with the listing hash after one more `-`. A match against the CURRENT tag answers 304 with no body.",
             "required": false,
             "schema": {
               "type": [
@@ -4816,7 +4816,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as read, the token a later `PUT` carries in `If-Match`."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as read, followed by `-` and a short hash of the artifact listing when the provisioning folders list any; the token a later `PUT` carries in `If-Match`."
               }
             },
             "content": {
@@ -4949,7 +4949,7 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum or `\"{checksum}-{version}\"`, either way compared by checksum only.",
+            "description": "The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum, `\"{checksum}-{version}\"` or that tag with the listing hash, every form compared by checksum only.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4975,7 +4975,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as saved, the token the next save carries."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as saved, followed by `-` and a short hash of the artifact listing when there is one; the token the next save carries."
               }
             },
             "content": {
@@ -5181,7 +5181,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads, followed by `-` and a short hash of the artifact listing when there is one."
               }
             },
             "content": {
