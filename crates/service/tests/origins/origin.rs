@@ -428,6 +428,111 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
     );
 }
 
+/// A team domain under a hidden parent, as under the default root
+/// `~/.crystalline`: the subscribe writes every file, and a share sends a new
+/// one. The dot in the parent never makes a file look hidden.
+#[tokio::test]
+async fn a_team_domain_under_a_hidden_parent_subscribes_and_shares() {
+    // `tempfile` names its folders `.tmpXXXX`; this one carries no dot, so
+    // the only hidden segment is `.crystalline`.
+    let tmp = tempfile::Builder::new().prefix("dotted").tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "turbines")),
+    ]));
+    mock.set_branch("main", &commit);
+    let root = tmp.path().join(".crystalline").join("brand-knowledge");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let added = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(added["engrams"], 2, "{added}");
+    assert!(root.join("notes/alpha.md").is_file());
+
+    std::fs::write(root.join("notes/new.md"), engram("New", "new", "fresh")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let result = eng
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(result["added"], serde_json::json!(["notes/new.md"]));
+    let branch = result["branch"].as_str().unwrap();
+    let shared = mock.branch_commit(branch).unwrap();
+    assert!(mock.commit_file(&shared, "notes/new.md").is_some());
+}
+
+/// A team domain connected without a folder lands under the domains root:
+/// beside the old domains on an install from before 0.37.0, which gets the
+/// pin, and under the hidden `~/.crystalline` on a fresh one.
+#[tokio::test]
+async fn origin_add_without_a_folder_follows_the_pinned_or_new_root() {
+    let scratch = crate::support::ScratchStateDir::acquire();
+    let home = scratch.home().to_path_buf();
+    for legacy in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProvider::new());
+        let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+        mock.set_branch("main", &commit);
+        let config_path = tmp.path().join("config.yaml");
+        let mut cfg = config(true);
+        if legacy {
+            let old = home.join("Documents/Crystalline/origin-old");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::write(old.join("MANIFEST.md"), manifest()).unwrap();
+            cfg.domains.insert(
+                "origin-old".into(),
+                crystalline_core::config::DomainEntry::file(old),
+            );
+        }
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        let eng = engine_with(&config_path, &tmp.path().join("origins"), mock, true, false).await;
+        let name = if legacy {
+            "origin-pinned"
+        } else {
+            "origin-fresh"
+        };
+        let result = eng
+            .origin_add("acme/brand-knowledge", Some(name), None, None, None, None)
+            .await
+            .unwrap();
+        let parent = if legacy {
+            home.join("Documents/Crystalline")
+        } else {
+            home.join(".crystalline")
+        };
+        assert_eq!(
+            result["root"].as_str().unwrap(),
+            parent.join(name).display().to_string(),
+            "{result}"
+        );
+        assert!(parent.join(name).join("MANIFEST.md").is_file());
+        let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+        assert_eq!(
+            on_disk.domains_root.is_some(),
+            legacy,
+            "{:?}",
+            on_disk.domains_root
+        );
+    }
+}
+
 /// A fresh connect of the team repository at `acme/brand-knowledge`, whose
 /// MANIFEST carries no team marker yet (a repository from before 0.30.0).
 async fn connected_unmarked(tmp: &Path) -> (Engine, Arc<MockProvider>, std::path::PathBuf) {
@@ -965,7 +1070,7 @@ async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review(
             kind: crystalline_core::config::DomainKind::File,
             path: Some(root.clone()),
             origin: None,
-            provision: Some(false),
+            provision: Some(crystalline_core::config::Provision::Deny),
             review: Some(crystalline_core::config::ReviewMode::Overlay),
             ..Default::default()
         },
@@ -995,7 +1100,7 @@ async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review(
     assert!(entry.origin.is_some());
     assert_eq!(
         entry.provision,
-        Some(false),
+        Some(crystalline_core::config::Provision::Deny),
         "the provisioning decision stays"
     );
     assert_eq!(

@@ -327,6 +327,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::ManifestSections,
         domains::RoutingSource,
         domains::ProvisioningView,
+        domains::ProvisioningArtifactView,
         domains::ProvisioningDeclView,
         domains::ManifestProblem,
         domains::TagAliasesView,

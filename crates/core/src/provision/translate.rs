@@ -19,7 +19,10 @@
 //!   Crossing between them is a real format conversion (frontmatter and body
 //!   <-> `name`/`description`/`developer_instructions`), and every field that
 //!   has no counterpart in the target - a vendor model name, a permission mode,
-//!   a tool list - is dropped with a notice, never silently.
+//!   a tool list - is dropped with a notice, never silently. The one exception
+//!   is `metadata`: it carries the optional provisioning mark and no
+//!   behaviour, and Codex refuses an agent TOML that holds it, so it is left
+//!   out of every render without a notice.
 
 use crate::harness::HarnessKind;
 use crate::manifest::ArtifactType;
@@ -209,8 +212,8 @@ fn render_agent(
 
 /// The canonical agent model, the meeting point of the two dialects. Only
 /// `name`, `description` and `instructions` carry across a conversion; every
-/// other field an author wrote is kept in `dropped` so a render can name what it
-/// left behind.
+/// other field an author wrote, except `metadata` (see the module doc), is kept
+/// in `dropped` so a render can name what it left behind.
 pub struct Agent {
     /// The agent's identity: its frontmatter/TOML `name`, or the file stem.
     pub name: String,
@@ -221,7 +224,8 @@ pub struct Agent {
     pub instructions: String,
     /// The names of source fields that do not cross to the other dialect - in
     /// document order for markdown frontmatter and in sorted key order for
-    /// TOML - so a render can raise one drop notice each.
+    /// TOML - so a render can raise one drop notice each. `metadata` is never
+    /// listed: it is left out silently.
     pub dropped: Vec<String>,
 }
 
@@ -243,6 +247,11 @@ impl Agent {
                     }
                 }
                 "description" => description = value.as_str().map(str::to_string),
+                // `metadata` carries the optional mark and no behaviour in
+                // either dialect, so it is neither rendered nor reported as
+                // dropped. Codex refuses an agent TOML that holds a
+                // `metadata` table, so it must never be rendered there.
+                "metadata" => {}
                 other => dropped.push(other.to_string()),
             }
         }
@@ -256,8 +265,8 @@ impl Agent {
 
     /// Parse a Codex TOML agent through the `toml` crate. `name`, `description`
     /// and `developer_instructions` are the string fields that carry; every
-    /// other top-level key (a table counts once, by its top-level name) is
-    /// recorded as dropped. Malformed TOML, or a missing required field, is an
+    /// other top-level key (a table counts once, by its top-level name) but
+    /// `metadata` is recorded as dropped. Malformed TOML, or a missing required field, is an
     /// error.
     pub fn parse_toml(stem: &str, source: &str) -> Result<Agent, String> {
         let table: toml::Table = source
@@ -282,6 +291,8 @@ impl Agent {
                 "developer_instructions" => {
                     instructions = value.as_str().map(|s| s.trim().to_string());
                 }
+                // Skipped as in parse_markdown: no behaviour, no notice.
+                "metadata" => {}
                 _ => dropped.push(key),
             }
         }
@@ -342,6 +353,70 @@ fn split_frontmatter(source: &str) -> Result<(IndexMap<String, YamlValue>, Strin
         YamlValue::Mapping(map) => Ok((map, body)),
         YamlValue::Null => Ok((IndexMap::new(), body)),
         _ => Err("its frontmatter is not a mapping".to_string()),
+    }
+}
+
+// --- the optional mark -------------------------------------------------------
+
+/// What an artifact says about the optional mark (`metadata.provision`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OptionalMark {
+    /// No `metadata.provision` value, or no frontmatter that parses.
+    Absent,
+    /// Exactly the string `optional`.
+    Optional,
+    /// Any other value, rendered for the notice that names it.
+    Other(String),
+}
+
+/// Read the optional mark from a markdown source's YAML frontmatter: the
+/// `provision` member of a `metadata` mapping. A frontmatter that does not
+/// parse, or is not a mapping, reads as [`OptionalMark::Absent`] with no
+/// notice; the paths that need a valid frontmatter already report it.
+pub(crate) fn frontmatter_optional_mark(source: &str) -> OptionalMark {
+    let Ok((front, _)) = split_frontmatter(source) else {
+        return OptionalMark::Absent;
+    };
+    let Some(value) = front
+        .get("metadata")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|meta| meta.get("provision"))
+    else {
+        return OptionalMark::Absent;
+    };
+    match value {
+        YamlValue::String(s) if s == "optional" => OptionalMark::Optional,
+        other => OptionalMark::Other(yaml_display(other)),
+    }
+}
+
+/// Read the optional mark from an MCP config's JSON object: the `provision`
+/// member of a `metadata` object, beside `name` and `server`.
+pub(crate) fn json_optional_mark(obj: &serde_json::Map<String, serde_json::Value>) -> OptionalMark {
+    let Some(value) = obj
+        .get("metadata")
+        .and_then(|v| v.as_object())
+        .and_then(|meta| meta.get("provision"))
+    else {
+        return OptionalMark::Absent;
+    };
+    match value {
+        serde_json::Value::String(s) if s == "optional" => OptionalMark::Optional,
+        serde_json::Value::String(s) => OptionalMark::Other(s.clone()),
+        other => OptionalMark::Other(other.to_string()),
+    }
+}
+
+/// A short plain rendering of a YAML value for a notice.
+fn yaml_display(value: &YamlValue) -> String {
+    match value {
+        YamlValue::Null => "null".to_string(),
+        YamlValue::Bool(b) => b.to_string(),
+        YamlValue::Int(i) => i.to_string(),
+        YamlValue::Float(f) => f.to_string(),
+        YamlValue::String(s) => s.clone(),
+        YamlValue::Sequence(_) => "a list".to_string(),
+        YamlValue::Mapping(_) => "a map".to_string(),
     }
 }
 
@@ -454,7 +529,7 @@ fn has_extension(rel: &str, ext: &str) -> bool {
 
 /// The file stem of an agent key: its final path component with a `.md` or
 /// `.toml` extension stripped.
-fn agent_stem(rel: &str) -> String {
+pub(crate) fn agent_stem(rel: &str) -> String {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     name.strip_suffix(".md")
         .or_else(|| name.strip_suffix(".toml"))
@@ -621,6 +696,47 @@ mod tests {
         let source = "name = \"reviewer\"\ndescription = \"Reviews code\"\ndeveloper_instructions = '''\nGo.\n'''\n\n[skills.config]\nfoo = \"bar\"\nbaz = \"qux\"\n";
         let agent = Agent::parse_toml("fallback", source).unwrap();
         assert_eq!(agent.dropped, vec!["skills"]);
+    }
+
+    #[test]
+    fn both_agent_parsers_skip_metadata_without_recording_it_as_dropped() {
+        let md = "---\nname: pilot\ndescription: Steers\nmetadata:\n  provision: optional\nmodel: opus\n---\n\nSteer.\n";
+        assert_eq!(
+            Agent::parse_markdown("pilot", md).unwrap().dropped,
+            vec!["model"]
+        );
+        let toml = "name = \"pilot\"\ndescription = \"Steers\"\nmodel = \"x\"\ndeveloper_instructions = '''\nSteer.\n'''\n\n[metadata]\nprovision = \"optional\"\n";
+        assert_eq!(
+            Agent::parse_toml("pilot", toml).unwrap().dropped,
+            vec!["model"]
+        );
+    }
+
+    #[test]
+    fn the_frontmatter_mark_reads_only_the_exact_string_optional() {
+        let mark = |s: &str| frontmatter_optional_mark(s);
+        assert_eq!(
+            mark("---\nmetadata:\n  provision: optional\n---\n\nx\n"),
+            OptionalMark::Optional
+        );
+        assert_eq!(
+            mark("---\nmetadata:\n  provision: Optional\n---\n\nx\n"),
+            OptionalMark::Other("Optional".to_string())
+        );
+        assert_eq!(
+            mark("---\nmetadata:\n  provision: true\n---\n\nx\n"),
+            OptionalMark::Other("true".to_string())
+        );
+        // A top-level `provision` key is not the mark.
+        assert_eq!(
+            mark("---\nprovision: optional\n---\n\nx\n"),
+            OptionalMark::Absent
+        );
+        assert_eq!(mark("no frontmatter\n"), OptionalMark::Absent);
+        assert_eq!(
+            mark("---\nmetadata: [broken\n---\n\nx\n"),
+            OptionalMark::Absent
+        );
     }
 
     #[test]

@@ -559,17 +559,37 @@ impl Engine {
         crystalline_core::provision::any_domain_declares(&self.config.read().unwrap())
     }
 
+    /// The artifacts `domain` ships, for the REST manifest answer: what
+    /// [`crystalline_core::provision::list_artifacts`] reports for a file
+    /// domain, and nothing for a virtual domain or a name that is not
+    /// registered. It does no scope check of its own; the caller has already
+    /// resolved the domain for whoever asks.
+    ///
+    /// Like the provisioning scan, the listing follows source roots that
+    /// leave the domain folder (`../tools/skills`). That is accepted: it is
+    /// the same right the Provisioning card already has to show those roots.
+    pub fn provision_listing(&self, domain: &str) -> Vec<ArtifactListing> {
+        match self.domain_entry(domain) {
+            Ok(entry) if !entry.is_virtual() => {
+                crystalline_core::provision::list_artifacts(domain, &entry).artifacts
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Apply, inspect or record a decision for domain-declared artifact
     /// provisioning (the skills, commands, agents and MCP servers a domain's
     /// `## Provisioning` section ships into a harness's own config
     /// directory). [`ProvisionAction::Status`] reports every domain's
     /// decision and every installed harness's counts, writing nothing -
     /// always allowed, even on a read-only instance, mirroring
-    /// `configure`'s `Show`. [`ProvisionAction::Allow`] and
-    /// [`ProvisionAction::Deny`] record one domain's decision (the same
+    /// `configure`'s `Show`. [`ProvisionAction::Allow`],
+    /// [`ProvisionAction::Deny`], [`ProvisionAction::Take`] and
+    /// [`ProvisionAction::Skip`] change one domain's decision (the same
     /// file-config write-lock-first discipline as `configure`'s `Set`, see
-    /// [`Engine::configure`]) and then reconcile; [`ProvisionAction::Apply`]
-    /// reconciles without changing any decision. All three refuse with
+    /// [`Engine::configure`]) and then reconcile, and their report carries a
+    /// top-level `decided` object; [`ProvisionAction::Apply`] reconciles
+    /// without changing any decision. Every action but `Status` refuses with
     /// `EngineError::ReadOnly` on a read-only instance.
     ///
     /// The harnesses reconciled into always come from this machine's install
@@ -606,7 +626,7 @@ impl Engine {
         // Resolved once, and used two different ways below because the two
         // arms owe different things. `Status` is a pure read, so it must not
         // even compute over a domain this caller may not see: the config it is
-        // given is narrowed first. `Allow`, `Deny` and `Apply` reconcile this
+        // given is narrowed first. The decisions and `Apply` reconcile this
         // *machine's* harnesses, and narrowing what they reconcile over would
         // make a stranger's call retire a hidden domain's installed artifacts -
         // worse than the disclosure it would close - so those keep the whole
@@ -652,7 +672,13 @@ impl Engine {
                 .map_err(|e| EngineError::Internal(e.to_string()))?;
                 Ok(status_report_json(&report))
             }
-            ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } => {
+            ProvisionAction::Allow { .. }
+            | ProvisionAction::Deny { .. }
+            | ProvisionAction::Take { .. }
+            | ProvisionAction::Skip { .. } => {
+                let (domain, change, names) = action
+                    .decision()
+                    .expect("every decision arm names a domain");
                 if frozen {
                     return Err(EngineError::ReadOnly);
                 }
@@ -663,7 +689,7 @@ impl Engine {
                 // helper every scoped refusal uses, ahead of the env check that
                 // would name the domain's variable. The MCP verb asks the same
                 // first; asking here keeps the engine safe on its own.
-                self.domain_entry_scoped(domain, &hidden)?;
+                let entry = self.domain_entry_scoped(domain, &hidden)?;
                 // An env-defined domain's source of truth is its variable: the
                 // overlay re-inserts a fresh entry (provision unset) on every
                 // effective-config recompute, so a decision written to the
@@ -676,29 +702,39 @@ impl Engine {
                         env.var
                     )));
                 }
-                let allow = matches!(action, ProvisionAction::Allow { .. });
+                // What the domain ships, read from its effective entry before
+                // any lock is taken: the walk touches the filesystem, and the
+                // file-config lock below is one every reader waits on. Only
+                // after the scope and env checks, so a domain this caller may
+                // not see is never listed.
+                let listing = decision_listing(domain, Some(&entry), change);
                 // Take the file-config write lock first, the same discipline
                 // `configure`'s Set uses: serialize against a concurrent
                 // decision, mutate a clone, persist, then swap both configs
                 // in. Lock order is always file_config then config.
-                {
+                let outcome = {
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard)?;
                     // The name was resolved above; a domain removed from the
                     // file since is refused through the same helper, so even
                     // that race lists only what this caller may see.
                     self.shadow_base_entry(&mut file, domain);
-                    set_domain_provision_decision(&mut file, domain, allow).map_err(
-                        |e| match e {
+                    let outcome = set_domain_provision(&mut file, domain, change, names, &listing)
+                        .map_err(|e| match e {
                             EngineError::UnknownDomain { domain, .. } => {
                                 self.unknown_domain(&domain, &hidden)
                             }
                             other => other,
-                        },
-                    )?;
+                        })?;
                     self.commit_config(&mut file_guard, file)?;
-                }
-                self.run_provision_apply(&receipt_path, &harnesses, &hidden)
+                    outcome
+                };
+                let mut value = self.run_provision_apply(&receipt_path, &harnesses, &hidden)?;
+                // After the hidden-domain filter: the domain passed the scope
+                // check above, so what the decision says about it is the
+                // caller's to read.
+                decorate_decided(&mut value, domain, &outcome);
+                Ok(value)
             }
             ProvisionAction::Apply => {
                 if frozen {
@@ -711,7 +747,7 @@ impl Engine {
 
     /// Reconcile every opted-in domain's declared artifacts into `harnesses`
     /// through the real system MCP runner - the shared tail of
-    /// `provision`'s `Allow`, `Deny` and `Apply` arms.
+    /// `provision`'s decision arms and its `Apply` arm.
     fn run_provision_apply(
         &self,
         receipt_path: &Path,
@@ -857,7 +893,9 @@ mod document_tests {
         let (engine, bytes, tmp) = engine_on(doc.clone()).await;
         let done = engine
             .register_in_document(|loaded, save| {
-                crate::registration::register_virtual_domain_saving(loaded, "fresh", None, save)
+                crate::registration::register_virtual_domain_saving(
+                    loaded, "fresh", None, None, save,
+                )
             })
             .expect("document mode")
             .unwrap();
@@ -875,7 +913,13 @@ mod document_tests {
         let before = doc.stored();
         let done = engine
             .register_in_document(|loaded, save| {
-                crate::registration::register_virtual_domain_saving(loaded, "base-only", None, save)
+                crate::registration::register_virtual_domain_saving(
+                    loaded,
+                    "base-only",
+                    None,
+                    None,
+                    save,
+                )
             })
             .unwrap()
             .unwrap();
@@ -886,7 +930,9 @@ mod document_tests {
         *doc.fail.lock().unwrap() = Some(EngineError::Internal("the database is gone".into()));
         let err = engine
             .register_in_document(|loaded, save| {
-                crate::registration::register_virtual_domain_saving(loaded, "other", None, save)
+                crate::registration::register_virtual_domain_saving(
+                    loaded, "other", None, None, save,
+                )
             })
             .unwrap()
             .unwrap_err();

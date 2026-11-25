@@ -121,7 +121,7 @@ async fn show_lists_every_registry_key_at_its_default() {
     // domains_root leads the registry; github.enabled follows it.
     assert_eq!(views[0].key, "domains_root");
     assert!(
-        views[0].value.ends_with("Documents/Crystalline"),
+        views[0].value.ends_with(".crystalline"),
         "{}",
         views[0].value
     );

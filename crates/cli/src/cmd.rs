@@ -453,11 +453,13 @@ pub(crate) fn domain_add_register(
     config_override: Option<&Path>,
 ) -> Result<(String, PathBuf, bool, Option<String>)> {
     let kept = crate::kept::root().ok();
+    let state = crystalline_core::config::state_dir().ok();
     let done = crystalline_service::registration::register_file_domain(
         name,
         path,
         config_override,
         kept.as_deref(),
+        state.as_deref(),
     )?;
     print_notes(&done.notes);
     let root = done
@@ -539,6 +541,7 @@ pub(crate) async fn register_in_document(
     config_override: Option<&Path>,
 ) -> Result<Option<crystalline_service::registration::Registered>> {
     let kept = crate::kept::root().ok();
+    let state = crystalline_core::config::state_dir().ok();
     let done = crystalline_service::register_in_document(
         kind,
         name,
@@ -546,6 +549,7 @@ pub(crate) async fn register_in_document(
         db,
         config_override,
         kept.as_deref(),
+        state.as_deref(),
     )
     .await?;
     if let Some(done) = &done {
@@ -563,10 +567,12 @@ pub(crate) fn domain_add_register_virtual(
     config_override: Option<&Path>,
 ) -> Result<(String, bool)> {
     let kept = crate::kept::root().ok();
+    let state = crystalline_core::config::state_dir().ok();
     let done = crystalline_service::registration::register_virtual_domain(
         name,
         config_override,
         kept.as_deref(),
+        state.as_deref(),
     )?;
     print_notes(&done.notes);
     Ok((done.manifest.unwrap_or_default(), done.adopted))
@@ -1843,7 +1849,7 @@ pub(crate) fn read_resolve_content(path: &Path) -> Result<Vec<u8>> {
 
 /// Render a `provision` result: `status`'s report through
 /// [`print_provision_status`], every other action (bare `provision`,
-/// `allow`, `deny`) through [`print_provision_apply`].
+/// `allow`, `deny`, `take`, `skip`) through [`print_provision_apply`].
 pub(crate) fn print_provision(action: &str, data: &serde_json::Value, json: bool, all: bool) {
     if action == "status" {
         print_provision_status(data, json, all);
@@ -1852,10 +1858,10 @@ pub(crate) fn print_provision(action: &str, data: &serde_json::Value, json: bool
     }
 }
 
-/// Render an apply report (bare `provision`, `allow` or `deny`): one line per
+/// Render an apply report (bare `provision`, `allow`, `deny`, `take` or
+/// `skip`): the `decided` line when the report carries one, then one line per
 /// harness with what it did, or "up to date" when nothing changed, then any
-/// notices, then domains still awaiting a decision with a hint to opt them
-/// in.
+/// notices, then domains still awaiting a decision with a hint to decide.
 pub(crate) fn print_provision_apply(data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -1865,6 +1871,9 @@ pub(crate) fn print_provision_apply(data: &serde_json::Value, json: bool) {
     // raises its own no-harness notice (with the `crystalline install` hint)
     // whenever a domain is opted in, and that notice prints below.
     let empty = Vec::new();
+    if let Some(line) = decided_line(&data["decided"]) {
+        println!("{line}");
+    }
     let harnesses = data["harnesses"].as_array().unwrap_or(&empty);
     for h in harnesses {
         let name = h["harness"].as_str().unwrap_or("");
@@ -1927,6 +1936,7 @@ pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool, all: 
         }
         let decision = d["decision"].as_str().unwrap_or("undecided");
         println!("{name}: {decision}, {}", format_counts(&d["counts"]));
+        print_provision_artifacts(name, decision, d);
     }
     if !all {
         if no_provisioning > 0 {
@@ -1988,9 +1998,129 @@ fn print_provision_pending(data: &serde_json::Value) {
     for p in pending {
         let name = p["domain"].as_str().unwrap_or("");
         println!(
-            "  {name}: {} - run `crystalline provision allow {name}` to opt in.",
+            "  {name}: {} - run `crystalline provision allow {name}`, `deny {name}` or pick with `take` or `skip`.",
             format_counts(&p["counts"])
         );
+    }
+}
+
+/// The names of one list of a `selection` object, empty when the key is
+/// absent.
+fn selection_names<'a>(selection: &'a serde_json::Value, list: &str) -> Vec<&'a str> {
+    selection[list]
+        .as_array()
+        .map(|a| a.iter().filter_map(|n| n.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// The line an apply report of `allow`, `deny`, `take` or `skip` opens with,
+/// from its `decided` block: `harbor: allowed, except skills/a`,
+/// `harbor: only skills/a, commands/b` or just `harbor: allowed`. `None`
+/// when the report carries no `decided` block.
+fn decided_line(decided: &serde_json::Value) -> Option<String> {
+    let domain = decided["domain"].as_str()?;
+    let decision = decided["decision"].as_str().unwrap_or("undecided");
+    let selection = &decided["selection"];
+    let mut line = format!("{domain}: {decision}");
+    if selection["only"].is_array() {
+        line.push(' ');
+        line.push_str(&selection_names(selection, "only").join(", "));
+    } else {
+        let except = selection_names(selection, "except");
+        if !except.is_empty() {
+            line.push_str(", except ");
+            line.push_str(&except.join(", "));
+        }
+        let also = selection_names(selection, "also");
+        if !also.is_empty() {
+            line.push_str(", also ");
+            line.push_str(&also.join(", "));
+        }
+    }
+    Some(line)
+}
+
+/// The words after an artifact key in `provision status`, from the domain's
+/// decision and its `selection` lists.
+fn artifact_reason(decision: &str, selection: &serde_json::Value, a: &serde_json::Value) -> String {
+    let key = a["key"].as_str().unwrap_or("");
+    let optional = a["optional"].as_bool().unwrap_or(false);
+    let on = a["on"].as_bool().unwrap_or(false);
+    match decision {
+        "only" => match (on, optional) {
+            (true, true) => "optional".to_string(),
+            (true, false) => String::new(),
+            (false, _) => "not taken".to_string(),
+        },
+        "allowed" => {
+            if selection_names(selection, "except").contains(&key) {
+                "skipped".to_string()
+            } else {
+                match (on, optional) {
+                    (true, true) => "optional, taken".to_string(),
+                    (false, true) => "optional".to_string(),
+                    _ => String::new(),
+                }
+            }
+        }
+        _ if optional => "optional".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The stale line of `provision status` and `doctor`: a name in the
+/// decision that the domain no longer ships, with the command that drops it.
+/// `take` removes a stale `except` name, `skip` a stale `also` or `only`
+/// name.
+pub(crate) fn stale_sentence(domain: &str, name: &str, in_except: bool) -> String {
+    let verb = if in_except { "take" } else { "skip" };
+    format!(
+        "{name} is in the decision, but {domain} no longer ships it - run `crystalline provision {verb} {domain} {name}` to drop it."
+    )
+}
+
+/// The malformed line of `provision status` and `doctor`.
+pub(crate) fn malformed_sentence(name: &str) -> String {
+    format!("{name} is not an artifact name; edit `config.yaml` to fix it.")
+}
+
+/// Print one domain's artifact lines, then its stale and malformed names.
+fn print_provision_artifacts(domain: &str, decision: &str, d: &serde_json::Value) {
+    let empty = Vec::new();
+    let selection = &d["selection"];
+    let artifacts = d["artifacts"].as_array().unwrap_or(&empty);
+    let width = artifacts
+        .iter()
+        .map(|a| a["key"].as_str().unwrap_or("").chars().count())
+        .max()
+        .unwrap_or(0);
+    for a in artifacts {
+        let key = a["key"].as_str().unwrap_or("");
+        let state = if a["on"].as_bool().unwrap_or(false) {
+            "on "
+        } else {
+            "off"
+        };
+        let reason = artifact_reason(decision, selection, a);
+        if reason.is_empty() {
+            println!("  {state}  {key}");
+        } else {
+            println!("  {state}  {key:<width$}   {reason}");
+        }
+    }
+    let except = selection_names(selection, "except");
+    for name in d["stale"].as_array().unwrap_or(&empty) {
+        if let Some(name) = name.as_str() {
+            println!(
+                "  stale: {}",
+                stale_sentence(domain, name, except.contains(&name))
+            );
+        }
+    }
+    for name in d["malformed"].as_array().unwrap_or(&empty) {
+        if let Some(name) = name.as_str() {
+            println!("  malformed: {}", malformed_sentence(name));
+        }
     }
 }
 

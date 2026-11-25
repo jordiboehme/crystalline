@@ -21,7 +21,7 @@ Bring a team repository in as a domain:
 crystalline domain add design --origin acme/design-knowledge
 ```
 
-`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository. The local folder defaults to `<domains_root>/<name>` (the domains root is `~/Documents/Crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool. Without `--branch` the domain tracks the repository's default branch, which is asked from GitHub once and written into the domain's entry.
+`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository. The local folder defaults to `<domains_root>/<name>` (the domains root is `~/.crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool. Without `--branch` the domain tracks the repository's default branch, which is asked from GitHub once and written into the domain's entry.
 
 From there, `crystalline origin` covers the team domain lifecycle:
 
@@ -76,7 +76,7 @@ The same actions are MCP tools an agent calls directly: `update_domain`, `origin
 ```yaml
 domains:
   design:
-    path: ~/Documents/Crystalline/design
+    path: ~/.crystalline/design
     origin:
       repo: acme/design-knowledge   # the GitHub repository, owner/name
       path: knowledge               # optional subfolder; absent means the repository root

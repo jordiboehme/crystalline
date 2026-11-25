@@ -49,7 +49,7 @@ pub(crate) fn default_domain_name(repo: &str) -> String {
 
 /// The domain folder a domain-creating call uses when the caller does not
 /// supply one: `<root>/<domain>`, where `root` is the configured domains root
-/// (`GlobalConfig::domains_root`, `~/Documents/Crystalline` by default). Kept a
+/// (`GlobalConfig::domains_root`, `~/.crystalline` by default). Kept a
 /// free function over the already-resolved root so both `origin_add`, the
 /// local-domain path and the standalone CLI's `domain add` (which has no
 /// engine to call into) share one placement rule. Public (re-exported from
@@ -1665,9 +1665,9 @@ mod tests {
         let root = GlobalConfig::default().domains_root();
         let folder = default_domain_folder(&root, "brand-knowledge");
         // Normalise separators so the suffix check holds on Windows, where the
-        // join appends a backslash (`Documents/Crystalline\brand-knowledge`).
+        // join appends a backslash (`.crystalline\brand-knowledge`).
         let s = folder.display().to_string().replace('\\', "/");
-        assert!(s.ends_with("Documents/Crystalline/brand-knowledge"), "{s}");
+        assert!(s.ends_with("/.crystalline/brand-knowledge"), "{s}");
         assert!(!s.starts_with('~'), "{s}");
     }
 

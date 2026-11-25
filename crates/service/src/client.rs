@@ -2673,6 +2673,7 @@ pub async fn register_in_document(
     db: Option<&Path>,
     config_path: Option<&Path>,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
 ) -> anyhow::Result<Option<crate::registration::Registered>> {
     use serde_json::json;
     let mut loaded = overlay::load(config_path)?;
@@ -2714,14 +2715,16 @@ pub async fn register_in_document(
     );
     crate::claim::attach_owned_document(&mut loaded, claim.as_ref()).await?;
     let done = match kind {
-        "file" => crate::registration::register_file_domain_in(loaded, name, path, kept_root)?,
+        "file" => {
+            crate::registration::register_file_domain_in(loaded, name, path, kept_root, state_dir)?
+        }
         "virtual" => {
             let name = name.ok_or_else(|| {
                 anyhow::anyhow!(
                     "`domain add --virtual` needs a name; there is no folder to derive one from"
                 )
             })?;
-            crate::registration::register_virtual_domain_in(loaded, name, kept_root)?
+            crate::registration::register_virtual_domain_in(loaded, name, kept_root, state_dir)?
         }
         other => anyhow::bail!("unknown domain_register kind '{other}'; expected file or virtual"),
     };
@@ -2967,10 +2970,12 @@ fn setting_view(
 /// `--config` override was given, else against the config file and the
 /// provisioning receipt directly, mirroring `configure`'s daemon-first
 /// discipline (provisioning never opens the index either, so there is no
-/// `--db` to gate on). `action` is one of `status`, `allow`, `deny` or
-/// `apply`; `domain` is required for `allow`/`deny` and ignored otherwise.
-/// `allow`, `deny` and `apply` refuse on a read-only effective config,
-/// matching `Engine::provision`'s own guard; `status` is always answered.
+/// `--db` to gate on). `action` is one of `status`, `allow`, `deny`, `take`,
+/// `skip` or `apply`; `domain` is required for the four decisions and
+/// ignored otherwise, and `artifacts` holds the `<kind>/<name>` keys `take`
+/// and `skip` name (ignored by the other actions). Every action but `status`
+/// refuses on a read-only effective config, matching `Engine::provision`'s
+/// own guard; `status` is always answered.
 ///
 /// The harnesses reconciled into always come from this machine's install
 /// receipt (`crystalline install`'s own record of onboarded harnesses),
@@ -2978,6 +2983,7 @@ fn setting_view(
 pub async fn provision(
     action: &str,
     domain: Option<&str>,
+    artifacts: &[String],
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
@@ -2987,6 +2993,7 @@ pub async fn provision(
     if config_path.is_none()
         && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "provision", "action": action, "domain": domain,
+            "artifacts": artifacts,
         }))
         .await?
     {
@@ -3005,18 +3012,20 @@ pub async fn provision(
     if loaded.mode == overlay::ConfigMode::Document && action != "status" {
         let action = match action {
             "apply" => crate::engine::ProvisionAction::Apply,
-            "allow" | "deny" => {
+            "allow" | "deny" | "take" | "skip" => {
                 let domain = domain
                     .ok_or_else(|| anyhow::anyhow!("provision {action} requires a domain"))?
                     .to_string();
-                if action == "allow" {
-                    crate::engine::ProvisionAction::Allow { domain }
-                } else {
-                    crate::engine::ProvisionAction::Deny { domain }
+                let artifacts = artifacts.to_vec();
+                match action {
+                    "allow" => crate::engine::ProvisionAction::Allow { domain },
+                    "deny" => crate::engine::ProvisionAction::Deny { domain },
+                    "take" => crate::engine::ProvisionAction::Take { domain, artifacts },
+                    _ => crate::engine::ProvisionAction::Skip { domain, artifacts },
                 }
             }
             other => anyhow::bail!(
-                "unknown provision action '{other}'; expected status, allow, deny or apply"
+                "unknown provision action '{other}'; expected status, allow, deny, take, skip or apply"
             ),
         };
         let db_path = resolve_db(None)?;
@@ -3058,7 +3067,7 @@ pub async fn provision(
             )?;
             Ok(crate::engine::status_report_json(&report))
         }
-        "allow" | "deny" => {
+        "allow" | "deny" | "take" | "skip" => {
             if loaded.effective.read_only() {
                 anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
             }
@@ -3075,8 +3084,20 @@ pub async fn provision(
                     env.var
                 );
             }
+            let change = match action {
+                "allow" => crate::engine::SelectionChange::Allow,
+                "deny" => crate::engine::SelectionChange::Deny,
+                "take" => crate::engine::SelectionChange::Take,
+                _ => crate::engine::SelectionChange::Skip,
+            };
+            // What the domain ships, read from its effective entry, as the
+            // daemon does before it takes its configuration lock. An
+            // unregistered or virtual name lists nothing; the seam refuses it.
+            let listing =
+                crate::engine::decision_listing(name, loaded.effective.domains.get(name), change);
             let mut file = loaded.file.clone();
-            crate::engine::set_domain_provision_decision(&mut file, name, action == "allow")?;
+            let outcome =
+                crate::engine::set_domain_provision(&mut file, name, change, artifacts, &listing)?;
             save_file(&loaded.path, &file)?;
             let effective = loaded.overlay.apply(&file);
             let mut mcp = crate::harness_cli::SystemMcpRunner;
@@ -3087,7 +3108,9 @@ pub async fn provision(
                 &mut mcp,
                 &env_domains,
             )?;
-            Ok(crate::engine::apply_report_json(&report))
+            let mut value = crate::engine::apply_report_json(&report);
+            crate::engine::decorate_decided(&mut value, name, &outcome);
+            Ok(value)
         }
         "apply" => {
             if loaded.effective.read_only() {
@@ -3105,7 +3128,7 @@ pub async fn provision(
         }
         other => {
             anyhow::bail!(
-                "unknown provision action '{other}'; expected status, allow, deny or apply"
+                "unknown provision action '{other}'; expected status, allow, deny, take, skip or apply"
             )
         }
     }

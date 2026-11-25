@@ -27,6 +27,7 @@ use crate::scope::Scope;
 use crystalline_core::manifest_view::{
     ManifestFacts, ManifestProblemRow, PolicyRow, RoutingSection, manifest_facts,
 };
+use crystalline_core::provision::ArtifactListing;
 use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
@@ -94,7 +95,7 @@ use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
                 "domains": [{
                     "name": "eng",
                     "kind": "file",
-                    "path": "/Users/ada/Documents/Crystalline/eng",
+                    "path": "/Users/ada/.crystalline/eng",
                     "engrams": 4,
                     "observations": 12,
                     "relations": 3,
@@ -469,6 +470,7 @@ pub async fn manifest(
         source.missing,
         StatusCode::OK,
         None,
+        state.engine.provision_listing(&domain),
     )?;
     resp.headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
@@ -561,6 +563,28 @@ pub struct ProvisioningView {
     pub decls: Vec<ProvisioningDeclView>,
     /// The bullets that did not parse, or lost to an earlier duplicate.
     pub problems: Vec<ManifestProblem>,
+    /// The artifacts the declared folders ship on the server's disk, by kind
+    /// and key. No on or off: that is decided per machine, and the server's
+    /// machine is not the reader's. Filled by the handlers from the engine, so the
+    /// pure parse of the markdown leaves it empty.
+    pub artifacts: Vec<ProvisioningArtifactView>,
+}
+
+/// One artifact a domain ships.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProvisioningArtifactView {
+    /// The provisioning key, `<kind>/<name>`.
+    #[schema(example = "skills/storm-warnings")]
+    pub key: String,
+    /// `skills`, `commands`, `agents` or `mcps`.
+    #[schema(example = "skills")]
+    pub kind: String,
+    /// The key without its `<kind>/` prefix.
+    #[schema(example = "storm-warnings")]
+    pub name: String,
+    /// True when the artifact is marked `metadata: { provision: optional }`.
+    #[schema(example = false)]
+    pub optional: bool,
 }
 
 /// One `kind: path` declaration.
@@ -706,6 +730,7 @@ impl ManifestSections {
                     })
                     .collect(),
                 problems: section.problems.into_iter().map(Into::into).collect(),
+                artifacts: Vec::new(),
             }),
             tag_aliases: tag_aliases.map(|section| TagAliasesView {
                 decls: section
@@ -980,6 +1005,7 @@ pub async fn save_manifest(
             false,
             StatusCode::OK,
             None,
+            state.engine.provision_listing(&domain),
         ),
         // The same stale-edit translation `engrams::save` makes, repeated
         // rather than shared for the same reason.
@@ -1147,7 +1173,14 @@ pub async fn set_domain_policies(
             .filter(|note| note.is_string())
             .map(|note| ("note", note.clone()))
     };
-    manifest_response(&domain, markdown, false, StatusCode::OK, extra)
+    manifest_response(
+        &domain,
+        markdown,
+        false,
+        StatusCode::OK,
+        extra,
+        state.engine.provision_listing(&domain),
+    )
 }
 
 /// The prefix every refused compare-and-swap opens with, wherever the
@@ -1177,6 +1210,7 @@ fn manifest_response(
     missing: bool,
     status: StatusCode,
     extra: Option<(&str, Value)>,
+    artifacts: Vec<ArtifactListing>,
 ) -> Result<Response, ApiError> {
     // The checksum is of the MANIFEST as it is stored, the token a save
     // compares; the markdown handed back is LF, whatever the file holds.
@@ -1184,7 +1218,18 @@ fn manifest_response(
     let markdown = crystalline_core::to_lf(&markdown).into_owned();
     let etag = HeaderValue::from_str(&format!("\"{}\"", versioned_etag(&checksum)))
         .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
-    let sections = ManifestSections::of(&markdown, domain);
+    let mut sections = ManifestSections::of(&markdown, domain);
+    if let Some(provisioning) = sections.provisioning.as_mut() {
+        provisioning.artifacts = artifacts
+            .into_iter()
+            .map(|row| ProvisioningArtifactView {
+                key: row.key,
+                kind: row.kind.id().to_string(),
+                name: row.name,
+                optional: row.optional,
+            })
+            .collect();
+    }
     let payload = ManifestResponse {
         domain: domain.to_string(),
         markdown,

@@ -259,7 +259,7 @@ impl From<Readers> for EngineReaders {
             body = Object,
             example = json!({
                 "domain": "notes",
-                "root": "/Users/ada/Documents/Crystalline/notes",
+                "root": "/Users/ada/.crystalline/notes",
                 "kind": "file",
                 "manifest_created": true,
                 "adopted": false

@@ -7497,3 +7497,60 @@ fn the_embedded_stack_exits_when_rmcp_ends_the_session_with_stdin_open() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// A daemon started on a configuration from before 0.37.0 (a domain in
+/// `~/Documents/Crystalline`, no `domains_root`) pins the old root before it
+/// serves: the first `add_domain` without a folder lands beside the old
+/// domain, and the configuration file carries the pin.
+#[test]
+fn a_daemon_pins_the_old_root_before_it_serves() {
+    let env = Env::new("rootpin");
+    let old = env.dir.join("Documents/Crystalline/old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(
+        old.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: old\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# old\n\n## Scope\n\n- old\n\n## When to Use\n\n- Route here for old\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    let mut cfg = GlobalConfig {
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("old".into(), config::DomainEntry::file(old.clone()));
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+    c1.send_call("add_domain", json!({ "domain": "fresh" }));
+    let r = c1.read_tool_value();
+    let root = PathBuf::from(r["root"].as_str().unwrap_or_default());
+    let expected = env.dir.join("Documents/Crystalline/fresh");
+    assert!(expected.is_dir(), "{r}");
+    assert_eq!(root, std::fs::canonicalize(expected).unwrap(), "{r}");
+    let saved: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert_eq!(
+        saved.domains_root.as_deref(),
+        Some(Path::new("~/Documents/Crystalline"))
+    );
+    let (ok, shown) = env.run(&["--json", "config", "show"]);
+    assert!(ok, "{shown}");
+    let shown: Value = serde_json::from_str(&shown).unwrap();
+    let row = shown["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "domains_root")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["source"], "config", "{row}");
+    assert!(!env.dir.join(".crystalline").exists());
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}

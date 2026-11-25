@@ -22,11 +22,13 @@
 pub mod model;
 pub mod receipt;
 pub mod reconcile;
+pub mod select;
 pub(crate) mod translate;
 
 pub use model::{
-    ArtifactFile, DesiredFile, DesiredMcp, DesiredPayload, DesiredSet, DomainArtifacts,
-    McpArtifact, desired_set, harness_supports, is_plain_component, resolve_source_roots,
+    ArtifactFile, ArtifactListing, ArtifactListingReport, DesiredFile, DesiredMcp, DesiredPayload,
+    DesiredSet, DomainArtifacts, McpArtifact, artifact_key, desired_set, harness_supports,
+    is_plain_component, list_artifacts, mcp_key, parse_artifact_key, resolve_source_roots,
     scan_domain,
 };
 pub use receipt::{
@@ -36,6 +38,7 @@ pub use receipt::{
 pub use reconcile::{
     ActionStatus, ArtifactAction, DeferringMcpRunner, McpOutcome, McpRunner, reconcile_harness,
 };
+pub use select::{SelectionChange, SelectionOutcome, change_selection};
 pub use translate::{Agent, Command};
 
 // --- orchestration -------------------------------------------------------
@@ -49,10 +52,10 @@ pub use translate::{Agent, Command};
 // harness's visibility for domains that have not declared anything to
 // provision at all.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, DomainEntry, GlobalConfig};
+use crate::config::{self, DomainEntry, GlobalConfig, Provision};
 use crate::harness::{HarnessKind, artifact_base};
 use crate::manifest::{ArtifactType, Manifest};
 use crate::parse::parse_engram;
@@ -495,6 +498,112 @@ fn push_notice(notices: &mut Vec<String>, seen: &mut HashSet<String>, notice: St
     }
 }
 
+// --- decision filter ----------------------------------------------------------
+
+/// The part of one domain's scan that `decision` installs: every file and MCP
+/// whose key [`Provision::selects`], given the artifact's optional mark.
+///
+/// The filter goes per artifact key, so every file that shares a key goes or
+/// stays together: all files of a skill (they all carry the mark of its
+/// `SKILL.md`) and an `.md` and `.toml` agent with the same stem (the `.toml`
+/// one shares the mark of the `.md` one). `apply`, `status` and the session
+/// path all filter through here, so what the session checks for drift is
+/// exactly what `apply` installs.
+pub fn filter_artifacts(artifacts: &DomainArtifacts, decision: &Provision) -> DomainArtifacts {
+    DomainArtifacts {
+        domain: artifacts.domain.clone(),
+        files: artifacts
+            .files
+            .iter()
+            .filter(|file| decision.selects(&artifact_key(file), file.optional))
+            .cloned()
+            .collect(),
+        mcps: artifacts
+            .mcps
+            .iter()
+            .filter(|mcp| decision.selects(&mcp_key(mcp), mcp.optional))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// The receipt's stamp key of a scanned file: `"<kind.id()>/<rel>"`.
+fn stamp_key(file: &ArtifactFile) -> String {
+    format!("{}/{}", file.kind.id(), file.rel)
+}
+
+/// Every artifact key `artifacts` marks optional, files and MCPs together.
+fn optional_keys(artifacts: &DomainArtifacts) -> BTreeSet<String> {
+    let files = artifacts
+        .files
+        .iter()
+        .filter(|f| f.optional)
+        .map(artifact_key);
+    let mcps = artifacts.mcps.iter().filter(|m| m.optional).map(mcp_key);
+    files.chain(mcps).collect()
+}
+
+/// One notice per artifact of `artifacts` that the author made optional
+/// since the last apply and that `decision` therefore stops installing.
+///
+/// A key qualifies only when all of these hold:
+/// - it is optional now and was not optional at the last apply (the
+///   receipt's `optional` list for the domain);
+/// - the decision selects it as a required artifact but not as an optional
+///   one, so the mark is what takes it out (under `only` or an `except` name
+///   the mark changes nothing);
+/// - the receipt already knew it before this apply: a file of it had a stamp
+///   under the domain, or, for an MCP, a harness row records it for the
+///   domain. A fresh opt-in or a brand-new optional artifact was never
+///   installed, so it gets no notice.
+///
+/// The caller writes the new `optional` list afterwards, so the notice fires
+/// once.
+fn newly_optional_notices(
+    artifacts: &DomainArtifacts,
+    decision: &Provision,
+    receipt: &ProvisionReceipt,
+) -> Vec<String> {
+    let domain = artifacts.domain.as_str();
+    let Some(stamped) = receipt.sources.get(domain) else {
+        return Vec::new();
+    };
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    for file in artifacts.files.iter().filter(|f| f.optional) {
+        if stamped.files.contains_key(&stamp_key(file)) {
+            known.insert(artifact_key(file));
+        }
+    }
+    for mcp in artifacts.mcps.iter().filter(|m| m.optional) {
+        let recorded = receipt.harnesses.values().any(|state| {
+            state
+                .mcps
+                .get(&mcp.name)
+                .is_some_and(|row| row.domain == domain)
+        });
+        if recorded {
+            known.insert(mcp_key(mcp));
+        }
+    }
+    known
+        .into_iter()
+        .filter(|key| {
+            !stamped.optional.contains(key)
+                && decision.selects(key, false)
+                && !decision.selects(key, true)
+        })
+        .map(|key| newly_optional_notice(domain, &key))
+        .collect()
+}
+
+/// The notice for an artifact the author made optional since the last apply,
+/// which the decision no longer installs.
+fn newly_optional_notice(domain: &str, key: &str) -> String {
+    format!(
+        "`{key}` from the `{domain}` domain is now optional, so it is no longer installed - run `crystalline provision take {domain} {key}` to keep it."
+    )
+}
+
 // --- receipt-key resolution (status only; apply's own reconcile keeps its
 // key resolution private to `reconcile.rs`) --------------------------------
 
@@ -646,9 +755,14 @@ pub struct ApplyReport {
 /// Reconcile every opted-in domain's declared artifacts into `harnesses`,
 /// updating the receipt at `receipt_path` to match.
 ///
-/// Opted-in domains (`provision == Some(true)`) are scanned in `global`'s own
-/// declaration order - the collision-precedence contract [`desired_set`]
-/// documents. A virtual domain can never ship artifacts (its MANIFEST lives
+/// Opted-in domains (a decision that [`Provision::includes_any`]) are scanned
+/// in `global`'s own declaration order - the collision-precedence contract
+/// [`desired_set`] documents. Each scan goes through [`filter_artifacts`]
+/// before it reaches the desired sets, so an artifact the decision leaves out
+/// is retired like a denied domain's: deleted when clean, kept as a `.bak`
+/// when edited, an MCP deregistered. An artifact the author made optional
+/// since the last apply raises one notice when that takes it out (see
+/// [`DomainSources::optional`]). A virtual domain can never ship artifacts (its MANIFEST lives
 /// in the database, unreadable from here), so an opted-in virtual domain
 /// produces one notice and contributes nothing to any harness. When
 /// `harnesses` is empty and at least one domain is opted in, `apply` stops
@@ -661,7 +775,9 @@ pub struct ApplyReport {
 ///
 /// The receipt is loaded once, updated per harness, then saved once at the
 /// end alongside a fresh set of source stamps for every opted-in domain (a
-/// domain no longer opted in loses its stamps entirely). A receipt that
+/// domain no longer opted in loses its stamps entirely). The stamps cover
+/// every scanned file, also those the decision leaves out, and sit beside the
+/// decision's fingerprint and the domain's optional keys. A receipt that
 /// cannot be read back is treated as empty, with a notice, rather than
 /// failing the run outright - the receipt is disposable derived state, the
 /// same philosophy as the search index. A single harness's own reconcile
@@ -704,11 +820,14 @@ pub fn apply(
     hand_over_skills(&mut receipt, harnesses);
 
     let mut any_opted_in = false;
-    let mut domain_artifacts: Vec<DomainArtifacts> = Vec::new();
+    // Each included domain's whole scan with its decision: the stamps, the
+    // fingerprint and the optional list come from these, and the filtered
+    // copy below feeds the desired sets.
+    let mut domain_artifacts: Vec<(DomainArtifacts, &Provision)> = Vec::new();
     for (name, entry) in &global.domains {
-        if entry.provision != Some(true) {
+        let Some(decision) = entry.provision.as_ref().filter(|p| p.includes_any()) else {
             continue;
-        }
+        };
         any_opted_in = true;
         if entry.is_virtual() {
             push_notice(
@@ -725,8 +844,12 @@ pub fn apply(
         for notice in scan_notices {
             push_notice(&mut notices, &mut seen, notice);
         }
-        domain_artifacts.push(artifacts);
+        domain_artifacts.push((artifacts, decision));
     }
+    let selected: Vec<DomainArtifacts> = domain_artifacts
+        .iter()
+        .map(|(artifacts, decision)| filter_artifacts(artifacts, decision))
+        .collect();
 
     // Display order only: the reconcile above and below keeps the config's
     // declaration order for its collision precedence.
@@ -748,9 +871,17 @@ pub fn apply(
         });
     }
 
+    // Read before any harness reconciles: the reconcile below drops the MCP
+    // rows of a server that just became optional.
+    for (artifacts, decision) in &domain_artifacts {
+        for notice in newly_optional_notices(artifacts, decision, &receipt) {
+            push_notice(&mut notices, &mut seen, notice);
+        }
+    }
+
     let mut harness_results = Vec::new();
     for &harness in harnesses {
-        let (desired, ds_notices) = desired_set(harness, &domain_artifacts);
+        let (desired, ds_notices) = desired_set(harness, &selected);
         for notice in ds_notices {
             push_notice(&mut notices, &mut seen, notice);
         }
@@ -804,15 +935,24 @@ pub fn apply(
         harness_results.push((stranded.harness, actions));
     }
 
+    // Every scanned file is stamped, also those the decision leaves out: the
+    // session walk does not know the decision (see `DomainSources`).
     let mut sources = BTreeMap::new();
-    for artifacts in &domain_artifacts {
+    for (artifacts, decision) in &domain_artifacts {
         let mut files = BTreeMap::new();
         for file in &artifacts.files {
             if let Some(stamp) = stamp_source(&file.source, &file.sha256) {
-                files.insert(format!("{}/{}", file.kind.id(), file.rel), stamp);
+                files.insert(stamp_key(file), stamp);
             }
         }
-        sources.insert(artifacts.domain.clone(), DomainSources { files });
+        sources.insert(
+            artifacts.domain.clone(),
+            DomainSources {
+                files,
+                decision: decision.fingerprint(),
+                optional: optional_keys(artifacts).into_iter().collect(),
+            },
+        );
     }
     receipt.sources = sources;
 
@@ -827,8 +967,8 @@ pub fn apply(
 
 // --- status -------------------------------------------------------------
 
-/// Where a domain sits in the status listing: allowed, undecided and denied
-/// domains that declare provisioning first, then the domains that declare
+/// Where a domain sits in the status listing: allowed (with `only` among
+/// them), undecided and denied domains that declare provisioning first, then the domains that declare
 /// none, then the virtual ones. Within a group the listing goes by name,
 /// case-insensitively, the same comparison `list_domains` uses.
 fn status_group(d: &DomainStatus) -> u8 {
@@ -839,7 +979,7 @@ fn status_group(d: &DomainStatus) -> u8 {
         return 3;
     }
     match d.decision {
-        Decision::Allowed => 0,
+        Decision::Allowed | Decision::Only => 0,
         Decision::Undecided => 1,
         Decision::Denied => 2,
     }
@@ -848,8 +988,12 @@ fn status_group(d: &DomainStatus) -> u8 {
 /// Which side of a provisioning decision a domain is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// `provision: true` - this domain's artifacts are provisioned.
+    /// `provision: true`, or an `except`/`also` map - everything the domain
+    /// ships is provisioned, apart from the names left out and the optional
+    /// artifacts not taken.
     Allowed,
+    /// `provision: {only: [...]}` - only the named artifacts are provisioned.
+    Only,
     /// `provision: false` - this domain's artifacts are never provisioned.
     Denied,
     /// `provision` absent - awaiting a decision.
@@ -859,9 +1003,10 @@ pub enum Decision {
 impl Decision {
     /// The decision a [`DomainEntry`]'s own `provision` field carries.
     fn from_entry(entry: &DomainEntry) -> Decision {
-        match entry.provision {
-            Some(true) => Decision::Allowed,
-            Some(false) => Decision::Denied,
+        match &entry.provision {
+            Some(Provision::All { .. }) => Decision::Allowed,
+            Some(Provision::Only(_)) => Decision::Only,
+            Some(Provision::Deny) => Decision::Denied,
             None => Decision::Undecided,
         }
     }
@@ -885,6 +1030,36 @@ pub struct DomainStatus {
     pub counts: BTreeMap<String, usize>,
     /// How many `Provisioning` bullets failed to parse into a declaration.
     pub parse_problems: usize,
+    /// The lists of the decision, `None` for plain `true`, `false` and
+    /// undecided.
+    pub selection: Option<Provision>,
+    /// Every artifact the domain ships, one row per key in kind order and
+    /// then by key, with whether this machine's decision installs it. Empty
+    /// for a virtual domain and a domain that declares no provisioning.
+    pub artifacts: Vec<ArtifactState>,
+    /// Names in the decision's lists the domain does not ship now. Only for
+    /// kinds whose root exists on disk: a missing root makes no name stale.
+    pub stale: Vec<String>,
+    /// Names in the decision's lists that are not `<kind>/<name>`.
+    pub malformed: Vec<String>,
+}
+
+/// One artifact a domain ships, as [`DomainStatus::artifacts`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactState {
+    /// The provisioning key, `<kind>/<name>`.
+    pub key: String,
+    /// The artifact's kind.
+    pub kind: ArtifactType,
+    /// The key without its `<kind>/` prefix.
+    pub name: String,
+    /// Whether the author marked it `metadata: { provision: optional }`.
+    pub optional: bool,
+    /// Whether this machine's decision selects it. This is not whether every
+    /// harness installs it (a harness may have no surface for the kind); the
+    /// harness rows say what is installed. Always `false` for an undecided or
+    /// denied domain.
+    pub on: bool,
 }
 
 /// One harness's provisioning status, read straight from the receipt and a
@@ -990,6 +1165,10 @@ pub fn status(
                 declares: false,
                 counts: BTreeMap::new(),
                 parse_problems: 0,
+                selection: selection_of(entry),
+                artifacts: Vec::new(),
+                stale: Vec::new(),
+                malformed: Vec::new(),
             });
             continue;
         }
@@ -1000,6 +1179,17 @@ pub fn status(
         let parse_problems = section.map(|s| s.problems.len()).unwrap_or(0);
         let roots = resolve_source_roots(name, entry);
         let (artifacts, _scan_notices) = scan_domain(name, &roots);
+        let (rows, stale, malformed) = if declares {
+            let rows = artifact_states(&artifacts, entry.provision.as_ref());
+            let (stale, malformed) = stale_and_malformed(
+                entry.provision.as_ref(),
+                &rows,
+                &model::present_kinds(&roots),
+            );
+            (rows, stale, malformed)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         domains.push(DomainStatus {
             domain: name.clone(),
             is_virtual: false,
@@ -1007,9 +1197,15 @@ pub fn status(
             declares,
             counts: count_artifacts(&artifacts),
             parse_problems,
+            selection: selection_of(entry),
+            artifacts: rows,
+            stale,
+            malformed,
         });
-        if decision == Decision::Allowed {
-            opted_artifacts.push(artifacts);
+        // Drift and orphans are counted against what `apply` would install:
+        // the decision's part of the scan, not the whole of it.
+        if let Some(provision) = entry.provision.as_ref().filter(|p| p.includes_any()) {
+            opted_artifacts.push(filter_artifacts(&artifacts, provision));
         }
     }
 
@@ -1063,6 +1259,82 @@ pub fn status(
     })
 }
 
+/// The decision's lists for [`DomainStatus::selection`]: the decision when
+/// it is a map, `None` for plain `true`, `false` and undecided.
+fn selection_of(entry: &DomainEntry) -> Option<Provision> {
+    entry.provision.clone().filter(|p| !p.is_plain_bool())
+}
+
+/// One row per artifact key of a full (unfiltered) scan, in kind order and
+/// then by key, with whether `decision` selects it.
+///
+/// Every file of a key shares one row: all files of a skill, and an `.md`
+/// and `.toml` agent with the same stem (the row is optional when any of its
+/// files is). Two MCP configs naming the same server give one row, the first
+/// in scan order, as [`list_artifacts`] does.
+fn artifact_states(
+    artifacts: &DomainArtifacts,
+    decision: Option<&Provision>,
+) -> Vec<ArtifactState> {
+    let mut rows: BTreeMap<(u8, String), (ArtifactType, bool)> = BTreeMap::new();
+    for file in &artifacts.files {
+        let slot = rows
+            .entry((model::kind_order(file.kind), artifact_key(file)))
+            .or_insert((file.kind, false));
+        slot.1 |= file.optional;
+    }
+    for mcp in &artifacts.mcps {
+        rows.entry((model::kind_order(ArtifactType::Mcps), mcp_key(mcp)))
+            .or_insert((ArtifactType::Mcps, mcp.optional));
+    }
+    rows.into_iter()
+        .map(|((_, key), (kind, optional))| {
+            let name = key
+                .split_once('/')
+                .map_or(key.as_str(), |(_, name)| name)
+                .to_string();
+            let on = decision.is_some_and(|d| d.selects(&key, optional));
+            ArtifactState {
+                key,
+                kind,
+                name,
+                optional,
+                on,
+            }
+        })
+        .collect()
+}
+
+/// The names in `decision`'s lists that are stale (well formed, of a kind
+/// whose root exists on disk, but not shipped now) and those that are
+/// malformed (not `<kind>/<name>`), each in list order without repeats.
+fn stale_and_malformed(
+    decision: Option<&Provision>,
+    rows: &[ArtifactState],
+    present: &[ArtifactType],
+) -> (Vec<String>, Vec<String>) {
+    let mut stale = Vec::new();
+    let mut malformed = Vec::new();
+    let Some(decision) = decision else {
+        return (stale, malformed);
+    };
+    let mut seen = HashSet::new();
+    for name in decision.names() {
+        if !seen.insert(name) {
+            continue;
+        }
+        match parse_artifact_key(name) {
+            None => malformed.push(name.to_string()),
+            Some((kind, _)) => {
+                if present.contains(&kind) && !rows.iter().any(|row| row.key == name) {
+                    stale.push(name.to_string());
+                }
+            }
+        }
+    }
+    (stale, malformed)
+}
+
 // --- session-start notices --------------------------------------------------
 
 /// The provisioning notices for one session start, appended after the routing
@@ -1113,10 +1385,14 @@ pub fn session_notices(
 
     // Opted-in file domains, in config order. A virtual domain can never ship
     // artifacts, so it is never part of the reconcile set - apply skips it too.
-    let opted: Vec<(&String, &DomainEntry)> = global
+    let opted: Vec<(&String, &DomainEntry, &Provision)> = global
         .domains
         .iter()
-        .filter(|(_, e)| e.provision == Some(true) && !e.is_virtual())
+        .filter(|(_, e)| !e.is_virtual())
+        .filter_map(|(name, e)| {
+            let decision = e.provision.as_ref().filter(|p| p.includes_any())?;
+            Some((name, e, decision))
+        })
         .collect();
     if opted.is_empty() {
         return pending_lines; // nothing opted in: only the pending block, if any
@@ -1135,20 +1411,26 @@ pub fn session_notices(
 
     // Stat-only walk of each domain's file sources (no hashing) plus a light
     // scan of its MCP configs (few, small) for the drift check below.
+    // The file walk is not filtered: `apply` stamps every scanned file, also
+    // those the decision leaves out. The MCP scan is filtered by the same
+    // decision `apply` uses, or a skipped server would read as drift on every
+    // session.
     let mut walked: BTreeMap<String, BTreeMap<String, FileStat>> = BTreeMap::new();
+    let mut fingerprints: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut mcp_artifacts: Vec<DomainArtifacts> = Vec::new();
-    for (name, entry) in &opted {
+    for (name, entry, decision) in &opted {
         let roots = resolve_source_roots(name, entry);
         let (mcp_roots, file_roots): (Vec<_>, Vec<_>) = roots
             .into_iter()
             .partition(|(kind, _)| *kind == ArtifactType::Mcps);
         walked.insert((*name).clone(), stat_file_sources(&file_roots));
+        fingerprints.insert((*name).clone(), decision.fingerprint());
         let (arts, _scan_notices) = scan_domain(name, &mcp_roots);
-        mcp_artifacts.push(arts);
+        mcp_artifacts.push(filter_artifacts(&arts, decision));
     }
 
     let work = matches!(
-        prefilter(Some(&receipt), &walked, harnesses),
+        prefilter(Some(&receipt), &walked, &fingerprints, harnesses),
         SessionWork::Work
     ) || mcp_drift(&mcp_artifacts, &receipt, harnesses);
     if !work {
@@ -1227,12 +1509,15 @@ enum SessionWork {
 /// harness current, the same reason `apply`'s doc comment gives) or skills
 /// records that sit under the wrong row: a folder's records under a harness
 /// that no longer owns it, or a departed harness's copies an installed one
-/// still reads ([`StrandedSkills`], the cover of a read-covered harness left).
-/// MCP drift is
-/// judged separately by [`mcp_drift`], since MCP configs carry no source stamp.
+/// still reads ([`StrandedSkills`], the cover of a read-covered harness left),
+/// or a domain whose decision fingerprint in `fingerprints` differs from the
+/// one stamped at the last apply (a hand-edited pick; a receipt without a
+/// fingerprint matches plain `true`). MCP drift is judged separately by
+/// [`mcp_drift`], since MCP configs carry no source stamp.
 fn prefilter(
     receipt: Option<&ProvisionReceipt>,
     walked: &BTreeMap<String, BTreeMap<String, FileStat>>,
+    fingerprints: &BTreeMap<String, Option<String>>,
     harnesses: &[HarnessKind],
 ) -> SessionWork {
     let Some(receipt) = receipt else {
@@ -1253,6 +1538,10 @@ fn prefilter(
         let Some(stamped) = receipt.sources.get(domain) else {
             return SessionWork::Work; // unreachable: set equality checked above
         };
+        let fingerprint = fingerprints.get(domain).cloned().flatten();
+        if stamped.decision != fingerprint {
+            return SessionWork::Work;
+        }
         if files.len() != stamped.files.len() {
             return SessionWork::Work;
         }
@@ -1285,7 +1574,8 @@ fn prefilter(
 /// stamp - the receipt's `sources` tracks file artifacts only - so this is the
 /// one place the session path rescans, which stays cheap because MCP configs
 /// are always few and small. `mcp_artifacts` holds each opted-in domain's
-/// freshly scanned MCP set (its files left empty); the comparison mirrors what
+/// freshly scanned MCP set (its files left empty), already passed through
+/// [`filter_artifacts`] with the domain's decision; the comparison mirrors what
 /// `apply` would act on for each harness, so a match here means apply would
 /// raise no MCP action at all.
 fn mcp_drift(
@@ -1580,14 +1870,16 @@ fn is_file_change(status: ActionStatus) -> bool {
 }
 
 /// One line per undecided domain that ships artifacts, naming its per-type
-/// counts and how to decide - raise it with the user, then apply the decision
-/// with the `provision` tool or the CLI. Empty when nothing is pending.
+/// counts and how to decide - ask the user for all, none or a pick, then apply
+/// it with the `provision` tool or the CLI. Counts only: no frontmatter is
+/// read here, so the hook keeps its latency budget; `provision status` lists
+/// each artifact and its optional mark. Empty when nothing is pending.
 fn render_pending(pending: &[PendingDomain]) -> Vec<String> {
     pending
         .iter()
         .map(|p| {
             format!(
-                "[crystalline] The `{}` domain ships artifacts to provision ({}) but has no decision yet - ask the user, then apply it with the `provision` tool or `crystalline provision allow {}`.",
+                "[crystalline] The `{}` domain ships artifacts to provision ({}) but has no decision yet - ask the user whether to install all, none or only some of them, then apply the answer with the `provision` tool (allow, deny, take or skip) or `crystalline provision allow {}`.",
                 p.domain,
                 render_counts(&p.counts),
                 p.domain
@@ -1596,11 +1888,25 @@ fn render_pending(pending: &[PendingDomain]) -> Vec<String> {
         .collect()
 }
 
-/// A domain's artifact counts as `kind: n` pairs in a stable order, for a
-/// pending line - for example `skills: 2, commands: 1`.
+/// A domain's artifact counts as `kind: n` pairs in [`ArtifactType`]
+/// declaration order, for a pending line - for example
+/// `skills: 2, commands: 1`. An id that names no kind goes last.
 fn render_counts(counts: &BTreeMap<String, usize>) -> String {
-    counts
-        .iter()
+    const ORDER: [ArtifactType; 4] = [
+        ArtifactType::Skills,
+        ArtifactType::Commands,
+        ArtifactType::Agents,
+        ArtifactType::Mcps,
+    ];
+    let mut pairs: Vec<(&String, &usize)> = counts.iter().collect();
+    pairs.sort_by_key(|(kind, _)| {
+        ORDER
+            .iter()
+            .position(|k| k.id() == kind.as_str())
+            .unwrap_or(ORDER.len())
+    });
+    pairs
+        .into_iter()
         .map(|(kind, n)| format!("{kind}: {n}"))
         .collect::<Vec<_>>()
         .join(", ")
@@ -1896,12 +2202,163 @@ mod tests {
                     ("skills/tide-tables/SKILL.md".to_string(), stamp(100, 10)),
                     ("agents/quartermaster.md".to_string(), stamp(200, 20)),
                 ]),
+                ..DomainSources::default()
             },
         );
         receipt
             .harnesses
             .insert("claude-code".to_string(), HarnessState::default());
         receipt
+    }
+
+    /// The config's fingerprints when every walked domain says plain `true`:
+    /// no entry reads as `None`, the fingerprint of plain `true`.
+    fn no_picks() -> BTreeMap<String, Option<String>> {
+        BTreeMap::new()
+    }
+
+    #[test]
+    fn prefilter_work_when_the_decision_fingerprint_changed() {
+        let skip = Provision::All {
+            except: vec!["skills/tide-tables".to_string()],
+            also: Vec::new(),
+        };
+        let picks = BTreeMap::from([("harbor".to_string(), skip.fingerprint())]);
+        assert_eq!(
+            prefilter(
+                Some(&steady_receipt()),
+                &steady_walk(),
+                &picks,
+                &[HarnessKind::ClaudeCode]
+            ),
+            SessionWork::Work,
+            "a hand-edited pick differs from the stamped plain true"
+        );
+
+        let mut receipt = steady_receipt();
+        receipt.sources.get_mut("harbor").unwrap().decision = skip.fingerprint();
+        assert_eq!(
+            prefilter(
+                Some(&receipt),
+                &steady_walk(),
+                &picks,
+                &[HarnessKind::ClaudeCode]
+            ),
+            SessionWork::NoWork,
+            "the stamped pick matches"
+        );
+        assert_eq!(
+            prefilter(
+                Some(&receipt),
+                &steady_walk(),
+                &no_picks(),
+                &[HarnessKind::ClaudeCode]
+            ),
+            SessionWork::Work,
+            "going back to plain true is a change too"
+        );
+    }
+
+    // --- filter_artifacts ---------------------------------------------------------
+
+    fn file(kind: ArtifactType, rel: &str, optional: bool) -> ArtifactFile {
+        ArtifactFile {
+            kind,
+            rel: rel.to_string(),
+            source: PathBuf::from(rel),
+            sha256: String::new(),
+            optional,
+        }
+    }
+
+    fn mcp(name: &str, optional: bool) -> McpArtifact {
+        McpArtifact {
+            name: name.to_string(),
+            server_json: "{}".to_string(),
+            sha256: String::new(),
+            optional,
+        }
+    }
+
+    /// A domain with a two-file skill, an `.md` and `.toml` agent pair, a
+    /// nested command and two MCP servers, one of them optional.
+    fn mixed_domain() -> DomainArtifacts {
+        DomainArtifacts {
+            domain: "harbor".to_string(),
+            files: vec![
+                file(ArtifactType::Skills, "tide-tables/SKILL.md", false),
+                file(ArtifactType::Skills, "tide-tables/scripts/chart.sh", false),
+                file(ArtifactType::Skills, "storm-warnings/SKILL.md", true),
+                file(ArtifactType::Commands, "charts/plot-route.md", false),
+                file(ArtifactType::Agents, "quartermaster.md", false),
+                file(ArtifactType::Agents, "quartermaster.toml", false),
+            ],
+            mcps: vec![mcp("lighthouse", false), mcp("foghorn", true)],
+        }
+    }
+
+    fn kept(artifacts: &DomainArtifacts) -> Vec<String> {
+        let files = artifacts
+            .files
+            .iter()
+            .map(|f| format!("{}/{}", f.kind.id(), f.rel));
+        let mcps = artifacts.mcps.iter().map(mcp_key);
+        files.chain(mcps).collect()
+    }
+
+    #[test]
+    fn filter_artifacts_keeps_or_drops_every_file_of_one_key_together() {
+        let domain = mixed_domain();
+        let except = Provision::All {
+            except: vec![
+                "skills/tide-tables".to_string(),
+                "agents/quartermaster".to_string(),
+            ],
+            also: vec!["mcps/foghorn".to_string()],
+        };
+        assert_eq!(
+            kept(&filter_artifacts(&domain, &except)),
+            vec![
+                "commands/charts/plot-route.md",
+                "mcps/lighthouse",
+                "mcps/foghorn"
+            ]
+        );
+
+        let only = Provision::Only(vec![
+            "skills/tide-tables".to_string(),
+            "agents/quartermaster".to_string(),
+            "skills/storm-warnings".to_string(),
+        ]);
+        assert_eq!(
+            kept(&filter_artifacts(&domain, &only)),
+            vec![
+                "skills/tide-tables/SKILL.md",
+                "skills/tide-tables/scripts/chart.sh",
+                "skills/storm-warnings/SKILL.md",
+                "agents/quartermaster.md",
+                "agents/quartermaster.toml"
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_artifacts_under_plain_true_leaves_out_only_optional_artifacts() {
+        let domain = mixed_domain();
+        let filtered = filter_artifacts(&domain, &Provision::all());
+        assert_eq!(filtered.domain, "harbor");
+        assert_eq!(
+            kept(&filtered),
+            vec![
+                "skills/tide-tables/SKILL.md",
+                "skills/tide-tables/scripts/chart.sh",
+                "commands/charts/plot-route.md",
+                "agents/quartermaster.md",
+                "agents/quartermaster.toml",
+                "mcps/lighthouse"
+            ]
+        );
+        assert!(kept(&filter_artifacts(&domain, &Provision::Deny)).is_empty());
     }
 
     fn steady_walk() -> BTreeMap<String, BTreeMap<String, FileStat>> {
@@ -1932,6 +2389,7 @@ mod tests {
             prefilter(
                 Some(&steady_receipt()),
                 &steady_walk(),
+                &no_picks(),
                 &[HarnessKind::ClaudeCode]
             ),
             SessionWork::NoWork
@@ -1947,7 +2405,12 @@ mod tests {
             .unwrap()
             .mtime = 201;
         assert_eq!(
-            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            prefilter(
+                Some(&steady_receipt()),
+                &walk,
+                &no_picks(),
+                &[HarnessKind::ClaudeCode]
+            ),
             SessionWork::Work
         );
     }
@@ -1961,7 +2424,12 @@ mod tests {
             .unwrap()
             .size = 11;
         assert_eq!(
-            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            prefilter(
+                Some(&steady_receipt()),
+                &walk,
+                &no_picks(),
+                &[HarnessKind::ClaudeCode]
+            ),
             SessionWork::Work
         );
     }
@@ -1971,7 +2439,12 @@ mod tests {
         let mut walk = steady_walk();
         walk.insert("cove".to_string(), BTreeMap::new());
         assert_eq!(
-            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            prefilter(
+                Some(&steady_receipt()),
+                &walk,
+                &no_picks(),
+                &[HarnessKind::ClaudeCode]
+            ),
             SessionWork::Work
         );
     }
@@ -1985,7 +2458,12 @@ mod tests {
             .sources
             .insert("cove".to_string(), DomainSources::default());
         assert_eq!(
-            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::ClaudeCode]),
+            prefilter(
+                Some(&receipt),
+                &steady_walk(),
+                &no_picks(),
+                &[HarnessKind::ClaudeCode]
+            ),
             SessionWork::Work
         );
     }
@@ -2001,7 +2479,12 @@ mod tests {
             },
         );
         assert_eq!(
-            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            prefilter(
+                Some(&steady_receipt()),
+                &walk,
+                &no_picks(),
+                &[HarnessKind::ClaudeCode]
+            ),
             SessionWork::Work
         );
     }
@@ -2014,6 +2497,7 @@ mod tests {
             prefilter(
                 Some(&steady_receipt()),
                 &steady_walk(),
+                &no_picks(),
                 &[HarnessKind::ClaudeCode, HarnessKind::Codex]
             ),
             SessionWork::Work
@@ -2044,12 +2528,22 @@ mod tests {
             .harnesses
             .insert("codex".to_string(), HarnessState::default());
         assert_eq!(
-            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::Cursor]),
+            prefilter(
+                Some(&receipt),
+                &steady_walk(),
+                &no_picks(),
+                &[HarnessKind::Cursor]
+            ),
             SessionWork::Work
         );
         // Codex never reads ~/.claude/skills: nothing is stranded for it.
         assert_eq!(
-            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::Codex]),
+            prefilter(
+                Some(&receipt),
+                &steady_walk(),
+                &no_picks(),
+                &[HarnessKind::Codex]
+            ),
             SessionWork::NoWork
         );
     }
@@ -2057,7 +2551,12 @@ mod tests {
     #[test]
     fn prefilter_advisory_when_the_receipt_would_not_load() {
         assert_eq!(
-            prefilter(None, &steady_walk(), &[HarnessKind::ClaudeCode]),
+            prefilter(
+                None,
+                &steady_walk(),
+                &no_picks(),
+                &[HarnessKind::ClaudeCode]
+            ),
             SessionWork::Advisory
         );
     }
@@ -2164,7 +2663,7 @@ mod tests {
     }
 
     fn with_decision(mut entry: DomainEntry, decision: Option<bool>) -> DomainEntry {
-        entry.provision = decision;
+        entry.provision = decision.map(Provision::from);
         entry
     }
 
@@ -2331,6 +2830,297 @@ mod tests {
         assert_eq!(
             report.harnesses[0].drift, 0,
             "the first-declared domain wins"
+        );
+    }
+
+    // --- status artifact rows ------------------------------------------------------
+
+    const OPTIONAL_MARK: &str = "---\nmetadata:\n  provision: optional\n---\n\nBody.\n";
+
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// A harbor that declares skills, agents and mcps: `skills/tide`
+    /// (required, two files), `skills/storm` (optional), `agents/pilot`
+    /// (required), `mcps/buoy` (required) and `mcps/lighthouse` (optional).
+    fn marked_harbor() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_manifest(
+            root,
+            "## Provisioning\n\n- skills: skills\n- agents: agents\n- mcps: mcps\n",
+        );
+        write_file(
+            root,
+            "skills/tide/SKILL.md",
+            "---\nname: tide\n---\n\nTides.\n",
+        );
+        write_file(root, "skills/tide/notes.md", "Notes.\n");
+        write_file(root, "skills/storm/SKILL.md", OPTIONAL_MARK);
+        write_file(root, "agents/pilot.md", "Steer.\n");
+        write_file(
+            root,
+            "mcps/buoy.json",
+            r#"{"name": "buoy", "server": {"type": "stdio"}}"#,
+        );
+        write_file(
+            root,
+            "mcps/lighthouse.json",
+            r#"{"name": "lighthouse", "metadata": {"provision": "optional"}, "server": {"type": "http"}}"#,
+        );
+        dir
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn status_of(global: &GlobalConfig) -> StatusReport {
+        let receipts = tempfile::tempdir().unwrap();
+        status(
+            global,
+            &receipts.path().join("receipt.json"),
+            &[],
+            &HashSet::new(),
+        )
+        .unwrap()
+    }
+
+    fn rows(d: &DomainStatus) -> Vec<(&str, bool, bool)> {
+        d.artifacts
+            .iter()
+            .map(|a| (a.key.as_str(), a.optional, a.on))
+            .collect()
+    }
+
+    fn domain<'a>(report: &'a StatusReport, name: &str) -> &'a DomainStatus {
+        report.domains.iter().find(|d| d.domain == name).unwrap()
+    }
+
+    fn picked_entry(dir: &Path, decision: Provision) -> DomainEntry {
+        let mut entry = DomainEntry::file(dir);
+        entry.provision = Some(decision);
+        entry
+    }
+
+    #[test]
+    fn status_lists_every_artifact_on_or_off_with_its_optional_mark() {
+        let (picked, plain, undecided, denied) = (
+            marked_harbor(),
+            marked_harbor(),
+            marked_harbor(),
+            marked_harbor(),
+        );
+        let pick = Provision::All {
+            except: names(&["skills/tide"]),
+            also: names(&["mcps/lighthouse"]),
+        };
+        let mut global = GlobalConfig::default();
+        let d = &mut global.domains;
+        d.insert("picked".into(), picked_entry(picked.path(), pick.clone()));
+        d.insert(
+            "plain".into(),
+            with_decision(DomainEntry::file(plain.path()), Some(true)),
+        );
+        d.insert("undecided".into(), DomainEntry::file(undecided.path()));
+        d.insert(
+            "denied".into(),
+            with_decision(DomainEntry::file(denied.path()), Some(false)),
+        );
+        let report = status_of(&global);
+
+        let picked = domain(&report, "picked");
+        assert_eq!(picked.selection, Some(pick));
+        assert_eq!(
+            rows(picked),
+            [
+                ("skills/storm", true, false),
+                ("skills/tide", false, false),
+                ("agents/pilot", false, true),
+                ("mcps/buoy", false, true),
+                ("mcps/lighthouse", true, true),
+            ]
+        );
+        let tide = &picked.artifacts[1];
+        assert_eq!(tide.kind, ArtifactType::Skills);
+        assert_eq!(tide.name, "tide");
+        assert!(picked.stale.is_empty() && picked.malformed.is_empty());
+
+        let plain = domain(&report, "plain");
+        assert_eq!(plain.selection, None);
+        assert_eq!(
+            rows(plain),
+            [
+                ("skills/storm", true, false),
+                ("skills/tide", false, true),
+                ("agents/pilot", false, true),
+                ("mcps/buoy", false, true),
+                ("mcps/lighthouse", true, false),
+            ]
+        );
+
+        for name in ["undecided", "denied"] {
+            let d = domain(&report, name);
+            assert_eq!(d.selection, None, "{name}");
+            assert_eq!(d.artifacts.len(), 5, "{name}");
+            assert!(d.artifacts.iter().all(|a| !a.on), "{name}");
+            let optional: Vec<&str> = d
+                .artifacts
+                .iter()
+                .filter(|a| a.optional)
+                .map(|a| a.key.as_str())
+                .collect();
+            assert_eq!(optional, ["skills/storm", "mcps/lighthouse"], "{name}");
+        }
+    }
+
+    #[test]
+    fn status_keeps_empty_artifact_lists_for_virtual_and_undeclaring_domains() {
+        let plain = tempfile::tempdir().unwrap();
+        write_manifest(plain.path(), "");
+        write_file(plain.path(), "skills/tide/SKILL.md", "Tides.\n");
+        let pick = Provision::Only(names(&["nonsense", "skills/gone"]));
+        let mut global = GlobalConfig::default();
+        global
+            .domains
+            .insert("plain".into(), picked_entry(plain.path(), pick.clone()));
+        let mut virtual_entry = DomainEntry::virtual_domain();
+        virtual_entry.provision = Some(pick);
+        global.domains.insert("cloud".into(), virtual_entry);
+        let report = status_of(&global);
+
+        assert_eq!(report.domains.len(), 2);
+        for d in &report.domains {
+            assert!(d.artifacts.is_empty(), "{}", d.domain);
+            assert!(d.stale.is_empty(), "{}", d.domain);
+            assert!(d.malformed.is_empty(), "{}", d.domain);
+        }
+    }
+
+    #[test]
+    fn status_names_stale_and_malformed_names() {
+        let (picked, only) = (marked_harbor(), marked_harbor());
+        let mut global = GlobalConfig::default();
+        let pick = Provision::All {
+            except: names(&["skills/old-charts", "skills", "boats/dinghy", "skills/tide"]),
+            also: names(&["mcps/gone", "mcps/lighthouse", "skills/old-charts"]),
+        }
+        .normalized();
+        global
+            .domains
+            .insert("picked".into(), picked_entry(picked.path(), pick));
+        let pick = Provision::Only(names(&["agents/pilot", "agents/ghost"])).normalized();
+        global
+            .domains
+            .insert("only".into(), picked_entry(only.path(), pick));
+        let report = status_of(&global);
+
+        let picked = domain(&report, "picked");
+        // `except` before `also`, each sorted; a name in both lists once.
+        assert_eq!(picked.stale, names(&["skills/old-charts", "mcps/gone"]));
+        assert_eq!(picked.malformed, names(&["boats/dinghy", "skills"]));
+        // A stale or malformed name adds no artifact row.
+        assert_eq!(picked.artifacts.len(), 5);
+
+        let only = domain(&report, "only");
+        assert_eq!(only.decision, Decision::Only);
+        assert_eq!(only.stale, names(&["agents/ghost"]));
+        assert!(only.malformed.is_empty());
+        assert_eq!(
+            rows(only),
+            [
+                ("skills/storm", true, false),
+                ("skills/tide", false, false),
+                ("agents/pilot", false, true),
+                ("mcps/buoy", false, false),
+                ("mcps/lighthouse", true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_root_reports_no_stale_names() {
+        let dir = tempfile::tempdir().unwrap();
+        // Commands and mcps are declared, but only the skills root is on disk
+        // (a mirror not pulled, a tools repository not checked out).
+        write_manifest(
+            dir.path(),
+            "## Provisioning\n\n- skills: skills\n- commands: commands\n- mcps: mcps\n",
+        );
+        write_file(dir.path(), "skills/tide/SKILL.md", "Tides.\n");
+        let pick = Provision::Only(names(&[
+            "commands/charts/plot-route",
+            "mcps/lighthouse",
+            "skills/old-charts",
+            "skills/tide",
+        ]));
+        let mut global = GlobalConfig::default();
+        global
+            .domains
+            .insert("harbor".into(), picked_entry(dir.path(), pick));
+        let report = status_of(&global);
+
+        let harbor = domain(&report, "harbor");
+        assert_eq!(harbor.stale, names(&["skills/old-charts"]));
+        assert_eq!(rows(harbor), [("skills/tide", false, true)]);
+    }
+
+    #[test]
+    fn only_sorts_with_allowed() {
+        let (alpha, bravo, aaa, abc) = (
+            shipping_domain("a1", "# A\n"),
+            shipping_domain("a2", "# A\n"),
+            shipping_domain("a3", "# A\n"),
+            shipping_domain("a4", "# A\n"),
+        );
+        let mut global = GlobalConfig::default();
+        let d = &mut global.domains;
+        d.insert(
+            "abc".into(),
+            with_decision(DomainEntry::file(abc.path()), Some(false)),
+        );
+        d.insert("aaa".into(), DomainEntry::file(aaa.path()));
+        d.insert(
+            "bravo".into(),
+            picked_entry(bravo.path(), Provision::Only(names(&["agents/a2"]))),
+        );
+        d.insert(
+            "alpha".into(),
+            with_decision(DomainEntry::file(alpha.path()), Some(true)),
+        );
+        let report = status_of(&global);
+
+        let order: Vec<(&str, Decision)> = report
+            .domains
+            .iter()
+            .map(|d| (d.domain.as_str(), d.decision))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("alpha", Decision::Allowed),
+                ("bravo", Decision::Only),
+                ("aaa", Decision::Undecided),
+                ("abc", Decision::Denied),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_pending_offers_all_none_or_pick() {
+        let pending = [PendingDomain {
+            domain: "harbor".to_string(),
+            counts: BTreeMap::from([("skills".to_string(), 2), ("mcps".to_string(), 1)]),
+        }];
+        assert_eq!(
+            render_pending(&pending),
+            vec![
+                "[crystalline] The `harbor` domain ships artifacts to provision (skills: 2, mcps: 1) but has no decision yet - ask the user whether to install all, none or only some of them, then apply the answer with the `provision` tool (allow, deny, take or skip) or `crystalline provision allow harbor`."
+                    .to_string()
+            ]
         );
     }
 }

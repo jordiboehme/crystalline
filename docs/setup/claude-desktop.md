@@ -46,7 +46,7 @@ Run `crystalline uninstall claude-desktop`. It deletes the built extension and C
 
 ## How it starts
 
-It starts with no domains: the agent creates one with the `add_domain` tool whenever it needs somewhere to capture knowledge - a folder of markdown files under your `Documents/Crystalline` folder, a database-backed domain or a GitHub team domain. Onboarding is automatic on every connection (see [Session onboarding](../learning-loop.md#session-onboarding)). The daemon serves the web UI at `http://localhost:7411` by default, where the first visit creates your admin account. The [Claude Desktop extension scenario](../deployment.md#claude-desktop-extension) shows how it works underneath.
+It starts with no domains: the agent creates one with the `add_domain` tool whenever it needs somewhere to capture knowledge - a folder of markdown files under the hidden `.crystalline` folder in your home, a database-backed domain or a GitHub team domain. Onboarding is automatic on every connection (see [Session onboarding](../learning-loop.md#session-onboarding)). The daemon serves the web UI at `http://localhost:7411` by default, where the first visit creates your admin account. The [Claude Desktop extension scenario](../deployment.md#claude-desktop-extension) shows how it works underneath.
 
 ## "Install Crystalline first"
 

@@ -173,7 +173,7 @@ fn apply_opts_in_domain_installs_files_and_stamps_sources() {
     write_harbor(domain_dir.path());
 
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let global = config_with("harbor", entry);
 
     let receipt_dir = tempfile::tempdir().unwrap();
@@ -250,7 +250,7 @@ fn apply_opt_out_removes_files_and_drops_source_stamps() {
     let previous = set_home(home.path());
 
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let allowed = config_with("harbor", entry.clone());
     provision::apply(
         &allowed,
@@ -266,7 +266,7 @@ fn apply_opt_out_removes_files_and_drops_source_stamps() {
             .exists()
     );
 
-    entry.provision = Some(false);
+    entry.provision = Some(crystalline_core::config::Provision::Deny);
     let denied = config_with("harbor", entry);
     let report = provision::apply(
         &denied,
@@ -306,7 +306,7 @@ fn apply_rename_at_source_removes_old_target_and_installs_new() {
     write(domain_dir.path(), "skills/tide-tables/SKILL.md", "tides\n");
 
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let global = config_with("harbor", entry);
 
     let receipt_dir = tempfile::tempdir().unwrap();
@@ -361,7 +361,7 @@ fn apply_with_no_installed_harnesses_writes_nothing_and_suggests_install() {
     write(domain_dir.path(), "skills/tide-tables/SKILL.md", "tides\n");
 
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let global = config_with("harbor", entry);
 
     let receipt_dir = tempfile::tempdir().unwrap();
@@ -425,7 +425,7 @@ fn apply_virtual_domain_opted_in_produces_a_notice_and_nothing_else() {
     let _guard = HOME_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut entry = DomainEntry::virtual_domain();
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let global = config_with("notes", entry);
 
     let receipt_dir = tempfile::tempdir().unwrap();
@@ -463,7 +463,7 @@ fn apply_corrupt_receipt_is_regenerated_with_a_notice() {
     write(domain_dir.path(), "skills/tide-tables/SKILL.md", "tides\n");
 
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let global = config_with("harbor", entry);
 
     let receipt_dir = tempfile::tempdir().unwrap();
@@ -508,7 +508,7 @@ fn status_reflects_decisions_counts_and_edits_without_writing() {
     write_harbor(domain_dir.path());
 
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let global = config_with("harbor", entry);
 
     let receipt_dir = tempfile::tempdir().unwrap();
@@ -590,10 +590,10 @@ fn status_reports_missing_files_and_virtual_decisions() {
     write(domain_dir.path(), "skills/tide-tables/SKILL.md", "tides\n");
 
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let mut global = config_with("harbor", entry);
     let mut virtual_entry = DomainEntry::virtual_domain();
-    virtual_entry.provision = Some(false);
+    virtual_entry.provision = Some(crystalline_core::config::Provision::Deny);
     global.domains.insert("notes".to_string(), virtual_entry);
 
     let receipt_dir = tempfile::tempdir().unwrap();
@@ -643,7 +643,7 @@ fn skills_only_domain() -> (tempfile::TempDir, GlobalConfig) {
         "---\nname: tide-tables\n---\n\nReads the tides.\n",
     );
     let mut entry = DomainEntry::file(domain_dir.path());
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     let global = config_with("harbor", entry);
     (domain_dir, global)
 }
@@ -803,7 +803,8 @@ fn run_apply(
 }
 
 fn deny(global: &mut GlobalConfig) {
-    global.domains.get_mut("harbor").unwrap().provision = Some(false);
+    global.domains.get_mut("harbor").unwrap().provision =
+        Some(crystalline_core::config::Provision::Deny);
 }
 
 fn statuses(report: &provision::ApplyReport, h: HarnessKind) -> Vec<ActionStatus> {
@@ -1209,3 +1210,7 @@ fn any_domain_declares_true_and_false_fixtures() {
         .insert("notes".to_string(), DomainEntry::virtual_domain());
     assert!(!provision::any_domain_declares(&plain_global));
 }
+
+// --- a pick of single artifacts and the optional mark --------------------------
+
+mod select;

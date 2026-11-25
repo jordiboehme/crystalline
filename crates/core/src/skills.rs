@@ -542,6 +542,10 @@ mod tests {
                 "crystalline-",
                 "the reserved prefix is named so the agent avoids it",
             ),
+            ("\"action\": \"skip\"", "the pick is shown with a skip call"),
+            ("take", "the agent can install single artifacts"),
+            ("optional", "the optional mark is taught"),
+            ("all, none or pick", "the decision question offers a pick"),
         ] {
             assert!(s.contains(needle), "{why}: missing {needle:?}");
         }

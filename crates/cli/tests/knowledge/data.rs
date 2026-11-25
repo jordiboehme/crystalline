@@ -2503,7 +2503,7 @@ fn team_config(config: &Path, root: &Path) {
         branch: Some("trunk".to_string()),
         poll_secs: None,
     });
-    entry.provision = Some(true);
+    entry.provision = Some(crystalline_core::config::Provision::all());
     entry.review = Some(ReviewMode::Overlay);
     cfg.domains.insert("eng".to_string(), entry);
     crystalline_core::config::save_yaml(config, &cfg).unwrap();

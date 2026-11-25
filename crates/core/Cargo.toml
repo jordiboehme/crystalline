@@ -43,7 +43,9 @@ libc = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 # The roaming folder from the known-folder API (`config::roaming_root`): the
 # same three features etcetera already enables, so nothing new is built.
-windows-sys = { workspace = true, features = ["Win32_System_Com", "Win32_UI_Shell"] }
+# `Win32_Storage_FileSystem` sets the hidden attribute on the default domains
+# root (`config::root_folder`).
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 minisign = { workspace = true }

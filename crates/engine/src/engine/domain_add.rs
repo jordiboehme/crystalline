@@ -46,6 +46,10 @@ impl Engine {
         // Before the folder is created or a MANIFEST scaffolded: the
         // registration at the end would refuse a file that does not parse.
         self.refuse_a_config_that_does_not_parse()?;
+        // Before the configuration changes and before the default folder is
+        // derived: an install whose domains live in the old default root
+        // keeps it, and a first add is recorded however it is placed.
+        self.pin_before_registration()?;
 
         // Against every registration this instance has, not the startup
         // snapshot alone: a domain the CLI registered after this engine
@@ -81,11 +85,15 @@ impl Engine {
 
         // An explicit folder wins; otherwise a named domain lands under the
         // configured root at `<root>/<name>`.
+        let mut default_root = None;
         let root = match folder {
             Some(f) => crystalline_core::config::expand_tilde(f),
             None => {
                 let domains_root = self.config.read().unwrap().domains_root();
-                origin::default_domain_folder(&domains_root, name.expect("checked above"))
+                let root =
+                    origin::default_domain_folder(&domains_root, name.expect("checked above"));
+                default_root = Some(domains_root);
+                root
             }
         };
         // Decided on the folder as it will be spelled once it exists, before
@@ -145,7 +153,11 @@ impl Engine {
             self.set_aside_orphan_kept(&domain_name);
         }
 
-        // Decided: only now does the folder come into being.
+        // Decided: only now does the folder come into being, and the root
+        // with it when the domain lands at the default placement.
+        if let Some(domains_root) = &default_root {
+            root_pin::prepare_default_root(domains_root)?;
+        }
         std::fs::create_dir_all(&root).map_err(|e| {
             EngineError::Internal(format!("creating domain directory {}: {e}", root.display()))
         })?;
@@ -245,6 +257,9 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // Recorded like every registration, so a later file domain under the
+        // old default root is not mistaken for an install from before 0.37.
+        self.pin_before_registration()?;
         // A name a connected server already gave out is the mount's; a new
         // local domain under it is the latecomer and gets the local suffix
         // (decision D13).

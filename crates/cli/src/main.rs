@@ -267,7 +267,7 @@ enum Command {
     /// harness this machine has onboarded: skills, commands, agents and MCP
     /// servers land under (or come out of) each harness's own config
     /// directory. Bare `provision` reconciles the decisions already on
-    /// file; `status`, `allow` and `deny` are subcommands.
+    /// file; `status`, `allow`, `deny`, `take` and `skip` are subcommands.
     Provision {
         #[command(subcommand)]
         command: Option<ProvisionCommand>,
@@ -1502,7 +1502,7 @@ enum DomainCommand {
         name: Option<String>,
         /// The domain root directory. Omitted for a virtual domain. For a
         /// file domain, defaults to <domains_root>/<name>
-        /// (~/Documents/Crystalline/<name> unless configured) when a name is
+        /// (~/.crystalline/<name> unless configured) when a name is
         /// given and this is omitted; with `--origin` this is where the team
         /// domain lives on this machine, and existing files there are kept.
         /// A lone argument on the command line is always the NAME: use
@@ -2206,7 +2206,9 @@ enum ProvisionCommand {
         config: Option<PathBuf>,
     },
     /// Opt a domain in to provisioning its declared artifacts, then
-    /// reconcile.
+    /// reconcile. This installs everything except optional artifacts you
+    /// did not take. `deny` installs nothing. Both replace a pick made with
+    /// `take` or `skip`, but `allow` keeps the optional artifacts you took.
     Allow {
         /// The domain to opt in.
         domain: String,
@@ -2216,9 +2218,43 @@ enum ProvisionCommand {
     },
     /// Opt a domain out of provisioning its declared artifacts, then
     /// reconcile - this removes any artifacts it previously shipped.
+    /// `allow` installs everything except optional artifacts you did not
+    /// take; `deny` installs nothing. Both replace a pick made with `take`
+    /// or `skip`, but `allow` keeps the optional artifacts you took.
     Deny {
         /// The domain to opt out.
         domain: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Leave out single artifacts of a domain, then reconcile. On a domain
+    /// with no decision yet this installs everything else. A skipped
+    /// artifact that is installed is removed. `allow` or `deny` later
+    /// replaces the pick.
+    Skip {
+        /// The domain to pick from.
+        domain: String,
+        /// Artifacts as <kind>/<name>, for example skills/tide-tables.
+        /// `provision status` lists them.
+        #[arg(required = true, num_args = 1..)]
+        artifacts: Vec<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Install single artifacts of a domain, then reconcile. On a domain
+    /// with no decision yet, or a denied one, this installs only these. Use
+    /// it for an artifact the author marked optional, too. `allow` or
+    /// `deny` later replaces the pick, but `allow` keeps the optional
+    /// artifacts you took.
+    Take {
+        /// The domain to pick from.
+        domain: String,
+        /// Artifacts as <kind>/<name>, for example skills/tide-tables.
+        /// `provision status` lists them.
+        #[arg(required = true, num_args = 1..)]
+        artifacts: Vec<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -3829,7 +3865,8 @@ fn print_setting_result(data: &serde_json::Value, json: bool) {
     }
 }
 
-/// `provision`/`provision status`/`provision allow`/`provision deny`:
+/// `provision`/`provision status`/`provision allow`/`provision deny`/
+/// `provision take`/`provision skip`:
 /// socket-first with an in-process fallback, handled inside
 /// `crystalline_service::client::provision`. Bare `provision` applies the
 /// decisions already on file; the subcommands report status or record one
@@ -3839,14 +3876,33 @@ async fn provision_dispatch(
     config: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let (action, domain, config, all) = match command {
-        None => ("apply", None, config, false),
-        Some(ProvisionCommand::Status { all, config }) => ("status", None, config, all),
-        Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config, false),
-        Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config, false),
+    let (action, domain, artifacts, config, all) = match command {
+        None => ("apply", None, Vec::new(), config, false),
+        Some(ProvisionCommand::Status { all, config }) => ("status", None, Vec::new(), config, all),
+        Some(ProvisionCommand::Allow { domain, config }) => {
+            ("allow", Some(domain), Vec::new(), config, false)
+        }
+        Some(ProvisionCommand::Deny { domain, config }) => {
+            ("deny", Some(domain), Vec::new(), config, false)
+        }
+        Some(ProvisionCommand::Skip {
+            domain,
+            artifacts,
+            config,
+        }) => ("skip", Some(domain), artifacts, config, false),
+        Some(ProvisionCommand::Take {
+            domain,
+            artifacts,
+            config,
+        }) => ("take", Some(domain), artifacts, config, false),
     };
-    let data = crystalline_service::client::provision(action, domain.as_deref(), config.as_deref())
-        .await?;
+    let data = crystalline_service::client::provision(
+        action,
+        domain.as_deref(),
+        &artifacts,
+        config.as_deref(),
+    )
+    .await?;
     cmd::print_provision(action, &data, json, all);
     Ok(())
 }

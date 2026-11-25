@@ -2743,6 +2743,28 @@ export type ProvidersResponse = {
 };
 
 /**
+ * One artifact a domain ships.
+ */
+export type ProvisioningArtifactView = {
+    /**
+     * The provisioning key, `<kind>/<name>`.
+     */
+    key: string;
+    /**
+     * `skills`, `commands`, `agents` or `mcps`.
+     */
+    kind: string;
+    /**
+     * The key without its `<kind>/` prefix.
+     */
+    name: string;
+    /**
+     * True when the artifact is marked `metadata: { provision: optional }`.
+     */
+    optional: boolean;
+};
+
+/**
  * One `kind: path` declaration.
  */
 export type ProvisioningDeclView = {
@@ -2760,6 +2782,13 @@ export type ProvisioningDeclView = {
  * The `Provisioning` section: what parsed, and what did not.
  */
 export type ProvisioningView = {
+    /**
+     * The artifacts the declared folders ship on the server's disk, by kind
+     * and key. No on or off: that is decided per machine, and the server's
+     * machine is not the reader's. Filled by the handlers from the engine, so the
+     * pure parse of the markdown leaves it empty.
+     */
+    artifacts: Array<ProvisioningArtifactView>;
     /**
      * The declarations that parsed, in document order, one per kind.
      */

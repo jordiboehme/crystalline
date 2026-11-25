@@ -12,7 +12,7 @@ use crate::harness::HarnessKind;
 use crate::manifest::{self, ArtifactType, Manifest};
 use crate::parse::parse_engram;
 use crate::provision::receipt::sha256_hex;
-use crate::provision::translate::{self, Translated};
+use crate::provision::translate::{self, OptionalMark, Translated};
 
 /// Whether `component` is safe to use as a single path component when an
 /// artifact's location is joined onto a harness config directory, i.e.
@@ -55,6 +55,12 @@ pub struct ArtifactFile {
     pub source: PathBuf,
     /// Lowercase hex sha256 of the file's bytes.
     pub sha256: String,
+    /// Whether the artifact says `metadata: { provision: optional }`. Every
+    /// file of a skill carries the value read from its `SKILL.md`; a command
+    /// or a markdown agent carries its own. A `.toml` agent carries no mark
+    /// of its own (Codex refuses an agent file with a `metadata` table): it
+    /// takes the mark of a markdown agent with the same stem, else `false`.
+    pub optional: bool,
 }
 
 /// One scanned MCP server config.
@@ -68,6 +74,8 @@ pub struct McpArtifact {
     pub server_json: String,
     /// Lowercase hex sha256 of `server_json`'s bytes.
     pub sha256: String,
+    /// Whether the JSON object says `"metadata": { "provision": "optional" }`.
+    pub optional: bool,
 }
 
 /// One domain's scanned artifacts: every file and MCP config its declared
@@ -83,6 +91,105 @@ pub struct DomainArtifacts {
     pub mcps: Vec<McpArtifact>,
 }
 
+// --- artifact keys -----------------------------------------------------------
+
+/// The key a provisioning decision names this file's artifact by:
+/// `<kind>/<name>`, where the name is the source name with the dialect
+/// extension dropped. A skill is its folder (`skills/tide-tables` for every
+/// file of the skill), a command is its `rel` without `.md` with the
+/// namespace slash kept (`commands/charts/plot-route`), an agent is its stem
+/// whether it is a `.md` or a `.toml` file (`agents/quartermaster`). The key
+/// is always the source name, never a per-harness name such as Codex's flat
+/// command file.
+pub fn artifact_key(file: &ArtifactFile) -> String {
+    let artifact = match file.kind {
+        ArtifactType::Skills => file
+            .rel
+            .split_once('/')
+            .map_or(file.rel.as_str(), |(dir, _)| dir)
+            .to_string(),
+        ArtifactType::Commands => file
+            .rel
+            .strip_suffix(".md")
+            .unwrap_or(&file.rel)
+            .to_string(),
+        ArtifactType::Agents => translate::agent_stem(&file.rel),
+        // A scan never puts an MCP into the files list; keep the rel as is.
+        ArtifactType::Mcps => file.rel.clone(),
+    };
+    format!("{}/{}", file.kind.id(), artifact)
+}
+
+/// The key a provisioning decision names this MCP server by:
+/// `mcps/<name>`, the name as the scan reads it.
+pub fn mcp_key(mcp: &McpArtifact) -> String {
+    format!("{}/{}", ArtifactType::Mcps.id(), mcp.name)
+}
+
+/// Split a provisioning key into its kind and its name, or `None` when the
+/// key is malformed.
+///
+/// The key splits on its first `/` only. The kind must be one of the four
+/// ids (`skills`, `commands`, `agents`, `mcps`). The name must not be empty;
+/// for skills, agents and mcps it is one plain path component
+/// ([`is_plain_component`]), for commands every `/`-separated segment must be
+/// plain, so a namespaced command (`commands/charts/plot-route`) is accepted.
+///
+/// Keys compare exactly: the kind and the name are case-sensitive, so
+/// `Skills/x` is malformed and `skills/Tide` names a different artifact than
+/// `skills/tide`. The same holds wherever a decision is matched against a key
+/// (`Provision::selects`).
+pub fn parse_artifact_key(key: &str) -> Option<(ArtifactType, &str)> {
+    let (kind, artifact) = key.split_once('/')?;
+    let kind = match kind {
+        "skills" => ArtifactType::Skills,
+        "commands" => ArtifactType::Commands,
+        "agents" => ArtifactType::Agents,
+        "mcps" => ArtifactType::Mcps,
+        _ => return None,
+    };
+    let well_formed = match kind {
+        ArtifactType::Commands => artifact.split('/').all(is_plain_component),
+        _ => is_plain_component(artifact),
+    };
+    well_formed.then_some((kind, artifact))
+}
+
+/// Turn a read mark into the artifact's `optional` flag, raising one notice
+/// for a value other than `optional`.
+fn resolve_mark(key: &str, mark: OptionalMark, notices: &mut Vec<String>) -> bool {
+    match mark {
+        OptionalMark::Absent => false,
+        OptionalMark::Optional => true,
+        OptionalMark::Other(value) => {
+            notices.push(format!(
+                "`{key}` says `metadata.provision: {value}`; only `optional` has a meaning - treating it as not optional"
+            ));
+            false
+        }
+    }
+}
+
+/// The mark of a markdown source given as raw bytes. Bytes that are not
+/// UTF-8 carry no frontmatter that parses, so they read as no mark.
+fn markdown_mark(bytes: &[u8]) -> OptionalMark {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => translate::frontmatter_optional_mark(text),
+        Err(_) => OptionalMark::Absent,
+    }
+}
+
+/// The mark of a skill, read from its `SKILL.md`. An unreadable file reads
+/// as no mark.
+fn skill_mark(skill_dir: &Path) -> OptionalMark {
+    match std::fs::read(skill_dir.join("SKILL.md")) {
+        Ok(bytes) => markdown_mark(&bytes),
+        Err(_) => OptionalMark::Absent,
+    }
+}
+
+// --- scan --------------------------------------------------------------------
+
 /// Scan a domain's resolved source roots into a hashed artifact set. Each
 /// `(kind, root)` pair in `source_roots` is scanned independently; a root
 /// that does not exist on disk contributes nothing and produces no notice
@@ -91,6 +198,9 @@ pub struct DomainArtifacts {
 /// a skill folder with no `SKILL.md`, a hostile path component, an MCP
 /// config with no `server` object - is reported as a notice and the single
 /// offending artifact is skipped; scanning itself never fails.
+///
+/// Which artifacts are selected is shared with [`list_artifacts`] (the
+/// `*_entries` enumerators below), so the two always agree on keys and marks.
 pub fn scan_domain(
     domain: &str,
     source_roots: &[(ArtifactType, PathBuf)],
@@ -114,6 +224,7 @@ pub fn scan_domain(
             .then_with(|| a.rel.cmp(&b.rel))
     });
     mcps.sort_by(|a, b| a.name.cmp(&b.name));
+    share_markdown_agent_marks(&mut files);
 
     (
         DomainArtifacts {
@@ -125,9 +236,32 @@ pub fn scan_domain(
     )
 }
 
+/// Give every `.toml` agent the mark of the markdown agent with the same
+/// stem. Both files are one artifact under one key, and a `.toml` agent
+/// carries no mark of its own, so where an `.md` and a `.toml` agent share a
+/// stem the `.md` file's mark wins; [`list_artifacts`] follows the same rule.
+fn share_markdown_agent_marks(files: &mut [ArtifactFile]) {
+    let mut markdown_marks: BTreeMap<String, bool> = BTreeMap::new();
+    for file in files.iter() {
+        if file.kind == ArtifactType::Agents && file.rel.ends_with(".md") {
+            markdown_marks
+                .entry(translate::agent_stem(&file.rel))
+                .or_insert(file.optional);
+        }
+    }
+    for file in files.iter_mut() {
+        if file.kind == ArtifactType::Agents
+            && file.rel.ends_with(".toml")
+            && let Some(optional) = markdown_marks.get(&translate::agent_stem(&file.rel))
+        {
+            file.optional = *optional;
+        }
+    }
+}
+
 /// [`ArtifactType`]'s declaration order, used to sort a scan's files the
 /// same way regardless of the order its source roots were given in.
-fn kind_order(kind: ArtifactType) -> u8 {
+pub(crate) fn kind_order(kind: ArtifactType) -> u8 {
     match kind {
         ArtifactType::Skills => 0,
         ArtifactType::Commands => 1,
@@ -136,21 +270,17 @@ fn kind_order(kind: ArtifactType) -> u8 {
     }
 }
 
-/// Each direct subdirectory of `root` that carries a `SKILL.md` is a skill;
-/// every file inside it (recursively) becomes one [`ArtifactFile`] keyed
-/// `<skill-dir-name>/<path-within-skill>`.
-fn scan_skills(
-    kind: ArtifactType,
-    root: &Path,
-    out: &mut Vec<ArtifactFile>,
-    notices: &mut Vec<String>,
-) {
+/// The skill folders under `root`: each direct, visible, plainly named
+/// subdirectory that carries a `SKILL.md`, as `(folder name, path)`. A
+/// folder with an unsafe name or no `SKILL.md` is skipped with a notice.
+fn skill_entries(root: &Path, notices: &mut Vec<String>) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+        return Vec::new();
     };
     let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| e.file_name());
 
+    let mut out = Vec::new();
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
@@ -175,6 +305,24 @@ fn scan_skills(
             ));
             continue;
         }
+        out.push((name, skill_dir));
+    }
+    out
+}
+
+/// Each direct subdirectory of `root` that carries a `SKILL.md` is a skill;
+/// every file inside it (recursively) becomes one [`ArtifactFile`] keyed
+/// `<skill-dir-name>/<path-within-skill>`. The skill's `SKILL.md` is read once
+/// for the optional mark, and every file of the skill carries it.
+fn scan_skills(
+    kind: ArtifactType,
+    root: &Path,
+    out: &mut Vec<ArtifactFile>,
+    notices: &mut Vec<String>,
+) {
+    for (name, skill_dir) in skill_entries(root, notices) {
+        let key = format!("{}/{}", kind.id(), name);
+        let optional = resolve_mark(&key, skill_mark(&skill_dir), notices);
         let mut visible = Vec::new();
         walk_visible(&skill_dir, &mut Vec::new(), &mut visible);
         for (rel_in_skill, source) in visible {
@@ -193,21 +341,20 @@ fn scan_skills(
                 rel: format!("{name}/{rel_in_skill}"),
                 source,
                 sha256,
+                optional,
             });
         }
     }
 }
 
-/// Every `*.md` file under `root`, recursively; `rel` is the path from
-/// `root`, `/`-separated, so subfolders act as command namespaces.
-fn scan_commands(
-    kind: ArtifactType,
-    root: &Path,
-    out: &mut Vec<ArtifactFile>,
-    notices: &mut Vec<String>,
-) {
+/// The command files under `root`: every visible `*.md` file at any depth
+/// whose path components are all plain, as `(rel, path)` with `rel`
+/// `/`-separated from `root`. A file with an unsafe component is skipped with
+/// a notice.
+fn command_entries(root: &Path, notices: &mut Vec<String>) -> Vec<(String, PathBuf)> {
     let mut visible = Vec::new();
     walk_visible(root, &mut Vec::new(), &mut visible);
+    let mut out = Vec::new();
     for (rel, source) in visible {
         if source.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
@@ -219,38 +366,49 @@ fn scan_commands(
             ));
             continue;
         }
-        let Some(sha256) = hash_file(&source) else {
-            continue;
-        };
-        out.push(ArtifactFile {
-            kind,
-            rel,
-            source,
-            sha256,
-        });
+        out.push((rel, source));
     }
+    out
 }
 
-/// Every `*.md` or `*.toml` file directly inside `root`, no recursion; `rel` is
-/// the file name. The extension is the agent's source dialect: a `.md` file is
-/// the markdown dialect Claude and GitHub Copilot read natively, a `.toml` file
-/// is the Codex dialect; the projection in [`crate::provision::translate`]
-/// decides which target gets a passthrough and which a conversion. A symlink is
-/// skipped silently rather than followed, the same no-follow stance
-/// [`walk_visible`] documents - following one would let a hostile entry stage
-/// the bytes of any file it can point at.
-fn scan_agents(
+/// Every `*.md` file under `root`, recursively; `rel` is the path from
+/// `root`, `/`-separated, so subfolders act as command namespaces. The hash
+/// and the optional mark come from one read of the file.
+fn scan_commands(
     kind: ArtifactType,
     root: &Path,
     out: &mut Vec<ArtifactFile>,
     notices: &mut Vec<String>,
 ) {
+    for (rel, source) in command_entries(root, notices) {
+        let Ok(bytes) = std::fs::read(&source) else {
+            continue;
+        };
+        let file = ArtifactFile {
+            kind,
+            rel,
+            source,
+            sha256: sha256_hex(&bytes),
+            optional: false,
+        };
+        let optional = resolve_mark(&artifact_key(&file), markdown_mark(&bytes), notices);
+        out.push(ArtifactFile { optional, ..file });
+    }
+}
+
+/// The agent files directly inside `root`, no recursion: every visible,
+/// plainly named `*.md` or `*.toml` regular file, as `(file name, path)`. A
+/// symlink is skipped silently rather than followed, the same no-follow
+/// stance [`walk_visible`] documents - following one would let a hostile
+/// entry stage the bytes of any file it can point at.
+fn agent_entries(root: &Path, notices: &mut Vec<String>) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+        return Vec::new();
     };
     let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| e.file_name());
 
+    let mut out = Vec::new();
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
@@ -270,30 +428,56 @@ fn scan_agents(
             ));
             continue;
         }
-        let Some(sha256) = hash_file(&path) else {
+        out.push((name, path));
+    }
+    out
+}
+
+/// Every `*.md` or `*.toml` file directly inside `root`, no recursion; `rel` is
+/// the file name. The extension is the agent's source dialect: a `.md` file is
+/// the markdown dialect Claude and GitHub Copilot read natively, a `.toml` file
+/// is the Codex dialect; the projection in [`crate::provision::translate`]
+/// decides which target gets a passthrough and which a conversion. A markdown
+/// agent's optional mark comes from the same read as its hash; a `.toml` agent
+/// is never read for a mark (see [`ArtifactFile::optional`]).
+fn scan_agents(
+    kind: ArtifactType,
+    root: &Path,
+    out: &mut Vec<ArtifactFile>,
+    notices: &mut Vec<String>,
+) {
+    for (name, path) in agent_entries(root, notices) {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        out.push(ArtifactFile {
+        let file = ArtifactFile {
             kind,
             rel: name,
             source: path,
-            sha256,
-        });
+            sha256: sha256_hex(&bytes),
+            optional: false,
+        };
+        let optional = if file.rel.ends_with(".md") {
+            resolve_mark(&artifact_key(&file), markdown_mark(&bytes), notices)
+        } else {
+            false
+        };
+        out.push(ArtifactFile { optional, ..file });
     }
 }
 
-/// Every `*.json` file directly inside `root`, no recursion. Each must parse
-/// as a JSON object with an object `server` member; the MCP's name is its
-/// own `name` string member, falling back to the file stem. A symlink is
-/// skipped silently rather than followed, the same no-follow stance
-/// [`walk_visible`] documents.
-fn scan_mcps(root: &Path, out: &mut Vec<McpArtifact>, notices: &mut Vec<String>) {
+/// The JSON files directly inside `root`, no recursion: every visible
+/// `*.json` regular file, as `(file name, path)`. A symlink is skipped
+/// silently rather than followed, the same no-follow stance [`walk_visible`]
+/// documents.
+fn mcp_entries(root: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+        return Vec::new();
     };
     let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| e.file_name());
 
+    let mut out = Vec::new();
     for entry in entries {
         let file_name = entry.file_name().to_string_lossy().into_owned();
         if file_name.starts_with('.') {
@@ -306,43 +490,66 @@ fn scan_mcps(root: &Path, out: &mut Vec<McpArtifact>, notices: &mut Vec<String>)
         if !file_type.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        out.push((file_name, path));
+    }
+    out
+}
 
-        let Ok(text) = std::fs::read_to_string(&path) else {
+/// One MCP config read and checked: its name, its `server` object and its
+/// optional flag, or `None` (with a notice where one is due) when the file
+/// is not a usable MCP config.
+fn read_mcp(
+    file_name: &str,
+    path: &Path,
+    notices: &mut Vec<String>,
+) -> Option<(String, serde_json::Map<String, serde_json::Value>, bool)> {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let text = std::fs::read_to_string(path).ok()?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        notices.push(format!(
+            "mcp config `{file_name}` is not valid JSON - skipping it"
+        ));
+        return None;
+    };
+    let Some(obj) = value.as_object() else {
+        notices.push(format!(
+            "mcp config `{file_name}` is not a JSON object - skipping it"
+        ));
+        return None;
+    };
+    let Some(server) = obj.get("server").and_then(|v| v.as_object()) else {
+        notices.push(format!(
+            "mcp config `{file_name}` has no `server` object member - skipping it"
+        ));
+        return None;
+    };
+    let name = match obj.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => stem,
+    };
+    if !is_plain_component(&name) {
+        notices.push(format!(
+            "mcp config `{file_name}` has a name `{name}` that is not a safe path component - skipping it"
+        ));
+        return None;
+    }
+    let key = format!("{}/{}", ArtifactType::Mcps.id(), name);
+    let optional = resolve_mark(&key, translate::json_optional_mark(obj), notices);
+    Some((name, server.clone(), optional))
+}
+
+/// Every `*.json` file directly inside `root`, no recursion. Each must parse
+/// as a JSON object with an object `server` member; the MCP's name is its
+/// own `name` string member, falling back to the file stem.
+fn scan_mcps(root: &Path, out: &mut Vec<McpArtifact>, notices: &mut Vec<String>) {
+    for (file_name, path) in mcp_entries(root) {
+        let Some((name, server, optional)) = read_mcp(&file_name, &path, notices) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            notices.push(format!(
-                "mcp config `{file_name}` is not valid JSON - skipping it"
-            ));
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
-            notices.push(format!(
-                "mcp config `{file_name}` is not a JSON object - skipping it"
-            ));
-            continue;
-        };
-        let Some(server) = obj.get("server").and_then(|v| v.as_object()) else {
-            notices.push(format!(
-                "mcp config `{file_name}` has no `server` object member - skipping it"
-            ));
-            continue;
-        };
-        let name = match obj.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n.to_string(),
-            None => stem,
-        };
-        if !is_plain_component(&name) {
-            notices.push(format!(
-                "mcp config `{file_name}` has a name `{name}` that is not a safe path component - skipping it"
-            ));
-            continue;
-        }
-        let server_value = serde_json::Value::Object(server.clone());
+        let server_value = serde_json::Value::Object(server);
         let Ok(server_json) = serde_json::to_string(&server_value) else {
             continue;
         };
@@ -351,8 +558,157 @@ fn scan_mcps(root: &Path, out: &mut Vec<McpArtifact>, notices: &mut Vec<String>)
             name,
             server_json,
             sha256,
+            optional,
         });
     }
+}
+
+// --- the light listing -------------------------------------------------------
+
+/// One artifact a domain ships, as [`list_artifacts`] reports it: one row per
+/// artifact (a skill once, not once per file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactListing {
+    /// The artifact's kind.
+    pub kind: ArtifactType,
+    /// The provisioning key, `<kind>/<name>` (see [`artifact_key`]).
+    pub key: String,
+    /// The key without its `<kind>/` prefix.
+    pub name: String,
+    /// Whether the artifact is marked `metadata: { provision: optional }`.
+    pub optional: bool,
+}
+
+/// What [`list_artifacts`] found in one domain.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactListingReport {
+    /// One row per artifact, sorted by kind ([`ArtifactType`] declaration
+    /// order) and then by key.
+    pub artifacts: Vec<ArtifactListing>,
+    /// The kinds with at least one resolved source root that exists on disk,
+    /// in kind order. A kind missing here may still ship artifacts that are
+    /// not on this machine yet (a team domain's mirror not pulled, a tools
+    /// repository not checked out), so an empty kind outside this list must
+    /// not be read as "the domain ships nothing of this kind".
+    pub present_kinds: Vec<ArtifactType>,
+    /// The same scan notices [`scan_domain`] raises for these roots: skipped
+    /// entries and optional marks with an unknown value.
+    pub notices: Vec<String>,
+}
+
+/// List the artifacts a domain ships without hashing anything: the same
+/// selection [`scan_domain`] makes (skill folders with a `SKILL.md`, `*.md`
+/// commands at any depth, top-level `*.md` and `*.toml` agents, top-level
+/// `*.json` MCP configs with a `server` object), reading per artifact only
+/// the one file that can carry the optional mark.
+///
+/// An `.md` and a `.toml` agent with the same stem give one row, and the
+/// `.md` file's mark wins (a `.toml` agent carries no mark). Two artifacts of
+/// one kind with the same key (two MCP configs naming the same server) give
+/// one row, the first in scan order.
+pub fn list_artifacts(domain: &str, entry: &DomainEntry) -> ArtifactListingReport {
+    list_artifacts_in(&resolve_source_roots(domain, entry))
+}
+
+/// [`list_artifacts`] over already resolved source roots.
+fn list_artifacts_in(source_roots: &[(ArtifactType, PathBuf)]) -> ArtifactListingReport {
+    let mut notices = Vec::new();
+    // Keyed by (kind order, key); the bool says whether a row came from a
+    // markdown agent, so a later `.md` agent replaces an earlier `.toml` one.
+    let mut rows: BTreeMap<(u8, String), (ArtifactListing, bool)> = BTreeMap::new();
+
+    let mut add = |kind: ArtifactType, artifact: String, optional: bool, markdown_agent: bool| {
+        let key = format!("{}/{}", kind.id(), artifact);
+        let row = ArtifactListing {
+            kind,
+            key: key.clone(),
+            name: artifact,
+            optional,
+        };
+        match rows.entry((kind_order(kind), key)) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert((row, markdown_agent));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if markdown_agent && !slot.get().1 {
+                    slot.insert((row, true));
+                }
+            }
+        }
+    };
+
+    for (kind, root) in source_roots {
+        match kind {
+            ArtifactType::Skills => {
+                for (name, skill_dir) in skill_entries(root, &mut notices) {
+                    let key = format!("{}/{}", kind.id(), name);
+                    let optional = resolve_mark(&key, skill_mark(&skill_dir), &mut notices);
+                    add(*kind, name, optional, false);
+                }
+            }
+            ArtifactType::Commands => {
+                for (rel, source) in command_entries(root, &mut notices) {
+                    // An unreadable file is dropped, as the scan drops it.
+                    let Ok(bytes) = std::fs::read(&source) else {
+                        continue;
+                    };
+                    let artifact = rel.strip_suffix(".md").unwrap_or(&rel).to_string();
+                    let key = format!("{}/{}", kind.id(), artifact);
+                    let optional = resolve_mark(&key, markdown_mark(&bytes), &mut notices);
+                    add(*kind, artifact, optional, false);
+                }
+            }
+            ArtifactType::Agents => {
+                for (file_name, path) in agent_entries(root, &mut notices) {
+                    let artifact = translate::agent_stem(&file_name);
+                    if file_name.ends_with(".md") {
+                        let Ok(bytes) = std::fs::read(&path) else {
+                            continue;
+                        };
+                        let key = format!("{}/{}", kind.id(), artifact);
+                        let optional = resolve_mark(&key, markdown_mark(&bytes), &mut notices);
+                        add(*kind, artifact, optional, true);
+                    } else {
+                        // A `.toml` agent is never read for a mark (Codex
+                        // refuses a `metadata` table), only checked readable
+                        // as the scan does.
+                        if std::fs::File::open(&path).is_err() {
+                            continue;
+                        }
+                        add(*kind, artifact, false, false);
+                    }
+                }
+            }
+            ArtifactType::Mcps => {
+                for (file_name, path) in mcp_entries(root) {
+                    if let Some((name, _, optional)) = read_mcp(&file_name, &path, &mut notices) {
+                        add(*kind, name, optional, false);
+                    }
+                }
+            }
+        }
+    }
+
+    ArtifactListingReport {
+        artifacts: rows.into_values().map(|(row, _)| row).collect(),
+        present_kinds: present_kinds(source_roots),
+        notices,
+    }
+}
+
+/// The kinds with at least one source root in `source_roots` that exists on
+/// disk as a folder, in kind order. A kind missing here lists nothing, which
+/// must not be read as "the domain ships nothing of this kind": its root may
+/// just not be on this machine yet. Only stats the roots, never reads a file.
+pub(crate) fn present_kinds(source_roots: &[(ArtifactType, PathBuf)]) -> Vec<ArtifactType> {
+    let mut present: Vec<ArtifactType> = Vec::new();
+    for (kind, root) in source_roots {
+        if !present.contains(kind) && root.is_dir() {
+            present.push(*kind);
+        }
+    }
+    present.sort_by_key(|kind| kind_order(*kind));
+    present
 }
 
 /// Recursively collect every visible (non-hidden) file under `dir`, as
@@ -747,6 +1103,7 @@ mod tests {
             rel: rel.to_string(),
             source: PathBuf::from(format!("/{domain}/{rel}")),
             sha256: sha256_hex(rel.as_bytes()),
+            optional: false,
         }
     }
 
@@ -755,6 +1112,7 @@ mod tests {
             name: name.to_string(),
             server_json: format!("{{\"domain\":\"{domain}\"}}"),
             sha256: sha256_hex(domain.as_bytes()),
+            optional: false,
         }
     }
 
