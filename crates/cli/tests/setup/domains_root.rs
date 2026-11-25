@@ -182,8 +182,11 @@ fn doctor_shows_where_new_domains_go_and_why() {
     );
     assert!(report["domains_root"].get("pin_pending").is_none());
     let text = doctor(home.path(), &config_path, false);
-    let note = "New domains are created under ~/Documents/Crystalline, which macOS privacy protection guards.";
-    assert_eq!(text.contains(note), cfg!(target_os = "macos"), "{text}");
+    let note = format!(
+        "New domains are created under {}, which macOS privacy protection guards.",
+        home.path().join("Documents/Crystalline").display()
+    );
+    assert_eq!(text.contains(&note), cfg!(target_os = "macos"), "{text}");
 
     // The environment wins and says so.
     let mut cmd = crate::common::crystalline();
@@ -295,4 +298,92 @@ fn a_config_set_in_the_cli_writes_through_a_linked_config() {
     assert_still_linked(home.path(), &real);
     let saved: GlobalConfig = config::load_yaml(&real).unwrap();
     assert_eq!(saved.domains_root.as_deref(), Some(Path::new("~/kb")));
+}
+
+/// A read-only instance never pins at its start, so doctor does not promise
+/// it. `crystalline config set` is refused on it as well (file mode), so
+/// doctor names the file to edit, and the edit is all it takes.
+#[test]
+fn doctor_on_a_read_only_instance_names_the_file_to_edit() {
+    let home = tempfile::tempdir().unwrap();
+    let docs = home.path().join("Documents").join("Crystalline");
+    manifest_at(&docs.join("old"), "old");
+    let mut cfg = GlobalConfig {
+        service: Some(config::ServiceConfig {
+            read_only: Some(true),
+            ..config::ServiceConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("old".into(), DomainEntry::file(docs.join("old")));
+    let config_path = config_file(home.path());
+    config::save_yaml(&config_path, &cfg).unwrap();
+
+    let report: serde_json::Value =
+        serde_json::from_str(&doctor(home.path(), &config_path, true)).unwrap();
+    assert_eq!(report["domains_root"]["pin_pending"], true, "{report}");
+    assert_eq!(report["domains_root"]["read_only"], true, "{report}");
+    let text = doctor(home.path(), &config_path, false);
+    assert!(!text.contains("at the next start"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "add `domains_root: ~/Documents/Crystalline` to {}",
+            config_path.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains("crystalline config set domains_root ~/Documents"),
+        "{text}"
+    );
+
+    // Why doctor does not name `config set`: it is refused here.
+    let out = run(
+        home.path(),
+        &[
+            "config",
+            "set",
+            "domains_root",
+            "~/Documents/Crystalline",
+            "--config",
+            config_path.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+
+    // The edit doctor names is all it takes: the note is gone.
+    let mut text = std::fs::read_to_string(&config_path).unwrap();
+    text.push_str("domains_root: ~/Documents/Crystalline\n");
+    std::fs::write(&config_path, text).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&doctor(home.path(), &config_path, true)).unwrap();
+    assert!(
+        report["domains_root"].get("pin_pending").is_none(),
+        "{report}"
+    );
+    assert_eq!(report["domains_root"]["source"], "config", "{report}");
+}
+
+/// The macOS note names the root new domains really go to.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_names_the_guarded_root_it_warns_about() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = config_file(home.path());
+    let cfg = GlobalConfig {
+        domains_root: Some(PathBuf::from("~/Desktop/kb")),
+        ..GlobalConfig::default()
+    };
+    config::save_yaml(&config_path, &cfg).unwrap();
+    let text = doctor(home.path(), &config_path, false);
+    let root = home.path().join("Desktop").join("kb");
+    assert!(
+        text.contains(&format!(
+            "New domains are created under {}, which macOS privacy protection guards.",
+            root.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("~/Documents/Crystalline"), "{text}");
 }
