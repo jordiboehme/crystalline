@@ -17803,12 +17803,13 @@
           "at",
           "by",
           "pages",
+          "skipped",
           "only_page"
         ],
         "properties": {
           "at": {
             "type": "string",
-            "description": "The time every page of this call was marked with, RFC 3339 in UTC\nwith milliseconds.",
+            "description": "The newest time this call marked a page with, RFC 3339 in UTC with\nmilliseconds. Every page gets the call's time, except a page whose\nmark (another call's) landed meanwhile: it gets a time just after\nthat mark, so a mark never moves backwards.",
             "example": "2026-11-25T14:03:07.412Z"
           },
           "by": {
@@ -17835,6 +17836,14 @@
               "arch/overview.md",
               "arch/overview/db.md"
             ]
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pages left out because they went missing or were retired while\nthe call ran; empty when none were.",
+            "example": []
           }
         }
       },

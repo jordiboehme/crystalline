@@ -644,8 +644,10 @@ pub struct MarkedStale {
     /// The domain.
     #[schema(example = "eng")]
     pub domain: String,
-    /// The time every page of this call was marked with, RFC 3339 in UTC
-    /// with milliseconds.
+    /// The newest time this call marked a page with, RFC 3339 in UTC with
+    /// milliseconds. Every page gets the call's time, except a page whose
+    /// mark (another call's) landed meanwhile: it gets a time just after
+    /// that mark, so a mark never moves backwards.
     #[schema(example = "2026-11-25T14:03:07.412Z")]
     pub at: String,
     /// Who marked them, by login.
@@ -654,6 +656,10 @@ pub struct MarkedStale {
     /// The pages marked, in order: each named page, then the pages it owns.
     #[schema(example = json!(["arch/overview.md", "arch/overview/db.md"]))]
     pub pages: Vec<String>,
+    /// The pages left out because they went missing or were retired while
+    /// the call ran; empty when none were.
+    #[schema(example = json!([]))]
+    pub skipped: Vec<String>,
     /// Whether only the named pages were marked.
     pub only_page: bool,
 }

@@ -274,8 +274,34 @@ fn mark_stale_text(answer: &Value) -> String {
         .as_array()
         .map(|pages| pages.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    match pages.as_slice() {
-        [] => format!("Nothing to mark: {domain} has no page that is not retired.\n"),
+    let skipped: Vec<&str> = answer["skipped"]
+        .as_array()
+        .map(|pages| pages.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut out = marked_text(domain, &pages, skipped.is_empty());
+    if !skipped.is_empty() {
+        let noun = if skipped.len() == 1 { "page" } else { "pages" };
+        out.push_str(&format!(
+            "Skipped {} {noun} that went missing or {} retired meanwhile:\n",
+            skipped.len(),
+            if skipped.len() == 1 { "was" } else { "were" }
+        ));
+        for page in skipped {
+            out.push_str(&format!("  {page}\n"));
+        }
+    }
+    out
+}
+
+/// The first lines of [`mark_stale_text`]: the pages a mark marked in
+/// `domain`. `nothing_skipped` tells an empty Reflection from one whose
+/// every page was skipped.
+fn marked_text(domain: &str, pages: &[&str], nothing_skipped: bool) -> String {
+    match pages {
+        [] if nothing_skipped => {
+            format!("Nothing to mark: {domain} has no page that is not retired.\n")
+        }
+        [] => format!("Nothing marked in {domain}.\n"),
         [page] => {
             format!("Marked {page} of {domain} as not fresh. The next reflect run reconciles it.\n")
         }
@@ -523,6 +549,35 @@ fn print_status(answer: &Value) {
 mod tests {
     use super::delivery_line;
     use serde_json::json;
+
+    /// A mark that skipped pages names them after the pages it marked, and
+    /// one that marked nothing because every page was skipped says so.
+    #[test]
+    fn a_mark_names_the_pages_it_skipped() {
+        let text = super::mark_stale_text(&json!({
+            "domain": "docs",
+            "pages": ["arch.md"],
+            "skipped": ["arch/db.md"],
+        }));
+        assert_eq!(
+            text,
+            "Marked arch.md of docs as not fresh. The next reflect run reconciles it.\nSkipped 1 page that went missing or was retired meanwhile:\n  arch/db.md\n"
+        );
+        let text = super::mark_stale_text(&json!({
+            "domain": "docs",
+            "pages": [],
+            "skipped": ["a.md", "b.md"],
+        }));
+        assert_eq!(
+            text,
+            "Nothing marked in docs.\nSkipped 2 pages that went missing or were retired meanwhile:\n  a.md\n  b.md\n"
+        );
+        let text = super::mark_stale_text(&json!({ "domain": "docs", "pages": [], "skipped": [] }));
+        assert_eq!(
+            text,
+            "Nothing to mark: docs has no page that is not retired.\n"
+        );
+    }
 
     /// A status answer for an agent whose token ends within 14 days, by the
     /// server's count, gives one warning line that names the date and the

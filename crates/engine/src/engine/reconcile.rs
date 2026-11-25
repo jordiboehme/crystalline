@@ -202,9 +202,12 @@ impl Engine {
     /// fresh) takes the marks it saw off: the page's and those of the pages
     /// it owns whose mark is at or before that part, each under its own
     /// lock (that write keeps the file's modified time). A later mark stays
-    /// and is named in the receipt's `still_marked`. A mark part newer than
-    /// every mark of the set answers no item the queue handed out and is
-    /// refused.
+    /// and is named in the receipt's `still_marked`. Such a version must be
+    /// the one the queue hands out for the page now (its hash is rebuilt
+    /// with its own period and mark part), or it is refused. A mark part
+    /// newer than every mark left in the set (a marked page was retired or
+    /// moved while the run worked) clears up to the newest mark still
+    /// there, and nothing when none is left.
     pub(crate) async fn reconciled_reflection(
         &self,
         domain: &str,
@@ -295,6 +298,29 @@ impl Engine {
         }
         self.refuse_owner_before_owned(domain, inner, &text, &rows)
             .await?;
+        let pact_hash = r::page_pact_hash(inner, texts.iter().copied()).unwrap_or_default();
+        // A version with a mark part clears marks, so it must be one the
+        // queue handed out: rebuilt from the page as it is, with the
+        // version's own period and mark part.
+        if super::reflect::stale_mark(version).is_some() {
+            let record = r::read_provenance(&text).page;
+            let (settings, _) = r::read_page_settings(&text, inner, &record);
+            let freshness = settings
+                .freshness
+                .as_ref()
+                .map_or("", |freshness| freshness.written.as_str());
+            let handed_out = self
+                .reflection_reconcile(domain, inner)
+                .await?
+                .is_some_and(|state| {
+                    super::reflect::marked_version_matches(version, freshness, &state, &pact_hash)
+                });
+            if !handed_out {
+                return Err(EngineError::Invalid(format!(
+                    "the version {version} is no version the reflect queue handed out for '{inner}' as it is now (its parts do not match the page's item, or the page's pacts or freshness changed since), so nothing is recorded; read the reflect queue again for the page's current item"
+                )));
+            }
+        }
         // The page and the pages it owns: the set a stale item of the page
         // names, whose marks its version saw.
         let owned = r::owned_pages(texts.iter().copied());
@@ -309,15 +335,13 @@ impl Engine {
             .filter_map(|(text, path)| super::mark_stale::text_mark(text, path))
             .map(|mark| mark.at_ms)
             .max();
-        let seen = super::reflect::stale_mark(version);
-        if let Some(sent) = seen
-            && newest.is_none_or(|newest| sent > newest)
-        {
-            return Err(EngineError::Invalid(format!(
-                "the version's mark part {sent} is newer than every not-fresh mark on '{inner}' and the pages it owns, so it answers no item the queue handed out; read the reflect queue again for the page's current item"
-            )));
-        }
-        let pact_hash = r::page_pact_hash(inner, texts.iter().copied()).unwrap_or_default();
+        // The version is one the queue handed out (checked above), so a mark
+        // part newer than every mark left in the set means marks left it
+        // while the run worked (a page retired or moved): clamp to the
+        // newest mark still there, and clear nothing when none is left. A
+        // mark set after the set was read is later than that and stays.
+        let seen = super::reflect::stale_mark(version)
+            .and_then(|sent| newest.map(|newest| sent.min(newest)));
         let state = self
             .record_reflection_reconcile(
                 domain,
@@ -344,32 +368,43 @@ impl Engine {
                 ),
             }
         }
+        // A row left behind its file (a bookkeeping write whose row commit
+        // was lost) is landed here, or the queue would hand out the old
+        // mark for ever.
+        if !cleared_here && let Ok(Some(now)) = read_opt(&abs) {
+            self.land_row_from_file(domain, &access, inner, &abs, &now)
+                .await;
+        }
         drop(_lock);
         if cleared_here {
             self.absorb_into_room(domain, inner).await;
         }
-        if let Some(up_to) = seen {
-            for child in set.iter().skip(1) {
-                let abs = access.abs(child);
-                let lock = self.lock_file(&abs).await;
-                let cleared = match read_opt(&abs) {
-                    Ok(Some(text)) if !super::page_life::is_retired(&text, child) => {
-                        self.clear_seen_mark(domain, &access, child, &abs, &text, up_to, caller)
-                            .await
-                    }
-                    Ok(_) => Ok(false),
-                    Err(e) => Err(e),
-                };
-                drop(lock);
-                match cleared {
-                    Ok(true) => self.absorb_into_room(domain, child).await,
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
-                        domain,
-                        path = %child,
-                        "the not-fresh mark the owner's reconcile saw was not taken off: {e}"
-                    ),
+        for child in set.iter().skip(1) {
+            let abs = access.abs(child);
+            let lock = self.lock_file(&abs).await;
+            let cleared = match (seen, read_opt(&abs)) {
+                (Some(up_to), Ok(Some(text))) if !super::page_life::is_retired(&text, child) => {
+                    self.clear_seen_mark(domain, &access, child, &abs, &text, up_to, caller)
+                        .await
                 }
+                (_, Ok(_)) => Ok(false),
+                (_, Err(e)) => Err(e),
+            };
+            if matches!(cleared, Ok(false))
+                && let Ok(Some(now)) = read_opt(&abs)
+            {
+                self.land_row_from_file(domain, &access, child, &abs, &now)
+                    .await;
+            }
+            drop(lock);
+            match cleared {
+                Ok(true) => self.absorb_into_room(domain, child).await,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    domain,
+                    path = %child,
+                    "the not-fresh mark the owner's reconcile saw was not taken off: {e}"
+                ),
             }
         }
         self.announce_reflection(
@@ -411,6 +446,55 @@ impl Engine {
             "refresh_requested": own_mark,
             "still_marked": still_marked,
         }))
+    }
+
+    /// Land the row of the page at `inner` from its file text `text` (read
+    /// under its lock, which the caller holds) when the stored row holds
+    /// other text. A bookkeeping write keeps the file's modified time, so
+    /// when its row commit was lost and the text kept its length, the
+    /// sync's stat check never reads the file again; the reconcile, which
+    /// reads the file anyway, puts the row right. A failure is logged: the
+    /// next reconcile tries again.
+    async fn land_row_from_file(
+        &self,
+        domain: &str,
+        access: &super::reflection::ReflectionAccess,
+        inner: &str,
+        abs: &std::path::Path,
+        text: &str,
+    ) {
+        let stored = self
+            .store
+            .lock()
+            .await
+            .get_reflection(access.domain_id, inner)
+            .await;
+        let behind = match stored {
+            Ok(row) => row.is_none_or(|row| row.content != text),
+            Err(e) => {
+                tracing::warn!(domain, path = inner, "the page row was not read: {e}");
+                return;
+            }
+        };
+        if !behind {
+            return;
+        }
+        let ops = [super::fence::RowOp::Page { inner, text, abs }];
+        match self
+            .commit_reflection_rows(
+                access.domain_id,
+                &ops,
+                super::fence::OnRefusal::read_heal(domain),
+            )
+            .await
+        {
+            Ok(()) => tracing::debug!(domain, path = inner, "landed a page row behind its file"),
+            Err(e) => tracing::warn!(
+                domain,
+                path = inner,
+                "the page row behind its file was not landed: {e}"
+            ),
+        }
     }
 
     /// Take the not-fresh mark off the page at `inner` (its text `text`,

@@ -127,7 +127,11 @@ export function ReflectionPageStatus({
       )}
       {line?.kind === "overdue" && line.hint !== null && <p>{line.hint}</p>}
       {mark !== null && (
-        <p>{`Not fresh: marked by ${personLabel(mark.by, mark.byDisplay)} at ${formatInstant(mark.at)}`}</p>
+        <p>
+          {mark.by === null
+            ? `Not fresh: marked at ${formatInstant(mark.at)}`
+            : `Not fresh: marked by ${personLabel(mark.by, mark.byDisplay)} at ${formatInstant(mark.at)}`}
+        </p>
       )}
       {skipped !== null && <p>{skipped}</p>}
       {unscheduled !== null && <p>{unscheduled}</p>}

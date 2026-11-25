@@ -171,6 +171,19 @@ describe("the not fresh line", () => {
     expect(screen.getByText(/^Not fresh: marked by ann at /)).toBeVisible();
   });
 
+  it("shows a mark whose record names nobody, without a name", () => {
+    status(PAGE, {
+      ...CLOCK,
+      refreshRequested: {
+        at: "2026-11-20T10:00:00Z",
+        by: null,
+        byDisplay: null,
+      },
+    });
+    expect(screen.getByText(/^Not fresh: marked at /)).toBeVisible();
+    expect(screen.queryByText(/marked by/)).toBeNull();
+  });
+
   it("is gone once the clock shows no mark, and on a retired page", () => {
     const mark = {
       at: "2026-11-20T10:00:00Z",

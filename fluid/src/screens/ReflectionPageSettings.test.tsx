@@ -873,6 +873,7 @@ describe("the page details column", () => {
         at: "2026-11-25T10:00:00Z",
         by: "ann",
         pages: [PAGE],
+        skipped: [],
         only_page: false,
       }),
     });
