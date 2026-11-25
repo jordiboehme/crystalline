@@ -35,7 +35,8 @@ export interface PageRetirement {
 /** A person's request that the next reflect run checks the page again. */
 export interface RefreshRequested {
   at: string;
-  by: string;
+  /** Who marked it, by login; null when the page record does not say. */
+  by: string | null;
   byDisplay: string | null;
 }
 
@@ -102,11 +103,10 @@ function readRef(value: unknown): PageRef | null {
 function readRefresh(value: unknown): RefreshRequested | null {
   const r = asObject(value);
   const at = asString(r?.at);
-  const by = asString(r?.by);
-  if (at === null || by === null) {
+  if (at === null) {
     return null;
   }
-  return { at, by, byDisplay: asString(r?.by_display) };
+  return { at, by: asString(r?.by), byDisplay: asString(r?.by_display) };
 }
 
 function readTitled(value: unknown): { path: string; title: string } | null {
