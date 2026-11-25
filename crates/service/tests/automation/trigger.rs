@@ -400,6 +400,58 @@ async fn source_changes_wait_for_thirty_quiet_minutes() {
     task.stop().await;
 }
 
+/// A mark is a page change: it arms a look, and a marked page is stale
+/// work, so the look sends without waiting for the sources to be quiet
+/// for half an hour. Marking every page of a large Reflection at once
+/// sends one webhook.
+#[tokio::test(start_paused = true)]
+async fn a_mark_sends_one_webhook_without_the_quiet_rule() {
+    let mut hook = hook();
+    let fx = reflecting("reflect_trigger: webhook\n", Some(&hook.url)).await;
+    for n in 0..30 {
+        fx.engine
+            .write_reflection(
+                &WriteReflectionParams {
+                    domain: "eng".into(),
+                    path: format!("pages/p{n}.md"),
+                    markdown: Some(format!("# Page {n}\n\n## Part\n\nText.\n")),
+                    ..Default::default()
+                },
+                &agent(),
+            )
+            .await
+            .unwrap();
+    }
+    let task = start(&fx.engine, &hook).await;
+    let begin = Instant::now();
+    // A source change starts the half hour of quiet.
+    let source = with_a_source_update(&fx).await;
+    change_source(&fx, &source, "at dawn").await;
+    let marked = fx
+        .engine
+        .mark_reflection_stale(
+            "eng",
+            &crystalline_service::params::MarkStale {
+                pages: crystalline_service::params::MarkPages::All,
+                only_page: false,
+            },
+            &person(),
+        )
+        .await
+        .unwrap();
+    assert!(marked["pages"].as_array().unwrap().len() >= 30, "{marked}");
+    let hit = hook.next(minutes(3)).await.expect("one webhook");
+    assert!(
+        hit.at - begin < minutes(5),
+        "sent {:?} after the mark, not after the quiet half hour",
+        hit.at - begin
+    );
+    let body = hit.json();
+    assert!(body["counts"]["stale"].as_u64().unwrap() >= 30, "{body}");
+    assert!(hook.next(minutes(4)).await.is_none(), "one for every page");
+    task.stop().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn nothing_is_sent_while_the_lease_is_held_and_one_is_sent_on_release() {
     let mut hook = hook();

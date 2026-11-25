@@ -192,11 +192,19 @@ impl Engine {
     /// here, never sent). A curator's (an agent of the reflect loop is one;
     /// an unattended run writes only into the domain it works on). The page
     /// must exist and not be retired: a retired page is never reconciled.
-    /// Nothing is written into the file, so no backup commit follows; open
-    /// tabs hear a change event and read the new state.
+    /// The record lives beside the file; open tabs hear a change event and
+    /// read the new state.
     ///
     /// A `version` of a `stale` item handed out before the reconcile
     /// recorded now is refused: that period was already reconciled.
+    ///
+    /// A version with a mark part (the item's set held a page marked not
+    /// fresh) takes the marks it saw off: the page's and those of the pages
+    /// it owns whose mark is at or before that part, each under its own
+    /// lock (that write keeps the file's modified time). A later mark stays
+    /// and is named in the receipt's `still_marked`. A mark part newer than
+    /// every mark of the set answers no item the queue handed out and is
+    /// refused.
     pub(crate) async fn reconciled_reflection(
         &self,
         domain: &str,
@@ -237,25 +245,36 @@ impl Engine {
                 "'{inner}' is retired, and a retired page is never reconciled; restore it first"
             )));
         }
+        let rows = self
+            .store
+            .lock()
+            .await
+            .list_reflections(access.domain_id)
+            .await?;
+        // The page as it is on disk, which its row follows.
+        let texts: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|row| row.path != inner)
+            .map(|row| (row.path.as_str(), row.content.as_str()))
+            .chain([(inner, text.as_str())])
+            .collect();
         // Without a version a late call cannot be told from a current one:
-        // while the page has a stale item open, its version is required.
+        // while the page has a stale item of its own, its version is
+        // required.
         if version.is_empty() {
-            let record = r::read_provenance(&text).page;
-            let (settings, _) = r::read_page_settings(&text, inner, &record);
-            if let Some(freshness) = settings.freshness
-                && let Some(state) = self.reflection_reconcile(domain, inner).await?
-                && let Some(at) = time::parse_rfc3339(&state.last_reconciled)
-                && freshness
-                    .timing(
-                        at.stamp().unix_seconds(),
-                        self.automation_clock().stamp().unix_seconds(),
-                        &[],
+            let states = self.reflection_reconciles(domain).await?;
+            let now = self.automation_clock().stamp().unix_seconds();
+            if super::reflect::has_own_stale_item(&texts, &states, inner, now) {
+                let marked = super::mark_stale::text_mark(&text, inner).is_some();
+                return Err(EngineError::Invalid(if marked {
+                    format!(
+                        "'{inner}' is marked not fresh and has a stale item in the reflect queue: send its version with reconciled, so the mark it saw is recorded"
                     )
-                    .stale()
-            {
-                return Err(EngineError::Invalid(format!(
-                    "'{inner}' has a stale item in the reflect queue: send its version with reconciled, so a late call for an older period can be told apart"
-                )));
+                } else {
+                    format!(
+                        "'{inner}' has a stale item in the reflect queue: send its version with reconciled, so a late call for an older period can be told apart"
+                    )
+                }));
             }
         }
         // A late call for an older period: the `stale` item it answers was
@@ -274,21 +293,31 @@ impl Engine {
                 state.last_reconciled
             )));
         }
-        let rows = self
-            .store
-            .lock()
-            .await
-            .list_reflections(access.domain_id)
-            .await?;
         self.refuse_owner_before_owned(domain, inner, &text, &rows)
             .await?;
-        // The page as it is on disk, which its row follows.
-        let files = rows
+        // The page and the pages it owns: the set a stale item of the page
+        // names, whose marks its version saw.
+        let owned = r::owned_pages(texts.iter().copied());
+        let set: Vec<String> = std::iter::once(inner.to_string())
+            .chain(super::reflect::owned_tree(&owned, inner))
+            .collect();
+        let by_path: BTreeMap<&str, &str> = texts.iter().copied().collect();
+        let newest = set
             .iter()
-            .filter(|row| row.path != inner)
-            .map(|row| (row.path.as_str(), row.content.as_str()))
-            .chain([(inner, text.as_str())]);
-        let pact_hash = r::page_pact_hash(inner, files).unwrap_or_default();
+            .filter_map(|path| by_path.get(path.as_str()))
+            .zip(set.iter())
+            .filter_map(|(text, path)| super::mark_stale::text_mark(text, path))
+            .map(|mark| mark.at_ms)
+            .max();
+        let seen = super::reflect::stale_mark(version);
+        if let Some(sent) = seen
+            && newest.is_none_or(|newest| sent > newest)
+        {
+            return Err(EngineError::Invalid(format!(
+                "the version's mark part {sent} is newer than every not-fresh mark on '{inner}' and the pages it owns, so it answers no item the queue handed out; read the reflect queue again for the page's current item"
+            )));
+        }
+        let pact_hash = r::page_pact_hash(inner, texts.iter().copied()).unwrap_or_default();
         let state = self
             .record_reflection_reconcile(
                 domain,
@@ -299,7 +328,50 @@ impl Engine {
                 version,
             )
             .await?;
+        // The marks the item saw come off: never one later than the mark
+        // part, which the check above holds at or below the newest mark.
+        let mut cleared_here = false;
+        if let Some(up_to) = seen {
+            match self
+                .clear_seen_mark(domain, &access, inner, &abs, &text, up_to, caller)
+                .await
+            {
+                Ok(cleared) => cleared_here = cleared,
+                Err(e) => tracing::warn!(
+                    domain,
+                    path = inner,
+                    "the not-fresh mark the reconcile saw was not taken off: {e}"
+                ),
+            }
+        }
         drop(_lock);
+        if cleared_here {
+            self.absorb_into_room(domain, inner).await;
+        }
+        if let Some(up_to) = seen {
+            for child in set.iter().skip(1) {
+                let abs = access.abs(child);
+                let lock = self.lock_file(&abs).await;
+                let cleared = match read_opt(&abs) {
+                    Ok(Some(text)) if !super::page_life::is_retired(&text, child) => {
+                        self.clear_seen_mark(domain, &access, child, &abs, &text, up_to, caller)
+                            .await
+                    }
+                    Ok(_) => Ok(false),
+                    Err(e) => Err(e),
+                };
+                drop(lock);
+                match cleared {
+                    Ok(true) => self.absorb_into_room(domain, child).await,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        domain,
+                        path = %child,
+                        "the not-fresh mark the owner's reconcile saw was not taken off: {e}"
+                    ),
+                }
+            }
+        }
         self.announce_reflection(
             domain,
             inner,
@@ -307,6 +379,28 @@ impl Engine {
             None,
             crate::changes::change_label(&caller.scope),
         );
+        // What is still marked after this record: marks set while the run
+        // worked, or ones a version without a mark part never saw.
+        let mut still_marked = Vec::new();
+        let mut own_mark = Value::Null;
+        if !version.is_empty() {
+            for path in &set {
+                let Ok(Some(text)) = read_opt(&access.abs(path)) else {
+                    continue;
+                };
+                if let Some(mark) = super::mark_stale::text_mark(&text, path) {
+                    if path == inner {
+                        own_mark = mark.to_json();
+                    }
+                    let mut entry = mark.to_json();
+                    entry["path"] = json!(path);
+                    still_marked.push(entry);
+                }
+            }
+        } else if let Ok(Some(text)) = read_opt(&abs) {
+            own_mark = super::mark_stale::text_mark(&text, inner)
+                .map_or(Value::Null, |mark| mark.to_json());
+        }
         Ok(json!({
             "domain": domain,
             "path": inner,
@@ -314,16 +408,47 @@ impl Engine {
             "last_reconciled": state.last_reconciled,
             "pact_hash": state.pact_hash,
             "version": state.version,
+            "refresh_requested": own_mark,
+            "still_marked": still_marked,
         }))
     }
 
+    /// Take the not-fresh mark off the page at `inner` (its text `text`,
+    /// under its lock, which the caller holds) when it is at or before
+    /// `up_to` (milliseconds since the epoch): the reconcile that saw it
+    /// was recorded. The file keeps its modified time. Answers whether
+    /// anything was written.
+    #[allow(clippy::too_many_arguments)]
+    async fn clear_seen_mark(
+        &self,
+        domain: &str,
+        access: &super::reflection::ReflectionAccess,
+        inner: &str,
+        abs: &std::path::Path,
+        text: &str,
+        up_to: i64,
+        caller: &ReflectionCaller,
+    ) -> Result<bool> {
+        let mut prov = r::read_provenance(text);
+        if !prov.page.mark_millis().is_some_and(|at| at <= up_to) {
+            return Ok(false);
+        }
+        prov.page.clear_mark();
+        let changed = r::write_provenance(text, &prov).map_err(EngineError::Invalid)?;
+        self.land_page_record(domain, access, inner, abs, text, &changed, caller, true)
+            .await?;
+        Ok(true)
+    }
+
     /// Refuse the `reconciled` of the page at `inner` (its text `text`, the
-    /// Reflection's rows `rows`) while it is due and a page it owns (its
-    /// owned pages' owned pages included, a retired one left out) has no
-    /// reconcile recorded since the owner's last one: owned pages first,
-    /// the owner last, so a run that stops at its cap never leaves owned
-    /// pages behind for a whole period (design 3.5). An owner that is not
-    /// due is reconciled whatever its owned pages are.
+    /// Reflection's rows `rows`) while it is due (its freshness ran out, or
+    /// it is marked not fresh) and a page it owns (its owned pages' owned
+    /// pages included, a retired one left out) has no reconcile recorded
+    /// since the later of the owner's last one, the owner's mark and its
+    /// own mark: owned pages first, the owner last, so a run that stops at
+    /// its cap never leaves owned pages behind for a whole period (design
+    /// 3.5). An owner that is not due is reconciled whatever its owned
+    /// pages are.
     async fn refuse_owner_before_owned(
         &self,
         domain: &str,
@@ -333,9 +458,10 @@ impl Engine {
     ) -> Result<()> {
         let record = r::read_provenance(text).page;
         let (settings, _) = r::read_page_settings(text, inner, &record);
-        let Some(freshness) = settings.freshness else {
+        let mark = super::mark_stale::text_mark(text, inner).map(|mark| mark.at_ms);
+        if settings.freshness.is_none() && mark.is_none() {
             return Ok(());
-        };
+        }
         let states = self.reflection_reconciles(domain).await?;
         let Some(since) = states
             .get(inner)
@@ -345,9 +471,13 @@ impl Engine {
             return Ok(());
         };
         let now = self.automation_clock().stamp().unix_seconds();
-        if !freshness.timing(since.unix_seconds(), now, &[]).stale() {
+        let ran_out = settings
+            .freshness
+            .is_some_and(|freshness| freshness.timing(since.unix_seconds(), now, &[]).stale());
+        if !ran_out && mark.is_none() {
             return Ok(());
         }
+        let since_ms = mark.map_or(since.unix_millis(), |mark| mark.max(since.unix_millis()));
         let texts: BTreeMap<&str, &str> = rows
             .iter()
             .map(|row| (row.path.as_str(), row.content.as_str()))
@@ -369,11 +499,11 @@ impl Engine {
                 {
                     continue;
                 }
-                let done = states.get(child).is_some_and(|state| {
-                    state.outcome.is_some()
-                        && time::parse_rfc3339(&state.last_reconciled)
-                            .is_some_and(|at| at.stamp() > since)
-                });
+                let child_mark = texts
+                    .get(child.as_str())
+                    .and_then(|text| super::mark_stale::text_mark(text, child))
+                    .map(|mark| mark.at_ms);
+                let done = super::reflect::owned_done(states.get(child), since_ms, child_mark);
                 if !done {
                     waiting.push(child.clone());
                 }

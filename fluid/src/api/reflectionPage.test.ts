@@ -71,6 +71,7 @@ describe("the page view", () => {
           reason: "shorter than 1h",
         },
       ],
+      refreshRequested: null,
     });
   });
 
@@ -187,6 +188,7 @@ describe("the page clock", () => {
         waiting: false,
         partOf: null,
         clockOf: "a.md",
+        refreshRequested: null,
       },
     });
   });

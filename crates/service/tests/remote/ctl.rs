@@ -200,7 +200,8 @@ fn the_remote_allow_lists_are_pinned() {
             "automation_lease_release",
             "automation_run_record",
             "automation_share",
-            "automation_runs"
+            "automation_runs",
+            "reflect_mark_stale"
         ]
     );
     assert_eq!(
@@ -572,4 +573,25 @@ async fn an_agent_token_reaches_only_the_automation_verbs_at_the_ctl_route() {
     let unknown = format!("cag_{}", "0".repeat(64));
     let (code, _) = server.ctl(Some(&unknown), status()).await;
     assert_eq!(code, 401);
+}
+
+/// `reflect_mark_stale` is on the remote allow list and runs as the token's
+/// account: it reaches the engine, which answers for the domain (here one
+/// with no Reflection), never the "not remote" sentence.
+#[tokio::test]
+async fn reflect_mark_stale_reaches_the_engine_remotely() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let keeper = server.token_for("keeper").await;
+    let (_, reply) = server
+        .ctl(
+            Some(&keeper),
+            json!({ "v": 1, "cmd": "reflect_mark_stale", "domain": "open", "all": true }),
+        )
+        .await;
+    let text = reply.to_string();
+    assert!(
+        !text.contains("is not available remotely") && !text.contains("not remote"),
+        "{reply}"
+    );
+    assert_eq!(reply["ok"], false, "the domain has no Reflection: {reply}");
 }

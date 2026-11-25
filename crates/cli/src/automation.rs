@@ -94,6 +94,28 @@ pub struct RunArgs {
     pub no_share: bool,
 }
 
+/// What `crystalline reflect` does: the loop commands, and marking pages
+/// not fresh.
+#[derive(Subcommand, Debug)]
+pub enum ReflectCommand {
+    #[command(flatten)]
+    Loop(LoopCommand),
+    /// Mark Reflection pages not fresh, so the next reflect run reconciles
+    /// them in full. Without pages every page of the domain is marked. A
+    /// page's owned pages are marked too unless --only-page is given. Mark
+    /// after the engrams the pages should show are written.
+    MarkStale {
+        /// The domain whose Reflection pages to mark.
+        domain: String,
+        /// The pages, by their paths inside reflections/ (for example
+        /// arch/overview.md). Omit to mark every page that is not retired.
+        pages: Vec<String>,
+        /// Mark only the named pages, not the pages they own.
+        #[arg(long)]
+        only_page: bool,
+    },
+}
+
 /// The four things a loop command does.
 #[derive(Subcommand, Debug)]
 pub enum LoopCommand {
@@ -203,6 +225,71 @@ fn local_prompt_inputs(
         local,
         crystalline_core::automation::skills_loaded(serve, skills_loaded),
     ))
+}
+
+/// `crystalline reflect mark-stale`: mark the pages through the local
+/// daemon or the server the environment names. Exit 0 when marked, 2 on an
+/// error or a refusal (its sentence on stderr).
+pub async fn mark_stale(
+    domain: String,
+    pages: Vec<String>,
+    only_page: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let marked = async {
+        let client = AutomationClient::from_env().await?;
+        let all = pages.is_empty();
+        client
+            .call(json!({
+                "v": 1,
+                "cmd": "reflect_mark_stale",
+                "domain": domain,
+                "pages": pages,
+                "all": all,
+                "only_page": only_page,
+            }))
+            .await
+    }
+    .await;
+    match marked {
+        Ok(answer) => {
+            if json {
+                println!("{answer}");
+            } else {
+                print!("{}", mark_stale_text(&answer));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            Err(ExitWith(EXIT_ERROR).into())
+        }
+    }
+}
+
+/// What `reflect mark-stale` prints for a mark's answer.
+fn mark_stale_text(answer: &Value) -> String {
+    let domain = answer["domain"].as_str().unwrap_or_default();
+    let pages: Vec<&str> = answer["pages"]
+        .as_array()
+        .map(|pages| pages.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    match pages.as_slice() {
+        [] => format!("Nothing to mark: {domain} has no page that is not retired.\n"),
+        [page] => {
+            format!("Marked {page} of {domain} as not fresh. The next reflect run reconciles it.\n")
+        }
+        pages => {
+            let mut out = format!(
+                "Marked {} pages of {domain} as not fresh. The next reflect run reconciles them.\n",
+                pages.len()
+            );
+            for page in pages {
+                out.push_str(&format!("  {page}\n"));
+            }
+            out
+        }
+    }
 }
 
 /// Run `command` for loop `lp`.

@@ -1995,6 +1995,56 @@ export type ManifestSections = {
 };
 
 /**
+ * What `POST /domains/{domain}/reflection/mark-stale` takes: exactly one
+ * of `path`, `pages` and `all`.
+ */
+export type MarkStaleBody = {
+    /**
+     * Every page of the Reflection that is not retired.
+     */
+    all?: boolean;
+    /**
+     * Mark only the named pages, not the pages they own.
+     */
+    only_page?: boolean;
+    /**
+     * Several pages, by their paths inside reflections/; not empty.
+     */
+    pages?: Array<string> | null;
+    /**
+     * One page, by its path inside reflections/.
+     */
+    path?: string | null;
+};
+
+/**
+ * What a mark answers.
+ */
+export type MarkedStale = {
+    /**
+     * The time every page of this call was marked with, RFC 3339 in UTC
+     * with milliseconds.
+     */
+    at: string;
+    /**
+     * Who marked them, by login.
+     */
+    by: string;
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * Whether only the named pages were marked.
+     */
+    only_page: boolean;
+    /**
+     * The pages marked, in order: each named page, then the pages it owns.
+     */
+    pages: Array<string>;
+};
+
+/**
  * One row of an account's MCP token list, for a management UI or CLI. Never
  * carries the token itself - only the hash is stored, so there is nothing to
  * show back after issuance.
@@ -2852,12 +2902,14 @@ export type ReflectionChanged = {
 export type ReflectionClockResponse = {
     /**
      * The checksum of the page file as stored, the same as a read's
-     * `checksum`; null for a missing page. A reconcile writes no file, so
-     * a client that heard a change compares this with the text it holds
-     * and reads the page again only when they differ.
+     * `checksum`; null for a missing page. A reconcile writes no file
+     * (unless it takes a not-fresh mark off), so a client that heard a
+     * change compares this with the text it holds and reads the page again
+     * only when they differ.
      */
     checksum?: string | null;
     clock?: ReflectionPageClock | null;
+    refresh_requested?: ReflectionRefreshRequested | null;
 };
 
 /**
@@ -3045,7 +3097,8 @@ export type ReflectionPageClock = {
  */
 export type ReflectionPageFinding = {
     /**
-     * `freshness`, `follows`, `owner` or `folder parent`.
+     * `freshness`, `follows`, `owner`, `folder parent` or
+     * `refresh_requested`.
      */
     key: string;
     /**
@@ -3118,6 +3171,7 @@ export type ReflectionPageView = {
      * page's own.
      */
     pacts: Array<string>;
+    refresh_requested?: ReflectionRefreshRequested | null;
     retired?: ReflectionRetirement | null;
     /**
      * The page's `status`, as written. Any word of the retired set, as an
@@ -3140,6 +3194,25 @@ export type ReflectionPartOf = {
      * Its title.
      */
     title: string;
+};
+
+/**
+ * A page's not-fresh mark: a person asked that the next reflect run
+ * reconciles the page in full.
+ */
+export type ReflectionRefreshRequested = {
+    /**
+     * When the page was marked, RFC 3339 in UTC with milliseconds.
+     */
+    at: string;
+    /**
+     * Who marked it, by login; null when the page record does not say.
+     */
+    by?: string | null;
+    /**
+     * The display name of `by`, when the account has one.
+     */
+    by_display?: string | null;
 };
 
 /**
@@ -7366,6 +7439,52 @@ export type DiscloseReflectionSectionResponses = {
 };
 
 export type DiscloseReflectionSectionResponse = DiscloseReflectionSectionResponses[keyof DiscloseReflectionSectionResponses];
+
+export type MarkReflectionStaleData = {
+    body: MarkStaleBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/mark-stale';
+};
+
+export type MarkReflectionStaleErrors = {
+    /**
+     * The anonymous viewer of a domain it reads.
+     */
+    401: ProblemDetail;
+    /**
+     * Below edit access, the domain is off the caller's write list, the domain or this instance is read-only, or the session is unattended.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or page, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The Reflection is not here.
+     */
+    409: ProblemDetail;
+    /**
+     * A pact file, a retired page, no page named, or more than one of `path`, `pages` and `all`.
+     */
+    422: ProblemDetail;
+};
+
+export type MarkReflectionStaleError = MarkReflectionStaleErrors[keyof MarkReflectionStaleErrors];
+
+export type MarkReflectionStaleResponses = {
+    /**
+     * Marked.
+     */
+    200: MarkedStale;
+};
+
+export type MarkReflectionStaleResponse = MarkReflectionStaleResponses[keyof MarkReflectionStaleResponses];
 
 export type MoveReflectionData = {
     body: MoveReflectionBody;

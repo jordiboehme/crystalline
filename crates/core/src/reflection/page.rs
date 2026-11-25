@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::layout::{PACT_FILE, validate_reflection_path};
-use super::provenance::PageRecord;
+use super::provenance::{PageRecord, REFRESH_REQUESTED_KEY};
 use crate::frontmatter::split_frontmatter;
 
 /// The suffix of a page pact, beside its page: `arch/overview.pact.md` for
@@ -55,6 +55,9 @@ pub const OWNER_MISSING: &str = "names an owner page that does not exist, so it 
 /// A step that leads back to a page already on the way; the chain stops
 /// before it.
 pub const FOLLOWS_CYCLE: &str = "leads back to a page already on the way, so the chain stops here";
+/// Why a `refresh_requested` in the page record is not read: it is no
+/// RFC 3339 time, so the page carries no not-fresh mark.
+pub const MARK_UNREADABLE: &str = "the page's not-fresh mark does not read; mark it again";
 
 /// Something a page says about itself that is not read the way its writer
 /// likely meant, in the shape of the pact's
@@ -64,8 +67,8 @@ pub struct PageFinding {
     /// The page the finding is about, by its path inside the Reflection. A
     /// finding of the pact chain may be about a page on the way up.
     pub page: String,
-    /// The key: [`FRESHNESS_KEY`], [`FOLLOWS_KEY`], [`OWNER_KEY`] or
-    /// [`FOLDER_PARENT`].
+    /// The key: [`FRESHNESS_KEY`], [`FOLLOWS_KEY`], [`OWNER_KEY`],
+    /// [`FOLDER_PARENT`] or [`REFRESH_REQUESTED_KEY`].
     pub key: &'static str,
     /// The value as written (YAML for a value that is no string).
     pub value: String,
@@ -316,6 +319,18 @@ pub fn read_page_settings(
     }
     if let Some(serde_yaml_ng::Value::String(status)) = map.get(STATUS_KEY) {
         settings.status = Some(status.clone());
+    }
+    if record
+        .unreadable
+        .iter()
+        .any(|key| key == REFRESH_REQUESTED_KEY)
+    {
+        let value = record
+            .other
+            .get(REFRESH_REQUESTED_KEY)
+            .map(as_written)
+            .unwrap_or_default();
+        findings.push(finding(REFRESH_REQUESTED_KEY, value, MARK_UNREADABLE));
     }
     (settings, findings)
 }

@@ -805,6 +805,11 @@ mod tests {
             "null",
             "owned pages first and the owner last",
             "`owned_reconciled`",
+            "`refresh_requested`",
+            "`owned_marked`",
+            "never takes that shortcut",
+            "presentation rules",
+            "`still_marked`",
         ] {
             assert!(
                 reconcile.contains(needle),

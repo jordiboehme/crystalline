@@ -488,6 +488,13 @@ impl Stamp {
         format!("{}{rest}", emit::year(self.utc_year()))
     }
 
+    /// RFC 3339 in UTC with `Z` and always three fraction digits:
+    /// `2026-01-05T10:17:19.120Z`.
+    pub fn rfc3339_millis_z(&self) -> String {
+        let rest = self.0.strftime("-%m-%dT%H:%M:%S%.3fZ");
+        format!("{}{rest}", emit::year(self.utc_year()))
+    }
+
     /// `20260105T101719.120Z`, always three fraction digits.
     pub fn compact_millis_z(&self) -> String {
         let rest = self.0.strftime("%m%dT%H%M%S%.3fZ");
@@ -1884,6 +1891,16 @@ mod tests {
         assert_eq!(max.compact_millis_z(), "99991230T220000.999Z");
         assert_eq!(Day(Date::MIN).ymd(), "-9999-01-01");
         assert_eq!(Day(Date::MAX).ymd(), "9999-12-31");
+    }
+
+    #[test]
+    fn rfc3339_millis_z_always_writes_three_digits_and_reads_back() {
+        let stamp = Stamp::from_unix_millis(1_764_079_387_412).unwrap();
+        assert_eq!(stamp.rfc3339_millis_z(), "2025-11-25T14:03:07.412Z");
+        let whole = Stamp::from_unix(1_764_079_387, 0).unwrap();
+        assert_eq!(whole.rfc3339_millis_z(), "2025-11-25T14:03:07.000Z");
+        let back = parse_rfc3339(&stamp.rfc3339_millis_z()).unwrap().stamp();
+        assert_eq!(back.unix_millis(), 1_764_079_387_412);
     }
 
     #[test]

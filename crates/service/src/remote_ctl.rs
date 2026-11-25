@@ -64,6 +64,7 @@ pub const REMOTE_COMMANDS: &[&str] = &[
     "automation_run_record",
     "automation_share",
     "automation_runs",
+    "reflect_mark_stale",
 ];
 
 /// The commands whose answer carries an etag, because a client caches it.
@@ -271,6 +272,19 @@ pub(crate) async fn dispatch(
         }
         crystalline_remote::FILE_COMMAND => {
             return verb_envelope(remote_file(engine, request, identity, &scope, base).await);
+        }
+        // A not-fresh mark, as the token's account (an agent token never
+        // reaches this door, and the engine refuses an agent anyway).
+        crate::automation_ctl::MARK_STALE_COMMAND => {
+            let mut request = request.clone();
+            if let Some(typed) = request.get("domain").and_then(Value::as_str) {
+                match localized(engine, typed, &scope).await {
+                    Ok(local) => request["domain"] = Value::String(local),
+                    Err(message) => return envelope_err(message),
+                }
+            }
+            let caller = crate::ReflectionCaller::person(scope.clone(), &identity.name);
+            return crate::automation_ctl::mark_stale(engine, &request, &caller).await;
         }
         // A runner's verbs: the token's account holds the lease and is the
         // one whose MCP writes the share carries.

@@ -181,7 +181,7 @@ Access has two axes. They are set side by side: per account for every shared dom
 | anonymous visitor, public domain | read, never comment | - | - |
 
 - **Read and comment** means reading every page, its threads and its files, and taking part in threads.
-- **Edit** adds writing pages: create, change, move and delete them, and add new files. An editor may change a page's `status` between words that do not retire it, for example from `current` to `draft`.
+- **Edit** adds writing pages: create, change, move and delete them, mark a page not fresh, and add new files. An editor may change a page's `status` between words that do not retire it, for example from `current` to `draft`.
 - **Curate** adds writing pact files (`PACT.md` and every page pact), recording the engrams a section was built from, settling feedback, and replacing, moving and removing files. It also adds a page's settings: `freshness`, `follows` and a `status` from the retired set, retire and restore, naming an `owner` when a page is created, and recording a reconcile. Moving or deleting a page that has a page pact needs curate, because the pact goes with it, and so does a move onto a path that makes the page the folder parent of pages that already exist. A move that takes a folder parent away from its pages needs only edit. Everyone who may edit the engrams curates. Readers and contributors propose a pact change in a thread.
 - A page's settings never change by accident. A write that leaves `freshness`, `follows` or `status` out keeps the stored value, for every writer, so an agent that rewrites a page without its frontmatter keeps the page's schedule. A curator takes a key off with the key and no value, for example `freshness:`, or with the page settings in Fluid. A write below curate that sends another `freshness` or `follows` than stored, either key on a new page, or a `status` that retires a page or brings it back is refused with a sentence that says to leave the key out or send it as stored. The co-editing editor never shows these keys, and a save there keeps the stored values.
 - A member of a private domain at knowledge `none` needs a Reflection level; without one the membership grants nothing and is refused.
@@ -230,7 +230,7 @@ crystalline domain members eng reflection remove ada
 | update | `unreflected` | An engram no section covers yet. |
 | update | `off_structure` | A page fits none of the pact's `## Structure` globs. |
 | update | `pact_changed` | A person changed the pact since the pages were last brought in line with it. `sections` lists the ids of the changed parts. |
-| update | `stale` | A page's freshness ran out, so it is brought in line with its pacts again. Only a run, or a call with `stale: true`, gets it. See [Pages that keep themselves current](#pages-that-keep-themselves-current). |
+| update | `stale` | A page's freshness ran out or a person marked it not fresh, so it is brought in line with its pacts again. Only a run, or a call with `stale: true`, gets it. See [Pages that keep themselves current](#pages-that-keep-themselves-current). |
 | update | `page_pact_changed` | A pact on the page's way changed. Either a person changed a page pact (`pacts` names the changed files, `diff` shows the change), or the page's pacts and settings no longer match what its last reconcile saw (`pacts` empty, `pact_hash_changed: true`). `chain` lists the pact files the page follows. See [When a pact changes](#when-a-pact-changes). |
 | update | `owner_gone` | The page that owned this page is missing or retired (`owner`, and `owner_is`: `missing` or `retired`), so no reconcile keeps it current. Retire it, or retire it and restore it without owner, so it stands on its own. |
 | update | `link_retired` | A section links a retired page. `links` names the targets. |
@@ -269,25 +269,57 @@ A page is due when its last reconcile is older than its freshness. It is due als
 
 `reflect` hands a due page out as a `stale` item. A run gets it by default: an agent of the loops, a session started for a run, or a session whose loop lease limits what it reads. Any other session gets it only with `stale: true`, and `stale: false` turns it off for a run too. It never counts in the session nudges (the routing line and the Stop hook), and the queue of the JSON API and Fluid's Review do not show it. The automation status counts it on its own (see [Run the loops on their own](automation.md#a-frequent-poll)). The item carries:
 
-- `freshness`, `last_reconciled` and `outcome` (`updated`, `unchanged`, or null when no reconcile was recorded yet);
+- `freshness`, `last_reconciled` and `outcome` (`updated`, `unchanged`, or null when no reconcile was recorded yet). `freshness` is null for a page that is due only because a person marked it;
+- `refresh_requested`: `{at, by}` while the page is marked not fresh, otherwise null. `owned_marked` lists the owned pages that are marked. See [Mark a page not fresh](#mark-a-page-not-fresh);
 - `pacts`: the pact files the page follows, in the order they apply. The answer carries their texts once, in a top-level `pacts` object by domain and path;
 - `pact_hash`: the hash of those pacts and the page's settings as they are now;
 - `owned`: the pages the page owns, and the pages they own, and `owned_reconciled`: those of them reconciled since the page's own last reconcile;
 - `unsettled`: the ids of the page's sections a person changed and nobody settled yet;
 - `changed_engrams`: how many engrams changed since `last_reconciled` in the domains the caller may read. It is null when that is not known: a domain the caller may read lives on a connected server, or a file domain was not read yet. A caller who may not see engrams gets no count;
 - `source_changed`: the page's own source changes. Once a page is due, its `source_changed` items leave the queue and are listed here instead;
-- `version`: the same for one period and new with the next.
+- `version`: the same for one period and new with the next. It has three parts, `base:period:hash`. When the item's set holds a marked page, it has a mark part and reads `base:period:mark:hash`. An item with no mark keeps the three-part form. A 0.36 instance reads a four-part version as no `stale` item's version, so its check for an older period takes it as sent.
 
-The agent reads the pact texts in order, searches the domains it may read for what changed since `last_reconciled`, changes only what new information requires and names every source. With `changed_engrams` 0 and a page that does not move with the calendar, it records the page unchanged at once. It creates the pages the pact asks for with `owner`, updates the pages the page owns and retires those that are no longer needed. A run never deletes a page.
+The agent reads the pact texts in order, searches the domains it may read for what changed since `last_reconciled`, changes only what new information requires and names every source. With `changed_engrams` 0, a page that does not move with the calendar and no mark, it records the page unchanged at once. It creates the pages the pact asks for with `owner`, updates the pages the page owns and retires those that are no longer needed. A run never deletes a page.
 
-Then it records the reconcile: `write_reflection` with `action: reconciled`, `outcome` `updated` or `unchanged`, and the item's `version`. Only this action records a reconcile; a write of the page does not. It needs curate, writes no file and sends a change event, so an open page in Fluid shows the new "Last checked". It is refused:
+Then it records the reconcile: `write_reflection` with `action: reconciled`, `outcome` `updated` or `unchanged`, and the item's `version`. Only this action records a reconcile; a write of the page does not. It needs curate and sends a change event, so an open page in Fluid shows the new "Last checked". The record itself is not in the page file. It writes the page only to take off the marks it saw (see [Mark a page not fresh](#mark-a-page-not-fresh)). It is refused:
 
-- while the page is due, without a `version`;
+- while the page is due, without a `version`. A marked page that has an item of its own needs one too, so the mark the run saw is recorded: "'{inner}' is marked not fresh and has a stale item in the reflect queue: send its version with reconciled, so the mark it saw is recorded";
 - with the version of an older period: the page was reconciled again after the item was handed out, so nothing is recorded and the agent reads the queue again;
+- with a version whose mark part is newer than every mark on the page and the pages it owns: it answers no item the queue handed out, so the agent reads the queue again. A run cannot cover a mark it did not see;
 - for an owner that is due while one of its owned pages has no reconcile after the owner's last one: the refusal names those pages. Owned pages come first and the owner last;
 - for `PACT.md`, a page pact and a retired page.
 
-A failed run records nothing, so the page stays due. A `stale` item that a run left for a person comes back with the next period.
+A failed run records nothing, so the page stays due. A `stale` item that a run left for a person comes back with the next period. A marked page stays due until a run reconciles it.
+
+When the version has a mark part, the reconcile takes the marks it saw off the page file: the page's own and the marks of each page it owns, recursively, whose mark is at or before that part. Each page is written under its own lock. The write changes only the page record and keeps the file's modified time. It is a page change like any other: a change event, a backup commit, and an open room takes it in. A mark that came later stays. The receipt names it in `still_marked` (a list of `{path, at, by}`) and carries the page's own `refresh_requested`. A reconcile with no version (an owned page under a due owner) or with a three-part version clears nothing.
+
+### Mark a page not fresh
+
+A person can mark a page as not fresh when it is wrong or out of date, whatever its freshness says. The next reflect run then brings it in line with its pacts again. This also works for a page with no freshness at all.
+
+A mark is two keys in the page's record, the `_page` entry of its `reflection:` block: `refresh_requested`, the time in RFC 3339 UTC with milliseconds (for example `2026-11-25T14:03:07.412Z`), and `refresh_requested_by`, the login of the person.
+
+- **Who may mark.** Everyone who may edit the Reflection: a contributor and up (see [Who may do what](#who-may-do-what)). Readers and the anonymous visitor may not. Nor may the agents of the loops or any unattended session. Its refusal says that a person marks the page in Fluid or in an attended session. The CLI verb `crystalline reflect mark-stale` is not gated by the unattended rule. On the machine it runs as the machine owner through the local control socket, and on a remote instance it runs as the person whose token it uses. A run never calls it.
+- **What is marked.** The named page and, unless `only_page` is set, each page it owns, and the pages those own, recursively. Retired owned pages are left out. A retired page and a pact file are refused. One call has one time for all its pages. It is always later than every mark it replaces, so marking a page again moves its time forward.
+- **A page is due** as soon as it carries a readable mark and is not retired. It gets a `stale` item of its own, unless a page up its owners is due too. Then it is part of that page's item. `freshness` is null in an item that is due only by its mark, and `age_secs` is the seconds since the mark.
+- **No shortcut.** A marked page never takes the shortcut of recording it unchanged at once, even when `changed_engrams` is 0. The agent looks at the page.
+- **The clock.** The mark write changes only the page record and keeps the file's modified time. A page that was never reconciled keeps its freshness clock.
+- **What clears a mark.** A reconcile that saw it takes it off the page file, as described under [The `stale` item](#the-stale-item). Owned pages count as done for the owner's item when they were recorded after the later of the owner's last reconcile, the owner's mark and their own mark. So `only_page` on an owner still has its owned pages reconciled first.
+- **Automation.** The `stale` count of the status includes marked pages, `due` is true, and the trigger sends without the 30-minute quiet rule. Marking many pages sends one webhook. See [Run the loops on their own](automation.md).
+
+Mark it in one of four ways:
+
+- In Fluid: the More actions menu has "Mark as not fresh". It marks the page and its owned pages. While the page is marked, a line under the title reads "Not fresh: marked by <name> at <time>".
+- In an attended session: `write_reflection` with `action: mark_stale` and one `path`. Add `only_page: true` to mark only that page.
+- Over the JSON API: `POST /api/v1/domains/{domain}/reflection/mark-stale` (see [Over the JSON API](#over-the-json-api)).
+- On the command line: `crystalline reflect mark-stale <domain> [<page>...] [--only-page] [--json]`. With no page it marks every page that is not retired.
+
+A pipeline that writes engrams writes them first and marks after. Engrams written through the API or MCP are indexed when the write returns. Files dropped on disk are picked up by the watcher a little later. So a pipeline that writes files marks after they are indexed, or writes through the API.
+
+A mark waits for a runner. Without one, nothing happens until one comes. Fluid shows the mark either way. Two more limits:
+
+- A restore from a backup taken before a mark was cleared brings that mark back once. The page is due again and the next run takes it off.
+- Marks compare by the clock of the instance that wrote them. In document mode, two instances with clocks that differ can order a mark and a seen mark wrongly by that difference.
 
 ### Owned pages
 
@@ -336,7 +368,8 @@ An unattended session may not:
 - delete a page or a page pact. It retires a page instead (`action: retire`);
 - write pact text: no create, change or overwrite of `PACT.md` or any page pact;
 - move a page that has its own page pact, since the pact moves with it;
-- change a page's `freshness` or `follows`, and it sets neither on a new page, an owned page included.
+- change a page's `freshness` or `follows`, and it sets neither on a new page, an owned page included;
+- mark a page not fresh. A person does that in Fluid or in an attended session.
 
 It still writes the text of pages, settles feedback (on a pact file too), opens and answers threads (on a pact file too), sets a `status`, retires, restores, creates owned pages and records reconciles. Sending `freshness` or `follows` as stored, or leaving them out, is no change. A move rewrites the links in `PACT.md` and in page pacts that point at the moved page; that is no pact write. Feedback or a thread that asks for a pact change, a new freshness or another `follows` is answered in its thread and left to a curator. So is a file item on a pact file, such as a missing file or an embedded engram attachment, because its fix would change the pact's text.
 
@@ -344,10 +377,11 @@ Each refusal says who makes the change and where, for example "an unattended ses
 
 ### Over the JSON API
 
-- `GET /api/v1/domains/{domain}/reflections/{path}`: a page's answer carries `page` with `freshness`, `follows`, `status`, `owner`, `retired` (`at`, `by` and `was_owned_by`; `at` and `by` are null for a page retired only by its status word), `chain` (the pages it follows, from the top down), `pacts` (the pact files in order), `pact` (its own page pact, with `exists`) and `findings`. Nodes of `GET .../reflection/tree` carry `retired` and `owner`, and hits of `GET .../reflection/search` carry `retired`.
+- `GET /api/v1/domains/{domain}/reflections/{path}`: a page's answer carries `page` with `refresh_requested` (`{at, by, by_display}` while the page is marked, null otherwise and on a retired page), `freshness`, `follows`, `status`, `owner`, `retired` (`at`, `by` and `was_owned_by`; `at` and `by` are null for a page retired only by its status word), `chain` (the pages it follows, from the top down), `pacts` (the pact files in order), `pact` (its own page pact, with `exists`) and `findings`. Nodes of `GET .../reflection/tree` carry `retired` and `owner`, and hits of `GET .../reflection/search` carry `retired`.
 - `PATCH /api/v1/domains/{domain}/reflection/settings` with `path` and any of `freshness`, `follows` and `status` changes a page's settings. A key left out, or sent as null, keeps its value; an empty string takes the key off; any other value sets it. At least one key is needed. It needs curate. It refuses a freshness under one hour or one that does not read, a freshness on an owned page, a retired word in `status` (retire the page instead), any `status` change on a retired page (restore it instead), a pact file and a `follows` the write would refuse. The answer is the write's receipt with the page as it is now.
+- `POST /api/v1/domains/{domain}/reflection/mark-stale` marks pages not fresh. It needs edit. The body has exactly one of `path`, `pages` (a list that is not empty) and `all: true`, and may add `only_page`. The answer is `{domain, at, by, pages, only_page}`. It refuses a retired page and a pact file.
 - `POST /api/v1/domains/{domain}/reflection/retire` with `path`, and `POST /api/v1/domains/{domain}/reflection/restore` with `path` and an optional `owner`, retire and restore a page.
-- `GET /api/v1/domains/{domain}/reflection/clock?path=<page>` answers `{clock, checksum}`. `clock` holds `path`, `freshness`, `last_reconciled`, `last_checked_secs`, `due_in_secs`, `stale`, `overdue_secs`, `missed_secs`, `loop_slower_than_freshness`, `waiting`, `part_of` and `clock_of`. Times are seconds relative to the server's clock. An owned page answers its owner in `part_of` and the clock of the first page up its owners that has one. `clock` is null for a page on its own with no freshness, a retired page and a missing page. `checksum` is the sha256 of the page file as stored, the same as a read's `checksum`, and null for a missing page. A reconcile writes no file, so a client that heard a change compares the checksum with the text it holds and reads the page again only when they differ.
+- `GET /api/v1/domains/{domain}/reflection/clock?path=<page>` answers `{clock, checksum, refresh_requested}`. `clock` holds `path`, `freshness`, `last_reconciled`, `last_checked_secs`, `due_in_secs`, `stale`, `overdue_secs`, `missed_secs`, `loop_slower_than_freshness`, `waiting`, `part_of` and `clock_of`. Times are seconds relative to the server's clock. An owned page answers its owner in `part_of` and the clock of the first page up its owners that has one. `clock` is null for a page on its own with no freshness, a retired page and a missing page. `checksum` is the sha256 of the page file as stored, the same as a read's `checksum`, and null for a missing page. `refresh_requested` is `{at, by, by_display}` while the page is marked, otherwise null. A reconcile writes no file unless it takes off a mark, so a client that heard a change compares the checksum with the text it holds and reads the page again only when they differ.
 - `GET /api/v1/reflection/missed` lists the pages a reflect run missed, over every Reflection the caller may read, longest missed first: `{pages: [{domain, path, freshness, last_checked_secs, missed_secs, waiting}]}`.
 
 A reconcile has no route of its own: only an agent records one, with `write_reflection`.

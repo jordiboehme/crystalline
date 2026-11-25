@@ -217,3 +217,65 @@ async fn run(
     };
     Ok(answer)
 }
+
+/// `reflect_mark_stale`: mark Reflection pages not fresh as `caller` (the
+/// machine owner on the control socket, the token's account on the remote
+/// ctl route). The request names `domain`, and `pages` (paths inside
+/// reflections/) or `all: true`, and `only_page`; one page in `pages` is
+/// the one-page case, and neither is refused with the engine's sentence.
+/// Answers the engine's answer.
+pub(crate) async fn mark_stale(
+    engine: &Arc<Engine>,
+    request: &Value,
+    caller: &crate::scope::ReflectionCaller,
+) -> Value {
+    match run_mark_stale(engine, request, caller).await {
+        Ok(data) => envelope_ok(data),
+        Err(f) if f.invalid => envelope_err_kind(f.message, crystalline_remote::INVALID_KIND),
+        Err(f) => envelope_err(f.message),
+    }
+}
+
+/// The command [`mark_stale`] answers.
+pub const MARK_STALE_COMMAND: &str = "reflect_mark_stale";
+
+async fn run_mark_stale(
+    engine: &Arc<Engine>,
+    request: &Value,
+    caller: &crate::scope::ReflectionCaller,
+) -> Result<Value, Failure> {
+    use crate::params::{MarkPages, MarkStale};
+    let domain = text(request, "domain")?;
+    let pages: Vec<String> = match request.get("pages") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| Failure::invalid("pages must be an array of paths"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(Failure::invalid("pages must be an array of paths")),
+    };
+    let flag = |key: &str| match request.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(on)) => Ok(*on),
+        Some(_) => Err(Failure::invalid(format!("{key} must be true or false"))),
+    };
+    let all = flag("all")?;
+    let only_page = flag("only_page")?;
+    let pages = match (all, pages.len()) {
+        (true, 0) => MarkPages::All,
+        (true, _) => {
+            return Err(Failure::invalid(
+                "name the pages to mark with pages or all: true, not both",
+            ));
+        }
+        (false, 1) => MarkPages::One(pages[0].clone()),
+        (false, _) => MarkPages::Many(pages),
+    };
+    Ok(engine
+        .mark_reflection_stale(domain, &MarkStale { pages, only_page }, caller)
+        .await?)
+}

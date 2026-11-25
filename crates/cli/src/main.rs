@@ -817,7 +817,7 @@ enum Command {
     /// comes in.
     Reflect {
         #[command(subcommand)]
-        command: automation::LoopCommand,
+        command: automation::ReflectCommand,
     },
     /// Sweep for the maintenance the knowledge needs and print a ranked queue.
     ///
@@ -2748,12 +2748,22 @@ fn run() -> anyhow::Result<()> {
         Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
         Some(Command::Agents { command }) => on_runtime(move || agents::run(command, cli.json)),
         Some(Command::Kept { command }) => kept::run(command, cli.json),
-        Some(Command::Reflect { command }) => on_runtime(move || {
-            automation::run(
-                crystalline_core::automation::Loop::Reflect,
-                command,
-                cli.json,
-            )
+        Some(Command::Reflect { command }) => on_runtime(move || async move {
+            match command {
+                automation::ReflectCommand::Loop(command) => {
+                    automation::run(
+                        crystalline_core::automation::Loop::Reflect,
+                        command,
+                        cli.json,
+                    )
+                    .await
+                }
+                automation::ReflectCommand::MarkStale {
+                    domain,
+                    pages,
+                    only_page,
+                } => automation::mark_stale(domain, pages, only_page, cli.json).await,
+            }
         }),
         Some(Command::Evolve {
             command: Some(command),

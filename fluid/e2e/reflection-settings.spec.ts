@@ -136,9 +136,19 @@ test("a curator edits a page's settings, makes its pact, retires, restores and d
       new RegExp(`Pacts: (PACT\\.md > )?${name}\\.pact\\.md`),
     );
 
+    // Mark as not fresh from the menu: the status line says so.
+    const more = page.getByRole("button", { name: "More actions" });
+    await more.click();
+    await page.getByRole("menuitem", { name: "Mark as not fresh" }).click();
+    await expect(
+      page.getByText(
+        "Marked as not fresh. The next reflect run checks it again.",
+      ),
+    ).toBeVisible();
+    await expect(status).toContainText("Not fresh: marked by");
+
     // Retire from the menu: the banner says so, the navigation hides the
     // page behind its switch, and the banner restores it.
-    const more = page.getByRole("button", { name: "More actions" });
     await more.click();
     await page.getByRole("menuitem", { name: "Retire" }).click();
     const banner = page.getByRole("note", { name: "Retired" });

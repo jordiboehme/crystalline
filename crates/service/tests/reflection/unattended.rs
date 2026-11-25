@@ -586,3 +586,90 @@ async fn a_run_session_over_mcp_keeps_off_settings_and_pact_text() {
     .await;
     landed(&answer);
 }
+
+/// A not-fresh mark is a person's: an agent of the loops and a session that
+/// says it is unattended are refused with a sentence that names Fluid and
+/// an attended session, and nothing is written. A session whose limit comes
+/// from a lease alone marks.
+#[tokio::test]
+async fn an_unattended_session_does_not_mark_a_page_not_fresh() {
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", &page("")).await;
+    for run in Run::both(&fx).await {
+        let e = run
+            .write(&fx, &act("mark_stale", "guides/a.md"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, EngineError::Forbidden(_)),
+            "{}: {e}",
+            run.name()
+        );
+        assert_eq!(
+            e.to_string(),
+            "an unattended session does not mark pages not fresh; 'guides/a.md' stays as it is, and a person marks it in Fluid or in an attended session",
+            "{}",
+            run.name()
+        );
+        let all = within(
+            run.limit(),
+            fx.engine.mark_reflection_stale(
+                "eng",
+                &crystalline_service::params::MarkStale {
+                    pages: crystalline_service::params::MarkPages::All,
+                    only_page: false,
+                },
+                &run.caller(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            all.to_string(),
+            "an unattended session does not mark pages not fresh; the pages of eng stay as they are, and a person marks them in Fluid or in an attended session"
+        );
+    }
+    assert!(
+        !file(&fx, "guides/a.md")
+            .unwrap()
+            .contains("refresh_requested")
+    );
+    within(
+        Some(Limit::default()),
+        fx.engine
+            .write_reflection(&act("mark_stale", "guides/a.md"), &person()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        file(&fx, "guides/a.md")
+            .unwrap()
+            .contains("refresh_requested")
+    );
+}
+
+/// Over MCP, a stdio session started for a run is refused the mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_session_over_mcp_does_not_mark() {
+    use crate::read_limit::{refused, session, tool};
+    use crystalline_service::McpServer;
+    use serde_json::json;
+
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", &page("")).await;
+    let mut wire = session(McpServer::new(fx.engine.clone()).with_run_domain("eng")).await;
+    let answer = tool(
+        &mut wire,
+        30,
+        "write_reflection",
+        json!({ "domain": "eng", "path": "guides/a.md", "action": "mark_stale" }),
+    )
+    .await;
+    let text = refused(&answer);
+    assert!(text.contains("does not mark pages not fresh"), "{text}");
+    assert!(
+        !file(&fx, "guides/a.md")
+            .unwrap()
+            .contains("refresh_requested")
+    );
+}

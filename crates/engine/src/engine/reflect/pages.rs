@@ -12,6 +12,7 @@ use crystalline_core::reflection as r;
 use serde_json::{Value, json};
 
 use super::{Item, item_basis};
+use crate::engine::mark_stale::{Mark, page_mark};
 use crate::engine::reconcile::PageReconcile;
 
 /// What an `owner_gone` item says to do.
@@ -33,6 +34,8 @@ pub(super) struct PageView {
     pact_files: BTreeSet<String>,
     /// The pages each page owns.
     owned: BTreeMap<String, Vec<String>>,
+    /// The pages marked not fresh (worked pages only), with their marks.
+    marks: BTreeMap<String, Mark>,
 }
 
 impl PageView {
@@ -58,13 +61,67 @@ impl PageView {
             links.insert(path.to_string(), settings.links(&record));
             pages.insert(path.to_string(), (settings, record));
         }
+        let marks = pages
+            .iter()
+            .filter(|(path, _)| !retired.contains(*path))
+            .filter_map(|(path, (_, record))| Some((path.clone(), page_mark(record)?)))
+            .collect();
         PageView {
             pages,
             retired,
             links,
             pact_files,
             owned: r::owned_pages(rows.iter().copied()),
+            marks,
         }
+    }
+
+    /// The not-fresh mark of the worked page at `path`, when it carries one.
+    pub(super) fn mark(&self, path: &str) -> Option<&Mark> {
+        self.marks.get(path)
+    }
+
+    /// Whether the worked page at `path` is due at `now` (seconds since the
+    /// epoch): its freshness ran out, or it is marked not fresh.
+    fn due(&self, states: &BTreeMap<String, PageReconcile>, path: &str, now: i64) -> bool {
+        self.worked(path)
+            && (self.marks.contains_key(path) || freshness_ran_out(self, states, path, now))
+    }
+
+    /// Whether a page up the owners of `path` is due: then `path` is part
+    /// of that page's `stale` item, not one of its own. The walk stops at a
+    /// missing or retired owner (it owns nothing) and where a loop comes
+    /// back.
+    fn owner_due(&self, states: &BTreeMap<String, PageReconcile>, path: &str, now: i64) -> bool {
+        let mut seen = BTreeSet::from([path.to_string()]);
+        let mut next = self
+            .pages
+            .get(path)
+            .and_then(|(_, record)| record.owner.clone());
+        while let Some(owner) = next.take() {
+            if !seen.insert(owner.clone()) || !self.worked(&owner) {
+                return false;
+            }
+            if self.due(states, &owner, now) {
+                return true;
+            }
+            next = self
+                .pages
+                .get(&owner)
+                .and_then(|(_, record)| record.owner.clone());
+        }
+        false
+    }
+
+    /// Whether the page at `path` has a `stale` item of its own at `now`:
+    /// it is due and no page up its owners is.
+    pub(super) fn own_item(
+        &self,
+        states: &BTreeMap<String, PageReconcile>,
+        path: &str,
+        now: i64,
+    ) -> bool {
+        self.due(states, path, now) && !self.owner_due(states, path, now)
     }
 
     /// Whether `path` is a page that is not retired: one that is worked.
@@ -87,18 +144,25 @@ impl PageView {
     /// Every page `path` owns, its owned pages' owned pages included, in
     /// the order they are reached.
     fn owned_tree(&self, path: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut next = vec![path.to_string()];
-        while let Some(owner) = next.pop() {
-            for child in self.owned.get(&owner).into_iter().flatten() {
-                if child != path && !out.contains(child) {
-                    out.push(child.clone());
-                    next.push(child.clone());
-                }
+        owned_tree(&self.owned, path)
+    }
+}
+
+/// Every page `path` owns by `owned` (the pages each page owns, as
+/// [`r::owned_pages`] reads them: a retired page is in no set), its owned
+/// pages' owned pages included, in the order they are reached.
+pub(crate) fn owned_tree(owned: &BTreeMap<String, Vec<String>>, path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut next = vec![path.to_string()];
+    while let Some(owner) = next.pop() {
+        for child in owned.get(&owner).into_iter().flatten() {
+            if child != path && !out.contains(child) {
+                out.push(child.clone());
+                next.push(child.clone());
             }
         }
-        out
     }
+    out
 }
 
 /// A pact file's change against its baseline: the diff the item shows and
@@ -252,18 +316,46 @@ pub(super) fn page_items(view: &PageView, inputs: &PageInputs<'_>) -> Vec<Item> 
     items
 }
 
+/// Whether the freshness of the page at `path` ran out at `now` (seconds
+/// since the epoch). An owned page's freshness is a finding and is never
+/// read, so it never runs out.
+fn freshness_ran_out(
+    view: &PageView,
+    states: &BTreeMap<String, PageReconcile>,
+    path: &str,
+    now: i64,
+) -> bool {
+    let Some((settings, _)) = view.pages.get(path) else {
+        return false;
+    };
+    let (Some(freshness), Some(state)) = (settings.freshness.as_ref(), states.get(path)) else {
+        return false;
+    };
+    crystalline_core::time::parse_rfc3339(&state.last_reconciled).is_some_and(|at| {
+        freshness
+            .timing(at.stamp().unix_seconds(), now, &[])
+            .stale()
+    })
+}
+
 /// The version of a `stale` item: the recorded reconcile it was handed out
 /// after (its time in milliseconds since the epoch, 0 for a page with none
-/// recorded), the index of the period since then and a hash of the
-/// freshness, the pact hash, that reconcile (or never) and the period. It
-/// stays the same for one period and moves with the next; a reconcile
-/// recorded after it was handed out makes it older ([`stale_base`]).
+/// recorded), the index of the period since then (0 for a page due only by
+/// its mark), the newest not-fresh mark of the item's set when it has one,
+/// and a hash of the freshness as written (empty for none), the pact hash,
+/// that reconcile (or never), the period and the mark. It stays the same
+/// for one period and moves with the next and with every re-mark; a
+/// reconcile recorded after it was handed out makes it older
+/// ([`stale_base`]). An item with no mark in its set has the version 0.36
+/// gave it, byte for byte (`base:period:hash`); one with a mark gets
+/// `base:period:mark:hash`.
 fn stale_version(
-    freshness: &r::Freshness,
+    freshness: &str,
     state: &PageReconcile,
     recorded_at: Option<i64>,
     period: i64,
     pact_hash: &str,
+    mark: Option<i64>,
 ) -> String {
     let period = period.to_string();
     let reconciled = if recorded_at.is_some() {
@@ -271,28 +363,95 @@ fn stale_version(
     } else {
         "never"
     };
-    let hash = item_basis([
-        freshness.written.as_str(),
-        pact_hash,
-        reconciled,
-        period.as_str(),
-    ]);
-    format!("{}:{period}:{hash}", recorded_at.unwrap_or(0))
+    let base = recorded_at.unwrap_or(0);
+    match mark {
+        None => {
+            let hash = item_basis([freshness, pact_hash, reconciled, period.as_str()]);
+            format!("{base}:{period}:{hash}")
+        }
+        Some(mark) => {
+            let mark = mark.to_string();
+            let hash = item_basis([
+                freshness,
+                pact_hash,
+                reconciled,
+                period.as_str(),
+                mark.as_str(),
+            ]);
+            format!("{base}:{period}:{mark}:{hash}")
+        }
+    }
+}
+
+/// The parts of a `stale` item's `version`: the recorded reconcile it was
+/// handed out after and the mark part, when it has one. `None` when
+/// `version` is no stale item's version. Reads both forms: 3 parts with no
+/// mark, 4 parts with one (decimal milliseconds).
+fn stale_parts(version: &str) -> Option<(i64, Option<i64>)> {
+    let parts: Vec<&str> = version.split(':').collect();
+    let (base, period, mark, hash) = match parts.as_slice() {
+        [base, period, hash] => (*base, *period, None, *hash),
+        [base, period, mark, hash] => (*base, *period, Some(*mark), *hash),
+        _ => return None,
+    };
+    let base = base.parse::<i64>().ok()?;
+    period.parse::<u64>().ok()?;
+    let mark = match mark {
+        Some(mark) if mark.bytes().all(|b| b.is_ascii_digit()) => Some(mark.parse::<i64>().ok()?),
+        Some(_) => return None,
+        None => None,
+    };
+    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some((base, mark))
 }
 
 /// The recorded reconcile a `stale` item's `version` was handed out after,
 /// in milliseconds since the epoch (0 for none), or `None` when `version`
 /// is no stale item's version.
 pub(crate) fn stale_base(version: &str) -> Option<i64> {
-    let mut parts = version.splitn(3, ':');
-    let base = parts.next()?.parse::<i64>().ok()?;
-    parts.next()?.parse::<u64>().ok()?;
-    let hash = parts.next()?;
-    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(base)
+    stale_parts(version).map(|(base, _)| base)
 }
 
-/// One page's `stale` item, when its freshness ran out at `now` (seconds
-/// since the epoch). Its `changed_engrams` is filled in later
+/// The mark part of a `stale` item's `version`: the newest not-fresh mark
+/// of the item's set when it was handed out, in milliseconds since the
+/// epoch. `None` for a version without one (3 parts) and for what is no
+/// stale item's version.
+pub(crate) fn stale_mark(version: &str) -> Option<i64> {
+    stale_parts(version)?.1
+}
+
+/// Whether the owned page `child` counts as reconciled for its owner's
+/// item: it has a recorded reconcile after `since` (the later of the
+/// owner's last reconcile and the owner's own mark) and after its own mark.
+pub(crate) fn owned_done(
+    state: Option<&PageReconcile>,
+    since_ms: i64,
+    mark_ms: Option<i64>,
+) -> bool {
+    let after = mark_ms.map_or(since_ms, |mark| mark.max(since_ms));
+    state.is_some_and(|state| {
+        state.outcome.is_some()
+            && crystalline_core::time::parse_rfc3339(&state.last_reconciled)
+                .is_some_and(|at| at.stamp().unix_millis() > after)
+    })
+}
+
+/// Whether the page at `path` of the Reflection `rows` (path, text) has a
+/// `stale` item of its own at `now` (seconds since the epoch), by
+/// `states`: it is due (its freshness ran out, or it is marked not fresh)
+/// and no page up its owners is. What a `reconciled` without a version is
+/// refused for.
+pub(crate) fn has_own_stale_item(
+    rows: &[(&str, &str)],
+    states: &BTreeMap<String, PageReconcile>,
+    path: &str,
+    now: i64,
+) -> bool {
+    PageView::read(rows).own_item(states, path, now)
+}
+
+/// One page's `stale` item, when it has one of its own at `now` (seconds
+/// since the epoch): its freshness ran out or it is marked not fresh, and
+/// no page up its owners is due (then it is part of that page's item). Its `changed_engrams` is filled in later
 /// (`Detail::Full` only), from the engrams changed since `last_reconciled`,
 /// which comes back beside the item: how many engrams changed since then in
 /// the domains the caller may read, or null when that is unknown. It is
@@ -305,22 +464,44 @@ pub(super) fn stale_item(
     path: &str,
     now: i64,
 ) -> Option<(Item, i64)> {
-    if view.retired.contains(path) {
+    if view.retired.contains(path) || !view.own_item(inputs.states, path, now) {
         return None;
     }
     let (settings, _) = view.pages.get(path)?;
     // An owned page's freshness is a finding and was not read.
-    let freshness = settings.freshness.as_ref()?;
+    let freshness = settings.freshness.as_ref();
     let state = inputs.states.get(path)?;
     let at = crystalline_core::time::parse_rfc3339(&state.last_reconciled)?.stamp();
-    let timing = freshness.timing(at.unix_seconds(), now, &[]);
-    if !timing.stale() {
-        return None;
-    }
-    let period = timing.period;
+    let timing = freshness
+        .map(|freshness| (freshness, freshness.timing(at.unix_seconds(), now, &[])))
+        .filter(|(_, timing)| timing.stale());
+    let mark = view.mark(path);
+    let period = timing.as_ref().map_or(0, |(_, timing)| timing.period);
     let recorded_at = state.outcome.is_some().then(|| at.unix_millis());
     let pact_hash = inputs.hashes.get(path).map(String::as_str).unwrap_or("");
-    let version = stale_version(freshness, state, recorded_at, period, pact_hash);
+    let owned = view.owned_tree(path);
+    let owned_marked: Vec<&String> = owned
+        .iter()
+        .filter(|child| view.mark(child).is_some())
+        .collect();
+    // The newest mark of the item's set: what its record may take off.
+    let set_mark = mark
+        .map(|mark| mark.at_ms)
+        .into_iter()
+        .chain(
+            owned_marked
+                .iter()
+                .filter_map(|child| view.mark(child).map(|m| m.at_ms)),
+        )
+        .max();
+    let version = stale_version(
+        freshness.map_or("", |freshness| freshness.written.as_str()),
+        state,
+        recorded_at,
+        period,
+        pact_hash,
+        set_mark,
+    );
     let chain = view.chain(path);
     let mut texts = serde_json::Map::new();
     for pact in &chain {
@@ -331,22 +512,30 @@ pub(super) fn stale_item(
             );
         }
     }
-    // The owned pages reconciled since the owner was: a run that stopped at
-    // its cap part way through them resumes after them (design 3.5). Only a
-    // recorded reconcile counts, never the seed of a page with none.
-    let owned = view.owned_tree(path);
+    // The owned pages reconciled since the owner was (and since the owner's
+    // mark and their own): a run that stopped at its cap part way through
+    // them resumes after them (design 3.5). Only a recorded reconcile
+    // counts, never the seed of a page with none.
+    let since = mark.map_or(at.unix_millis(), |mark| mark.at_ms.max(at.unix_millis()));
     let owned_reconciled: Vec<&String> = owned
         .iter()
         .filter(|child| {
-            inputs.states.get(child.as_str()).is_some_and(|child| {
-                child.outcome.is_some()
-                    && crystalline_core::time::parse_rfc3339(&child.last_reconciled)
-                        .is_some_and(|t| t.stamp() > at)
-            })
+            owned_done(
+                inputs.states.get(child.as_str()),
+                since,
+                view.mark(child).map(|m| m.at_ms),
+            )
         })
         .collect();
+    let freshness_age = timing
+        .as_ref()
+        .map(|(freshness, timing)| timing.last_checked_secs - freshness.seconds);
+    let mark_age = mark.map(|mark| (now - mark.at_ms.div_euclid(1000)).max(0));
+    let age_secs = freshness_age.into_iter().chain(mark_age).max().unwrap_or(0);
     let extra = json!({
-        "freshness": freshness.written,
+        "freshness": timing.as_ref().map(|(freshness, _)| freshness.written.clone()),
+        "refresh_requested": mark.map(Mark::to_json),
+        "owned_marked": owned_marked,
         "last_reconciled": state.last_reconciled,
         "outcome": state.outcome.map(|o| o.as_str()),
         "pacts": chain,
@@ -365,7 +554,7 @@ pub(super) fn stale_item(
             path: path.to_string(),
             section: None,
             heading: String::new(),
-            age_secs: timing.last_checked_secs - freshness.seconds,
+            age_secs,
             extra,
             basis: version,
         },
@@ -394,7 +583,55 @@ pub(super) const PACT_TEXTS: &str = "_pact_texts";
 mod tests {
     use std::collections::HashSet;
 
-    use super::counted_elsewhere;
+    use super::{counted_elsewhere, stale_base, stale_mark, stale_version};
+    use crate::engine::reconcile::{PageReconcile, ReconcileOutcome};
+
+    fn state() -> PageReconcile {
+        PageReconcile {
+            last_reconciled: "2026-11-20T10:00:00+00:00".into(),
+            outcome: Some(ReconcileOutcome::Updated),
+            pact_hash: Some("abc".into()),
+            version: None,
+        }
+    }
+
+    /// An item with no mark in its set has the version 0.36 gave it, byte
+    /// for byte, so an item a run left for a person before the upgrade
+    /// stays left.
+    #[test]
+    fn an_unmarked_version_is_the_one_0_36_gave() {
+        let version = stale_version("1d", &state(), Some(1_795_600_000_000), 3, "abc", None);
+        assert_eq!(
+            version,
+            "1795600000000:3:8d33ce9b99db50b6480f8e67e7cc632fcf04c7c05d1651d851fff473d3da3499"
+        );
+        assert_eq!(stale_base(&version), Some(1_795_600_000_000));
+        assert_eq!(stale_mark(&version), None);
+    }
+
+    /// A version with a mark has four parts; both forms read, and the mark
+    /// moves the version.
+    #[test]
+    fn a_marked_version_carries_its_mark_and_reads_back() {
+        let marked = stale_version("", &state(), None, 0, "abc", Some(1_795_615_387_412));
+        let parts: Vec<&str> = marked.split(':').collect();
+        assert_eq!(parts.len(), 4, "{marked}");
+        assert_eq!(&parts[..3], ["0", "0", "1795615387412"]);
+        assert_eq!(stale_base(&marked), Some(0));
+        assert_eq!(stale_mark(&marked), Some(1_795_615_387_412));
+        let later = stale_version("", &state(), None, 0, "abc", Some(1_795_615_387_413));
+        assert_ne!(later, marked);
+        for wrong in [
+            "1:2",
+            "x:1:aa",
+            "1:2:-5:8d33ce9b99db50b6480f8e67e7cc632fcf04c7c05d1651d851fff473d3da3499",
+            "1:2:3:4:8d33ce9b99db50b6480f8e67e7cc632fcf04c7c05d1651d851fff473d3da3499",
+            "v1",
+        ] {
+            assert_eq!(stale_base(wrong), None, "{wrong}");
+            assert_eq!(stale_mark(wrong), None, "{wrong}");
+        }
+    }
 
     #[test]
     fn a_readable_mount_makes_the_count_unknown() {

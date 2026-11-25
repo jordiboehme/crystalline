@@ -286,6 +286,9 @@ fn reflection_allow_list() -> &'static [(&'static str, &'static [&'static str])]
                 "engine/src/engine/reconcile.rs",
                 // The page clocks read each page's freshness from its text.
                 "engine/src/engine/freshness.rs",
+                // A not-fresh mark reads the pages it reaches and their
+                // owned pages.
+                "engine/src/engine/mark_stale.rs",
             ],
         ),
         (

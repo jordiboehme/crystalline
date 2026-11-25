@@ -846,6 +846,17 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let marked = shared.engine.schedule_too_wide_backups().await;
             (envelope_ok(json!({ "marked": marked })), false)
         }
+        // A not-fresh mark, as the machine owner: the CLI's verb, never a
+        // run's.
+        crate::automation_ctl::MARK_STALE_COMMAND => (
+            crate::automation_ctl::mark_stale(
+                &shared.engine,
+                req,
+                &crate::scope::ReflectionCaller::owner(),
+            )
+            .await,
+            false,
+        ),
         // The runner's verbs for the reflect and evolve loops, as the machine
         // owner: no account, so a share falls back to the changed files.
         automation if crate::automation_ctl::AUTOMATION_COMMANDS.contains(&automation) => (
@@ -1353,7 +1364,7 @@ fn folds_on_the_way_in(req: &Value) -> bool {
 /// domain collide with the one an alias already points at. Nor is
 /// `forget_domain`: it names a domain that was just removed, and mapping that
 /// name could only land on a different, live domain.
-const DOMAIN_REFERENCE_COMMANDS: [&str; 23] = [
+const DOMAIN_REFERENCE_COMMANDS: [&str; 24] = [
     "sync",
     "file_stamps",
     "scaffold_manifest",
@@ -1377,6 +1388,7 @@ const DOMAIN_REFERENCE_COMMANDS: [&str; 23] = [
     "automation_run_record",
     "automation_share",
     "automation_runs",
+    "reflect_mark_stale",
 ];
 
 /// `req` with its `domain` spelled as the local name, when it is a command
