@@ -111,6 +111,63 @@ fn reports_clean_when_nothing_is_wrong() {
     );
 }
 
+/// A config that does not load (here a misspelled key inside a `provision`
+/// pick) is doctor's first finding, not an exit with a bare error: the
+/// report names the load error as a problem and exits 1.
+#[test]
+fn a_config_that_does_not_load_is_reported_as_a_problem() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let domain_dir = work.path().join("kb-eng");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    write(
+        work.path(),
+        "config.yaml",
+        &format!(
+            "domains:\n  eng:\n    path: {}\n    provision:\n      exept:\n      - skills/storm\n",
+            domain_dir.display()
+        ),
+    );
+    let db = work.path().join("index.db");
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "doctor printed a report ({e}); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let error = report["config_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(error.contains("exept"), "{error}");
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("config:\n  [problem] "), "{text}");
+    assert!(text.contains("exept"), "{text}");
+}
+
 #[test]
 fn reports_near_duplicate_tag_clusters_without_failing() {
     let work = tempfile::tempdir().unwrap();
