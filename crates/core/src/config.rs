@@ -7,6 +7,7 @@
 //! here.
 
 pub mod registration;
+pub mod root_folder;
 pub mod root_pin;
 pub mod write_fence;
 
