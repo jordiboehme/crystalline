@@ -9716,6 +9716,7 @@ pub use github_app::{
 #[cfg(any(test, feature = "testing"))]
 pub use github_app::{AppKeychainSeam, AppLookupFn};
 mod kept;
+mod mark_stale;
 mod move_;
 mod name_report;
 mod names;
@@ -11404,6 +11405,37 @@ pub(crate) fn text_read_error(abs: &Path, source: std::io::Error) -> EngineError
 /// [`write_bytes`] instead.
 fn write_file(abs: &Path, contents: &str) -> Result<()> {
     write_bytes(abs, crystalline_core::to_lf(contents).as_bytes())
+}
+
+/// [`write_file`], with the file's modified time set to `modified` before
+/// it takes the file's place, so nothing that watches the folder sees the
+/// new text with another time.
+fn write_file_keeping_modified(
+    abs: &Path,
+    contents: &str,
+    modified: std::time::SystemTime,
+) -> Result<()> {
+    let tmp = crystalline_core::path::hidden_temp_path(abs, "tmp");
+    let file = std::fs::File::create(&tmp).map_err(|source| EngineError::Io {
+        path: tmp.display().to_string(),
+        source,
+    })?;
+    let written =
+        std::io::Write::write_all(&mut &file, crystalline_core::to_lf(contents).as_bytes())
+            .and_then(|()| file.set_modified(modified));
+    drop(file);
+    if let Err(source) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EngineError::Io {
+            path: tmp.display().to_string(),
+            source,
+        });
+    }
+    std::fs::rename(&tmp, abs).map_err(|source| EngineError::Io {
+        path: abs.display().to_string(),
+        source,
+    })?;
+    Ok(())
 }
 
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {

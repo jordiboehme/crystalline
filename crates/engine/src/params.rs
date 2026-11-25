@@ -682,7 +682,9 @@ pub struct WriteReflectionParams {
     /// page out of the navigation, kept and restorable; an unattended
     /// session retires and never deletes), restore (bring a retired page
     /// back), reconciled (record that a page was brought in line with its
-    /// pacts, with outcome updated or unchanged), write_asset
+    /// pacts, with outcome updated or unchanged), mark_stale (mark a page
+    /// not fresh: the next reflect run reconciles it and the pages it owns,
+    /// without the shortcut; edit access), write_asset
     /// (upload a file under reflections/assets/: path, and content or
     /// base64; replacing one with overwrite needs curate access), move_asset
     /// or delete_asset (move or remove a file under reflections/assets/; both
@@ -765,6 +767,9 @@ pub struct WriteReflectionParams {
     /// before the page's last reconcile is refused as an older period.
     #[serde(default)]
     pub version: Option<String>,
+    /// mark_stale: mark only this page, not the pages it owns.
+    #[serde(default)]
+    pub only_page: bool,
     /// write: the checksum read_reflection returned; a reflection that changed
     /// since is refused rather than overwritten.
     #[serde(default)]
@@ -785,6 +790,30 @@ pub struct WriteReflectionParams {
     /// agent can set it in its arguments and the MCP schema does not show it.
     #[serde(skip)]
     pub disclosed: Option<String>,
+}
+
+/// Which pages a not-fresh mark names ([`MarkStale`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkPages {
+    /// One page, by its path inside reflections/.
+    One(String),
+    /// Several pages, in the order given.
+    Many(Vec<String>),
+    /// Every page of the Reflection that is not retired.
+    All,
+}
+
+/// A request to mark Reflection pages not fresh
+/// (`Engine::mark_reflection_stale`): the next reflect run reconciles them
+/// in full, without the "changed_engrams 0" shortcut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkStale {
+    /// The pages to mark.
+    pub pages: MarkPages,
+    /// Mark only the named pages, not the pages they own. Without it the
+    /// pages each named page owns are marked too, recursively.
+    #[serde(default)]
+    pub only_page: bool,
 }
 
 /// A change to a Reflection page's settings, the frontmatter keys only a

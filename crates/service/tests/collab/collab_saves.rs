@@ -2040,6 +2040,48 @@ async fn a_reflection_room_save_is_announced_with_its_typist() {
     );
 }
 
+/// A not-fresh mark landed while a room has the page open survives the
+/// room's next save: the room puts the stored block back.
+#[tokio::test]
+async fn a_mark_landed_while_a_room_is_open_survives_its_save() {
+    let (tmp, engine, _scratch) = reflection_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let mut joined = sessions
+        .join_reflection("eng", "guides/a.md", "ada")
+        .await
+        .unwrap();
+    let doc = sync_client(&joined).await;
+    let answer = engine
+        .mark_reflection_stale(
+            "eng",
+            &crystalline_service::params::MarkStale {
+                pages: crystalline_service::params::MarkPages::One("guides/a.md".into()),
+                only_page: false,
+            },
+            &crystalline_service::ReflectionCaller::owner(),
+        )
+        .await
+        .unwrap();
+    let at = answer["at"].as_str().unwrap().to_string();
+    assert_eq!(next_control(&mut joined.rx).await, Control::Merged);
+    append_line(&joined, &doc, "Typed after the mark.").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    let saved = next_control(&mut joined.rx).await;
+    assert!(matches!(saved, Control::Saved { .. }), "{saved:?}");
+    let saved = std::fs::read_to_string(tmp.path().join("eng/reflections/guides/a.md")).unwrap();
+    assert!(saved.contains("Typed after the mark."), "{saved}");
+    let record = crystalline_core::reflection::read_provenance(&saved).page;
+    assert_eq!(
+        record.refresh_requested.as_deref(),
+        Some(at.as_str()),
+        "{saved}"
+    );
+}
+
 /// A room closed without typing writes nothing, so it announces nothing.
 /// The fixture's page has no provenance block yet, which the first close
 /// writes; the second room finds nothing left to write.

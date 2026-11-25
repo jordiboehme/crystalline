@@ -87,18 +87,25 @@ impl PageView {
     /// Every page `path` owns, its owned pages' owned pages included, in
     /// the order they are reached.
     fn owned_tree(&self, path: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut next = vec![path.to_string()];
-        while let Some(owner) = next.pop() {
-            for child in self.owned.get(&owner).into_iter().flatten() {
-                if child != path && !out.contains(child) {
-                    out.push(child.clone());
-                    next.push(child.clone());
-                }
+        owned_tree(&self.owned, path)
+    }
+}
+
+/// Every page `path` owns by `owned` (the pages each page owns, as
+/// [`r::owned_pages`] reads them: a retired page is in no set), its owned
+/// pages' owned pages included, in the order they are reached.
+pub(crate) fn owned_tree(owned: &BTreeMap<String, Vec<String>>, path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut next = vec![path.to_string()];
+    while let Some(owner) = next.pop() {
+        for child in owned.get(&owner).into_iter().flatten() {
+            if child != path && !out.contains(child) {
+                out.push(child.clone());
+                next.push(child.clone());
             }
         }
-        out
     }
+    out
 }
 
 /// A pact file's change against its baseline: the diff the item shows and

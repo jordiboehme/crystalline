@@ -16,6 +16,7 @@ mod fixture;
 mod guards;
 mod hosts;
 mod kept;
+mod mark_stale;
 mod mode_change;
 mod nudges;
 mod own_writes;

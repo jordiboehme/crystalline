@@ -1159,6 +1159,21 @@ pub(crate) fn unattended_delete_refusal(inner: &str) -> String {
     }
 }
 
+/// The refusal of a not-fresh mark by an unattended session
+/// ([`Engine::is_unattended`]): a person asks for a full look, a run never
+/// asks itself. `first` is the first page named; `None` for every page of
+/// `domain`.
+pub(crate) fn unattended_mark_refusal(domain: &str, first: Option<&str>) -> String {
+    match first {
+        Some(inner) => format!(
+            "an unattended session does not mark pages not fresh; '{inner}' stays as it is, and a person marks it in Fluid or in an attended session"
+        ),
+        None => format!(
+            "an unattended session does not mark pages not fresh; the pages of {domain} stay as they are, and a person marks them in Fluid or in an attended session"
+        ),
+    }
+}
+
 /// The refusal of a page's `freshness` or `follows` change by an unattended
 /// session ([`Engine::is_unattended`]): a curator decides how often a page
 /// is reconciled and which pact it follows. `new` is a page the write
@@ -1833,6 +1848,13 @@ impl Engine {
                     .await
             }
             "retire" => self.retire_reflection(&p.domain, &p.path, caller).await,
+            "mark_stale" => {
+                let mark = crate::params::MarkStale {
+                    pages: crate::params::MarkPages::One(p.path.clone()),
+                    only_page: p.only_page,
+                };
+                self.mark_reflection_stale(&p.domain, &mark, caller).await
+            }
             "restore" => {
                 self.restore_reflection(&p.domain, &p.path, p.owner.as_deref(), caller)
                     .await
@@ -1864,7 +1886,7 @@ impl Engine {
             }
             "write_asset" => self.write_reflection_asset(p, caller).await,
             other => Err(EngineError::Invalid(format!(
-                "`{other}` is not a write_reflection action; use write, move, delete, settle, retire, restore, reconciled, write_asset, move_asset or delete_asset"
+                "`{other}` is not a write_reflection action; use write, move, delete, settle, retire, restore, reconciled, mark_stale, write_asset, move_asset or delete_asset"
             ))),
         }
     }
