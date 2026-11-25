@@ -293,6 +293,16 @@ struct Inner {
     branches: HashMap<String, String>,
     etags: HashMap<String, String>,
     blobs: HashMap<String, Vec<u8>>,
+    /// Blob shas whose `blob` read answers a 500. Set through
+    /// `MockProvider::fail_blob`.
+    failing_blobs: HashSet<String>,
+    /// Bytes a `blob` read serves in place of the stored content. Set through
+    /// `MockProvider::replace_blob`; kept apart from `blobs` so a later
+    /// `create_blob` of the same content does not undo it.
+    replaced_blobs: HashMap<String, Vec<u8>>,
+    /// The blob shas `blob` was asked for, in call order. Kept apart from
+    /// `calls`, whose exact sequences other tests compare.
+    blob_reads: Vec<String>,
     etag_counter: u64,
     commit_counter: u64,
     current_user: String,
@@ -489,6 +499,31 @@ impl MockProvider {
                 ..Inner::default()
             }),
         }
+    }
+
+    /// Makes every `blob` read of `sha` answer a 500, the way a forge that is
+    /// down or a network that is gone fails a fetch.
+    pub fn fail_blob(&self, sha: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .failing_blobs
+            .insert(sha.to_string());
+    }
+
+    /// Makes every `blob` read of `sha` answer `bytes`, content that does not
+    /// hash to what was shared under that sha.
+    pub fn replace_blob(&self, sha: &str, bytes: &[u8]) {
+        self.inner
+            .lock()
+            .unwrap()
+            .replaced_blobs
+            .insert(sha.to_string(), bytes.to_vec());
+    }
+
+    /// The blob shas `blob` was asked for so far, in call order.
+    pub fn blob_reads(&self) -> Vec<String> {
+        self.inner.lock().unwrap().blob_reads.clone()
     }
 
     /// Makes `default_branch` answer `branch`, for a repository whose default
@@ -1007,7 +1042,17 @@ impl Provider for MockProvider {
     }
 
     async fn blob(&self, _origin: &OriginSpec, sha: &str) -> Result<Vec<u8>, RemoteError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.blob_reads.push(sha.to_string());
+        if inner.failing_blobs.contains(sha) {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: format!("blob {sha} failed"),
+            });
+        }
+        if let Some(bytes) = inner.replaced_blobs.get(sha) {
+            return Ok(bytes.clone());
+        }
         inner
             .blobs
             .get(sha)

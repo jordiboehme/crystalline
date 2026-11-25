@@ -13246,3 +13246,113 @@ async fn a_case_only_rename_upstream_keeps_the_file() {
         crystalline_remote::changes::detect_local_changes(&sub.domain_root, &st.files).unwrap();
     assert!(local.changes.is_empty(), "{:?}", local.changes);
 }
+
+// A discard on a domain with an open stacked proposal: the change list
+// measures against the chain tip, so a discard puts back what the proposal
+// carries, never the older team copy underneath it.
+
+/// A discard of `paths` the way the engine makes one, each guarded by the
+/// digest of the file as it stands now.
+fn discard_as_a_caller_would(
+    sub: &Subscribed,
+    paths: &[&str],
+) -> crystalline_remote::ops::DiscardReport {
+    let state = load_state(&sub.state_dir);
+    let base = crystalline_remote::ops::unshared_base(&state);
+    let local = crystalline_remote::changes::detect_local_changes_against(
+        &sub.domain_root,
+        &base,
+        &sub.state_dir,
+        crystalline_core::ReflectionMode::Off,
+    )
+    .unwrap();
+    let targets: Vec<crystalline_remote::ops::DiscardTarget> = paths
+        .iter()
+        .map(|p| crystalline_remote::ops::DiscardTarget {
+            path: p.to_string(),
+            sha256: std::fs::read(sub.domain_root.join(p))
+                .ok()
+                .map(|b| sha256_hex(&b)),
+        })
+        .collect();
+    crystalline_remote::ops::discard_local_files(
+        &sub.domain_root,
+        &sub.state_dir,
+        &base,
+        &local,
+        &targets,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "0.37.0 part 3: fixed in M3"]
+async fn discard_after_a_real_stacked_share_restores_the_layer_content() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+
+    let report = discard_as_a_caller_would(&sub, &["notes/a.md"]);
+
+    assert_eq!(
+        report.restored,
+        vec!["notes/a.md".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+}
+
+#[tokio::test]
+#[ignore = "0.37.0 part 3: fixed in M3"]
+async fn withdrawing_an_upper_layer_restores_the_lower_layers_content_not_the_trunks() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    let report = stacked_withdraw(&mock, &sub, Some(second.number), true).await;
+
+    assert_eq!(
+        report.restored,
+        vec!["notes/a.md".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"alpha v2\n",
+        "the lower layer's content, not the trunk's"
+    );
+}
+
+#[tokio::test]
+#[ignore = "0.37.0 part 3: fixed in M3"]
+async fn a_reviewer_amendment_leaves_the_discard_on_what_this_machine_shared() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let head = mock.branch_commit(&first.branch).expect("the layer head");
+    let mut files = mock.commit_tree(&head).expect("the layer tree");
+    files.insert(
+        "notes/a.md".to_string(),
+        b"alpha by the reviewer\n".to_vec(),
+    );
+    let amended = mock.add_commit(files, Some(&head));
+    mock.set_branch(&first.branch, &amended);
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+
+    let report = discard_as_a_caller_would(&sub, &["notes/a.md"]);
+
+    assert_eq!(
+        report.restored,
+        vec!["notes/a.md".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+    assert_eq!(
+        mock.branch_commit(&first.branch),
+        Some(amended),
+        "the reviewer's commit stays on the branch"
+    );
+}
