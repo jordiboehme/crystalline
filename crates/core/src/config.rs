@@ -2971,6 +2971,7 @@ mod tests {
 
     /// The names in `dir`, sorted, so a test sees a temporary file left
     /// behind.
+    #[cfg(unix)]
     fn names_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
