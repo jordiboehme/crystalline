@@ -752,6 +752,17 @@ pub struct ProvisioningDomainDoctor {
     /// same poller that keeps the domain's engrams current, never by doctor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror_present: Option<bool>,
+    /// The lists of the decision when it is a pick (`except` and `also`, or
+    /// `only`). Absent for `true`, `false` and undecided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crystalline_core::config::Provision>,
+    /// Names in the decision the domain does not ship now. A warning, never
+    /// a counted problem, and `--fix` leaves the decision alone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale: Vec<String>,
+    /// Names in the decision that are not `<kind>/<name>`. A warning too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub malformed: Vec<String>,
 }
 
 /// What the Claude Desktop record says is wrong, if anything. Built from
@@ -4900,6 +4911,9 @@ fn check_provisioning(
             decision: provisioning_decision_label(d.decision).to_string(),
             counts: d.counts.clone(),
             mirror_present: mirror_present(cfg, &d.domain),
+            selection: d.selection.clone(),
+            stale: d.stale.clone(),
+            malformed: d.malformed.clone(),
         })
         .collect();
 
@@ -6813,6 +6827,27 @@ pub fn render_human(report: &DoctorReport) -> String {
                     }
                 );
             }
+            let in_except = |name: &str| {
+                matches!(
+                    &d.selection,
+                    Some(crystalline_core::config::Provision::All { except, .. })
+                        if except.iter().any(|e| e == name)
+                )
+            };
+            for name in &d.stale {
+                let _ = writeln!(
+                    out,
+                    "    [warning] stale: {}",
+                    crate::cmd::stale_sentence(&d.name, name, in_except(name))
+                );
+            }
+            for name in &d.malformed {
+                let _ = writeln!(
+                    out,
+                    "    [warning] malformed: {}",
+                    crate::cmd::malformed_sentence(name)
+                );
+            }
         }
         for h in &p.harnesses {
             if let Some(owner) = &h.covered_by {
@@ -6851,9 +6886,10 @@ pub fn render_human(report: &DoctorReport) -> String {
             for pd in &p.pending {
                 let _ = writeln!(
                     out,
-                    "    {}: {} - run `crystalline provision allow {}`.",
+                    "    {}: {} - run `crystalline provision allow {}`, `deny {}` or pick with `take` or `skip`.",
                     pd.domain,
                     render_provision_counts(&pd.counts),
+                    pd.domain,
                     pd.domain
                 );
             }

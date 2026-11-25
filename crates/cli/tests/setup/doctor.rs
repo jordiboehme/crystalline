@@ -3124,6 +3124,173 @@ fn provisioning_section_reports_domain_counts_pending_line_and_harness_drift_edi
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Run `doctor` (human and `--json`) against `config` in an isolated home and
+/// return both renderings.
+#[cfg(unix)]
+fn doctor_both(home: &Path, work: &Path, config: &Path) -> (String, Value) {
+    let mut cmd = bin();
+    apply_home(&mut cmd, home);
+    let json = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(config)
+        .args(["--db"])
+        .arg(work.join("index.db"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let mut cmd = bin();
+    apply_home(&mut cmd, home);
+    let human = cmd
+        .args(["doctor", "--config"])
+        .arg(config)
+        .args(["--db"])
+        .arg(work.join("index.db"))
+        .output()
+        .unwrap()
+        .stdout;
+    (
+        String::from_utf8(human).unwrap(),
+        serde_json::from_slice(&json).unwrap(),
+    )
+}
+
+/// A name in the decision that the domain no longer ships is a warning with
+/// the command that drops it (`take` for an `except` name, `skip` for an
+/// `also` name), a malformed name is a warning too, neither counts as a
+/// problem, and `--fix` leaves the decision alone.
+#[test]
+#[cfg(unix)]
+fn doctor_warns_about_a_stale_provision_name() {
+    let (home, _state_dir) = isolated_home("provisioning-stale");
+    let work = tempfile::tempdir().unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_provisioning_manifest(&harbor_dir, "harbor", "- skills: skills\n");
+    write(
+        &harbor_dir,
+        "skills/tide-tables/SKILL.md",
+        "---\nname: tide-tables\n---\n\nReads the harbor's tide tables.\n",
+    );
+    write_claude_code_install_receipt(&home);
+    let config = work.path().join("config.yaml");
+    let yaml = format!(
+        "domains:\n  harbor:\n    path: {}\n    provision:\n      except:\n      - skills/old-charts\n      - skills\n      also:\n      - skills/gone-lookout\n",
+        harbor_dir.display()
+    );
+    std::fs::write(&config, &yaml).unwrap();
+
+    let (human, report) = doctor_both(&home, work.path(), &config);
+    assert!(human.contains("harbor: allowed"), "{human}");
+    assert!(
+        human.contains(
+            "[warning] stale: skills/old-charts is in the decision, but harbor no longer ships it - run `crystalline provision take harbor skills/old-charts` to drop it."
+        ),
+        "{human}"
+    );
+    assert!(
+        human.contains(
+            "[warning] stale: skills/gone-lookout is in the decision, but harbor no longer ships it - run `crystalline provision skip harbor skills/gone-lookout` to drop it."
+        ),
+        "{human}"
+    );
+    assert!(
+        human.contains(
+            "[warning] malformed: skills is not an artifact name; edit `config.yaml` to fix it."
+        ),
+        "{human}"
+    );
+    let harbor = report["provisioning"]["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "harbor")
+        .unwrap_or_else(|| panic!("{report}"))
+        .clone();
+    assert_eq!(
+        harbor["stale"],
+        json!(["skills/old-charts", "skills/gone-lookout"]),
+        "{harbor}"
+    );
+    assert_eq!(harbor["malformed"], json!(["skills"]), "{harbor}");
+    assert_eq!(
+        harbor["selection"],
+        json!({"except": ["skills", "skills/old-charts"], "also": ["skills/gone-lookout"]}),
+        "{harbor}"
+    );
+    // A stale name is a warning, not a problem: the count matches the same
+    // domain with a plain decision.
+    let plain = work.path().join("plain.yaml");
+    std::fs::write(
+        &plain,
+        format!(
+            "domains:\n  harbor:\n    path: {}\n    provision: true\n",
+            harbor_dir.display()
+        ),
+    )
+    .unwrap();
+    let (plain_human, _) = doctor_both(&home, work.path(), &plain);
+    let remaining = |text: &str| {
+        text.lines()
+            .find(|l| l.ends_with(" remaining"))
+            .unwrap_or_else(|| panic!("no problem count: {text}"))
+            .to_string()
+    };
+    assert_eq!(remaining(&human), remaining(&plain_human), "{human}");
+
+    // `--fix` never touches the decision.
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    cmd.args(["doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .output()
+        .unwrap();
+    let after = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        after.contains("skills/old-charts") && after.contains("skills/gone-lookout"),
+        "the decision is the person's choice: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A kind whose folder is not on disk (a mirror not pulled, a tools folder
+/// not checked out) lists nothing, and that must not make every name of the
+/// decision look stale.
+#[test]
+#[cfg(unix)]
+fn doctor_names_no_stale_name_while_the_mirror_is_missing() {
+    let (home, _state_dir) = isolated_home("provisioning-nomirror");
+    let work = tempfile::tempdir().unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_provisioning_manifest(&harbor_dir, "harbor", "- skills: ../absent-skills\n");
+    write_claude_code_install_receipt(&home);
+    let config = work.path().join("config.yaml");
+    let yaml = format!(
+        "domains:\n  harbor:\n    path: {}\n    provision:\n      only:\n      - skills/tide-tables\n",
+        harbor_dir.display()
+    );
+    std::fs::write(&config, &yaml).unwrap();
+
+    let (human, report) = doctor_both(&home, work.path(), &config);
+    assert!(human.contains("harbor: only"), "{human}");
+    assert!(!human.contains("stale"), "{human}");
+    assert!(!human.contains("[warning]"), "{human}");
+    let harbor = report["provisioning"]["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "harbor")
+        .unwrap_or_else(|| panic!("{report}"))
+        .clone();
+    assert!(harbor.get("stale").is_none(), "{harbor}");
+    assert_eq!(harbor["selection"], json!({"only": ["skills/tide-tables"]}));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// The provisioning section lists domains in the same order `provision
 /// status` does: allowed, undecided, denied, each by name, whatever order the
 /// config registers them in, and the awaiting list goes by name too.
