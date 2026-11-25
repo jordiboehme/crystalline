@@ -18561,6 +18561,38 @@
           }
         }
       },
+      "ProvisioningArtifactView": {
+        "type": "object",
+        "description": "One artifact a domain ships.",
+        "required": [
+          "key",
+          "kind",
+          "name",
+          "optional"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The provisioning key, `<kind>/<name>`.",
+            "example": "skills/storm-warnings"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`skills`, `commands`, `agents` or `mcps`.",
+            "example": "skills"
+          },
+          "name": {
+            "type": "string",
+            "description": "The key without its `<kind>/` prefix.",
+            "example": "storm-warnings"
+          },
+          "optional": {
+            "type": "boolean",
+            "description": "True when the artifact is marked `metadata: { provision: optional }`.",
+            "example": false
+          }
+        }
+      },
       "ProvisioningDeclView": {
         "type": "object",
         "description": "One `kind: path` declaration.",
@@ -18586,9 +18618,17 @@
         "description": "The `Provisioning` section: what parsed, and what did not.",
         "required": [
           "decls",
-          "problems"
+          "problems",
+          "artifacts"
         ],
         "properties": {
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProvisioningArtifactView"
+            },
+            "description": "The artifacts the declared folders ship on the server's disk, by kind\nand key. No on or off: that is decided per machine, and the server's\nmachine is not the reader's. Filled by the handlers from the engine, so the\npure parse of the markdown leaves it empty."
+          },
           "decls": {
             "type": "array",
             "items": {

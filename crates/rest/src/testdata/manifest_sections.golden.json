@@ -278,6 +278,7 @@
       }
     ],
     "provisioning": {
+      "artifacts": [],
       "decls": [
         {
           "kind": "commands",
@@ -488,6 +489,7 @@
       }
     ],
     "provisioning": {
+      "artifacts": [],
       "decls": [
         {
           "kind": "skills",

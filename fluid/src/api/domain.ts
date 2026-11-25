@@ -175,6 +175,15 @@ export interface ManifestProblem {
  * panels show it, and a change goes through the editor. `null` for the two
  * optional sections means the MANIFEST has no such section.
  */
+/** One artifact a domain ships, with the author's optional mark. */
+export interface ProvisioningArtifact {
+  key: string;
+  /** `skills`, `commands`, `agents` or `mcps`. */
+  kind: string;
+  name: string;
+  optional: boolean;
+}
+
 export interface ManifestSections {
   scope: string[];
   whenToUse: string[];
@@ -185,6 +194,11 @@ export interface ManifestSections {
   provisioning: {
     decls: { kind: string; path: string }[];
     problems: ManifestProblem[];
+    /**
+     * What the declared folders ship on the server's disk. No on or off:
+     * each machine decides that for itself. Empty from an older server.
+     */
+    artifacts: ProvisioningArtifact[];
   } | null;
   tagAliases: {
     decls: { alias: string; canonical: string }[];
@@ -366,6 +380,15 @@ export function readManifestSections(value: unknown): ManifestSections | null {
               return kind !== null && path !== null ? [{ kind, path }] : [];
             }),
             problems: readProblems(provisioning.problems),
+            artifacts: asArray(provisioning.artifacts).flatMap((entry) => {
+              const artifact = asObject(entry);
+              const key = asString(artifact?.key);
+              const kind = asString(artifact?.kind);
+              const name = asString(artifact?.name);
+              return key !== null && kind !== null && name !== null
+                ? [{ key, kind, name, optional: artifact?.optional === true }]
+                : [];
+            }),
           },
     tagAliases:
       aliases === null
