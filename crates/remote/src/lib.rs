@@ -60,10 +60,12 @@ pub use mounts::{
     translate_answer,
 };
 pub use ops::{
-    ChangeSides, CommitReport, DIRECT_NO_AMEND, DiscardRefusal, DiscardReport, DiscardTarget,
-    OriginStatusReport, PlannedAction, ProposeOutcome, ProposeReport, PullReport, SharePlan,
-    SubscribeReport, discard_local_files, local_change_sides, materialise_base_paths, propose,
-    propose_preview, pull, resolve_local_change, status, subscribe, unshared_base,
+    ChangeSides, CommitReport, DIRECT_NO_AMEND, DiscardBase, DiscardRefusal, DiscardReport,
+    DiscardTarget, FetchedCopies, MissingCopy, OriginStatusReport, PlannedAction, ProposeOutcome,
+    ProposeReport, PullReport, SharePlan, SubscribeReport, TipSource, TipSources, Unrestorable,
+    discard_local_files, fetch_proposed_copies, local_change_sides, materialise_base_paths,
+    missing_proposed_copies, propose, propose_preview, pull, resolve_local_change, status,
+    subscribe, tip_stamps, unshared_base, unshared_layers, unshared_sources,
 };
 pub use provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,

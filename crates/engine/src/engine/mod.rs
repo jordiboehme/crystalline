@@ -542,14 +542,10 @@ fn fill_unguarded(targets: &[DiscardTarget], local: &LocalChanges) -> Vec<Discar
 
 /// What one offline read of a team domain's unshared delta needs: the domain
 /// root, its origin state directory, the base every comparison is made
-/// against and the delta detection found. What
-/// [`Engine::team_local_changes`] hands its three callers.
-type TeamChanges = (
-    PathBuf,
-    PathBuf,
-    BTreeMap<String, crystalline_remote::state::BaseStamp>,
-    LocalChanges,
-);
+/// against, with the source of every stamp (`ops::unshared_sources`), and the
+/// delta detection found against its stamps. What
+/// [`Engine::team_local_changes`] hands its callers.
+type TeamChanges = (PathBuf, PathBuf, ops::TipSources, LocalChanges);
 
 /// Renders one side of a conflict for [`Engine::origin_conflict_detail`]: an
 /// absent side is `null`, a UTF-8 one is a JSON string, and a side that

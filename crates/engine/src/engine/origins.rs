@@ -3963,11 +3963,14 @@ impl Engine {
         let state = crystalline_remote::state::OriginState::load(&state_dir)?.ok_or_else(|| {
             EngineError::Invalid(format!("domain '{domain}' has no origin state"))
         })?;
-        let base = ops::unshared_base(&state);
+        let sources = ops::unshared_sources(&state);
         let local = crystalline_remote::changes::detect_local_changes_against(
-            &root, &base, &state_dir, reflection,
+            &root,
+            &ops::tip_stamps(&sources),
+            &state_dir,
+            reflection,
         )?;
-        Ok((root, state_dir, base, local))
+        Ok((root, state_dir, sources, local))
     }
 
     /// The domain's own refusal for a caller that asked about local changes
@@ -4045,11 +4048,12 @@ impl Engine {
                 json!({ "domain": domain, "mode": "review", "changes": changes, "skipped_large": [] }),
             );
         }
-        let (root, state_dir, _, local) =
+        let (root, state_dir, sources, local) =
             self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let mut changes = Vec::new();
         for change in local.substantive() {
-            let Some(found) = ops::local_change_sides(&root, &state_dir, &local, change.path())?
+            let Some(found) =
+                ops::local_change_sides(&root, &state_dir, &sources, &local, change.path())?
             else {
                 continue;
             };
@@ -4115,10 +4119,10 @@ impl Engine {
             value["domain"] = json!(domain);
             return Ok(value);
         }
-        let (root, state_dir, _, local) =
+        let (root, state_dir, sources, local) =
             self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
-        let sides =
-            ops::local_change_sides(&root, &state_dir, &local, path)?.ok_or_else(not_a_change)?;
+        let sides = ops::local_change_sides(&root, &state_dir, &sources, &local, path)?
+            .ok_or_else(not_a_change)?;
         let mut value = origin::change_detail_json(
             sides.change.path(),
             change_kind(&sides.change),
@@ -4161,9 +4165,14 @@ impl Engine {
         if let Some(who) = drafting {
             return self.discard_into_overlay(domain, &who, targets).await;
         }
-        let (root, state_dir, base, local) =
+        let (root, state_dir, sources, local) =
             self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let targets = fill_unguarded(targets, &local);
+        let unrestorable = BTreeMap::new();
+        let base = ops::DiscardBase {
+            sources: &sources,
+            unrestorable: &unrestorable,
+        };
         let report = ops::discard_local_files(&root, &state_dir, &base, &local, &targets)?;
         let touched: Vec<String> = report
             .restored

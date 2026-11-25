@@ -13284,16 +13284,18 @@ async fn a_case_only_rename_upstream_keeps_the_file() {
 // carries, never the older team copy underneath it.
 
 /// A discard of `paths` the way the engine makes one, each guarded by the
-/// digest of the file as it stands now.
-fn discard_as_a_caller_would(
+/// digest of the file as it stands now: a fetch from `mock` first for any
+/// proposal content with no local copy, then the discard.
+async fn discard_as_a_caller_would(
+    mock: &MockProvider,
     sub: &Subscribed,
     paths: &[&str],
 ) -> crystalline_remote::ops::DiscardReport {
     let state = load_state(&sub.state_dir);
-    let base = crystalline_remote::ops::unshared_base(&state);
+    let sources = crystalline_remote::ops::unshared_sources(&state);
     let local = crystalline_remote::changes::detect_local_changes_against(
         &sub.domain_root,
-        &base,
+        &crystalline_remote::ops::tip_stamps(&sources),
         &sub.state_dir,
         crystalline_core::ReflectionMode::Off,
     )
@@ -13307,10 +13309,23 @@ fn discard_as_a_caller_would(
                 .map(|b| sha256_hex(&b)),
         })
         .collect();
+    let missing = crystalline_remote::ops::missing_proposed_copies(
+        &sub.state_dir,
+        &sources,
+        &local,
+        &targets,
+    )
+    .unwrap();
+    let fetched =
+        crystalline_remote::ops::fetch_proposed_copies(mock, &spec(), &sub.state_dir, &missing)
+            .await;
     crystalline_remote::ops::discard_local_files(
         &sub.domain_root,
         &sub.state_dir,
-        &base,
+        &crystalline_remote::ops::DiscardBase {
+            sources: &sources,
+            unrestorable: &fetched.unrestorable,
+        },
         &local,
         &targets,
     )
@@ -13318,14 +13333,13 @@ fn discard_as_a_caller_would(
 }
 
 #[tokio::test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 async fn discard_after_a_real_stacked_share_restores_the_layer_content() {
     let mock = MockProvider::new();
     mock.enable_stacks();
     let (sub, _first) = stacked_bottom_layer(&mock).await;
     write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
 
-    let report = discard_as_a_caller_would(&sub, &["notes/a.md"]);
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
 
     assert_eq!(
         report.restored,
@@ -13336,7 +13350,6 @@ async fn discard_after_a_real_stacked_share_restores_the_layer_content() {
 }
 
 #[tokio::test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 async fn withdrawing_an_upper_layer_restores_the_lower_layers_content_not_the_trunks() {
     let mock = MockProvider::new();
     mock.enable_stacks();
@@ -13359,7 +13372,6 @@ async fn withdrawing_an_upper_layer_restores_the_lower_layers_content_not_the_tr
 }
 
 #[tokio::test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 async fn a_reviewer_amendment_leaves_the_discard_on_what_this_machine_shared() {
     let mock = MockProvider::new();
     mock.enable_stacks();
@@ -13374,7 +13386,7 @@ async fn a_reviewer_amendment_leaves_the_discard_on_what_this_machine_shared() {
     mock.set_branch(&first.branch, &amended);
     write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
 
-    let report = discard_as_a_caller_would(&sub, &["notes/a.md"]);
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
 
     assert_eq!(
         report.restored,
@@ -13606,4 +13618,69 @@ async fn a_fresh_subscribe_prunes_the_copies_an_earlier_one_left() {
     .await
     .unwrap();
     assert!(proposed_copies(&state_dir).is_empty());
+}
+
+// A proposal shared by a version before 0.37.0 left no local copy: a discard
+// fetches the content by the blob sha the record names, checks it against the
+// record's digest and keeps it, so the next discard of it is offline.
+
+#[tokio::test]
+async fn a_pre_upgrade_layer_is_fetched_checked_and_kept() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+    forget_proposed_copies(&sub.state_dir);
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
+
+    assert_eq!(
+        report.restored,
+        vec!["notes/a.md".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+    assert_eq!(mock.blob_reads().len(), 1, "{:?}", mock.blob_reads());
+    assert_eq!(proposed_copies(&sub.state_dir), digests(&[b"alpha v2\n"]));
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v4\n");
+    let again = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
+    assert_eq!(again.restored, vec!["notes/a.md".to_string()]);
+    assert_eq!(mock.blob_reads().len(), 1, "the kept copy is read offline");
+}
+
+#[tokio::test]
+async fn a_failed_fetch_names_fetch_failed() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+    forget_proposed_copies(&sub.state_dir);
+    mock.fail_blob(&sha256_hex(b"alpha v2\n"));
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
+
+    assert_eq!(report.refused.len(), 1, "{report:?}");
+    assert_eq!(report.refused[0].1.code(), "no_base_copy");
+    assert_eq!(report.refused[0].1.detail(), Some("fetch_failed"));
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v3\n");
+}
+
+#[tokio::test]
+async fn a_blob_that_does_not_hash_names_digest_mismatch() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+    forget_proposed_copies(&sub.state_dir);
+    mock.replace_blob(&sha256_hex(b"alpha v2\n"), b"something else\n");
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
+
+    assert_eq!(report.refused[0].1.detail(), Some("digest_mismatch"));
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v3\n");
+    assert!(
+        proposed_copies(&sub.state_dir).is_empty(),
+        "nothing was stored"
+    );
 }

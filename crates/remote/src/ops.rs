@@ -1910,11 +1910,13 @@ pub fn resolve_local_change<'a>(local: &'a LocalChanges, raw: &str) -> Option<&'
 
 /// Both byte sides of one detected change.
 ///
-/// The base side is the base snapshot's copy of the reported path, which is
+/// The base side is what the path's stamp describes ([`unshared_sources`]):
+/// the base snapshot's copy for a path whose stamp is the trunk's, which is
 /// the team's version for a modification and the last known content for a
-/// deletion; `None` for an addition, and `None` for a path the trunk never
-/// carried because a lower open stacked layer owns it (its base side is the
-/// tip's shared content, which the stamps describe by digest alone). The
+/// deletion, and the local copy of the shared content for a path an open or
+/// merged proposal carries. `None` for an addition, and `None` for a
+/// proposal's path with no local copy (a proposal shared by a version before
+/// 0.37.0): this never fetches. The
 /// current side is the working-tree file, read at the on-disk spelling
 /// through the validated join; `None` for a deletion, whose current side is
 /// absence and is not read from disk at all.
@@ -1930,9 +1932,13 @@ pub struct ChangeSides {
 
 /// [`ChangeSides`] for the change `raw` names, or `None` when it names none
 /// (see [`resolve_local_change`]). Reads two files at most and nothing else.
+///
+/// `sources` is the map `local` was detected against, with the source of
+/// every stamp ([`unshared_sources`]).
 pub fn local_change_sides(
     domain_root: &Path,
     state_dir: &Path,
+    sources: &TipSources,
     local: &LocalChanges,
     raw: &str,
 ) -> Result<Option<ChangeSides>, RemoteError> {
@@ -1943,7 +1949,12 @@ pub fn local_change_sides(
     let base = match change {
         LocalChange::Added { .. } => None,
         LocalChange::Modified { .. } | LocalChange::Deleted { .. } => {
-            state::read_base_file(state_dir, path)?
+            match sources.get(path).map(|(_, source)| source) {
+                Some(TipSource::Record { sha256, .. }) => {
+                    state::read_proposed_copy(state_dir, sha256)?
+                }
+                Some(TipSource::Trunk) | None => state::read_base_file(state_dir, path)?,
+            }
         }
     };
     let current = match change {
@@ -2059,7 +2070,49 @@ fn tip_files_over(
     base: &BTreeMap<String, BaseStamp>,
     layers: &[&Proposal],
 ) -> BTreeMap<String, BaseStamp> {
-    let mut tip = base.clone();
+    tip_stamps(&tip_sources_over(base, layers))
+}
+
+/// Where the content of one path of a chain tip comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TipSource {
+    /// The trunk: the base snapshot holds the bytes.
+    Trunk,
+    /// A proposal record laid over the trunk: its local copy under the state
+    /// folder holds the bytes, or the blob it names on GitHub.
+    Record {
+        /// The proposal number.
+        number: u64,
+        /// The digest of the shared bytes, which is also the stamp's digest.
+        sha256: String,
+        /// The git blob sha of the shared bytes, `None` on a record from
+        /// before 0.17.0.
+        blob_sha: Option<String>,
+    },
+}
+
+/// A chain tip with the source of every stamp: what [`tip_sources_over`]
+/// builds, so the base a detection runs against and the content a discard
+/// restores always come from one walk and can never disagree.
+pub type TipSources = BTreeMap<String, (BaseStamp, TipSource)>;
+
+/// The stamps of `sources`, the base map a detection runs against.
+pub fn tip_stamps(sources: &TipSources) -> BTreeMap<String, BaseStamp> {
+    sources
+        .iter()
+        .map(|(path, (stamp, _))| (path.clone(), stamp.clone()))
+        .collect()
+}
+
+/// [`tip_files_over`], remembering which record set each stamp. The rules
+/// are the same: bottom to top, an added or modified entry with no digest
+/// is skipped (the path keeps what stood below), a deleted one removes the
+/// path.
+fn tip_sources_over(base: &BTreeMap<String, BaseStamp>, layers: &[&Proposal]) -> TipSources {
+    let mut tip: TipSources = base
+        .iter()
+        .map(|(path, stamp)| (path.clone(), (stamp.clone(), TipSource::Trunk)))
+        .collect();
     for layer in layers {
         for file in &layer.files {
             match file.change {
@@ -2071,7 +2124,12 @@ fn tip_files_over(
                         .size
                         .or_else(|| base.get(&file.path).map(|stamp| stamp.size))
                         .unwrap_or_default();
-                    tip.insert(file.path.clone(), BaseStamp { sha256, size });
+                    let source = TipSource::Record {
+                        number: layer.number,
+                        sha256: sha256.clone(),
+                        blob_sha: file.blob_sha.clone(),
+                    };
+                    tip.insert(file.path.clone(), (BaseStamp { sha256, size }, source));
                 }
                 ProposedChange::Deleted => {
                     tip.remove(&file.path);
@@ -2080,6 +2138,32 @@ fn tip_files_over(
         }
     }
     tip
+}
+
+/// The records [`unshared_base`] lays over the trunk, bottom first: every
+/// Open or Merged record on the stacked path, none off it.
+fn unshared_layer_refs(state: &OriginState) -> Vec<&Proposal> {
+    if state.stacks_available != Some(true) || !chain_is_stacked(state) {
+        return Vec::new();
+    }
+    state
+        .proposals
+        .iter()
+        .filter(|p| matches!(p.status, ProposalStatus::Open | ProposalStatus::Merged))
+        .collect()
+}
+
+/// The records [`unshared_base`] lays over the trunk, bottom first: every
+/// Open or Merged record on the stacked path, and none off it.
+pub fn unshared_layers(state: &OriginState) -> Vec<Proposal> {
+    unshared_layer_refs(state).into_iter().cloned().collect()
+}
+
+/// [`unshared_base`] with the source of every stamp: the map a discard and
+/// the change sides read, so a path whose stamp comes from a proposal record
+/// is restored and shown from that record's content, not the trunk's.
+pub fn unshared_sources(state: &OriginState) -> TipSources {
+    tip_sources_over(&state.files, &unshared_layer_refs(state))
 }
 
 /// The base an unshared-work walk counts against.
@@ -2103,16 +2187,15 @@ fn tip_files_over(
 /// hook's share nudge, the write-receipt trailer and the owned-changes count
 /// are all computed from - so no surface can disagree with the badge beside
 /// it.
+///
+/// It is the stamps of [`unshared_sources`]; a discard reads that map
+/// instead, so it puts a path back to what its stamp describes.
 pub fn unshared_base(state: &OriginState) -> BTreeMap<String, BaseStamp> {
-    if state.stacks_available != Some(true) || !chain_is_stacked(state) {
+    let layers = unshared_layer_refs(state);
+    if layers.is_empty() {
         return state.files.clone();
     }
-    let carried: Vec<&Proposal> = state
-        .proposals
-        .iter()
-        .filter(|p| matches!(p.status, ProposalStatus::Open | ProposalStatus::Merged))
-        .collect();
-    tip_files_over(&state.files, &carried)
+    tip_files_over(&state.files, &layers)
 }
 
 /// Whether a stack write failed because the stack this machine records is no
@@ -5703,9 +5786,9 @@ pub enum DiscardRefusal {
     ChangedSince,
     /// The path is a team file and it matches the base again already.
     NotAChange,
-    /// The trunk has no copy: a lower open layer owns the path, and a discard
-    /// never fetches (withdrawing that layer is what brings the bytes back).
-    NoBaseCopy,
+    /// The content the path goes back to is not at hand: the detail says
+    /// why.
+    NoBaseCopy(Unrestorable),
     /// Not among this domain's local changes, a generated listing included.
     UnknownPath,
 }
@@ -5716,10 +5799,190 @@ impl DiscardRefusal {
         match self {
             DiscardRefusal::ChangedSince => "changed_since",
             DiscardRefusal::NotAChange => "not_a_change",
-            DiscardRefusal::NoBaseCopy => "no_base_copy",
+            DiscardRefusal::NoBaseCopy(_) => "no_base_copy",
             DiscardRefusal::UnknownPath => "unknown_path",
         }
     }
+
+    /// The wire spelling of why a [`DiscardRefusal::NoBaseCopy`] happened,
+    /// `None` for every other refusal and for a trunk copy that is gone.
+    pub fn detail(self) -> Option<&'static str> {
+        match self {
+            DiscardRefusal::NoBaseCopy(why) => why.code(),
+            _ => None,
+        }
+    }
+}
+
+/// Why the content a path goes back to is not at hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unrestorable {
+    /// The proposal record names no blob (a record from before 0.17.0), so
+    /// there is nothing to fetch the content from.
+    NoBlobRecorded,
+    /// No local copy, and no fetch was made: no credential, or no way to
+    /// reach GitHub was given.
+    NotFetched,
+    /// GitHub did not give the blob: offline, gone, or an error.
+    FetchFailed,
+    /// The blob GitHub gave does not hash to the digest the record carries.
+    DigestMismatch,
+    /// A trunk path whose base snapshot copy is gone.
+    BaseMissing,
+}
+
+impl Unrestorable {
+    /// The wire spelling, `None` for [`Unrestorable::BaseMissing`], which has
+    /// no detail of its own.
+    pub fn code(self) -> Option<&'static str> {
+        match self {
+            Unrestorable::NoBlobRecorded => Some("no_blob_recorded"),
+            Unrestorable::NotFetched => Some("not_fetched"),
+            Unrestorable::FetchFailed => Some("fetch_failed"),
+            Unrestorable::DigestMismatch => Some("digest_mismatch"),
+            Unrestorable::BaseMissing => None,
+        }
+    }
+}
+
+/// What a discard measures against and restores from.
+#[derive(Debug, Clone, Copy)]
+pub struct DiscardBase<'a> {
+    /// The tip the changes were detected against, with the source of every
+    /// stamp ([`unshared_sources`], or [`tip_sources_over`] in a revert).
+    pub sources: &'a TipSources,
+    /// The fetches that failed, by digest ([`fetch_proposed_copies`]).
+    pub unrestorable: &'a BTreeMap<String, Unrestorable>,
+}
+
+/// One path whose content lives in a proposal record and has no local copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingCopy {
+    /// The reported path.
+    pub path: String,
+    /// The proposal that carries it.
+    pub number: u64,
+    /// The digest of the shared content.
+    pub sha256: String,
+    /// The blob sha to fetch it by, `None` on a record from before 0.17.0.
+    pub blob_sha: Option<String>,
+}
+
+/// The targets of a discard that would restore from a proposal record with
+/// no local copy: a modification or a deletion whose stamp in `sources` is a
+/// record's. Offline: it only reads the copy folder.
+pub fn missing_proposed_copies(
+    state_dir: &Path,
+    sources: &TipSources,
+    local: &LocalChanges,
+    targets: &[DiscardTarget],
+) -> Result<Vec<MissingCopy>, RemoteError> {
+    let mut missing = Vec::new();
+    for target in targets {
+        let Some(change) = resolve_local_change(local, &target.path) else {
+            continue;
+        };
+        if matches!(change, LocalChange::Added { .. }) {
+            continue;
+        }
+        let path = change.path();
+        let Some((
+            _,
+            TipSource::Record {
+                number,
+                sha256,
+                blob_sha,
+            },
+        )) = sources.get(path)
+        else {
+            continue;
+        };
+        if state::read_proposed_copy(state_dir, sha256)?.is_some() {
+            continue;
+        }
+        missing.push(MissingCopy {
+            path: path.to_string(),
+            number: *number,
+            sha256: sha256.clone(),
+            blob_sha: blob_sha.clone(),
+        });
+    }
+    Ok(missing)
+}
+
+/// What [`fetch_proposed_copies`] could not get.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchedCopies {
+    /// Each digest that is still missing, with why.
+    pub unrestorable: BTreeMap<String, Unrestorable>,
+    /// Whether GitHub refused the credential on one of the reads
+    /// ([`RemoteError::AuthExpired`]), so the caller can drop it as every
+    /// other verb does.
+    pub auth_expired: bool,
+}
+
+/// Fetches the content of each missing copy from GitHub by the blob sha its
+/// record names, checks it against the record's digest and keeps it as a
+/// local copy, so the next discard of the same content is offline.
+///
+/// One read per distinct digest. Never an error for the whole call: a record
+/// with no blob sha, a failed read and content that does not hash to the
+/// digest each name their digest in the result, and nothing is written for
+/// them. The bytes are kept exactly as fetched, never normalized.
+pub async fn fetch_proposed_copies(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state_dir: &Path,
+    missing: &[MissingCopy],
+) -> FetchedCopies {
+    let mut out = FetchedCopies::default();
+    let mut seen = BTreeSet::new();
+    for copy in missing {
+        if !seen.insert(copy.sha256.clone()) {
+            continue;
+        }
+        let Some(blob_sha) = copy.blob_sha.as_deref() else {
+            out.unrestorable
+                .insert(copy.sha256.clone(), Unrestorable::NoBlobRecorded);
+            continue;
+        };
+        let why = match provider.blob(spec, blob_sha).await {
+            Ok(bytes) if state::sha256_hex(&bytes) == copy.sha256 => {
+                match state::write_proposed_copy(state_dir, &bytes) {
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            "could not keep the fetched copy of {} from #{}: {e}",
+                            copy.path,
+                            copy.number
+                        );
+                        Unrestorable::FetchFailed
+                    }
+                }
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    "the blob #{} records for {} does not hash to its recorded digest",
+                    copy.number,
+                    copy.path
+                );
+                Unrestorable::DigestMismatch
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "fetching #{}'s copy of {} failed: {e}",
+                    copy.number,
+                    copy.path
+                );
+                if matches!(e, RemoteError::AuthExpired) {
+                    out.auth_expired = true;
+                }
+                Unrestorable::FetchFailed
+            }
+        };
+        out.unrestorable.insert(copy.sha256.clone(), why);
+    }
+    out
 }
 
 /// What [`discard_local_files`] did, path by path, in the order asked.
@@ -5744,11 +6007,18 @@ pub struct DiscardReport {
 /// through `checked_working_path` at its on-disk spelling; read the current
 /// file and compare its digest with what the caller looked at, the guard
 /// `revert_layer_files` keeps, so newer work is never destroyed
-/// ([`DiscardRefusal::ChangedSince`]); then act. An addition is removed, a
-/// modification or a deletion is written back from the base copy, and a
-/// path the trunk has no copy of is [`DiscardRefusal::NoBaseCopy`] with
-/// nothing written: the fetch that could restore it belongs to the withdrawal
-/// of the layer that owns it, never to a discard.
+/// ([`DiscardRefusal::ChangedSince`]); then act. An addition is removed, and
+/// a modification or a deletion is written back to what its stamp in
+/// `base.sources` describes: the base snapshot copy for a trunk stamp, the
+/// local copy of the shared content for a stamp an open or merged proposal
+/// set. A path whose content is not at hand is
+/// [`DiscardRefusal::NoBaseCopy`] with nothing written, and its
+/// [`Unrestorable`] says why: the failed fetch named in `base.unrestorable`,
+/// [`Unrestorable::NoBlobRecorded`] for a record with no blob sha,
+/// [`Unrestorable::NotFetched`] for any other record with no copy, and
+/// [`Unrestorable::BaseMissing`] for a trunk path whose base copy is gone.
+/// This never fetches: a caller that can reach GitHub runs
+/// [`missing_proposed_copies`] and [`fetch_proposed_copies`] first.
 ///
 /// Every path in the report is the reported spelling, the one the caller
 /// named it by; the write itself lands at the on-disk spelling, so a
@@ -5756,7 +6026,7 @@ pub struct DiscardReport {
 pub fn discard_local_files(
     domain_root: &Path,
     state_dir: &Path,
-    base: &BTreeMap<String, BaseStamp>,
+    base: &DiscardBase<'_>,
     local: &LocalChanges,
     targets: &[DiscardTarget],
 ) -> Result<DiscardReport, RemoteError> {
@@ -5765,7 +6035,7 @@ pub fn discard_local_files(
         let Some(change) = resolve_local_change(local, &target.path) else {
             let normalized = normalize_selected_path(&target.path);
             let reason = if !crystalline_core::is_index_path(&normalized)
-                && base.contains_key(&normalized)
+                && base.sources.contains_key(&normalized)
             {
                 DiscardRefusal::NotAChange
             } else {
@@ -5794,12 +6064,28 @@ pub fn discard_local_files(
                 report.deleted.push(path);
             }
             LocalChange::Modified { .. } | LocalChange::Deleted { .. } => {
-                match state::read_base_file(state_dir, &path)? {
-                    Some(bytes) => {
+                let restored =
+                    match base.sources.get(&path).map(|(_, source)| source) {
+                        Some(TipSource::Record {
+                            sha256, blob_sha, ..
+                        }) => state::read_proposed_copy(state_dir, sha256)?.ok_or_else(|| {
+                            base.unrestorable.get(sha256).copied().unwrap_or(
+                                if blob_sha.is_none() {
+                                    Unrestorable::NoBlobRecorded
+                                } else {
+                                    Unrestorable::NotFetched
+                                },
+                            )
+                        }),
+                        Some(TipSource::Trunk) | None => state::read_base_file(state_dir, &path)?
+                            .ok_or(Unrestorable::BaseMissing),
+                    };
+                match restored {
+                    Ok(bytes) => {
                         write_working_file(&wt_path, &bytes)?;
                         report.restored.push(path);
                     }
-                    None => report.refused.push((path, DiscardRefusal::NoBaseCopy)),
+                    Err(why) => report.refused.push((path, DiscardRefusal::NoBaseCopy(why))),
                 }
             }
         }
@@ -5812,16 +6098,16 @@ pub fn discard_local_files(
 ///
 /// A file that diverged since sharing is never touched: the recorded digest is
 /// what says whether the local copy is still the one that was proposed, and
-/// anything else is newer work. What a restore reads from is the base
-/// snapshot - except where the trunk never carried the file at all, which is
-/// the shape a stacked chain makes possible: a layer below added the path and
-/// this layer modified or retired it, so the pre-share content is that lower
-/// layer's, and the only copy of it is the blob its record names. That blob is
-/// fetched by sha and CHECKED against the lower record's digest before it is
-/// written; a record with no blob sha, a fetch that fails and content that
-/// does not hash to what was recorded all leave the path exactly as it stands
-/// and name it in [`WithdrawReport::skipped_reverts`]. A withdrawal is never
-/// failed over a file that cannot be put back.
+/// anything else is newer work. What a restore reads from is what the tip of
+/// the layers `below` says the path was ([`tip_sources_over`]): the base
+/// snapshot for a trunk path, and for a path a lower layer carries, that
+/// layer's content - its local copy, or, for a layer shared by a version
+/// before 0.37.0, the blob its record names, fetched by sha and CHECKED
+/// against the record's digest before it is kept and written. A record with
+/// no blob sha, a fetch that fails and content that does not hash to what was
+/// recorded all leave the path exactly as it stands and name it in
+/// [`WithdrawReport::skipped_reverts`]. A withdrawal is never failed over a
+/// file that cannot be put back.
 ///
 /// **Every path here is opened at its spelling on disk, never at the recorded
 /// one.** A proposal records the base snapshot's spelling, and on a
@@ -5835,14 +6121,13 @@ pub fn discard_local_files(
 /// the forge and every other surface know.
 ///
 /// The spellings are resolved against the trunk with the layers `below` laid
-/// over it ([`tip_files_over`]), not against the trunk alone. Both write arms
-/// need that: the first restores from the base snapshot, whose paths are the
-/// trunk's, and the second restores a path only a lower layer ever carried, so
-/// a trunk-only detection would return that path's recorded spelling
-/// unchanged and duplicate exactly the file it was meant to leave alone.
-/// [`LocalChanges::disk_paths`] records an adoption even where it produced no
-/// change, which is what makes a map built for detection answer a question
-/// about replay.
+/// over it, not against the trunk alone. Both kinds of restore need that: one
+/// restores from the base snapshot, whose paths are the trunk's, and the other
+/// restores a path only a lower layer ever carried, so a trunk-only detection
+/// would return that path's recorded spelling unchanged and duplicate exactly
+/// the file it was meant to leave alone. [`LocalChanges::disk_paths`] records
+/// an adoption even where it produced no change, which is what makes a map
+/// built for detection answer a question about replay.
 ///
 /// One residue: a path this layer *added* is in neither the trunk nor a layer
 /// below, so no adoption can be recorded for it and an added file that was
@@ -5868,13 +6153,14 @@ async fn revert_layer_files(
     report: &mut WithdrawReport,
 ) -> Result<(), RemoteError> {
     let layers: Vec<&Proposal> = below.iter().collect();
-    let base = tip_files_over(base, &layers);
+    let sources = tip_sources_over(base, &layers);
+    let stamps = tip_stamps(&sources);
     // The detection a share made, with the Reflection mode in effect: while a
     // switch is pending, the engrams still under `reflections/` were shared
     // and are reverted like any other file.
     let local = crate::changes::detect_local_changes_with(
         domain_root,
-        &base,
+        &stamps,
         crystalline_core::generated_indexes_at(domain_root),
         reflection,
         None,
@@ -5888,26 +6174,24 @@ async fn revert_layer_files(
             sha256: pf.sha256.clone(),
         })
         .collect();
-    let discarded = discard_local_files(domain_root, state_dir, &base, &local, &targets)?;
+    // A lower layer shared by a version before 0.37.0 has no local copy, so
+    // its content is fetched here, once per digest, before the loop runs.
+    let missing = missing_proposed_copies(state_dir, &sources, &local, &targets)?;
+    let fetched = fetch_proposed_copies(provider, spec, state_dir, &missing).await;
+    let discard_base = DiscardBase {
+        sources: &sources,
+        unrestorable: &fetched.unrestorable,
+    };
+    let discarded = discard_local_files(domain_root, state_dir, &discard_base, &local, &targets)?;
     report.restored.extend(discarded.restored);
     report.deleted.extend(discarded.deleted);
     for (path, reason) in discarded.refused {
         match reason {
             DiscardRefusal::ChangedSince => report.skipped_diverged.push(path),
-            // The trunk has no copy. On a chain that means a layer below owns
-            // the path, and its recorded blob is the pre-share content; this
-            // is the one arm a withdrawal fetches for, and a discard never
-            // does.
-            DiscardRefusal::NoBaseCopy => {
-                let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(&path))?;
-                match layer_below_content(provider, spec, below, &path).await {
-                    Some(bytes) => {
-                        write_working_file(&wt_path, &bytes)?;
-                        report.restored.push(path);
-                    }
-                    None => report.skipped_reverts.push(path),
-                }
-            }
+            // The content the path stood at below this layer is not at hand:
+            // no blob to fetch it by, a fetch that failed, content that did
+            // not check, or a base copy that is gone.
+            DiscardRefusal::NoBaseCopy(_) => report.skipped_reverts.push(path),
             // A proposed file that no longer differs from the tip is already
             // where a revert would put it, and a path the detection cannot
             // name (a re-cased addition, see the doc comment) is left
@@ -5930,61 +6214,6 @@ async fn revert_layer_files(
         }
     }
     Ok(())
-}
-
-/// The content the nearest layer below carries at `path`, fetched by blob sha
-/// and verified against that layer's recorded digest, or `None` when no layer
-/// below can speak for the path with content this function is willing to
-/// write.
-///
-/// Nearest first, since a higher layer's version is the one that stood
-/// directly beneath the withdrawn layer. Every way this can go wrong answers
-/// `None` rather than an error: a record from before blob shas existed, a
-/// record with no digest to check against, a blob the forge no longer has, and
-/// content that does not hash to what was recorded. The caller reports the
-/// path as unrestored, which is the honest outcome.
-async fn layer_below_content(
-    provider: &dyn Provider,
-    spec: &OriginSpec,
-    below: &[Proposal],
-    path: &str,
-) -> Option<Vec<u8>> {
-    for layer in below.iter().rev() {
-        let Some(file) = layer.files.iter().find(|f| f.path == path) else {
-            continue;
-        };
-        match file.change {
-            ProposedChange::Added | ProposedChange::Modified => {}
-            // This layer retired the path too, so it is not what stood below.
-            ProposedChange::Deleted => return None,
-        }
-        let (Some(blob_sha), Some(recorded)) = (file.blob_sha.as_deref(), file.sha256.as_deref())
-        else {
-            tracing::debug!(
-                "layer #{} records {path} without a blob to restore it from",
-                layer.number
-            );
-            return None;
-        };
-        match provider.blob(spec, blob_sha).await {
-            Ok(bytes) if state::sha256_hex(&bytes) == recorded => return Some(bytes),
-            Ok(_) => {
-                tracing::debug!(
-                    "the blob layer #{} records for {path} does not hash to its recorded digest",
-                    layer.number
-                );
-                return None;
-            }
-            Err(e) => {
-                tracing::debug!(
-                    "fetching layer #{}'s copy of {path} failed: {e}",
-                    layer.number
-                );
-                return None;
-            }
-        }
-    }
-    None
 }
 
 /// Resolves one recorded conflict at `path`: settles it per `resolution`,

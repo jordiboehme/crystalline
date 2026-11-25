@@ -10,8 +10,9 @@ use crystalline_remote::changes::{
     LocalChange, LocalChanges, detect_local_changes, detect_local_changes_against,
 };
 use crystalline_remote::ops::{
-    ChangeSides, DiscardRefusal, DiscardReport, DiscardTarget, discard_local_files,
-    local_change_sides, resolve_local_change, unshared_base,
+    ChangeSides, DiscardBase, DiscardRefusal, DiscardReport, DiscardTarget, TipSources,
+    Unrestorable, discard_local_files, local_change_sides, resolve_local_change, tip_stamps,
+    unshared_base, unshared_sources,
 };
 use crystalline_remote::state::{
     BaseStamp, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile, write_base_file,
@@ -74,6 +75,20 @@ fn base_of(t: &Tree) -> BTreeMap<String, BaseStamp> {
     unshared_base(&OriginState::load(&t.state_dir).unwrap().unwrap())
 }
 
+fn sources_of(t: &Tree) -> TipSources {
+    unshared_sources(&OriginState::load(&t.state_dir).unwrap().unwrap())
+}
+
+/// No fetch was made, so nothing failed.
+static NOTHING_FAILED: BTreeMap<String, Unrestorable> = BTreeMap::new();
+
+fn no_fetch(sources: &TipSources) -> DiscardBase<'_> {
+    DiscardBase {
+        sources,
+        unrestorable: &NOTHING_FAILED,
+    }
+}
+
 fn detect(t: &Tree) -> LocalChanges {
     detect_local_changes(&t.root, &base_of(t)).unwrap()
 }
@@ -99,7 +114,7 @@ fn a_modification_is_restored_to_the_base_copy() {
     let report = discard_local_files(
         &t.root,
         &t.state_dir,
-        &base_of(&t),
+        &no_fetch(&sources_of(&t)),
         &local,
         &[target("a.md", Some(b"new\n"))],
     )
@@ -125,7 +140,7 @@ fn an_addition_is_deleted_and_a_deletion_is_restored() {
     let report = discard_local_files(
         &t.root,
         &t.state_dir,
-        &base_of(&t),
+        &no_fetch(&sources_of(&t)),
         &local,
         &[target("new.md", Some(b"mine\n")), target("gone.md", None)],
     )
@@ -161,7 +176,7 @@ fn a_side_that_moved_since_the_caller_looked_is_refused_and_the_others_proceed()
     let report = discard_local_files(
         &t.root,
         &t.state_dir,
-        &base_of(&t),
+        &no_fetch(&sources_of(&t)),
         &local,
         &[
             target("a.md", Some(b"stale\n")),
@@ -194,48 +209,88 @@ fn a_side_that_moved_since_the_caller_looked_is_refused_and_the_others_proceed()
 }
 
 #[test]
-fn a_path_with_no_base_copy_is_refused_without_a_provider() {
-    // A stamp for a path the base tree holds no bytes for: the shape a lower
-    // open stacked layer leaves behind through `tip_files_over`.
+fn a_layer_path_with_no_copy_is_refused_with_its_detail() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes())],
         &[("MANIFEST.md", MANIFEST.as_bytes()), ("layer.md", b"v2\n")],
     );
-    let mut base = base_of(&t);
-    base.insert(
-        "layer.md".to_string(),
-        BaseStamp {
-            sha256: hex(b"v1\n"),
-            size: 3,
-        },
-    );
-    let local = detect_local_changes(&t.root, &base).unwrap();
+    let mut record = layer(1, ProposalStatus::Open, &[added("layer.md", b"v1\n")]);
+    with_layers(&t, Some(true), vec![record.clone()]);
+    let sources = sources_of(&t);
+    let local = detect_as_the_engine_does(&t, &base_of(&t));
     assert!(matches!(
         resolve_local_change(&local, "layer.md"),
         Some(LocalChange::Modified { .. })
     ));
-    let sides = local_change_sides(&t.root, &t.state_dir, &local, "layer.md")
+    let sides = local_change_sides(&t.root, &t.state_dir, &sources, &local, "layer.md")
         .unwrap()
         .unwrap();
-    assert_eq!(sides.base, None, "the trunk has no copy");
+    assert_eq!(sides.base, None, "no copy here, and sides never fetch");
     assert_eq!(sides.current, Some(b"v2\n".to_vec()));
+
+    // A blob to fetch it by, and no fetch made.
+    let report = discard_as_a_caller_would(&t, &[target("layer.md", Some(b"v2\n"))]);
+    assert_eq!(
+        report.refused,
+        vec![(
+            "layer.md".to_string(),
+            DiscardRefusal::NoBaseCopy(Unrestorable::NotFetched)
+        )]
+    );
+    assert_eq!(report.refused[0].1.code(), "no_base_copy");
+    assert_eq!(report.refused[0].1.detail(), Some("not_fetched"));
+
+    // A fetch that failed names itself.
+    let failed = BTreeMap::from([(hex(b"v1\n"), Unrestorable::FetchFailed)]);
     let report = discard_local_files(
         &t.root,
         &t.state_dir,
-        &base,
+        &DiscardBase {
+            sources: &sources,
+            unrestorable: &failed,
+        },
         &local,
         &[target("layer.md", Some(b"v2\n"))],
     )
     .unwrap();
+    assert_eq!(report.refused[0].1.detail(), Some("fetch_failed"));
+
+    // A record from before blob shas were kept has nothing to fetch.
+    record.files[0].blob_sha = None;
+    with_layers(&t, Some(true), vec![record]);
+    let report = discard_as_a_caller_would(&t, &[target("layer.md", Some(b"v2\n"))]);
     assert_eq!(
         report.refused,
-        vec![("layer.md".to_string(), DiscardRefusal::NoBaseCopy)]
+        vec![(
+            "layer.md".to_string(),
+            DiscardRefusal::NoBaseCopy(Unrestorable::NoBlobRecorded)
+        )]
     );
+    assert_eq!(report.refused[0].1.detail(), Some("no_blob_recorded"));
     assert_eq!(
         read(&t.root.join("layer.md")),
         Some(b"v2\n".to_vec()),
         "nothing written"
     );
+}
+
+#[test]
+fn a_trunk_path_whose_base_copy_is_gone_is_refused_with_no_detail() {
+    let t = tree(
+        &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v1\n")],
+        &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v2\n")],
+    );
+    std::fs::remove_file(t.state_dir.join("base").join("a.md")).unwrap();
+    let report = discard_as_a_caller_would(&t, &[target("a.md", Some(b"v2\n"))]);
+    assert_eq!(
+        report.refused,
+        vec![(
+            "a.md".to_string(),
+            DiscardRefusal::NoBaseCopy(Unrestorable::BaseMissing)
+        )]
+    );
+    assert_eq!(report.refused[0].1.detail(), None);
+    assert_eq!(read(&t.root.join("a.md")), Some(b"v2\n".to_vec()));
 }
 
 #[test]
@@ -264,14 +319,14 @@ fn a_generated_listing_is_never_resolved_listed_or_discarded_even_where_shared()
     assert!(local.substantive().all(|c| !c.is_generated_index()));
     assert!(resolve_local_change(&local, "index.md").is_none());
     assert!(
-        local_change_sides(&t.root, &t.state_dir, &local, "index.md")
+        local_change_sides(&t.root, &t.state_dir, &sources_of(&t), &local, "index.md")
             .unwrap()
             .is_none()
     );
     let report = discard_local_files(
         &t.root,
         &t.state_dir,
-        &base_of(&t),
+        &no_fetch(&sources_of(&t)),
         &local,
         &[target("index.md", Some(b"# kb\n\n- new\n"))],
     )
@@ -296,7 +351,7 @@ fn an_unknown_path_is_refused_by_name() {
     let report = discard_local_files(
         &t.root,
         &t.state_dir,
-        &base_of(&t),
+        &no_fetch(&sources_of(&t)),
         &local,
         &[target("nowhere.md", None)],
     )
@@ -306,7 +361,7 @@ fn an_unknown_path_is_refused_by_name() {
         vec![("nowhere.md".to_string(), DiscardRefusal::UnknownPath)]
     );
     assert!(
-        local_change_sides(&t.root, &t.state_dir, &local, "nowhere.md")
+        local_change_sides(&t.root, &t.state_dir, &sources_of(&t), &local, "nowhere.md")
             .unwrap()
             .is_none()
     );
@@ -335,14 +390,14 @@ fn a_case_only_rename_is_resolved_and_restored_through_the_disk_spelling() {
         resolve_local_change(&local, "Notes/A.md").unwrap().path(),
         "Notes/A.md"
     );
-    let sides = local_change_sides(&t.root, &t.state_dir, &local, "notes/a.md")
+    let sides = local_change_sides(&t.root, &t.state_dir, &sources_of(&t), &local, "notes/a.md")
         .unwrap()
         .unwrap();
     assert_eq!(sides.current, Some(b"new\n".to_vec()));
     let report = discard_local_files(
         &t.root,
         &t.state_dir,
-        &base_of(&t),
+        &no_fetch(&sources_of(&t)),
         &local,
         &[target("notes/a.md", Some(b"new\n"))],
     )
@@ -381,18 +436,18 @@ fn sides_of_every_kind() {
         ],
     );
     let local = detect(&t);
-    let m = local_change_sides(&t.root, &t.state_dir, &local, "m.md")
+    let m = local_change_sides(&t.root, &t.state_dir, &sources_of(&t), &local, "m.md")
         .unwrap()
         .unwrap();
     assert_eq!(
         (m.base, m.current),
         (Some(b"old\n".to_vec()), Some(b"new\n".to_vec()))
     );
-    let a = local_change_sides(&t.root, &t.state_dir, &local, "a.md")
+    let a = local_change_sides(&t.root, &t.state_dir, &sources_of(&t), &local, "a.md")
         .unwrap()
         .unwrap();
     assert_eq!((a.base, a.current), (None, Some(b"added\n".to_vec())));
-    let d = local_change_sides(&t.root, &t.state_dir, &local, "d.md")
+    let d = local_change_sides(&t.root, &t.state_dir, &sources_of(&t), &local, "d.md")
         .unwrap()
         .unwrap();
     assert_eq!((d.base, d.current), (Some(b"gone\n".to_vec()), None));
@@ -504,16 +559,16 @@ fn detect_as_the_engine_does(t: &Tree, base: &BTreeMap<String, BaseStamp>) -> Lo
 
 /// A discard of `targets` the way the engine makes one.
 fn discard_as_a_caller_would(t: &Tree, targets: &[DiscardTarget]) -> DiscardReport {
-    let base = base_of(t);
-    let local = detect_as_the_engine_does(t, &base);
-    discard_local_files(&t.root, &t.state_dir, &base, &local, targets).unwrap()
+    let sources = sources_of(t);
+    let local = detect_as_the_engine_does(t, &tip_stamps(&sources));
+    discard_local_files(&t.root, &t.state_dir, &no_fetch(&sources), &local, targets).unwrap()
 }
 
 /// Both sides of `raw` the way the engine reads them.
 fn sides_as_a_caller_would(t: &Tree, raw: &str) -> Option<ChangeSides> {
-    let base = base_of(t);
-    let local = detect_as_the_engine_does(t, &base);
-    local_change_sides(&t.root, &t.state_dir, &local, raw).unwrap()
+    let sources = sources_of(t);
+    let local = detect_as_the_engine_does(t, &tip_stamps(&sources));
+    local_change_sides(&t.root, &t.state_dir, &sources, &local, raw).unwrap()
 }
 
 /// The paths detection reports as changed now.
@@ -526,7 +581,6 @@ fn changed_paths(t: &Tree) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn a_layer_that_added_a_path_edited_again_is_restored_to_the_layer_content() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes())],
@@ -545,7 +599,6 @@ fn a_layer_that_added_a_path_edited_again_is_restored_to_the_layer_content() {
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn a_layer_that_modified_a_trunk_path_edited_again_is_restored_to_the_layer_not_the_trunk() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v1\n")],
@@ -564,7 +617,6 @@ fn a_layer_that_modified_a_trunk_path_edited_again_is_restored_to_the_layer_not_
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn a_deleted_file_a_layer_added_is_restored_from_the_layer() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes())],
@@ -583,7 +635,6 @@ fn a_deleted_file_a_layer_added_is_restored_from_the_layer() {
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn a_deleted_file_a_layer_modified_is_restored_from_the_layer() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v1\n")],
@@ -602,7 +653,6 @@ fn a_deleted_file_a_layer_modified_is_restored_from_the_layer() {
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn the_top_record_wins_when_two_layers_carry_the_path() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v1\n")],
@@ -625,7 +675,6 @@ fn the_top_record_wins_when_two_layers_carry_the_path() {
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn a_merged_record_still_standing_is_restored_from_its_copy() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v1\n")],
@@ -685,7 +734,6 @@ fn off_the_stacked_path_the_trunk_copy_is_restored() {
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn a_layer_copy_that_fails_its_digest_is_not_written() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v1\n")],
@@ -701,14 +749,13 @@ fn a_layer_copy_that_fails_its_digest_is_not_written() {
     assert!(report.restored.is_empty(), "{report:?}");
     assert_eq!(report.refused.len(), 1, "{report:?}");
     assert!(
-        matches!(report.refused[0].1, DiscardRefusal::NoBaseCopy),
+        matches!(report.refused[0].1, DiscardRefusal::NoBaseCopy(_)),
         "{report:?}"
     );
     assert_eq!(read(&t.root.join("a.md")), Some(b"v3\n".to_vec()));
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn a_crlf_layer_copy_is_restored_byte_for_byte() {
     let crlf: &[u8] = b"a\r\nb\r\n";
     let t = tree(
@@ -728,7 +775,6 @@ fn a_crlf_layer_copy_is_restored_byte_for_byte() {
 }
 
 #[test]
-#[ignore = "0.37.0 part 3: fixed in M3"]
 fn sides_of_a_layer_path_show_the_layer_content_as_base() {
     let t = tree(
         &[("MANIFEST.md", MANIFEST.as_bytes()), ("a.md", b"v1\n")],
