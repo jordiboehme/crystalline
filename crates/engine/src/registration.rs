@@ -33,7 +33,8 @@ pub use crystalline_core::config::registration::Registered;
 /// `MANIFEST.md` already. `kept_root` is this machine's `<state>/kept`
 /// folder: kept texts no registered domain owns are set aside there before
 /// the name is taken. `state_dir` is this machine's state folder, where the
-/// one-time domains root check is recorded ([`LegacyRootPin`]); `None` runs
+/// one-time domains root check is recorded
+/// ([`crystalline_core::config::root_pin::PinRecord`]); `None` runs
 /// the check without reading or writing a record.
 ///
 /// The MANIFEST name write-back runs only for a fresh registration: an
