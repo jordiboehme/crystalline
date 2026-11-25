@@ -281,7 +281,7 @@ impl Engine {
         self.refuse_a_config_that_does_not_parse()?;
         // Before the default folder is derived from the root: an install
         // whose domains live in the old default root keeps it.
-        self.pin_before_registration()?;
+        let mut pin = self.pin_before_registration();
         // Who may read it, asked before anything else is: on an instance
         // with a GitHub App the answer decides whether the content is open to
         // everyone signed in, so it is never defaulted.
@@ -460,6 +460,7 @@ impl Engine {
 
         let adopts_registered = existing.is_some();
         if !adopts_registered {
+            pin.refuse_a_new_domain()?;
             self.set_aside_orphan_kept(&domain_name);
         }
         let mut default_root = None;
@@ -469,7 +470,7 @@ impl Engine {
                 match folder {
                     Some(f) => crystalline_core::config::expand_tilde(f),
                     None => {
-                        let domains_root = self.config.read().unwrap().domains_root();
+                        let domains_root = self.fresh_domains_root(&pin)?;
                         let root = origin::default_domain_folder(&domains_root, &domain_name);
                         default_root = Some(domains_root);
                         root

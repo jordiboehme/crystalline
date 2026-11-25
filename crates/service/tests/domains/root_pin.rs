@@ -253,27 +253,102 @@ async fn a_config_that_does_not_parse_is_refused_and_not_recorded() {
     assert!(!PinRecord::path(&f.state_dir()).exists());
 }
 
+/// A `config.yaml` that is a symbolic link into a dotfiles folder, kept owner
+/// only, holding `cfg`. Answers the link's target.
 #[cfg(unix)]
-#[tokio::test]
-async fn a_linked_config_is_left_alone_at_start() {
-    let f = Fixture::new();
-    let cfg = legacy(&f.documents_domain("pin-link"));
-    let real = f.tmp.path().join("dotfiles").join("config.yaml");
-    crystalline_core::config::save_yaml(&real, &cfg).unwrap();
+fn linked_config(f: &Fixture, cfg: &GlobalConfig) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = f.tmp.path().join("dotfiles").join("crystalline.yaml");
+    crystalline_core::config::save_yaml(&real, cfg).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::create_dir_all(f.config_path().parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&real, f.config_path()).unwrap();
-    let engine = f.engine(cfg).await;
-    assert_eq!(
-        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
-        None
-    );
+    std::os::unix::fs::symlink("../dotfiles/crystalline.yaml", f.config_path()).unwrap();
+    real
+}
+
+/// The link is still a link, its target owner only and the only file in its
+/// folder (no temporary file left), and the target holds what the link reads.
+#[cfg(unix)]
+fn assert_written_through(f: &Fixture, real: &Path) {
+    use std::os::unix::fs::PermissionsExt;
     assert!(
         std::fs::symlink_metadata(f.config_path())
             .unwrap()
             .file_type()
-            .is_symlink()
+            .is_symlink(),
+        "the link stays a link"
     );
-    assert_eq!(f.recorded(), None, "the next registration checks again");
+    let mode = std::fs::metadata(real).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let names: Vec<_> = std::fs::read_dir(real.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("crystalline.yaml")]);
+    let names: Vec<_> = std::fs::read_dir(f.config_path().parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("config.yaml")]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_linked_config_is_pinned_through_the_link_at_start() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("pin-link"));
+    let real = linked_config(&f, &cfg);
+    let engine = f.engine(cfg).await;
+    assert_eq!(
+        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
+        Some(true)
+    );
+    assert_written_through(&f, &real);
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&real).unwrap();
+    assert_eq!(
+        pinned_root(&saved),
+        Some(Path::new("~/Documents/Crystalline"))
+    );
+    assert_eq!(f.recorded(), Some(true));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_registration_pins_through_a_linked_config() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("link-old"));
+    let real = linked_config(&f, &cfg);
+    let engine = f.engine(cfg).await;
+    engine
+        .domain_add_local(Some("link-new"), None)
+        .await
+        .unwrap();
+    assert_written_through(&f, &real);
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&real).unwrap();
+    assert_eq!(
+        pinned_root(&saved),
+        Some(Path::new("~/Documents/Crystalline"))
+    );
+    assert!(saved.domains.contains_key("link-new"));
+    assert!(f.home.join("Documents/Crystalline/link-new").is_dir());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_config_set_writes_through_a_linked_config() {
+    let f = Fixture::new();
+    let real = linked_config(&f, &GlobalConfig::default());
+    let engine = f.engine(GlobalConfig::default()).await;
+    engine
+        .configure(&ConfigureAction::Set {
+            key: "domains_root".into(),
+            value: "~/kb".into(),
+        })
+        .await
+        .unwrap();
+    assert_written_through(&f, &real);
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&real).unwrap();
+    assert_eq!(pinned_root(&saved), Some(Path::new("~/kb")));
 }
 
 #[tokio::test]
@@ -392,4 +467,145 @@ async fn a_file_at_the_root_refuses_the_add() {
         )
     );
     assert!(!f.on_disk().domains.contains_key("on-a-file"));
+}
+
+/// A pin another process wrote (the CLI's own `domain add`, or the ctl
+/// `domain_register` in file mode) and recorded: this engine read the
+/// configuration before it, so its own memory has no root, but a new domain
+/// still lands beside the old ones.
+#[tokio::test]
+async fn a_pin_written_outside_the_engine_places_the_next_domain() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("outside-old"));
+    f.save(&cfg);
+    let engine = f.engine(cfg.clone()).await;
+    let mut pinned = cfg;
+    crystalline_core::config::root_pin::pin(&mut pinned);
+    f.save(&pinned);
+    PinRecord::record(&f.state_dir(), &config_key(Some(&f.config_path())), true).unwrap();
+
+    let added = engine
+        .domain_add_local(Some("outside-new"), None)
+        .await
+        .unwrap();
+    let root = PathBuf::from(added["root"].as_str().unwrap());
+    assert_eq!(
+        root,
+        std::fs::canonicalize(f.home.join("Documents/Crystalline/outside-new")).unwrap()
+    );
+    assert!(!f.home.join(".crystalline/outside-new").exists());
+}
+
+/// A due pin that cannot be saved refuses only an add that would place a
+/// new domain: adding a domain that is already registered again places
+/// nothing, so it answers as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_due_pin_that_cannot_be_saved_still_lets_a_re_add_through() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let dir = f.documents_domain("readd-old");
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("readd-old".into(), DomainEntry::file(&dir));
+    cfg.domains
+        .insert("readd-virtual".into(), DomainEntry::virtual_domain());
+    f.save(&cfg);
+    let engine = f.engine(cfg).await;
+    let folder = f.config_path().parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let by_name = engine.domain_add_local(Some("readd-old"), None).await;
+    let by_folder = engine
+        .domain_add_local(None, Some(dir.to_str().unwrap()))
+        .await;
+    let by_virtual = engine.domain_add_virtual("readd-virtual").await;
+    let new_virtual = engine.domain_add_virtual("readd-virtual-new").await;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let by_name = by_name.unwrap();
+    assert_eq!(by_name["adopted"], true, "{by_name}");
+    let by_folder = by_folder.unwrap();
+    assert_eq!(by_folder["adopted"], true, "{by_folder}");
+    by_virtual.unwrap();
+    assert!(new_virtual.is_err(), "{new_virtual:?}");
+    assert_eq!(pinned_root(&f.on_disk()), None);
+    assert_eq!(f.recorded(), None);
+}
+
+/// Document mode: the pin lands in the document, the read-only base file
+/// is left as it is, and the record is keyed `document`.
+#[tokio::test]
+async fn a_document_install_is_pinned_in_the_document() {
+    use crystalline_core::config::root_pin::DOCUMENT_KEY;
+    use crystalline_engine::persisted::{MemoryDocument, PersistedConfig};
+    let f = Fixture::new();
+    let base = legacy(&f.documents_domain("pin-document"));
+    f.save(&base);
+    let before = std::fs::read(f.config_path()).unwrap();
+    let doc = Arc::new(MemoryDocument::default());
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        GlobalConfig::default(),
+        None,
+        Some(f.config_path()),
+    )
+    .with_state_dir(f.state_dir())
+    .with_persisted(
+        PersistedConfig::Document {
+            doc: doc.clone(),
+            base: Some(f.config_path()),
+        },
+        Some(base),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
+        Some(true)
+    );
+    let stored = doc.stored().expect("the document was saved");
+    assert_eq!(
+        stored["domains_root"], "~/Documents/Crystalline",
+        "{stored}"
+    );
+    assert_eq!(std::fs::read(f.config_path()).unwrap(), before);
+    let (record, _) = PinRecord::load(&f.state_dir());
+    assert!(
+        record
+            .checked
+            .iter()
+            .any(|c| c.config == DOCUMENT_KEY && c.pinned),
+        "{record:?}"
+    );
+    assert_eq!(f.recorded(), None, "the base file is not keyed");
+    assert_eq!(
+        engine.config().domains_root(),
+        f.home.join("Documents/Crystalline")
+    );
+}
+
+/// The pin rewrites `config.yaml` through serde, as every configuration
+/// save does: a key this version does not know is dropped, and so is a
+/// comment (the release notes say both), the known keys are kept.
+#[tokio::test]
+async fn the_pin_drops_keys_it_does_not_know() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("pin-unknown"));
+    f.save(&cfg);
+    let mut text = std::fs::read_to_string(f.config_path()).unwrap();
+    text.push_str("# a comment\nfuture_key: 1\n");
+    std::fs::write(f.config_path(), &text).unwrap();
+    let engine = f.engine(cfg).await;
+    assert_eq!(
+        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
+        Some(true)
+    );
+    let after = std::fs::read_to_string(f.config_path()).unwrap();
+    assert!(!after.contains("future_key"), "{after}");
+    assert!(!after.contains("# a comment"), "{after}");
+    assert!(after.contains("pin-unknown"), "{after}");
+    assert!(
+        after.contains("domains_root: ~/Documents/Crystalline"),
+        "{after}"
+    );
 }

@@ -49,7 +49,7 @@ impl Engine {
         // Before the configuration changes and before the default folder is
         // derived: an install whose domains live in the old default root
         // keeps it, and a first add is recorded however it is placed.
-        self.pin_before_registration()?;
+        let mut pin = self.pin_before_registration();
 
         // Against every registration this instance has, not the startup
         // snapshot alone: a domain the CLI registered after this engine
@@ -89,7 +89,7 @@ impl Engine {
         let root = match folder {
             Some(f) => crystalline_core::config::expand_tilde(f),
             None => {
-                let domains_root = self.config.read().unwrap().domains_root();
+                let domains_root = self.fresh_domains_root(&pin)?;
                 let root =
                     origin::default_domain_folder(&domains_root, name.expect("checked above"));
                 default_root = Some(domains_root);
@@ -150,6 +150,7 @@ impl Engine {
         };
         let wanted = wanted.unwrap_or_else(|| domain_name.clone());
         if !adopted {
+            pin.refuse_a_new_domain()?;
             self.set_aside_orphan_kept(&domain_name);
         }
 
@@ -259,7 +260,7 @@ impl Engine {
         }
         // Recorded like every registration, so a later file domain under the
         // old default root is not mistaken for an install from before 0.37.
-        self.pin_before_registration()?;
+        let mut pin = self.pin_before_registration();
         // A name a connected server already gave out is the mount's; a new
         // local domain under it is the latecomer and gets the local suffix
         // (decision D13).
@@ -303,6 +304,7 @@ impl Engine {
         // A domain added this way is always named on purpose: there is no
         // repository or folder to derive a default from.
         if is_new {
+            pin.refuse_a_new_domain()?;
             self.set_aside_orphan_kept(name);
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;

@@ -2837,6 +2837,15 @@ pub struct DomainsRootDoctor {
     /// live there and it was not checked yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin_pending: bool,
+    /// Whether the configuration makes this instance read-only
+    /// (`service.read_only`): its start then never pins, so a pending pin is
+    /// set by hand.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// The configuration file to edit by hand: set only on a read-only
+    /// instance in file mode, where `crystalline config set` is refused too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_file: Option<String>,
 }
 
 /// Where new domains are created and why, read only: doctor never pins and
@@ -2866,28 +2875,57 @@ fn check_domains_root(
         .ok()
         .is_some_and(|dir| PinRecord::load(&dir).0.checked(&key));
     let path = loaded.effective.domains_root();
+    let read_only = loaded.effective.read_only();
     Some(DomainsRootDoctor {
         path: path.display().to_string(),
         source: source.to_string(),
         protected: crystalline_core::config::in_protected_user_folder(&path),
         pin_pending: !checked && root_pin::is_due_here(&persisted),
+        read_only,
+        config_file: (read_only
+            && matches!(loaded.mode, crystalline_service::overlay::ConfigMode::File))
+        .then(|| loaded.path.display().to_string()),
     })
 }
 
-/// The note for a domains root in a folder macOS privacy protection guards.
-pub const PROTECTED_ROOT_NOTE: &str = "New domains are created under ~/Documents/Crystalline, which macOS privacy protection guards. To create new ones under ~/.crystalline, run `crystalline config set domains_root ~/.crystalline`. Existing domains stay where they are.";
+/// The note for a domains root at `path`, a folder macOS privacy protection
+/// guards.
+pub fn protected_root_note(path: &str) -> String {
+    format!(
+        "New domains are created under {path}, which macOS privacy protection guards. To create new ones under ~/.crystalline, run `crystalline config set domains_root ~/.crystalline`. Existing domains stay where they are."
+    )
+}
 
 /// The note for a pin that has not run yet.
 pub const PIN_PENDING_NOTE: &str = "domains_root will be set to ~/Documents/Crystalline at the next start, so new domains land beside the existing ones.";
+
+/// The note for a pin that has not run yet on a read-only instance, whose
+/// start never pins: in file mode `crystalline config set` is refused as
+/// well, so the note names the file to edit (`config_file`); in document
+/// mode the operator's `config set` is taken.
+pub fn pin_by_hand_note(config_file: Option<&str>) -> String {
+    let how = match config_file {
+        Some(file) => format!("add `domains_root: ~/Documents/Crystalline` to {file}"),
+        None => "run `crystalline config set domains_root ~/Documents/Crystalline`".to_string(),
+    };
+    format!(
+        "This instance is read-only, so its start does not set domains_root. To keep new domains beside the existing ones, {how}."
+    )
+}
 
 fn render_domains_root(out: &mut String, root: &DomainsRootDoctor) {
     use std::fmt::Write as _;
     let _ = writeln!(out, "domains root: {} ({})", root.path, root.source);
     if root.pin_pending {
-        let _ = writeln!(out, "  {PIN_PENDING_NOTE}");
+        let note = if root.read_only {
+            pin_by_hand_note(root.config_file.as_deref())
+        } else {
+            PIN_PENDING_NOTE.to_string()
+        };
+        let _ = writeln!(out, "  {note}");
     }
     if root.protected {
-        let _ = writeln!(out, "  {PROTECTED_ROOT_NOTE}");
+        let _ = writeln!(out, "  {}", protected_root_note(&root.path));
     }
 }
 

@@ -1809,11 +1809,91 @@ pub fn load_yaml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigE
     serde_yaml_ng::from_str(&text).map_err(|e| ConfigError::Yaml(e.to_string()))
 }
 
-/// Serialize and atomically save a config to a YAML file. Writes a sibling
-/// temporary file then renames it into place.
+/// Serialize and atomically save a config to a YAML file, through a symbolic
+/// link when `path` is one ([`save_bytes_through_link`]).
 pub fn save_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
     let yaml = serde_yaml_ng::to_string(value).map_err(|e| ConfigError::Yaml(e.to_string()))?;
-    save_bytes(path, yaml.as_bytes())
+    save_bytes_through_link(path, yaml.as_bytes())
+}
+
+/// [`save_bytes`] for a configuration file a person may keep elsewhere: when
+/// `path` is a symbolic link (a dotfiles checkout), the file it points to is
+/// written, so the link stays a link. The temporary file is made beside that
+/// target and renamed over it, and on Unix it takes the target's mode first,
+/// so a `config.yaml` kept owner only stays owner only. A link whose target
+/// is missing creates the target.
+pub fn save_bytes_through_link(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    save_bytes_through_link_in(path, bytes, write_fence::fence())
+}
+
+/// [`save_bytes_through_link`] under `fence`. The fence checks the link and
+/// its target, so a link cannot carry a write into a folder it guards.
+fn save_bytes_through_link_in(
+    path: &Path,
+    bytes: &[u8],
+    fence: Option<&WriteFence>,
+) -> Result<(), ConfigError> {
+    if let Some(fence) = fence {
+        fence.check(path)?;
+    }
+    let target = link_target(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if let Some(fence) = fence {
+        fence.check(&target)?;
+    }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let io = |source| ConfigError::Io {
+        path: target.display().to_string(),
+        source,
+    };
+    let tmp = temp_sibling(&target);
+    let written = std::fs::write(&tmp, bytes).and_then(|()| {
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.map_err(io)
+}
+
+/// The file `path` names once every symbolic link on its last component is
+/// followed: `path` itself when it is no link or does not exist. A relative
+/// link is read from the folder the link is in. The folders above are left
+/// as they are spelled. Gives up after 40 links, as the kernel does.
+fn link_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let next = std::fs::read_link(&current)?;
+                current = if next.is_absolute() {
+                    next
+                } else {
+                    current.parent().unwrap_or(Path::new("")).join(next)
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
 }
 
 /// Atomically write raw bytes to a file: create the parent directory if it is
@@ -2887,6 +2967,117 @@ mod tests {
         // destination already exists.
         save_bytes(&path, b"{\"v\":2}").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"v\":2}");
+    }
+
+    /// The names in `dir`, sorted, so a test sees a temporary file left
+    /// behind.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_saved_over_a_link_is_written_through_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        let config = tmp.path().join("config");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let target = dotfiles.join("crystalline.yaml");
+        std::fs::write(&target, "domains: {}\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A relative link, as a dotfiles manager makes it.
+        let link = config.join("config.yaml");
+        std::os::unix::fs::symlink("../dotfiles/crystalline.yaml", &link).unwrap();
+
+        let cfg = GlobalConfig {
+            domains_root: Some(PathBuf::from("~/kb")),
+            ..GlobalConfig::default()
+        };
+        save_yaml(&link, &cfg).unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link stays a link");
+        let back: GlobalConfig = load_yaml(&target).unwrap();
+        assert_eq!(back.domains_root.as_deref(), Some(Path::new("~/kb")));
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the target keeps its mode");
+        assert_eq!(names_in(&config), vec!["config.yaml"]);
+        assert_eq!(names_in(&dotfiles), vec!["crystalline.yaml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_links_and_a_dangling_link_are_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real").join("config.yaml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "domains: {}\n").unwrap();
+        let middle = tmp.path().join("middle.yaml");
+        std::os::unix::fs::symlink(&real, &middle).unwrap();
+        let first = tmp.path().join("first.yaml");
+        std::os::unix::fs::symlink("middle.yaml", &first).unwrap();
+        save_bytes_through_link(&first, b"a: 1\n").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&first)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&middle)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"a: 1\n");
+
+        // A link whose target is not there yet: the target is created.
+        let dangling = tmp.path().join("dangling.yaml");
+        let missing = tmp.path().join("later").join("config.yaml");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        save_bytes_through_link(&dangling, b"b: 2\n").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&missing).unwrap(), b"b: 2\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_config_keeps_its_mode_when_saved() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, "domains: {}\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        save_yaml(&path, &GlobalConfig::default()).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(names_in(tmp.path()), vec!["config.yaml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_appdata_is_refused_inside_a_package() {
+        let home = tempfile::tempdir().unwrap();
+        let fence = appdata_fence(home.path());
+        let inside = home.path().join("roaming").join("x").join("config.yaml");
+        let link = home.path().join("config.yaml");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        let err = save_bytes_through_link_in(&link, b"a: 1\n", Some(&fence)).unwrap_err();
+        assert!(matches!(err, ConfigError::PackagedWrite { .. }), "{err}");
+        assert!(!home.path().join("roaming").exists());
     }
 
     fn appdata_fence(home: &Path) -> WriteFence {
