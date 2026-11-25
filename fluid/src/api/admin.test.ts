@@ -1960,11 +1960,18 @@ describe("local changes", () => {
     expect(refusalSentence("not_a_change")).toBe(
       "Already matches the team's copy.",
     );
-    const unreachable =
-      "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.";
-    expect(refusalSentence("no_base_copy")).toBe(unreachable);
-    expect(refusalSentence("no_base_copy", "not_fetched")).toBe(unreachable);
-    expect(refusalSentence("no_base_copy", "fetch_failed")).toBe(unreachable);
+    expect(refusalSentence("no_base_copy")).toBe(
+      "The team's copy of this file is missing on this machine, so it cannot be put back.",
+    );
+    expect(refusalSentence("no_base_copy", "not_fetched")).toBe(
+      "The proposal's copy of this file is not on this machine, and there is no GitHub connection to fetch it. Connect GitHub, then try again.",
+    );
+    expect(refusalSentence("no_base_copy", "fetch_failed")).toBe(
+      "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.",
+    );
+    expect(refusalSentence("no_base_copy", "something_new")).toBe(
+      "The content this file goes back to is not at hand, so it cannot be put back.",
+    );
     expect(refusalSentence("no_base_copy", "no_blob_recorded")).toBe(
       "This proposal was shared by an older version and keeps no copy of this file. Withdraw the proposal to undo it.",
     );

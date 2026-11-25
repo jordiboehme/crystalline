@@ -2196,8 +2196,14 @@ export function refusalSentence(
           return "This proposal was shared by an older version and keeps no copy of this file. Withdraw the proposal to undo it.";
         case "digest_mismatch":
           return "The proposal's copy of this file on GitHub does not match what was shared. Nothing was changed.";
-        default:
+        case undefined:
+          return "The team's copy of this file is missing on this machine, so it cannot be put back.";
+        case "not_fetched":
+          return "The proposal's copy of this file is not on this machine, and there is no GitHub connection to fetch it. Connect GitHub, then try again.";
+        case "fetch_failed":
           return "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.";
+        default:
+          return "The content this file goes back to is not at hand, so it cannot be put back.";
       }
     case "share_pending":
       return proposal === undefined
