@@ -3334,6 +3334,27 @@ mod tests {
     }
 
     #[test]
+    fn only_true_and_false_are_plain_bools() {
+        assert!(Provision::Deny.is_plain_bool());
+        assert!(Provision::all().is_plain_bool());
+        assert!(
+            !Provision::All {
+                except: names(&["skills/out"]),
+                also: Vec::new(),
+            }
+            .is_plain_bool()
+        );
+        assert!(
+            !Provision::All {
+                except: Vec::new(),
+                also: names(&["mcps/taken"]),
+            }
+            .is_plain_bool()
+        );
+        assert!(!Provision::Only(names(&["skills/in"])).is_plain_bool());
+    }
+
+    #[test]
     fn fingerprint_is_none_for_plain_true() {
         assert_eq!(Provision::all().fingerprint(), None);
         assert_eq!(

@@ -64,6 +64,18 @@ impl Provision {
         }
     }
 
+    /// Whether this decision is written as a plain `true` or `false`, the two
+    /// shapes an older Crystalline binary can read: [`Provision::Deny`], or
+    /// [`Provision::All`] with both lists empty. A map (`except`, `also` or
+    /// `only`) is not.
+    pub fn is_plain_bool(&self) -> bool {
+        match self {
+            Provision::Deny => true,
+            Provision::All { except, also } => except.is_empty() && also.is_empty(),
+            Provision::Only(_) => false,
+        }
+    }
+
     /// Whether this decision installs anything at all: every shape but
     /// [`Provision::Deny`]. An `Only` list is never empty after
     /// [`Provision::normalized`].

@@ -22,6 +22,7 @@
 pub mod model;
 pub mod receipt;
 pub mod reconcile;
+pub mod select;
 pub(crate) mod translate;
 
 pub use model::{
@@ -37,6 +38,7 @@ pub use receipt::{
 pub use reconcile::{
     ActionStatus, ArtifactAction, DeferringMcpRunner, McpOutcome, McpRunner, reconcile_harness,
 };
+pub use select::{SelectionChange, SelectionOutcome, change_selection};
 pub use translate::{Agent, Command};
 
 // --- orchestration -------------------------------------------------------
