@@ -846,6 +846,17 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let marked = shared.engine.schedule_too_wide_backups().await;
             (envelope_ok(json!({ "marked": marked })), false)
         }
+        // A not-fresh mark, as the machine owner: the CLI's verb, never a
+        // run's.
+        crate::automation_ctl::MARK_STALE_COMMAND => (
+            crate::automation_ctl::mark_stale(
+                &shared.engine,
+                req,
+                &crate::scope::ReflectionCaller::owner(),
+            )
+            .await,
+            false,
+        ),
         // The runner's verbs for the reflect and evolve loops, as the machine
         // owner: no account, so a share falls back to the changed files.
         automation if crate::automation_ctl::AUTOMATION_COMMANDS.contains(&automation) => (
@@ -935,8 +946,8 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
         }
         // Apply, inspect or record a decision for domain-declared artifact
-        // provisioning. `status` is always allowed; `allow`, `deny` and
-        // `apply` refuse on a read-only daemon (the engine itself checks)
+        // provisioning. `status` is always allowed; `allow`, `deny`, `take`,
+        // `skip` and `apply` refuse on a read-only daemon (the engine checks)
         // unless the configuration is kept in the database, as for
         // `configure`.
         "provision" => {
@@ -948,7 +959,20 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .get("domain")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let action = match action_str {
+            // The artifact keys `take` and `skip` name; absent means none.
+            let artifacts: Result<Vec<String>, String> = match req.get("artifacts") {
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str().map(str::to_string).ok_or_else(|| {
+                            "provision artifacts must be a list of strings".to_string()
+                        })
+                    })
+                    .collect(),
+                Some(_) => Err("provision artifacts must be a list of strings".to_string()),
+            };
+            let action = artifacts.and_then(|artifacts| match action_str {
                 "status" => Ok(crate::engine::ProvisionAction::Status),
                 "allow" => domain
                     .map(|domain| crate::engine::ProvisionAction::Allow { domain })
@@ -956,11 +980,17 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "deny" => domain
                     .map(|domain| crate::engine::ProvisionAction::Deny { domain })
                     .ok_or_else(|| "provision deny requires a domain".to_string()),
+                "take" => domain
+                    .map(|domain| crate::engine::ProvisionAction::Take { domain, artifacts })
+                    .ok_or_else(|| "provision take requires a domain".to_string()),
+                "skip" => domain
+                    .map(|domain| crate::engine::ProvisionAction::Skip { domain, artifacts })
+                    .ok_or_else(|| "provision skip requires a domain".to_string()),
                 "apply" => Ok(crate::engine::ProvisionAction::Apply),
                 other => Err(format!(
-                    "unknown provision action '{other}'; expected status, allow, deny or apply"
+                    "unknown provision action '{other}'; expected status, allow, deny, take, skip or apply"
                 )),
-            };
+            });
             match action {
                 Ok(action) => match shared
                     .engine
@@ -1058,6 +1088,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .config_override()
                 .map(std::path::Path::to_path_buf);
             let kept = shared.engine.kept_folder();
+            let state = shared.engine.state_folder();
             let unknown = |other: &str| {
                 anyhow::anyhow!("unknown domain_register kind '{other}'; expected file or virtual")
             };
@@ -1076,6 +1107,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                         name,
                         path.as_deref(),
                         kept.as_deref(),
+                        state.as_deref(),
                         save,
                     ),
                     "virtual" => match name {
@@ -1084,6 +1116,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                                 loaded,
                                 name,
                                 kept.as_deref(),
+                                state.as_deref(),
                                 save,
                             )
                         }
@@ -1099,12 +1132,14 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                         path.as_deref(),
                         config.as_deref(),
                         kept.as_deref(),
+                        state.as_deref(),
                     ),
                     "virtual" => match name {
                         Some(name) => crystalline_engine::registration::register_virtual_domain(
                             name,
                             config.as_deref(),
                             kept.as_deref(),
+                            state.as_deref(),
                         ),
                         None => Err(no_name()),
                     },
@@ -1353,7 +1388,7 @@ fn folds_on_the_way_in(req: &Value) -> bool {
 /// domain collide with the one an alias already points at. Nor is
 /// `forget_domain`: it names a domain that was just removed, and mapping that
 /// name could only land on a different, live domain.
-const DOMAIN_REFERENCE_COMMANDS: [&str; 23] = [
+const DOMAIN_REFERENCE_COMMANDS: [&str; 24] = [
     "sync",
     "file_stamps",
     "scaffold_manifest",
@@ -1377,6 +1412,7 @@ const DOMAIN_REFERENCE_COMMANDS: [&str; 23] = [
     "automation_run_record",
     "automation_share",
     "automation_runs",
+    "reflect_mark_stale",
 ];
 
 /// `req` with its `domain` spelled as the local name, when it is a command

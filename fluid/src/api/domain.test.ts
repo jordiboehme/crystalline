@@ -165,6 +165,47 @@ describe("the manifest policies", () => {
     changed_by: "owner",
   };
 
+  it("reads provisioning artifacts, and none from an older server", () => {
+    const withArtifacts = readManifestSections({
+      provisioning: {
+        decls: [{ kind: "skills", path: "skills" }],
+        problems: [],
+        artifacts: [
+          {
+            key: "skills/storm-warnings",
+            kind: "skills",
+            name: "storm-warnings",
+            optional: true,
+          },
+          { key: "skills/lighthouse", kind: "skills", name: "lighthouse" },
+          { kind: "skills", name: "no-key", optional: true },
+        ],
+      },
+    });
+    expect(withArtifacts?.provisioning?.artifacts).toEqual([
+      {
+        key: "skills/storm-warnings",
+        kind: "skills",
+        name: "storm-warnings",
+        optional: true,
+      },
+      {
+        key: "skills/lighthouse",
+        kind: "skills",
+        name: "lighthouse",
+        optional: false,
+      },
+    ]);
+
+    const older = readManifestSections({
+      provisioning: {
+        decls: [{ kind: "skills", path: "skills" }],
+        problems: [],
+      },
+    });
+    expect(older?.provisioning?.artifacts).toEqual([]);
+  });
+
   it("reads every registry row and drops one without a key or an effective value", () => {
     const sections = readManifestSections({
       scope: [],

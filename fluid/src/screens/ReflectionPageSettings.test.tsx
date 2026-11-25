@@ -866,6 +866,109 @@ describe("the page details column", () => {
     expect(screen.queryByRole("menuitem", { name: "Retire" })).toBeNull();
   });
 
+  it("marks a page not fresh from the More actions menu and says so", async () => {
+    serve("edit", {
+      "/domains/eng/reflection/mark-stale": () => ({
+        domain: "eng",
+        at: "2026-11-25T10:00:00Z",
+        by: "ann",
+        pages: [PAGE],
+        skipped: [],
+        only_page: false,
+      }),
+    });
+    renderApp(URL);
+    await details();
+    await moreActions();
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: "Mark as not fresh" }),
+    );
+    await waitFor(() => {
+      expect(sent("POST", "/domains/eng/reflection/mark-stale")).toEqual([
+        { path: PAGE },
+      ]);
+    });
+    expect(
+      await screen.findByText(
+        "Marked as not fresh. The next reflect run checks it again.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("says why a mark failed in the alert line", async () => {
+    serve("edit", {
+      "/domains/eng/reflection/mark-stale": () => {
+        throw new ApiProblem(409, "conflict", "the page is retired");
+      },
+    });
+    renderApp(URL);
+    await details();
+    await moreActions();
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: "Mark as not fresh" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "the page is retired",
+    );
+  });
+
+  it("offers Mark as not fresh to an editor, also on a marked page, not to a reader or on a retired page", async () => {
+    serve("read");
+    const first = renderApp(URL);
+    await details();
+    await moreActions();
+    expect(
+      screen.queryByRole("menuitem", { name: "Mark as not fresh" }),
+    ).toBeNull();
+    await userEvent.keyboard("{Escape}");
+    first.unmount();
+    serve("edit", {
+      [DOC]: () =>
+        doc(
+          view({
+            refresh_requested: { at: "2026-11-24T10:00:00Z", by: "bob" },
+          }),
+        ),
+    });
+    const second = renderApp(URL);
+    await details();
+    await moreActions();
+    expect(
+      screen.getByRole("menuitem", { name: "Mark as not fresh" }),
+    ).toBeVisible();
+    await userEvent.keyboard("{Escape}");
+    second.unmount();
+    serve("edit", {
+      [DOC]: () =>
+        doc(view({ retired: { at: null, by: null, was_owned_by: null } })),
+      "/domains/eng/reflection/clock": () => ({ clock: null, checksum: "c1" }),
+    });
+    renderApp(URL);
+    await screen.findByRole("note", { name: "Retired" });
+    await moreActions();
+    expect(
+      screen.queryByRole("menuitem", { name: "Mark as not fresh" }),
+    ).toBeNull();
+  });
+
+  it("shows the not fresh line from the clock", async () => {
+    serve("edit", {
+      "/domains/eng/reflection/clock": () => ({
+        clock: clockOf(),
+        checksum: "c1",
+        refresh_requested: {
+          at: "2026-11-24T10:00:00Z",
+          by: "bob",
+          by_display: "Bob Stone",
+        },
+      }),
+    });
+    renderApp(URL);
+    expect(
+      await screen.findByText(/^Not fresh: marked by Bob Stone at /),
+    ).toBeVisible();
+  });
+
   it("hands focus to the banner's Restore after a retire, and to More actions after a restore", async () => {
     let retired = false;
     serve("curate", {

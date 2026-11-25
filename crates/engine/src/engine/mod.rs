@@ -25,7 +25,7 @@ use crystalline_core::config::registration::{
     decide_registration, infer_name_origin, needs_manifest_write_back, validate_domain_name,
 };
 use crystalline_core::config::{
-    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, NameOrigin, OriginConfig,
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, NameOrigin, OriginConfig, Provision,
     ResponseFormat, ShareIdentityMode, VerifyConfig,
 };
 use crystalline_core::emit::{
@@ -542,14 +542,10 @@ fn fill_unguarded(targets: &[DiscardTarget], local: &LocalChanges) -> Vec<Discar
 
 /// What one offline read of a team domain's unshared delta needs: the domain
 /// root, its origin state directory, the base every comparison is made
-/// against and the delta detection found. What
-/// [`Engine::team_local_changes`] hands its three callers.
-type TeamChanges = (
-    PathBuf,
-    PathBuf,
-    BTreeMap<String, crystalline_remote::state::BaseStamp>,
-    LocalChanges,
-);
+/// against, with the source of every stamp (`ops::unshared_sources`), and the
+/// delta detection found against its stamps. What
+/// [`Engine::team_local_changes`] hands its callers.
+type TeamChanges = (PathBuf, PathBuf, ops::TipSources, LocalChanges);
 
 /// Renders one side of a conflict for [`Engine::origin_conflict_detail`]: an
 /// absent side is `null`, a UTF-8 one is a JSON string, and a side that
@@ -1858,6 +1854,9 @@ pub enum PreviewCredential {
 pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
+pub use crystalline_core::provision::{
+    ArtifactListing, ArtifactListingReport, SelectionChange, SelectionOutcome,
+};
 pub use crystalline_core::threads::ThreadTarget;
 pub use disclosure::{DISCLOSURE_CHANGED, DisclosureAsk, NOBODY_ASKED_NOTE, REPO_READERS_UNKNOWN};
 pub use domain_settings::{DOMAIN_SETTINGS_HOW, PolicyEdit, VIRTUAL_NO_RULES};
@@ -8791,6 +8790,13 @@ impl Engine {
         self.kept_dir()
     }
 
+    /// This machine's state folder as this engine knows it, `None` without
+    /// one: where a registration this engine runs for a client records the
+    /// one-time domains root check.
+    pub fn state_folder(&self) -> Option<PathBuf> {
+        self.journal_state_dir().ok()
+    }
+
     /// The configuration a routing block is built from, as this engine sees
     /// it now: the file re-read with the environment overlay, every
     /// registered domain (a domain registered after start included), and
@@ -9716,6 +9722,7 @@ pub use github_app::{
 #[cfg(any(test, feature = "testing"))]
 pub use github_app::{AppKeychainSeam, AppLookupFn};
 mod kept;
+mod mark_stale;
 mod move_;
 mod name_report;
 mod names;
@@ -9742,6 +9749,8 @@ pub use reflection::{
 pub use reflection_assets::WrittenReflectionAsset;
 mod manifest_rename;
 mod rename_domain;
+mod root_pin;
+pub use root_pin::PinCause;
 mod review_mode;
 pub(crate) use review_mode::{folder_may_fold_case, page_folds_case};
 #[cfg(test)]
@@ -10336,37 +10345,103 @@ pub enum ProvisionAction {
     /// Report every domain's decision and every installed harness's counts,
     /// writing nothing.
     Status,
-    /// Opt `domain` in (`provision: true`), then reconcile.
+    /// Opt `domain` in, then reconcile: everything it ships is installed
+    /// except optional artifacts that were not taken. It replaces a pick made
+    /// with `take` or `skip`, but keeps the optional artifacts that were
+    /// taken.
     Allow {
         /// The domain to opt in.
         domain: String,
     },
     /// Opt `domain` out (`provision: false`), then reconcile - this removes
-    /// any artifacts it previously shipped.
+    /// any artifacts it previously shipped. It replaces any pick.
     Deny {
         /// The domain to opt out.
         domain: String,
+    },
+    /// Install the named artifacts of `domain` (`<kind>/<name>` keys), then
+    /// reconcile. On a domain with no decision yet only these are installed.
+    Take {
+        /// The domain to pick from.
+        domain: String,
+        /// The artifact keys to install.
+        artifacts: Vec<String>,
+    },
+    /// Leave the named artifacts of `domain` out, then reconcile. On a domain
+    /// with no decision yet everything else is installed.
+    Skip {
+        /// The domain to pick from.
+        domain: String,
+        /// The artifact keys to leave out.
+        artifacts: Vec<String>,
     },
     /// Reconcile every already opted-in domain's artifacts, without
     /// changing any decision.
     Apply,
 }
 
-/// Record `name`'s provisioning decision (`provision: true` for `allow`,
-/// `provision: false` otherwise) directly on `file`. The one seam
-/// [`Engine::provision`]'s daemon path and `client::provision`'s static
-/// fallback both mutate a config through, so the two can never diverge on
-/// what counts as "unregistered" or "virtual". Errors with
-/// [`EngineError::UnknownDomain`] naming every domain `file` does carry when
-/// `name` is not one of them, and with [`EngineError::Invalid`] when `name`
-/// is a virtual domain - it has no filesystem root to ship artifacts from,
-/// so no decision is recorded.
+impl ProvisionAction {
+    /// The domain a decision names, with the change and the artifact names
+    /// it carries; `None` for `Status` and `Apply`.
+    pub fn decision(&self) -> Option<(&str, SelectionChange, &[String])> {
+        match self {
+            ProvisionAction::Allow { domain } => Some((domain, SelectionChange::Allow, &[])),
+            ProvisionAction::Deny { domain } => Some((domain, SelectionChange::Deny, &[])),
+            ProvisionAction::Take { domain, artifacts } => {
+                Some((domain, SelectionChange::Take, artifacts))
+            }
+            ProvisionAction::Skip { domain, artifacts } => {
+                Some((domain, SelectionChange::Skip, artifacts))
+            }
+            ProvisionAction::Status | ProvisionAction::Apply => None,
+        }
+    }
+}
+
+/// The artifact listing a decision about `entry` needs, read before any
+/// configuration lock is taken: what
+/// [`crystalline_core::provision::list_artifacts`] reports for a file domain,
+/// and an empty report for `deny` (which reads no listing), for a virtual
+/// domain and for a domain that is not registered (the seam refuses both).
 #[doc(hidden)]
-pub fn set_domain_provision_decision(
+pub fn decision_listing(
+    domain: &str,
+    entry: Option<&DomainEntry>,
+    change: SelectionChange,
+) -> ArtifactListingReport {
+    match entry {
+        Some(entry) if change != SelectionChange::Deny && !entry.is_virtual() => {
+            crystalline_core::provision::list_artifacts(domain, entry)
+        }
+        _ => ArtifactListingReport::default(),
+    }
+}
+
+/// Record a change to `name`'s provisioning decision directly on `file`.
+///
+/// The one seam [`Engine::provision`]'s daemon path and
+/// `client::provision`'s static fallback both mutate a config through, so the
+/// two can never diverge on what counts as "unregistered" or "virtual", or on
+/// the decision a change writes. It computes the new decision with
+/// [`crystalline_core::provision::change_selection`] and stores it
+/// normalized. `listing` comes from [`decision_listing`], which the caller
+/// runs before it takes any configuration lock, so no filesystem walk runs
+/// under a lock every reader waits on.
+///
+/// Errors with [`EngineError::UnknownDomain`] naming every domain `file` does
+/// carry when `name` is not one of them, with [`EngineError::Invalid`] when
+/// `name` is a virtual domain (it has no filesystem root to ship artifacts
+/// from, so no decision is recorded), and with [`EngineError::Invalid`]
+/// carrying `change_selection`'s sentence when an artifact name is refused.
+/// On any error `file` is left as it was.
+#[doc(hidden)]
+pub fn set_domain_provision(
     file: &mut GlobalConfig,
     name: &str,
-    allow: bool,
-) -> Result<()> {
+    change: SelectionChange,
+    names: &[String],
+    listing: &ArtifactListingReport,
+) -> Result<SelectionOutcome> {
     let Some(entry) = file.domains.get(name) else {
         return Err(EngineError::UnknownDomain {
             domain: name.to_string(),
@@ -10378,8 +10453,101 @@ pub fn set_domain_provision_decision(
             "domain '{name}' is virtual; virtual domains have no files to provision, so no decision was recorded"
         )));
     }
-    file.domains.get_mut(name).unwrap().provision = Some(allow);
-    Ok(())
+    let outcome = crystalline_core::provision::change_selection(
+        name,
+        entry.provision.as_ref(),
+        change,
+        names,
+        &listing.artifacts,
+        &listing.present_kinds,
+    )
+    .map_err(EngineError::Invalid)?;
+    file.domains.get_mut(name).unwrap().provision = Some(outcome.decision.clone());
+    Ok(outcome)
+}
+
+/// Add what a decision did to an apply report: the top-level `decided`
+/// object (`{"domain", "decision", "selection"}`, `selection` as in the
+/// status report), the notes
+/// [`crystalline_core::provision::change_selection`] raised, and, when the
+/// decision is written as a map, one notice that older Crystalline versions
+/// cannot read it. The decision's notices come before the reconcile's. Every
+/// one names the domain between backticks, so the hidden-domain notice
+/// filter keeps working. Shared by the daemon and the static fallback so
+/// their answers cannot diverge.
+#[doc(hidden)]
+pub fn decorate_decided(value: &mut Value, domain: &str, outcome: &SelectionOutcome) {
+    let mut notices: Vec<Value> = outcome
+        .notes
+        .iter()
+        .map(|note| Value::String(decision_note(domain, note)))
+        .collect();
+    if outcome.writes_map() {
+        notices.push(Value::String(older_versions_notice(domain)));
+    }
+    let Value::Object(map) = value else {
+        return;
+    };
+    map.insert(
+        "decided".to_string(),
+        json!({
+            "domain": domain,
+            "decision": provision_decision_id(&outcome.decision),
+            "selection": selection_json(Some(&outcome.decision)),
+        }),
+    );
+    if let Some(existing) = map.get_mut("notices").and_then(Value::as_array_mut) {
+        notices.append(existing);
+    }
+    map.insert("notices".to_string(), Value::Array(notices));
+}
+
+/// One note of [`crystalline_core::provision::change_selection`] as a
+/// notice: a sentence that names `domain` between backticks. A note that
+/// names it already ("the `harbor` domain is denied, ...") only gains a
+/// capital and a full stop; any other ("`skills/x` is already on") also
+/// gains "in `harbor`".
+fn decision_note(domain: &str, note: &str) -> String {
+    let mut chars = note.chars();
+    let note = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+        None => String::new(),
+    };
+    if note.contains(&format!("`{domain}`")) {
+        format!("{note}.")
+    } else {
+        format!("{note} in `{domain}`.")
+    }
+}
+
+/// The notice a decision written as a map carries: a binary before 0.37.0
+/// reads `provision` as a plain bool and fails to load such a config.
+fn older_versions_notice(domain: &str) -> String {
+    format!(
+        "Older Crystalline versions cannot read the choice for the `{domain}` domain in `config.yaml`. `crystalline provision deny {domain}`, or `allow {domain}` when no optional artifact is taken, writes a value they read."
+    )
+}
+
+/// The decision id ([`decision_id`]'s spelling) of a recorded decision.
+fn provision_decision_id(decision: &Provision) -> &'static str {
+    match decision {
+        Provision::All { .. } => "allowed",
+        Provision::Only(_) => "only",
+        Provision::Deny => "denied",
+    }
+}
+
+/// The lists of a decision as JSON: `null` for no decision and for plain
+/// `true` or `false`, `{"except": [...], "also": [...]}` (both keys always
+/// present) for a map of `except` and `also`, `{"only": [...]}` for `only`.
+fn selection_json(decision: Option<&Provision>) -> Value {
+    match decision {
+        Some(Provision::All { except, also }) if !(except.is_empty() && also.is_empty()) => {
+            json!({ "except": except, "also": also })
+        }
+        Some(Provision::Only(only)) if !only.is_empty() => json!({ "only": only }),
+        _ => Value::Null,
+    }
 }
 
 /// Serialize an [`crystalline_core::provision::ApplyReport`] into the JSON
@@ -10456,6 +10624,20 @@ fn domain_status_json(status: &crystalline_core::provision::DomainStatus) -> Val
         "declares": status.declares,
         "counts": status.counts,
         "parse_problems": status.parse_problems,
+        "selection": selection_json(status.selection.as_ref()),
+        "artifacts": status.artifacts.iter().map(artifact_state_json).collect::<Vec<_>>(),
+        "stale": status.stale,
+        "malformed": status.malformed,
+    })
+}
+
+fn artifact_state_json(state: &crystalline_core::provision::ArtifactState) -> Value {
+    json!({
+        "key": state.key,
+        "kind": state.kind.id(),
+        "name": state.name,
+        "optional": state.optional,
+        "on": state.on,
     })
 }
 
@@ -10465,6 +10647,7 @@ fn decision_id(decision: crystalline_core::provision::Decision) -> &'static str 
     use crystalline_core::provision::Decision::*;
     match decision {
         Allowed => "allowed",
+        Only => "only",
         Denied => "denied",
         Undecided => "undecided",
     }
@@ -11404,6 +11587,37 @@ pub(crate) fn text_read_error(abs: &Path, source: std::io::Error) -> EngineError
 /// [`write_bytes`] instead.
 fn write_file(abs: &Path, contents: &str) -> Result<()> {
     write_bytes(abs, crystalline_core::to_lf(contents).as_bytes())
+}
+
+/// [`write_file`], with the file's modified time set to `modified` before
+/// it takes the file's place, so nothing that watches the folder sees the
+/// new text with another time.
+fn write_file_keeping_modified(
+    abs: &Path,
+    contents: &str,
+    modified: std::time::SystemTime,
+) -> Result<()> {
+    let tmp = crystalline_core::path::hidden_temp_path(abs, "tmp");
+    let file = std::fs::File::create(&tmp).map_err(|source| EngineError::Io {
+        path: tmp.display().to_string(),
+        source,
+    })?;
+    let written =
+        std::io::Write::write_all(&mut &file, crystalline_core::to_lf(contents).as_bytes())
+            .and_then(|()| file.set_modified(modified));
+    drop(file);
+    if let Err(source) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EngineError::Io {
+            path: tmp.display().to_string(),
+            source,
+        });
+    }
+    std::fs::rename(&tmp, abs).map_err(|source| EngineError::Io {
+        path: abs.display().to_string(),
+        source,
+    })?;
+    Ok(())
 }
 
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {

@@ -75,7 +75,10 @@ async fn a_curator_sets_retires_and_restores_and_a_reader_sees_the_clock() {
     let (_, none) = ann
         .get("/api/v1/domains/eng/reflection/clock?path=gone.md")
         .await;
-    assert_eq!(none, json!({ "clock": null, "checksum": null }));
+    assert_eq!(
+        none,
+        json!({ "clock": null, "checksum": null, "refresh_requested": null })
+    );
 
     // Retire and restore: a curator's, and the tree marks the page.
     let (status, err) = ann
@@ -297,5 +300,90 @@ async fn the_clock_names_the_checksum_a_read_answers() {
     let (_, none) = ann
         .get("/api/v1/domains/eng/reflection/clock?path=gone.md")
         .await;
-    assert_eq!(none, json!({ "clock": null, "checksum": null }));
+    assert_eq!(
+        none,
+        json!({ "clock": null, "checksum": null, "refresh_requested": null })
+    );
+}
+
+/// Marking over the JSON API: one page, several or all, with `only_page`;
+/// the read and the clock show the mark with the marker's display name; a
+/// reader, the anonymous visitor and the wrong bodies are refused.
+#[tokio::test]
+async fn an_editor_marks_pages_not_fresh_and_every_reader_sees_it() {
+    let s = serve().await;
+    s.auth.set_display("ann", Some("Ann Nash")).await.unwrap();
+    let ann = Session::login(s.addr, "ann").await;
+    let vera = Session::login(s.addr, "vera").await;
+    let url = "/api/v1/domains/eng/reflection/mark-stale";
+
+    let (status, marked) = ann
+        .send(Method::POST, url, Some(json!({ "path": PAGE })))
+        .await;
+    assert_eq!(status, 200, "{marked}");
+    assert_eq!(marked["domain"], "eng");
+    assert_eq!(marked["by"], "ann");
+    assert_eq!(marked["pages"], json!([PAGE]));
+    assert_eq!(marked["only_page"], false);
+    assert_eq!(marked["skipped"], json!([]));
+    let at = marked["at"].as_str().unwrap().to_string();
+
+    let (_, doc) = vera
+        .get(&format!("/api/v1/domains/eng/reflections/{PAGE}"))
+        .await;
+    assert_eq!(doc["page"]["refresh_requested"]["at"], at.as_str(), "{doc}");
+    assert_eq!(doc["page"]["refresh_requested"]["by"], "ann");
+    assert_eq!(
+        doc["page"]["refresh_requested"]["by_display"], "Ann Nash",
+        "{doc}"
+    );
+    let (_, clock) = vera
+        .get(&format!("/api/v1/domains/eng/reflection/clock?path={PAGE}"))
+        .await;
+    assert_eq!(
+        clock["refresh_requested"], doc["page"]["refresh_requested"],
+        "{clock}"
+    );
+    assert_eq!(clock["checksum"], doc["checksum"]);
+
+    let (status, again) = ann
+        .send(
+            Method::POST,
+            url,
+            Some(json!({ "pages": [PAGE], "only_page": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["only_page"], true);
+    assert!(again["at"].as_str().unwrap() > at.as_str(), "{again}");
+    let (status, all) = ann
+        .send(Method::POST, url, Some(json!({ "all": true })))
+        .await;
+    assert_eq!(status, 200, "{all}");
+    assert!(
+        all["pages"].as_array().unwrap().contains(&json!(PAGE)),
+        "{all}"
+    );
+
+    for body in [
+        json!({}),
+        json!({ "pages": [] }),
+        json!({ "path": PAGE, "all": true }),
+        json!({ "path": "PACT.md" }),
+    ] {
+        let (status, err) = ann.send(Method::POST, url, Some(body.clone())).await;
+        assert_eq!(status, 422, "{body}: {err}");
+    }
+    let (status, err) = ann
+        .send(Method::POST, url, Some(json!({ "path": "gone.md" })))
+        .await;
+    assert_eq!(status, 404, "{err}");
+    let (status, err) = vera
+        .send(Method::POST, url, Some(json!({ "path": PAGE })))
+        .await;
+    assert_eq!(status, 403, "a reader does not mark: {err}");
+    let open = crate::rest::serve_with(true).await;
+    let (status, err) =
+        crate::rest::anonymous(open.addr, Method::POST, url, Some(json!({ "path": PAGE }))).await;
+    assert_eq!(status, 401, "{err}");
 }

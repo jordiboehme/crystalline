@@ -2084,7 +2084,8 @@ async fn domain_manifest_carries_every_section_it_declares() {
                     { "kind": "skills", "path": "skills" },
                     { "kind": "agents", "path": "../agents" }
                 ],
-                "problems": []
+                "problems": [],
+                "artifacts": []
             },
             "tag_aliases": {
                 "decls": [
@@ -2107,6 +2108,126 @@ async fn domain_manifest_carries_every_section_it_declares() {
             ],
             "starters": starters_json()
         }),
+        "{body}"
+    );
+}
+
+/// The provisioning section lists what the declared folders ship on the
+/// server's disk, one row per artifact with its optional mark, and nothing
+/// about on or off: that is each machine's own decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_answer_lists_the_provisioned_artifacts_with_their_marks() {
+    let fixture = serve_anonymous().await;
+    write_manifest(
+        &fixture,
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n\n## Provisioning\n\n- skills: skills\n- commands: cmds\n",
+    );
+    let root = fixture._tmp.path().join("eng");
+    for (name, body) in [
+        (
+            "storm-warnings",
+            "---\nname: storm-warnings\ndescription: Warn.\nmetadata:\n  provision: optional\n---\n\nBody.\n",
+        ),
+        (
+            "lighthouse",
+            "---\nname: lighthouse\ndescription: Shine.\n---\n\nBody.\n",
+        ),
+    ] {
+        let dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+    std::fs::create_dir_all(root.join("cmds")).unwrap();
+    std::fs::write(root.join("cmds/deploy.md"), "Deploy it.\n").unwrap();
+
+    let body: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/manifest")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["sections"]["provisioning"]["artifacts"],
+        serde_json::json!([
+            { "key": "skills/lighthouse", "kind": "skills", "name": "lighthouse", "optional": false },
+            { "key": "skills/storm-warnings", "kind": "skills", "name": "storm-warnings", "optional": true },
+            { "key": "commands/deploy", "kind": "commands", "name": "deploy", "optional": false }
+        ]),
+        "{body}"
+    );
+}
+
+/// The artifact listing is read from the source folders, not from the
+/// MANIFEST, so the read's validator covers it too: a new artifact or a
+/// changed optional mark answers a conditional read with the full body, not a
+/// 304 that would leave the Provisioning card showing the old list. The
+/// `checksum` in the body stays the MANIFEST's own, the token a save compares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_validator_follows_the_artifact_listing() {
+    let fixture = serve_anonymous().await;
+    let manifest = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n\n## Provisioning\n\n- skills: skills\n";
+    write_manifest(&fixture, manifest);
+    let skills = fixture._tmp.path().join("eng/skills");
+    let write_skill = |name: &str, optional: bool| {
+        let dir = skills.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = if optional {
+            "metadata:\n  provision: optional\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: A skill.\n{mark}---\n\nBody.\n"),
+        )
+        .unwrap();
+    };
+    write_skill("lighthouse", false);
+    let path = "/api/v1/domains/eng/manifest";
+
+    let first = get(fixture.addr, path).await;
+    let first_tag = header(&first, "etag");
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(
+        get_if_none_match(fixture.addr, path, &first_tag)
+            .await
+            .status(),
+        304,
+        "nothing moved"
+    );
+
+    // A new skill on disk, the MANIFEST unchanged.
+    write_skill("storm-warnings", false);
+    let resp = get_if_none_match(fixture.addr, path, &first_tag).await;
+    assert_eq!(resp.status(), 200, "a new artifact is not a 304");
+    let second_tag = header(&resp, "etag");
+    assert_ne!(second_tag, first_tag);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["sections"]["provisioning"]["artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        body["checksum"], first_body["checksum"],
+        "the save checksum is the MANIFEST's alone"
+    );
+    assert_eq!(
+        get_if_none_match(fixture.addr, path, &second_tag)
+            .await
+            .status(),
+        304
+    );
+
+    // The same skills, one now marked optional.
+    write_skill("storm-warnings", true);
+    let resp = get_if_none_match(fixture.addr, path, &second_tag).await;
+    assert_eq!(resp.status(), 200, "a changed mark is not a 304");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["sections"]["provisioning"]["artifacts"][1]["optional"], true,
         "{body}"
     );
 }

@@ -385,7 +385,12 @@ export default function ShareDialogBody({
         return now;
       });
       setRefusals(
-        new Map(result.refused.map((r) => [r.path, refusalSentence(r.reason)])),
+        new Map(
+          result.refused.map((r) => [
+            r.path,
+            refusalSentence(r.reason, r.detail, r.proposal),
+          ]),
+        ),
       );
       // A file the open pane is showing was refused because it moved under
       // this reader: the two sides they are looking at are the old ones.

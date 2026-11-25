@@ -1060,3 +1060,93 @@ fn a_stop_during_an_unreachable_record_ends_within_the_grace_period() {
         .unwrap();
     assert!(!Path::new(&cfg).exists(), "the MCP config was left behind");
 }
+
+/// `crystalline reflect mark-stale` through the daemon: one page and its
+/// owned pages, `--only-page`, every page with no page named, `--json`,
+/// and a refusal that exits 2 with its sentence. `evolve mark-stale` does
+/// not exist.
+#[test]
+fn reflect_mark_stale_marks_pages_through_the_daemon() {
+    let mut env = DaemonEnv::new("mark");
+    let kb = env.dir.join("kb-docs");
+    std::fs::create_dir_all(kb.join("reflections/arch")).unwrap();
+    std::fs::write(
+        kb.join("MANIFEST.md"),
+        manifest("docs").replacen("---\n\n", "reflection: on\n---\n\n", 1),
+    )
+    .unwrap();
+    std::fs::write(
+        kb.join("reflections/arch.md"),
+        "# Arch\n\n## One\n<!-- r:aaaa1111 -->\n\nText.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        kb.join("reflections/arch/db.md"),
+        "---\nreflection:\n  _page:\n    owner: arch.md\n---\n# Db\n\n## One\n<!-- r:bbbb2222 -->\n\nText.\n",
+    )
+    .unwrap();
+    let config = env.config_path();
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "service:\n  response_format: json\ndomains:\n  docs:\n    path: {}\n",
+            kb.display()
+        ),
+    )
+    .unwrap();
+    env.serve();
+
+    // The daemon's first sync reads the Reflection in; until then its
+    // pages are files nobody has sorted.
+    let start = Instant::now();
+    let out = loop {
+        let out = env.output(&["reflect", "mark-stale", "docs", "arch.md"]);
+        if !String::from_utf8_lossy(&out.stderr).contains("waits until")
+            || start.elapsed() > Duration::from_secs(30)
+        {
+            break out;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(code(&out), Some(0), "{}", explain(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Marked 2 pages of docs as not fresh. The next reflect run reconciles them.\n  arch.md\n  arch/db.md\n",
+        "{}",
+        explain(&out)
+    );
+    assert!(
+        std::fs::read_to_string(kb.join("reflections/arch/db.md"))
+            .unwrap()
+            .contains("refresh_requested:")
+    );
+
+    let out = env.output(&["reflect", "mark-stale", "docs", "arch.md", "--only-page"]);
+    assert_eq!(code(&out), Some(0), "{}", explain(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Marked arch.md of docs as not fresh. The next reflect run reconciles it.\n"
+    );
+
+    let out = env.output(&["--json", "reflect", "mark-stale", "docs"]);
+    assert_eq!(code(&out), Some(0), "{}", explain(&out));
+    let answer: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        answer["pages"],
+        json!(["arch.md", "arch/db.md"]),
+        "{answer}"
+    );
+    assert_eq!(answer["only_page"], false);
+
+    let out = env.output(&["reflect", "mark-stale", "docs", "gone.md"]);
+    assert_eq!(code(&out), Some(2), "{}", explain(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("Error: "),
+        "{}",
+        explain(&out)
+    );
+
+    let out = env.output(&["evolve", "mark-stale", "docs"]);
+    assert_ne!(code(&out), Some(0), "{}", explain(&out));
+}

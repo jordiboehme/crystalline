@@ -682,7 +682,9 @@ pub struct WriteReflectionParams {
     /// page out of the navigation, kept and restorable; an unattended
     /// session retires and never deletes), restore (bring a retired page
     /// back), reconciled (record that a page was brought in line with its
-    /// pacts, with outcome updated or unchanged), write_asset
+    /// pacts, with outcome updated or unchanged), mark_stale (mark a page
+    /// not fresh: the next reflect run reconciles it and the pages it owns,
+    /// without the shortcut; edit access), write_asset
     /// (upload a file under reflections/assets/: path, and content or
     /// base64; replacing one with overwrite needs curate access), move_asset
     /// or delete_asset (move or remove a file under reflections/assets/; both
@@ -765,6 +767,9 @@ pub struct WriteReflectionParams {
     /// before the page's last reconcile is refused as an older period.
     #[serde(default)]
     pub version: Option<String>,
+    /// mark_stale: mark only this page, not the pages it owns.
+    #[serde(default)]
+    pub only_page: bool,
     /// write: the checksum read_reflection returned; a reflection that changed
     /// since is refused rather than overwritten.
     #[serde(default)]
@@ -785,6 +790,30 @@ pub struct WriteReflectionParams {
     /// agent can set it in its arguments and the MCP schema does not show it.
     #[serde(skip)]
     pub disclosed: Option<String>,
+}
+
+/// Which pages a not-fresh mark names ([`MarkStale`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkPages {
+    /// One page, by its path inside reflections/.
+    One(String),
+    /// Several pages, in the order given.
+    Many(Vec<String>),
+    /// Every page of the Reflection that is not retired.
+    All,
+}
+
+/// A request to mark Reflection pages not fresh
+/// (`Engine::mark_reflection_stale`): the next reflect run reconciles them
+/// in full, without the "changed_engrams 0" shortcut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkStale {
+    /// The pages to mark.
+    pub pages: MarkPages,
+    /// Mark only the named pages, not the pages they own. Without it the
+    /// pages each named page owns are marked too, recursively.
+    #[serde(default)]
+    pub only_page: bool,
 }
 
 /// A change to a Reflection page's settings, the frontmatter keys only a
@@ -866,14 +895,16 @@ pub struct ReflectParams {
     /// One-based page number. Defaults to 1.
     #[serde(default)]
     pub page: Option<usize>,
-    /// Whether to hand out `stale` items: pages whose freshness ran out and
-    /// that a reconcile brings in line with their pacts again. Omit for the
+    /// Whether to hand out `stale` items: pages whose freshness ran out or
+    /// that a person marked not fresh, and that a reconcile brings in line
+    /// with their pacts again. Omit for the
     /// default: a run (an unattended session or one holding a loop's
     /// lease) gets them, an interactive session does not. A stale item's
     /// `changed_engrams` counts the engrams changed since its last
     /// reconcile in the domains you may read, or is null when that is
     /// unknown (a domain on a connected server, or a file domain that could
-    /// not be walked).
+    /// not be walked). A count of 0 lets a page be recorded unchanged at
+    /// once, never a marked one (`refresh_requested` or `owned_marked`).
     // Left out when unset, so a call forwarded to an older server, which
     // refuses a key it does not know, carries it only when it was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -970,7 +1001,7 @@ pub struct AddDomainParams {
     /// domain lives on this machine; created and given a starter `MANIFEST.md`
     /// when empty, adopted in place when it already holds engrams. Defaults to
     /// the configured domains root at `<root>/<domain>` (root default
-    /// `~/Documents/Crystalline`). The default mode when neither `repo` nor
+    /// `~/.crystalline`). The default mode when neither `repo` nor
     /// `virtual` is given.
     #[serde(default)]
     pub folder: Option<String>,
@@ -1181,13 +1212,19 @@ pub struct SkillsParams {
 /// Parameters for `provision`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProvisionParams {
-    /// What to do: "status" reports decisions, shipped artifacts and installed
-    /// state; "allow" or "deny" records the user's decision for `domain` and
+    /// What to do: "status" reports decisions, every artifact a domain ships
+    /// with whether it is installed, and installed state; "allow" or "deny"
+    /// records an all or nothing decision for `domain` and applies it; "take"
+    /// or "skip" installs or leaves out single artifacts of `domain` and
     /// applies it; "apply" reconciles current decisions.
     pub action: String,
-    /// The domain for allow or deny. Omit for status and apply.
+    /// The domain for allow, deny, take or skip. Omit for status and apply.
     #[serde(default)]
     pub domain: Option<String>,
+    /// The artifacts for take or skip, as `<kind>/<name>` exactly as status
+    /// lists them, for example "skills/tide-tables" or "mcps/lighthouse".
+    #[serde(default)]
+    pub artifacts: Vec<String>,
 }
 
 /// A params struct that names existing domains, so a caller may spell each

@@ -54,6 +54,43 @@ pub fn fold_path_case(path: &str) -> String {
     path.to_lowercase()
 }
 
+/// Whether `path` lies at or under `root`, compared by components, never on
+/// disk: both separators split, `.` dropped and `..` applied, a Windows
+/// verbatim prefix (`\\?\`, `\\?\UNC\`) removed and, with `fold_case`,
+/// without regard to case ([`fold_path_case`]). So `AppData-old` never
+/// matches `AppData`. Nothing is opened or canonicalized, so a path in a
+/// folder the OS guards (macOS privacy protection) is compared without
+/// touching it.
+pub fn lies_within(path: &Path, root: &Path, fold_case: bool) -> bool {
+    let path = parts(path, fold_case);
+    let root = parts(root, fold_case);
+    !root.is_empty() && path.len() >= root.len() && path[..root.len()] == root[..]
+}
+
+/// The components [`lies_within`] compares.
+fn parts(path: &Path, fold_case: bool) -> Vec<String> {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        text = format!("//{rest}");
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        text = rest.to_string();
+    }
+    if fold_case {
+        text = fold_path_case(&text);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other.to_string()),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +128,31 @@ mod tests {
     fn folding_reaches_beyond_ascii() {
         assert_eq!(fold_path_case("Ordner/Größe.md"), "ordner/größe.md");
         assert_eq!(fold_path_case("notes/ÉCOLE.md"), "notes/école.md");
+    }
+
+    #[test]
+    fn lies_within_compares_components_by_text() {
+        use super::lies_within;
+        let p = |s: &str| std::path::PathBuf::from(s);
+        assert!(lies_within(&p("/a/b/c"), &p("/a/b"), false));
+        assert!(lies_within(&p("/a/b"), &p("/a/b"), false));
+        assert!(!lies_within(&p("/a/b-old/c"), &p("/a/b"), false));
+        assert!(lies_within(&p("/a/./x/../b/c"), &p("/a/b"), false));
+        assert!(lies_within(
+            &p(r"\\?\C:\Users\ada\kb"),
+            &p(r"C:\Users\ada"),
+            false
+        ));
+        assert!(lies_within(
+            &p(r"\\?\UNC\srv\share\kb"),
+            &p(r"\\srv\share"),
+            false
+        ));
+        assert!(!lies_within(&p("/A/B/c"), &p("/a/b"), false));
+        assert!(lies_within(&p("/A/B/c"), &p("/a/b"), true));
+        assert!(
+            !lies_within(&p("/a"), &p(""), true),
+            "an empty root holds nothing"
+        );
     }
 }

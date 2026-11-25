@@ -322,3 +322,94 @@ fn cross_domain_collision_after_flattening_keeps_the_first_domain() {
         "cross-domain notice names both domains: {notices:?}"
     );
 }
+
+// --- the optional mark across dialects ---------------------------------------
+
+/// Codex refuses an agent TOML that holds a `metadata` table, so a markdown
+/// agent marked optional must render into Codex TOML without any `metadata`,
+/// and the render must not report the field as dropped.
+#[test]
+fn a_markdown_agent_marked_optional_renders_to_codex_toml_without_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "agents/pilot.md",
+        "---\nname: pilot\ndescription: Steers the ship\nmetadata:\n  provision: optional\n---\n\nSteer.\n",
+    );
+    let harbor = scan("harbor", dir.path());
+    assert!(harbor.files[0].optional, "the scan reads the mark");
+
+    let (desired, notices) = desired_set(HarnessKind::Codex, std::slice::from_ref(&harbor));
+    let agent = &desired.files["agents/pilot.toml"];
+    let DesiredPayload::Rendered(bytes) = &agent.payload else {
+        panic!("the agent must be a cross-dialect render");
+    };
+    let rendered = String::from_utf8(bytes.clone()).unwrap();
+    assert_eq!(
+        rendered,
+        "name = \"pilot\"\ndescription = \"Steers the ship\"\ndeveloper_instructions = '''\nSteer.\n'''\n"
+    );
+    assert!(!rendered.contains("metadata"), "{rendered}");
+    assert!(
+        notices.iter().all(|n| !n.contains("metadata")),
+        "no dropped notice for `metadata`: {notices:?}"
+    );
+}
+
+#[test]
+fn a_metadata_field_is_not_reported_as_dropped_when_an_agent_is_translated() {
+    let dir = tempfile::tempdir().unwrap();
+    // Markdown to TOML (Codex).
+    write(
+        dir.path(),
+        "md/agents/pilot.md",
+        "---\nname: pilot\ndescription: Steers\nmodel: opus\nmetadata:\n  provision: optional\n---\n\nSteer.\n",
+    );
+    // TOML to markdown (Claude Code, Copilot). Codex itself refuses this file,
+    // but a hand-written one must still translate without a `metadata` notice.
+    write(
+        dir.path(),
+        "toml/agents/reviewer.toml",
+        "name = \"reviewer\"\ndescription = \"Reviews\"\nmodel = \"gpt-5-codex\"\ndeveloper_instructions = '''\nGo.\n'''\n\n[metadata]\nprovision = \"optional\"\n",
+    );
+    let md = scan("harbor", &dir.path().join("md"));
+    let toml = scan("cove", &dir.path().join("toml"));
+
+    for (harness, domain, agent_key, stem) in [
+        (HarnessKind::Codex, &md, "agents/pilot.toml", "pilot"),
+        (
+            HarnessKind::ClaudeCode,
+            &toml,
+            "agents/reviewer.md",
+            "reviewer",
+        ),
+        (
+            HarnessKind::Copilot,
+            &toml,
+            "agents/reviewer.md",
+            "reviewer",
+        ),
+    ] {
+        let (desired, notices) = desired_set(harness, std::slice::from_ref(domain));
+        let DesiredPayload::Rendered(bytes) = &desired.files[agent_key].payload else {
+            panic!("{agent_key} must be rendered for {harness:?}");
+        };
+        assert!(
+            !String::from_utf8(bytes.clone())
+                .unwrap()
+                .contains("metadata"),
+            "{harness:?}"
+        );
+        // `model` is still reported, `metadata` is not.
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("`model`") && n.contains(&format!("`{stem}`"))),
+            "{harness:?}: {notices:?}"
+        );
+        assert!(
+            notices.iter().all(|n| !n.contains("metadata")),
+            "{harness:?}: {notices:?}"
+        );
+    }
+}

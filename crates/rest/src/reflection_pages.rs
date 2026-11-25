@@ -1,6 +1,6 @@
 //! A Reflection page's life beside its text (design 2.1 to 2.4 and 3.2): its
-//! settings, its retirement and its clock, and the pages a reflect run
-//! missed. Every verb is the engine's; this module builds the caller and
+//! settings, its retirement, its not-fresh mark and its clock, and the pages
+//! a reflect run missed. Every verb is the engine's; this module builds the caller and
 //! gives the answers a typed shape, so Fluid draws them from generated
 //! types.
 //!
@@ -17,7 +17,7 @@ use utoipa::{IntoParams, ToSchema};
 use super::auth::Identity;
 use super::reflections::{ANONYMOUS_EDIT, caller, reflection_error, refuse_anonymous};
 use super::{ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, refuse_read_only};
-use crate::params::{PageSettingsChange, WriteReflectionParams};
+use crate::params::{MarkPages, MarkStale, PageSettingsChange, WriteReflectionParams};
 
 /// A page as another page names it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -59,7 +59,8 @@ pub struct ReflectionPageFinding {
     /// The page it is about: this page, or a page up its chain.
     #[schema(example = "notes.md")]
     pub page: String,
-    /// `freshness`, `follows`, `owner` or `folder parent`.
+    /// `freshness`, `follows`, `owner`, `folder parent` or
+    /// `refresh_requested`.
     #[schema(example = "freshness")]
     pub key: String,
     /// The value as written.
@@ -83,6 +84,22 @@ pub struct ReflectionRetirement {
     /// The page that owned it then; a restore can put it back under that
     /// page.
     pub was_owned_by: Option<ReflectionPageRef>,
+}
+
+/// A page's not-fresh mark: a person asked that the next reflect run
+/// reconciles the page in full.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReflectionRefreshRequested {
+    /// When the page was marked, RFC 3339 in UTC with milliseconds.
+    #[schema(example = "2026-11-25T14:03:07.412Z")]
+    pub at: String,
+    /// Who marked it, by login; null when the page record does not say.
+    #[schema(example = "ada")]
+    pub by: Option<String>,
+    /// The display name of `by`, when the account has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Ada Lovelace")]
+    pub by_display: Option<String>,
 }
 
 /// What a page says about itself beside its text: the `page` member of
@@ -122,6 +139,11 @@ pub struct ReflectionPageView {
     pub pact: ReflectionPactFile,
     /// What did not read, on this page or up its chain.
     pub findings: Vec<ReflectionPageFinding>,
+    /// Set while the page is marked not fresh: the next reflect run
+    /// reconciles it in full and takes the mark off. Always null on a
+    /// retired page.
+    #[serde(default)]
+    pub refresh_requested: Option<ReflectionRefreshRequested>,
 }
 
 /// What `PATCH /domains/{domain}/reflection/settings` takes.
@@ -508,10 +530,17 @@ pub struct ReflectionClockResponse {
     /// page and a missing one.
     pub clock: Option<ReflectionPageClock>,
     /// The checksum of the page file as stored, the same as a read's
-    /// `checksum`; null for a missing page. A reconcile writes no file, so
-    /// a client that heard a change compares this with the text it holds
-    /// and reads the page again only when they differ.
+    /// `checksum`; null for a missing page. A reconcile writes no file
+    /// (unless it takes a not-fresh mark off), so a client that heard a
+    /// change compares this with the text it holds and reads the page again
+    /// only when they differ.
     pub checksum: Option<String>,
+    /// The page's not-fresh mark, the same as the page view's
+    /// `refresh_requested`; null while the page is not marked, and for a
+    /// retired, missing or pact file. Beside `clock`, which is null for a
+    /// page without a freshness.
+    #[serde(default)]
+    pub refresh_requested: Option<ReflectionRefreshRequested>,
 }
 
 /// The query of `GET /domains/{domain}/reflection/clock`.
@@ -572,7 +601,154 @@ pub async fn clock(
         .reflection_page_checksum(&domain, &q.path, &caller(&identity))
         .await
         .map_err(reflection_error)?;
-    Ok(Json(ReflectionClockResponse { clock, checksum }))
+    let mark = state
+        .engine
+        .reflection_page_mark(&domain, &q.path, &caller(&identity))
+        .await
+        .map_err(reflection_error)?;
+    let mut held = serde_json::json!({ "refresh_requested": mark });
+    super::display_names::enrich_reflection(&state.auth, &mut held).await;
+    let refresh_requested = match held["refresh_requested"].take() {
+        Value::Null => None,
+        mark => Some(typed_value(mark, "page mark")?),
+    };
+    Ok(Json(ReflectionClockResponse {
+        clock,
+        checksum,
+        refresh_requested,
+    }))
+}
+
+/// What `POST /domains/{domain}/reflection/mark-stale` takes: exactly one
+/// of `path`, `pages` and `all`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MarkStaleBody {
+    /// One page, by its path inside reflections/.
+    #[serde(default)]
+    #[schema(example = "arch/overview.md")]
+    pub path: Option<String>,
+    /// Several pages, by their paths inside reflections/; not empty.
+    #[serde(default)]
+    pub pages: Option<Vec<String>>,
+    /// Every page of the Reflection that is not retired.
+    #[serde(default)]
+    pub all: bool,
+    /// Mark only the named pages, not the pages they own.
+    #[serde(default)]
+    pub only_page: bool,
+}
+
+/// What a mark answers.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MarkedStale {
+    /// The domain.
+    #[schema(example = "eng")]
+    pub domain: String,
+    /// The newest time this call marked a page with, RFC 3339 in UTC with
+    /// milliseconds. Every page gets the call's time, except a page whose
+    /// mark (another call's) landed meanwhile: it gets a time just after
+    /// that mark, so a mark never moves backwards.
+    #[schema(example = "2026-11-25T14:03:07.412Z")]
+    pub at: String,
+    /// Who marked them, by login.
+    #[schema(example = "ada")]
+    pub by: String,
+    /// The pages marked, in order: each named page, then the pages it owns.
+    #[schema(example = json!(["arch/overview.md", "arch/overview/db.md"]))]
+    pub pages: Vec<String>,
+    /// The pages left out because they went missing or were retired while
+    /// the call ran; empty when none were.
+    #[schema(example = json!([]))]
+    pub skipped: Vec<String>,
+    /// Whether only the named pages were marked.
+    pub only_page: bool,
+}
+
+/// `POST /domains/{domain}/reflection/mark-stale`
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/reflection/mark-stale",
+    tag = "reflection",
+    operation_id = "mark_reflection_stale",
+    summary = "Mark pages not fresh: the next reflect run reconciles them.",
+    description = "Needs `edit`. The body names one page (`path`), several \
+                   (`pages`) or every page that is not retired (`all: \
+                   true`). The pages each named page owns are marked too, \
+                   unless `only_page` is true. Retired pages and pact files \
+                   are refused. The next reflect run reconciles every marked \
+                   page in full, without the `changed_engrams` 0 shortcut, \
+                   and takes the mark off. Until then the page view and the \
+                   clock answer show the mark (`refresh_requested`). Mark \
+                   after the engrams the pages should show are written.",
+    params(("domain" = String, Path, description = "The domain.")),
+    request_body = MarkStaleBody,
+    responses(
+        (status = 200, description = "Marked.", body = MarkedStale),
+        (
+            status = 401,
+            description = "The anonymous viewer of a domain it reads.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "Below edit access, the domain is off the caller's \
+                           write list, the domain or this instance is \
+                           read-only, or the session is unattended.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or page, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The Reflection is not here.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "A pact file, a retired page, no page named, or more \
+                           than one of `path`, `pages` and `all`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn mark_stale(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<MarkStaleBody>,
+) -> Result<Json<MarkedStale>, ApiError> {
+    refuse_anonymous(&state, &identity, &domain, ANONYMOUS_EDIT).await?;
+    refuse_read_only(&state)?;
+    let pages = match (body.path, body.pages, body.all) {
+        (Some(path), None, false) => MarkPages::One(path),
+        (None, Some(pages), false) => MarkPages::Many(pages),
+        (None, None, true) => MarkPages::All,
+        (None, None, false) => MarkPages::Many(Vec::new()),
+        _ => {
+            return Err(reflection_error(crate::engine::EngineError::Invalid(
+                "name the pages to mark with one of path, pages or all: true, not more than one"
+                    .into(),
+            )));
+        }
+    };
+    let mark = MarkStale {
+        pages,
+        only_page: body.only_page,
+    };
+    let answer = state
+        .engine
+        .mark_reflection_stale(&domain, &mark, &caller(&identity))
+        .await
+        .map_err(reflection_error)?;
+    typed(answer, "mark receipt")
 }
 
 /// A page a reflect run missed.

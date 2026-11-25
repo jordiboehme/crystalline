@@ -36,7 +36,8 @@ fn finding(f: &r::PageFinding) -> Value {
 impl Engine {
     /// The `page` member of a read of the page at `inner` of the Reflection
     /// `domain_id`, whose stored text is `text`: `{freshness, follows,
-    /// status, owner, retired, chain, pacts, pact, findings}`.
+    /// status, owner, retired, chain, pacts, pact, findings,
+    /// refresh_requested}`.
     ///
     /// - `freshness`: as written when it reads (an hour or more, not on an
     ///   owned page), else null and named in `findings`.
@@ -52,6 +53,8 @@ impl Engine {
     /// - `pact`: `{path, exists}` of its own page pact.
     /// - `findings`: `{page, key, value, reason}` for what did not read, on
     ///   this page or on a page up its chain.
+    /// - `refresh_requested`: `{at, by}` while the page is marked not fresh
+    ///   ([`super::mark_stale`]), else null; always null on a retired page.
     pub(super) async fn page_view(
         &self,
         domain_id: DomainId,
@@ -126,6 +129,7 @@ impl Engine {
             "pacts": chain.pacts,
             "pact": { "path": own_pact, "exists": pact_files.contains(&own_pact) },
             "findings": findings.iter().map(finding).collect::<Vec<_>>(),
+            "refresh_requested": super::mark_stale::text_mark(text, inner).map(|mark| mark.to_json()),
         }))
     }
 }

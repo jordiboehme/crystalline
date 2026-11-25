@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_core::config::{DomainEntry, GlobalConfig, Provision};
 use crystalline_index::TursoStore;
 use crystalline_service::engine::ProvisionAction;
 use crystalline_service::rest::{AuthStore, Role};
@@ -167,7 +167,10 @@ async fn allow_persists_the_decision_into_the_config_file_and_returns_a_report()
     // The decision landed on the config file this engine owns, byte for
     // byte readable back off disk - not just the in-memory config.
     let saved: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-    assert_eq!(saved.domains["harbor"].provision, Some(true));
+    assert_eq!(
+        saved.domains["harbor"].provision,
+        Some(crystalline_core::config::Provision::all())
+    );
 
     // A report comes back naming the one harness this machine onboarded and
     // what it did.
@@ -406,7 +409,7 @@ async fn an_apply_report_names_no_domain_the_caller_may_not_see() {
         cfg.domains.insert(
             name.to_string(),
             DomainEntry {
-                provision: Some(true),
+                provision: Some(crystalline_core::config::Provision::all()),
                 ..DomainEntry::virtual_domain()
             },
         );
@@ -665,4 +668,737 @@ async fn a_hidden_env_domain_is_refused_like_an_unknown_name() {
 
     assert!(!config_path.exists());
     restore_env(previous);
+}
+
+// --- take and skip -------------------------------------------------------
+
+/// A scratch `HOME` and `XDG_STATE_HOME` under one temp directory, with
+/// claude-code onboarded and harbor (plus an optional skill) written at
+/// `kb-harbor`. The caller holds [`HOME_LOCK`] and calls
+/// [`Sandbox::finish`] before it returns.
+struct Sandbox {
+    work: tempfile::TempDir,
+    home: std::path::PathBuf,
+    harbor_dir: std::path::PathBuf,
+    config_path: std::path::PathBuf,
+    previous: (Option<OsString>, Option<OsString>),
+}
+
+impl Sandbox {
+    fn new() -> Sandbox {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let xdg_state_home = work.path().join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg_state_home).unwrap();
+        let previous = set_env(&home, &xdg_state_home);
+        let harbor_dir = work.path().join("kb-harbor");
+        write_harbor(&harbor_dir);
+        write_optional_skill(&harbor_dir);
+        write_install_receipt(&xdg_state_home);
+        let config_path = work.path().join("config.yaml");
+        Sandbox {
+            work,
+            home,
+            harbor_dir,
+            config_path,
+            previous,
+        }
+    }
+
+    fn installed(&self, rel: &str) -> bool {
+        self.home.join(".claude").join(rel).exists()
+    }
+
+    fn saved_decision(&self) -> Option<Provision> {
+        let saved: GlobalConfig = crystalline_core::config::load_yaml(&self.config_path).unwrap();
+        saved.domains["harbor"].provision.clone()
+    }
+
+    fn finish(self) {
+        restore_env(self.previous);
+    }
+}
+
+/// A second harbor skill the author marked optional.
+fn write_optional_skill(dir: &Path) {
+    write(
+        dir,
+        "skills/storm-charts/SKILL.md",
+        "---\nname: storm-charts\nmetadata:\n  provision: optional\n---\n\nReads storm charts.\n",
+    );
+}
+
+fn take(domain: &str, names: &[&str]) -> ProvisionAction {
+    ProvisionAction::Take {
+        domain: domain.to_string(),
+        artifacts: strings(names),
+    }
+}
+
+fn skip(domain: &str, names: &[&str]) -> ProvisionAction {
+    ProvisionAction::Skip {
+        domain: domain.to_string(),
+        artifacts: strings(names),
+    }
+}
+
+fn allow(domain: &str) -> ProvisionAction {
+    ProvisionAction::Allow {
+        domain: domain.to_string(),
+    }
+}
+
+fn deny(domain: &str) -> ProvisionAction {
+    ProvisionAction::Deny {
+        domain: domain.to_string(),
+    }
+}
+
+fn strings(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| n.to_string()).collect()
+}
+
+/// The text of every notice in a report.
+fn notices(report: &serde_json::Value) -> Vec<String> {
+    report["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Whether a report carries the notice that older versions cannot read the
+/// decision.
+fn has_older_versions_notice(report: &serde_json::Value) -> bool {
+    notices(report)
+        .iter()
+        .any(|n| n.starts_with("Older Crystalline versions cannot read"))
+}
+
+#[tokio::test]
+async fn skip_persists_an_except_list_and_reconciles() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let engine = engine_at(
+        &sandbox.config_path,
+        config_with_harbor(&sandbox.harbor_dir),
+        false,
+    )
+    .await;
+
+    let data = engine
+        .provision(
+            &skip("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    // Skip on a domain with no decision yet installs everything else.
+    assert_eq!(
+        sandbox.saved_decision(),
+        Some(Provision::All {
+            except: strings(&["skills/tide-tables"]),
+            also: Vec::new(),
+        })
+    );
+    assert_eq!(
+        data["decided"],
+        serde_json::json!({
+            "domain": "harbor",
+            "decision": "allowed",
+            "selection": { "except": ["skills/tide-tables"], "also": [] },
+        }),
+        "{data}"
+    );
+    assert!(!sandbox.installed("skills/tide-tables"), "{data}");
+    assert!(sandbox.installed("commands/charts/plot-route.md"));
+    assert!(sandbox.installed("agents/quartermaster.md"));
+    // The optional skill was not taken, so it stays out.
+    assert!(!sandbox.installed("skills/storm-charts"));
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn take_on_an_undecided_domain_persists_only_and_reconciles() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let engine = engine_at(
+        &sandbox.config_path,
+        config_with_harbor(&sandbox.harbor_dir),
+        false,
+    )
+    .await;
+
+    let data = engine
+        .provision(
+            &take(
+                "harbor",
+                &["commands/charts/plot-route", "skills/storm-charts"],
+            ),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sandbox.saved_decision(),
+        Some(Provision::Only(strings(&[
+            "commands/charts/plot-route",
+            "skills/storm-charts"
+        ])))
+    );
+    assert_eq!(
+        data["decided"],
+        serde_json::json!({
+            "domain": "harbor",
+            "decision": "only",
+            "selection": { "only": ["commands/charts/plot-route", "skills/storm-charts"] },
+        }),
+        "{data}"
+    );
+    assert!(sandbox.installed("commands/charts/plot-route.md"), "{data}");
+    assert!(sandbox.installed("skills/storm-charts/SKILL.md"), "{data}");
+    assert!(!sandbox.installed("skills/tide-tables"));
+    assert!(!sandbox.installed("agents/quartermaster.md"));
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn allow_after_a_pick_writes_plain_true() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let engine = engine_at(
+        &sandbox.config_path,
+        config_with_harbor(&sandbox.harbor_dir),
+        false,
+    )
+    .await;
+
+    engine
+        .provision(
+            &skip("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(!sandbox.installed("skills/tide-tables"));
+
+    let data = engine
+        .provision(&allow("harbor"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(sandbox.saved_decision(), Some(Provision::all()));
+    let yaml = std::fs::read_to_string(&sandbox.config_path).unwrap();
+    assert!(yaml.contains("provision: true"), "{yaml}");
+    assert_eq!(
+        data["decided"],
+        serde_json::json!({ "domain": "harbor", "decision": "allowed", "selection": null }),
+        "{data}"
+    );
+    assert!(!has_older_versions_notice(&data), "{data}");
+    assert!(sandbox.installed("skills/tide-tables/SKILL.md"));
+    sandbox.finish();
+}
+
+/// `allow` clears `except` and `only` but keeps the optional artifacts that
+/// were taken, so a pick never silently retires one.
+#[tokio::test]
+async fn allow_after_a_pick_keeps_taken_optional_artifacts() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let engine = engine_at(
+        &sandbox.config_path,
+        config_with_harbor(&sandbox.harbor_dir),
+        false,
+    )
+    .await;
+
+    // `{except: [skills/tide-tables], also: [skills/storm-charts]}`.
+    engine
+        .provision(
+            &skip("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    engine
+        .provision(
+            &take("harbor", &["skills/storm-charts"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox.saved_decision(),
+        Some(Provision::All {
+            except: strings(&["skills/tide-tables"]),
+            also: strings(&["skills/storm-charts"]),
+        })
+    );
+    assert!(sandbox.installed("skills/storm-charts/SKILL.md"));
+
+    let data = engine
+        .provision(&allow("harbor"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox.saved_decision(),
+        Some(Provision::All {
+            except: Vec::new(),
+            also: strings(&["skills/storm-charts"]),
+        })
+    );
+    assert_eq!(
+        data["decided"]["selection"],
+        serde_json::json!({ "except": [], "also": ["skills/storm-charts"] }),
+        "{data}"
+    );
+    assert!(has_older_versions_notice(&data), "{data}");
+    assert!(sandbox.installed("skills/storm-charts/SKILL.md"), "{data}");
+    assert!(sandbox.installed("skills/tide-tables/SKILL.md"), "{data}");
+
+    // From `only`, allow keeps the taken names that are optional.
+    engine
+        .provision(&deny("harbor"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    engine
+        .provision(
+            &take("harbor", &["agents/quartermaster", "skills/storm-charts"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    engine
+        .provision(&allow("harbor"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox.saved_decision(),
+        Some(Provision::All {
+            except: Vec::new(),
+            also: strings(&["skills/storm-charts"]),
+        })
+    );
+    assert!(sandbox.installed("skills/storm-charts/SKILL.md"));
+    assert!(sandbox.installed("commands/charts/plot-route.md"));
+
+    // With no optional artifact taken, allow writes plain `true`.
+    engine
+        .provision(
+            &skip("harbor", &["skills/storm-charts"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let data = engine
+        .provision(&allow("harbor"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(sandbox.saved_decision(), Some(Provision::all()));
+    assert!(!has_older_versions_notice(&data), "{data}");
+    assert!(!sandbox.installed("skills/storm-charts"));
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn skip_with_an_unknown_name_refuses_and_writes_nothing() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let engine = engine_at(
+        &sandbox.config_path,
+        config_with_harbor(&sandbox.harbor_dir),
+        false,
+    )
+    .await;
+
+    // One unknown name refuses the whole call, the good name included.
+    let err = engine
+        .provision(
+            &skip("harbor", &["skills/tide-tables", "skills/fog-horns"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    let message = err.to_string();
+    assert!(
+        message.contains("does not ship `skills/fog-horns`"),
+        "{message}"
+    );
+    assert!(message.contains("`skills/tide-tables`"), "{message}");
+
+    // A malformed name is refused too.
+    let err = engine
+        .provision(&take("harbor", &["skills"]), &Scope::Unrestricted)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    assert!(err.to_string().contains("is not an artifact name"), "{err}");
+
+    assert!(!sandbox.config_path.exists());
+    assert!(!sandbox.home.join(".claude").exists());
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn read_only_refuses_take_and_skip_but_answers_status() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let engine = engine_at(
+        &sandbox.config_path,
+        config_with_harbor(&sandbox.harbor_dir),
+        true,
+    )
+    .await;
+
+    for action in [
+        take("harbor", &["skills/tide-tables"]),
+        skip("harbor", &["skills/tide-tables"]),
+    ] {
+        let err = engine
+            .provision(&action, &Scope::Unrestricted)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReadOnly), "{err}");
+    }
+    assert!(!sandbox.config_path.exists());
+    assert!(!sandbox.home.join(".claude").exists());
+
+    let data = engine
+        .provision(&ProvisionAction::Status, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let harbor = &data["domains"][0];
+    assert_eq!(harbor["decision"], "undecided", "{data}");
+    assert_eq!(harbor["selection"], serde_json::Value::Null, "{data}");
+    let artifacts = harbor["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 4, "{data}");
+    assert!(artifacts.iter().all(|a| a["on"] == false), "{data}");
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn take_and_skip_on_an_env_defined_or_virtual_domain_are_refused() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let overlay = EnvOverlay::from_vars(vec![
+        (
+            "CRYSTALLINE_DOMAIN_HARBOR".to_string(),
+            sandbox.harbor_dir.display().to_string(),
+        ),
+        (
+            "CRYSTALLINE_DOMAIN_COVE".to_string(),
+            sandbox.work.path().join("kb-cove").display().to_string(),
+        ),
+    ])
+    .unwrap();
+    let mut cfg = config_with_harbor(&sandbox.harbor_dir);
+    cfg.domains
+        .insert("notes".to_string(), DomainEntry::virtual_domain());
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Engine::new(
+        Arc::new(TokioMutex::new(store)),
+        cfg,
+        None,
+        Some(sandbox.config_path.clone()),
+    )
+    .with_env_overlay(overlay);
+
+    for domain in ["harbor", "cove", "notes"] {
+        let allowed = engine
+            .provision(&allow(domain), &Scope::Unrestricted)
+            .await
+            .unwrap_err()
+            .to_string();
+        for action in [
+            take(domain, &["skills/tide-tables"]),
+            skip(domain, &["skills/tide-tables"]),
+        ] {
+            let err = engine
+                .provision(&action, &Scope::Unrestricted)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, allowed, "{domain}: the same refusal as allow");
+        }
+        let expected = match domain {
+            "harbor" => "CRYSTALLINE_DOMAIN_HARBOR",
+            "cove" => "CRYSTALLINE_DOMAIN_COVE",
+            _ => "virtual",
+        };
+        assert!(allowed.contains(expected), "{allowed}");
+    }
+
+    assert!(!sandbox.config_path.exists());
+    sandbox.finish();
+}
+
+/// A private domain is refused like a name nobody registered, before its
+/// listing is read, so the refusal never says what the domain ships.
+#[tokio::test]
+async fn a_hidden_domain_take_is_refused_like_an_unknown_name() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let vault_dir = sandbox.work.path().join("kb-vault");
+    write_harbor(&vault_dir);
+    let mut cfg = config_with_harbor(&sandbox.harbor_dir);
+    cfg.domains
+        .insert("vault".to_string(), DomainEntry::file(&vault_dir));
+    let engine = engine_at(&sandbox.config_path, cfg, false).await;
+
+    let auth = Arc::new(
+        AuthStore::open(&sandbox.work.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("keeper", "keeper", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    auth.set_domain_visibility("vault", true, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+    assert_eq!(
+        engine.hidden_domains(&Scope::Anonymous).await.unwrap(),
+        Some(std::collections::HashSet::from(["vault".to_string()])),
+    );
+
+    // A name the hidden domain does not ship: were the domain listed, the
+    // refusal would name what it ships.
+    let actions: [fn(&str) -> ProvisionAction; 2] = [
+        |d| take(d, &["skills/fog-horns"]),
+        |d| skip(d, &["skills/fog-horns"]),
+    ];
+    for action in actions {
+        let hidden = engine
+            .provision(&action("vault"), &Scope::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(hidden, EngineError::UnknownDomain { .. }),
+            "{hidden}"
+        );
+        let unknown = engine
+            .provision(&action("typo"), &Scope::Anonymous)
+            .await
+            .unwrap_err();
+        let hidden = hidden.to_string();
+        assert!(!hidden.contains("tide-tables"), "{hidden}");
+        assert_eq!(
+            hidden.replace("'vault'", "'NAME'"),
+            unknown.to_string().replace("'typo'", "'NAME'"),
+            "a hidden name and a typo read back the same bytes"
+        );
+    }
+
+    assert!(!sandbox.config_path.exists());
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn status_json_carries_selection_artifacts_stale_and_malformed() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let mut cfg = config_with_harbor(&sandbox.harbor_dir);
+    cfg.domains.get_mut("harbor").unwrap().provision = Some(Provision::All {
+        except: strings(&["skills", "skills/old-charts", "skills/tide-tables"]),
+        also: strings(&["skills/storm-charts"]),
+    });
+    cfg.domains
+        .insert("notes".to_string(), DomainEntry::virtual_domain());
+    let engine = engine_at(&sandbox.config_path, cfg, false).await;
+
+    let data = engine
+        .provision(&ProvisionAction::Status, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let domains = data["domains"].as_array().unwrap();
+    let harbor = domains.iter().find(|d| d["domain"] == "harbor").unwrap();
+    assert_eq!(harbor["decision"], "allowed", "{data}");
+    assert_eq!(
+        harbor["selection"],
+        serde_json::json!({
+            "except": ["skills", "skills/old-charts", "skills/tide-tables"],
+            "also": ["skills/storm-charts"],
+        }),
+        "{data}"
+    );
+    let row = |key: &str| {
+        harbor["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["key"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("no row for {key}: {data}"))
+    };
+    assert_eq!(
+        row("skills/storm-charts"),
+        serde_json::json!({
+            "key": "skills/storm-charts",
+            "kind": "skills",
+            "name": "storm-charts",
+            "optional": true,
+            "on": true,
+        })
+    );
+    assert_eq!(row("skills/tide-tables")["on"], false);
+    assert_eq!(row("skills/tide-tables")["optional"], false);
+    assert_eq!(
+        row("commands/charts/plot-route")["name"],
+        "charts/plot-route"
+    );
+    assert_eq!(row("commands/charts/plot-route")["kind"], "commands");
+    assert_eq!(row("agents/quartermaster")["on"], true);
+    assert_eq!(harbor["artifacts"].as_array().unwrap().len(), 4, "{data}");
+    assert_eq!(harbor["stale"], serde_json::json!(["skills/old-charts"]));
+    assert_eq!(harbor["malformed"], serde_json::json!(["skills"]));
+    // The keys that were there before are unchanged.
+    assert_eq!(harbor["declares"], true);
+    assert_eq!(harbor["parse_problems"], 0);
+    assert_eq!(harbor["counts"]["skills"], 2, "{data}");
+
+    // A virtual domain keeps empty lists and no selection.
+    let notes = domains.iter().find(|d| d["domain"] == "notes").unwrap();
+    assert_eq!(notes["selection"], serde_json::Value::Null);
+    assert_eq!(notes["artifacts"], serde_json::json!([]));
+    assert_eq!(notes["stale"], serde_json::json!([]));
+    assert_eq!(notes["malformed"], serde_json::json!([]));
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn skip_and_take_add_the_older_versions_notice_only_for_a_map() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let engine = engine_at(
+        &sandbox.config_path,
+        config_with_harbor(&sandbox.harbor_dir),
+        false,
+    )
+    .await;
+
+    // A map: one notice, naming the domain between backticks so the
+    // hidden-domain filter can find it.
+    let data = engine
+        .provision(
+            &skip("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let older: Vec<String> = notices(&data)
+        .into_iter()
+        .filter(|n| n.starts_with("Older Crystalline versions"))
+        .collect();
+    assert_eq!(older.len(), 1, "{data}");
+    assert!(older[0].contains("`harbor`"), "{}", older[0]);
+    assert!(older[0].contains("`config.yaml`"), "{}", older[0]);
+
+    // Taking the name back normalizes to plain `true`: no notice.
+    let data = engine
+        .provision(
+            &take("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sandbox.saved_decision(), Some(Provision::all()));
+    assert!(!has_older_versions_notice(&data), "{data}");
+
+    // A name that changes nothing gets a note naming the domain.
+    let data = engine
+        .provision(
+            &take("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        notices(&data).contains(&"`skills/tide-tables` is already on in `harbor`.".to_string()),
+        "{data}"
+    );
+    assert!(!has_older_versions_notice(&data), "{data}");
+
+    // Deny then take: `only` is a map again.
+    engine
+        .provision(&deny("harbor"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let data = engine
+        .provision(
+            &take("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(has_older_versions_notice(&data), "{data}");
+
+    // Skipping the last name of `only` normalizes to plain `false`.
+    let data = engine
+        .provision(
+            &skip("harbor", &["skills/tide-tables"]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sandbox.saved_decision(), Some(Provision::Deny));
+    assert!(!has_older_versions_notice(&data), "{data}");
+    assert_eq!(data["decided"]["decision"], "denied", "{data}");
+    sandbox.finish();
+}
+
+/// The daemon path and the static fallback write a pick through one seam,
+/// so the same steps on the same config give the same bytes on disk.
+#[tokio::test]
+async fn the_daemon_and_the_fallback_write_the_same_pick() {
+    let _guard = HOME_LOCK.lock().await;
+    let sandbox = Sandbox::new();
+    let daemon_path = sandbox.config_path.clone();
+    let fallback_path = sandbox.work.path().join("fallback.yaml");
+    let cfg = config_with_harbor(&sandbox.harbor_dir);
+    crystalline_core::config::save_yaml(&daemon_path, &cfg).unwrap();
+    crystalline_core::config::save_yaml(&fallback_path, &cfg).unwrap();
+    let engine = engine_at(&daemon_path, cfg, false).await;
+
+    let steps: [(&str, &[&str]); 3] = [
+        ("skip", &["skills/tide-tables"]),
+        ("take", &["skills/storm-charts"]),
+        ("skip", &["agents/quartermaster"]),
+    ];
+    for (action, names) in steps {
+        let engine_action = if action == "skip" {
+            skip("harbor", names)
+        } else {
+            take("harbor", names)
+        };
+        let daemon = engine
+            .provision(&engine_action, &Scope::Unrestricted)
+            .await
+            .unwrap();
+        let fallback = crystalline_service::client::provision(
+            action,
+            Some("harbor"),
+            &strings(names),
+            Some(&fallback_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(daemon["decided"], fallback["decided"], "{action} {names:?}");
+        assert_eq!(
+            has_older_versions_notice(&daemon),
+            has_older_versions_notice(&fallback)
+        );
+        let daemon_yaml = std::fs::read(&daemon_path).unwrap();
+        let fallback_yaml = std::fs::read(&fallback_path).unwrap();
+        assert_eq!(daemon_yaml, fallback_yaml, "after {action} {names:?}");
+    }
+    let yaml = std::fs::read_to_string(&daemon_path).unwrap();
+    assert!(yaml.contains("except:"), "{yaml}");
+    assert!(yaml.contains("also:"), "{yaml}");
+    sandbox.finish();
 }

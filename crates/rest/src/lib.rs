@@ -249,6 +249,7 @@ use crate::scope::{DomainAccess, DomainRight};
         reflection_pages::settings,
         reflection_pages::retire,
         reflection_pages::restore,
+        reflection_pages::mark_stale,
         reflection_pages::clock,
         reflection_pages::missed,
         events::stream_events,
@@ -326,6 +327,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::ManifestSections,
         domains::RoutingSource,
         domains::ProvisioningView,
+        domains::ProvisioningArtifactView,
         domains::ProvisioningDeclView,
         domains::ManifestProblem,
         domains::TagAliasesView,
@@ -478,6 +480,7 @@ use crate::scope::{DomainAccess, DomainRight};
         reflection_pages::ReflectionPactFile,
         reflection_pages::ReflectionPageFinding,
         reflection_pages::ReflectionRetirement,
+        reflection_pages::ReflectionRefreshRequested,
         reflection_pages::ReflectionPageView,
         reflections::ReflectionDoc,
         reflection_pages::ReflectionSettingsBody,
@@ -486,6 +489,8 @@ use crate::scope::{DomainAccess, DomainRight};
         reflection_pages::RetiredReflection,
         reflection_pages::RestoreReflectionBody,
         reflection_pages::RestoredReflection,
+        reflection_pages::MarkStaleBody,
+        reflection_pages::MarkedStale,
         reflection_pages::ReflectionPartOf,
         reflection_pages::ReflectionPageClock,
         reflection_pages::ReflectionClockResponse,
@@ -1250,6 +1255,10 @@ fn routes(state: RestState) -> Router {
         .route(
             "/domains/{domain}/reflection/restore",
             post(reflection_pages::restore),
+        )
+        .route(
+            "/domains/{domain}/reflection/mark-stale",
+            post(reflection_pages::mark_stale),
         )
         .route(
             "/domains/{domain}/reflection/clock",

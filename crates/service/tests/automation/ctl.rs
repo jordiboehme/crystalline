@@ -343,3 +343,66 @@ async fn automation_prompt_picks_the_skills_line_from_the_setting_and_the_reques
         }
     }
 }
+
+/// `reflect_mark_stale` on the control socket runs as the machine owner:
+/// one page, every page, the owned pages unless `only_page`, and the
+/// engine's sentences for nothing named and for a bad request.
+#[tokio::test]
+async fn reflect_mark_stale_marks_as_the_machine_owner() {
+    let fx = fixture(&[("MANIFEST.md", &manifest("reflection: on\n"))]).await;
+    let owner = crystalline_service::ReflectionCaller::owner();
+    for path in ["a.md", "b.md"] {
+        fx.engine
+            .write_reflection(
+                &crystalline_service::params::WriteReflectionParams {
+                    domain: "eng".into(),
+                    path: path.into(),
+                    markdown: Some("# A\n\n## One\n\nText.\n".into()),
+                    ..Default::default()
+                },
+                &owner,
+            )
+            .await
+            .unwrap();
+    }
+    let one = ask(
+        &fx,
+        "reflect_mark_stale",
+        json!({ "domain": "eng", "pages": ["a.md"], "only_page": true }),
+    )
+    .await;
+    assert_eq!(one["ok"], true, "{one}");
+    assert_eq!(one["data"]["pages"], json!(["a.md"]), "{one}");
+    assert_eq!(one["data"]["by"], owner.author.name.as_str());
+    assert_eq!(one["data"]["only_page"], true);
+    let all = ask(
+        &fx,
+        "reflect_mark_stale",
+        json!({ "domain": "eng", "all": true }),
+    )
+    .await;
+    assert_eq!(all["data"]["pages"], json!(["a.md", "b.md"]), "{all}");
+    let none = ask(&fx, "reflect_mark_stale", json!({ "domain": "eng" })).await;
+    assert_eq!(none["ok"], false, "{none}");
+    assert!(
+        none["error"]
+            .as_str()
+            .unwrap()
+            .contains("name the pages to mark"),
+        "{none}"
+    );
+    let both = ask(
+        &fx,
+        "reflect_mark_stale",
+        json!({ "domain": "eng", "all": true, "pages": ["a.md"] }),
+    )
+    .await;
+    assert_eq!(both["ok"], false, "{both}");
+    let gone = ask(
+        &fx,
+        "reflect_mark_stale",
+        json!({ "domain": "eng", "pages": ["gone.md"] }),
+    )
+    .await;
+    assert_eq!(gone["ok"], false, "{gone}");
+}

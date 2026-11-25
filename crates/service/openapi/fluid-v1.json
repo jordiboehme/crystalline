@@ -1570,7 +1570,7 @@
                       "name": "eng",
                       "name_origin": "derived",
                       "observations": 12,
-                      "path": "/Users/ada/Documents/Crystalline/eng",
+                      "path": "/Users/ada/.crystalline/eng",
                       "private": false,
                       "relations": 3,
                       "rename_pending": null,
@@ -1637,7 +1637,7 @@
                   "domain": "notes",
                   "kind": "file",
                   "manifest_created": true,
-                  "root": "/Users/ada/Documents/Crystalline/notes"
+                  "root": "/Users/ada/.crystalline/notes"
                 }
               }
             }
@@ -2292,7 +2292,7 @@
           "domains"
         ],
         "summary": "Discard chosen unshared changes.",
-        "description": "An editor or an admin with write access to the domain. Each named path is put back the way the team has it: a modification gets the team's copy back, an addition is deleted, a deletion is restored, and in a domain that reviews changes the caller's own draft of the path is cleared. The index is updated at once. Always 200 once the body parses: refusals are per path, under `refused` with a reason - `changed_since` (the file moved since the digest was read), `not_a_change`, `no_base_copy` (an open proposal below the top layer holds the earlier content; withdraw that layer), `unknown_path`, `open_in_editor` (a draft somebody has open). Never contacts GitHub; refused on a read-only instance.",
+        "description": "An editor or an admin with write access to the domain. Each named path is put back the way the team has it: a modification gets the team's copy back, an addition is deleted, a deletion is restored, and in a domain that reviews changes the caller's own draft of the path is cleared. A file an open proposal already carries goes back to the proposal's content, not the older team copy. The index is updated at once. Always 200 once the body parses: refusals are per path, under `refused` with a reason - `changed_since` (the file moved since the digest was read), `not_a_change`, `no_base_copy` (the content it goes back to is not at hand; `detail` says why: `no_blob_recorded`, `not_fetched`, `fetch_failed` or `digest_mismatch`), `share_pending` (the last share into the proposal that carries the file did not finish, so what it carries is not known here; `proposal` names it, and a share into it finishes it), `unknown_path`, `open_in_editor` (a draft somebody has open). Works offline; it reads a file from GitHub only to restore a proposal shared by an older version, and never writes there. Refused on a read-only instance.",
         "operationId": "discard_domain_changes",
         "parameters": [
           {
@@ -4776,7 +4776,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.\n\nA domain with no MANIFEST yet answers 200 with `missing: true`, empty markdown and the checksum of the empty text; a `PUT` carrying that checksum creates it.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. When the provisioning folders list artifacts, a short hash of that listing follows after one more `-`, so a new artifact or a changed optional mark is never masked by a 304 either; the body's `checksum` stays the MANIFEST's own. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.\n\nA domain with no MANIFEST yet answers 200 with `missing: true`, empty markdown and the checksum of the empty text; a `PUT` carrying that checksum creates it.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -4791,7 +4791,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "The quoted tag of a version already held: the bare checksum, or `\"{checksum}-{version}\"`. A match against the CURRENT tag answers 304 with no body.",
+            "description": "The quoted tag of a version already held: the bare checksum, `\"{checksum}-{version}\"`, or that tag with the listing hash after one more `-`. A match against the CURRENT tag answers 304 with no body.",
             "required": false,
             "schema": {
               "type": [
@@ -4816,7 +4816,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as read, the token a later `PUT` carries in `If-Match`."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as read, followed by `-` and a short hash of the artifact listing when the provisioning folders list any; the token a later `PUT` carries in `If-Match`."
               }
             },
             "content": {
@@ -4949,7 +4949,7 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum or `\"{checksum}-{version}\"`, either way compared by checksum only.",
+            "description": "The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum, `\"{checksum}-{version}\"` or that tag with the listing hash, every form compared by checksum only.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4975,7 +4975,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as saved, the token the next save carries."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as saved, followed by `-` and a short hash of the artifact listing when there is one; the token the next save carries."
               }
             },
             "content": {
@@ -5181,7 +5181,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads, followed by `-` and a short hash of the artifact listing when there is one."
               }
             },
             "content": {
@@ -6605,6 +6605,99 @@
           },
           "422": {
             "description": "A bad path, or nobody here knows who reads which domain because the accounts store could not be read.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection/mark-stale": {
+      "post": {
+        "tags": [
+          "reflection"
+        ],
+        "summary": "Mark pages not fresh: the next reflect run reconciles them.",
+        "description": "Needs `edit`. The body names one page (`path`), several (`pages`) or every page that is not retired (`all: true`). The pages each named page owns are marked too, unless `only_page` is true. Retired pages and pact files are refused. The next reflect run reconciles every marked page in full, without the `changed_engrams` 0 shortcut, and takes the mark off. Until then the page view and the clock answer show the mark (`refresh_requested`). Mark after the engrams the pages should show are written.",
+        "operationId": "mark_reflection_stale",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkStaleBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Marked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarkedStale"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The anonymous viewer of a domain it reads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Below edit access, the domain is off the caller's write list, the domain or this instance is read-only, or the session is unattended.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or page, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Reflection is not here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A pact file, a retired page, no page named, or more than one of `path`, `pages` and `all`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -17670,6 +17763,90 @@
           }
         }
       },
+      "MarkStaleBody": {
+        "type": "object",
+        "description": "What `POST /domains/{domain}/reflection/mark-stale` takes: exactly one\nof `path`, `pages` and `all`.",
+        "properties": {
+          "all": {
+            "type": "boolean",
+            "description": "Every page of the Reflection that is not retired."
+          },
+          "only_page": {
+            "type": "boolean",
+            "description": "Mark only the named pages, not the pages they own."
+          },
+          "pages": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Several pages, by their paths inside reflections/; not empty."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One page, by its path inside reflections/.",
+            "example": "arch/overview.md"
+          }
+        }
+      },
+      "MarkedStale": {
+        "type": "object",
+        "description": "What a mark answers.",
+        "required": [
+          "domain",
+          "at",
+          "by",
+          "pages",
+          "skipped",
+          "only_page"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "The newest time this call marked a page with, RFC 3339 in UTC with\nmilliseconds. Every page gets the call's time, except a page whose\nmark (another call's) landed meanwhile: it gets a time just after\nthat mark, so a mark never moves backwards.",
+            "example": "2026-11-25T14:03:07.412Z"
+          },
+          "by": {
+            "type": "string",
+            "description": "Who marked them, by login.",
+            "example": "ada"
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain.",
+            "example": "eng"
+          },
+          "only_page": {
+            "type": "boolean",
+            "description": "Whether only the named pages were marked."
+          },
+          "pages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pages marked, in order: each named page, then the pages it owns.",
+            "example": [
+              "arch/overview.md",
+              "arch/overview/db.md"
+            ]
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pages left out because they went missing or were retired while\nthe call ran; empty when none were.",
+            "example": []
+          }
+        }
+      },
       "McpTokenInfo": {
         "type": "object",
         "description": "One row of an account's MCP token list, for a management UI or CLI. Never\ncarries the token itself - only the hash is stored, so there is nothing to\nshow back after issuance.",
@@ -18561,6 +18738,38 @@
           }
         }
       },
+      "ProvisioningArtifactView": {
+        "type": "object",
+        "description": "One artifact a domain ships.",
+        "required": [
+          "key",
+          "kind",
+          "name",
+          "optional"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The provisioning key, `<kind>/<name>`.",
+            "example": "skills/storm-warnings"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`skills`, `commands`, `agents` or `mcps`.",
+            "example": "skills"
+          },
+          "name": {
+            "type": "string",
+            "description": "The key without its `<kind>/` prefix.",
+            "example": "storm-warnings"
+          },
+          "optional": {
+            "type": "boolean",
+            "description": "True when the artifact is marked `metadata: { provision: optional }`.",
+            "example": false
+          }
+        }
+      },
       "ProvisioningDeclView": {
         "type": "object",
         "description": "One `kind: path` declaration.",
@@ -18586,9 +18795,17 @@
         "description": "The `Provisioning` section: what parsed, and what did not.",
         "required": [
           "decls",
-          "problems"
+          "problems",
+          "artifacts"
         ],
         "properties": {
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProvisioningArtifactView"
+            },
+            "description": "The artifacts the declared folders ship on the server's disk, by kind\nand key. No on or off: that is decided per machine, and the server's\nmachine is not the reader's. Filled by the handlers from the engine, so the\npure parse of the markdown leaves it empty."
+          },
           "decls": {
             "type": "array",
             "items": {
@@ -18820,13 +19037,24 @@
               "string",
               "null"
             ],
-            "description": "The checksum of the page file as stored, the same as a read's\n`checksum`; null for a missing page. A reconcile writes no file, so\na client that heard a change compares this with the text it holds\nand reads the page again only when they differ."
+            "description": "The checksum of the page file as stored, the same as a read's\n`checksum`; null for a missing page. A reconcile writes no file\n(unless it takes a not-fresh mark off), so a client that heard a\nchange compares this with the text it holds and reads the page again\nonly when they differ."
           },
           "clock": {
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ReflectionPageClock",
                 "description": "The clock; null for a page on its own with no freshness, a retired\npage and a missing one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "refresh_requested": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionRefreshRequested",
+                "description": "The page's not-fresh mark, the same as the page view's\n`refresh_requested`; null while the page is not marked, and for a\nretired, missing or pact file. Beside `clock`, which is null for a\npage without a freshness."
               },
               {
                 "type": "null"
@@ -19103,7 +19331,7 @@
         "properties": {
           "key": {
             "type": "string",
-            "description": "`freshness`, `follows`, `owner` or `folder parent`.",
+            "description": "`freshness`, `follows`, `owner`, `folder parent` or\n`refresh_requested`.",
             "example": "freshness"
           },
           "page": {
@@ -19213,6 +19441,17 @@
               "arch/overview.pact.md"
             ]
           },
+          "refresh_requested": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionRefreshRequested",
+                "description": "Set while the page is marked not fresh: the next reflect run\nreconciles it in full and takes the mark off. Always null on a\nretired page."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "retired": {
             "oneOf": [
               {
@@ -19250,6 +19489,36 @@
             "type": "string",
             "description": "Its title.",
             "example": "Architecture overview"
+          }
+        }
+      },
+      "ReflectionRefreshRequested": {
+        "type": "object",
+        "description": "A page's not-fresh mark: a person asked that the next reflect run\nreconciles the page in full.",
+        "required": [
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "When the page was marked, RFC 3339 in UTC with milliseconds.",
+            "example": "2026-11-25T14:03:07.412Z"
+          },
+          "by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who marked it, by login; null when the page record does not say.",
+            "example": "ada"
+          },
+          "by_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `by`, when the account has one.",
+            "example": "Ada Lovelace"
           }
         }
       },

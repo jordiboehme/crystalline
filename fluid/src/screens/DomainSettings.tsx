@@ -43,7 +43,13 @@ import { MembersCard } from "../components/MembersCard";
 import { RenameDomainDialog } from "../components/RenameDomainDialog";
 import { ReviewModeCard } from "../components/ReviewModeCard";
 import { Loading } from "../components/Loading";
-import { CHROME_LINK, FIELD, RAIL_LABEL, SIDE } from "../components/primitives";
+import {
+  CHROME_LINK,
+  Chip,
+  FIELD,
+  RAIL_LABEL,
+  SIDE,
+} from "../components/primitives";
 import { useDomainWritable } from "../domainWritable";
 import { isMissing, useDomainRights } from "../domainRights";
 import { engramsRoute, manifestEditRoute } from "../paths";
@@ -406,12 +412,36 @@ function ConfigSections({
         ) : (
           <>
             <ul className="flex flex-col gap-1 text-sm">
-              {sections.provisioning.decls.map((decl) => (
-                <li key={decl.kind} className="font-mono">
-                  {`${decl.kind}: ${decl.path}`}
-                </li>
-              ))}
+              {sections.provisioning.decls.map((decl) => {
+                const shipped = sections.provisioning?.artifacts.filter(
+                  (artifact) => artifact.kind === decl.kind,
+                );
+                return (
+                  <li key={decl.kind}>
+                    <span className="font-mono">{`${decl.kind}: ${decl.path}`}</span>
+                    {shipped !== undefined && shipped.length > 0 && (
+                      <ul className="mt-1 mb-2 ml-4 flex flex-col gap-1">
+                        {shipped.map((artifact) => (
+                          <li
+                            key={artifact.key}
+                            className="flex items-center gap-2"
+                          >
+                            <span className="font-mono">{artifact.name}</span>
+                            {artifact.optional && <Chip>optional</Chip>}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
+            {sections.provisioning.artifacts.length > 0 && (
+              <p className="text-caption text-slate-500 dark:text-slate-400">
+                Each machine decides which of these it installs, with{" "}
+                <code className="font-mono">crystalline provision</code>.
+              </p>
+            )}
           </>
         )}
         {sections.provisioning !== null && (

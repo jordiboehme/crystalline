@@ -372,7 +372,7 @@ mod tests {
     fn domain_entry_replaces_whole_base_entry() {
         let mut base = GlobalConfig::default();
         let mut entry = domain("/base/a");
-        entry.provision = Some(true);
+        entry.provision = Some(crystalline_core::config::Provision::all());
         // A nested map in the base entry must not merge into the document's.
         entry.origin = Some(crystalline_core::config::OriginConfig {
             repo: "acme/a".into(),
@@ -567,6 +567,58 @@ mod tests {
         let order: Vec<_> = read.domains.keys().take(2).map(String::as_str).collect();
         assert_eq!(order, ["b", "zeta"]);
         assert_eq!(read.domains.len(), names.len());
+    }
+
+    #[test]
+    fn a_provision_pick_survives_the_document_round_trip() {
+        use crystalline_core::config::Provision;
+        let picks = [
+            (
+                "harbor",
+                Provision::All {
+                    except: vec!["skills/storm-warnings".into()],
+                    also: vec!["mcps/lighthouse".into()],
+                },
+            ),
+            (
+                "cove",
+                Provision::Only(vec!["agents/bosun".into(), "commands/charts/plot".into()]),
+            ),
+            ("plain", Provision::all()),
+            ("shut", Provision::Deny),
+        ];
+        let mut cfg = GlobalConfig::default();
+        for (name, pick) in &picks {
+            let mut entry = domain(&format!("/{name}"));
+            entry.provision = Some(pick.clone());
+            cfg.domains.insert((*name).into(), entry);
+        }
+        let body = document_body(&cfg).unwrap();
+        assert_eq!(
+            body["domains"]["harbor"]["provision"],
+            serde_json::json!({"except": ["skills/storm-warnings"], "also": ["mcps/lighthouse"]})
+        );
+        assert_eq!(
+            body["domains"]["plain"]["provision"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            body["domains"]["shut"]["provision"],
+            serde_json::json!(false)
+        );
+        // Through a string, as the database hands it back.
+        let text = serde_json::to_string(&body).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let (read, _) = config_from_document(back).unwrap();
+        assert_eq!(read, cfg);
+        for (name, pick) in picks {
+            assert_eq!(read.domains[name].provision, Some(pick));
+        }
+        // A document entry replaces the base entry whole, pick included.
+        let mut base = GlobalConfig::default();
+        base.domains.insert("harbor".into(), domain("/harbor"));
+        let merged = merge(&base, &read).unwrap();
+        assert_eq!(merged.domains["harbor"], read.domains["harbor"]);
     }
 
     #[cfg(feature = "postgres")]

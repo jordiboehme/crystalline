@@ -279,6 +279,9 @@ impl Engine {
         // Before anything is downloaded or origin state written: the
         // registration at the end would refuse a file that does not parse.
         self.refuse_a_config_that_does_not_parse()?;
+        // Before the default folder is derived from the root: an install
+        // whose domains live in the old default root keeps it.
+        let mut pin = self.pin_before_registration();
         // Who may read it, asked before anything else is: on an instance
         // with a GitHub App the answer decides whether the content is open to
         // everyone signed in, so it is never defaulted.
@@ -457,16 +460,20 @@ impl Engine {
 
         let adopts_registered = existing.is_some();
         if !adopts_registered {
+            pin.refuse_a_new_domain()?;
             self.set_aside_orphan_kept(&domain_name);
         }
+        let mut default_root = None;
         let (root, adopted_entry) = match existing {
             Some((r, entry)) => (r, Some(entry)),
             None => (
                 match folder {
                     Some(f) => crystalline_core::config::expand_tilde(f),
                     None => {
-                        let domains_root = self.config.read().unwrap().domains_root();
-                        origin::default_domain_folder(&domains_root, &domain_name)
+                        let domains_root = self.fresh_domains_root(&pin)?;
+                        let root = origin::default_domain_folder(&domains_root, &domain_name);
+                        default_root = Some(domains_root);
+                        root
                     }
                 },
                 None,
@@ -488,6 +495,11 @@ impl Engine {
             branch: branch_name.clone(),
         };
         let state_dir = self.origin_state_dir(&domain_name)?;
+        // The subscribe creates the domain folder; the root above it is
+        // made ready first when the domain lands at the default placement.
+        if let Some(domains_root) = &default_root {
+            super::root_pin::prepare_default_root(domains_root)?;
+        }
         progress_at(1, &format!("downloading {repo}"));
         let report = ops::subscribe(
             provider.as_ref(),
@@ -3963,11 +3975,14 @@ impl Engine {
         let state = crystalline_remote::state::OriginState::load(&state_dir)?.ok_or_else(|| {
             EngineError::Invalid(format!("domain '{domain}' has no origin state"))
         })?;
-        let base = ops::unshared_base(&state);
+        let sources = ops::unshared_sources(&state);
         let local = crystalline_remote::changes::detect_local_changes_against(
-            &root, &base, &state_dir, reflection,
+            &root,
+            &ops::tip_stamps(&sources),
+            &state_dir,
+            reflection,
         )?;
-        Ok((root, state_dir, base, local))
+        Ok((root, state_dir, sources, local))
     }
 
     /// The domain's own refusal for a caller that asked about local changes
@@ -4045,11 +4060,12 @@ impl Engine {
                 json!({ "domain": domain, "mode": "review", "changes": changes, "skipped_large": [] }),
             );
         }
-        let (root, state_dir, _, local) =
+        let (root, state_dir, sources, local) =
             self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let mut changes = Vec::new();
         for change in local.substantive() {
-            let Some(found) = ops::local_change_sides(&root, &state_dir, &local, change.path())?
+            let Some(found) =
+                ops::local_change_sides(&root, &state_dir, &sources, &local, change.path())?
             else {
                 continue;
             };
@@ -4115,10 +4131,10 @@ impl Engine {
             value["domain"] = json!(domain);
             return Ok(value);
         }
-        let (root, state_dir, _, local) =
+        let (root, state_dir, sources, local) =
             self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
-        let sides =
-            ops::local_change_sides(&root, &state_dir, &local, path)?.ok_or_else(not_a_change)?;
+        let sides = ops::local_change_sides(&root, &state_dir, &sources, &local, path)?
+            .ok_or_else(not_a_change)?;
         let mut value = origin::change_detail_json(
             sides.change.path(),
             change_kind(&sides.change),
@@ -4131,10 +4147,14 @@ impl Engine {
     }
 
     /// Put the named paths back the way the team has them: `{ domain,
-    /// restored, deleted, cleared: [{ path, kind }], refused: [{ path, reason }],
-    /// reindexed }`. Under the domain's origin lock like a withdrawal, so it
-    /// never interleaves with a share's pull; refuses on a read-only instance.
-    /// A team domain restores from the base copy and re-indexes exactly the
+    /// restored, deleted, cleared: [{ path, kind }], refused: [{ path, reason,
+    /// detail? }], reindexed }`. Under the domain's origin lock like a
+    /// withdrawal, so it never interleaves with a share's pull; refuses on a
+    /// read-only instance. A team domain restores each path to what its
+    /// unshared change is measured against (`ops::unshared_sources`): the base
+    /// copy, or the local copy of what an open proposal carries; only for a
+    /// proposal shared by an older version, which kept no copy, does it
+    /// resolve a provider and read that one blob. It re-indexes exactly the
     /// touched paths; a reviewing domain clears the acting actor's own drafts
     /// through `DomainView::drop` and `overlay_files::clear` and moves
     /// nothing in the folder. One refused path never stops the others.
@@ -4161,9 +4181,53 @@ impl Engine {
         if let Some(who) = drafting {
             return self.discard_into_overlay(domain, &who, targets).await;
         }
-        let (root, state_dir, base, local) =
+        let (root, state_dir, sources, local) =
             self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let targets = fill_unguarded(targets, &local);
+        // A path whose content an open proposal carries is restored from the
+        // local copy a share keeps. Only a proposal shared by an older
+        // version has none, and only then is a provider resolved, to read
+        // that one blob; any way that fails refuses the path, not the call.
+        let missing = ops::missing_proposed_copies(&state_dir, &sources, &local, &targets)?;
+        let mut unrestorable = BTreeMap::new();
+        if !missing.is_empty() {
+            if missing.iter().any(|m| m.blob_sha.is_some()) {
+                let (spec, _, _) = self.origin_spec_for_domain(domain)?;
+                match self.resolve_share_provider(actor, &spec.repo).await {
+                    Ok((provider, _)) => {
+                        let fetched = ops::fetch_proposed_copies(
+                            provider.as_ref(),
+                            &spec,
+                            &state_dir,
+                            &missing,
+                        )
+                        .await;
+                        if fetched.auth_expired {
+                            self.drop_github_credential_on_auth(&RemoteError::AuthExpired);
+                        }
+                        unrestorable = fetched.unrestorable;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "discarding in '{domain}' without fetching a proposal's copy: {e}"
+                        );
+                    }
+                }
+            }
+            for copy in &missing {
+                unrestorable
+                    .entry(copy.sha256.clone())
+                    .or_insert(if copy.blob_sha.is_none() {
+                        ops::Unrestorable::NoBlobRecorded
+                    } else {
+                        ops::Unrestorable::NotFetched
+                    });
+            }
+        }
+        let base = ops::DiscardBase {
+            sources: &sources,
+            unrestorable: &unrestorable,
+        };
         let report = ops::discard_local_files(&root, &state_dir, &base, &local, &targets)?;
         let touched: Vec<String> = report
             .restored
@@ -4187,7 +4251,16 @@ impl Engine {
         let refused: Vec<Value> = report
             .refused
             .iter()
-            .map(|(path, reason)| json!({ "path": path, "reason": reason.code() }))
+            .map(|(path, reason)| {
+                let mut entry = json!({ "path": path, "reason": reason.code() });
+                if let Some(detail) = reason.detail() {
+                    entry["detail"] = json!(detail);
+                }
+                if let Some(number) = reason.proposal() {
+                    entry["proposal"] = json!(number);
+                }
+                entry
+            })
             .collect();
         Ok(json!({
             "domain": domain,

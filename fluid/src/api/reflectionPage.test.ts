@@ -71,7 +71,21 @@ describe("the page view", () => {
           reason: "shorter than 1h",
         },
       ],
+      refreshRequested: null,
     });
+  });
+
+  it("reads a mark whose record names nobody, and none without a time", () => {
+    expect(
+      readPageView({
+        ...PAGE_VIEW,
+        refresh_requested: { at: "2026-11-20T10:00:00Z", by: null },
+      })?.refreshRequested,
+    ).toEqual({ at: "2026-11-20T10:00:00Z", by: null, byDisplay: null });
+    expect(
+      readPageView({ ...PAGE_VIEW, refresh_requested: { by: "ann" } })
+        ?.refreshRequested,
+    ).toBeNull();
   });
 
   it("reads a retirement whose time and actor are unknown", () => {
@@ -187,6 +201,7 @@ describe("the page clock", () => {
         waiting: false,
         partOf: null,
         clockOf: "a.md",
+        refreshRequested: null,
       },
     });
   });

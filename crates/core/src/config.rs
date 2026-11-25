@@ -6,9 +6,13 @@
 //! XDG-aware default paths. It computes paths only; there is no daemon logic
 //! here.
 
+pub mod provision;
 pub mod registration;
+pub mod root_folder;
+pub mod root_pin;
 pub mod write_fence;
 
+pub use provision::Provision;
 pub use write_fence::{WriteFence, check_write, fence, refuse_appdata_writes};
 
 use std::path::{Path, PathBuf};
@@ -53,6 +57,16 @@ pub enum ConfigError {
 
 // --- global config -----------------------------------------------------------
 
+/// Where a new file domain lands when no `domains_root` is set: a hidden
+/// folder in the home (`%USERPROFILE%\\.crystalline` on Windows), outside the
+/// user folders macOS privacy protection guards.
+pub const DEFAULT_DOMAINS_ROOT: &str = "~/.crystalline";
+
+/// The default before 0.37.0. Written into `domains_root` once for an
+/// install whose domains live there ([`root_pin`]), as this literal text, so
+/// it resolves the same on every machine the file is copied to.
+pub const LEGACY_DOMAINS_ROOT: &str = "~/Documents/Crystalline";
+
 /// The global `config.yaml`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GlobalConfig {
@@ -61,8 +75,10 @@ pub struct GlobalConfig {
     pub domains: IndexMap<String, DomainEntry>,
     /// The default root folder new file domains are created under, when the
     /// caller does not give an explicit path: a domain named `foo` lands at
-    /// `<domains_root>/foo`. Absent means `~/Documents/Crystalline`, so every
-    /// existing config keeps working untouched.
+    /// `<domains_root>/foo`. Absent means [`DEFAULT_DOMAINS_ROOT`], the
+    /// hidden `~/.crystalline`. An install from before 0.37.0 whose domains
+    /// live under [`LEGACY_DOMAINS_ROOT`] gets that value written here once
+    /// ([`root_pin`]), so its new domains keep landing beside the old ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domains_root: Option<PathBuf>,
     /// Service settings.
@@ -231,12 +247,14 @@ impl GlobalConfig {
     }
 
     /// The root folder new file domains are created under, from `domains_root`
-    /// (tilde-expanded), or `~/Documents/Crystalline` when unset. A domain
-    /// created without an explicit path lands at `<domains_root>/<name>`.
+    /// (tilde-expanded), or [`DEFAULT_DOMAINS_ROOT`] (`~/.crystalline`) when
+    /// unset. A domain created without an explicit path lands at
+    /// `<domains_root>/<name>`. A plain resolver: it never looks at the
+    /// registered domains.
     pub fn domains_root(&self) -> PathBuf {
         match &self.domains_root {
             Some(p) => expand_tilde(&p.to_string_lossy()),
-            None => expand_tilde("~/Documents/Crystalline"),
+            None => expand_tilde(DEFAULT_DOMAINS_ROOT),
         }
     }
 
@@ -593,11 +611,12 @@ pub struct DomainEntry {
     /// no origin (the common case, and every domain predating this feature).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<OriginConfig>,
-    /// Whether this domain's declared artifacts are provisioned into harnesses.
-    /// Absent means undecided: the domain's artifacts are surfaced as awaiting a
-    /// decision but nothing installs.
+    /// Whether, and which of, this domain's declared artifacts are provisioned
+    /// into harnesses (see [`Provision`]). Absent means undecided: the
+    /// domain's artifacts are surfaced as awaiting a decision but nothing
+    /// installs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provision: Option<bool>,
+    pub provision: Option<Provision>,
     /// How this domain takes changes. Absent is the direct domain everybody
     /// has always had: a write lands in the folder or the database straight
     /// away. [`ReviewMode::Overlay`] is review mode, where every write joins
@@ -1790,11 +1809,91 @@ pub fn load_yaml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigE
     serde_yaml_ng::from_str(&text).map_err(|e| ConfigError::Yaml(e.to_string()))
 }
 
-/// Serialize and atomically save a config to a YAML file. Writes a sibling
-/// temporary file then renames it into place.
+/// Serialize and atomically save a config to a YAML file, through a symbolic
+/// link when `path` is one ([`save_bytes_through_link`]).
 pub fn save_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
     let yaml = serde_yaml_ng::to_string(value).map_err(|e| ConfigError::Yaml(e.to_string()))?;
-    save_bytes(path, yaml.as_bytes())
+    save_bytes_through_link(path, yaml.as_bytes())
+}
+
+/// [`save_bytes`] for a configuration file a person may keep elsewhere: when
+/// `path` is a symbolic link (a dotfiles checkout), the file it points to is
+/// written, so the link stays a link. The temporary file is made beside that
+/// target and renamed over it, and on Unix it takes the target's mode first,
+/// so a `config.yaml` kept owner only stays owner only. A link whose target
+/// is missing creates the target.
+pub fn save_bytes_through_link(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    save_bytes_through_link_in(path, bytes, write_fence::fence())
+}
+
+/// [`save_bytes_through_link`] under `fence`. The fence checks the link and
+/// its target, so a link cannot carry a write into a folder it guards.
+fn save_bytes_through_link_in(
+    path: &Path,
+    bytes: &[u8],
+    fence: Option<&WriteFence>,
+) -> Result<(), ConfigError> {
+    if let Some(fence) = fence {
+        fence.check(path)?;
+    }
+    let target = link_target(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if let Some(fence) = fence {
+        fence.check(&target)?;
+    }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let io = |source| ConfigError::Io {
+        path: target.display().to_string(),
+        source,
+    };
+    let tmp = temp_sibling(&target);
+    let written = std::fs::write(&tmp, bytes).and_then(|()| {
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.map_err(io)
+}
+
+/// The file `path` names once every symbolic link on its last component is
+/// followed: `path` itself when it is no link or does not exist. A relative
+/// link is read from the folder the link is in. The folders above are left
+/// as they are spelled. Gives up after 40 links, as the kernel does.
+fn link_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let next = std::fs::read_link(&current)?;
+                current = if next.is_absolute() {
+                    next
+                } else {
+                    current.parent().unwrap_or(Path::new("")).join(next)
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
 }
 
 /// Atomically write raw bytes to a file: create the parent directory if it is
@@ -1876,12 +1975,19 @@ fn temp_sibling(path: &Path) -> PathBuf {
 
 /// Expand a leading `~` to the user's home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        return home_dir().unwrap_or_else(|_| PathBuf::from("~"));
+    match home_dir() {
+        Ok(home) => expand_tilde_in(path, &home),
+        Err(_) => PathBuf::from(path),
     }
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = home_dir()
-    {
+}
+
+/// [`expand_tilde`] against `home` rather than the user's own home, so a
+/// caller (and a test) can compare paths under one home it names.
+pub fn expand_tilde_in(path: &str, home: &Path) -> PathBuf {
+    if path == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
         return home.join(rest);
     }
     PathBuf::from(path)
@@ -1910,6 +2016,15 @@ pub fn io_hint_suffix(path: &str, source: &std::io::Error) -> String {
         return format!("; {MACOS_PRIVACY_HINT}");
     }
     String::new()
+}
+
+/// Whether `path` sits inside one of the user folders macOS privacy
+/// protection guards (Documents, Desktop, Downloads in the user's home).
+/// Always false on other platforms. Doctor uses it to say that new domains
+/// would land in such a folder.
+pub fn in_protected_user_folder(path: &Path) -> bool {
+    cfg!(target_os = "macos")
+        && home_dir().is_ok_and(|home| in_protected_folder(&path.to_string_lossy(), &home))
 }
 
 /// Whether `path` sits inside one of the user folders macOS privacy
@@ -2854,6 +2969,118 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"v\":2}");
     }
 
+    /// The names in `dir`, sorted, so a test sees a temporary file left
+    /// behind.
+    #[cfg(unix)]
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_saved_over_a_link_is_written_through_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        let config = tmp.path().join("config");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let target = dotfiles.join("crystalline.yaml");
+        std::fs::write(&target, "domains: {}\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A relative link, as a dotfiles manager makes it.
+        let link = config.join("config.yaml");
+        std::os::unix::fs::symlink("../dotfiles/crystalline.yaml", &link).unwrap();
+
+        let cfg = GlobalConfig {
+            domains_root: Some(PathBuf::from("~/kb")),
+            ..GlobalConfig::default()
+        };
+        save_yaml(&link, &cfg).unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link stays a link");
+        let back: GlobalConfig = load_yaml(&target).unwrap();
+        assert_eq!(back.domains_root.as_deref(), Some(Path::new("~/kb")));
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the target keeps its mode");
+        assert_eq!(names_in(&config), vec!["config.yaml"]);
+        assert_eq!(names_in(&dotfiles), vec!["crystalline.yaml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_links_and_a_dangling_link_are_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real").join("config.yaml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "domains: {}\n").unwrap();
+        let middle = tmp.path().join("middle.yaml");
+        std::os::unix::fs::symlink(&real, &middle).unwrap();
+        let first = tmp.path().join("first.yaml");
+        std::os::unix::fs::symlink("middle.yaml", &first).unwrap();
+        save_bytes_through_link(&first, b"a: 1\n").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&first)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&middle)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"a: 1\n");
+
+        // A link whose target is not there yet: the target is created.
+        let dangling = tmp.path().join("dangling.yaml");
+        let missing = tmp.path().join("later").join("config.yaml");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        save_bytes_through_link(&dangling, b"b: 2\n").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&missing).unwrap(), b"b: 2\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_config_keeps_its_mode_when_saved() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, "domains: {}\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        save_yaml(&path, &GlobalConfig::default()).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(names_in(tmp.path()), vec!["config.yaml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_appdata_is_refused_inside_a_package() {
+        let home = tempfile::tempdir().unwrap();
+        let fence = appdata_fence(home.path());
+        let inside = home.path().join("roaming").join("x").join("config.yaml");
+        let link = home.path().join("config.yaml");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        let err = save_bytes_through_link_in(&link, b"a: 1\n", Some(&fence)).unwrap_err();
+        assert!(matches!(err, ConfigError::PackagedWrite { .. }), "{err}");
+        assert!(!home.path().join("roaming").exists());
+    }
+
     fn appdata_fence(home: &Path) -> WriteFence {
         WriteFence::new(
             "this command runs inside an app package",
@@ -3014,10 +3241,10 @@ mod tests {
     fn provision_true_and_false_round_trip() {
         let mut domains = IndexMap::new();
         let mut allowed = DomainEntry::file("/knowledge/allowed");
-        allowed.provision = Some(true);
+        allowed.provision = Some(Provision::all());
         domains.insert("allowed".to_string(), allowed);
         let mut denied = DomainEntry::file("/knowledge/denied");
-        denied.provision = Some(false);
+        denied.provision = Some(Provision::Deny);
         domains.insert("denied".to_string(), denied);
         let cfg = GlobalConfig {
             domains,
@@ -3028,8 +3255,333 @@ mod tests {
         assert!(yaml.contains("provision: true"), "{yaml}");
         assert!(yaml.contains("provision: false"), "{yaml}");
         let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
-        assert_eq!(back.domains.get("allowed").unwrap().provision, Some(true));
-        assert_eq!(back.domains.get("denied").unwrap().provision, Some(false));
+        assert_eq!(
+            back.domains.get("allowed").unwrap().provision,
+            Some(Provision::all())
+        );
+        assert_eq!(
+            back.domains.get("denied").unwrap().provision,
+            Some(Provision::Deny)
+        );
+    }
+
+    /// The `harbor` domain's `provision` value as it reads from `yaml`, the
+    /// text after `provision:` (a scalar or an indented block).
+    fn harbor_config(provision: &str) -> String {
+        format!("domains:\n  harbor:\n    path: /knowledge/harbor\n    provision:{provision}\n")
+    }
+
+    /// Load `text` through [`load_yaml`], the way `config.yaml` is read, and
+    /// answer the error text.
+    fn load_error(text: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, text).unwrap();
+        match load_yaml::<GlobalConfig>(&path) {
+            Ok(cfg) => panic!("the load should fail, it read {cfg:?}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn provision_true_and_false_stay_byte_identical() {
+        for value in [" true", " false"] {
+            let text = harbor_config(value);
+            let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+            assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn provision_except_and_also_round_trip_in_yaml_and_json() {
+        let text = harbor_config(
+            "\n      except:\n      - skills/storm-warnings\n      also:\n      - mcps/lighthouse",
+        );
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+        let pick = Provision::All {
+            except: names(&["skills/storm-warnings"]),
+            also: names(&["mcps/lighthouse"]),
+        };
+        assert_eq!(cfg.domains["harbor"].provision, Some(pick.clone()));
+        assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            json["domains"]["harbor"]["provision"],
+            serde_json::json!({"except": ["skills/storm-warnings"], "also": ["mcps/lighthouse"]})
+        );
+        let back: GlobalConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back, cfg);
+
+        // One list alone writes only that list.
+        for (pick, key) in [
+            (
+                Provision::All {
+                    except: names(&["agents/bosun"]),
+                    also: Vec::new(),
+                },
+                "except",
+            ),
+            (
+                Provision::All {
+                    except: Vec::new(),
+                    also: names(&["agents/bosun"]),
+                },
+                "also",
+            ),
+        ] {
+            let yaml = serde_yaml_ng::to_string(&pick).unwrap();
+            assert_eq!(yaml, format!("{key}:\n- agents/bosun\n"));
+            assert_eq!(serde_yaml_ng::from_str::<Provision>(&yaml).unwrap(), pick);
+            let json = serde_json::to_string(&pick).unwrap();
+            assert_eq!(json, format!(r#"{{"{key}":["agents/bosun"]}}"#));
+            assert_eq!(serde_json::from_str::<Provision>(&json).unwrap(), pick);
+        }
+    }
+
+    #[test]
+    fn provision_only_round_trips_in_yaml_and_json() {
+        let text = harbor_config(
+            "\n      only:\n      - commands/charts/plot-route\n      - skills/tide-tables",
+        );
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+        let pick = Provision::Only(names(&["commands/charts/plot-route", "skills/tide-tables"]));
+        assert_eq!(cfg.domains["harbor"].provision, Some(pick.clone()));
+        assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+
+        let json = serde_json::to_string(&pick).unwrap();
+        assert_eq!(
+            json,
+            r#"{"only":["commands/charts/plot-route","skills/tide-tables"]}"#
+        );
+        assert_eq!(serde_json::from_str::<Provision>(&json).unwrap(), pick);
+        let back: GlobalConfig =
+            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn provision_lists_are_sorted_and_deduped_on_write() {
+        let pick = Provision::All {
+            except: names(&["skills/b", "skills/a", "skills/b"]),
+            also: names(&["mcps/z", "mcps/y", "mcps/z"]),
+        };
+        assert_eq!(
+            serde_yaml_ng::to_string(&pick).unwrap(),
+            "except:\n- skills/a\n- skills/b\nalso:\n- mcps/y\n- mcps/z\n"
+        );
+        assert_eq!(
+            serde_json::to_string(&Provision::Only(names(&["b", "a", "a"]))).unwrap(),
+            r#"{"only":["a","b"]}"#
+        );
+        // A hand-written unsorted list reads back normalized.
+        let read: Provision = serde_yaml_ng::from_str("only: [b, a, b]").unwrap();
+        assert_eq!(read, Provision::Only(names(&["a", "b"])));
+    }
+
+    #[test]
+    fn an_empty_except_list_writes_true_and_an_empty_only_list_writes_false() {
+        let all = Provision::All {
+            except: Vec::new(),
+            also: Vec::new(),
+        };
+        assert_eq!(serde_yaml_ng::to_string(&all).unwrap(), "true\n");
+        assert_eq!(
+            serde_yaml_ng::to_string(&Provision::Only(Vec::new())).unwrap(),
+            "false\n"
+        );
+        assert_eq!(serde_json::to_string(&all).unwrap(), "true");
+        assert_eq!(
+            serde_json::to_string(&Provision::Only(Vec::new())).unwrap(),
+            "false"
+        );
+        // Read from a hand edit, the empty lists normalize the same way.
+        let read: Provision = serde_yaml_ng::from_str("except: []").unwrap();
+        assert_eq!(read, Provision::all());
+        let read: Provision = serde_yaml_ng::from_str("only: []").unwrap();
+        assert_eq!(read, Provision::Deny);
+        assert_eq!(Provision::Only(Vec::new()).normalized(), Provision::Deny);
+    }
+
+    #[test]
+    fn a_misspelled_provision_key_fails_the_load() {
+        let err = load_error(&harbor_config(
+            "\n      exept:\n      - skills/storm-warnings",
+        ));
+        assert!(err.contains("domains.harbor.provision"), "{err}");
+        assert!(err.contains("`exept`"), "{err}");
+        assert!(err.contains("it takes `except`, `also` or `only`"), "{err}");
+        let json = serde_json::from_str::<Provision>(r#"{"exept":["a"]}"#).unwrap_err();
+        assert!(json.to_string().contains("`exept`"), "{json}");
+    }
+
+    #[test]
+    fn an_empty_provision_map_fails_the_load() {
+        let err = load_error(&harbor_config(" {}"));
+        assert!(err.contains("domains.harbor.provision"), "{err}");
+        assert!(
+            err.contains("`provision` needs `except`, `also` or `only`, or `true` or `false`"),
+            "{err}"
+        );
+        let json = serde_json::from_str::<Provision>("{}").unwrap_err();
+        assert!(
+            json.to_string()
+                .contains("`provision` needs `except`, `also` or `only`, or `true` or `false`"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn only_beside_except_fails_the_load() {
+        let never_both = "`provision` takes `only`, or `except` and `also`, never both";
+        for map in [
+            "\n      only: [skills/a]\n      except: [skills/b]",
+            "\n      also: [skills/b]\n      only: [skills/a]",
+        ] {
+            let err = load_error(&harbor_config(map));
+            assert!(err.contains("domains.harbor.provision"), "{err}");
+            assert!(err.contains(never_both), "{err}");
+        }
+        let json =
+            serde_json::from_str::<Provision>(r#"{"only":["a"],"except":["b"]}"#).unwrap_err();
+        assert!(json.to_string().contains(never_both), "{json}");
+    }
+
+    #[test]
+    fn a_malformed_name_loads_and_is_kept() {
+        let text = harbor_config("\n      only:\n      - skills");
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+        assert_eq!(
+            cfg.domains["harbor"].provision,
+            Some(Provision::Only(names(&["skills"])))
+        );
+        assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+        let names: Vec<_> = cfg.domains["harbor"]
+            .provision
+            .as_ref()
+            .unwrap()
+            .names()
+            .collect();
+        assert_eq!(names, ["skills"]);
+    }
+
+    #[test]
+    fn selects_follows_every_form() {
+        let except = Provision::All {
+            except: names(&["skills/out", "mcps/both"]),
+            also: Vec::new(),
+        };
+        let also = Provision::All {
+            except: Vec::new(),
+            also: names(&["mcps/taken"]),
+        };
+        // A hand edit that names one key in both lists: except wins.
+        let both = Provision::All {
+            except: names(&["mcps/both"]),
+            also: names(&["mcps/both", "mcps/taken"]),
+        };
+        let only = Provision::Only(names(&["skills/in", "mcps/taken"]));
+        // (decision, key, optional, selected)
+        let table: &[(&Provision, &str, bool, bool)] = &[
+            (&Provision::Deny, "skills/in", false, false),
+            (&Provision::Deny, "mcps/taken", true, false),
+            (&Provision::all(), "skills/in", false, true),
+            (&Provision::all(), "mcps/taken", true, false),
+            (&except, "skills/out", false, false),
+            (&except, "skills/in", false, true),
+            (&except, "mcps/taken", true, false),
+            (&also, "mcps/taken", true, true),
+            (&also, "mcps/other", true, false),
+            (&also, "skills/in", false, true),
+            (&both, "mcps/both", true, false),
+            (&both, "mcps/taken", true, true),
+            (&only, "skills/in", false, true),
+            (&only, "mcps/taken", true, true),
+            (&only, "skills/out", false, false),
+            (&only, "mcps/other", true, false),
+            // Keys compare exactly.
+            (&only, "skills/In", false, false),
+        ];
+        for (decision, key, optional, selected) in table {
+            assert_eq!(
+                decision.selects(key, *optional),
+                *selected,
+                "{decision:?} selects {key} (optional {optional})"
+            );
+        }
+        assert!(!Provision::Deny.includes_any());
+        assert!(Provision::all().includes_any());
+        assert!(except.includes_any());
+        assert!(only.includes_any());
+        assert_eq!(
+            both.names().collect::<Vec<_>>(),
+            ["mcps/both", "mcps/both", "mcps/taken"]
+        );
+        assert_eq!(Provision::from(true), Provision::all());
+        assert_eq!(Provision::from(false), Provision::Deny);
+    }
+
+    #[test]
+    fn only_true_and_false_are_plain_bools() {
+        assert!(Provision::Deny.is_plain_bool());
+        assert!(Provision::all().is_plain_bool());
+        assert!(
+            !Provision::All {
+                except: names(&["skills/out"]),
+                also: Vec::new(),
+            }
+            .is_plain_bool()
+        );
+        assert!(
+            !Provision::All {
+                except: Vec::new(),
+                also: names(&["mcps/taken"]),
+            }
+            .is_plain_bool()
+        );
+        assert!(!Provision::Only(names(&["skills/in"])).is_plain_bool());
+    }
+
+    #[test]
+    fn fingerprint_is_none_for_plain_true() {
+        assert_eq!(Provision::all().fingerprint(), None);
+        assert_eq!(
+            Provision::All {
+                except: Vec::new(),
+                also: Vec::new()
+            }
+            .fingerprint(),
+            None
+        );
+        assert_eq!(Provision::Deny.fingerprint().as_deref(), Some("deny"));
+        assert_eq!(
+            Provision::All {
+                except: names(&["b", "a"]),
+                also: names(&["c"]),
+            }
+            .fingerprint()
+            .as_deref(),
+            Some("except=a,b;also=c")
+        );
+        assert_eq!(
+            Provision::All {
+                except: Vec::new(),
+                also: names(&["c"]),
+            }
+            .fingerprint()
+            .as_deref(),
+            Some("also=c")
+        );
+        assert_eq!(
+            Provision::Only(names(&["b", "a", "b"]))
+                .fingerprint()
+                .as_deref(),
+            Some("only=a,b")
+        );
     }
 
     /// The two login throttle keys default, read back and round trip through

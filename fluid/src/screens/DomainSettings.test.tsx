@@ -448,6 +448,104 @@ describe("the domain settings screen", () => {
     ).toBeVisible();
   });
 
+  function provisioningManifest(artifacts: unknown[]) {
+    return {
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: manifestSectionsResponse({
+          provisioning: {
+            decls: [
+              { kind: "skills", path: "skills" },
+              { kind: "commands", path: "cmds" },
+            ],
+            problems: [],
+            artifacts,
+          },
+        }),
+      }),
+    };
+  }
+
+  it("lists each artifact under its folder with an optional badge", async () => {
+    serve(
+      provisioningManifest([
+        {
+          key: "skills/lighthouse",
+          kind: "skills",
+          name: "lighthouse",
+          optional: false,
+        },
+        {
+          key: "skills/storm-warnings",
+          kind: "skills",
+          name: "storm-warnings",
+          optional: true,
+        },
+        {
+          key: "commands/deploy",
+          kind: "commands",
+          name: "deploy",
+          optional: false,
+        },
+      ]),
+    );
+
+    renderApp("/d/eng/settings");
+
+    const card = await screen.findByRole("region", { name: "Provisioning" });
+    const skills = within(
+      within(card).getByText("skills: skills").closest("li") as HTMLElement,
+    );
+    expect(skills.getByText("lighthouse")).toBeVisible();
+    const storm = skills.getByText("storm-warnings").closest("li");
+    expect(within(storm as HTMLElement).getByText("optional")).toBeVisible();
+    const lighthouse = skills.getByText("lighthouse").closest("li");
+    expect(
+      within(lighthouse as HTMLElement).queryByText("optional"),
+    ).toBeNull();
+    const commands = within(
+      within(card).getByText("commands: cmds").closest("li") as HTMLElement,
+    );
+    expect(commands.getByText("deploy")).toBeVisible();
+    expect(skills.queryByText("deploy")).toBeNull();
+  });
+
+  it("says each machine decides", async () => {
+    serve(
+      provisioningManifest([
+        {
+          key: "skills/lighthouse",
+          kind: "skills",
+          name: "lighthouse",
+          optional: false,
+        },
+      ]),
+    );
+
+    const { unmount } = renderApp("/d/eng/settings");
+
+    const card = await screen.findByRole("region", { name: "Provisioning" });
+    expect(
+      await within(card).findByText(
+        (_, node) =>
+          node?.tagName === "P" &&
+          node.textContent ===
+            "Each machine decides which of these it installs, with crystalline provision.",
+      ),
+    ).toBeVisible();
+    expect(within(card).getByText("crystalline provision").tagName).toBe(
+      "CODE",
+    );
+    unmount();
+
+    serve(provisioningManifest([]));
+    renderApp("/d/eng/settings");
+    const empty = await screen.findByRole("region", { name: "Provisioning" });
+    await within(empty).findByText("skills: skills");
+    expect(within(empty).queryByText(/Each machine decides/)).toBeNull();
+  });
+
   it("says nothing extra about a section that is declared, and lists its problems", async () => {
     serve({
       "/domains/eng/manifest": () => ({

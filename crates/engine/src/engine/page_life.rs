@@ -188,7 +188,7 @@ impl Engine {
         prov.page.owner = owner.map(str::to_string);
         let changed = r::write_provenance(&text, &prov).map_err(EngineError::Invalid)?;
         let changed = set_status(&changed, was_status.as_deref())?;
-        self.land_page_record(domain, &access, inner, &abs, &text, &changed, caller)
+        self.land_page_record(domain, &access, inner, &abs, &text, &changed, caller, false)
             .await?;
         drop(_lock);
         self.absorb_into_room(domain, inner).await;
@@ -387,7 +387,7 @@ impl Engine {
         let _lock = self.lock_file(&abs).await;
         let text = read_opt(&abs)?.ok_or_else(|| no_page(domain, inner))?;
         let changed = change(&text)?;
-        self.land_page_record(domain, &access, inner, &abs, &text, &changed, caller)
+        self.land_page_record(domain, &access, inner, &abs, &text, &changed, caller, false)
             .await?;
         drop(_lock);
         self.absorb_into_room(domain, inner).await;
@@ -426,8 +426,13 @@ impl Engine {
     /// stored pact hash along in the same commit, as a write's does
     /// ([`Engine::settings_rehash`]), so a retire or a restore asks for no
     /// reconcile.
+    ///
+    /// With `keep_modified` the file keeps the modified time it had: a
+    /// not-fresh mark and the reconcile that takes it off are bookkeeping,
+    /// and the modified time is what a page with no recorded reconcile
+    /// counts its freshness from.
     #[allow(clippy::too_many_arguments)]
-    async fn land_page_record(
+    pub(super) async fn land_page_record(
         &self,
         domain: &str,
         access: &ReflectionAccess,
@@ -436,6 +441,7 @@ impl Engine {
         current: &str,
         text: &str,
         caller: &ReflectionCaller,
+        keep_modified: bool,
     ) -> Result<()> {
         let text = crystalline_core::to_lf(text).into_owned();
         let rehash = self
@@ -443,7 +449,13 @@ impl Engine {
             .await?;
         let mut undo = DiskUndo::default();
         undo.record(abs)?;
-        write_file(abs, &text)?;
+        let modified = keep_modified
+            .then(|| std::fs::metadata(abs).and_then(|meta| meta.modified()).ok())
+            .flatten();
+        match modified {
+            Some(modified) => write_file_keeping_modified(abs, &text, modified)?,
+            None => write_file(abs, &text)?,
+        }
         let mut ops = vec![super::fence::RowOp::Page {
             inner,
             text: &text,
@@ -472,7 +484,7 @@ impl Engine {
 
     /// Let a live room over the page at `inner` take the file in, as a
     /// write's does; a room that closed meanwhile is no refusal.
-    async fn absorb_into_room(&self, domain: &str, inner: &str) {
+    pub(super) async fn absorb_into_room(&self, domain: &str, inner: &str) {
         let doc = RoomDoc::Reflection(inner.to_string());
         if let Some(rooms) = self.collab_rooms()
             && rooms.has_live_doc(domain, &doc, None).await

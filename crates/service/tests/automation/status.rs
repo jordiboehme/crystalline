@@ -379,6 +379,50 @@ async fn a_stale_page_is_due_work_and_the_status_says_when_the_next_is() {
     assert_eq!(entry["next_stale_at"], "2026-10-23T10:00:00Z", "{due}");
 }
 
+/// A page a person marked not fresh is due work at once, counted under
+/// `stale` (not among the `updates`), whatever its freshness says; the next
+/// stale time stays the freshness's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marked_page_is_stale_work_and_the_next_time_stays() {
+    let fx = rolling_page("2026-10-21T10:00:00+00:00").await;
+    now_at(&fx.engine, "2026-10-21T12:00:00+00:00");
+    fx.engine
+        .write_reflection(
+            &WriteReflectionParams {
+                domain: "eng".into(),
+                path: "plain.md".into(),
+                markdown: Some("# Plain\n\n## Now\n\nText.\n".into()),
+                ..Default::default()
+            },
+            &ReflectionCaller::person(Scope::Unrestricted, "jordi"),
+        )
+        .await
+        .unwrap();
+    let before = status_with(&fx.engine, Loop::Reflect, true).await;
+    let updates = before["domains"][0]["counts"]["updates"].clone();
+    for path in ["w.md", "plain.md"] {
+        fx.engine
+            .write_reflection(
+                &WriteReflectionParams {
+                    domain: "eng".into(),
+                    path: path.into(),
+                    action: Some("mark_stale".into()),
+                    ..Default::default()
+                },
+                &ReflectionCaller::person(Scope::Unrestricted, "jordi"),
+            )
+            .await
+            .unwrap();
+    }
+    let due = status_with(&fx.engine, Loop::Reflect, true).await;
+    let entry = &due["domains"][0];
+    assert_eq!(entry["due"], true, "{due}");
+    assert_eq!(entry["counts"]["stale"], 2, "{due}");
+    assert_eq!(entry["counts"]["updates"], updates, "{due}");
+    assert_eq!(entry["counts"]["pages_to_update"], 0, "{due}");
+    assert_eq!(entry["next_stale_at"], "2026-10-22T10:00:00Z", "{due}");
+}
+
 /// A retired page and a page without a freshness are never due and name
 /// no next time; with no page that keeps itself current both are null.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

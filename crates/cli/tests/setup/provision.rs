@@ -1414,3 +1414,463 @@ fn an_uninstalled_codex_copy_under_a_covered_cursor_is_a_doctor_problem_and_deny
         "{before}\n---\n{after}"
     );
 }
+
+// --- take and skip (0.37.0) ---------------------------------------------------
+
+/// An optional skill beside harbor's tide-tables: the author marks it with
+/// `metadata: { provision: optional }`.
+fn write_storm_warnings(harbor_dir: &Path) {
+    write(
+        harbor_dir,
+        "skills/storm-warnings/SKILL.md",
+        "---\nname: storm-warnings\nmetadata:\n  provision: optional\n---\n\nWarns of storms.\n",
+    );
+}
+
+/// The isolated home's global config file.
+fn config_file(home: &Path) -> PathBuf {
+    home.join("config/crystalline/config.yaml")
+}
+
+/// Run `provision` with `args` in the isolated home and return its stdout.
+fn provision_ok(home: &Path, bin_dir: &Path, args: &[&str]) -> String {
+    let out = provision_cmd(home, bin_dir)
+        .arg("provision")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "provision {args:?} must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Write a global config registering harbor with `decision` (YAML lines
+/// under `provision:`, already indented, or an empty string for none).
+fn write_config(home: &Path, harbor_dir: &Path, decision: &str) {
+    let path = config_file(home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        format!(
+            "domains:\n  harbor:\n    path: {}\n{decision}",
+            harbor_dir.display()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn skip_removes_one_skill_and_keeps_the_rest() {
+    let (work, home, bin_dir, harbor_dir) = setup("skip-one");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    assert!(home.join(".claude/skills/tide-tables/SKILL.md").exists());
+
+    let out = provision_ok(&home, &bin_dir, &["skip", "harbor", "skills/tide-tables"]);
+    assert!(
+        out.lines()
+            .next()
+            .unwrap()
+            .starts_with("harbor: allowed, except skills/tide-tables"),
+        "the decided line leads the report: {out}"
+    );
+    assert!(
+        out.contains("Older Crystalline versions cannot read the choice"),
+        "the older-versions notice is printed: {out}"
+    );
+    assert!(
+        !home.join(".claude/skills/tide-tables").exists(),
+        "the skipped skill is gone"
+    );
+    assert!(home.join(".claude/commands/charts/plot-route.md").exists());
+    assert!(home.join(".claude/agents/quartermaster.md").exists());
+    let yaml = std::fs::read_to_string(config_file(&home)).unwrap();
+    assert!(
+        yaml.contains("except:") && yaml.contains("- skills/tide-tables"),
+        "{yaml}"
+    );
+}
+
+#[test]
+fn take_installs_an_optional_skill_that_allow_left_out() {
+    let (work, home, bin_dir, harbor_dir) = setup("take-optional");
+    write_storm_warnings(&harbor_dir);
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    assert!(
+        !home.join(".claude/skills/storm-warnings").exists(),
+        "allow leaves an optional skill out"
+    );
+
+    let out = provision_ok(
+        &home,
+        &bin_dir,
+        &["take", "harbor", "skills/storm-warnings"],
+    );
+    assert!(
+        out.contains("harbor: allowed, also skills/storm-warnings"),
+        "{out}"
+    );
+    assert!(home.join(".claude/skills/storm-warnings/SKILL.md").exists());
+    assert!(home.join(".claude/skills/tide-tables/SKILL.md").exists());
+
+    // `allow` keeps what was taken.
+    let out = provision_ok(&home, &bin_dir, &["allow", "harbor"]);
+    assert!(
+        out.contains("harbor: allowed, also skills/storm-warnings"),
+        "{out}"
+    );
+    assert!(home.join(".claude/skills/storm-warnings/SKILL.md").exists());
+}
+
+#[test]
+fn take_on_an_undecided_domain_installs_only_the_named_artifacts() {
+    let (work, home, bin_dir, harbor_dir) = setup("take-undecided");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_harbor(&home, &bin_dir, &harbor_dir);
+
+    let out = provision_ok(
+        &home,
+        &bin_dir,
+        &[
+            "take",
+            "harbor",
+            "skills/tide-tables",
+            "agents/quartermaster",
+        ],
+    );
+    assert!(
+        out.contains("harbor: only agents/quartermaster, skills/tide-tables"),
+        "{out}"
+    );
+    assert!(home.join(".claude/skills/tide-tables/SKILL.md").exists());
+    assert!(home.join(".claude/agents/quartermaster.md").exists());
+    assert!(!home.join(".claude/commands").exists());
+    assert!(
+        !read_log(&log).contains("mcp add-json"),
+        "the mcp was not taken"
+    );
+    let data = status_json(&home, &bin_dir);
+    let harbor = data["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["domain"] == "harbor")
+        .unwrap();
+    assert_eq!(harbor["decision"], "only", "{data}");
+}
+
+/// Collapse every run of spaces so a test reads a status line by its words.
+fn words(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The one status line naming `key`, with its spaces collapsed.
+fn status_words(out: &str, key: &str) -> String {
+    let line = out
+        .lines()
+        .find(|l| l.contains(key))
+        .unwrap_or_else(|| panic!("no line for {key}: {out}"));
+    words(line)
+}
+
+#[test]
+fn status_text_lists_each_artifact_on_or_off_with_optional_marks() {
+    let (work, home, bin_dir, harbor_dir) = setup("status-artifacts");
+    write_storm_warnings(&harbor_dir);
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+
+    // Before any pick: the optional skill is off and says why.
+    let out = provision_ok(&home, &bin_dir, &["status"]);
+    assert_eq!(
+        status_words(&out, "skills/storm-warnings"),
+        "off skills/storm-warnings optional"
+    );
+    assert!(
+        out.lines().any(|l| l == "  on   skills/tide-tables"),
+        "{out}"
+    );
+
+    provision_ok(&home, &bin_dir, &["skip", "harbor", "agents/quartermaster"]);
+    provision_ok(
+        &home,
+        &bin_dir,
+        &["take", "harbor", "skills/storm-warnings"],
+    );
+    let out = provision_ok(&home, &bin_dir, &["status"]);
+    assert!(out.contains("harbor: allowed, "), "{out}");
+    assert_eq!(
+        status_words(&out, "agents/quartermaster"),
+        "off agents/quartermaster skipped"
+    );
+    assert_eq!(
+        status_words(&out, "skills/storm-warnings"),
+        "on skills/storm-warnings optional, taken"
+    );
+    assert_eq!(
+        status_words(&out, "skills/tide-tables"),
+        "on skills/tide-tables"
+    );
+    assert_eq!(status_words(&out, "mcps/lighthouse"), "on mcps/lighthouse");
+    // The reason column lines up across the rows that have one.
+    let col = |key: &str, word: &str| {
+        out.lines()
+            .find(|l| l.contains(key))
+            .unwrap()
+            .find(word)
+            .unwrap()
+    };
+    assert_eq!(
+        col("agents/quartermaster", "skipped"),
+        col("skills/storm-warnings", "optional, taken")
+    );
+
+    // Under `only` an unlisted artifact reads "not taken".
+    provision_ok(&home, &bin_dir, &["deny", "harbor"]);
+    provision_ok(&home, &bin_dir, &["take", "harbor", "skills/tide-tables"]);
+    let out = provision_ok(&home, &bin_dir, &["status"]);
+    assert_eq!(
+        status_words(&out, "skills/tide-tables"),
+        "on skills/tide-tables"
+    );
+    assert_eq!(
+        status_words(&out, "agents/quartermaster"),
+        "off agents/quartermaster not taken"
+    );
+    assert_eq!(
+        status_words(&out, "skills/storm-warnings"),
+        "off skills/storm-warnings not taken"
+    );
+}
+
+#[test]
+fn status_text_names_a_stale_name_with_the_command_to_drop_it() {
+    let (work, home, bin_dir, harbor_dir) = setup("status-stale");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    write_config(
+        &home,
+        &harbor_dir,
+        "    provision:\n      except:\n      - skills/old-charts\n      - skills\n      also:\n      - skills/gone-lookout\n",
+    );
+
+    let out = provision_ok(&home, &bin_dir, &["status"]);
+    assert!(
+        out.contains(
+            "  stale: skills/old-charts is in the decision, but harbor no longer ships it - run `crystalline provision take harbor skills/old-charts` to drop it."
+        ),
+        "an except name is dropped with take: {out}"
+    );
+    assert!(
+        out.contains(
+            "  stale: skills/gone-lookout is in the decision, but harbor no longer ships it - run `crystalline provision skip harbor skills/gone-lookout` to drop it."
+        ),
+        "an also name is dropped with skip: {out}"
+    );
+    assert!(
+        out.contains("  malformed: skills is not an artifact name; edit `config.yaml` to fix it."),
+        "{out}"
+    );
+
+    // The command the line names really does drop it.
+    provision_ok(&home, &bin_dir, &["take", "harbor", "skills/old-charts"]);
+    let out = provision_ok(&home, &bin_dir, &["status"]);
+    assert!(!out.contains("skills/old-charts"), "{out}");
+}
+
+#[test]
+fn skip_json_carries_the_decided_block() {
+    let (work, home, bin_dir, harbor_dir) = setup("skip-json");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+
+    let out = provision_cmd(&home, &bin_dir)
+        .args([
+            "--json",
+            "provision",
+            "skip",
+            "harbor",
+            "commands/charts/plot-route",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        data["decided"],
+        json!({
+            "domain": "harbor",
+            "decision": "allowed",
+            "selection": { "except": ["commands/charts/plot-route"], "also": [] }
+        }),
+        "{data}"
+    );
+    assert!(data["harnesses"].is_array(), "{data}");
+
+    let out = provision_cmd(&home, &bin_dir)
+        .args([
+            "--json",
+            "provision",
+            "take",
+            "harbor",
+            "commands/charts/plot-route",
+        ])
+        .output()
+        .unwrap();
+    let data: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        data["decided"],
+        json!({ "domain": "harbor", "decision": "allowed", "selection": null }),
+        "a pick that normalizes back to true has no selection: {data}"
+    );
+}
+
+#[test]
+fn prompt_skips_hashing_when_stamps_unchanged_with_a_skipped_artifact() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-skip-pick");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    write_config(
+        &home,
+        &harbor_dir,
+        "    provision:\n      except:\n      - mcps/lighthouse\n      - skills/tide-tables\n",
+    );
+    provision_ok(&home, &bin_dir, &[]);
+    bump_install_receipt_current(&home);
+    assert!(!home.join(".claude/skills/tide-tables").exists());
+    assert!(home.join(".claude/agents/quartermaster.md").exists());
+
+    let receipt_path = home.join("state/crystalline/provisions.json");
+    let receipt_before = std::fs::read(&receipt_path).unwrap();
+    let target = home.join(".claude/agents/quartermaster.md");
+    let mtime_before = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+    let (_, first) = prompt_output(&home, &bin_dir);
+    let (_, second) = prompt_output(&home, &bin_dir);
+
+    assert_eq!(
+        std::fs::read(&receipt_path).unwrap(),
+        receipt_before,
+        "the receipt is never rewritten while a skipped artifact stays skipped"
+    );
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().modified().unwrap(),
+        mtime_before
+    );
+    for notices in [&first, &second] {
+        assert!(
+            !notices.contains("Refreshed") && !notices.contains("MCP server changes"),
+            "no session does any work: {notices}"
+        );
+    }
+}
+
+#[test]
+fn prompt_reconciles_after_a_hand_edited_except_list() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-hand-edit");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+    let target = home.join(".claude/skills/tide-tables/SKILL.md");
+    assert!(target.exists());
+    // A session with nothing to do leaves the skill alone.
+    let _ = prompt_output(&home, &bin_dir);
+    assert!(target.exists());
+
+    // The person edits `config.yaml` by hand, with no command involved.
+    write_config(
+        &home,
+        &harbor_dir,
+        "    provision:\n      except:\n      - skills/tide-tables\n",
+    );
+    let (_, notices) = prompt_output(&home, &bin_dir);
+    assert!(
+        !home.join(".claude/skills/tide-tables").exists(),
+        "the next session removes what the list now leaves out: {notices}"
+    );
+    assert!(home.join(".claude/agents/quartermaster.md").exists());
+}
+
+/// A real daemon answers `take` and `skip` over the control socket, and a
+/// following `allow` keeps what was taken. No mcp is shipped, so the daemon
+/// never runs a harness CLI.
+#[test]
+fn take_and_skip_go_through_a_running_daemon() {
+    let mut env = crate::daemon_env::DaemonEnv::new("pick");
+    let harbor_dir = env.dir.join("kb-harbor");
+    write_manifest(&harbor_dir, "- skills: skills\n");
+    write(
+        &harbor_dir,
+        "skills/tide-tables/SKILL.md",
+        "---\nname: tide-tables\n---\n\nReads the harbor's tide tables.\n",
+    );
+    write_storm_warnings(&harbor_dir);
+    write_install_receipt(&env.dir);
+    let config = env.config_path();
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "domains:\n  harbor:\n    path: {}\n    provision: true\nembeddings:\n  provider: openai-compatible\n  model: stub-model\n",
+            harbor_dir.display()
+        ),
+    )
+    .unwrap();
+    env.serve();
+    let claude = env.dir.join(".claude/skills");
+
+    let (ok, out) = env.run(&["provision", "take", "harbor", "skills/storm-warnings"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("harbor: allowed, also skills/storm-warnings"),
+        "{out}"
+    );
+    assert!(claude.join("storm-warnings/SKILL.md").exists());
+    assert!(claude.join("tide-tables/SKILL.md").exists());
+
+    let (ok, out) = env.run(&["provision", "skip", "harbor", "skills/tide-tables"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("harbor: allowed, except skills/tide-tables, also skills/storm-warnings"),
+        "{out}"
+    );
+    assert!(!claude.join("tide-tables").exists());
+    assert!(claude.join("storm-warnings/SKILL.md").exists());
+
+    let (ok, out) = env.run(&["--json", "provision", "status"]);
+    assert!(ok, "{out}");
+    let data: Value = serde_json::from_str(&out).unwrap();
+    let harbor = data["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["domain"] == "harbor")
+        .unwrap();
+    assert_eq!(
+        harbor["selection"],
+        json!({ "except": ["skills/tide-tables"], "also": ["skills/storm-warnings"] }),
+        "{data}"
+    );
+
+    // A name the domain does not ship is refused, and the daemon wrote nothing.
+    let before = std::fs::read(&config).unwrap();
+    let (ok, _) = env.run(&["provision", "skip", "harbor", "skills/nope"]);
+    assert!(!ok, "an unknown name is refused");
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+
+    env.shutdown();
+}

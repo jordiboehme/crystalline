@@ -1,10 +1,14 @@
 //! Artifact scan, source-root resolution and the desired-set projection.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crystalline_core::config::DomainEntry;
 use crystalline_core::manifest::ArtifactType;
-use crystalline_core::{resolve_source_roots, scan_domain};
+use crystalline_core::provision::{
+    ArtifactListing, ArtifactListingReport, artifact_key, list_artifacts, mcp_key,
+    parse_artifact_key,
+};
+use crystalline_core::{ArtifactFile, resolve_source_roots, scan_domain};
 
 /// Write a harbor-shaped MANIFEST at `dir`, declaring a `## Provisioning`
 /// section from `bullets` (already `- `-prefixed lines, one per artifact
@@ -457,4 +461,572 @@ fn every_name_a_notice_interpolates_is_backticked() {
             }
         }
     }
+}
+
+// --- artifact keys -------------------------------------------------------------
+
+fn artifact(kind: ArtifactType, rel: &str) -> ArtifactFile {
+    ArtifactFile {
+        kind,
+        rel: rel.to_string(),
+        source: PathBuf::from(rel),
+        sha256: String::new(),
+        optional: false,
+    }
+}
+
+#[test]
+fn artifact_keys_follow_the_source_names() {
+    // Every file of a skill shares the skill folder's key.
+    assert_eq!(
+        artifact_key(&artifact(ArtifactType::Skills, "tide-tables/SKILL.md")),
+        "skills/tide-tables"
+    );
+    assert_eq!(
+        artifact_key(&artifact(
+            ArtifactType::Skills,
+            "tide-tables/scripts/chart.sh"
+        )),
+        "skills/tide-tables"
+    );
+    // A nested command keeps its namespace slash and drops `.md`.
+    assert_eq!(
+        artifact_key(&artifact(ArtifactType::Commands, "charts/plot-route.md")),
+        "commands/charts/plot-route"
+    );
+    assert_eq!(
+        artifact_key(&artifact(ArtifactType::Commands, "deploy.md")),
+        "commands/deploy"
+    );
+    // An agent is its stem in either dialect.
+    assert_eq!(
+        artifact_key(&artifact(ArtifactType::Agents, "quartermaster.md")),
+        "agents/quartermaster"
+    );
+    assert_eq!(
+        artifact_key(&artifact(ArtifactType::Agents, "quartermaster.toml")),
+        "agents/quartermaster"
+    );
+    // An MCP is the name the scan read from its JSON.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "mcps/beacon.json",
+        r#"{"name": "lighthouse", "server": {"type": "http"}}"#,
+    );
+    let (artifacts, _) = scan_domain("harbor", &[(ArtifactType::Mcps, dir.path().join("mcps"))]);
+    assert_eq!(mcp_key(&artifacts.mcps[0]), "mcps/lighthouse");
+}
+
+#[test]
+fn parse_artifact_key_accepts_the_four_kinds_and_refuses_malformed_ones() {
+    assert_eq!(
+        parse_artifact_key("skills/tide-tables"),
+        Some((ArtifactType::Skills, "tide-tables"))
+    );
+    assert_eq!(
+        parse_artifact_key("commands/deploy"),
+        Some((ArtifactType::Commands, "deploy"))
+    );
+    assert_eq!(
+        parse_artifact_key("agents/quartermaster"),
+        Some((ArtifactType::Agents, "quartermaster"))
+    );
+    assert_eq!(
+        parse_artifact_key("mcps/lighthouse"),
+        Some((ArtifactType::Mcps, "lighthouse"))
+    );
+    // A nested command name is accepted.
+    assert_eq!(
+        parse_artifact_key("commands/charts/plot-route"),
+        Some((ArtifactType::Commands, "charts/plot-route"))
+    );
+
+    for malformed in [
+        "skills",                // no slash
+        "tools/hammer",          // unknown kind
+        "Skills/tide-tables",    // keys compare exactly: the kind is case-sensitive
+        "skills/",               // empty name
+        "skills/..",             // not a plain component
+        "agents/.hidden",        // not a plain component
+        "skills/tide/tables",    // a nested skill name
+        "mcps/a/b",              // a nested mcp name
+        "commands/charts/",      // an empty command segment
+        "commands/charts/../up", // `..` inside a command name
+        "",
+    ] {
+        assert_eq!(parse_artifact_key(malformed), None, "{malformed}");
+    }
+}
+
+// --- the optional mark -----------------------------------------------------------
+
+const OPTIONAL_FRONTMATTER: &str = "---\nname: x\nmetadata:\n  provision: optional\n---\n\nBody.\n";
+
+#[test]
+fn a_skill_marked_optional_marks_every_file_of_the_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "skills/storm/SKILL.md", OPTIONAL_FRONTMATTER);
+    write(dir.path(), "skills/storm/scripts/warn.sh", "echo storm\n");
+    write(dir.path(), "skills/storm/notes/read.md", "No mark here.\n");
+    write(
+        dir.path(),
+        "skills/tide/SKILL.md",
+        "---\nname: tide\n---\n\nTides.\n",
+    );
+
+    let (artifacts, notices) = scan_domain(
+        "harbor",
+        &[(ArtifactType::Skills, dir.path().join("skills"))],
+    );
+    assert!(notices.is_empty(), "{notices:?}");
+    let marks: Vec<(&str, bool)> = artifacts
+        .files
+        .iter()
+        .map(|f| (f.rel.as_str(), f.optional))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            ("storm/SKILL.md", true),
+            ("storm/notes/read.md", true),
+            ("storm/scripts/warn.sh", true),
+            ("tide/SKILL.md", false),
+        ]
+    );
+}
+
+#[test]
+fn commands_agents_and_mcps_read_the_optional_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "commands/charts/plot-route.md",
+        OPTIONAL_FRONTMATTER,
+    );
+    write(
+        dir.path(),
+        "commands/deploy.md",
+        "---\ndescription: Deploy\n---\n\nGo.\n",
+    );
+    write(dir.path(), "agents/quartermaster.md", OPTIONAL_FRONTMATTER);
+    write(dir.path(), "agents/scout.md", "Scout ahead.\n");
+    write(
+        dir.path(),
+        "mcps/lighthouse.json",
+        r#"{"name": "lighthouse", "metadata": {"provision": "optional"}, "server": {"type": "http"}}"#,
+    );
+    write(
+        dir.path(),
+        "mcps/buoy.json",
+        r#"{"name": "buoy", "server": {"type": "stdio"}}"#,
+    );
+
+    let (artifacts, notices) = scan_domain(
+        "harbor",
+        &[
+            (ArtifactType::Commands, dir.path().join("commands")),
+            (ArtifactType::Agents, dir.path().join("agents")),
+            (ArtifactType::Mcps, dir.path().join("mcps")),
+        ],
+    );
+    assert!(notices.is_empty(), "{notices:?}");
+    let files: Vec<(String, bool)> = artifacts
+        .files
+        .iter()
+        .map(|f| (artifact_key(f), f.optional))
+        .collect();
+    assert_eq!(
+        files,
+        vec![
+            ("commands/charts/plot-route".to_string(), true),
+            ("commands/deploy".to_string(), false),
+            ("agents/quartermaster".to_string(), true),
+            ("agents/scout".to_string(), false),
+        ]
+    );
+    let mcps: Vec<(String, bool)> = artifacts
+        .mcps
+        .iter()
+        .map(|m| (mcp_key(m), m.optional))
+        .collect();
+    assert_eq!(
+        mcps,
+        vec![
+            ("mcps/buoy".to_string(), false),
+            ("mcps/lighthouse".to_string(), true),
+        ]
+    );
+}
+
+/// Codex refuses an agent TOML with a `metadata` table, so a `.toml` agent
+/// carries no mark of its own: the scan never reads `[metadata]` there. A
+/// `.toml` agent beside a markdown agent of the same stem takes the
+/// markdown agent's mark, so both files of the one key agree.
+#[test]
+fn a_toml_agent_carries_no_mark_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = "name = \"reviewer\"\ndescription = \"Reviews\"\ndeveloper_instructions = '''\nGo.\n'''\n\n[metadata]\nprovision = \"optional\"\n";
+    write(dir.path(), "agents/reviewer.toml", toml);
+    write(dir.path(), "agents/pilot.md", OPTIONAL_FRONTMATTER);
+    write(
+        dir.path(),
+        "agents/pilot.toml",
+        "name = \"pilot\"\ndescription = \"Steers\"\ndeveloper_instructions = '''\nSteer.\n'''\n",
+    );
+
+    let (artifacts, notices) = scan_domain(
+        "harbor",
+        &[(ArtifactType::Agents, dir.path().join("agents"))],
+    );
+    assert!(notices.is_empty(), "{notices:?}");
+    let marks: Vec<(&str, bool)> = artifacts
+        .files
+        .iter()
+        .map(|f| (f.rel.as_str(), f.optional))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            ("pilot.md", true),
+            ("pilot.toml", true),
+            ("reviewer.toml", false),
+        ]
+    );
+}
+
+#[test]
+fn an_unknown_metadata_provision_value_raises_one_notice_and_reads_as_required() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "skills/storm/SKILL.md",
+        "---\nname: storm\nmetadata:\n  provision: maybe\n---\n\nStorms.\n",
+    );
+    write(dir.path(), "skills/storm/scripts/warn.sh", "echo storm\n");
+    write(
+        dir.path(),
+        "mcps/lighthouse.json",
+        r#"{"name": "lighthouse", "metadata": {"provision": true}, "server": {"type": "http"}}"#,
+    );
+
+    let roots = [
+        (ArtifactType::Skills, dir.path().join("skills")),
+        (ArtifactType::Mcps, dir.path().join("mcps")),
+    ];
+    let (artifacts, notices) = scan_domain("harbor", &roots);
+    assert!(artifacts.files.iter().all(|f| !f.optional));
+    assert!(!artifacts.mcps[0].optional);
+    // One notice per artifact, not one per file of the skill.
+    assert_eq!(
+        notices,
+        vec![
+            "`skills/storm` says `metadata.provision: maybe`; only `optional` has a meaning - treating it as not optional".to_string(),
+            "`mcps/lighthouse` says `metadata.provision: true`; only `optional` has a meaning - treating it as not optional".to_string(),
+        ]
+    );
+    // A different case is a different value: only the exact string marks.
+    write(
+        dir.path(),
+        "skills/storm/SKILL.md",
+        "---\nname: storm\nmetadata:\n  provision: Optional\n---\n\nStorms.\n",
+    );
+    let (artifacts, notices) = scan_domain("harbor", &roots[..1]);
+    assert!(artifacts.files.iter().all(|f| !f.optional));
+    assert_eq!(notices.len(), 1, "{notices:?}");
+}
+
+/// The scan and the listing must agree on a mark that cannot be read: both
+/// read it as optional (fail closed) and raise the same notice naming the
+/// file. `rel` is the file's path inside the kind's folder.
+fn assert_unreadable_mark_reads_optional(kind: ArtifactType, rel: &str, bytes: &[u8], key: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(kind.id()).join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let roots = [(kind, dir.path().join(kind.id()))];
+
+    let (artifacts, notices) = scan_domain("harbor", &roots);
+    assert_eq!(artifacts.files.len(), 1, "{rel}");
+    assert!(artifacts.files[0].optional, "{rel} must read as optional");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].starts_with(&format!("`{key}` (`{rel}`): ")),
+        "{notices:?}"
+    );
+    assert!(
+        notices[0].ends_with(
+            "so its optional mark cannot be read - treating it as optional until it is fixed"
+        ),
+        "{notices:?}"
+    );
+
+    let listing = list_artifacts_in_roots(&roots);
+    assert_eq!(listing.artifacts.len(), 1, "{rel}");
+    assert!(listing.artifacts[0].optional, "{rel} must list as optional");
+    assert_eq!(listing.notices, notices);
+}
+
+/// `list_artifacts` over a domain entry whose MANIFEST declares exactly
+/// `roots`, each `<kind>: <kind id>`.
+fn list_artifacts_in_roots(roots: &[(ArtifactType, PathBuf)]) -> ArtifactListingReport {
+    let base = roots[0].1.parent().unwrap();
+    let bullets: String = roots
+        .iter()
+        .map(|(kind, _)| format!("- {}: {}\n", kind.id(), kind.id()))
+        .collect();
+    write_manifest(base, bullets.trim_end());
+    list_artifacts("harbor", &DomainEntry::file(base))
+}
+
+#[test]
+fn a_frontmatter_that_does_not_parse_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "broken.md",
+        b"---\nmetadata: [unterminated\n---\n\nBody.\n",
+        "commands/broken",
+    );
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Agents,
+        "list.md",
+        b"---\n- a\n- b\n---\n\nBody.\n",
+        "agents/list",
+    );
+}
+
+#[test]
+fn a_skill_whose_frontmatter_does_not_parse_reads_as_optional_in_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "skills/storm/SKILL.md",
+        "---\nname: storm\nmetadata: {provision: optional\n---\n\nStorms.\n",
+    );
+    write(dir.path(), "skills/storm/scripts/warn.sh", "echo storm\n");
+    let roots = [(ArtifactType::Skills, dir.path().join("skills"))];
+    let (artifacts, notices) = scan_domain("harbor", &roots);
+    assert_eq!(artifacts.files.len(), 2);
+    assert!(artifacts.files.iter().all(|f| f.optional));
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0]
+            .starts_with("`skills/storm` (`storm/SKILL.md`): its frontmatter is not valid YAML"),
+        "{notices:?}"
+    );
+    let listing = list_artifacts_in_roots(&roots);
+    assert!(listing.artifacts[0].optional);
+    assert_eq!(listing.notices, notices);
+}
+
+#[test]
+fn a_frontmatter_after_a_byte_order_mark_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "bom.md",
+        "\u{feff}---\ndescription: Deploy\n---\n\nGo.\n".as_bytes(),
+        "commands/bom",
+    );
+}
+
+#[test]
+fn a_frontmatter_after_blank_lines_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Agents,
+        "late.md",
+        b"\n  \r\n---\ndescription: Late\n---\n\nBody.\n",
+        "agents/late",
+    );
+}
+
+#[test]
+fn a_frontmatter_with_no_closing_line_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "open.md",
+        b"---\ndescription: Open\n\nBody with no closing line.\n",
+        "commands/open",
+    );
+}
+
+#[test]
+fn a_markdown_file_that_is_not_utf8_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "latin.md",
+        b"---\ndescription: Caf\xe9\n---\n\nBody.\n",
+        "commands/latin",
+    );
+}
+
+#[test]
+fn a_file_without_frontmatter_or_with_a_valid_one_raises_no_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "commands/plain.md", "Just a body.\n");
+    write(dir.path(), "commands/empty.md", "");
+    write(
+        dir.path(),
+        "commands/ruled.md",
+        "Intro\n\n---\n\nMore after a rule.\n",
+    );
+    write(
+        dir.path(),
+        "commands/ok.md",
+        "---\ndescription: Fine\n---\n\nBody.\n",
+    );
+    let (artifacts, notices) = scan_domain(
+        "harbor",
+        &[(ArtifactType::Commands, dir.path().join("commands"))],
+    );
+    assert_eq!(artifacts.files.len(), 4);
+    assert!(artifacts.files.iter().all(|f| !f.optional));
+    assert!(notices.is_empty(), "{notices:?}");
+}
+
+// --- the light listing -----------------------------------------------------------
+
+/// A harbor with all four kinds, optional and required artifacts of each, a
+/// skill with several files and an agent in both dialects.
+fn write_marked_harbor(dir: &Path) {
+    write_manifest(
+        dir,
+        "- skills: skills\n- commands: commands\n- agents: agents\n- mcps: mcps\n",
+    );
+    write(dir, "skills/storm/SKILL.md", OPTIONAL_FRONTMATTER);
+    write(dir, "skills/storm/scripts/warn.sh", "echo storm\n");
+    write(
+        dir,
+        "skills/tide/SKILL.md",
+        "---\nname: tide\n---\n\nTides.\n",
+    );
+    write(dir, "skills/tide/notes.md", "Notes.\n");
+    write(dir, "commands/charts/plot-route.md", OPTIONAL_FRONTMATTER);
+    write(dir, "commands/deploy.md", "Deploy.\n");
+    write(dir, "agents/pilot.md", OPTIONAL_FRONTMATTER);
+    write(
+        dir,
+        "agents/pilot.toml",
+        "name = \"pilot\"\ndescription = \"Steers\"\ndeveloper_instructions = '''\nSteer.\n'''\n",
+    );
+    write(
+        dir,
+        "agents/reviewer.toml",
+        "name = \"reviewer\"\ndescription = \"Reviews\"\ndeveloper_instructions = '''\nGo.\n'''\n",
+    );
+    write(dir, "agents/scout.md", "Scout ahead.\n");
+    write(
+        dir,
+        "mcps/lighthouse.json",
+        r#"{"name": "lighthouse", "metadata": {"provision": "optional"}, "server": {"type": "http"}}"#,
+    );
+    write(
+        dir,
+        "mcps/buoy.json",
+        r#"{"name": "buoy", "server": {"type": "stdio"}}"#,
+    );
+    // Skipped by both, with the same notices.
+    write(dir, "skills/no-skill/notes.txt", "stray\n");
+    write(dir, "mcps/broken.json", "{not json");
+    write(
+        dir,
+        "skills/odd/SKILL.md",
+        "---\nmetadata:\n  provision: sometimes\n---\n\nOdd.\n",
+    );
+}
+
+#[test]
+fn list_artifacts_agrees_with_scan_domain_on_keys_and_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    write_marked_harbor(dir.path());
+    let entry = DomainEntry::file(dir.path());
+
+    let (artifacts, scan_notices) = scan_domain("harbor", &resolve_source_roots("harbor", &entry));
+    let mut from_scan: Vec<(String, bool)> = artifacts
+        .files
+        .iter()
+        .map(|f| (artifact_key(f), f.optional))
+        .chain(artifacts.mcps.iter().map(|m| (mcp_key(m), m.optional)))
+        .collect();
+    // A skill's files and an agent's two dialects share one key each.
+    from_scan.dedup();
+
+    let listing = list_artifacts("harbor", &entry);
+    let from_listing: Vec<(String, bool)> = listing
+        .artifacts
+        .iter()
+        .map(|row| (row.key.clone(), row.optional))
+        .collect();
+
+    assert_eq!(from_listing, from_scan);
+    assert_eq!(
+        from_listing,
+        vec![
+            ("skills/odd".to_string(), false),
+            ("skills/storm".to_string(), true),
+            ("skills/tide".to_string(), false),
+            ("commands/charts/plot-route".to_string(), true),
+            ("commands/deploy".to_string(), false),
+            ("agents/pilot".to_string(), true),
+            ("agents/reviewer".to_string(), false),
+            ("agents/scout".to_string(), false),
+            ("mcps/buoy".to_string(), false),
+            ("mcps/lighthouse".to_string(), true),
+        ]
+    );
+    let mut scan_notices = scan_notices;
+    let mut listing_notices = listing.notices.clone();
+    scan_notices.sort();
+    listing_notices.sort();
+    assert_eq!(listing_notices, scan_notices);
+    assert_eq!(listing_notices.len(), 3, "{listing_notices:?}");
+}
+
+#[test]
+fn list_artifacts_lists_a_skill_once() {
+    let dir = tempfile::tempdir().unwrap();
+    write_marked_harbor(dir.path());
+    let listing = list_artifacts("harbor", &DomainEntry::file(dir.path()));
+
+    let storm: Vec<&ArtifactListing> = listing
+        .artifacts
+        .iter()
+        .filter(|row| row.kind == ArtifactType::Skills && row.name == "storm")
+        .collect();
+    assert_eq!(storm.len(), 1);
+    assert_eq!(storm[0].key, "skills/storm");
+    assert!(storm[0].optional);
+
+    // A nested command's name keeps its namespace.
+    assert!(
+        listing
+            .artifacts
+            .iter()
+            .any(|row| row.key == "commands/charts/plot-route" && row.name == "charts/plot-route")
+    );
+}
+
+#[test]
+fn list_artifacts_reports_only_kinds_whose_root_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "- skills: skills\n- commands: commands\n- agents: agents\n- mcps: mcps\n",
+    );
+    write(dir.path(), "skills/tide/SKILL.md", "Tides.\n");
+    // An existing but empty agents folder is present; it ships nothing.
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let listing = list_artifacts("harbor", &DomainEntry::file(dir.path()));
+    assert_eq!(
+        listing.present_kinds,
+        vec![ArtifactType::Skills, ArtifactType::Agents]
+    );
+    assert_eq!(listing.artifacts.len(), 1);
+    assert!(listing.notices.is_empty(), "{:?}", listing.notices);
+}
+
+#[test]
+fn list_artifacts_of_a_virtual_domain_is_empty() {
+    let listing = list_artifacts("lab", &DomainEntry::virtual_domain());
+    assert_eq!(listing, ArtifactListingReport::default());
 }

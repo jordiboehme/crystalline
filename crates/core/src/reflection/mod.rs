@@ -48,16 +48,17 @@ pub use links::{rebase_links, relative_to, rewrite_asset_links, rewrite_links_to
 pub use page::{
     FOLDER_PARENT, FOLLOWS_CYCLE, FOLLOWS_KEY, FOLLOWS_MISSING, FOLLOWS_NO_PAGE,
     FOLLOWS_OTHER_DOMAIN, FRESHNESS_KEY, FRESHNESS_ON_OWNED_PAGE, FRESHNESS_TOO_SHORT,
-    FRESHNESS_UNREADABLE, Freshness, MIN_FRESHNESS_SECONDS, OWNER_KEY, OWNER_MISSING, PAGE_KEYS,
-    PAGE_PACT_SUFFIX, PactChain, PageFinding, PageLinks, PageSettings, PageTiming, RunSpan,
-    STATUS_KEY, carry_page_keys, follows_refusal, is_loose_pact, pact_chain, pact_page_of,
-    page_key_values, page_pact_path, parse_freshness, read_page_settings, repeated_page_keys,
-    rewrite_follows, without_page_keys, would_cycle,
+    FRESHNESS_UNREADABLE, Freshness, MARK_UNREADABLE, MIN_FRESHNESS_SECONDS, OWNER_KEY,
+    OWNER_MISSING, PAGE_KEYS, PAGE_PACT_SUFFIX, PactChain, PageFinding, PageLinks, PageSettings,
+    PageTiming, RunSpan, STATUS_KEY, carry_page_keys, follows_refusal, is_loose_pact, pact_chain,
+    pact_page_of, page_key_values, page_pact_path, parse_freshness, read_page_settings,
+    repeated_page_keys, rewrite_follows, without_page_keys, would_cycle,
 };
 pub use provenance::{
-    PAGE_RECORD_KEY, PROVENANCE_KEY, PageRecord, Provenance, Retirement, SectionRecord, SourceName,
-    SourceRef, block_as_written, parse_source_name, provenance_unreadable, read_provenance,
-    respell_source_domains, source_domains_named, text_changed, title_of, write_provenance,
+    PAGE_RECORD_KEY, PROVENANCE_KEY, PageRecord, Provenance, REFRESH_REQUESTED_BY_KEY,
+    REFRESH_REQUESTED_KEY, Retirement, SectionRecord, SourceName, SourceRef, block_as_written,
+    parse_source_name, provenance_unreadable, read_provenance, respell_source_domains,
+    source_domains_named, text_changed, title_of, write_provenance,
 };
 pub use reconcile::{
     CoverChange, cover_change, owned_pages, owner_refusal, pact_hash, pact_hashes, page_pact_hash,

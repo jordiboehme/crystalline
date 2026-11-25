@@ -33,6 +33,7 @@ mod docs_links;
 mod doctor;
 mod doctor_names;
 mod domain_case;
+mod domains_root;
 #[cfg(unix)]
 mod harness_install;
 #[cfg(unix)]

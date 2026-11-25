@@ -141,6 +141,14 @@ pub struct SectionRecord {
 /// text before the first `##`.
 pub const PAGE_RECORD_KEY: &str = "_page";
 
+/// The key of the page record that holds when the page was last marked not
+/// fresh ([`PageRecord::refresh_requested`]).
+pub const REFRESH_REQUESTED_KEY: &str = "refresh_requested";
+
+/// The key of the page record that holds who marked the page not fresh
+/// ([`PageRecord::refresh_requested_by`]).
+pub const REFRESH_REQUESTED_BY_KEY: &str = "refresh_requested_by";
+
 /// What Crystalline keeps about the page as a whole, under
 /// [`PAGE_RECORD_KEY`] in the block.
 ///
@@ -155,11 +163,16 @@ pub const PAGE_RECORD_KEY: &str = "_page";
 /// an empty record here.
 ///
 /// A part that does not read is never dropped and never makes the block
-/// unreadable (the record holds no sources): an `owner` or a `retired` that
-/// does not read is kept as written in `other`, a `_page` that is no mapping
-/// is kept whole in `unread`, both are written back as they were, and each
-/// is named in `unreadable` so it can be reported. `owner` and `retired`
-/// read on their own, so a broken `retired` costs `owner` nothing.
+/// unreadable (the record holds no sources): an `owner`, a `retired`, a
+/// `refresh_requested` or a `refresh_requested_by` that does not read is
+/// kept as written in `other`, a `_page` that is no mapping is kept whole
+/// in `unread`, both are written back as they were, and each is named in
+/// `unreadable` so it can be reported. Each key reads on its own, so a
+/// broken `retired` costs `owner` nothing.
+///
+/// A not-fresh mark ([`PageRecord::refresh_requested`]) is written by a
+/// person who wants the next reflect run to reconcile the page in full,
+/// and taken off by the reconcile that saw it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageRecord {
     /// The Reflection page that owns this one, by its path relative to the
@@ -168,36 +181,71 @@ pub struct PageRecord {
     /// When and by whom the page was retired, and the page that owned it
     /// then.
     pub retired: Option<Retirement>,
-    /// Keys this binary does not know, and an `owner` or a `retired` that
-    /// does not read, kept as they were through a read and a write, so a
-    /// newer binary's data survives an older one. A typed `owner` or
-    /// `retired` replaces a kept one of the same name when written.
+    /// When the page was last marked not fresh: RFC 3339 in UTC with
+    /// milliseconds, as written. Only a value that reads as RFC 3339 is
+    /// held here; anything else is kept in `other` and counts as no mark.
+    pub refresh_requested: Option<String>,
+    /// Who marked the page not fresh, by login.
+    pub refresh_requested_by: Option<String>,
+    /// Keys this binary does not know, and a typed key that does not read,
+    /// kept as they were through a read and a write, so a newer binary's
+    /// data survives an older one. A typed key replaces a kept one of the
+    /// same name when written.
     pub other: serde_yaml_ng::Mapping,
     /// A `_page` value that is no mapping, kept to be written back as it
     /// was while the record has nothing typed or kept to write instead.
     pub unread: Option<serde_yaml_ng::Value>,
     /// The parts that did not read, for a finding: [`PAGE_RECORD_KEY`] for a
-    /// `_page` that is no mapping, `owner` or `retired` for that key. Filled
+    /// `_page` that is no mapping, else the key that did not read. Filled
     /// by [`read_provenance`]; never written.
     pub unreadable: Vec<String>,
 }
 
 impl PageRecord {
-    /// Whether there is nothing to record: no owner, no retirement, no key
-    /// this binary does not know and no value kept unread.
+    /// Whether there is nothing to record: no owner, no retirement, no
+    /// mark, no key this binary does not know and no value kept unread.
     pub fn is_empty(&self) -> bool {
-        self.owner.is_none()
-            && self.retired.is_none()
-            && self.other.is_empty()
-            && self.unread.is_none()
+        !self.has_typed() && self.other.is_empty() && self.unread.is_none()
+    }
+
+    /// Whether any typed key holds a value.
+    fn has_typed(&self) -> bool {
+        self.owner.is_some()
+            || self.retired.is_some()
+            || self.refresh_requested.is_some()
+            || self.refresh_requested_by.is_some()
+    }
+
+    /// The not-fresh mark in milliseconds since the epoch, when the page
+    /// carries one that reads.
+    pub fn mark_millis(&self) -> Option<i64> {
+        let at = self.refresh_requested.as_deref()?;
+        crate::time::parse_rfc3339(at).map(|at| at.stamp().unix_millis())
+    }
+
+    /// Mark the page not fresh at `at` (RFC 3339) by `by`, replacing a mark
+    /// it carried and a kept value of either key that did not read.
+    pub fn set_mark(&mut self, at: String, by: String) {
+        self.other.remove(REFRESH_REQUESTED_KEY);
+        self.other.remove(REFRESH_REQUESTED_BY_KEY);
+        self.refresh_requested = Some(at);
+        self.refresh_requested_by = Some(by);
+    }
+
+    /// Take the not-fresh mark off: both keys, typed or kept.
+    pub fn clear_mark(&mut self) {
+        self.other.remove(REFRESH_REQUESTED_KEY);
+        self.other.remove(REFRESH_REQUESTED_BY_KEY);
+        self.refresh_requested = None;
+        self.refresh_requested_by = None;
     }
 
     /// The record as it is written under [`PAGE_RECORD_KEY`]: `owner`,
-    /// `retired`, then the kept keys in their order; the unread value when
-    /// there is nothing else.
+    /// `retired`, `refresh_requested`, `refresh_requested_by`, then the
+    /// kept keys in their order; the unread value when there is nothing
+    /// else.
     fn to_value(&self) -> Result<serde_yaml_ng::Value, String> {
-        if self.owner.is_none()
-            && self.retired.is_none()
+        if !self.has_typed()
             && self.other.is_empty()
             && let Some(raw) = &self.unread
         {
@@ -213,10 +261,18 @@ impl PageRecord {
                 serde_yaml_ng::to_value(retired).map_err(|e| e.to_string())?,
             );
         }
+        if let Some(at) = &self.refresh_requested {
+            map.insert(REFRESH_REQUESTED_KEY.into(), at.as_str().into());
+        }
+        if let Some(by) = &self.refresh_requested_by {
+            map.insert(REFRESH_REQUESTED_BY_KEY.into(), by.as_str().into());
+        }
         for (key, value) in &self.other {
             let typed = match key.as_str() {
                 Some("owner") => self.owner.is_some(),
                 Some("retired") => self.retired.is_some(),
+                Some(REFRESH_REQUESTED_KEY) => self.refresh_requested.is_some(),
+                Some(REFRESH_REQUESTED_BY_KEY) => self.refresh_requested_by.is_some(),
                 _ => false,
             };
             if !typed {
@@ -253,6 +309,26 @@ impl PageRecord {
                     Err(_) => {
                         page.other.insert(key.clone(), value.clone());
                         page.unreadable.push("retired".to_string());
+                    }
+                },
+                Some(REFRESH_REQUESTED_KEY) => match value {
+                    serde_yaml_ng::Value::String(at)
+                        if crate::time::parse_rfc3339(at).is_some() =>
+                    {
+                        page.refresh_requested = Some(at.clone());
+                    }
+                    _ => {
+                        page.other.insert(key.clone(), value.clone());
+                        page.unreadable.push(REFRESH_REQUESTED_KEY.to_string());
+                    }
+                },
+                Some(REFRESH_REQUESTED_BY_KEY) => match value {
+                    serde_yaml_ng::Value::String(by) => {
+                        page.refresh_requested_by = Some(by.clone());
+                    }
+                    _ => {
+                        page.other.insert(key.clone(), value.clone());
+                        page.unreadable.push(REFRESH_REQUESTED_BY_KEY.to_string());
                     }
                 },
                 _ => {
@@ -1004,6 +1080,141 @@ mod tests {
             write_provenance(page, &prov).unwrap(),
             "---\nreflection:\n  _page:\n    owner: arch/overview.md\n---\n\n# T\n"
         );
+    }
+
+    /// A not-fresh mark is written after `owner` and `retired` and before
+    /// the kept keys, reads back as written, and goes with `clear_mark`.
+    #[test]
+    fn a_mark_round_trips_after_owner_and_retired_and_goes_again() {
+        let mut prov = Provenance::new();
+        prov.insert("aaaa1111".into(), record());
+        prov.page = owned_and_retired();
+        prov.page
+            .other
+            .insert("zeta".into(), serde_yaml_ng::Value::Bool(true));
+        prov.page
+            .set_mark("2026-11-25T14:03:07.412Z".into(), "ada".into());
+        let written = write_provenance(PAGE, &prov).unwrap();
+        let block = block_as_written(&written).unwrap();
+        let page_keys: Vec<&str> = block
+            .split_once(
+                "_page:
+",
+            )
+            .unwrap()
+            .1
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+            .map(|l| l.trim().split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            page_keys,
+            [
+                "owner",
+                "retired",
+                "refresh_requested",
+                "refresh_requested_by",
+                "zeta"
+            ],
+            "{block}"
+        );
+        assert!(
+            block.contains("  refresh_requested: 2026-11-25T14:03:07.412Z\n"),
+            "{block}"
+        );
+        let back = read_provenance(&written);
+        assert_eq!(back, prov);
+        assert_eq!(back.page.mark_millis(), Some(1_795_615_387_412));
+        assert_eq!(write_provenance(&written, &back).unwrap(), written);
+
+        let mut cleared = back.clone();
+        cleared.page.clear_mark();
+        assert_eq!(cleared.page.mark_millis(), None);
+        let without = write_provenance(&written, &cleared).unwrap();
+        assert!(!without.contains("refresh_requested"), "{without}");
+        assert!(without.contains("zeta: true"), "{without}");
+
+        // A mark alone is something to record, and clearing it takes the
+        // whole page record away.
+        let mut only = Provenance::new();
+        only.page
+            .set_mark("2026-11-25T14:03:07.412Z".into(), "ada".into());
+        assert!(!only.is_empty());
+        let bare = "# T\n";
+        let marked = write_provenance(bare, &only).unwrap();
+        assert_eq!(
+            marked,
+            "---\nreflection:\n  _page:\n    refresh_requested: 2026-11-25T14:03:07.412Z\n    refresh_requested_by: ada\n---\n\n# T\n"
+        );
+        let mut read = read_provenance(&marked);
+        read.page.clear_mark();
+        assert!(read.page.is_empty());
+        assert_eq!(write_provenance(&marked, &read).unwrap(), bare);
+    }
+
+    /// A mark that is no RFC 3339 time, or a `refresh_requested_by` that is
+    /// no string, is kept as written, named in `unreadable` and counts as no
+    /// mark; the page settings name an unreadable mark as a finding. A new
+    /// mark replaces the kept value.
+    #[test]
+    fn a_mark_that_does_not_read_is_kept_and_named() {
+        let page = "---\nreflection:\n  _page:\n    owner: arch/overview.md\n    refresh_requested: last tuesday\n    refresh_requested_by: 7\n---\n\n# T\n";
+        let prov = read_provenance(page);
+        assert_eq!(
+            prov.page.unreadable,
+            ["refresh_requested", "refresh_requested_by"]
+        );
+        assert_eq!(prov.page.refresh_requested, None);
+        assert_eq!(prov.page.mark_millis(), None);
+        assert_eq!(prov.page.owner.as_deref(), Some("arch/overview.md"));
+        assert_eq!(write_provenance(page, &prov).unwrap(), page);
+        let (_, findings) =
+            crate::reflection::read_page_settings(page, "arch/overview/db.md", &prov.page);
+        let finding = findings
+            .iter()
+            .find(|f| f.key == REFRESH_REQUESTED_KEY)
+            .expect("a finding for the mark");
+        assert_eq!(finding.value, "last tuesday");
+        assert_eq!(finding.reason, crate::reflection::MARK_UNREADABLE);
+
+        let mut marked = prov.clone();
+        marked
+            .page
+            .set_mark("2026-11-25T14:03:07.412Z".into(), "ada".into());
+        let written = write_provenance(page, &marked).unwrap();
+        assert_eq!(
+            written,
+            "---\nreflection:\n  _page:\n    owner: arch/overview.md\n    refresh_requested: 2026-11-25T14:03:07.412Z\n    refresh_requested_by: ada\n---\n\n# T\n"
+        );
+    }
+
+    /// A binary from before the mark (0.36) reads both keys as keys it does
+    /// not know, keeps them in `other` and writes them back as they were:
+    /// the same record with the typed keys moved to `other` writes the same
+    /// block. A section record reader (0.34.1) ignores them.
+    #[test]
+    fn an_older_reader_keeps_the_mark_through_a_write() {
+        let mut prov = Provenance::new();
+        prov.insert("aaaa1111".into(), record());
+        prov.page.owner = Some("arch/overview.md".into());
+        prov.page
+            .set_mark("2026-11-25T14:03:07.412Z".into(), "ada".into());
+        let written = write_provenance(PAGE, &prov).unwrap();
+        let mut as_036 = read_provenance(&written);
+        let at = as_036.page.refresh_requested.take().unwrap();
+        let by = as_036.page.refresh_requested_by.take().unwrap();
+        as_036
+            .page
+            .other
+            .insert(REFRESH_REQUESTED_KEY.into(), at.as_str().into());
+        as_036
+            .page
+            .other
+            .insert(REFRESH_REQUESTED_BY_KEY.into(), by.as_str().into());
+        assert_eq!(write_provenance(&written, &as_036).unwrap(), written);
+        assert!(!older_binary::provenance_unreadable(&written));
+        let old = older_binary::read_provenance(&written);
+        assert_eq!(old["_page"], older_binary::SectionRecord::default());
     }
 
     /// `_page` is never a section id: an id line never names it, and a section record keyed by it is refused on

@@ -61,6 +61,12 @@ impl ProvisionReceipt {
     /// and the old name's other stamps join them. Which one is kept does not
     /// matter for correctness: a stamp is only a cache of the last scan, and a
     /// wrong one merely makes the next reconcile rehash that file.
+    ///
+    /// The decision fingerprint and the optional keys move too. When `new`
+    /// already has a fingerprint it stays, else the old name's is taken; the
+    /// two optional lists join. A wrong fingerprint only costs one extra
+    /// reconcile, and a joined optional list can only hold back a newly
+    /// optional notice, never raise a false one.
     pub fn rename_domain(&mut self, old: &str, new: &str) -> bool {
         if old == new {
             return false;
@@ -71,6 +77,12 @@ impl ProvisionReceipt {
             for (key, stamp) in sources.files {
                 target.files.entry(key).or_insert(stamp);
             }
+            if target.decision.is_none() {
+                target.decision = sources.decision;
+            }
+            target.optional.extend(sources.optional);
+            target.optional.sort();
+            target.optional.dedup();
             moved = true;
         }
         for harness in self.harnesses.values_mut() {
@@ -87,11 +99,29 @@ impl ProvisionReceipt {
 
 /// One domain's source stamps, keyed the same way a scan keys an
 /// [`crate::provision::model::ArtifactFile`]: `"<kind.id()>/<rel>"`.
+///
+/// The stamps cover every scanned file of the domain, also the files its
+/// decision leaves out: the session prefilter walks the source folders
+/// without knowing the decision, so stamping only the selected files would
+/// make it find more files than stamps and reconcile on every session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DomainSources {
     /// Key to stamp.
     #[serde(default)]
     pub files: BTreeMap<String, SourceStamp>,
+    /// The domain's decision at the last apply, as
+    /// [`crate::config::Provision::fingerprint`] writes it. `None` (and
+    /// absent from the file) for plain `true`, so a receipt written before
+    /// picks existed matches a plain `true` decision. The session prefilter
+    /// compares it with the config's decision, so a hand-edited pick
+    /// reconciles at the next session start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    /// The artifact keys (`<kind>/<name>`) the domain marked optional at the
+    /// last apply, sorted. A key that is optional now but missing here was
+    /// made optional since, which raises the newly optional notice once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<String>,
 }
 
 /// A cheap fingerprint of a source file as last scanned: its modification
@@ -232,6 +262,8 @@ mod tests {
                         sha256: sha256_hex(b"tide tables"),
                     },
                 )]),
+                decision: Some("except=skills/storm-warnings".to_string()),
+                optional: vec!["mcps/lighthouse".to_string()],
             },
         );
         receipt.harnesses.insert(
@@ -264,6 +296,11 @@ mod tests {
             .unwrap();
         assert_eq!(stamp.mtime, 1_700_000_000);
         assert_eq!(stamp.size, 42);
+        assert_eq!(
+            domain_sources.decision.as_deref(),
+            Some("except=skills/storm-warnings")
+        );
+        assert_eq!(domain_sources.optional, vec!["mcps/lighthouse"]);
         let harness = loaded.harnesses.get("claude-code").unwrap();
         assert_eq!(
             harness.files["skills/tide-tables/SKILL.md"].domain,
@@ -293,6 +330,8 @@ mod tests {
                 domain.to_string(),
                 DomainSources {
                     files: BTreeMap::from([(format!("skills/{domain}/SKILL.md"), stamp(b"x"))]),
+                    decision: Some(format!("except=skills/{domain}-old")),
+                    optional: vec![format!("skills/{domain}-extra")],
                 },
             );
         }
@@ -331,6 +370,15 @@ mod tests {
                 .files
                 .contains_key("skills/eng/SKILL.md")
         );
+        assert_eq!(
+            receipt.sources["platform"].decision.as_deref(),
+            Some("except=skills/eng-old"),
+            "the decision fingerprint moves with the stamps"
+        );
+        assert_eq!(
+            receipt.sources["platform"].optional,
+            vec!["skills/eng-extra"]
+        );
         assert!(receipt.sources.contains_key("ops"));
         let harness = &receipt.harnesses["claude-code"];
         assert_eq!(harness.files["skills/eng/SKILL.md"].domain, "platform");
@@ -356,6 +404,8 @@ mod tests {
             "platform".to_string(),
             DomainSources {
                 files: BTreeMap::from([("skills/eng/SKILL.md".to_string(), stamp(b"newer"))]),
+                decision: None,
+                optional: vec!["mcps/platform-only".to_string()],
             },
         );
         receipt
@@ -369,6 +419,48 @@ mod tests {
         let files = &receipt.sources["platform"].files;
         assert_eq!(files["skills/eng/SKILL.md"], stamp(b"newer"));
         assert_eq!(files["agents/extra.md"], stamp(b"extra"));
+        // The new name had no fingerprint, so the old name's is taken; the
+        // optional lists join.
+        assert_eq!(
+            receipt.sources["platform"].decision.as_deref(),
+            Some("except=skills/eng-old")
+        );
+        assert_eq!(
+            receipt.sources["platform"].optional,
+            vec!["mcps/platform-only", "skills/eng-extra"]
+        );
+    }
+
+    #[test]
+    fn renaming_onto_a_name_with_its_own_fingerprint_keeps_it() {
+        let mut receipt = two_domain_receipt();
+        assert!(receipt.rename_domain("eng", "ops"));
+        assert_eq!(
+            receipt.sources["ops"].decision.as_deref(),
+            Some("except=skills/ops-old")
+        );
+        assert_eq!(
+            receipt.sources["ops"].optional,
+            vec!["skills/eng-extra", "skills/ops-extra"]
+        );
+    }
+
+    #[test]
+    fn a_receipt_without_decision_or_optional_loads_and_writes_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provisions.json");
+        std::fs::write(
+            &path,
+            r#"{"format": 1, "sources": {"harbor": {"files": {}}}, "harnesses": {}}"#,
+        )
+        .unwrap();
+        let receipt = load(&path).unwrap();
+        assert_eq!(receipt.sources["harbor"].decision, None);
+        assert!(receipt.sources["harbor"].optional.is_empty());
+        save(&path, &receipt).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("decision"), "{text}");
+        assert!(!text.contains("optional"), "{text}");
     }
 
     #[test]

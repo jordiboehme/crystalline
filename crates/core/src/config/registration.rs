@@ -645,7 +645,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let mut team = DomainEntry::file(root.clone());
-        team.provision = Some(true);
+        team.provision = Some(crate::config::Provision::all());
         team.review = Some(crate::config::ReviewMode::Overlay);
         team.origin = Some(crate::config::OriginConfig {
             repo: "acme/kb".to_string(),

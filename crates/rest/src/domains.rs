@@ -27,6 +27,7 @@ use crate::scope::Scope;
 use crystalline_core::manifest_view::{
     ManifestFacts, ManifestProblemRow, PolicyRow, RoutingSection, manifest_facts,
 };
+use crystalline_core::provision::ArtifactListing;
 use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
@@ -94,7 +95,7 @@ use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
                 "domains": [{
                     "name": "eng",
                     "kind": "file",
-                    "path": "/Users/ada/Documents/Crystalline/eng",
+                    "path": "/Users/ada/.crystalline/eng",
                     "engrams": 4,
                     "observations": 12,
                     "relations": 3,
@@ -325,7 +326,10 @@ pub async fn tree(
 /// version half exists because `sections` is read out of the markdown by
 /// this binary rather than sent as written: a shape it gained across a
 /// release (`sections` itself arrived in 0.18.3) would otherwise stay hidden
-/// behind a 304 answered from a browser's pre-upgrade cache.
+/// behind a 304 answered from a browser's pre-upgrade cache. When the
+/// provisioning folders list artifacts, a short hash of that listing follows
+/// after one more `-` (see [`manifest_etag`]), so a new artifact or a changed
+/// optional mark is never masked by a 304 either.
 #[utoipa::path(
     get,
     path = "/api/v1/domains/{domain}/manifest",
@@ -337,7 +341,12 @@ pub async fn tree(
                    `\"{checksum}-{version}\"`: the plain content checksum \
                    plus this binary's own version, so a shape `sections` \
                    gains across a release is never masked by a 304 answered \
-                   from a browser's pre-upgrade cache. It is the same \
+                   from a browser's pre-upgrade cache. When the \
+                   provisioning folders list artifacts, a short hash of \
+                   that listing follows after one more `-`, so a new \
+                   artifact or a changed optional mark is never masked by \
+                   a 304 either; the body's `checksum` stays the \
+                   MANIFEST's own. It is the same \
                    validator a later `PUT` compares an `If-Match` against, \
                    which accepts either this full tag or the bare checksum. \
                    `If-None-Match` naming the current tag answers 304 with \
@@ -363,9 +372,10 @@ pub async fn tree(
             "If-None-Match" = Option<String>,
             Header,
             description = "The quoted tag of a version already held: the \
-                           bare checksum, or `\"{checksum}-{version}\"`. A \
-                           match against the CURRENT tag answers 304 with \
-                           no body.",
+                           bare checksum, `\"{checksum}-{version}\"`, or \
+                           that tag with the listing hash after one more \
+                           `-`. A match against the CURRENT tag answers 304 \
+                           with no body.",
             example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
@@ -376,8 +386,10 @@ pub async fn tree(
             body = ManifestResponse,
             headers(
                 ("etag" = String, description = "The quoted \
-                 `\"{checksum}-{version}\"` of the manifest as read, the \
-                 token a later `PUT` carries in `If-Match`."),
+                 `\"{checksum}-{version}\"` of the manifest as read, \
+                 followed by `-` and a short hash of the artifact listing \
+                 when the provisioning folders list any; the token a later \
+                 `PUT` carries in `If-Match`."),
                 ("cache-control" = String, description = "Always `no-cache`: \
                  store it, but revalidate before every use."),
             ),
@@ -447,8 +459,11 @@ pub async fn manifest(
     // the empty text's checksum and `missing: true`, so the editor can offer
     // the starter document and its save creates the file.
     let source = state.engine.manifest_source(&domain).await?;
+    // The listing is read from the source folders, not from the MANIFEST, so
+    // it is read before the conditional check: the tag covers it too.
+    let artifacts = state.engine.provision_listing(&domain);
     let checksum = manifest_checksum(&source.markdown);
-    let tag = versioned_etag(&checksum);
+    let tag = manifest_etag(&checksum, &artifacts);
     if if_none_match_matches(&headers, &tag) {
         let etag = HeaderValue::from_str(&format!("\"{tag}\""))
             .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
@@ -469,6 +484,7 @@ pub async fn manifest(
         source.missing,
         StatusCode::OK,
         None,
+        artifacts,
     )?;
     resp.headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
@@ -561,6 +577,28 @@ pub struct ProvisioningView {
     pub decls: Vec<ProvisioningDeclView>,
     /// The bullets that did not parse, or lost to an earlier duplicate.
     pub problems: Vec<ManifestProblem>,
+    /// The artifacts the declared folders ship on the server's disk, by kind
+    /// and key. No on or off: that is decided per machine, and the server's
+    /// machine is not the reader's. Filled by the handlers from the engine, so the
+    /// pure parse of the markdown leaves it empty.
+    pub artifacts: Vec<ProvisioningArtifactView>,
+}
+
+/// One artifact a domain ships.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProvisioningArtifactView {
+    /// The provisioning key, `<kind>/<name>`.
+    #[schema(example = "skills/storm-warnings")]
+    pub key: String,
+    /// `skills`, `commands`, `agents` or `mcps`.
+    #[schema(example = "skills")]
+    pub kind: String,
+    /// The key without its `<kind>/` prefix.
+    #[schema(example = "storm-warnings")]
+    pub name: String,
+    /// True when the artifact is marked `metadata: { provision: optional }`.
+    #[schema(example = false)]
+    pub optional: bool,
 }
 
 /// One `kind: path` declaration.
@@ -706,6 +744,7 @@ impl ManifestSections {
                     })
                     .collect(),
                 problems: section.problems.into_iter().map(Into::into).collect(),
+                artifacts: Vec::new(),
             }),
             tag_aliases: tag_aliases.map(|section| TagAliasesView {
                 decls: section
@@ -818,9 +857,10 @@ pub struct SaveManifestBody {
             "If-Match" = String,
             Header,
             description = "The quoted `ETag` of the version being replaced, \
-                           from the manifest read: the bare checksum or \
-                           `\"{checksum}-{version}\"`, either way compared \
-                           by checksum only.",
+                           from the manifest read: the bare checksum, \
+                           `\"{checksum}-{version}\"` or that tag with the \
+                           listing hash, every form compared by checksum \
+                           only.",
             example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
@@ -832,7 +872,9 @@ pub struct SaveManifestBody {
             body = ManifestResponse,
             headers(("etag" = String, description = "The quoted \
                      `\"{checksum}-{version}\"` of the manifest as saved, \
-                     the token the next save carries.")),
+                     followed by `-` and a short hash of the artifact \
+                     listing when there is one; the token the next save \
+                     carries.")),
             example = json!({
                 "domain": "eng",
                 "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
@@ -980,6 +1022,7 @@ pub async fn save_manifest(
             false,
             StatusCode::OK,
             None,
+            state.engine.provision_listing(&domain),
         ),
         // The same stale-edit translation `engrams::save` makes, repeated
         // rather than shared for the same reason.
@@ -990,7 +1033,7 @@ pub async fn save_manifest(
             let checksum = manifest_checksum(&current);
             Ok(precondition_failed(
                 message,
-                &versioned_etag(&checksum),
+                &manifest_etag(&checksum, &state.engine.provision_listing(&domain)),
                 crystalline_core::to_lf(&current).into_owned(),
             ))
         }
@@ -1045,7 +1088,7 @@ pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
                            a domain connected to GitHub: \"share changes\" then offers \
                            the files in `reflections/` as engram changes.",
             body = ManifestResponse,
-            headers(("etag" = String, description = "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads.")),
+            headers(("etag" = String, description = "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads, followed by `-` and a short hash of the artifact listing when there is one.")),
             example = json!({
                 "domain": "kb",
                 "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
@@ -1147,7 +1190,14 @@ pub async fn set_domain_policies(
             .filter(|note| note.is_string())
             .map(|note| ("note", note.clone()))
     };
-    manifest_response(&domain, markdown, false, StatusCode::OK, extra)
+    manifest_response(
+        &domain,
+        markdown,
+        false,
+        StatusCode::OK,
+        extra,
+        state.engine.provision_listing(&domain),
+    )
 }
 
 /// The prefix every refused compare-and-swap opens with, wherever the
@@ -1157,8 +1207,9 @@ pub async fn set_domain_policies(
 const STALE_EDIT: &str = "stale edit";
 
 /// The manifest response both the GET and the PUT answer with: the domain,
-/// the markdown, its checksum, and the same checksum again - versioned, see
-/// [`versioned_etag`] - as a quoted `ETag` header. One shape for a manifest on
+/// the markdown, its checksum, and the same checksum again - versioned and
+/// covering the artifact listing, see [`manifest_etag`] - as a quoted `ETag`
+/// header. One shape for a manifest on
 /// this surface, so a client that has just saved one holds what the GET route
 /// would have given it.
 ///
@@ -1177,14 +1228,26 @@ fn manifest_response(
     missing: bool,
     status: StatusCode,
     extra: Option<(&str, Value)>,
+    artifacts: Vec<ArtifactListing>,
 ) -> Result<Response, ApiError> {
     // The checksum is of the MANIFEST as it is stored, the token a save
     // compares; the markdown handed back is LF, whatever the file holds.
     let checksum = manifest_checksum(&markdown);
     let markdown = crystalline_core::to_lf(&markdown).into_owned();
-    let etag = HeaderValue::from_str(&format!("\"{}\"", versioned_etag(&checksum)))
+    let etag = HeaderValue::from_str(&format!("\"{}\"", manifest_etag(&checksum, &artifacts)))
         .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
-    let sections = ManifestSections::of(&markdown, domain);
+    let mut sections = ManifestSections::of(&markdown, domain);
+    if let Some(provisioning) = sections.provisioning.as_mut() {
+        provisioning.artifacts = artifacts
+            .into_iter()
+            .map(|row| ProvisioningArtifactView {
+                key: row.key,
+                kind: row.kind.id().to_string(),
+                name: row.name,
+                optional: row.optional,
+            })
+            .collect();
+    }
     let payload = ManifestResponse {
         domain: domain.to_string(),
         markdown,
@@ -1203,6 +1266,32 @@ fn manifest_response(
     };
     resp.headers_mut().insert(ETAG, etag);
     Ok(resp)
+}
+
+/// The `ETag` a manifest answer carries: the [`versioned_etag`] of the
+/// MANIFEST's checksum, and, when the provisioning folders list any
+/// artifact, a short hash of that listing after one more `-`.
+///
+/// The listing is read from the source folders on every answer, so a new
+/// artifact or a changed optional mark must change the validator, or a
+/// conditional read would answer 304 and leave the Provisioning card on the
+/// old list. The body's `checksum` stays the MANIFEST's own: it is the token
+/// a save compares, and [`super::if_match`] reads only the part before the
+/// first `-`, so a save carrying this full tag still works. With no
+/// artifacts the tag keeps its plain shape.
+fn manifest_etag(checksum: &str, artifacts: &[ArtifactListing]) -> String {
+    let tag = versioned_etag(checksum);
+    if artifacts.is_empty() {
+        return tag;
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for row in artifacts {
+        hasher.update(row.key.as_bytes());
+        hasher.update(if row.optional { b"\x01" } else { b"\x00" });
+    }
+    let digest = crystalline_index::hex_lower(&hasher.finalize());
+    format!("{tag}-{}", &digest[..16])
 }
 
 /// The manifest's strong validator: sha256 of the markdown, the same token the
@@ -1236,6 +1325,49 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/src/testdata/manifest_sections.golden.json"
     );
+
+    fn listing_row(key: &str, optional: bool) -> ArtifactListing {
+        let (kind, name) = crystalline_core::provision::parse_artifact_key(key).unwrap();
+        ArtifactListing {
+            kind,
+            key: key.to_string(),
+            name: name.to_string(),
+            optional,
+        }
+    }
+
+    /// No artifacts keep the plain versioned tag; a listing adds a hash that
+    /// moves with a new artifact and with a changed mark, and a save carrying
+    /// the full tag still names the bare checksum.
+    #[test]
+    fn the_manifest_etag_follows_the_listing_and_keeps_the_save_checksum() {
+        let plain = manifest_etag("abc123", &[]);
+        assert_eq!(plain, versioned_etag("abc123"));
+
+        let one = manifest_etag("abc123", &[listing_row("skills/tide", false)]);
+        let two = manifest_etag(
+            "abc123",
+            &[
+                listing_row("skills/tide", false),
+                listing_row("skills/storm", false),
+            ],
+        );
+        let marked = manifest_etag("abc123", &[listing_row("skills/tide", true)]);
+        assert!(one.starts_with(&format!("{plain}-")), "{one}");
+        assert_ne!(one, two);
+        assert_ne!(one, marked);
+        assert_eq!(
+            one,
+            manifest_etag("abc123", &[listing_row("skills/tide", false)])
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::IF_MATCH,
+            HeaderValue::from_str(&format!("\"{one}\"")).unwrap(),
+        );
+        assert_eq!(super::super::if_match(&headers).unwrap(), "abc123");
+    }
 
     /// The sections for the fixture, the starter document masked: it carries
     /// today's date.

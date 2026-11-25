@@ -703,6 +703,12 @@ async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
         provision.contains("## Provisioning"),
         "provision's description must name what has to declare before it can act: {provision}"
     );
+    for word in ["take", "skip", "optional"] {
+        assert!(
+            provision.contains(word),
+            "provision's description must name `{word}`: {provision}"
+        );
+    }
     for name in ["reflect", "read_reflection", "write_reflection", "discuss"] {
         let text = description(name);
         assert!(
@@ -6490,6 +6496,14 @@ async fn provision_is_listed_when_no_domain_declares_and_refuses_the_mutations()
     for (action, args) in [
         ("allow", json!({ "action": "allow", "domain": "eng" })),
         ("deny", json!({ "action": "deny", "domain": "eng" })),
+        (
+            "take",
+            json!({ "action": "take", "domain": "eng", "artifacts": ["skills/tide-tables"] }),
+        ),
+        (
+            "skip",
+            json!({ "action": "skip", "domain": "eng", "artifacts": ["skills/tide-tables"] }),
+        ),
         ("apply", json!({ "action": "apply" })),
     ] {
         let result = call_result(peer, "provision", args).await;
@@ -6511,6 +6525,38 @@ async fn provision_is_listed_when_no_domain_declares_and_refuses_the_mutations()
             "provision {action} is never role gated over stdio: {text}"
         );
     }
+}
+
+/// `take` and `skip` name a domain and at least one artifact; without either
+/// the call is an invalid-params error that says so, before anything else is
+/// asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_take_and_skip_need_a_domain_and_artifacts() {
+    let h = Harness::new(&["eng"]).await;
+    declare_provisioning(&h.root, "eng");
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    for action in ["take", "skip"] {
+        for args in [
+            json!({ "action": action }),
+            json!({ "action": action, "domain": "eng" }),
+            json!({ "action": action, "domain": "eng", "artifacts": [] }),
+            json!({ "action": action, "artifacts": ["skills/tide-tables"] }),
+        ] {
+            let err = call(peer, "provision", args.clone()).await.unwrap_err();
+            assert!(
+                err.contains(&format!("provision {action} requires domain and artifacts")),
+                "{args}: {err}"
+            );
+        }
+    }
+    let err = call(peer, "provision", json!({ "action": "pick" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("status, allow, deny, take, skip or apply"),
+        "{err}"
+    );
 }
 
 /// Once a domain's MANIFEST declares a `Provisioning` section, the tool shows
@@ -6764,7 +6810,10 @@ async fn provision_allow_then_status_flow() {
     // The decision landed on the config file this engine owns, not just in
     // memory.
     let saved: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-    assert_eq!(saved.domains["harbor"].provision, Some(true));
+    assert_eq!(
+        saved.domains["harbor"].provision,
+        Some(crystalline_core::config::Provision::all())
+    );
 
     // The files actually landed under the isolated HOME.
     assert!(home.join(".claude/skills/tide-tables/SKILL.md").exists());
@@ -6780,6 +6829,90 @@ async fn provision_allow_then_status_flow() {
         status["pending"].as_array().unwrap().is_empty(),
         "harbor is decided, not pending: {status}"
     );
+
+    drop(client);
+    drop(server);
+}
+
+/// `skip` over MCP records the pick on the config file, removes the artifact
+/// from the harness and `status` lists it as off.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_skip_over_mcp_reconciles_and_status_shows_the_artifact_off() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let xdg_state_home = work.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg_state_home).unwrap();
+    let _env = ScratchEnv::new(&home, &xdg_state_home).await;
+
+    let harbor_dir = work.path().join("kb-harbor");
+    write_provision_harbor(&harbor_dir);
+    write_provision_install_receipt(&xdg_state_home);
+
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("harbor".to_string(), DomainEntry::file(harbor_dir));
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = work.path().join("config.yaml");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path.clone()),
+    ));
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_engine = engine.clone();
+    let server_task =
+        tokio::spawn(
+            async move { rmcp::serve_server(McpServer::new(server_engine), server_io).await },
+        );
+    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    let peer = client.peer();
+
+    call(
+        peer,
+        "provision",
+        json!({"action": "allow", "domain": "harbor"}),
+    )
+    .await
+    .unwrap();
+    assert!(home.join(".claude/skills/tide-tables/SKILL.md").exists());
+
+    let skipped = call(
+        peer,
+        "provision",
+        json!({"action": "skip", "domain": "harbor", "artifacts": ["skills/tide-tables"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(skipped["decided"]["domain"], "harbor", "{skipped}");
+    assert!(!home.join(".claude/skills/tide-tables").exists());
+
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert_eq!(
+        saved.domains["harbor"].provision,
+        Some(crystalline_core::config::Provision::All {
+            except: vec!["skills/tide-tables".to_string()],
+            also: Vec::new(),
+        })
+    );
+
+    let status = call(peer, "provision", json!({"action": "status"}))
+        .await
+        .unwrap();
+    let artifacts = status["domains"][0]["artifacts"].as_array().unwrap();
+    let tide = artifacts
+        .iter()
+        .find(|a| a["key"] == "skills/tide-tables")
+        .unwrap_or_else(|| panic!("{status}"));
+    assert_eq!(tide["on"], json!(false), "{status}");
 
     drop(client);
     drop(server);

@@ -762,3 +762,40 @@ async fn fixing_a_local_only_spelling_in_a_team_domain_is_a_local_change() {
         vec!["notes/link.md".to_string()]
     );
 }
+
+/// A folderless connect places the domain under the root the configuration
+/// file names now, not the one this engine read at its start: another
+/// process (the CLI's own `domain add`, which may pin the old root, or a
+/// `config set` without the daemon) may have changed it since.
+#[tokio::test]
+async fn a_folderless_connect_lands_under_the_root_the_file_names_now() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = forge(&[
+        ("MANIFEST.md", bare_manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha")),
+    ]);
+    let r = rig(tmp.path(), mock.clone(), &[]).await;
+    let moved = tmp.path().join("moved-root");
+    let file = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        }),
+        domains_root: Some(moved.clone()),
+        ..GlobalConfig::default()
+    };
+    crystalline_core::config::save_yaml(&r.config_path, &file).unwrap();
+
+    let result = r
+        .eng
+        .origin_add(REPO, None, None, None, None, None)
+        .await
+        .unwrap();
+    let root = PathBuf::from(result["root"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(&root).unwrap(),
+        std::fs::canonicalize(moved.join("eng-knowledge")).unwrap(),
+        "{result}"
+    );
+    assert!(!r.domains_root.join("eng-knowledge").exists());
+}

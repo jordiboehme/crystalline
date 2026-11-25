@@ -740,7 +740,7 @@ pub struct HarnessDoctor {
 pub struct ProvisioningDomainDoctor {
     /// The domain name.
     pub name: String,
-    /// `"allowed"`, `"denied"` or `"undecided"`.
+    /// `"allowed"`, `"only"`, `"denied"` or `"undecided"`.
     pub decision: String,
     /// [`crystalline_core::manifest::ArtifactType::id`] to how many
     /// artifacts of that kind the domain ships.
@@ -752,6 +752,17 @@ pub struct ProvisioningDomainDoctor {
     /// same poller that keeps the domain's engrams current, never by doctor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror_present: Option<bool>,
+    /// The lists of the decision when it is a pick (`except` and `also`, or
+    /// `only`). Absent for `true`, `false` and undecided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crystalline_core::config::Provision>,
+    /// Names in the decision the domain does not ship now. A warning, never
+    /// a counted problem, and `--fix` leaves the decision alone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale: Vec<String>,
+    /// Names in the decision that are not `<kind>/<name>`. A warning too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub malformed: Vec<String>,
 }
 
 /// What the Claude Desktop record says is wrong, if anything. Built from
@@ -1852,6 +1863,11 @@ pub struct ModelLocksDoctor {
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
+    /// Why the configuration could not be loaded, such as a misspelled key.
+    /// When set, it is the whole report: every other check needs the
+    /// configuration, so none ran. One counted problem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
     /// Who owns the Postgres database and where the accounts live. `None`
     /// on Turso.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1919,6 +1935,10 @@ pub struct DoctorReport {
     pub fix: bool,
     /// Every connected server; empty when none.
     pub sources: Vec<SourceDoctor>,
+    /// Where a new domain without a folder is created. Never a problem.
+    /// `None` when the configuration could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains_root: Option<DomainsRootDoctor>,
     /// The Windows daemon task. `None` off Windows, and on a Windows machine
     /// the task does not concern (see `task_concerns_this_machine`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2284,6 +2304,7 @@ impl DoctorReport {
         if matches!(self.index, IndexAccess::Unavailable { .. }) {
             n += 1;
         }
+        n += usize::from(self.config_error.is_some());
         for d in &self.domains {
             if !d.path_exists || !d.manifest_present {
                 n += 1;
@@ -2468,7 +2489,18 @@ pub async fn run(
     // A domain filter nobody registers fails before anything is fixed.
     // On Postgres the registrations are read from the configuration
     // document without the lock (a report never owns the database).
-    let early = crystalline_service::config_for_report(config_override).await?;
+    // A configuration that does not load is the report's one finding, not
+    // an exit: every check below needs it, so none runs and nothing is fixed.
+    let early = match crystalline_service::config_for_report(config_override).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            return Ok(DoctorReport {
+                config_error: Some(format!("{e:#}")),
+                fix,
+                ..DoctorReport::default()
+            });
+        }
+    };
     select_domains(&early.effective, domain_filter)?;
     // On Postgres another machine's instance owns the database: nothing is
     // fixed from here (spec section L).
@@ -2771,8 +2803,10 @@ pub async fn run(
     let update = Some(UpdateDoctor { facts, lines });
 
     Ok(DoctorReport {
+        config_error: None,
         durable_state,
         index,
+        domains_root: check_domains_root(&loaded),
         domains,
         service,
         environment,
@@ -2804,6 +2838,113 @@ pub async fn run(
         agents_not_checked,
         reflection_overdue,
     })
+}
+
+/// Where new domains are created ([`DoctorReport::domains_root`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainsRootDoctor {
+    /// The root, expanded.
+    pub path: String,
+    /// Where the value comes from: `default`, `config` or `environment`.
+    pub source: String,
+    /// Whether the root lies in a folder macOS privacy protection guards
+    /// (Documents, Desktop, Downloads). Always false off macOS.
+    pub protected: bool,
+    /// Whether `domains_root` will be set to `~/Documents/Crystalline` at
+    /// the next start or registration, because this configuration's domains
+    /// live there and it was not checked yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pin_pending: bool,
+    /// Whether the configuration makes this instance read-only
+    /// (`service.read_only`): its start then never pins, so a pending pin is
+    /// set by hand.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// The configuration file to edit by hand: set only on a read-only
+    /// instance in file mode, where `crystalline config set` is refused too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_file: Option<String>,
+}
+
+/// Where new domains are created and why, read only: doctor never pins and
+/// never creates the folder.
+fn check_domains_root(
+    loaded: &crystalline_service::overlay::LoadedConfig,
+) -> Option<DomainsRootDoctor> {
+    use crystalline_core::config::root_pin::{self, PinRecord};
+    let persisted = loaded.persisted_view().ok()?.into_owned();
+    let from_env = loaded
+        .overlay
+        .apply(&GlobalConfig::default())
+        .domains_root
+        .is_some();
+    let source = if from_env {
+        "environment"
+    } else if persisted.domains_root.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let key = root_pin::config_key(match loaded.mode {
+        crystalline_service::overlay::ConfigMode::File => Some(loaded.path.as_path()),
+        crystalline_service::overlay::ConfigMode::Document => None,
+    });
+    let checked = crystalline_core::config::state_dir()
+        .ok()
+        .is_some_and(|dir| PinRecord::load(&dir).0.checked(&key));
+    let path = loaded.effective.domains_root();
+    let read_only = loaded.effective.read_only();
+    Some(DomainsRootDoctor {
+        path: path.display().to_string(),
+        source: source.to_string(),
+        protected: crystalline_core::config::in_protected_user_folder(&path),
+        pin_pending: !checked && root_pin::is_due_here(&persisted),
+        read_only,
+        config_file: (read_only
+            && matches!(loaded.mode, crystalline_service::overlay::ConfigMode::File))
+        .then(|| loaded.path.display().to_string()),
+    })
+}
+
+/// The note for a domains root at `path`, a folder macOS privacy protection
+/// guards.
+pub fn protected_root_note(path: &str) -> String {
+    format!(
+        "New domains are created under {path}, which macOS privacy protection guards. To create new ones under ~/.crystalline, run `crystalline config set domains_root ~/.crystalline`. Existing domains stay where they are."
+    )
+}
+
+/// The note for a pin that has not run yet.
+pub const PIN_PENDING_NOTE: &str = "domains_root will be set to ~/Documents/Crystalline at the next start, so new domains land beside the existing ones.";
+
+/// The note for a pin that has not run yet on a read-only instance, whose
+/// start never pins: in file mode `crystalline config set` is refused as
+/// well, so the note names the file to edit (`config_file`); in document
+/// mode the operator's `config set` is taken.
+pub fn pin_by_hand_note(config_file: Option<&str>) -> String {
+    let how = match config_file {
+        Some(file) => format!("add `domains_root: ~/Documents/Crystalline` to {file}"),
+        None => "run `crystalline config set domains_root ~/Documents/Crystalline`".to_string(),
+    };
+    format!(
+        "This instance is read-only, so its start does not set domains_root. To keep new domains beside the existing ones, {how}."
+    )
+}
+
+fn render_domains_root(out: &mut String, root: &DomainsRootDoctor) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "domains root: {} ({})", root.path, root.source);
+    if root.pin_pending {
+        let note = if root.read_only {
+            pin_by_hand_note(root.config_file.as_deref())
+        } else {
+            PIN_PENDING_NOTE.to_string()
+        };
+        let _ = writeln!(out, "  {note}");
+    }
+    if root.protected {
+        let _ = writeln!(out, "  {}", protected_root_note(&root.path));
+    }
 }
 
 /// The note for [`DoctorReport::agents_not_checked`] on Postgres without an
@@ -4826,6 +4967,9 @@ fn check_provisioning(
             decision: provisioning_decision_label(d.decision).to_string(),
             counts: d.counts.clone(),
             mirror_present: mirror_present(cfg, &d.domain),
+            selection: d.selection.clone(),
+            stale: d.stale.clone(),
+            malformed: d.malformed.clone(),
         })
         .collect();
 
@@ -4935,6 +5079,7 @@ fn provisioning_decision_label(decision: provision::Decision) -> &'static str {
     use provision::Decision::*;
     match decision {
         Allowed => "allowed",
+        Only => "only",
         Denied => "denied",
         Undecided => "undecided",
     }
@@ -5721,6 +5866,23 @@ pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
+    // A configuration that does not load stopped every other check, so it
+    // is the whole report.
+    if let Some(error) = &report.config_error {
+        let _ = writeln!(out, "config:");
+        let _ = writeln!(out, "  [problem] {error}");
+        let _ = writeln!(
+            out,
+            "  fix the file and run `crystalline doctor` again: no other check ran"
+        );
+        let _ = writeln!(
+            out,
+            "{} remaining",
+            plural(report.remaining_problems(), "problem", "problems")
+        );
+        return out;
+    }
+
     // Inside Claude Desktop's app package first: every line below may read
     // the package's private copy of the state folder.
     if let Some(line) = &report.inside_package {
@@ -6028,6 +6190,9 @@ pub fn render_human(report: &DoctorReport) -> String {
         {
             let _ = writeln!(out, "  ok");
         }
+    }
+    if let Some(root) = &report.domains_root {
+        render_domains_root(&mut out, root);
     }
 
     // Domains the index still holds rows for and the configuration does not
@@ -6735,6 +6900,27 @@ pub fn render_human(report: &DoctorReport) -> String {
                     }
                 );
             }
+            let in_except = |name: &str| {
+                matches!(
+                    &d.selection,
+                    Some(crystalline_core::config::Provision::All { except, .. })
+                        if except.iter().any(|e| e == name)
+                )
+            };
+            for name in &d.stale {
+                let _ = writeln!(
+                    out,
+                    "    [warning] stale: {}",
+                    crate::cmd::stale_sentence(&d.name, name, in_except(name))
+                );
+            }
+            for name in &d.malformed {
+                let _ = writeln!(
+                    out,
+                    "    [warning] malformed: {}",
+                    crate::cmd::malformed_sentence(name)
+                );
+            }
         }
         for h in &p.harnesses {
             if let Some(owner) = &h.covered_by {
@@ -6773,9 +6959,10 @@ pub fn render_human(report: &DoctorReport) -> String {
             for pd in &p.pending {
                 let _ = writeln!(
                     out,
-                    "    {}: {} - run `crystalline provision allow {}`.",
+                    "    {}: {} - run `crystalline provision allow {}`, `deny {}` or pick with `take` or `skip`.",
                     pd.domain,
                     render_provision_counts(&pd.counts),
+                    pd.domain,
                     pd.domain
                 );
             }
