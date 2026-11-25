@@ -2156,6 +2156,82 @@ async fn the_manifest_answer_lists_the_provisioned_artifacts_with_their_marks() 
     );
 }
 
+/// The artifact listing is read from the source folders, not from the
+/// MANIFEST, so the read's validator covers it too: a new artifact or a
+/// changed optional mark answers a conditional read with the full body, not a
+/// 304 that would leave the Provisioning card showing the old list. The
+/// `checksum` in the body stays the MANIFEST's own, the token a save compares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_validator_follows_the_artifact_listing() {
+    let fixture = serve_anonymous().await;
+    let manifest = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n\n## Provisioning\n\n- skills: skills\n";
+    write_manifest(&fixture, manifest);
+    let skills = fixture._tmp.path().join("eng/skills");
+    let write_skill = |name: &str, optional: bool| {
+        let dir = skills.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = if optional {
+            "metadata:\n  provision: optional\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: A skill.\n{mark}---\n\nBody.\n"),
+        )
+        .unwrap();
+    };
+    write_skill("lighthouse", false);
+    let path = "/api/v1/domains/eng/manifest";
+
+    let first = get(fixture.addr, path).await;
+    let first_tag = header(&first, "etag");
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(
+        get_if_none_match(fixture.addr, path, &first_tag)
+            .await
+            .status(),
+        304,
+        "nothing moved"
+    );
+
+    // A new skill on disk, the MANIFEST unchanged.
+    write_skill("storm-warnings", false);
+    let resp = get_if_none_match(fixture.addr, path, &first_tag).await;
+    assert_eq!(resp.status(), 200, "a new artifact is not a 304");
+    let second_tag = header(&resp, "etag");
+    assert_ne!(second_tag, first_tag);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["sections"]["provisioning"]["artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        body["checksum"], first_body["checksum"],
+        "the save checksum is the MANIFEST's alone"
+    );
+    assert_eq!(
+        get_if_none_match(fixture.addr, path, &second_tag)
+            .await
+            .status(),
+        304
+    );
+
+    // The same skills, one now marked optional.
+    write_skill("storm-warnings", true);
+    let resp = get_if_none_match(fixture.addr, path, &second_tag).await;
+    assert_eq!(resp.status(), 200, "a changed mark is not a 304");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["sections"]["provisioning"]["artifacts"][1]["optional"], true,
+        "{body}"
+    );
+}
+
 /// A MANIFEST with only the required sections answers `null` for the two
 /// optional ones and the local default for the switch; one missing a
 /// required section names it, and routing falls back to Scope, then to
