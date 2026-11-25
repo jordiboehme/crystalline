@@ -253,27 +253,102 @@ async fn a_config_that_does_not_parse_is_refused_and_not_recorded() {
     assert!(!PinRecord::path(&f.state_dir()).exists());
 }
 
+/// A `config.yaml` that is a symbolic link into a dotfiles folder, kept owner
+/// only, holding `cfg`. Answers the link's target.
 #[cfg(unix)]
-#[tokio::test]
-async fn a_linked_config_is_left_alone_at_start() {
-    let f = Fixture::new();
-    let cfg = legacy(&f.documents_domain("pin-link"));
-    let real = f.tmp.path().join("dotfiles").join("config.yaml");
-    crystalline_core::config::save_yaml(&real, &cfg).unwrap();
+fn linked_config(f: &Fixture, cfg: &GlobalConfig) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = f.tmp.path().join("dotfiles").join("crystalline.yaml");
+    crystalline_core::config::save_yaml(&real, cfg).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::create_dir_all(f.config_path().parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&real, f.config_path()).unwrap();
-    let engine = f.engine(cfg).await;
-    assert_eq!(
-        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
-        None
-    );
+    std::os::unix::fs::symlink("../dotfiles/crystalline.yaml", f.config_path()).unwrap();
+    real
+}
+
+/// The link is still a link, its target owner only and the only file in its
+/// folder (no temporary file left), and the target holds what the link reads.
+#[cfg(unix)]
+fn assert_written_through(f: &Fixture, real: &Path) {
+    use std::os::unix::fs::PermissionsExt;
     assert!(
         std::fs::symlink_metadata(f.config_path())
             .unwrap()
             .file_type()
-            .is_symlink()
+            .is_symlink(),
+        "the link stays a link"
     );
-    assert_eq!(f.recorded(), None, "the next registration checks again");
+    let mode = std::fs::metadata(real).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let names: Vec<_> = std::fs::read_dir(real.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("crystalline.yaml")]);
+    let names: Vec<_> = std::fs::read_dir(f.config_path().parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("config.yaml")]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_linked_config_is_pinned_through_the_link_at_start() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("pin-link"));
+    let real = linked_config(&f, &cfg);
+    let engine = f.engine(cfg).await;
+    assert_eq!(
+        engine.pin_legacy_domains_root(PinCause::Start).unwrap(),
+        Some(true)
+    );
+    assert_written_through(&f, &real);
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&real).unwrap();
+    assert_eq!(
+        pinned_root(&saved),
+        Some(Path::new("~/Documents/Crystalline"))
+    );
+    assert_eq!(f.recorded(), Some(true));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_registration_pins_through_a_linked_config() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("link-old"));
+    let real = linked_config(&f, &cfg);
+    let engine = f.engine(cfg).await;
+    engine
+        .domain_add_local(Some("link-new"), None)
+        .await
+        .unwrap();
+    assert_written_through(&f, &real);
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&real).unwrap();
+    assert_eq!(
+        pinned_root(&saved),
+        Some(Path::new("~/Documents/Crystalline"))
+    );
+    assert!(saved.domains.contains_key("link-new"));
+    assert!(f.home.join("Documents/Crystalline/link-new").is_dir());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_config_set_writes_through_a_linked_config() {
+    let f = Fixture::new();
+    let real = linked_config(&f, &GlobalConfig::default());
+    let engine = f.engine(GlobalConfig::default()).await;
+    engine
+        .configure(&ConfigureAction::Set {
+            key: "domains_root".into(),
+            value: "~/kb".into(),
+        })
+        .await
+        .unwrap();
+    assert_written_through(&f, &real);
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&real).unwrap();
+    assert_eq!(pinned_root(&saved), Some(Path::new("~/kb")));
 }
 
 #[tokio::test]

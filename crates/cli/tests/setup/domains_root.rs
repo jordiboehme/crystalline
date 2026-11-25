@@ -199,3 +199,100 @@ fn doctor_shows_where_new_domains_go_and_why() {
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["domains_root"]["source"], "environment");
 }
+
+/// A `config.yaml` that is a relative symbolic link into a dotfiles folder,
+/// kept owner only, holding `cfg`. Answers the link's target.
+#[cfg(unix)]
+fn linked_config(home: &Path, cfg: &GlobalConfig) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = home.join("dotfiles").join("crystalline.yaml");
+    config::save_yaml(&real, cfg).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = config_file(home);
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("../dotfiles/crystalline.yaml", &link).unwrap();
+    real
+}
+
+#[cfg(unix)]
+fn assert_still_linked(home: &Path, real: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let link = config_file(home);
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link stays a link"
+    );
+    let mode = std::fs::metadata(real).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    for (dir, only) in [
+        (link.parent().unwrap(), "config.yaml"),
+        (real.parent().unwrap(), "crystalline.yaml"),
+    ] {
+        let names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![only.to_string()], "no temporary file left");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registration_in_the_cli_pins_through_a_linked_config() {
+    let home = tempfile::tempdir().unwrap();
+    let docs = home.path().join("Documents").join("Crystalline");
+    manifest_at(&docs.join("old"), "old");
+    manifest_at(&docs.join("new"), "new");
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("old".into(), DomainEntry::file(docs.join("old")));
+    let real = linked_config(home.path(), &cfg);
+    let link = config_file(home.path());
+
+    let out = run(
+        home.path(),
+        &["domain", "add", "new", "--config", link.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_still_linked(home.path(), &real);
+    let saved: GlobalConfig = config::load_yaml(&real).unwrap();
+    assert_eq!(
+        saved.domains_root.as_deref(),
+        Some(Path::new("~/Documents/Crystalline"))
+    );
+    assert!(saved.domains.contains_key("new"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_set_in_the_cli_writes_through_a_linked_config() {
+    let home = tempfile::tempdir().unwrap();
+    let real = linked_config(home.path(), &GlobalConfig::default());
+    let link = config_file(home.path());
+    let out = run(
+        home.path(),
+        &[
+            "config",
+            "set",
+            "domains_root",
+            "~/kb",
+            "--config",
+            link.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_still_linked(home.path(), &real);
+    let saved: GlobalConfig = config::load_yaml(&real).unwrap();
+    assert_eq!(saved.domains_root.as_deref(), Some(Path::new("~/kb")));
+}
