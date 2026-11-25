@@ -101,6 +101,9 @@ struct StoredStack {
 
 #[derive(Default)]
 struct Inner {
+    /// Run once, by the next `create_blob`, before it stores anything: a
+    /// test's hook for a write that lands while a share is uploading.
+    before_create_blob: Option<Box<dyn FnOnce() + Send>>,
     /// A directory [`MockProvider::make_dir_when_refused`] creates the next
     /// time `update_branch` answers a protected-branch refusal.
     dir_on_refusal: Option<std::path::PathBuf>,
@@ -690,6 +693,14 @@ impl MockProvider {
         self.inner.lock().unwrap().list_stacks_fails = true;
     }
 
+    /// Runs `hook` once, at the start of the next `create_blob` and outside
+    /// the mock's lock: a share reads and uploads its files one by one, so a
+    /// hook that writes a later file lands between the share's detection and
+    /// its read of that file.
+    pub fn before_next_create_blob(&self, hook: impl FnOnce() + Send + 'static) {
+        self.inner.lock().unwrap().before_create_blob = Some(Box::new(hook));
+    }
+
     /// Makes every [`Provider::blob`] read of `sha` answer a 500, the way a
     /// forge that is down or a network that is gone fails a fetch.
     pub fn fail_blob(&self, sha: &str) {
@@ -871,6 +882,10 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         content: &[u8],
     ) -> Result<String, RemoteError> {
+        let hook = self.inner.lock().unwrap().before_create_blob.take();
+        if let Some(hook) = hook {
+            hook();
+        }
         let sha = sha256_hex(content);
         let mut inner = self.inner.lock().unwrap();
         inner.blobs.insert(sha.clone(), content.to_vec());

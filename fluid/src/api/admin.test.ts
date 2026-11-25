@@ -1915,6 +1915,7 @@ describe("local changes", () => {
       refused: [
         { path: "b.md", reason: "changed_since" },
         { path: "c.md", reason: "no_base_copy", detail: "fetch_failed" },
+        { path: "e.md", reason: "share_pending", proposal: 7 },
       ],
       reindexed: 1,
     });
@@ -1939,6 +1940,7 @@ describe("local changes", () => {
       refused: [
         { path: "b.md", reason: "changed_since" },
         { path: "c.md", reason: "no_base_copy", detail: "fetch_failed" },
+        { path: "e.md", reason: "share_pending", proposal: 7 },
       ],
       reindexed: 1,
     });
@@ -1958,16 +1960,29 @@ describe("local changes", () => {
     expect(refusalSentence("not_a_change")).toBe(
       "Already matches the team's copy.",
     );
-    const unreachable =
-      "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.";
-    expect(refusalSentence("no_base_copy")).toBe(unreachable);
-    expect(refusalSentence("no_base_copy", "not_fetched")).toBe(unreachable);
-    expect(refusalSentence("no_base_copy", "fetch_failed")).toBe(unreachable);
+    expect(refusalSentence("no_base_copy")).toBe(
+      "The team's copy of this file is missing on this machine, so it cannot be put back.",
+    );
+    expect(refusalSentence("no_base_copy", "not_fetched")).toBe(
+      "The proposal's copy of this file is not on this machine, and there is no GitHub connection to fetch it. Connect GitHub, then try again.",
+    );
+    expect(refusalSentence("no_base_copy", "fetch_failed")).toBe(
+      "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.",
+    );
+    expect(refusalSentence("no_base_copy", "something_new")).toBe(
+      "The content this file goes back to is not at hand, so it cannot be put back.",
+    );
     expect(refusalSentence("no_base_copy", "no_blob_recorded")).toBe(
       "This proposal was shared by an older version and keeps no copy of this file. Withdraw the proposal to undo it.",
     );
     expect(refusalSentence("no_base_copy", "digest_mismatch")).toBe(
       "The proposal's copy of this file on GitHub does not match what was shared. Nothing was changed.",
+    );
+    expect(refusalSentence("share_pending", undefined, 7)).toBe(
+      "The last share into proposal #7 did not finish. Share into it again, then discard this file.",
+    );
+    expect(refusalSentence("share_pending")).toBe(
+      "The last share into this file's proposal did not finish. Share into it again, then discard this file.",
     );
     expect(refusalSentence("unknown_path")).toBe(
       "Not among this domain's unshared changes.",

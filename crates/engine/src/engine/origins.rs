@@ -4255,6 +4255,9 @@ impl Engine {
                 if let Some(detail) = reason.detail() {
                     entry["detail"] = json!(detail);
                 }
+                if let Some(number) = reason.proposal() {
+                    entry["proposal"] = json!(number);
+                }
                 entry
             })
             .collect();

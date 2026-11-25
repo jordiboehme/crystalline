@@ -846,6 +846,13 @@ enum ProposedFolder {
     Other(PathBuf),
 }
 
+/// Reads `<dir>/proposed` without following it. `symlink_metadata` opens the
+/// entry itself, never what it points at, and on Windows std reports a
+/// junction (a name-surrogate reparse point, as `mklink /J` makes) the same
+/// way it reports a symlink: `is_symlink()` is true and `is_dir()` false. So
+/// a junction lands in [`ProposedFolder::Other`] exactly as a symlink does,
+/// and the copy names inside are judged by `read_regular_file` and the
+/// prune's `DirEntry::file_type` under the same rule.
 fn proposed_folder(dir: &Path) -> Result<ProposedFolder, RemoteError> {
     let path = dir.join(PROPOSED_DIR_NAME);
     match std::fs::symlink_metadata(&path) {
@@ -1916,6 +1923,41 @@ mod tests {
             let meta = std::fs::symlink_metadata(dir.path().join("proposed")).unwrap();
             assert!(meta.is_dir() && !meta.file_type().is_symlink());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_at_proposed_is_never_written_or_read_through_and_prune_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(sha256_hex(b"x")), b"x").unwrap();
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.path().join("proposed"))
+            .arg(&elsewhere)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink failed");
+
+        assert!(write_proposed_copy(dir.path(), b"y").is_err());
+        assert!(
+            !elsewhere.join(sha256_hex(b"y")).exists(),
+            "nothing was written through the junction"
+        );
+        assert_eq!(
+            read_proposed_copy(dir.path(), &sha256_hex(b"x")).unwrap(),
+            None
+        );
+        prune_proposed_copies(dir.path(), &BTreeSet::new()).unwrap();
+        assert!(std::fs::symlink_metadata(dir.path().join("proposed")).is_err());
+        assert!(
+            elsewhere.join(sha256_hex(b"x")).exists(),
+            "what the junction pointed at is untouched"
+        );
+        write_proposed_copy(dir.path(), b"y").unwrap();
+        let meta = std::fs::symlink_metadata(dir.path().join("proposed")).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
     }
 
     #[cfg(unix)]

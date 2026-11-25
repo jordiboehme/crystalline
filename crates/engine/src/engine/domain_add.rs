@@ -1132,6 +1132,22 @@ impl Engine {
         // leaving the journal behind would mean a domain re-added under this
         // name resurrecting somebody's old private drafts into it.
         let drafts_swept = self.sweep_domain_journal(name).await + files_swept;
+        // The local copies of the files this domain's proposals carry hold
+        // content nobody has shared into the team copy yet, and with the
+        // domain gone nothing restores from them, so they go with it. The
+        // rest of the origin state folder (the base snapshot, `state.json`)
+        // stays, as it always has. Best effort: the removal has happened.
+        if let Ok(dir) = self.origin_state_dir(name)
+            && let Err(e) = crystalline_remote::state::prune_proposed_copies(
+                &dir,
+                &std::collections::BTreeSet::new(),
+            )
+        {
+            tracing::warn!(
+                domain = name,
+                "the copies of the removed domain's proposed files could not be removed: {e}"
+            );
+        }
         if let Value::Object(map) = &mut report {
             map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
             map.insert("drafts_swept".to_string(), Value::from(drafts_swept));

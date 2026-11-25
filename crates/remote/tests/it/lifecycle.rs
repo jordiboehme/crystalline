@@ -13401,6 +13401,250 @@ async fn a_reviewer_amendment_leaves_the_discard_on_what_this_machine_shared() {
     );
 }
 
+// An amend whose push landed and whose record never caught up (the
+// proposal update after the branch move failed) leaves the layer's record
+// on the content it carried before, while the branch already carries the
+// new content. A discard must not put that old content back as if it were
+// what the proposal carries, and a share must be able to finish the amend.
+
+/// An amend of `number` that is expected to fail.
+async fn failed_amend(mock: &MockProvider, sub: &Subscribed, number: u64) {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(number),
+            stacks_allowed: true,
+            sharing: Sharing::Proposal,
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect_err("the amend is interrupted");
+}
+
+/// What `branch` carries at `path` on the mock forge.
+fn branch_file(mock: &MockProvider, branch: &str, path: &str) -> Option<Vec<u8>> {
+    let head = mock.branch_commit(branch)?;
+    mock.commit_tree(&head)?.get(path).cloned()
+}
+
+#[tokio::test]
+async fn a_discard_after_an_interrupted_amend_is_refused_until_the_share_finishes() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    mock.fail_update_proposal(first.number);
+    failed_amend(&mock, &sub, first.number).await;
+    assert!(
+        load_state(&sub.state_dir).proposals[0]
+            .pending_head_commit
+            .is_some(),
+        "the push landed and the record did not catch up"
+    );
+    assert_eq!(
+        branch_file(&mock, &first.branch, "notes/a.md"),
+        Some(b"alpha v3\n".to_vec()),
+        "the branch already carries the amended content"
+    );
+
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
+
+    assert!(report.restored.is_empty(), "{report:?}");
+    assert_eq!(report.refused.len(), 1, "{report:?}");
+    assert_eq!(report.refused[0].1.code(), "share_pending");
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"alpha v3\n",
+        "nothing was written"
+    );
+    assert!(
+        mock.blob_reads().is_empty(),
+        "a refused path is never fetched: {:?}",
+        mock.blob_reads()
+    );
+
+    // Sharing into the proposal again finishes the amend, and the discard
+    // then restores what the proposal carries.
+    mock.heal_update_proposal(first.number);
+    let _ = updated(amend_share(&mock, &sub, first.number).await);
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0].pending_head_commit,
+        None
+    );
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v4\n");
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
+    assert_eq!(
+        report.restored,
+        vec!["notes/a.md".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v3\n");
+}
+
+#[tokio::test]
+async fn an_amend_with_nothing_new_after_a_landed_push_rebuilds_the_layer_from_its_record() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    mock.fail_update_proposal(first.number);
+    failed_amend(&mock, &sub, first.number).await;
+    // The person puts the file back by hand to what the record carries, so
+    // nothing is new against the record, while the branch still carries v3.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    mock.heal_update_proposal(first.number);
+
+    let outcome = amend_share(&mock, &sub, first.number).await;
+
+    let _ = updated(outcome);
+    assert_eq!(
+        branch_file(&mock, &first.branch, "notes/a.md"),
+        Some(b"alpha v2\n".to_vec()),
+        "the branch carries what the record and the working tree say"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals[0].pending_head_commit, None);
+    assert_eq!(
+        state.proposals[0].head_commit,
+        mock.branch_commit(&first.branch)
+    );
+    assert_eq!(
+        state.proposals[0].files[0].sha256,
+        Some(sha256_hex(b"alpha v2\n"))
+    );
+}
+
+#[tokio::test]
+async fn an_amend_with_nothing_new_after_a_push_that_never_landed_clears_the_pending_head() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let head = mock.branch_commit(&first.branch);
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    mock.protect_branch(&first.branch, "no pushes");
+    failed_amend(&mock, &sub, first.number).await;
+    assert!(
+        load_state(&sub.state_dir).proposals[0]
+            .pending_head_commit
+            .is_some()
+    );
+    assert_eq!(mock.branch_commit(&first.branch), head, "nothing landed");
+    mock.unprotect_branch(&first.branch);
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+
+    let outcome = amend_share(&mock, &sub, first.number).await;
+
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        mock.branch_commit(&first.branch),
+        head,
+        "nothing was pushed"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals[0].pending_head_commit, None);
+    assert_eq!(state.proposals[0].head_commit, head);
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v4\n");
+    let report = discard_as_a_caller_would(&mock, &sub, &["notes/a.md"]).await;
+    assert_eq!(
+        report.restored,
+        vec!["notes/a.md".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+}
+
+// A file written while a share is uploading: the share reads each file after
+// its detection, so what it records about a file must be what it read, never
+// the digest the detection saw. Otherwise the record names content the
+// proposal does not carry, and the local copy sits under another name.
+
+/// Every added or modified file of every saved record names the bytes the
+/// share sent: its digest is the blob's (the mock names a blob by the
+/// digest of its bytes) and a local copy is kept under it.
+fn assert_records_name_what_was_sent(sub: &Subscribed) {
+    let state = load_state(&sub.state_dir);
+    let mut seen = 0;
+    for file in state.proposals.iter().flat_map(|p| p.files.iter()) {
+        if file.sha256.is_none() {
+            continue;
+        }
+        seen += 1;
+        assert_eq!(file.sha256, file.blob_sha, "{}", file.path);
+        let sha = file.sha256.as_deref().unwrap();
+        let copy = crystalline_remote::state::read_proposed_copy(&sub.state_dir, sha)
+            .unwrap()
+            .unwrap_or_else(|| panic!("no copy of {} under {sha}", file.path));
+        assert_eq!(copy.len() as u64, file.size.unwrap(), "{}", file.path);
+    }
+    assert!(seen > 0, "nothing was recorded");
+}
+
+#[tokio::test]
+async fn a_share_records_the_digest_of_the_bytes_it_sent() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/b.md", b"beta\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/b.md"), b"beta v2\n");
+    let later = sub.domain_root.join("notes/b.md");
+    mock.before_next_create_blob(move || write(&later, b"beta written during the share\n"));
+
+    let _ = proposed(stacked_share(&mock, &sub).await);
+
+    assert_records_name_what_was_sent(&sub);
+    let state = load_state(&sub.state_dir);
+    let b = state.proposals[0]
+        .files
+        .iter()
+        .find(|f| f.path == "notes/b.md")
+        .expect("b was shared");
+    assert_eq!(
+        b.sha256,
+        Some(sha256_hex(b"beta written during the share\n"))
+    );
+}
+
+#[tokio::test]
+async fn an_amend_records_the_digest_of_the_bytes_it_sent() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let later = sub.domain_root.join("notes/b.md");
+    mock.before_next_create_blob(move || write(&later, b"beta written during the amend\n"));
+
+    let _ = updated(amend_share(&mock, &sub, first.number).await);
+
+    assert_records_name_what_was_sent(&sub);
+    let state = load_state(&sub.state_dir);
+    let b = state.proposals[0]
+        .files
+        .iter()
+        .find(|f| f.path == "notes/b.md")
+        .expect("b was shared");
+    assert_eq!(
+        b.sha256,
+        Some(sha256_hex(b"beta written during the amend\n"))
+    );
+}
+
 // The local copies of proposed files: a share keeps one per added or modified
 // file, and every share, pull, withdrawal and subscribe prunes them down to
 // what the saved records still carry.
