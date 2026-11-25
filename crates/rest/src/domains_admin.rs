@@ -2988,14 +2988,19 @@ pub struct DiscardBody {
                    modification gets the team's copy back, an addition is \
                    deleted, a deletion is restored, and in a domain that \
                    reviews changes the caller's own draft of the path is \
-                   cleared. The index is updated at once. Always 200 once \
-                   the body parses: refusals are per path, under `refused` \
-                   with a reason - `changed_since` (the file moved since the \
-                   digest was read), `not_a_change`, `no_base_copy` (an open \
-                   proposal below the top layer holds the earlier content; \
-                   withdraw that layer), `unknown_path`, `open_in_editor` (a \
-                   draft somebody has open). Never contacts GitHub; refused on \
-                   a read-only instance.",
+                   cleared. A file an open proposal already carries goes \
+                   back to the proposal's content, not the older team copy. \
+                   The index is updated at once. Always 200 once the body \
+                   parses: refusals are per path, under `refused` with a \
+                   reason - `changed_since` (the file moved since the digest \
+                   was read), `not_a_change`, `no_base_copy` (the content it \
+                   goes back to is not at hand; `detail` says why: \
+                   `no_blob_recorded`, `not_fetched`, `fetch_failed` or \
+                   `digest_mismatch`), `unknown_path`, `open_in_editor` (a \
+                   draft somebody has open). Works offline; it reads a file \
+                   from GitHub only to restore a proposal shared by an older \
+                   version, and never writes there. Refused on a read-only \
+                   instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = DiscardBody,
     responses(

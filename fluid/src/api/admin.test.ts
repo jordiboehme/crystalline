@@ -1912,7 +1912,10 @@ describe("local changes", () => {
       restored: ["notes/a.md"],
       deleted: [],
       cleared: [{ path: "d.md", kind: "added" }],
-      refused: [{ path: "b.md", reason: "changed_since" }],
+      refused: [
+        { path: "b.md", reason: "changed_since" },
+        { path: "c.md", reason: "no_base_copy", detail: "fetch_failed" },
+      ],
       reindexed: 1,
     });
     const receipt = await discardChanges("eng", [
@@ -1933,7 +1936,10 @@ describe("local changes", () => {
       restored: ["notes/a.md"],
       deleted: [],
       cleared: [{ path: "d.md", kind: "added" }],
-      refused: [{ path: "b.md", reason: "changed_since" }],
+      refused: [
+        { path: "b.md", reason: "changed_since" },
+        { path: "c.md", reason: "no_base_copy", detail: "fetch_failed" },
+      ],
       reindexed: 1,
     });
 
@@ -1952,8 +1958,16 @@ describe("local changes", () => {
     expect(refusalSentence("not_a_change")).toBe(
       "Already matches the team's copy.",
     );
-    expect(refusalSentence("no_base_copy")).toBe(
-      "Its earlier content is in an open proposal below this one; withdraw that layer to get it back.",
+    const unreachable =
+      "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.";
+    expect(refusalSentence("no_base_copy")).toBe(unreachable);
+    expect(refusalSentence("no_base_copy", "not_fetched")).toBe(unreachable);
+    expect(refusalSentence("no_base_copy", "fetch_failed")).toBe(unreachable);
+    expect(refusalSentence("no_base_copy", "no_blob_recorded")).toBe(
+      "This proposal was shared by an older version and keeps no copy of this file. Withdraw the proposal to undo it.",
+    );
+    expect(refusalSentence("no_base_copy", "digest_mismatch")).toBe(
+      "The proposal's copy of this file on GitHub does not match what was shared. Nothing was changed.",
     );
     expect(refusalSentence("unknown_path")).toBe(
       "Not among this domain's unshared changes.",

@@ -2110,8 +2110,10 @@ enum OriginCommand {
     /// Put chosen unshared files back the way the team has them: a
     /// modified engram gets the team's copy back, an added file is
     /// deleted, a deleted file is restored; in a domain that reviews
-    /// changes, your own drafts of them are cleared. Previews first and
-    /// asks; never contacts GitHub.
+    /// changes, your own drafts of them are cleared. A file an open
+    /// proposal already carries goes back to the proposal's content.
+    /// Previews first and asks; works offline; it reads a file from GitHub
+    /// only to restore a proposal shared by an older version.
     Discard {
         /// The team domain the changes belong to.
         domain: String,

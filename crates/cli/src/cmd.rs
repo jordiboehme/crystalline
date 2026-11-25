@@ -1563,11 +1563,31 @@ pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool
             p["path"].as_str().unwrap_or(""),
             p["reason"].as_str().unwrap_or("")
         );
+        if let Some(why) = p["detail"].as_str().and_then(discard_detail_sentence) {
+            println!("  {why}");
+        }
     }
     if let Some(n) = data["reindexed"].as_u64().filter(|n| *n > 0) {
         println!("re-indexed {}", plural(n as usize, "file", "files"));
     }
     acted > 0
+}
+
+/// The sentence for the `detail` of a `no_base_copy` refusal, the same
+/// words Fluid shows.
+fn discard_detail_sentence(detail: &str) -> Option<&'static str> {
+    match detail {
+        "no_blob_recorded" => Some(
+            "This proposal was shared by an older version and keeps no copy of this file. Withdraw the proposal to undo it.",
+        ),
+        "digest_mismatch" => Some(
+            "The proposal's copy of this file on GitHub does not match what was shared. Nothing was changed.",
+        ),
+        "not_fetched" | "fetch_failed" => Some(
+            "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.",
+        ),
+        _ => None,
+    }
 }
 
 /// Print `origin resolve`'s result: the resolved path and how many

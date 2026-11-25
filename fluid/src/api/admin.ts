@@ -2015,7 +2015,8 @@ export interface DiscardReceipt {
   restored: string[];
   deleted: string[];
   cleared: { path: string; kind: string }[];
-  refused: { path: string; reason: string }[];
+  /** Each refused path, with its reason and, for `no_base_copy`, why. */
+  refused: { path: string; reason: string; detail?: string }[];
   reindexed: number;
 }
 
@@ -2134,12 +2135,18 @@ export function readDiscardReceipt(value: unknown): DiscardReceipt {
       .map((entry) => {
         const item = asObject(entry);
         const path = asString(item?.path);
-        return path === null
-          ? null
-          : { path, reason: asString(item?.reason) ?? "" };
+        if (path === null) return null;
+        const refusal: { path: string; reason: string; detail?: string } = {
+          path,
+          reason: asString(item?.reason) ?? "",
+        };
+        const detail = asString(item?.detail);
+        if (detail !== null) refusal.detail = detail;
+        return refusal;
       })
       .filter(
-        (entry): entry is { path: string; reason: string } => entry !== null,
+        (entry): entry is { path: string; reason: string; detail?: string } =>
+          entry !== null,
       ),
     reindexed: asNumber(record?.reindexed) ?? 0,
   };
@@ -2158,15 +2165,25 @@ export async function discardChanges(
   );
 }
 
-/** The sentence a refused path wears, per reason, in the server's own terms. */
-export function refusalSentence(reason: string): string {
+/**
+ * The sentence a refused path wears, per reason, in the server's own terms.
+ * `detail` says why a `no_base_copy` happened.
+ */
+export function refusalSentence(reason: string, detail?: string): string {
   switch (reason) {
     case "changed_since":
       return "Changed since you looked.";
     case "not_a_change":
       return "Already matches the team's copy.";
     case "no_base_copy":
-      return "Its earlier content is in an open proposal below this one; withdraw that layer to get it back.";
+      switch (detail) {
+        case "no_blob_recorded":
+          return "This proposal was shared by an older version and keeps no copy of this file. Withdraw the proposal to undo it.";
+        case "digest_mismatch":
+          return "The proposal's copy of this file on GitHub does not match what was shared. Nothing was changed.";
+        default:
+          return "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.";
+      }
     case "unknown_path":
       return "Not among this domain's unshared changes.";
     case "open_in_editor":
