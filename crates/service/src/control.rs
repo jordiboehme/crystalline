@@ -935,8 +935,8 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
         }
         // Apply, inspect or record a decision for domain-declared artifact
-        // provisioning. `status` is always allowed; `allow`, `deny` and
-        // `apply` refuse on a read-only daemon (the engine itself checks)
+        // provisioning. `status` is always allowed; `allow`, `deny`, `take`,
+        // `skip` and `apply` refuse on a read-only daemon (the engine checks)
         // unless the configuration is kept in the database, as for
         // `configure`.
         "provision" => {
@@ -948,7 +948,20 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .get("domain")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let action = match action_str {
+            // The artifact keys `take` and `skip` name; absent means none.
+            let artifacts: Result<Vec<String>, String> = match req.get("artifacts") {
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str().map(str::to_string).ok_or_else(|| {
+                            "provision artifacts must be a list of strings".to_string()
+                        })
+                    })
+                    .collect(),
+                Some(_) => Err("provision artifacts must be a list of strings".to_string()),
+            };
+            let action = artifacts.and_then(|artifacts| match action_str {
                 "status" => Ok(crate::engine::ProvisionAction::Status),
                 "allow" => domain
                     .map(|domain| crate::engine::ProvisionAction::Allow { domain })
@@ -956,11 +969,17 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "deny" => domain
                     .map(|domain| crate::engine::ProvisionAction::Deny { domain })
                     .ok_or_else(|| "provision deny requires a domain".to_string()),
+                "take" => domain
+                    .map(|domain| crate::engine::ProvisionAction::Take { domain, artifacts })
+                    .ok_or_else(|| "provision take requires a domain".to_string()),
+                "skip" => domain
+                    .map(|domain| crate::engine::ProvisionAction::Skip { domain, artifacts })
+                    .ok_or_else(|| "provision skip requires a domain".to_string()),
                 "apply" => Ok(crate::engine::ProvisionAction::Apply),
                 other => Err(format!(
-                    "unknown provision action '{other}'; expected status, allow, deny or apply"
+                    "unknown provision action '{other}'; expected status, allow, deny, take, skip or apply"
                 )),
-            };
+            });
             match action {
                 Ok(action) => match shared
                     .engine

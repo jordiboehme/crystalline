@@ -3833,8 +3833,9 @@ async fn provision_dispatch(
         Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config, false),
         Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config, false),
     };
-    let data = crystalline_service::client::provision(action, domain.as_deref(), config.as_deref())
-        .await?;
+    let data =
+        crystalline_service::client::provision(action, domain.as_deref(), &[], config.as_deref())
+            .await?;
     cmd::print_provision(action, &data, json, all);
     Ok(())
 }
