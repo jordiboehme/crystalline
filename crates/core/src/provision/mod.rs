@@ -25,8 +25,9 @@ pub mod reconcile;
 pub(crate) mod translate;
 
 pub use model::{
-    ArtifactFile, DesiredFile, DesiredMcp, DesiredPayload, DesiredSet, DomainArtifacts,
-    McpArtifact, desired_set, harness_supports, is_plain_component, resolve_source_roots,
+    ArtifactFile, ArtifactListing, ArtifactListingReport, DesiredFile, DesiredMcp, DesiredPayload,
+    DesiredSet, DomainArtifacts, McpArtifact, artifact_key, desired_set, harness_supports,
+    is_plain_component, list_artifacts, mcp_key, parse_artifact_key, resolve_source_roots,
     scan_domain,
 };
 pub use receipt::{
