@@ -736,20 +736,150 @@ fn an_unknown_metadata_provision_value_raises_one_notice_and_reads_as_required()
     assert_eq!(notices.len(), 1, "{notices:?}");
 }
 
+/// The scan and the listing must agree on a mark that cannot be read: both
+/// read it as optional (fail closed) and raise the same notice naming the
+/// file. `rel` is the file's path inside the kind's folder.
+fn assert_unreadable_mark_reads_optional(kind: ArtifactType, rel: &str, bytes: &[u8], key: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(kind.id()).join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let roots = [(kind, dir.path().join(kind.id()))];
+
+    let (artifacts, notices) = scan_domain("harbor", &roots);
+    assert_eq!(artifacts.files.len(), 1, "{rel}");
+    assert!(artifacts.files[0].optional, "{rel} must read as optional");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].starts_with(&format!("`{key}` (`{rel}`): ")),
+        "{notices:?}"
+    );
+    assert!(
+        notices[0].ends_with(
+            "so its optional mark cannot be read - treating it as optional until it is fixed"
+        ),
+        "{notices:?}"
+    );
+
+    let listing = list_artifacts_in_roots(&roots);
+    assert_eq!(listing.artifacts.len(), 1, "{rel}");
+    assert!(listing.artifacts[0].optional, "{rel} must list as optional");
+    assert_eq!(listing.notices, notices);
+}
+
+/// `list_artifacts` over a domain entry whose MANIFEST declares exactly
+/// `roots`, each `<kind>: <kind id>`.
+fn list_artifacts_in_roots(roots: &[(ArtifactType, PathBuf)]) -> ArtifactListingReport {
+    let base = roots[0].1.parent().unwrap();
+    let bullets: String = roots
+        .iter()
+        .map(|(kind, _)| format!("- {}: {}\n", kind.id(), kind.id()))
+        .collect();
+    write_manifest(base, bullets.trim_end());
+    list_artifacts("harbor", &DomainEntry::file(base))
+}
+
 #[test]
-fn a_frontmatter_that_does_not_parse_reads_as_not_optional_without_a_notice() {
+fn a_frontmatter_that_does_not_parse_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "broken.md",
+        b"---\nmetadata: [unterminated\n---\n\nBody.\n",
+        "commands/broken",
+    );
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Agents,
+        "list.md",
+        b"---\n- a\n- b\n---\n\nBody.\n",
+        "agents/list",
+    );
+}
+
+#[test]
+fn a_skill_whose_frontmatter_does_not_parse_reads_as_optional_in_every_file() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
-        "commands/broken.md",
-        "---\nmetadata: [unterminated\n---\n\nBody.\n",
+        "skills/storm/SKILL.md",
+        "---\nname: storm\nmetadata: {provision: optional\n---\n\nStorms.\n",
+    );
+    write(dir.path(), "skills/storm/scripts/warn.sh", "echo storm\n");
+    let roots = [(ArtifactType::Skills, dir.path().join("skills"))];
+    let (artifacts, notices) = scan_domain("harbor", &roots);
+    assert_eq!(artifacts.files.len(), 2);
+    assert!(artifacts.files.iter().all(|f| f.optional));
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0]
+            .starts_with("`skills/storm` (`storm/SKILL.md`): its frontmatter is not valid YAML"),
+        "{notices:?}"
+    );
+    let listing = list_artifacts_in_roots(&roots);
+    assert!(listing.artifacts[0].optional);
+    assert_eq!(listing.notices, notices);
+}
+
+#[test]
+fn a_frontmatter_after_a_byte_order_mark_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "bom.md",
+        "\u{feff}---\ndescription: Deploy\n---\n\nGo.\n".as_bytes(),
+        "commands/bom",
+    );
+}
+
+#[test]
+fn a_frontmatter_after_blank_lines_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Agents,
+        "late.md",
+        b"\n  \r\n---\ndescription: Late\n---\n\nBody.\n",
+        "agents/late",
+    );
+}
+
+#[test]
+fn a_frontmatter_with_no_closing_line_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "open.md",
+        b"---\ndescription: Open\n\nBody with no closing line.\n",
+        "commands/open",
+    );
+}
+
+#[test]
+fn a_markdown_file_that_is_not_utf8_reads_as_optional_with_a_notice() {
+    assert_unreadable_mark_reads_optional(
+        ArtifactType::Commands,
+        "latin.md",
+        b"---\ndescription: Caf\xe9\n---\n\nBody.\n",
+        "commands/latin",
+    );
+}
+
+#[test]
+fn a_file_without_frontmatter_or_with_a_valid_one_raises_no_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "commands/plain.md", "Just a body.\n");
+    write(dir.path(), "commands/empty.md", "");
+    write(
+        dir.path(),
+        "commands/ruled.md",
+        "Intro\n\n---\n\nMore after a rule.\n",
+    );
+    write(
+        dir.path(),
+        "commands/ok.md",
+        "---\ndescription: Fine\n---\n\nBody.\n",
     );
     let (artifacts, notices) = scan_domain(
         "harbor",
         &[(ArtifactType::Commands, dir.path().join("commands"))],
     );
-    assert_eq!(artifacts.files.len(), 1);
-    assert!(!artifacts.files[0].optional);
+    assert_eq!(artifacts.files.len(), 4);
+    assert!(artifacts.files.iter().all(|f| !f.optional));
     assert!(notices.is_empty(), "{notices:?}");
 }
 

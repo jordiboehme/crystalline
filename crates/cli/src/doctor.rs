@@ -1863,6 +1863,11 @@ pub struct ModelLocksDoctor {
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
+    /// Why the configuration could not be loaded, such as a misspelled key.
+    /// When set, it is the whole report: every other check needs the
+    /// configuration, so none ran. One counted problem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
     /// Who owns the Postgres database and where the accounts live. `None`
     /// on Turso.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2299,6 +2304,7 @@ impl DoctorReport {
         if matches!(self.index, IndexAccess::Unavailable { .. }) {
             n += 1;
         }
+        n += usize::from(self.config_error.is_some());
         for d in &self.domains {
             if !d.path_exists || !d.manifest_present {
                 n += 1;
@@ -2483,7 +2489,18 @@ pub async fn run(
     // A domain filter nobody registers fails before anything is fixed.
     // On Postgres the registrations are read from the configuration
     // document without the lock (a report never owns the database).
-    let early = crystalline_service::config_for_report(config_override).await?;
+    // A configuration that does not load is the report's one finding, not
+    // an exit: every check below needs it, so none runs and nothing is fixed.
+    let early = match crystalline_service::config_for_report(config_override).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            return Ok(DoctorReport {
+                config_error: Some(format!("{e:#}")),
+                fix,
+                ..DoctorReport::default()
+            });
+        }
+    };
     select_domains(&early.effective, domain_filter)?;
     // On Postgres another machine's instance owns the database: nothing is
     // fixed from here (spec section L).
@@ -2786,6 +2803,7 @@ pub async fn run(
     let update = Some(UpdateDoctor { facts, lines });
 
     Ok(DoctorReport {
+        config_error: None,
         durable_state,
         index,
         domains_root: check_domains_root(&loaded),
@@ -5847,6 +5865,23 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
 pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+
+    // A configuration that does not load stopped every other check, so it
+    // is the whole report.
+    if let Some(error) = &report.config_error {
+        let _ = writeln!(out, "config:");
+        let _ = writeln!(out, "  [problem] {error}");
+        let _ = writeln!(
+            out,
+            "  fix the file and run `crystalline doctor` again: no other check ran"
+        );
+        let _ = writeln!(
+            out,
+            "{} remaining",
+            plural(report.remaining_problems(), "problem", "problems")
+        );
+        return out;
+    }
 
     // Inside Claude Desktop's app package first: every line below may read
     // the package's private copy of the state folder.

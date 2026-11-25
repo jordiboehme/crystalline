@@ -638,6 +638,48 @@ fn a_new_optional_artifact_raises_no_newly_optional_notice() {
     }
 }
 
+/// Stamps are written for every scanned file, skipped ones too (spec 6.2), so
+/// a stamp alone does not say the artifact was installed. An artifact left
+/// out by `except`, then made optional, then let in again by `allow`, was
+/// never installed from this domain: it gets no notice.
+#[test]
+fn a_skipped_artifact_made_optional_raises_no_newly_optional_notice_on_allow() {
+    let left_out = [
+        "skills/storm-warnings",
+        "commands/charts/plot-route",
+        "agents/navigator",
+        "mcps/foghorn",
+    ];
+    for harness in HarnessKind::ALL {
+        let sandbox = Sandbox::new();
+        let dir = fleet_domain(&[]);
+        let mut global = harbor(dir.path(), except(&left_out));
+        apply_one(&global, &sandbox, harness, &mut RecordingRunner::new());
+        assert!(
+            !skill_dir(harness, "storm-warnings").exists(),
+            "{harness:?}"
+        );
+
+        for key in left_out {
+            write_artifact(dir.path(), key, true);
+        }
+        set_decision(&mut global, "harbor", Provision::all());
+        let mut runner = RecordingRunner::new();
+        let report = apply_one(&global, &sandbox, harness, &mut runner);
+        assert!(
+            newly_optional(&report).is_empty(),
+            "{harness:?}: {:?}",
+            report.notices
+        );
+        assert!(runner.calls.is_empty(), "{harness:?}: {:?}", runner.calls);
+        assert_eq!(
+            installed(&sandbox.receipt(), harness),
+            expected(harness, &all_but(&left_out)),
+            "{harness:?}"
+        );
+    }
+}
+
 // --- collisions and notices ------------------------------------------------------
 
 #[test]

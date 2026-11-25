@@ -156,8 +156,11 @@ pub fn parse_artifact_key(key: &str) -> Option<(ArtifactType, &str)> {
 }
 
 /// Turn a read mark into the artifact's `optional` flag, raising one notice
-/// for a value other than `optional`.
-fn resolve_mark(key: &str, mark: OptionalMark, notices: &mut Vec<String>) -> bool {
+/// for a value other than `optional`, and one naming `file` (the path inside
+/// the kind's folder) for a mark that cannot be read. An unreadable mark
+/// reads as optional: failing closed keeps an artifact its author meant to
+/// be optional from being installed because its file broke.
+fn resolve_mark(key: &str, file: &str, mark: OptionalMark, notices: &mut Vec<String>) -> bool {
     match mark {
         OptionalMark::Absent => false,
         OptionalMark::Optional => true,
@@ -167,25 +170,37 @@ fn resolve_mark(key: &str, mark: OptionalMark, notices: &mut Vec<String>) -> boo
             ));
             false
         }
+        OptionalMark::Unreadable(reason) => {
+            notices.push(format!(
+                "`{key}` (`{file}`): {reason}, so its optional mark cannot be read - treating it as optional until it is fixed"
+            ));
+            true
+        }
     }
 }
 
 /// The mark of a markdown source given as raw bytes. Bytes that are not
-/// UTF-8 carry no frontmatter that parses, so they read as no mark.
+/// UTF-8 cannot be read for a mark.
 fn markdown_mark(bytes: &[u8]) -> OptionalMark {
     match std::str::from_utf8(bytes) {
         Ok(text) => translate::frontmatter_optional_mark(text),
-        Err(_) => OptionalMark::Absent,
+        Err(_) => OptionalMark::Unreadable("it is not UTF-8 text".to_string()),
     }
 }
 
-/// The mark of a skill, read from its `SKILL.md`. An unreadable file reads
-/// as no mark.
+/// The mark of a skill, read from its `SKILL.md`. A file that cannot be read
+/// gives [`OptionalMark::Unreadable`]: the skill's other files are still
+/// scanned and would otherwise install under a mark nobody could read.
 fn skill_mark(skill_dir: &Path) -> OptionalMark {
     match std::fs::read(skill_dir.join("SKILL.md")) {
         Ok(bytes) => markdown_mark(&bytes),
-        Err(_) => OptionalMark::Absent,
+        Err(e) => OptionalMark::Unreadable(format!("it cannot be read ({e})")),
     }
+}
+
+/// The path of a skill's `SKILL.md` inside the skills folder, for a notice.
+fn skill_file(name: &str) -> String {
+    [name, "SKILL.md"].join("/")
 }
 
 // --- scan --------------------------------------------------------------------
@@ -322,7 +337,7 @@ fn scan_skills(
 ) {
     for (name, skill_dir) in skill_entries(root, notices) {
         let key = format!("{}/{}", kind.id(), name);
-        let optional = resolve_mark(&key, skill_mark(&skill_dir), notices);
+        let optional = resolve_mark(&key, &skill_file(&name), skill_mark(&skill_dir), notices);
         let mut visible = Vec::new();
         walk_visible(&skill_dir, &mut Vec::new(), &mut visible);
         for (rel_in_skill, source) in visible {
@@ -391,7 +406,12 @@ fn scan_commands(
             sha256: sha256_hex(&bytes),
             optional: false,
         };
-        let optional = resolve_mark(&artifact_key(&file), markdown_mark(&bytes), notices);
+        let optional = resolve_mark(
+            &artifact_key(&file),
+            &file.rel,
+            markdown_mark(&bytes),
+            notices,
+        );
         out.push(ArtifactFile { optional, ..file });
     }
 }
@@ -458,7 +478,12 @@ fn scan_agents(
             optional: false,
         };
         let optional = if file.rel.ends_with(".md") {
-            resolve_mark(&artifact_key(&file), markdown_mark(&bytes), notices)
+            resolve_mark(
+                &artifact_key(&file),
+                &file.rel,
+                markdown_mark(&bytes),
+                notices,
+            )
         } else {
             false
         };
@@ -537,7 +562,7 @@ fn read_mcp(
         return None;
     }
     let key = format!("{}/{}", ArtifactType::Mcps.id(), name);
-    let optional = resolve_mark(&key, translate::json_optional_mark(obj), notices);
+    let optional = resolve_mark(&key, file_name, translate::json_optional_mark(obj), notices);
     Some((name, server.clone(), optional))
 }
 
@@ -642,7 +667,12 @@ fn list_artifacts_in(source_roots: &[(ArtifactType, PathBuf)]) -> ArtifactListin
             ArtifactType::Skills => {
                 for (name, skill_dir) in skill_entries(root, &mut notices) {
                     let key = format!("{}/{}", kind.id(), name);
-                    let optional = resolve_mark(&key, skill_mark(&skill_dir), &mut notices);
+                    let optional = resolve_mark(
+                        &key,
+                        &skill_file(&name),
+                        skill_mark(&skill_dir),
+                        &mut notices,
+                    );
                     add(*kind, name, optional, false);
                 }
             }
@@ -654,7 +684,7 @@ fn list_artifacts_in(source_roots: &[(ArtifactType, PathBuf)]) -> ArtifactListin
                     };
                     let artifact = rel.strip_suffix(".md").unwrap_or(&rel).to_string();
                     let key = format!("{}/{}", kind.id(), artifact);
-                    let optional = resolve_mark(&key, markdown_mark(&bytes), &mut notices);
+                    let optional = resolve_mark(&key, &rel, markdown_mark(&bytes), &mut notices);
                     add(*kind, artifact, optional, false);
                 }
             }
@@ -666,7 +696,8 @@ fn list_artifacts_in(source_roots: &[(ArtifactType, PathBuf)]) -> ArtifactListin
                             continue;
                         };
                         let key = format!("{}/{}", kind.id(), artifact);
-                        let optional = resolve_mark(&key, markdown_mark(&bytes), &mut notices);
+                        let optional =
+                            resolve_mark(&key, &file_name, markdown_mark(&bytes), &mut notices);
                         add(*kind, artifact, optional, true);
                     } else {
                         // A `.toml` agent is never read for a mark (Codex

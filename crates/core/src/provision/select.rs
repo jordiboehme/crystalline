@@ -88,8 +88,12 @@ pub fn change_selection(
     shipped: &[ArtifactListing],
     present_kinds: &[ArtifactType],
 ) -> Result<SelectionOutcome, String> {
+    let lookup = Lookup {
+        shipped,
+        present_kinds,
+    };
     let (decision, notes) = match change {
-        SelectionChange::Allow => (allow(current, shipped), Vec::new()),
+        SelectionChange::Allow => (allow(current, &lookup), Vec::new()),
         SelectionChange::Deny => (Provision::Deny, Vec::new()),
         SelectionChange::Skip | SelectionChange::Take => {
             let names = distinct(names);
@@ -104,12 +108,8 @@ pub fn change_selection(
                 ));
             }
             check_names(domain, current, &names, shipped, present_kinds)?;
-            let lookup = Lookup {
-                shipped,
-                present_kinds,
-            };
             if change == SelectionChange::Skip {
-                skip(domain, current, &names)
+                skip(domain, current, &names, &lookup)
             } else {
                 take(current, &names, &lookup)
             }
@@ -203,6 +203,13 @@ impl Lookup<'_> {
                 .is_some_and(|(kind, _)| !self.present_kinds.contains(&kind)),
         }
     }
+
+    /// Whether the listing marks `name` optional. Unlike
+    /// [`Lookup::may_be_optional`], a name the listing cannot see is not
+    /// optional here: `skip` must record a name that may be required.
+    fn is_optional(&self, name: &str) -> bool {
+        self.shipped.iter().any(|a| a.key == name && a.optional)
+    }
 }
 
 /// Whether `list` holds `name`.
@@ -228,7 +235,10 @@ fn already_off(name: &str) -> String {
 }
 
 /// `allow`: plain `true`, keeping the optional artifacts that were taken.
-fn allow(current: Option<&Provision>, shipped: &[ArtifactListing]) -> Provision {
+/// From `{only}` a name is kept in `also` when it may be optional, the same
+/// test `take` applies: the listing marks it optional, or its kind's root is
+/// missing so the mark cannot be read.
+fn allow(current: Option<&Provision>, lookup: &Lookup<'_>) -> Provision {
     match current {
         Some(Provision::All { also, .. }) => Provision::All {
             except: Vec::new(),
@@ -238,7 +248,7 @@ fn allow(current: Option<&Provision>, shipped: &[ArtifactListing]) -> Provision 
             except: Vec::new(),
             also: only
                 .iter()
-                .filter(|name| shipped.iter().any(|a| &a.key == *name && a.optional))
+                .filter(|name| lookup.may_be_optional(name))
                 .cloned()
                 .collect(),
         },
@@ -246,8 +256,16 @@ fn allow(current: Option<&Provision>, shipped: &[ArtifactListing]) -> Provision 
     }
 }
 
-/// `skip`: leave the names out.
-fn skip(domain: &str, current: Option<&Provision>, names: &[&str]) -> (Provision, Vec<String>) {
+/// `skip`: leave the names out. Under `true` or an `except` list (and on an
+/// undecided domain, which `skip` decides as "everything else"), an optional
+/// name that was not taken is already off: it gets the note and no `except`
+/// entry, so no map is written for it.
+fn skip(
+    domain: &str,
+    current: Option<&Provision>,
+    names: &[&str],
+    lookup: &Lookup<'_>,
+) -> (Provision, Vec<String>) {
     let mut notes = Vec::new();
     let decision = match current {
         Some(Provision::Deny) => {
@@ -256,17 +274,16 @@ fn skip(domain: &str, current: Option<&Provision>, names: &[&str]) -> (Provision
             ));
             Provision::Deny
         }
-        None => Provision::All {
-            except: names.iter().map(|n| n.to_string()).collect(),
-            also: Vec::new(),
-        },
-        Some(Provision::All { except, also }) => {
-            let (mut except, mut also) = (except.clone(), also.clone());
+        None | Some(Provision::All { .. }) => {
+            let (mut except, mut also) = match current {
+                Some(Provision::All { except, also }) => (except.clone(), also.clone()),
+                _ => (Vec::new(), Vec::new()),
+            };
             for &name in names {
                 if remove(&mut also, name) {
                     continue;
                 }
-                if holds(&except, name) {
+                if holds(&except, name) || lookup.is_optional(name) {
                     notes.push(already_off(name));
                 } else {
                     except.push(name.to_string());
@@ -406,12 +423,54 @@ mod tests {
             SelectionChange::Skip,
             &["skills/tide-tables", "mcps/lighthouse"],
         );
-        assert_eq!(
-            out.decision,
-            except_also(&["mcps/lighthouse", "skills/tide-tables"], &[])
-        );
-        assert!(out.notes.is_empty());
+        // `mcps/lighthouse` is optional: deciding "everything else" leaves it
+        // out already, so it needs no `except` entry.
+        assert_eq!(out.decision, except_also(&["skills/tide-tables"], &[]));
+        assert_eq!(out.notes, ["`mcps/lighthouse` is already off"]);
         assert!(out.writes_map());
+    }
+
+    #[test]
+    fn skip_of_an_optional_name_that_is_off_changes_nothing() {
+        let out = ok(
+            Some(&Provision::all()),
+            SelectionChange::Skip,
+            &["mcps/lighthouse"],
+        );
+        assert_eq!(out.decision, Provision::all());
+        assert_eq!(out.notes, ["`mcps/lighthouse` is already off"]);
+        assert!(!out.writes_map());
+
+        let out = ok(None, SelectionChange::Skip, &["skills/charts"]);
+        assert_eq!(out.decision, Provision::all());
+        assert_eq!(out.notes, ["`skills/charts` is already off"]);
+        assert!(!out.writes_map());
+
+        let current = except_also(&["skills/tide-tables"], &[]);
+        let out = ok(Some(&current), SelectionChange::Skip, &["skills/charts"]);
+        assert_eq!(out.decision, current);
+        assert_eq!(out.notes, ["`skills/charts` is already off"]);
+    }
+
+    #[test]
+    fn skip_of_a_name_of_a_missing_kind_still_writes_except() {
+        // The mark of an artifact whose root is missing cannot be read, and it
+        // may be required, so `skip` records it.
+        let out = change_selection(
+            DOMAIN,
+            Some(&Provision::all()),
+            SelectionChange::Skip,
+            &names(&["agents/scout"]),
+            &shipped(),
+            &[
+                ArtifactType::Skills,
+                ArtifactType::Commands,
+                ArtifactType::Mcps,
+            ],
+        )
+        .expect("the change is accepted");
+        assert_eq!(out.decision, except_also(&["agents/scout"], &[]));
+        assert!(out.notes.is_empty());
     }
 
     #[test]
@@ -787,6 +846,31 @@ mod tests {
         let current = only(&["skills/tide-tables"]);
         let out = ok(Some(&current), SelectionChange::Allow, &[]);
         assert_eq!(out.decision, Provision::all());
+    }
+
+    #[test]
+    fn allow_after_only_keeps_a_name_of_a_missing_kind_as_also() {
+        // `agents/scout` cannot be looked up (the agents root is not on this
+        // machine), so it may be optional: `allow` keeps it, as `take` would
+        // have recorded it.
+        let current = only(&["agents/scout", "skills/charts", "skills/tide-tables"]);
+        let out = change_selection(
+            DOMAIN,
+            Some(&current),
+            SelectionChange::Allow,
+            &[],
+            &shipped(),
+            &[
+                ArtifactType::Skills,
+                ArtifactType::Commands,
+                ArtifactType::Mcps,
+            ],
+        )
+        .expect("the change is accepted");
+        assert_eq!(
+            out.decision,
+            except_also(&[], &["agents/scout", "skills/charts"])
+        );
     }
 
     #[test]

@@ -198,7 +198,7 @@ crystalline provision skip engineering skills/storm-warnings agents/night-owl
 crystalline provision take engineering skills/tide-tables
 ```
 
-On a domain with no decision yet, `skip` installs everything else, and `take` installs only the named artifacts. A skipped artifact that is installed is removed, an adopted original included. The decision is saved in `config.yaml` in one of four forms:
+On a domain with no decision yet, `skip` installs everything else, and `take` installs only the named artifacts. A skipped artifact that is installed is removed, an adopted original included. Skipping an optional artifact you did not take changes nothing. The decision is saved in `config.yaml` in one of four forms:
 
 ```yaml
 provision: true                      # everything except optional artifacts not taken
@@ -241,6 +241,8 @@ An MCP config carries it as a member of its JSON:
 ```
 
 A `.toml` agent cannot carry the mark, because Codex refuses an agent TOML with a `[metadata]` table. Write the agent in markdown to mark it optional. A `.toml` agent with the same stem as a marked `.md` agent shares that mark.
+
+If the file that carries the mark cannot be read, the artifact counts as optional until it is fixed, and a notice names the file. This covers a frontmatter that is not valid YAML or has no closing `---` line, a frontmatter after a byte order mark or after blank lines, and a file that is not UTF-8 text.
 
 If an author marks an artifact that already shipped, the next reconcile removes it for everyone who did not take it. Crystalline raises one notice with the `take` command that keeps it.
 

@@ -4776,7 +4776,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.\n\nA domain with no MANIFEST yet answers 200 with `missing: true`, empty markdown and the checksum of the empty text; a `PUT` carrying that checksum creates it.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. When the provisioning folders list artifacts, a short hash of that listing follows after one more `-`, so a new artifact or a changed optional mark is never masked by a 304 either; the body's `checksum` stays the MANIFEST's own. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.\n\nA domain with no MANIFEST yet answers 200 with `missing: true`, empty markdown and the checksum of the empty text; a `PUT` carrying that checksum creates it.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -4791,7 +4791,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "The quoted tag of a version already held: the bare checksum, or `\"{checksum}-{version}\"`. A match against the CURRENT tag answers 304 with no body.",
+            "description": "The quoted tag of a version already held: the bare checksum, `\"{checksum}-{version}\"`, or that tag with the listing hash after one more `-`. A match against the CURRENT tag answers 304 with no body.",
             "required": false,
             "schema": {
               "type": [
@@ -4816,7 +4816,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as read, the token a later `PUT` carries in `If-Match`."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as read, followed by `-` and a short hash of the artifact listing when the provisioning folders list any; the token a later `PUT` carries in `If-Match`."
               }
             },
             "content": {
@@ -4949,7 +4949,7 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum or `\"{checksum}-{version}\"`, either way compared by checksum only.",
+            "description": "The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum, `\"{checksum}-{version}\"` or that tag with the listing hash, every form compared by checksum only.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4975,7 +4975,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as saved, the token the next save carries."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as saved, followed by `-` and a short hash of the artifact listing when there is one; the token the next save carries."
               }
             },
             "content": {
@@ -5181,7 +5181,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads, followed by `-` and a short hash of the artifact listing when there is one."
               }
             },
             "content": {

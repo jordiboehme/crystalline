@@ -361,21 +361,39 @@ fn split_frontmatter(source: &str) -> Result<(IndexMap<String, YamlValue>, Strin
 /// What an artifact says about the optional mark (`metadata.provision`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OptionalMark {
-    /// No `metadata.provision` value, or no frontmatter that parses.
+    /// No frontmatter at all, or one without a `metadata.provision` value.
     Absent,
     /// Exactly the string `optional`.
     Optional,
     /// Any other value, rendered for the notice that names it.
     Other(String),
+    /// The file cannot be read for a mark: a frontmatter is there but does
+    /// not parse, or the file is not readable text. The reason is a short
+    /// clause for the notice. The artifact reads as optional (fail closed),
+    /// so a broken file never installs an artifact its author meant to be
+    /// optional.
+    Unreadable(String),
 }
 
 /// Read the optional mark from a markdown source's YAML frontmatter: the
-/// `provision` member of a `metadata` mapping. A frontmatter that does not
-/// parse, or is not a mapping, reads as [`OptionalMark::Absent`] with no
-/// notice; the paths that need a valid frontmatter already report it.
+/// `provision` member of a `metadata` mapping.
+///
+/// A frontmatter that is there but cannot be read gives
+/// [`OptionalMark::Unreadable`]: YAML that does not parse or is not a
+/// mapping, an opening `---` with no closing line, and a `---` block after a
+/// byte order mark or after blank lines (which the frontmatter reader does
+/// not see as a frontmatter, though an author meant one).
 pub(crate) fn frontmatter_optional_mark(source: &str) -> OptionalMark {
-    let Ok((front, _)) = split_frontmatter(source) else {
-        return OptionalMark::Absent;
+    let (has_frontmatter, _, _) = locate(source);
+    if !has_frontmatter {
+        return match misplaced_frontmatter(source) {
+            Some(reason) => OptionalMark::Unreadable(reason.to_string()),
+            None => OptionalMark::Absent,
+        };
+    }
+    let front = match split_frontmatter(source) {
+        Ok((front, _)) => front,
+        Err(reason) => return OptionalMark::Unreadable(reason),
     };
     let Some(value) = front
         .get("metadata")
@@ -388,6 +406,36 @@ pub(crate) fn frontmatter_optional_mark(source: &str) -> OptionalMark {
         YamlValue::String(s) if s == "optional" => OptionalMark::Optional,
         other => OptionalMark::Other(yaml_display(other)),
     }
+}
+
+/// Why a source that [`locate`] finds no frontmatter in still looks like it
+/// meant one, or `None` when it does not: after an optional byte order mark
+/// and blank lines, its first line is `---`.
+fn misplaced_frontmatter(source: &str) -> Option<&'static str> {
+    let (rest, bom) = match source.strip_prefix('\u{feff}') {
+        Some(rest) => (rest, true),
+        None => (source, false),
+    };
+    let mut lines = rest.split('\n').map(|line| line.trim_end_matches('\r'));
+    let mut blank_before = false;
+    let first = loop {
+        match lines.next() {
+            Some(line) if line.trim().is_empty() && lines.clone().next().is_some() => {
+                blank_before = true;
+            }
+            other => break other?,
+        }
+    };
+    if first != "---" {
+        return None;
+    }
+    Some(if bom {
+        "it starts with a byte order mark before its frontmatter"
+    } else if blank_before {
+        "its frontmatter does not start on the first line"
+    } else {
+        "its frontmatter has no closing `---` line"
+    })
 }
 
 /// Read the optional mark from an MCP config's JSON object: the `provision`
@@ -733,9 +781,31 @@ mod tests {
             OptionalMark::Absent
         );
         assert_eq!(mark("no frontmatter\n"), OptionalMark::Absent);
-        assert_eq!(
+        assert_eq!(mark(""), OptionalMark::Absent);
+        assert_eq!(mark("\n\ntext\n---\n"), OptionalMark::Absent);
+        assert!(matches!(
             mark("---\nmetadata: [broken\n---\n\nx\n"),
-            OptionalMark::Absent
+            OptionalMark::Unreadable(reason) if reason.starts_with("its frontmatter is not valid YAML")
+        ));
+        assert_eq!(
+            mark("---\n- a\n---\n\nx\n"),
+            OptionalMark::Unreadable("its frontmatter is not a mapping".to_string())
+        );
+        assert_eq!(
+            mark("\u{feff}---\nname: x\n---\n\nx\n"),
+            OptionalMark::Unreadable(
+                "it starts with a byte order mark before its frontmatter".to_string()
+            )
+        );
+        assert_eq!(
+            mark("\n\r\n---\nname: x\n---\n\nx\n"),
+            OptionalMark::Unreadable(
+                "its frontmatter does not start on the first line".to_string()
+            )
+        );
+        assert_eq!(
+            mark("---\nname: x\n\nx\n"),
+            OptionalMark::Unreadable("its frontmatter has no closing `---` line".to_string())
         );
     }
 
