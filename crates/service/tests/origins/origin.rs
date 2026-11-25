@@ -428,6 +428,56 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
     );
 }
 
+/// A team domain under a hidden parent, as under the default root
+/// `~/.crystalline`: the subscribe writes every file, and a share sends a new
+/// one. The dot in the parent never makes a file look hidden.
+#[tokio::test]
+async fn a_team_domain_under_a_hidden_parent_subscribes_and_shares() {
+    // `tempfile` names its folders `.tmpXXXX`; this one carries no dot, so
+    // the only hidden segment is `.crystalline`.
+    let tmp = tempfile::Builder::new().prefix("dotted").tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "turbines")),
+    ]));
+    mock.set_branch("main", &commit);
+    let root = tmp.path().join(".crystalline").join("brand-knowledge");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let added = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(added["engrams"], 2, "{added}");
+    assert!(root.join("notes/alpha.md").is_file());
+
+    std::fs::write(root.join("notes/new.md"), engram("New", "new", "fresh")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let result = eng
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(result["added"], serde_json::json!(["notes/new.md"]));
+    let branch = result["branch"].as_str().unwrap();
+    let shared = mock.branch_commit(branch).unwrap();
+    assert!(mock.commit_file(&shared, "notes/new.md").is_some());
+}
+
 /// A fresh connect of the team repository at `acme/brand-knowledge`, whose
 /// MANIFEST carries no team marker yet (a repository from before 0.30.0).
 async fn connected_unmarked(tmp: &Path) -> (Engine, Arc<MockProvider>, std::path::PathBuf) {

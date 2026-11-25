@@ -18,6 +18,7 @@ mod domain_access;
 mod domain_admin;
 mod domain_rename;
 mod domain_settings;
+mod dotted_root;
 mod evolve;
 mod evolve_twins;
 mod file_host;

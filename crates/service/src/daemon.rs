@@ -5956,6 +5956,34 @@ mod tests {
         assert_eq!(as_path(&hits[0].1), Some("sub/does-not-exist.md"));
     }
 
+    /// A domain under the default root `~/.crystalline` has a hidden parent.
+    /// The watcher classifies relative to the domain root, so a change in it
+    /// is an ordinary path, live or vanished, and only a hidden segment below
+    /// the root is ignored.
+    #[test]
+    fn classify_event_treats_a_domain_under_a_hidden_parent_as_ordinary() {
+        let dir = tempfile::Builder::new().prefix("dotted").tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join(".crystalline")
+            .join("dom");
+        std::fs::create_dir_all(root.join("topics")).unwrap();
+        std::fs::write(root.join("topics/note.md"), "body").unwrap();
+        let domains = vec![("dom".to_string(), root.clone())];
+
+        let live = classify_event(&root.join("topics/note.md"), &domains);
+        assert_eq!(live.len(), 1);
+        assert_eq!(as_path(&live[0].1), Some("topics/note.md"));
+        assert_eq!(
+            as_path(&classify_in_root(&root.join("gone.md"), &root)),
+            Some("gone.md")
+        );
+
+        std::fs::write(root.join(".hidden.md"), "x").unwrap();
+        let hidden = classify_event(&root.join(".hidden.md"), &domains);
+        assert!(matches!(hidden[0].1, DirtyKind::Ignore));
+    }
+
     #[test]
     fn classify_event_returns_empty_when_no_root_matches() {
         let root = PathBuf::from("/some/canonical/root");
