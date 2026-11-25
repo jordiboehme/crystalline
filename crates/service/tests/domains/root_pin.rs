@@ -468,3 +468,65 @@ async fn a_file_at_the_root_refuses_the_add() {
     );
     assert!(!f.on_disk().domains.contains_key("on-a-file"));
 }
+
+/// A pin another process wrote (the CLI's own `domain add`, or the ctl
+/// `domain_register` in file mode) and recorded: this engine read the
+/// configuration before it, so its own memory has no root, but a new domain
+/// still lands beside the old ones.
+#[tokio::test]
+async fn a_pin_written_outside_the_engine_places_the_next_domain() {
+    let f = Fixture::new();
+    let cfg = legacy(&f.documents_domain("outside-old"));
+    f.save(&cfg);
+    let engine = f.engine(cfg.clone()).await;
+    let mut pinned = cfg;
+    crystalline_core::config::root_pin::pin(&mut pinned);
+    f.save(&pinned);
+    PinRecord::record(&f.state_dir(), &config_key(Some(&f.config_path())), true).unwrap();
+
+    let added = engine
+        .domain_add_local(Some("outside-new"), None)
+        .await
+        .unwrap();
+    let root = PathBuf::from(added["root"].as_str().unwrap());
+    assert_eq!(
+        root,
+        std::fs::canonicalize(f.home.join("Documents/Crystalline/outside-new")).unwrap()
+    );
+    assert!(!f.home.join(".crystalline/outside-new").exists());
+}
+
+/// A due pin that cannot be saved refuses only an add that would place a
+/// new domain: adding a domain that is already registered again places
+/// nothing, so it answers as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_due_pin_that_cannot_be_saved_still_lets_a_re_add_through() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let dir = f.documents_domain("readd-old");
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("readd-old".into(), DomainEntry::file(&dir));
+    cfg.domains
+        .insert("readd-virtual".into(), DomainEntry::virtual_domain());
+    f.save(&cfg);
+    let engine = f.engine(cfg).await;
+    let folder = f.config_path().parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let by_name = engine.domain_add_local(Some("readd-old"), None).await;
+    let by_folder = engine
+        .domain_add_local(None, Some(dir.to_str().unwrap()))
+        .await;
+    let by_virtual = engine.domain_add_virtual("readd-virtual").await;
+    let new_virtual = engine.domain_add_virtual("readd-virtual-new").await;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let by_name = by_name.unwrap();
+    assert_eq!(by_name["adopted"], true, "{by_name}");
+    let by_folder = by_folder.unwrap();
+    assert_eq!(by_folder["adopted"], true, "{by_folder}");
+    by_virtual.unwrap();
+    assert!(new_virtual.is_err(), "{new_virtual:?}");
+    assert_eq!(pinned_root(&f.on_disk()), None);
+    assert_eq!(f.recorded(), None);
+}
