@@ -1058,6 +1058,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .config_override()
                 .map(std::path::Path::to_path_buf);
             let kept = shared.engine.kept_folder();
+            let state = shared.engine.state_folder();
             let unknown = |other: &str| {
                 anyhow::anyhow!("unknown domain_register kind '{other}'; expected file or virtual")
             };
@@ -1076,6 +1077,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                         name,
                         path.as_deref(),
                         kept.as_deref(),
+                        state.as_deref(),
                         save,
                     ),
                     "virtual" => match name {
@@ -1084,6 +1086,7 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                                 loaded,
                                 name,
                                 kept.as_deref(),
+                                state.as_deref(),
                                 save,
                             )
                         }
@@ -1099,12 +1102,14 @@ pub(crate) async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                         path.as_deref(),
                         config.as_deref(),
                         kept.as_deref(),
+                        state.as_deref(),
                     ),
                     "virtual" => match name {
                         Some(name) => crystalline_engine::registration::register_virtual_domain(
                             name,
                             config.as_deref(),
                             kept.as_deref(),
+                            state.as_deref(),
                         ),
                         None => Err(no_name()),
                     },

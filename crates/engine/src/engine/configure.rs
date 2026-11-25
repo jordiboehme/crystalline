@@ -857,7 +857,9 @@ mod document_tests {
         let (engine, bytes, tmp) = engine_on(doc.clone()).await;
         let done = engine
             .register_in_document(|loaded, save| {
-                crate::registration::register_virtual_domain_saving(loaded, "fresh", None, save)
+                crate::registration::register_virtual_domain_saving(
+                    loaded, "fresh", None, None, save,
+                )
             })
             .expect("document mode")
             .unwrap();
@@ -875,7 +877,13 @@ mod document_tests {
         let before = doc.stored();
         let done = engine
             .register_in_document(|loaded, save| {
-                crate::registration::register_virtual_domain_saving(loaded, "base-only", None, save)
+                crate::registration::register_virtual_domain_saving(
+                    loaded,
+                    "base-only",
+                    None,
+                    None,
+                    save,
+                )
             })
             .unwrap()
             .unwrap();
@@ -886,7 +894,9 @@ mod document_tests {
         *doc.fail.lock().unwrap() = Some(EngineError::Internal("the database is gone".into()));
         let err = engine
             .register_in_document(|loaded, save| {
-                crate::registration::register_virtual_domain_saving(loaded, "other", None, save)
+                crate::registration::register_virtual_domain_saving(
+                    loaded, "other", None, None, save,
+                )
             })
             .unwrap()
             .unwrap_err();

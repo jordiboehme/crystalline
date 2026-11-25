@@ -25,6 +25,7 @@ mod file_host;
 mod metal_runtime;
 mod read_only_rows;
 mod relative_links;
+mod root_pin;
 mod toon_measurement;
 mod virtual_domains;
 mod virtual_import;

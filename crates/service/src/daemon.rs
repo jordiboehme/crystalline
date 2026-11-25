@@ -751,6 +751,15 @@ pub async fn run_serve(
     // every other domain is served.
     engine.finish_leftover_rename().await;
 
+    // An install from before 0.37.0 whose domains live in the old default
+    // root keeps it for new domains, written into its configuration once
+    // (the document in document mode), before anything places a domain.
+    // A failure is a warning: the next start, or the next registration,
+    // checks again.
+    if let Err(e) = engine.pin_legacy_domains_root(crystalline_engine::engine::PinCause::Start) {
+        tracing::warn!(error = %e, "checking the domains root failed");
+    }
+
     // This machine's sources (`crystalline connect`): the mount table its
     // owner's calls route through and the local copies it hides. Installed
     // only now, once the rename above is done, because that recovery reads

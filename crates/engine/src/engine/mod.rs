@@ -8791,6 +8791,13 @@ impl Engine {
         self.kept_dir()
     }
 
+    /// This machine's state folder as this engine knows it, `None` without
+    /// one: where a registration this engine runs for a client records the
+    /// one-time domains root check.
+    pub fn state_folder(&self) -> Option<PathBuf> {
+        self.journal_state_dir().ok()
+    }
+
     /// The configuration a routing block is built from, as this engine sees
     /// it now: the file re-read with the environment overlay, every
     /// registered domain (a domain registered after start included), and
@@ -9742,6 +9749,8 @@ pub use reflection::{
 pub use reflection_assets::WrittenReflectionAsset;
 mod manifest_rename;
 mod rename_domain;
+mod root_pin;
+pub use root_pin::PinCause;
 mod review_mode;
 pub(crate) use review_mode::{folder_may_fold_case, page_folds_case};
 #[cfg(test)]

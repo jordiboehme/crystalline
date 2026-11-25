@@ -478,6 +478,61 @@ async fn a_team_domain_under_a_hidden_parent_subscribes_and_shares() {
     assert!(mock.commit_file(&shared, "notes/new.md").is_some());
 }
 
+/// A team domain connected without a folder lands under the domains root:
+/// beside the old domains on an install from before 0.37.0, which gets the
+/// pin, and under the hidden `~/.crystalline` on a fresh one.
+#[tokio::test]
+async fn origin_add_without_a_folder_follows_the_pinned_or_new_root() {
+    let scratch = crate::support::ScratchStateDir::acquire();
+    let home = scratch.home().to_path_buf();
+    for legacy in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProvider::new());
+        let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+        mock.set_branch("main", &commit);
+        let config_path = tmp.path().join("config.yaml");
+        let mut cfg = config(true);
+        if legacy {
+            let old = home.join("Documents/Crystalline/origin-old");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::write(old.join("MANIFEST.md"), manifest()).unwrap();
+            cfg.domains.insert(
+                "origin-old".into(),
+                crystalline_core::config::DomainEntry::file(old),
+            );
+        }
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        let eng = engine_with(&config_path, &tmp.path().join("origins"), mock, true, false).await;
+        let name = if legacy {
+            "origin-pinned"
+        } else {
+            "origin-fresh"
+        };
+        let result = eng
+            .origin_add("acme/brand-knowledge", Some(name), None, None, None, None)
+            .await
+            .unwrap();
+        let parent = if legacy {
+            home.join("Documents/Crystalline")
+        } else {
+            home.join(".crystalline")
+        };
+        assert_eq!(
+            result["root"].as_str().unwrap(),
+            parent.join(name).display().to_string(),
+            "{result}"
+        );
+        assert!(parent.join(name).join("MANIFEST.md").is_file());
+        let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+        assert_eq!(
+            on_disk.domains_root.is_some(),
+            legacy,
+            "{:?}",
+            on_disk.domains_root
+        );
+    }
+}
+
 /// A fresh connect of the team repository at `acme/brand-knowledge`, whose
 /// MANIFEST carries no team marker yet (a repository from before 0.30.0).
 async fn connected_unmarked(tmp: &Path) -> (Engine, Arc<MockProvider>, std::path::PathBuf) {

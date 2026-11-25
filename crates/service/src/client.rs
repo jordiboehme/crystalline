@@ -2673,6 +2673,7 @@ pub async fn register_in_document(
     db: Option<&Path>,
     config_path: Option<&Path>,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
 ) -> anyhow::Result<Option<crate::registration::Registered>> {
     use serde_json::json;
     let mut loaded = overlay::load(config_path)?;
@@ -2714,14 +2715,16 @@ pub async fn register_in_document(
     );
     crate::claim::attach_owned_document(&mut loaded, claim.as_ref()).await?;
     let done = match kind {
-        "file" => crate::registration::register_file_domain_in(loaded, name, path, kept_root)?,
+        "file" => {
+            crate::registration::register_file_domain_in(loaded, name, path, kept_root, state_dir)?
+        }
         "virtual" => {
             let name = name.ok_or_else(|| {
                 anyhow::anyhow!(
                     "`domain add --virtual` needs a name; there is no folder to derive one from"
                 )
             })?;
-            crate::registration::register_virtual_domain_in(loaded, name, kept_root)?
+            crate::registration::register_virtual_domain_in(loaded, name, kept_root, state_dir)?
         }
         other => anyhow::bail!("unknown domain_register kind '{other}'; expected file or virtual"),
     };

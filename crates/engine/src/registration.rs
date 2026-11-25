@@ -32,7 +32,9 @@ pub use crystalline_core::config::registration::Registered;
 /// name its MANIFEST declares or its basename gives. The folder must hold a
 /// `MANIFEST.md` already. `kept_root` is this machine's `<state>/kept`
 /// folder: kept texts no registered domain owns are set aside there before
-/// the name is taken.
+/// the name is taken. `state_dir` is this machine's state folder, where the
+/// one-time domains root check is recorded ([`LegacyRootPin`]); `None` runs
+/// the check without reading or writing a record.
 ///
 /// The MANIFEST name write-back runs only for a fresh registration: an
 /// adopted entry may be a team or review-mode domain, where a raw write
@@ -43,12 +45,14 @@ pub fn register_file_domain(
     path: Option<&Path>,
     config_override: Option<&Path>,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
 ) -> Result<Registered> {
     register_file_domain_in(
         crate::overlay::load(config_override)?,
         name,
         path,
         kept_root,
+        state_dir,
     )
 }
 
@@ -62,11 +66,17 @@ pub fn register_file_domain_in(
     name: Option<&str>,
     path: Option<&Path>,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
 ) -> Result<Registered> {
     let persisted = loaded.persisted()?;
-    register_file_domain_saving(loaded, name, path, kept_root, &mut |cfg, name| {
-        save_registration(&persisted, &cfg, name)
-    })
+    register_file_domain_saving(
+        loaded,
+        name,
+        path,
+        kept_root,
+        state_dir,
+        &mut |cfg, name| save_registration(&persisted, &cfg, name),
+    )
 }
 
 /// What saves a registration: it gets the persisted truth with the new entry
@@ -82,12 +92,21 @@ pub fn register_file_domain_saving(
     name: Option<&str>,
     path: Option<&Path>,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
     save: SaveRegistration<'_>,
 ) -> Result<Registered> {
     // Mutate the persisted truth and save it back; the environment overlay
     // is never written.
     let registered = loaded.persisted_view()?.into_owned();
     let mut notes = Vec::new();
+    // Before the entry is added and before the default folder is derived.
+    let pin = LegacyRootPin::check(&loaded, &registered, state_dir);
+    let mut save = |mut cfg: GlobalConfig, name: &str| -> Result<()> {
+        pin.apply(&mut cfg);
+        save(cfg, name)?;
+        pin.record();
+        Ok(())
+    };
 
     match name {
         Some(name) => {
@@ -113,9 +132,10 @@ pub fn register_file_domain_saving(
 
             let root = match path {
                 Some(p) => p.to_path_buf(),
-                None => {
-                    crate::origin::default_domain_folder(&loaded.effective.domains_root(), name)
-                }
+                None => crate::origin::default_domain_folder(
+                    &pin.domains_root(&loaded, &registered),
+                    name,
+                ),
             };
 
             let abs = domain_root_with_manifest(&root)?;
@@ -231,8 +251,14 @@ pub fn register_virtual_domain(
     name: &str,
     config_override: Option<&Path>,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
 ) -> Result<Registered> {
-    register_virtual_domain_in(crate::overlay::load(config_override)?, name, kept_root)
+    register_virtual_domain_in(
+        crate::overlay::load(config_override)?,
+        name,
+        kept_root,
+        state_dir,
+    )
 }
 
 /// [`register_virtual_domain`] over a configuration the caller loaded, as
@@ -241,9 +267,10 @@ pub fn register_virtual_domain_in(
     loaded: LoadedConfig,
     name: &str,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
 ) -> Result<Registered> {
     let persisted = loaded.persisted()?;
-    register_virtual_domain_saving(loaded, name, kept_root, &mut |cfg, name| {
+    register_virtual_domain_saving(loaded, name, kept_root, state_dir, &mut |cfg, name| {
         save_registration(&persisted, &cfg, name)
     })
 }
@@ -254,9 +281,11 @@ pub fn register_virtual_domain_saving(
     loaded: LoadedConfig,
     name: &str,
     kept_root: Option<&Path>,
+    state_dir: Option<&Path>,
     save: SaveRegistration<'_>,
 ) -> Result<Registered> {
     let registered = loaded.persisted_view()?.into_owned();
+    let pin = LegacyRootPin::check(&loaded, &registered, state_dir);
     if let Some(env) = loaded.overlay.env_domain(name) {
         bail!(
             "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
@@ -286,7 +315,9 @@ pub fn register_virtual_domain_saving(
             name.to_string(),
             DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
         );
+        pin.apply(&mut cfg);
         save(cfg, name)?;
+        pin.record();
     }
     let today = crystalline_core::time::today_utc().ymd();
     Ok(Registered {
@@ -297,6 +328,79 @@ pub fn register_virtual_domain_saving(
         manifest: Some(crystalline_core::manifest_template(name, &today)),
         notes,
     })
+}
+
+/// The one-time domains root check of a registration
+/// ([`crystalline_core::config::root_pin`]): decided on the persisted truth
+/// before the new entry is added, applied to the configuration the
+/// registration saves (so the pin lands in the same save and the same
+/// layer), and recorded only once that save landed. A registration that
+/// saves nothing (an adopted one) neither pins nor records.
+struct LegacyRootPin {
+    due: bool,
+    /// Where to record the check, and under which key; `None` without a
+    /// state folder or when the configuration was checked before.
+    record: Option<(PathBuf, String)>,
+}
+
+impl LegacyRootPin {
+    fn check(loaded: &LoadedConfig, registered: &GlobalConfig, state_dir: Option<&Path>) -> Self {
+        use crystalline_core::config::root_pin::{self, PinRecord};
+        let key = root_pin::config_key(match loaded.mode {
+            crate::overlay::ConfigMode::File => Some(loaded.path.as_path()),
+            crate::overlay::ConfigMode::Document => None,
+        });
+        let record = match state_dir {
+            Some(dir) => {
+                let (record, problem) = PinRecord::load(dir);
+                if let Some(problem) = problem {
+                    tracing::warn!("domains root record: {problem}");
+                }
+                if record.checked(&key) {
+                    return LegacyRootPin {
+                        due: false,
+                        record: None,
+                    };
+                }
+                Some((dir.to_path_buf(), key))
+            }
+            None => None,
+        };
+        LegacyRootPin {
+            due: root_pin::is_due_here(registered),
+            record,
+        }
+    }
+
+    /// The root a domain without a folder lands under: the pinned one when
+    /// the pin is due, else the effective one. The environment still wins.
+    fn domains_root(&self, loaded: &LoadedConfig, registered: &GlobalConfig) -> PathBuf {
+        if !self.due {
+            return loaded.effective.domains_root();
+        }
+        let mut pinned = registered.clone();
+        crystalline_core::config::root_pin::pin(&mut pinned);
+        loaded.overlay.apply(&pinned).domains_root()
+    }
+
+    fn apply(&self, cfg: &mut GlobalConfig) {
+        if self.due {
+            crystalline_core::config::root_pin::pin(cfg);
+        }
+    }
+
+    /// Record the check after the save landed; a failure is a warning.
+    fn record(&self) {
+        if self.due {
+            tracing::info!("{}", crystalline_core::config::root_pin::PINNED_NOTE);
+        }
+        let Some((dir, key)) = &self.record else {
+            return;
+        };
+        if let Err(e) = crystalline_core::config::root_pin::PinRecord::record(dir, key, self.due) {
+            tracing::warn!(error = %e, "writing the domains root record failed");
+        }
+    }
 }
 
 /// Save `cfg`, the persisted truth with the registration of `name` in it.
@@ -510,6 +614,7 @@ mod tests {
             loaded_in_document(tmp.path(), &base, doc.clone()),
             "fresh",
             None,
+            None,
         )
         .unwrap();
         assert!(!done.adopted);
@@ -528,6 +633,7 @@ mod tests {
             loaded_in_document(tmp.path(), &base, doc.clone()),
             "base-only",
             None,
+            None,
         )
         .unwrap();
         assert!(done.adopted);
@@ -537,6 +643,7 @@ mod tests {
         let err = register_virtual_domain_in(
             loaded_in_document(tmp.path(), &base, doc.clone()),
             "from-env",
+            None,
             None,
         )
         .unwrap_err();
@@ -559,6 +666,7 @@ mod tests {
             loaded_in_document(tmp.path(), &base, doc.clone()),
             "landed",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(done.name, "landed");
@@ -571,6 +679,7 @@ mod tests {
             loaded_in_document(tmp.path(), &base, doc.clone()),
             "lost",
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("was not stored"), "{err}");
@@ -582,6 +691,7 @@ mod tests {
         let err = register_virtual_domain_in(
             loaded_in_document(tmp.path(), &base, doc.clone()),
             "unknown",
+            None,
             None,
         )
         .unwrap_err();
@@ -605,7 +715,7 @@ mod tests {
             base: None,
             document: None,
         };
-        let err = register_virtual_domain_in(loaded, "fresh", None).unwrap_err();
+        let err = register_virtual_domain_in(loaded, "fresh", None, None).unwrap_err();
         assert!(err.to_string().contains("was not read yet"), "{err}");
         assert_eq!(
             config::load_yaml::<GlobalConfig>(&path).unwrap(),

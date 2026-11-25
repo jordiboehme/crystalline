@@ -453,11 +453,13 @@ pub(crate) fn domain_add_register(
     config_override: Option<&Path>,
 ) -> Result<(String, PathBuf, bool, Option<String>)> {
     let kept = crate::kept::root().ok();
+    let state = crystalline_core::config::state_dir().ok();
     let done = crystalline_service::registration::register_file_domain(
         name,
         path,
         config_override,
         kept.as_deref(),
+        state.as_deref(),
     )?;
     print_notes(&done.notes);
     let root = done
@@ -539,6 +541,7 @@ pub(crate) async fn register_in_document(
     config_override: Option<&Path>,
 ) -> Result<Option<crystalline_service::registration::Registered>> {
     let kept = crate::kept::root().ok();
+    let state = crystalline_core::config::state_dir().ok();
     let done = crystalline_service::register_in_document(
         kind,
         name,
@@ -546,6 +549,7 @@ pub(crate) async fn register_in_document(
         db,
         config_override,
         kept.as_deref(),
+        state.as_deref(),
     )
     .await?;
     if let Some(done) = &done {
@@ -563,10 +567,12 @@ pub(crate) fn domain_add_register_virtual(
     config_override: Option<&Path>,
 ) -> Result<(String, bool)> {
     let kept = crate::kept::root().ok();
+    let state = crystalline_core::config::state_dir().ok();
     let done = crystalline_service::registration::register_virtual_domain(
         name,
         config_override,
         kept.as_deref(),
+        state.as_deref(),
     )?;
     print_notes(&done.notes);
     Ok((done.manifest.unwrap_or_default(), done.adopted))

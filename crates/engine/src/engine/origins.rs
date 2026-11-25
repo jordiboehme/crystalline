@@ -279,6 +279,9 @@ impl Engine {
         // Before anything is downloaded or origin state written: the
         // registration at the end would refuse a file that does not parse.
         self.refuse_a_config_that_does_not_parse()?;
+        // Before the default folder is derived from the root: an install
+        // whose domains live in the old default root keeps it.
+        self.pin_before_registration()?;
         // Who may read it, asked before anything else is: on an instance
         // with a GitHub App the answer decides whether the content is open to
         // everyone signed in, so it is never defaulted.
@@ -459,6 +462,7 @@ impl Engine {
         if !adopts_registered {
             self.set_aside_orphan_kept(&domain_name);
         }
+        let mut default_root = None;
         let (root, adopted_entry) = match existing {
             Some((r, entry)) => (r, Some(entry)),
             None => (
@@ -466,7 +470,9 @@ impl Engine {
                     Some(f) => crystalline_core::config::expand_tilde(f),
                     None => {
                         let domains_root = self.config.read().unwrap().domains_root();
-                        origin::default_domain_folder(&domains_root, &domain_name)
+                        let root = origin::default_domain_folder(&domains_root, &domain_name);
+                        default_root = Some(domains_root);
+                        root
                     }
                 },
                 None,
@@ -488,6 +494,11 @@ impl Engine {
             branch: branch_name.clone(),
         };
         let state_dir = self.origin_state_dir(&domain_name)?;
+        // The subscribe creates the domain folder; the root above it is
+        // made ready first when the domain lands at the default placement.
+        if let Some(domains_root) = &default_root {
+            super::root_pin::prepare_default_root(domains_root)?;
+        }
         progress_at(1, &format!("downloading {repo}"));
         let report = ops::subscribe(
             provider.as_ref(),
