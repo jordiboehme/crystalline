@@ -108,3 +108,94 @@ fn a_name_without_a_path_looks_under_the_hidden_root_on_a_fresh_install() {
     let saved: GlobalConfig = config::load_yaml(&config_path).unwrap();
     assert!(saved.domains_root.is_none());
 }
+
+fn doctor(home: &Path, config_path: &Path, json: bool) -> String {
+    let db = home.join("index.db");
+    let mut args = vec![];
+    if json {
+        args.push("--json");
+    }
+    args.extend([
+        "doctor",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+    ]);
+    let out = run(home, &args);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn doctor_shows_where_new_domains_go_and_why() {
+    // A fresh install: the hidden default.
+    let home = tempfile::tempdir().unwrap();
+    let config_path = config_file(home.path());
+    config::save_yaml(&config_path, &GlobalConfig::default()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&doctor(home.path(), &config_path, true)).unwrap();
+    let hidden = home.path().join(".crystalline");
+    assert_eq!(
+        report["domains_root"],
+        serde_json::json!({
+            "path": hidden.display().to_string(),
+            "source": "default",
+            "protected": false,
+        })
+    );
+    let text = doctor(home.path(), &config_path, false);
+    assert!(
+        text.contains(&format!("domains root: {} (default)", hidden.display())),
+        "{text}"
+    );
+    assert!(!hidden.exists(), "doctor creates nothing");
+
+    // Before 0.37.0's first start: the pin is announced, and doctor writes
+    // nothing.
+    let docs = home.path().join("Documents").join("Crystalline");
+    manifest_at(&docs.join("old"), "old");
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("old".into(), DomainEntry::file(docs.join("old")));
+    config::save_yaml(&config_path, &cfg).unwrap();
+    let before = std::fs::read(&config_path).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&doctor(home.path(), &config_path, true)).unwrap();
+    assert_eq!(report["domains_root"]["pin_pending"], true, "{report}");
+    let text = doctor(home.path(), &config_path, false);
+    assert!(
+        text.contains("domains_root will be set to ~/Documents/Crystalline at the next start"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), before);
+
+    // Pinned: the source is the configuration, and on macOS the note says
+    // how to send new domains to the hidden folder.
+    cfg.domains_root = Some(PathBuf::from("~/Documents/Crystalline"));
+    config::save_yaml(&config_path, &cfg).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&doctor(home.path(), &config_path, true)).unwrap();
+    assert_eq!(report["domains_root"]["source"], "config");
+    assert_eq!(
+        report["domains_root"]["protected"],
+        cfg!(target_os = "macos")
+    );
+    assert!(report["domains_root"].get("pin_pending").is_none());
+    let text = doctor(home.path(), &config_path, false);
+    let note = "New domains are created under ~/Documents/Crystalline, which macOS privacy protection guards.";
+    assert_eq!(text.contains(note), cfg!(target_os = "macos"), "{text}");
+
+    // The environment wins and says so.
+    let mut cmd = crate::common::crystalline();
+    crate::common::isolate(&mut cmd, home.path());
+    let out = cmd
+        .env("CRYSTALLINE_DOMAINS_ROOT", home.path().join("elsewhere"))
+        .args(["--json", "doctor", "--config"])
+        .arg(&config_path)
+        .arg("--db")
+        .arg(home.path().join("index.db"))
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["domains_root"]["source"], "environment");
+}

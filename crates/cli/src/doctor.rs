@@ -1919,6 +1919,10 @@ pub struct DoctorReport {
     pub fix: bool,
     /// Every connected server; empty when none.
     pub sources: Vec<SourceDoctor>,
+    /// Where a new domain without a folder is created. Never a problem.
+    /// `None` when the configuration could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains_root: Option<DomainsRootDoctor>,
     /// The Windows daemon task. `None` off Windows, and on a Windows machine
     /// the task does not concern (see `task_concerns_this_machine`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2773,6 +2777,7 @@ pub async fn run(
     Ok(DoctorReport {
         durable_state,
         index,
+        domains_root: check_domains_root(&loaded),
         domains,
         service,
         environment,
@@ -2804,6 +2809,75 @@ pub async fn run(
         agents_not_checked,
         reflection_overdue,
     })
+}
+
+/// Where new domains are created ([`DoctorReport::domains_root`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainsRootDoctor {
+    /// The root, expanded.
+    pub path: String,
+    /// Where the value comes from: `default`, `config` or `environment`.
+    pub source: String,
+    /// Whether the root lies in a folder macOS privacy protection guards
+    /// (Documents, Desktop, Downloads). Always false off macOS.
+    pub protected: bool,
+    /// Whether `domains_root` will be set to `~/Documents/Crystalline` at
+    /// the next start or registration, because this configuration's domains
+    /// live there and it was not checked yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pin_pending: bool,
+}
+
+/// Where new domains are created and why, read only: doctor never pins and
+/// never creates the folder.
+fn check_domains_root(
+    loaded: &crystalline_service::overlay::LoadedConfig,
+) -> Option<DomainsRootDoctor> {
+    use crystalline_core::config::root_pin::{self, PinRecord};
+    let persisted = loaded.persisted_view().ok()?.into_owned();
+    let from_env = loaded
+        .overlay
+        .apply(&GlobalConfig::default())
+        .domains_root
+        .is_some();
+    let source = if from_env {
+        "environment"
+    } else if persisted.domains_root.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let key = root_pin::config_key(match loaded.mode {
+        crystalline_service::overlay::ConfigMode::File => Some(loaded.path.as_path()),
+        crystalline_service::overlay::ConfigMode::Document => None,
+    });
+    let checked = crystalline_core::config::state_dir()
+        .ok()
+        .is_some_and(|dir| PinRecord::load(&dir).0.checked(&key));
+    let path = loaded.effective.domains_root();
+    Some(DomainsRootDoctor {
+        path: path.display().to_string(),
+        source: source.to_string(),
+        protected: crystalline_core::config::in_protected_user_folder(&path),
+        pin_pending: !checked && root_pin::is_due_here(&persisted),
+    })
+}
+
+/// The note for a domains root in a folder macOS privacy protection guards.
+pub const PROTECTED_ROOT_NOTE: &str = "New domains are created under ~/Documents/Crystalline, which macOS privacy protection guards. To create new ones under ~/.crystalline, run `crystalline config set domains_root ~/.crystalline`. Existing domains stay where they are.";
+
+/// The note for a pin that has not run yet.
+pub const PIN_PENDING_NOTE: &str = "domains_root will be set to ~/Documents/Crystalline at the next start, so new domains land beside the existing ones.";
+
+fn render_domains_root(out: &mut String, root: &DomainsRootDoctor) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "domains root: {} ({})", root.path, root.source);
+    if root.pin_pending {
+        let _ = writeln!(out, "  {PIN_PENDING_NOTE}");
+    }
+    if root.protected {
+        let _ = writeln!(out, "  {PROTECTED_ROOT_NOTE}");
+    }
 }
 
 /// The note for [`DoctorReport::agents_not_checked`] on Postgres without an
@@ -6028,6 +6102,9 @@ pub fn render_human(report: &DoctorReport) -> String {
         {
             let _ = writeln!(out, "  ok");
         }
+    }
+    if let Some(root) = &report.domains_root {
+        render_domains_root(&mut out, root);
     }
 
     // Domains the index still holds rows for and the configuration does not

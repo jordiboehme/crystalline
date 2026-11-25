@@ -169,7 +169,7 @@ pub fn registry() -> &'static [SettingSpec] {
     &[
         SettingSpec {
             key: "domains_root",
-            doc: "The default root folder new file domains are created under (default ~/Documents/Crystalline)",
+            doc: "The default root folder new file domains are created under (default ~/.crystalline)",
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
