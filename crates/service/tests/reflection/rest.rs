@@ -934,7 +934,7 @@ fn reflection_requests(domain: &str) -> Vec<(reqwest::Method, String, Option<Val
         .collect();
     assert_eq!(
         ops.len(),
-        23,
+        24,
         "every per-domain reflection operation: {ops:?}"
     );
     ops

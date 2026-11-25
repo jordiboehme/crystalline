@@ -6616,6 +6616,99 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/reflection/mark-stale": {
+      "post": {
+        "tags": [
+          "reflection"
+        ],
+        "summary": "Mark pages not fresh: the next reflect run reconciles them.",
+        "description": "Needs `edit`. The body names one page (`path`), several (`pages`) or every page that is not retired (`all: true`). The pages each named page owns are marked too, unless `only_page` is true. Retired pages and pact files are refused. The next reflect run reconciles every marked page in full, without the `changed_engrams` 0 shortcut, and takes the mark off. Until then the page view and the clock answer show the mark (`refresh_requested`). Mark after the engrams the pages should show are written.",
+        "operationId": "mark_reflection_stale",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkStaleBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Marked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarkedStale"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The anonymous viewer of a domain it reads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Below edit access, the domain is off the caller's write list, the domain or this instance is read-only, or the session is unattended.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or page, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Reflection is not here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A pact file, a retired page, no page named, or more than one of `path`, `pages` and `all`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/reflection/move": {
       "post": {
         "tags": [
@@ -17670,6 +17763,81 @@
           }
         }
       },
+      "MarkStaleBody": {
+        "type": "object",
+        "description": "What `POST /domains/{domain}/reflection/mark-stale` takes: exactly one\nof `path`, `pages` and `all`.",
+        "properties": {
+          "all": {
+            "type": "boolean",
+            "description": "Every page of the Reflection that is not retired."
+          },
+          "only_page": {
+            "type": "boolean",
+            "description": "Mark only the named pages, not the pages they own."
+          },
+          "pages": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Several pages, by their paths inside reflections/; not empty."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One page, by its path inside reflections/.",
+            "example": "arch/overview.md"
+          }
+        }
+      },
+      "MarkedStale": {
+        "type": "object",
+        "description": "What a mark answers.",
+        "required": [
+          "domain",
+          "at",
+          "by",
+          "pages",
+          "only_page"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "The time every page of this call was marked with, RFC 3339 in UTC\nwith milliseconds.",
+            "example": "2026-11-25T14:03:07.412Z"
+          },
+          "by": {
+            "type": "string",
+            "description": "Who marked them, by login.",
+            "example": "ada"
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain.",
+            "example": "eng"
+          },
+          "only_page": {
+            "type": "boolean",
+            "description": "Whether only the named pages were marked."
+          },
+          "pages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pages marked, in order: each named page, then the pages it owns.",
+            "example": [
+              "arch/overview.md",
+              "arch/overview/db.md"
+            ]
+          }
+        }
+      },
       "McpTokenInfo": {
         "type": "object",
         "description": "One row of an account's MCP token list, for a management UI or CLI. Never\ncarries the token itself - only the hash is stored, so there is nothing to\nshow back after issuance.",
@@ -18820,13 +18988,24 @@
               "string",
               "null"
             ],
-            "description": "The checksum of the page file as stored, the same as a read's\n`checksum`; null for a missing page. A reconcile writes no file, so\na client that heard a change compares this with the text it holds\nand reads the page again only when they differ."
+            "description": "The checksum of the page file as stored, the same as a read's\n`checksum`; null for a missing page. A reconcile writes no file\n(unless it takes a not-fresh mark off), so a client that heard a\nchange compares this with the text it holds and reads the page again\nonly when they differ."
           },
           "clock": {
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ReflectionPageClock",
                 "description": "The clock; null for a page on its own with no freshness, a retired\npage and a missing one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "refresh_requested": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionRefreshRequested",
+                "description": "The page's not-fresh mark, the same as the page view's\n`refresh_requested`; null while the page is not marked, and for a\nretired, missing or pact file. Beside `clock`, which is null for a\npage without a freshness."
               },
               {
                 "type": "null"
@@ -19103,7 +19282,7 @@
         "properties": {
           "key": {
             "type": "string",
-            "description": "`freshness`, `follows`, `owner` or `folder parent`.",
+            "description": "`freshness`, `follows`, `owner`, `folder parent` or\n`refresh_requested`.",
             "example": "freshness"
           },
           "page": {
@@ -19213,6 +19392,17 @@
               "arch/overview.pact.md"
             ]
           },
+          "refresh_requested": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReflectionRefreshRequested",
+                "description": "Set while the page is marked not fresh: the next reflect run\nreconciles it in full and takes the mark off. Always null on a\nretired page."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "retired": {
             "oneOf": [
               {
@@ -19250,6 +19440,36 @@
             "type": "string",
             "description": "Its title.",
             "example": "Architecture overview"
+          }
+        }
+      },
+      "ReflectionRefreshRequested": {
+        "type": "object",
+        "description": "A page's not-fresh mark: a person asked that the next reflect run\nreconciles the page in full.",
+        "required": [
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "When the page was marked, RFC 3339 in UTC with milliseconds.",
+            "example": "2026-11-25T14:03:07.412Z"
+          },
+          "by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who marked it, by login; null when the page record does not say.",
+            "example": "ada"
+          },
+          "by_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name of `by`, when the account has one.",
+            "example": "Ada Lovelace"
           }
         }
       },

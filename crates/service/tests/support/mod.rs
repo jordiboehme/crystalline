@@ -195,6 +195,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "PATCH /api/v1/domains/{domain}/reflection/settings",
     "POST /api/v1/domains/{domain}/reflection/retire",
     "POST /api/v1/domains/{domain}/reflection/restore",
+    "POST /api/v1/domains/{domain}/reflection/mark-stale",
     "GET /api/v1/domains/{domain}/reflection/clock",
     "GET /api/v1/domains/{domain}/reflection/threads",
     "POST /api/v1/domains/{domain}/reflection/threads",

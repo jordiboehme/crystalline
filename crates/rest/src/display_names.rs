@@ -63,9 +63,10 @@ pub(crate) fn beside(name: Option<&str>, displays: &Displays) -> Option<String> 
 /// Add display names to a Reflection answer, wherever it names a person:
 /// a person's `author` (`{ name, agent }`, in thread entries), the entries
 /// of `people` (the summary), the logins of `changed_by` (queue items, as
-/// `changed_by_display`, a map from login to display name) and `disclosed.by`
-/// (as `disclosed.by_display`). An agent keeps its name: only a person's
-/// name is looked up.
+/// `changed_by_display`, a map from login to display name), `disclosed.by`
+/// (as `disclosed.by_display`) and `refresh_requested.by` (as
+/// `refresh_requested.by_display`). An agent keeps its name: only a
+/// person's name is looked up.
 pub(crate) async fn enrich_reflection(auth: &AuthStore, answer: &mut Value) {
     let mut names = BTreeSet::new();
     collect(answer, &mut names);
@@ -289,7 +290,7 @@ fn collect(v: &Value, names: &mut BTreeSet<String>) {
                             }
                         }
                     }
-                    "disclosed" => {
+                    "disclosed" | "refresh_requested" => {
                         if let Some(n) = child.get("by").and_then(Value::as_str) {
                             names.insert(n.to_string());
                         }
@@ -341,7 +342,7 @@ fn annotate(v: &mut Value, displays: &Displays) {
                             items.iter_mut().for_each(|p| set_person(p, displays));
                         }
                     }
-                    "disclosed" => {
+                    "disclosed" | "refresh_requested" => {
                         if let Some(d) = child.as_object_mut() {
                             set_beside(d, "by", displays);
                         }
@@ -379,6 +380,7 @@ mod tests {
             "people": [ { "name": "ada", "agent": false } ],
             "queue": [ { "changed_by": ["ada", "bob"] }, { "changed_by": ["bob"] } ],
             "sections": [ { "disclosed": { "by": "ada", "at": "2026-11-24" } } ],
+            "page": { "refresh_requested": { "by": "ada", "at": "2026-11-25T14:03:07.412Z" } },
         });
         let mut names = BTreeSet::new();
         collect(&v, &mut names);
@@ -399,5 +401,6 @@ mod tests {
         );
         assert!(v["queue"][1].get("changed_by_display").is_none());
         assert_eq!(v["sections"][0]["disclosed"]["by_display"], "Ada Lovelace");
+        assert_eq!(v["page"]["refresh_requested"]["by_display"], "Ada Lovelace");
     }
 }

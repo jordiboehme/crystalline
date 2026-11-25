@@ -67,6 +67,20 @@ async fn page_of(fx: &Fx, path: &str) -> Value {
         .clone()
 }
 
+/// The queue's items without their ages, which move with the clock.
+fn ageless(q: &Value) -> Vec<Value> {
+    q["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            let mut i = i.clone();
+            i.as_object_mut().unwrap().remove("age_secs");
+            i
+        })
+        .collect()
+}
+
 fn pages(answer: &Value) -> Vec<String> {
     answer["pages"]
         .as_array()
@@ -412,7 +426,7 @@ async fn a_mark_raises_nothing_and_survives_a_write_and_a_move() {
         )
         .await
         .unwrap();
-    assert_eq!(after["queue"], before["queue"], "no new item: {after}");
+    assert_eq!(ageless(&after), ageless(&before), "no new item: {after}");
     let state = fx
         .engine
         .reflection_reconcile("eng", "a.md")
@@ -870,7 +884,12 @@ async fn a_mark_and_its_clearing_raise_nothing_on_other_pages() {
             .unwrap()
             .iter()
             .filter(|i| i["what"] != "stale")
-            .cloned()
+            .map(|i| {
+                // An age moves with the clock, which a slow run crosses.
+                let mut i = i.clone();
+                i.as_object_mut().unwrap().remove("age_secs");
+                i
+            })
             .collect()
     };
     let before = without_stale(&queue(&fx).await);
