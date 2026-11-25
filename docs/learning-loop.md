@@ -183,6 +183,67 @@ crystalline provision deny engineering    # opt out, removing anything already s
 crystalline provision status              # every domain's decision, every harness's installed state
 ```
 
+`allow` installs everything except the optional artifacts you did not take. `deny` installs nothing.
+
 `provision status` lists the allowed domains first, then the undecided ones, then the denied ones, each group by name, and `crystalline doctor` uses the same order. Domains that declare no provisioning and virtual domains fold into one summary line each; add `--all` to list every one of them. The JSON output (and the MCP `provision` tool's `status`) always lists every domain in that order.
 
 Bare `crystalline provision` reconciles every opted-in domain into every harness this machine has onboarded. It is idempotent and safe to rerun: installing what is missing, updating what changed and retiring what a domain no longer ships. A provisioned file you edited by hand is still brought current on the next reconcile, with your edited version kept beside it as a `.bak` copy rather than lost. A foreign file Crystalline never wrote is adopted when it already matches byte for byte and otherwise left untouched, never overwritten.
+
+### Pick single artifacts
+
+A person can also decide per artifact. `skip` leaves artifacts out and `take` installs only the artifacts it names:
+
+```sh
+crystalline provision skip engineering skills/storm-warnings agents/night-owl
+crystalline provision take engineering skills/tide-tables
+```
+
+On a domain with no decision yet, `skip` installs everything else, and `take` installs only the named artifacts. A skipped artifact that is installed is removed, an adopted original included. The decision is saved in `config.yaml` in one of four forms:
+
+```yaml
+provision: true                      # everything except optional artifacts not taken
+provision: false                     # nothing
+provision:
+  except: [skills/storm-warnings]    # everything except these
+  also: [skills/tide-tables]         # plus these optional ones
+provision:
+  only: [skills/tide-tables]         # only these
+```
+
+Keys name the source artifact and compare exactly, so the case must match:
+
+| Kind | Key |
+| --- | --- |
+| Skill | `skills/<dir>`, the skill's folder name |
+| Command | `commands/<path>`, the path without `.md`, a namespace slash kept (`commands/ops/restart`) |
+| Agent | `agents/<stem>`, the file name without its extension |
+| MCP server | `mcps/<name>` |
+
+`crystalline provision status` lists every artifact with its key. `allow` and `deny` replace a pick. `allow` keeps the optional artifacts you took: it clears `except` and keeps `also`. A name in a decision that the domain no longer ships is stale. It does no harm, and `status` and `crystalline doctor` name it with the command that drops it. A kind whose folder is missing on this machine makes no name stale.
+
+### Mark an artifact optional
+
+An author marks a tool that most people do not need as optional. An optional artifact is not installed by `allow`: each person takes it on purpose with `take`. The mark is `metadata: { provision: optional }`. Only the exact string `optional` counts. A skill, a command and a markdown agent carry it in their frontmatter:
+
+```markdown
+---
+name: storm-warnings
+description: Weather alerts for the harbor.
+metadata:
+  provision: optional
+---
+```
+
+An MCP config carries it as a member of its JSON:
+
+```json
+{ "name": "tide-tables", "metadata": { "provision": "optional" }, "server": { "command": "tide-mcp" } }
+```
+
+A `.toml` agent cannot carry the mark, because Codex refuses an agent TOML with a `[metadata]` table. Write the agent in markdown to mark it optional. A `.toml` agent with the same stem as a marked `.md` agent shares that mark.
+
+If an author marks an artifact that already shipped, the next reconcile removes it for everyone who did not take it. Crystalline raises one notice with the `take` command that keeps it.
+
+### Older versions
+
+Older Crystalline versions cannot read a pick, that is any decision that is not a plain `true` or `false`. This matters after a downgrade, while an old daemon still runs, with the Desktop-only macOS bundle that carries its own binary, and when an older instance reads a shared config in document mode during a rolling upgrade. Crystalline adds a notice when it writes a pick. `deny`, or `allow` when no optional artifact is taken, writes a plain value they read.

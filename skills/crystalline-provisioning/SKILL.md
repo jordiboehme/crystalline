@@ -28,6 +28,8 @@ Create one folder per kind, and only the kinds the person will use:
 { "name": "tide-tables", "server": { "command": "tide-mcp", "args": ["--stdio"] } }
 ```
 
+Mark a tool that most people do not need as optional with `metadata: { provision: optional }`: in the frontmatter of a skill, a command or a markdown agent, and as a `"metadata": {"provision": "optional"}` member in an `mcps` JSON. Allow does not install an optional artifact; each person takes it on purpose. A `.toml` agent cannot carry the mark (Codex refuses a `[metadata]` table), so write the agent in markdown to mark it. Only the exact string `optional` counts.
+
 Skills reach all seven harnesses in the table below. Agents and MCP servers reach Claude Code, Codex and GitHub Copilot CLI only, and commands reach Claude Code and Codex only, so prefer a skill unless the person uses only those harnesses. An HTTP server that needs a header does not work in Codex. In the other harnesses the person registers MCP servers themselves. Write real files: symlinks and anything whose name starts with `.` never ship.
 
 ## Name things
@@ -76,11 +78,19 @@ After every MANIFEST edit that is not a draft, call `provision` `status` and com
 
 ## Ask for the decision
 
-Summarize in one sentence what the domain would ship, with the counts per kind, and ask whether to allow or deny. Call `provision` only after the person answers:
+Summarize in one sentence what the domain would ship, with the counts per kind, and ask: all, none or pick? Call `provision` only after the person answers:
 
 ```json
 { "tool": "provision", "arguments": { "action": "allow", "domain": "harbor" } }
 ```
+
+For a pick, call `provision` `status` and show the artifacts with their optional marks. Then call `take` when the person names what they want, or `skip` when the person names what they do not want:
+
+```json
+{ "tool": "provision", "arguments": { "action": "skip", "domain": "harbor", "artifacts": ["skills/storm-warnings"] } }
+```
+
+Keys are `skills/<dir>`, `commands/<path without .md>`, `agents/<stem>` and `mcps/<name>`, always the source name, and they match exactly. On a domain with no decision yet, `skip` installs everything else and `take` installs only the named artifacts. Allow installs everything except optional artifacts the person did not take, so tell the person which artifacts are optional.
 
 A request to set up provisioning is not consent to allow it.
 
@@ -90,7 +100,7 @@ After every allow or deny, call `provision` `status` again. A harness row with `
 
 ## Change or update later
 
-Change artifacts in the tools repo: a hand edit in a harness folder is replaced on the next apply and kept as a `.bak` file. After an edit, or after a `git pull` you proposed and the person confirmed, call `provision` with `action: "apply"` (or run `crystalline provision`) right away: MCP servers change only then. Before a `deny`, say that it removes everything the domain shipped, adopted originals included.
+Change artifacts in the tools repo: a hand edit in a harness folder is replaced on the next apply and kept as a `.bak` file. After an edit, or after a `git pull` you proposed and the person confirmed, call `provision` with `action: "apply"` (or run `crystalline provision`) right away: MCP servers change only then. Before a `deny`, say that it removes everything the domain shipped, adopted originals included. Before a `skip`, say that it removes that artifact, adopted originals included. `allow` and `deny` replace a pick, but `allow` keeps the optional artifacts the person took. A stale name in a pick is harmless: `provision` `status` names it with the command that drops it.
 
 ## Team domains
 
@@ -106,7 +116,7 @@ A separate tools repo works only as a domain of its own, which each person subsc
 
 - Never write a secret value (token, password, API key) into an `mcps` file or any artifact: the `server` object lands in clear in the harness config and in the repo. For a stdio server, tell the person which variable the server reads and where to set it, and leave the value out. An HTTP server that needs a secret header cannot ship in a working way: write no `mcps` file for it, and tell the person to register it in each harness themselves.
 - Never ship a skill, command, agent or MCP server you have not read: it runs with the person's permissions.
-- Never decide `allow` or `deny`, and never take a setup request as the decision.
+- Never decide `allow`, `deny`, `take` or `skip`, and never take a setup request as the decision.
 - Never run `git clone`, `git init`, `git pull`, commit or push without showing the path and command and getting a yes.
 - Never move a skill out of a harness folder; copy it.
 - Never edit provisioned files inside a harness folder; edit the source in the tools repo.
@@ -118,5 +128,6 @@ A separate tools repo works only as a domain of its own, which each person subsc
 - New section -> `read_engram` `manifest`, `edit_engram` `append` with `expected_checksum`; existing -> `replace_section`, body only; then `provision` `status`.
 - Draft receipt -> share and merge before the decision.
 - Allow or deny -> check the counts, summarize, call `provision` only after the person answers.
+- Pick -> `provision` `status`, then `take` (what they want) or `skip` (what they do not want) with `artifacts`.
 - After an edit, a `git pull` or an `update_domain` -> `provision` `apply` at once.
 - Team domain -> folders inside the domain; `../` only within the repository root.
