@@ -552,10 +552,12 @@ fn optional_keys(artifacts: &DomainArtifacts) -> BTreeSet<String> {
 /// - the decision selects it as a required artifact but not as an optional
 ///   one, so the mark is what takes it out (under `only` or an `except` name
 ///   the mark changes nothing);
-/// - the receipt already knew it before this apply: a file of it had a stamp
-///   under the domain, or, for an MCP, a harness row records it for the
-///   domain. A fresh opt-in or a brand-new optional artifact was never
-///   installed, so it gets no notice.
+/// - the last apply installed it from this domain: a harness row records a
+///   file of it (or, for an MCP, the server) for the domain. A stamp alone is
+///   not enough, since every scanned file is stamped, skipped ones too
+///   (an artifact left out by `except` and let in again by `allow` was
+///   never installed). A fresh opt-in or a brand-new optional artifact was
+///   never installed either, so neither gets a notice.
 ///
 /// The caller writes the new `optional` list afterwards, so the notice fires
 /// once.
@@ -570,7 +572,7 @@ fn newly_optional_notices(
     };
     let mut known: BTreeSet<String> = BTreeSet::new();
     for file in artifacts.files.iter().filter(|f| f.optional) {
-        if stamped.files.contains_key(&stamp_key(file)) {
+        if stamped.files.contains_key(&stamp_key(file)) && installed_from(file, domain, receipt) {
             known.insert(artifact_key(file));
         }
     }
@@ -594,6 +596,27 @@ fn newly_optional_notices(
         })
         .map(|key| newly_optional_notice(domain, &key))
         .collect()
+}
+
+/// Whether a harness row records `file` as installed from `domain`. Receipt
+/// rows are keyed by the harness's own path (Codex flattens commands and
+/// renders agents to `.toml`), so the file is projected for each recorded
+/// harness and that harness's row looked up. Only called for the few
+/// optional files the notice considers.
+fn installed_from(file: &ArtifactFile, domain: &str, receipt: &ProvisionReceipt) -> bool {
+    receipt.harnesses.iter().any(|(id, state)| {
+        let Some(harness) = HarnessKind::from_id(id) else {
+            return false;
+        };
+        let translate::Translated::Emit { rel, .. } = translate::translate_file(harness, file)
+        else {
+            return false;
+        };
+        state
+            .files
+            .get(&format!("{}/{}", file.kind.id(), rel))
+            .is_some_and(|row| row.domain == domain)
+    })
 }
 
 /// The notice for an artifact the author made optional since the last apply,
