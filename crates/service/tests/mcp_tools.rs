@@ -6764,7 +6764,10 @@ async fn provision_allow_then_status_flow() {
     // The decision landed on the config file this engine owns, not just in
     // memory.
     let saved: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-    assert_eq!(saved.domains["harbor"].provision, Some(true));
+    assert_eq!(
+        saved.domains["harbor"].provision,
+        Some(crystalline_core::config::Provision::all())
+    );
 
     // The files actually landed under the isolated HOME.
     assert!(home.join(".claude/skills/tide-tables/SKILL.md").exists());

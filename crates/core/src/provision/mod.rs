@@ -52,7 +52,7 @@ pub use translate::{Agent, Command};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, DomainEntry, GlobalConfig};
+use crate::config::{self, DomainEntry, GlobalConfig, Provision};
 use crate::harness::{HarnessKind, artifact_base};
 use crate::manifest::{ArtifactType, Manifest};
 use crate::parse::parse_engram;
@@ -706,7 +706,11 @@ pub fn apply(
     let mut any_opted_in = false;
     let mut domain_artifacts: Vec<DomainArtifacts> = Vec::new();
     for (name, entry) in &global.domains {
-        if entry.provision != Some(true) {
+        if !entry
+            .provision
+            .as_ref()
+            .is_some_and(Provision::includes_any)
+        {
             continue;
         }
         any_opted_in = true;
@@ -859,9 +863,9 @@ pub enum Decision {
 impl Decision {
     /// The decision a [`DomainEntry`]'s own `provision` field carries.
     fn from_entry(entry: &DomainEntry) -> Decision {
-        match entry.provision {
-            Some(true) => Decision::Allowed,
-            Some(false) => Decision::Denied,
+        match &entry.provision {
+            Some(p) if p.includes_any() => Decision::Allowed,
+            Some(_) => Decision::Denied,
             None => Decision::Undecided,
         }
     }
@@ -1116,7 +1120,9 @@ pub fn session_notices(
     let opted: Vec<(&String, &DomainEntry)> = global
         .domains
         .iter()
-        .filter(|(_, e)| e.provision == Some(true) && !e.is_virtual())
+        .filter(|(_, e)| {
+            e.provision.as_ref().is_some_and(Provision::includes_any) && !e.is_virtual()
+        })
         .collect();
     if opted.is_empty() {
         return pending_lines; // nothing opted in: only the pending block, if any
@@ -2164,7 +2170,7 @@ mod tests {
     }
 
     fn with_decision(mut entry: DomainEntry, decision: Option<bool>) -> DomainEntry {
-        entry.provision = decision;
+        entry.provision = decision.map(Provision::from);
         entry
     }
 

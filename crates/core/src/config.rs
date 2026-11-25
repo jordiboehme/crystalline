@@ -6,11 +6,13 @@
 //! XDG-aware default paths. It computes paths only; there is no daemon logic
 //! here.
 
+pub mod provision;
 pub mod registration;
 pub mod root_folder;
 pub mod root_pin;
 pub mod write_fence;
 
+pub use provision::Provision;
 pub use write_fence::{WriteFence, check_write, fence, refuse_appdata_writes};
 
 use std::path::{Path, PathBuf};
@@ -609,11 +611,12 @@ pub struct DomainEntry {
     /// no origin (the common case, and every domain predating this feature).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<OriginConfig>,
-    /// Whether this domain's declared artifacts are provisioned into harnesses.
-    /// Absent means undecided: the domain's artifacts are surfaced as awaiting a
-    /// decision but nothing installs.
+    /// Whether, and which of, this domain's declared artifacts are provisioned
+    /// into harnesses (see [`Provision`]). Absent means undecided: the
+    /// domain's artifacts are surfaced as awaiting a decision but nothing
+    /// installs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provision: Option<bool>,
+    pub provision: Option<Provision>,
     /// How this domain takes changes. Absent is the direct domain everybody
     /// has always had: a write lands in the folder or the database straight
     /// away. [`ReviewMode::Overlay`] is review mode, where every write joins
@@ -3046,10 +3049,10 @@ mod tests {
     fn provision_true_and_false_round_trip() {
         let mut domains = IndexMap::new();
         let mut allowed = DomainEntry::file("/knowledge/allowed");
-        allowed.provision = Some(true);
+        allowed.provision = Some(Provision::all());
         domains.insert("allowed".to_string(), allowed);
         let mut denied = DomainEntry::file("/knowledge/denied");
-        denied.provision = Some(false);
+        denied.provision = Some(Provision::Deny);
         domains.insert("denied".to_string(), denied);
         let cfg = GlobalConfig {
             domains,
@@ -3060,8 +3063,312 @@ mod tests {
         assert!(yaml.contains("provision: true"), "{yaml}");
         assert!(yaml.contains("provision: false"), "{yaml}");
         let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
-        assert_eq!(back.domains.get("allowed").unwrap().provision, Some(true));
-        assert_eq!(back.domains.get("denied").unwrap().provision, Some(false));
+        assert_eq!(
+            back.domains.get("allowed").unwrap().provision,
+            Some(Provision::all())
+        );
+        assert_eq!(
+            back.domains.get("denied").unwrap().provision,
+            Some(Provision::Deny)
+        );
+    }
+
+    /// The `harbor` domain's `provision` value as it reads from `yaml`, the
+    /// text after `provision:` (a scalar or an indented block).
+    fn harbor_config(provision: &str) -> String {
+        format!("domains:\n  harbor:\n    path: /knowledge/harbor\n    provision:{provision}\n")
+    }
+
+    /// Load `text` through [`load_yaml`], the way `config.yaml` is read, and
+    /// answer the error text.
+    fn load_error(text: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, text).unwrap();
+        match load_yaml::<GlobalConfig>(&path) {
+            Ok(cfg) => panic!("the load should fail, it read {cfg:?}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn provision_true_and_false_stay_byte_identical() {
+        for value in [" true", " false"] {
+            let text = harbor_config(value);
+            let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+            assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn provision_except_and_also_round_trip_in_yaml_and_json() {
+        let text = harbor_config(
+            "\n      except:\n      - skills/storm-warnings\n      also:\n      - mcps/lighthouse",
+        );
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+        let pick = Provision::All {
+            except: names(&["skills/storm-warnings"]),
+            also: names(&["mcps/lighthouse"]),
+        };
+        assert_eq!(cfg.domains["harbor"].provision, Some(pick.clone()));
+        assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            json["domains"]["harbor"]["provision"],
+            serde_json::json!({"except": ["skills/storm-warnings"], "also": ["mcps/lighthouse"]})
+        );
+        let back: GlobalConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back, cfg);
+
+        // One list alone writes only that list.
+        for (pick, key) in [
+            (
+                Provision::All {
+                    except: names(&["agents/bosun"]),
+                    also: Vec::new(),
+                },
+                "except",
+            ),
+            (
+                Provision::All {
+                    except: Vec::new(),
+                    also: names(&["agents/bosun"]),
+                },
+                "also",
+            ),
+        ] {
+            let yaml = serde_yaml_ng::to_string(&pick).unwrap();
+            assert_eq!(yaml, format!("{key}:\n- agents/bosun\n"));
+            assert_eq!(serde_yaml_ng::from_str::<Provision>(&yaml).unwrap(), pick);
+            let json = serde_json::to_string(&pick).unwrap();
+            assert_eq!(json, format!(r#"{{"{key}":["agents/bosun"]}}"#));
+            assert_eq!(serde_json::from_str::<Provision>(&json).unwrap(), pick);
+        }
+    }
+
+    #[test]
+    fn provision_only_round_trips_in_yaml_and_json() {
+        let text = harbor_config(
+            "\n      only:\n      - commands/charts/plot-route\n      - skills/tide-tables",
+        );
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+        let pick = Provision::Only(names(&["commands/charts/plot-route", "skills/tide-tables"]));
+        assert_eq!(cfg.domains["harbor"].provision, Some(pick.clone()));
+        assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+
+        let json = serde_json::to_string(&pick).unwrap();
+        assert_eq!(
+            json,
+            r#"{"only":["commands/charts/plot-route","skills/tide-tables"]}"#
+        );
+        assert_eq!(serde_json::from_str::<Provision>(&json).unwrap(), pick);
+        let back: GlobalConfig =
+            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn provision_lists_are_sorted_and_deduped_on_write() {
+        let pick = Provision::All {
+            except: names(&["skills/b", "skills/a", "skills/b"]),
+            also: names(&["mcps/z", "mcps/y", "mcps/z"]),
+        };
+        assert_eq!(
+            serde_yaml_ng::to_string(&pick).unwrap(),
+            "except:\n- skills/a\n- skills/b\nalso:\n- mcps/y\n- mcps/z\n"
+        );
+        assert_eq!(
+            serde_json::to_string(&Provision::Only(names(&["b", "a", "a"]))).unwrap(),
+            r#"{"only":["a","b"]}"#
+        );
+        // A hand-written unsorted list reads back normalized.
+        let read: Provision = serde_yaml_ng::from_str("only: [b, a, b]").unwrap();
+        assert_eq!(read, Provision::Only(names(&["a", "b"])));
+    }
+
+    #[test]
+    fn an_empty_except_list_writes_true_and_an_empty_only_list_writes_false() {
+        let all = Provision::All {
+            except: Vec::new(),
+            also: Vec::new(),
+        };
+        assert_eq!(serde_yaml_ng::to_string(&all).unwrap(), "true\n");
+        assert_eq!(
+            serde_yaml_ng::to_string(&Provision::Only(Vec::new())).unwrap(),
+            "false\n"
+        );
+        assert_eq!(serde_json::to_string(&all).unwrap(), "true");
+        assert_eq!(
+            serde_json::to_string(&Provision::Only(Vec::new())).unwrap(),
+            "false"
+        );
+        // Read from a hand edit, the empty lists normalize the same way.
+        let read: Provision = serde_yaml_ng::from_str("except: []").unwrap();
+        assert_eq!(read, Provision::all());
+        let read: Provision = serde_yaml_ng::from_str("only: []").unwrap();
+        assert_eq!(read, Provision::Deny);
+        assert_eq!(Provision::Only(Vec::new()).normalized(), Provision::Deny);
+    }
+
+    #[test]
+    fn a_misspelled_provision_key_fails_the_load() {
+        let err = load_error(&harbor_config(
+            "\n      exept:\n      - skills/storm-warnings",
+        ));
+        assert!(err.contains("domains.harbor.provision"), "{err}");
+        assert!(err.contains("`exept`"), "{err}");
+        assert!(err.contains("it takes `except`, `also` or `only`"), "{err}");
+        let json = serde_json::from_str::<Provision>(r#"{"exept":["a"]}"#).unwrap_err();
+        assert!(json.to_string().contains("`exept`"), "{json}");
+    }
+
+    #[test]
+    fn an_empty_provision_map_fails_the_load() {
+        let err = load_error(&harbor_config(" {}"));
+        assert!(err.contains("domains.harbor.provision"), "{err}");
+        assert!(
+            err.contains("`provision` needs `except`, `also` or `only`, or `true` or `false`"),
+            "{err}"
+        );
+        let json = serde_json::from_str::<Provision>("{}").unwrap_err();
+        assert!(
+            json.to_string()
+                .contains("`provision` needs `except`, `also` or `only`, or `true` or `false`"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn only_beside_except_fails_the_load() {
+        let never_both = "`provision` takes `only`, or `except` and `also`, never both";
+        for map in [
+            "\n      only: [skills/a]\n      except: [skills/b]",
+            "\n      also: [skills/b]\n      only: [skills/a]",
+        ] {
+            let err = load_error(&harbor_config(map));
+            assert!(err.contains("domains.harbor.provision"), "{err}");
+            assert!(err.contains(never_both), "{err}");
+        }
+        let json =
+            serde_json::from_str::<Provision>(r#"{"only":["a"],"except":["b"]}"#).unwrap_err();
+        assert!(json.to_string().contains(never_both), "{json}");
+    }
+
+    #[test]
+    fn a_malformed_name_loads_and_is_kept() {
+        let text = harbor_config("\n      only:\n      - skills");
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+        assert_eq!(
+            cfg.domains["harbor"].provision,
+            Some(Provision::Only(names(&["skills"])))
+        );
+        assert_eq!(serde_yaml_ng::to_string(&cfg).unwrap(), text);
+        let names: Vec<_> = cfg.domains["harbor"]
+            .provision
+            .as_ref()
+            .unwrap()
+            .names()
+            .collect();
+        assert_eq!(names, ["skills"]);
+    }
+
+    #[test]
+    fn selects_follows_every_form() {
+        let except = Provision::All {
+            except: names(&["skills/out", "mcps/both"]),
+            also: Vec::new(),
+        };
+        let also = Provision::All {
+            except: Vec::new(),
+            also: names(&["mcps/taken"]),
+        };
+        // A hand edit that names one key in both lists: except wins.
+        let both = Provision::All {
+            except: names(&["mcps/both"]),
+            also: names(&["mcps/both", "mcps/taken"]),
+        };
+        let only = Provision::Only(names(&["skills/in", "mcps/taken"]));
+        // (decision, key, optional, selected)
+        let table: &[(&Provision, &str, bool, bool)] = &[
+            (&Provision::Deny, "skills/in", false, false),
+            (&Provision::Deny, "mcps/taken", true, false),
+            (&Provision::all(), "skills/in", false, true),
+            (&Provision::all(), "mcps/taken", true, false),
+            (&except, "skills/out", false, false),
+            (&except, "skills/in", false, true),
+            (&except, "mcps/taken", true, false),
+            (&also, "mcps/taken", true, true),
+            (&also, "mcps/other", true, false),
+            (&also, "skills/in", false, true),
+            (&both, "mcps/both", true, false),
+            (&both, "mcps/taken", true, true),
+            (&only, "skills/in", false, true),
+            (&only, "mcps/taken", true, true),
+            (&only, "skills/out", false, false),
+            (&only, "mcps/other", true, false),
+            // Keys compare exactly.
+            (&only, "skills/In", false, false),
+        ];
+        for (decision, key, optional, selected) in table {
+            assert_eq!(
+                decision.selects(key, *optional),
+                *selected,
+                "{decision:?} selects {key} (optional {optional})"
+            );
+        }
+        assert!(!Provision::Deny.includes_any());
+        assert!(Provision::all().includes_any());
+        assert!(except.includes_any());
+        assert!(only.includes_any());
+        assert_eq!(
+            both.names().collect::<Vec<_>>(),
+            ["mcps/both", "mcps/both", "mcps/taken"]
+        );
+        assert_eq!(Provision::from(true), Provision::all());
+        assert_eq!(Provision::from(false), Provision::Deny);
+    }
+
+    #[test]
+    fn fingerprint_is_none_for_plain_true() {
+        assert_eq!(Provision::all().fingerprint(), None);
+        assert_eq!(
+            Provision::All {
+                except: Vec::new(),
+                also: Vec::new()
+            }
+            .fingerprint(),
+            None
+        );
+        assert_eq!(Provision::Deny.fingerprint().as_deref(), Some("deny"));
+        assert_eq!(
+            Provision::All {
+                except: names(&["b", "a"]),
+                also: names(&["c"]),
+            }
+            .fingerprint()
+            .as_deref(),
+            Some("except=a,b;also=c")
+        );
+        assert_eq!(
+            Provision::All {
+                except: Vec::new(),
+                also: names(&["c"]),
+            }
+            .fingerprint()
+            .as_deref(),
+            Some("also=c")
+        );
+        assert_eq!(
+            Provision::Only(names(&["b", "a", "b"]))
+                .fingerprint()
+                .as_deref(),
+            Some("only=a,b")
+        );
     }
 
     /// The two login throttle keys default, read back and round trip through

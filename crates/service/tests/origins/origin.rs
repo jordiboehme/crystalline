@@ -1070,7 +1070,7 @@ async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review(
             kind: crystalline_core::config::DomainKind::File,
             path: Some(root.clone()),
             origin: None,
-            provision: Some(false),
+            provision: Some(crystalline_core::config::Provision::Deny),
             review: Some(crystalline_core::config::ReviewMode::Overlay),
             ..Default::default()
         },
@@ -1100,7 +1100,7 @@ async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review(
     assert!(entry.origin.is_some());
     assert_eq!(
         entry.provision,
-        Some(false),
+        Some(crystalline_core::config::Provision::Deny),
         "the provisioning decision stays"
     );
     assert_eq!(

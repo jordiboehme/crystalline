@@ -10387,7 +10387,8 @@ pub fn set_domain_provision_decision(
             "domain '{name}' is virtual; virtual domains have no files to provision, so no decision was recorded"
         )));
     }
-    file.domains.get_mut(name).unwrap().provision = Some(allow);
+    file.domains.get_mut(name).unwrap().provision =
+        Some(crystalline_core::config::Provision::from(allow));
     Ok(())
 }
 

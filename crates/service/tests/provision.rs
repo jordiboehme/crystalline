@@ -167,7 +167,10 @@ async fn allow_persists_the_decision_into_the_config_file_and_returns_a_report()
     // The decision landed on the config file this engine owns, byte for
     // byte readable back off disk - not just the in-memory config.
     let saved: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-    assert_eq!(saved.domains["harbor"].provision, Some(true));
+    assert_eq!(
+        saved.domains["harbor"].provision,
+        Some(crystalline_core::config::Provision::all())
+    );
 
     // A report comes back naming the one harness this machine onboarded and
     // what it did.
@@ -406,7 +409,7 @@ async fn an_apply_report_names_no_domain_the_caller_may_not_see() {
         cfg.domains.insert(
             name.to_string(),
             DomainEntry {
-                provision: Some(true),
+                provision: Some(crystalline_core::config::Provision::all()),
                 ..DomainEntry::virtual_domain()
             },
         );
