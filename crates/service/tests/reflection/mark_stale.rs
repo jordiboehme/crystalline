@@ -675,7 +675,11 @@ async fn a_made_up_mark_part_is_refused() {
     let made_up = format!("{}:{}:{later}:{}", parts[0], parts[1], parts[3]);
     let e = reconcile(&fx, "guides/a.md", &made_up).await.unwrap_err();
     assert!(matches!(e, EngineError::Invalid(_)), "{e}");
-    assert!(e.to_string().contains("no version the reflect queue handed out"), "{e}");
+    assert!(
+        e.to_string()
+            .contains("no version the reflect queue handed out"),
+        "{e}"
+    );
     assert!(
         fx.engine
             .reflection_reconcile("eng", "guides/a.md")
@@ -691,7 +695,11 @@ async fn a_made_up_mark_part_is_refused() {
     // A page with no mark at all refuses any mark part.
     put(&fx, "guides/b.md", PAGE).await;
     let e = reconcile(&fx, "guides/b.md", &made_up).await.unwrap_err();
-    assert!(e.to_string().contains("no version the reflect queue handed out"), "{e}");
+    assert!(
+        e.to_string()
+            .contains("no version the reflect queue handed out"),
+        "{e}"
+    );
 
     // A version without a mark part records and clears nothing.
     let three = format!("{}:{}:{}", parts[0], parts[1], parts[3]);
@@ -719,7 +727,10 @@ async fn a_version_with_a_made_up_hash_clears_nothing() {
     let made_up = format!("0:0:{at_ms}:{}", "0".repeat(64));
     let e = reconcile(&fx, "guides/a.md", &made_up).await.unwrap_err();
     assert!(matches!(e, EngineError::Invalid(_)), "{e}");
-    assert!(e.to_string().contains("read the reflect queue again"), "{e}");
+    assert!(
+        e.to_string().contains("read the reflect queue again"),
+        "{e}"
+    );
     assert!(
         fx.engine
             .reflection_reconcile("eng", "guides/a.md")

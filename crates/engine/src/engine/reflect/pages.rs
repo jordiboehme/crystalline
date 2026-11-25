@@ -444,7 +444,8 @@ fn stale_parts(version: &str) -> Option<(i64, i64, Option<i64>)> {
         Some(_) => return None,
         None => None,
     };
-    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some((base, period, mark))
+    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some((base, period, mark))
 }
 
 /// The recorded reconcile a `stale` item's `version` was handed out after,

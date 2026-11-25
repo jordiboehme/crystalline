@@ -383,9 +383,7 @@ impl Engine {
             let abs = access.abs(child);
             let lock = self.lock_file(&abs).await;
             let cleared = match (seen, read_opt(&abs)) {
-                (Some(up_to), Ok(Some(text)))
-                    if !super::page_life::is_retired(&text, child) =>
-                {
+                (Some(up_to), Ok(Some(text))) if !super::page_life::is_retired(&text, child) => {
                     self.clear_seen_mark(domain, &access, child, &abs, &text, up_to, caller)
                         .await
                 }
