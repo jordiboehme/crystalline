@@ -675,7 +675,7 @@ async fn a_made_up_mark_part_is_refused() {
     let made_up = format!("{}:{}:{later}:{}", parts[0], parts[1], parts[3]);
     let e = reconcile(&fx, "guides/a.md", &made_up).await.unwrap_err();
     assert!(matches!(e, EngineError::Invalid(_)), "{e}");
-    assert!(e.to_string().contains("mark part"), "{e}");
+    assert!(e.to_string().contains("no version the reflect queue handed out"), "{e}");
     assert!(
         fx.engine
             .reflection_reconcile("eng", "guides/a.md")
@@ -691,13 +691,54 @@ async fn a_made_up_mark_part_is_refused() {
     // A page with no mark at all refuses any mark part.
     put(&fx, "guides/b.md", PAGE).await;
     let e = reconcile(&fx, "guides/b.md", &made_up).await.unwrap_err();
-    assert!(e.to_string().contains("mark part"), "{e}");
+    assert!(e.to_string().contains("no version the reflect queue handed out"), "{e}");
 
     // A version without a mark part records and clears nothing.
     let three = format!("{}:{}:{}", parts[0], parts[1], parts[3]);
     let receipt = reconcile(&fx, "guides/a.md", &three).await.unwrap();
     assert_eq!(receipt["still_marked"].as_array().unwrap().len(), 1);
     assert!(file(&fx, "guides/a.md").contains("refresh_requested"));
+}
+
+/// A version built from what the page view shows (no recorded reconcile,
+/// period 0, the mark as its mark part) with a made-up hash is no version
+/// the queue handed out: refused, nothing recorded, the mark stays.
+#[tokio::test]
+async fn a_version_with_a_made_up_hash_clears_nothing() {
+    let fx = reflecting().await;
+    put(&fx, "guides/a.md", PAGE).await;
+    mark(&fx, &one("guides/a.md"), &person()).await.unwrap();
+    let at = page_of(&fx, "guides/a.md").await["refresh_requested"]["at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let at_ms = crystalline_core::time::parse_rfc3339(&at)
+        .unwrap()
+        .stamp()
+        .unix_millis();
+    let made_up = format!("0:0:{at_ms}:{}", "0".repeat(64));
+    let e = reconcile(&fx, "guides/a.md", &made_up).await.unwrap_err();
+    assert!(matches!(e, EngineError::Invalid(_)), "{e}");
+    assert!(e.to_string().contains("read the reflect queue again"), "{e}");
+    assert!(
+        fx.engine
+            .reflection_reconcile("eng", "guides/a.md")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .is_none(),
+        "nothing recorded"
+    );
+    assert!(file(&fx, "guides/a.md").contains("refresh_requested"));
+    // The version the queue hands out is taken.
+    let version = stale_of(&queue(&fx).await, "guides/a.md").unwrap()["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(version, made_up);
+    reconcile(&fx, "guides/a.md", &version).await.unwrap();
+    assert!(!file(&fx, "guides/a.md").contains("refresh_requested"));
 }
 
 /// While a marked page has an item of its own, `reconciled` needs its
@@ -738,6 +779,78 @@ async fn the_owner_record_takes_the_owned_marks_off() {
     for page in ["arch.md", "arch/db.md", "arch/api.md"] {
         assert!(!file(&fx, page).contains("refresh_requested"), "{page}");
     }
+    assert!(stale_items(&queue(&fx).await).is_empty());
+}
+
+/// An honest run that retired the only marked page of the set while it
+/// worked: the owner's version still carries that mark, and the set holds
+/// no readable mark any more. The record lands and clears nothing; the
+/// retired page keeps its mark in its file.
+#[tokio::test]
+async fn a_run_that_retired_the_marked_owned_page_still_records() {
+    let fx = reflecting().await;
+    put(&fx, "week.md", "---\nfreshness: 1d\n---\n# Week\n").await;
+    owned(&fx, "week/mon.md", "week.md").await;
+    reconcile(&fx, "week/mon.md", "").await.unwrap();
+    reconcile(&fx, "week.md", "").await.unwrap();
+    mark(&fx, &one("week/mon.md"), &person()).await.unwrap();
+    backdate(&fx, "week.md", 2 * DAY).await;
+    let owner = stale_of(&queue(&fx).await, "week.md").expect("the owner's item");
+    let version = owner["version"].as_str().unwrap().to_string();
+    assert_eq!(version.split(':').count(), 4, "{version}");
+
+    fx.engine
+        .write_reflection(&act("retire", "week/mon.md"), &agent())
+        .await
+        .unwrap();
+    let receipt = reconcile(&fx, "week.md", &version).await.unwrap();
+    assert_eq!(receipt["still_marked"], serde_json::json!([]), "{receipt}");
+    assert!(
+        fx.engine
+            .reflection_reconcile("eng", "week.md")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .is_some(),
+        "recorded"
+    );
+    assert!(file(&fx, "week/mon.md").contains("refresh_requested"));
+    assert!(stale_items(&queue(&fx).await).is_empty());
+}
+
+/// The owner marked first, its owned page later, then the owned page
+/// retired by the run: the version's mark part (the owned page's) is newer
+/// than every mark left in the set. The record lands and clears the
+/// owner's mark, never more than the newest mark it still reads.
+#[tokio::test]
+async fn a_run_that_retired_the_newest_marked_page_clears_up_to_what_is_left() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    owned(&fx, "arch/db.md", "arch.md").await;
+    mark(
+        &fx,
+        &MarkStale {
+            pages: MarkPages::One("arch.md".into()),
+            only_page: true,
+        },
+        &person(),
+    )
+    .await
+    .unwrap();
+    mark(&fx, &one("arch/db.md"), &person()).await.unwrap();
+    let item = stale_of(&queue(&fx).await, "arch.md").unwrap();
+    assert_eq!(item["owned_marked"], serde_json::json!(["arch/db.md"]));
+    let version = item["version"].as_str().unwrap().to_string();
+
+    fx.engine
+        .write_reflection(&act("retire", "arch/db.md"), &agent())
+        .await
+        .unwrap();
+    let receipt = reconcile(&fx, "arch.md", &version).await.unwrap();
+    assert_eq!(receipt["still_marked"], serde_json::json!([]), "{receipt}");
+    assert!(receipt["refresh_requested"].is_null(), "{receipt}");
+    assert!(!file(&fx, "arch.md").contains("refresh_requested"));
     assert!(stale_items(&queue(&fx).await).is_empty());
 }
 
@@ -911,3 +1024,4 @@ async fn a_mark_and_its_clearing_raise_nothing_on_other_pages() {
         "{after}"
     );
 }
+

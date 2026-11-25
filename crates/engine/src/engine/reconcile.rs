@@ -202,9 +202,12 @@ impl Engine {
     /// fresh) takes the marks it saw off: the page's and those of the pages
     /// it owns whose mark is at or before that part, each under its own
     /// lock (that write keeps the file's modified time). A later mark stays
-    /// and is named in the receipt's `still_marked`. A mark part newer than
-    /// every mark of the set answers no item the queue handed out and is
-    /// refused.
+    /// and is named in the receipt's `still_marked`. Such a version must be
+    /// the one the queue hands out for the page now (its hash is rebuilt
+    /// with its own period and mark part), or it is refused. A mark part
+    /// newer than every mark left in the set (a marked page was retired or
+    /// moved while the run worked) clears up to the newest mark still
+    /// there, and nothing when none is left.
     pub(crate) async fn reconciled_reflection(
         &self,
         domain: &str,
@@ -295,6 +298,29 @@ impl Engine {
         }
         self.refuse_owner_before_owned(domain, inner, &text, &rows)
             .await?;
+        let pact_hash = r::page_pact_hash(inner, texts.iter().copied()).unwrap_or_default();
+        // A version with a mark part clears marks, so it must be one the
+        // queue handed out: rebuilt from the page as it is, with the
+        // version's own period and mark part.
+        if super::reflect::stale_mark(version).is_some() {
+            let record = r::read_provenance(&text).page;
+            let (settings, _) = r::read_page_settings(&text, inner, &record);
+            let freshness = settings
+                .freshness
+                .as_ref()
+                .map_or("", |freshness| freshness.written.as_str());
+            let handed_out = self
+                .reflection_reconcile(domain, inner)
+                .await?
+                .is_some_and(|state| {
+                    super::reflect::marked_version_matches(version, freshness, &state, &pact_hash)
+                });
+            if !handed_out {
+                return Err(EngineError::Invalid(format!(
+                    "the version {version} is no version the reflect queue handed out for '{inner}' as it is now (its parts do not match the page's item, or the page's pacts or freshness changed since), so nothing is recorded; read the reflect queue again for the page's current item"
+                )));
+            }
+        }
         // The page and the pages it owns: the set a stale item of the page
         // names, whose marks its version saw.
         let owned = r::owned_pages(texts.iter().copied());
@@ -309,15 +335,13 @@ impl Engine {
             .filter_map(|(text, path)| super::mark_stale::text_mark(text, path))
             .map(|mark| mark.at_ms)
             .max();
-        let seen = super::reflect::stale_mark(version);
-        if let Some(sent) = seen
-            && newest.is_none_or(|newest| sent > newest)
-        {
-            return Err(EngineError::Invalid(format!(
-                "the version's mark part {sent} is newer than every not-fresh mark on '{inner}' and the pages it owns, so it answers no item the queue handed out; read the reflect queue again for the page's current item"
-            )));
-        }
-        let pact_hash = r::page_pact_hash(inner, texts.iter().copied()).unwrap_or_default();
+        // The version is one the queue handed out (checked above), so a mark
+        // part newer than every mark left in the set means marks left it
+        // while the run worked (a page retired or moved): clamp to the
+        // newest mark still there, and clear nothing when none is left. A
+        // mark set after the set was read is later than that and stays.
+        let seen = super::reflect::stale_mark(version)
+            .and_then(|sent| newest.map(|newest| sent.min(newest)));
         let state = self
             .record_reflection_reconcile(
                 domain,

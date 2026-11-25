@@ -285,13 +285,13 @@ Then it records the reconcile: `write_reflection` with `action: reconciled`, `ou
 
 - while the page is due, without a `version`. A marked page that has an item of its own needs one too, so the mark the run saw is recorded: "'{inner}' is marked not fresh and has a stale item in the reflect queue: send its version with reconciled, so the mark it saw is recorded";
 - with the version of an older period: the page was reconciled again after the item was handed out, so nothing is recorded and the agent reads the queue again;
-- with a version whose mark part is newer than every mark on the page and the pages it owns: it answers no item the queue handed out, so the agent reads the queue again. A run cannot cover a mark it did not see;
+- with a version with a mark part that is not the one the queue hands out for the page now: its parts do not match the page's item, or the page's pacts or freshness changed while the run worked. Nothing is recorded and the agent reads the queue again;
 - for an owner that is due while one of its owned pages has no reconcile after the owner's last one: the refusal names those pages. Owned pages come first and the owner last;
 - for `PACT.md`, a page pact and a retired page.
 
 A failed run records nothing, so the page stays due. A `stale` item that a run left for a person comes back with the next period. A marked page stays due until a run reconciles it.
 
-When the version has a mark part, the reconcile takes the marks it saw off the page file: the page's own and the marks of each page it owns, recursively, whose mark is at or before that part. Each page is written under its own lock. The write changes only the page record and keeps the file's modified time. It is a page change like any other: a change event, a backup commit, and an open room takes it in. A mark that came later stays. The receipt names it in `still_marked` (a list of `{path, at, by}`) and carries the page's own `refresh_requested`. A reconcile with no version (an owned page under a due owner) or with a three-part version clears nothing.
+When the version has a mark part, the reconcile takes the marks it saw off the page file: the page's own and the marks of each page it owns, recursively, whose mark is at or before that part. Each page is written under its own lock. The write changes only the page record and keeps the file's modified time. It is a page change like any other: a change event, a backup commit, and an open room takes it in. A mark that came later stays, so a run cannot cover a mark it did not see. When a marked page left the set while the run worked (it was retired or moved), the reconcile takes off only marks at or before the newest mark still there, and nothing when no mark is left. The receipt names it in `still_marked` (a list of `{path, at, by}`) and carries the page's own `refresh_requested`. A reconcile with no version (an owned page under a due owner) or with a three-part version clears nothing.
 
 ### Mark a page not fresh
 

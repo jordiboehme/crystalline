@@ -383,11 +383,54 @@ fn stale_version(
     }
 }
 
+/// The version of the `stale` item of a page whose reconcile state is
+/// `state`, whose freshness is written `freshness` (empty for none) and
+/// whose pact hash is `pact_hash`, in the period `period`, with `mark` the
+/// newest mark of its set: [`stale_version`] with the recorded reconcile
+/// read from `state` (none while it has no outcome). `None` when the
+/// state's time does not read.
+fn item_version(
+    freshness: &str,
+    state: &PageReconcile,
+    period: i64,
+    pact_hash: &str,
+    mark: Option<i64>,
+) -> Option<String> {
+    let at = crystalline_core::time::parse_rfc3339(&state.last_reconciled)?.stamp();
+    let recorded_at = state.outcome.is_some().then(|| at.unix_millis());
+    Some(stale_version(
+        freshness,
+        state,
+        recorded_at,
+        period,
+        pact_hash,
+        mark,
+    ))
+}
+
+/// Whether the 4-part `version` (one with a mark part) is the version the
+/// queue hands out for the page whose reconcile state is `state`, whose
+/// freshness is written `freshness` and whose pact hash is `pact_hash`:
+/// rebuilt with the version's own period and mark part, so a period that
+/// ran on since the item was handed out still matches. A version with no
+/// mark part, or that is no stale item's version, answers false.
+pub(crate) fn marked_version_matches(
+    version: &str,
+    freshness: &str,
+    state: &PageReconcile,
+    pact_hash: &str,
+) -> bool {
+    let Some((_, period, Some(mark))) = stale_parts(version) else {
+        return false;
+    };
+    item_version(freshness, state, period, pact_hash, Some(mark)).as_deref() == Some(version)
+}
+
 /// The parts of a `stale` item's `version`: the recorded reconcile it was
-/// handed out after and the mark part, when it has one. `None` when
-/// `version` is no stale item's version. Reads both forms: 3 parts with no
-/// mark, 4 parts with one (decimal milliseconds).
-fn stale_parts(version: &str) -> Option<(i64, Option<i64>)> {
+/// handed out after, the period and the mark part, when it has one. `None`
+/// when `version` is no stale item's version. Reads both forms: 3 parts
+/// with no mark, 4 parts with one (decimal milliseconds).
+fn stale_parts(version: &str) -> Option<(i64, i64, Option<i64>)> {
     let parts: Vec<&str> = version.split(':').collect();
     let (base, period, mark, hash) = match parts.as_slice() {
         [base, period, hash] => (*base, *period, None, *hash),
@@ -395,20 +438,20 @@ fn stale_parts(version: &str) -> Option<(i64, Option<i64>)> {
         _ => return None,
     };
     let base = base.parse::<i64>().ok()?;
-    period.parse::<u64>().ok()?;
+    let period = i64::try_from(period.parse::<u64>().ok()?).ok()?;
     let mark = match mark {
         Some(mark) if mark.bytes().all(|b| b.is_ascii_digit()) => Some(mark.parse::<i64>().ok()?),
         Some(_) => return None,
         None => None,
     };
-    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some((base, mark))
+    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some((base, period, mark))
 }
 
 /// The recorded reconcile a `stale` item's `version` was handed out after,
 /// in milliseconds since the epoch (0 for none), or `None` when `version`
 /// is no stale item's version.
 pub(crate) fn stale_base(version: &str) -> Option<i64> {
-    stale_parts(version).map(|(base, _)| base)
+    stale_parts(version).map(|(base, _, _)| base)
 }
 
 /// The mark part of a `stale` item's `version`: the newest not-fresh mark
@@ -416,7 +459,7 @@ pub(crate) fn stale_base(version: &str) -> Option<i64> {
 /// epoch. `None` for a version without one (3 parts) and for what is no
 /// stale item's version.
 pub(crate) fn stale_mark(version: &str) -> Option<i64> {
-    stale_parts(version)?.1
+    stale_parts(version)?.2
 }
 
 /// Whether the owned page `child` counts as reconciled for its owner's
@@ -477,7 +520,6 @@ pub(super) fn stale_item(
         .filter(|(_, timing)| timing.stale());
     let mark = view.mark(path);
     let period = timing.as_ref().map_or(0, |(_, timing)| timing.period);
-    let recorded_at = state.outcome.is_some().then(|| at.unix_millis());
     let pact_hash = inputs.hashes.get(path).map(String::as_str).unwrap_or("");
     let owned = view.owned_tree(path);
     let owned_marked: Vec<&String> = owned
@@ -494,14 +536,13 @@ pub(super) fn stale_item(
                 .filter_map(|child| view.mark(child).map(|m| m.at_ms)),
         )
         .max();
-    let version = stale_version(
+    let version = item_version(
         freshness.map_or("", |freshness| freshness.written.as_str()),
         state,
-        recorded_at,
         period,
         pact_hash,
         set_mark,
-    );
+    )?;
     let chain = view.chain(path);
     let mut texts = serde_json::Map::new();
     for pact in &chain {
@@ -583,7 +624,7 @@ pub(super) const PACT_TEXTS: &str = "_pact_texts";
 mod tests {
     use std::collections::HashSet;
 
-    use super::{counted_elsewhere, stale_base, stale_mark, stale_version};
+    use super::{counted_elsewhere, marked_version_matches, stale_base, stale_mark, stale_version};
     use crate::engine::reconcile::{PageReconcile, ReconcileOutcome};
 
     fn state() -> PageReconcile {
@@ -631,6 +672,35 @@ mod tests {
             assert_eq!(stale_base(wrong), None, "{wrong}");
             assert_eq!(stale_mark(wrong), None, "{wrong}");
         }
+    }
+
+    /// A marked version matches only the item it was built for: its own
+    /// period and mark part, the state, the freshness and the pact hash
+    /// as they are. A 3-part version never matches.
+    #[test]
+    fn a_marked_version_matches_only_its_own_item() {
+        let at = crystalline_core::time::parse_rfc3339(&state().last_reconciled)
+            .unwrap()
+            .stamp()
+            .unix_millis();
+        let version = stale_version("1d", &state(), Some(at), 4, "abc", Some(1_795_615_387_412));
+        assert!(marked_version_matches(&version, "1d", &state(), "abc"));
+        assert!(!marked_version_matches(&version, "2d", &state(), "abc"));
+        assert!(!marked_version_matches(&version, "1d", &state(), "abd"));
+        let parts: Vec<&str> = version.split(':').collect();
+        let made_up = format!("{}:{}:{}:{}", parts[0], parts[1], parts[2], "0".repeat(64));
+        assert!(!marked_version_matches(&made_up, "1d", &state(), "abc"));
+        let later = format!("{}:{}:1795615387413:{}", parts[0], parts[1], parts[3]);
+        assert!(!marked_version_matches(&later, "1d", &state(), "abc"));
+        let unmarked = stale_version("1d", &state(), Some(at), 4, "abc", None);
+        assert!(!marked_version_matches(&unmarked, "1d", &state(), "abc"));
+        let never = PageReconcile {
+            outcome: None,
+            ..state()
+        };
+        let seeded = stale_version("", &never, None, 0, "abc", Some(1_795_615_387_412));
+        assert!(marked_version_matches(&seeded, "", &never, "abc"));
+        assert!(!marked_version_matches(&seeded, "", &state(), "abc"));
     }
 
     #[test]
