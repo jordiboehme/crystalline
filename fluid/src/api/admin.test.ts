@@ -1915,6 +1915,7 @@ describe("local changes", () => {
       refused: [
         { path: "b.md", reason: "changed_since" },
         { path: "c.md", reason: "no_base_copy", detail: "fetch_failed" },
+        { path: "e.md", reason: "share_pending", proposal: 7 },
       ],
       reindexed: 1,
     });
@@ -1939,6 +1940,7 @@ describe("local changes", () => {
       refused: [
         { path: "b.md", reason: "changed_since" },
         { path: "c.md", reason: "no_base_copy", detail: "fetch_failed" },
+        { path: "e.md", reason: "share_pending", proposal: 7 },
       ],
       reindexed: 1,
     });
@@ -1968,6 +1970,12 @@ describe("local changes", () => {
     );
     expect(refusalSentence("no_base_copy", "digest_mismatch")).toBe(
       "The proposal's copy of this file on GitHub does not match what was shared. Nothing was changed.",
+    );
+    expect(refusalSentence("share_pending", undefined, 7)).toBe(
+      "The last share into proposal #7 did not finish. Share into it again, then discard this file.",
+    );
+    expect(refusalSentence("share_pending")).toBe(
+      "The last share into this file's proposal did not finish. Share into it again, then discard this file.",
     );
     expect(refusalSentence("unknown_path")).toBe(
       "Not among this domain's unshared changes.",

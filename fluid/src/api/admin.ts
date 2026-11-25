@@ -2010,13 +2010,24 @@ export interface ChangeDetail extends LocalChange {
   tooLarge: boolean;
 }
 
+/** One path a discard left as it stands, and why. */
+export interface DiscardRefusal {
+  path: string;
+  reason: string;
+  detail?: string;
+  proposal?: number;
+}
+
 /** What a discard did, path by path. */
 export interface DiscardReceipt {
   restored: string[];
   deleted: string[];
   cleared: { path: string; kind: string }[];
-  /** Each refused path, with its reason and, for `no_base_copy`, why. */
-  refused: { path: string; reason: string; detail?: string }[];
+  /**
+   * Each refused path, with its reason and, for `no_base_copy`, why; for
+   * `share_pending`, the proposal whose share did not finish.
+   */
+  refused: DiscardRefusal[];
   reindexed: number;
 }
 
@@ -2136,18 +2147,17 @@ export function readDiscardReceipt(value: unknown): DiscardReceipt {
         const item = asObject(entry);
         const path = asString(item?.path);
         if (path === null) return null;
-        const refusal: { path: string; reason: string; detail?: string } = {
+        const refusal: DiscardRefusal = {
           path,
           reason: asString(item?.reason) ?? "",
         };
         const detail = asString(item?.detail);
         if (detail !== null) refusal.detail = detail;
+        const proposal = asNumber(item?.proposal);
+        if (proposal !== null) refusal.proposal = proposal;
         return refusal;
       })
-      .filter(
-        (entry): entry is { path: string; reason: string; detail?: string } =>
-          entry !== null,
-      ),
+      .filter((entry): entry is DiscardRefusal => entry !== null),
     reindexed: asNumber(record?.reindexed) ?? 0,
   };
 }
@@ -2167,9 +2177,14 @@ export async function discardChanges(
 
 /**
  * The sentence a refused path wears, per reason, in the server's own terms.
- * `detail` says why a `no_base_copy` happened.
+ * `detail` says why a `no_base_copy` happened; `proposal` names the proposal
+ * of a `share_pending`.
  */
-export function refusalSentence(reason: string, detail?: string): string {
+export function refusalSentence(
+  reason: string,
+  detail?: string,
+  proposal?: number,
+): string {
   switch (reason) {
     case "changed_since":
       return "Changed since you looked.";
@@ -2184,6 +2199,10 @@ export function refusalSentence(reason: string, detail?: string): string {
         default:
           return "The proposal's copy of this file is not on this machine and could not be fetched from GitHub. Try again when you are online.";
       }
+    case "share_pending":
+      return proposal === undefined
+        ? "The last share into this file's proposal did not finish. Share into it again, then discard this file."
+        : `The last share into proposal #${proposal} did not finish. Share into it again, then discard this file.`;
     case "unknown_path":
       return "Not among this domain's unshared changes.";
     case "open_in_editor":

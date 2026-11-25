@@ -2088,6 +2088,13 @@ pub enum TipSource {
         /// The git blob sha of the shared bytes, `None` on a record from
         /// before 0.17.0.
         blob_sha: Option<String>,
+        /// Whether the record has a push in flight
+        /// ([`Proposal::pending_head_commit`]): a share into it moved, or
+        /// tried to move, its branch and never recorded the result. The
+        /// branch may then carry content this record does not name, so a
+        /// discard refuses the path ([`DiscardRefusal::SharePending`]) until
+        /// a share into the proposal finishes.
+        pending: bool,
     },
 }
 
@@ -2128,6 +2135,7 @@ fn tip_sources_over(base: &BTreeMap<String, BaseStamp>, layers: &[&Proposal]) ->
                         number: layer.number,
                         sha256: sha256.clone(),
                         blob_sha: file.blob_sha.clone(),
+                        pending: layer.pending_head_commit.is_some(),
                     };
                     tip.insert(file.path.clone(), (BaseStamp { sha256, size }, source));
                 }
@@ -3961,9 +3969,13 @@ async fn collect_changes(
 
     for change in &local.changes {
         match change {
-            LocalChange::Added { path, sha256 } => {
+            LocalChange::Added { path, .. } => {
                 let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
                 let bytes = read_working_file(&wt_path)?;
+                // The digest of the bytes this share sends, not the one the
+                // detection saw: a write in between would otherwise leave a
+                // record naming content the proposal does not carry.
+                let sha256 = state::sha256_hex(&bytes);
                 keep_proposed_copy(state_dir, path, &bytes);
                 let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
@@ -3976,14 +3988,16 @@ async fn collect_changes(
                 out.files.push(ProposedFile {
                     path: path.clone(),
                     change: ProposedChange::Added,
-                    sha256: Some(sha256.clone()),
+                    sha256: Some(sha256),
                     blob_sha: Some(blob_sha),
                     size: Some(size),
                 });
             }
-            LocalChange::Modified { path, sha256 } => {
+            LocalChange::Modified { path, .. } => {
                 let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
                 let bytes = read_working_file(&wt_path)?;
+                // As above: the digest of what is sent.
+                let sha256 = state::sha256_hex(&bytes);
                 keep_proposed_copy(state_dir, path, &bytes);
                 let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
@@ -3996,7 +4010,7 @@ async fn collect_changes(
                 out.files.push(ProposedFile {
                     path: path.clone(),
                     change: ProposedChange::Modified,
-                    sha256: Some(sha256.clone()),
+                    sha256: Some(sha256),
                     blob_sha: Some(blob_sha),
                     size: Some(size),
                 });
@@ -4657,9 +4671,33 @@ async fn amend_layer(
         files,
     )?;
     if fresh.changes.is_empty() {
-        return Ok(ProposeOutcome::NothingToShare {
-            skipped_large: fresh.skipped_large,
-        });
+        // An earlier share into this layer that never recorded its push
+        // (`pending_head_commit`) is settled here rather than left behind,
+        // since a discard refuses the layer's paths while it stands:
+        //
+        // - the push never landed (the live head is the recorded one): the
+        //   record is still the truth, so the pending sha is dropped;
+        // - the push landed: the branch carries content the record does not
+        //   name, and the commit's files are not known here, so adopting the
+        //   head as it stands would make the record lie. The layer is rebuilt
+        //   from its record instead (nothing fresh, so every entry is kept)
+        //   and pushed fast-forward on top of it, which makes the branch
+        //   carry what the record and the working tree say again.
+        match layer.pending_head_commit.as_deref() {
+            Some(pending) if pending == live_head => {}
+            Some(_) => {
+                state.proposals[index].pending_head_commit = None;
+                state.save(state_dir)?;
+                return Ok(ProposeOutcome::NothingToShare {
+                    skipped_large: fresh.skipped_large,
+                });
+            }
+            None => {
+                return Ok(ProposeOutcome::NothingToShare {
+                    skipped_large: fresh.skipped_large,
+                });
+            }
+        }
     }
 
     // Which paths the layers above claim decides whether the working tree may
@@ -4861,15 +4899,20 @@ async fn collect_amend_changes(
 
     for change in &fresh.changes {
         match change {
-            LocalChange::Added { path, sha256 } | LocalChange::Modified { path, sha256 } => {
+            LocalChange::Added { path, .. } | LocalChange::Modified { path, .. } => {
+                // Read first, and judge and record the bytes that are read,
+                // never the digest the detection saw: a write in between
+                // would otherwise leave a record naming content the layer
+                // does not carry.
+                let wt_path = checked_working_path(state_dir, domain_root, fresh.disk_path(path))?;
+                let bytes = read_working_file(&wt_path)?;
+                let sha256 = state::sha256_hex(&bytes);
                 let beneath = below.get(path);
                 if beneath.map(|stamp| stamp.sha256.as_str()) == Some(sha256.as_str()) {
                     // The tip below already carries exactly this content.
                     merged.remove(path);
                     continue;
                 }
-                let wt_path = checked_working_path(state_dir, domain_root, fresh.disk_path(path))?;
-                let bytes = read_working_file(&wt_path)?;
                 keep_proposed_copy(state_dir, path, &bytes);
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 merged.insert(
@@ -4880,7 +4923,7 @@ async fn collect_amend_changes(
                             Some(_) => ProposedChange::Modified,
                             None => ProposedChange::Added,
                         },
-                        sha256: Some(sha256.clone()),
+                        sha256: Some(sha256),
                         blob_sha: Some(blob_sha),
                         size: Some(bytes.len() as u64),
                     },
@@ -5789,6 +5832,11 @@ pub enum DiscardRefusal {
     /// The content the path goes back to is not at hand: the detail says
     /// why.
     NoBaseCopy(Unrestorable),
+    /// The proposal that carries the path (its number) has a share in
+    /// flight: its branch may already carry content its record does not
+    /// name, so what the proposal carries is not known here. A share into
+    /// that proposal finishes it, and the discard works again.
+    SharePending(u64),
     /// Not among this domain's local changes, a generated listing included.
     UnknownPath,
 }
@@ -5800,6 +5848,7 @@ impl DiscardRefusal {
             DiscardRefusal::ChangedSince => "changed_since",
             DiscardRefusal::NotAChange => "not_a_change",
             DiscardRefusal::NoBaseCopy(_) => "no_base_copy",
+            DiscardRefusal::SharePending(_) => "share_pending",
             DiscardRefusal::UnknownPath => "unknown_path",
         }
     }
@@ -5809,6 +5858,15 @@ impl DiscardRefusal {
     pub fn detail(self) -> Option<&'static str> {
         match self {
             DiscardRefusal::NoBaseCopy(why) => why.code(),
+            _ => None,
+        }
+    }
+
+    /// The proposal a [`DiscardRefusal::SharePending`] names, `None` for
+    /// every other refusal.
+    pub fn proposal(self) -> Option<u64> {
+        match self {
+            DiscardRefusal::SharePending(number) => Some(number),
             _ => None,
         }
     }
@@ -5892,9 +5950,12 @@ pub fn missing_proposed_copies(
                 number,
                 sha256,
                 blob_sha,
+                pending: false,
             },
         )) = sources.get(path)
         else {
+            // A trunk path, or a record with a push in flight: the discard
+            // refuses that one without its content, so nothing is fetched.
             continue;
         };
         if state::read_proposed_copy(state_dir, sha256)?.is_some() {
@@ -6064,28 +6125,34 @@ pub fn discard_local_files(
                 report.deleted.push(path);
             }
             LocalChange::Modified { .. } | LocalChange::Deleted { .. } => {
-                let restored =
-                    match base.sources.get(&path).map(|(_, source)| source) {
-                        Some(TipSource::Record {
-                            sha256, blob_sha, ..
-                        }) => state::read_proposed_copy(state_dir, sha256)?.ok_or_else(|| {
+                let restored = match base.sources.get(&path).map(|(_, source)| source) {
+                    Some(TipSource::Record {
+                        number,
+                        pending: true,
+                        ..
+                    }) => Err(DiscardRefusal::SharePending(*number)),
+                    Some(TipSource::Record {
+                        sha256, blob_sha, ..
+                    }) => state::read_proposed_copy(state_dir, sha256)?.ok_or_else(|| {
+                        DiscardRefusal::NoBaseCopy(
                             base.unrestorable.get(sha256).copied().unwrap_or(
                                 if blob_sha.is_none() {
                                     Unrestorable::NoBlobRecorded
                                 } else {
                                     Unrestorable::NotFetched
                                 },
-                            )
-                        }),
-                        Some(TipSource::Trunk) | None => state::read_base_file(state_dir, &path)?
-                            .ok_or(Unrestorable::BaseMissing),
-                    };
+                            ),
+                        )
+                    }),
+                    Some(TipSource::Trunk) | None => state::read_base_file(state_dir, &path)?
+                        .ok_or(DiscardRefusal::NoBaseCopy(Unrestorable::BaseMissing)),
+                };
                 match restored {
                     Ok(bytes) => {
                         write_working_file(&wt_path, &bytes)?;
                         report.restored.push(path);
                     }
-                    Err(why) => report.refused.push((path, DiscardRefusal::NoBaseCopy(why))),
+                    Err(why) => report.refused.push((path, why)),
                 }
             }
         }
@@ -6190,8 +6257,11 @@ async fn revert_layer_files(
             DiscardRefusal::ChangedSince => report.skipped_diverged.push(path),
             // The content the path stood at below this layer is not at hand:
             // no blob to fetch it by, a fetch that failed, content that did
-            // not check, or a base copy that is gone.
-            DiscardRefusal::NoBaseCopy(_) => report.skipped_reverts.push(path),
+            // not check, or a base copy that is gone. A lower layer with a
+            // share in flight is the same case: what it carries is not known.
+            DiscardRefusal::NoBaseCopy(_) | DiscardRefusal::SharePending(_) => {
+                report.skipped_reverts.push(path)
+            }
             // A proposed file that no longer differs from the tip is already
             // where a revert would put it, and a path the detection cannot
             // name (a re-cased addition, see the doc comment) is left

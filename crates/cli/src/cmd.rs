@@ -1569,7 +1569,7 @@ pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool
             p["path"].as_str().unwrap_or(""),
             p["reason"].as_str().unwrap_or("")
         );
-        if let Some(why) = p["detail"].as_str().and_then(discard_detail_sentence) {
+        if let Some(why) = discard_refusal_sentence(p) {
             println!("  {why}");
         }
     }
@@ -1577,6 +1577,24 @@ pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool
         println!("re-indexed {}", plural(n as usize, "file", "files"));
     }
     acted > 0
+}
+
+/// The sentence a refused discard path prints under its line, the same
+/// words Fluid shows; `None` for a reason whose code says enough.
+fn discard_refusal_sentence(refusal: &serde_json::Value) -> Option<String> {
+    match refusal["reason"].as_str()? {
+        "no_base_copy" => refusal["detail"]
+            .as_str()
+            .and_then(discard_detail_sentence)
+            .map(str::to_string),
+        "share_pending" => Some(match refusal["proposal"].as_u64() {
+            Some(number) => format!(
+                "The last share into proposal #{number} did not finish. Share into it again, then discard this file."
+            ),
+            None => "The last share into this file's proposal did not finish. Share into it again, then discard this file.".to_string(),
+        }),
+        _ => None,
+    }
 }
 
 /// The sentence for the `detail` of a `no_base_copy` refusal, the same
@@ -1699,6 +1717,36 @@ fn origin_resolve_lines(domain: &str, asked: &str, data: &serde_json::Value) -> 
         lines.push(format!("Note: {warning}"));
     }
     lines
+}
+
+#[cfg(test)]
+mod origin_discard_tests {
+    use super::discard_refusal_sentence;
+    use serde_json::json;
+
+    #[test]
+    fn a_share_pending_refusal_says_to_share_into_its_proposal_first() {
+        assert_eq!(
+            discard_refusal_sentence(
+                &json!({ "path": "a.md", "reason": "share_pending", "proposal": 7 })
+            )
+            .as_deref(),
+            Some(
+                "The last share into proposal #7 did not finish. Share into it again, then discard this file."
+            )
+        );
+        assert_eq!(
+            discard_refusal_sentence(&json!({ "path": "a.md", "reason": "share_pending" }))
+                .as_deref(),
+            Some(
+                "The last share into this file's proposal did not finish. Share into it again, then discard this file."
+            )
+        );
+        assert_eq!(
+            discard_refusal_sentence(&json!({ "path": "a.md", "reason": "changed_since" })),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

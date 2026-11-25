@@ -388,7 +388,7 @@ export default function ShareDialogBody({
         new Map(
           result.refused.map((r) => [
             r.path,
-            refusalSentence(r.reason, r.detail),
+            refusalSentence(r.reason, r.detail, r.proposal),
           ]),
         ),
       );

@@ -2996,8 +2996,11 @@ pub struct DiscardBody {
                    was read), `not_a_change`, `no_base_copy` (the content it \
                    goes back to is not at hand; `detail` says why: \
                    `no_blob_recorded`, `not_fetched`, `fetch_failed` or \
-                   `digest_mismatch`), `unknown_path`, `open_in_editor` (a \
-                   draft somebody has open). Works offline; it reads a file \
+                   `digest_mismatch`), `share_pending` (the last share into \
+                   the proposal that carries the file did not finish, so \
+                   what it carries is not known here; `proposal` names it, \
+                   and a share into it finishes it), `unknown_path`, \
+                   `open_in_editor` (a draft somebody has open). Works offline; it reads a file \
                    from GitHub only to restore a proposal shared by an older \
                    version, and never writes there. Refused on a read-only \
                    instance.",
