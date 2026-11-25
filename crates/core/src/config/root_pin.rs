@@ -43,13 +43,41 @@ pub fn fold_case() -> bool {
 
 /// The record key of a configuration: the file's path, or
 /// [`DOCUMENT_KEY`] when there is no file (document mode).
+///
+/// One file has one key however it is spelled: the path is resolved
+/// (symbolic links followed, `.` and `..` applied) through its nearest part
+/// that exists, so a file that is not there yet gets the key it will have,
+/// and on macOS and Windows the case is folded ([`fold_case`]).
 pub fn config_key(config_path: Option<&Path>) -> String {
-    match config_path {
-        Some(path) => std::path::absolute(path)
-            .unwrap_or_else(|_| path.to_path_buf())
-            .display()
-            .to_string(),
-        None => DOCUMENT_KEY.to_string(),
+    let Some(path) = config_path else {
+        return DOCUMENT_KEY.to_string();
+    };
+    let key = resolved(path).display().to_string();
+    if fold_case() {
+        crate::path::fold_path_case(&key)
+    } else {
+        key
+    }
+}
+
+/// `path` made absolute and resolved through its nearest existing
+/// ancestor, with the parts below it joined back as they are spelled. The
+/// absolute path when nothing resolves.
+fn resolved(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut tail = Vec::new();
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return absolute,
+        }
     }
 }
 
@@ -414,5 +442,36 @@ mod tests {
         assert_eq!(config_key(None), DOCUMENT_KEY);
         let key = config_key(Some(Path::new("rel/config.yaml")));
         assert!(Path::new(&key).is_absolute(), "{key}");
+    }
+
+    #[test]
+    fn a_config_file_has_one_key_however_it_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.yaml");
+        // The same key before and after the file exists.
+        let before = config_key(Some(&file));
+        std::fs::write(&file, "domains: {}\n").unwrap();
+        assert_eq!(config_key(Some(&file)), before);
+        // A `.` and a `..` in the spelling.
+        let dotted = dir.join(".").join("x").join("..").join("config.yaml");
+        std::fs::create_dir_all(dir.join("x")).unwrap();
+        assert_eq!(config_key(Some(&dotted)), before);
+        // Through a linked folder, and through a linked file.
+        #[cfg(unix)]
+        {
+            let linked_dir = tmp.path().join("linked");
+            std::os::unix::fs::symlink(&dir, &linked_dir).unwrap();
+            assert_eq!(config_key(Some(&linked_dir.join("config.yaml"))), before);
+            let linked_file = tmp.path().join("config.yaml");
+            std::os::unix::fs::symlink(&file, &linked_file).unwrap();
+            assert_eq!(config_key(Some(&linked_file)), before);
+        }
+        // Another case, where the filesystem ignores it.
+        if fold_case() {
+            let upper = tmp.path().join("CONFIG").join("Config.YAML");
+            assert_eq!(config_key(Some(&upper)), before);
+        }
     }
 }
