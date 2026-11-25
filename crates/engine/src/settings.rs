@@ -4109,7 +4109,7 @@ mod tests {
 
         let domains_root = &views[0];
         assert!(
-            domains_root.value.ends_with("Documents/Crystalline"),
+            domains_root.value.ends_with(".crystalline"),
             "{}",
             domains_root.value
         );
@@ -4843,7 +4843,7 @@ mod tests {
             cfg.domains_root()
                 .display()
                 .to_string()
-                .ends_with("Documents/Crystalline"),
+                .ends_with(".crystalline"),
             "{}",
             cfg.domains_root().display()
         );

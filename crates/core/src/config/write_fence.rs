@@ -66,7 +66,8 @@ impl WriteFence {
     /// directory first.
     pub fn refuses(&self, path: &Path) -> bool {
         let path = absolute(path);
-        let under = |root: &PathBuf| within(&path, &absolute(root));
+        let under =
+            |root: &PathBuf| crate::path::lies_within(&path, &absolute(root), cfg!(windows));
         self.roots.iter().any(under)
             && (!self.exempt.iter().any(under) || self.still_fenced.iter().any(under))
     }
@@ -163,39 +164,6 @@ fn absolute(path: &Path) -> PathBuf {
         return path.to_path_buf();
     }
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Whether `path` lies at or under `root`, compared by components: split on
-/// both separators, `.` dropped and `..` applied, a Windows verbatim prefix
-/// (`\\?\`) removed and, on Windows, without regard to ASCII case. So
-/// `AppData-old` never matches `AppData`.
-fn within(path: &Path, root: &Path) -> bool {
-    let path = parts(path);
-    let root = parts(root);
-    !root.is_empty() && path.len() >= root.len() && path[..root.len()] == root[..]
-}
-
-fn parts(path: &Path) -> Vec<String> {
-    let mut text = path.to_string_lossy().replace('\\', "/");
-    if let Some(rest) = text.strip_prefix("//?/UNC/") {
-        text = format!("//{rest}");
-    } else if let Some(rest) = text.strip_prefix("//?/") {
-        text = rest.to_string();
-    }
-    if cfg!(windows) {
-        text = text.to_ascii_lowercase();
-    }
-    let mut out: Vec<String> = Vec::new();
-    for part in text.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            other => out.push(other.to_string()),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

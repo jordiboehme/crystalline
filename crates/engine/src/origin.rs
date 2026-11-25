@@ -1665,9 +1665,9 @@ mod tests {
         let root = GlobalConfig::default().domains_root();
         let folder = default_domain_folder(&root, "brand-knowledge");
         // Normalise separators so the suffix check holds on Windows, where the
-        // join appends a backslash (`Documents/Crystalline\brand-knowledge`).
+        // join appends a backslash (`.crystalline\brand-knowledge`).
         let s = folder.display().to_string().replace('\\', "/");
-        assert!(s.ends_with("Documents/Crystalline/brand-knowledge"), "{s}");
+        assert!(s.ends_with("/.crystalline/brand-knowledge"), "{s}");
         assert!(!s.starts_with('~'), "{s}");
     }
 

@@ -189,15 +189,19 @@ fn legacy_config_without_origin_or_github_round_trips_byte_identical() {
 #[test]
 fn domains_root_round_trips_and_is_absent_by_default() {
     // Absent by default: it never appears in a config that does not set it, and
-    // the resolver falls back to the built-in Documents/Crystalline default.
+    // the resolver falls back to the hidden `.crystalline` in the home, joined
+    // onto the home as one component (a backslash join on Windows).
     let cfg = GlobalConfig::default();
     let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
     assert!(!yaml.contains("domains_root"), "{yaml}");
+    let home = etcetera::home_dir().unwrap();
+    assert_eq!(cfg.domains_root(), home.join(".crystalline"));
+    #[cfg(windows)]
     assert!(
         cfg.domains_root()
             .display()
             .to_string()
-            .ends_with("Documents/Crystalline"),
+            .ends_with(r"\.crystalline"),
         "{}",
         cfg.domains_root().display()
     );

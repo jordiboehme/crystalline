@@ -7,6 +7,7 @@
 //! here.
 
 pub mod registration;
+pub mod root_pin;
 pub mod write_fence;
 
 pub use write_fence::{WriteFence, check_write, fence, refuse_appdata_writes};
@@ -53,6 +54,16 @@ pub enum ConfigError {
 
 // --- global config -----------------------------------------------------------
 
+/// Where a new file domain lands when no `domains_root` is set: a hidden
+/// folder in the home (`%USERPROFILE%\\.crystalline` on Windows), outside the
+/// user folders macOS privacy protection guards.
+pub const DEFAULT_DOMAINS_ROOT: &str = "~/.crystalline";
+
+/// The default before 0.37.0. Written into `domains_root` once for an
+/// install whose domains live there ([`root_pin`]), as this literal text, so
+/// it resolves the same on every machine the file is copied to.
+pub const LEGACY_DOMAINS_ROOT: &str = "~/Documents/Crystalline";
+
 /// The global `config.yaml`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GlobalConfig {
@@ -61,8 +72,10 @@ pub struct GlobalConfig {
     pub domains: IndexMap<String, DomainEntry>,
     /// The default root folder new file domains are created under, when the
     /// caller does not give an explicit path: a domain named `foo` lands at
-    /// `<domains_root>/foo`. Absent means `~/Documents/Crystalline`, so every
-    /// existing config keeps working untouched.
+    /// `<domains_root>/foo`. Absent means [`DEFAULT_DOMAINS_ROOT`], the
+    /// hidden `~/.crystalline`. An install from before 0.37.0 whose domains
+    /// live under [`LEGACY_DOMAINS_ROOT`] gets that value written here once
+    /// ([`root_pin`]), so its new domains keep landing beside the old ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domains_root: Option<PathBuf>,
     /// Service settings.
@@ -231,12 +244,14 @@ impl GlobalConfig {
     }
 
     /// The root folder new file domains are created under, from `domains_root`
-    /// (tilde-expanded), or `~/Documents/Crystalline` when unset. A domain
-    /// created without an explicit path lands at `<domains_root>/<name>`.
+    /// (tilde-expanded), or [`DEFAULT_DOMAINS_ROOT`] (`~/.crystalline`) when
+    /// unset. A domain created without an explicit path lands at
+    /// `<domains_root>/<name>`. A plain resolver: it never looks at the
+    /// registered domains.
     pub fn domains_root(&self) -> PathBuf {
         match &self.domains_root {
             Some(p) => expand_tilde(&p.to_string_lossy()),
-            None => expand_tilde("~/Documents/Crystalline"),
+            None => expand_tilde(DEFAULT_DOMAINS_ROOT),
         }
     }
 
@@ -1876,12 +1891,19 @@ fn temp_sibling(path: &Path) -> PathBuf {
 
 /// Expand a leading `~` to the user's home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        return home_dir().unwrap_or_else(|_| PathBuf::from("~"));
+    match home_dir() {
+        Ok(home) => expand_tilde_in(path, &home),
+        Err(_) => PathBuf::from(path),
     }
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = home_dir()
-    {
+}
+
+/// [`expand_tilde`] against `home` rather than the user's own home, so a
+/// caller (and a test) can compare paths under one home it names.
+pub fn expand_tilde_in(path: &str, home: &Path) -> PathBuf {
+    if path == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
         return home.join(rest);
     }
     PathBuf::from(path)
@@ -1910,6 +1932,15 @@ pub fn io_hint_suffix(path: &str, source: &std::io::Error) -> String {
         return format!("; {MACOS_PRIVACY_HINT}");
     }
     String::new()
+}
+
+/// Whether `path` sits inside one of the user folders macOS privacy
+/// protection guards (Documents, Desktop, Downloads in the user's home).
+/// Always false on other platforms. Doctor uses it to say that new domains
+/// would land in such a folder.
+pub fn in_protected_user_folder(path: &Path) -> bool {
+    cfg!(target_os = "macos")
+        && home_dir().is_ok_and(|home| in_protected_folder(&path.to_string_lossy(), &home))
 }
 
 /// Whether `path` sits inside one of the user folders macOS privacy
