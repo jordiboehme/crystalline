@@ -368,32 +368,45 @@ impl Engine {
                 ),
             }
         }
+        // A row left behind its file (a bookkeeping write whose row commit
+        // was lost) is landed here, or the queue would hand out the old
+        // mark for ever.
+        if !cleared_here && let Ok(Some(now)) = read_opt(&abs) {
+            self.land_row_from_file(domain, &access, inner, &abs, &now)
+                .await;
+        }
         drop(_lock);
         if cleared_here {
             self.absorb_into_room(domain, inner).await;
         }
-        if let Some(up_to) = seen {
-            for child in set.iter().skip(1) {
-                let abs = access.abs(child);
-                let lock = self.lock_file(&abs).await;
-                let cleared = match read_opt(&abs) {
-                    Ok(Some(text)) if !super::page_life::is_retired(&text, child) => {
-                        self.clear_seen_mark(domain, &access, child, &abs, &text, up_to, caller)
-                            .await
-                    }
-                    Ok(_) => Ok(false),
-                    Err(e) => Err(e),
-                };
-                drop(lock);
-                match cleared {
-                    Ok(true) => self.absorb_into_room(domain, child).await,
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
-                        domain,
-                        path = %child,
-                        "the not-fresh mark the owner's reconcile saw was not taken off: {e}"
-                    ),
+        for child in set.iter().skip(1) {
+            let abs = access.abs(child);
+            let lock = self.lock_file(&abs).await;
+            let cleared = match (seen, read_opt(&abs)) {
+                (Some(up_to), Ok(Some(text)))
+                    if !super::page_life::is_retired(&text, child) =>
+                {
+                    self.clear_seen_mark(domain, &access, child, &abs, &text, up_to, caller)
+                        .await
                 }
+                (_, Ok(_)) => Ok(false),
+                (_, Err(e)) => Err(e),
+            };
+            if matches!(cleared, Ok(false))
+                && let Ok(Some(now)) = read_opt(&abs)
+            {
+                self.land_row_from_file(domain, &access, child, &abs, &now)
+                    .await;
+            }
+            drop(lock);
+            match cleared {
+                Ok(true) => self.absorb_into_room(domain, child).await,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    domain,
+                    path = %child,
+                    "the not-fresh mark the owner's reconcile saw was not taken off: {e}"
+                ),
             }
         }
         self.announce_reflection(
@@ -435,6 +448,55 @@ impl Engine {
             "refresh_requested": own_mark,
             "still_marked": still_marked,
         }))
+    }
+
+    /// Land the row of the page at `inner` from its file text `text` (read
+    /// under its lock, which the caller holds) when the stored row holds
+    /// other text. A bookkeeping write keeps the file's modified time, so
+    /// when its row commit was lost and the text kept its length, the
+    /// sync's stat check never reads the file again; the reconcile, which
+    /// reads the file anyway, puts the row right. A failure is logged: the
+    /// next reconcile tries again.
+    async fn land_row_from_file(
+        &self,
+        domain: &str,
+        access: &super::reflection::ReflectionAccess,
+        inner: &str,
+        abs: &std::path::Path,
+        text: &str,
+    ) {
+        let stored = self
+            .store
+            .lock()
+            .await
+            .get_reflection(access.domain_id, inner)
+            .await;
+        let behind = match stored {
+            Ok(row) => row.is_none_or(|row| row.content != text),
+            Err(e) => {
+                tracing::warn!(domain, path = inner, "the page row was not read: {e}");
+                return;
+            }
+        };
+        if !behind {
+            return;
+        }
+        let ops = [super::fence::RowOp::Page { inner, text, abs }];
+        match self
+            .commit_reflection_rows(
+                access.domain_id,
+                &ops,
+                super::fence::OnRefusal::read_heal(domain),
+            )
+            .await
+        {
+            Ok(()) => tracing::debug!(domain, path = inner, "landed a page row behind its file"),
+            Err(e) => tracing::warn!(
+                domain,
+                path = inner,
+                "the page row behind its file was not landed: {e}"
+            ),
+        }
     }
 
     /// Take the not-fresh mark off the page at `inner` (its text `text`,

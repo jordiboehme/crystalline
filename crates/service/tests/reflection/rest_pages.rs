@@ -325,6 +325,7 @@ async fn an_editor_marks_pages_not_fresh_and_every_reader_sees_it() {
     assert_eq!(marked["by"], "ann");
     assert_eq!(marked["pages"], json!([PAGE]));
     assert_eq!(marked["only_page"], false);
+    assert_eq!(marked["skipped"], json!([]));
     let at = marked["at"].as_str().unwrap().to_string();
 
     let (_, doc) = vera

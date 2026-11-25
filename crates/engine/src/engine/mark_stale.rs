@@ -69,9 +69,13 @@ impl Engine {
     /// not retired.
     ///
     /// All pages of one call carry the same time, which is later than every
-    /// mark it replaces. Only the page record changes, under each page's
-    /// lock, and the file keeps its modified time. Answers `{domain, at, by,
-    /// pages, only_page}`.
+    /// mark it replaces; a page whose mark (another call's) landed after
+    /// the rows were read gets a time just after that one, so a mark never
+    /// moves backwards. Only the page record changes, under each page's
+    /// lock, and the file keeps its modified time. A page that went missing
+    /// or was retired after the rows were read is skipped and named in
+    /// `skipped`. Answers `{domain, at, by, pages, skipped, only_page}`,
+    /// `at` the newest time the call wrote.
     pub async fn mark_reflection_stale(
         &self,
         domain: &str,
@@ -172,27 +176,34 @@ impl Engine {
             .max();
         let now = time::now().unix_millis();
         let at_ms = newest.map_or(now, |newest| now.max(newest.saturating_add(1)));
-        let at = time::Stamp::from_unix_millis(at_ms)
-            .ok_or_else(|| EngineError::Internal(format!("no time for {at_ms} ms")))?
-            .rfc3339_millis_z();
         let by = caller.author.name.clone();
         let mut marked: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        // The newest time this call wrote: the call's own, or later where a
+        // mark landed on a page after the rows were read.
+        let mut newest_written = at_ms;
         for inner in &set {
             let abs = access.abs(inner);
             let lock = self.lock_file(&abs).await;
-            let text = read_opt(&abs)?.ok_or_else(|| {
-                EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"))
-            })?;
-            // Retired since the rows were read: a named page is refused, an
-            // owned one left out.
+            // Gone or retired since the rows were read: skipped and named,
+            // so the pages marked before it are not answered as an error.
+            let Some(text) = read_opt(&abs)? else {
+                skipped.push(inner.clone());
+                continue;
+            };
             if is_retired(&text, inner) {
-                if named.as_ref().is_some_and(|named| named.contains(inner)) {
-                    return Err(EngineError::Invalid(retired_refusal(inner)));
-                }
+                skipped.push(inner.clone());
                 continue;
             }
             let mut prov = r::read_provenance(&text);
-            prov.page.set_mark(at.clone(), by.clone());
+            // A mark written after the rows were read (another call's) is
+            // never moved backwards.
+            let page_ms = prov
+                .page
+                .mark_millis()
+                .map_or(at_ms, |existing| at_ms.max(existing.saturating_add(1)));
+            newest_written = newest_written.max(page_ms);
+            prov.page.set_mark(millis_z(page_ms)?, by.clone());
             let changed = r::write_provenance(&text, &prov).map_err(EngineError::Invalid)?;
             self.land_page_record(domain, &access, inner, &abs, &text, &changed, caller, true)
                 .await?;
@@ -202,9 +213,10 @@ impl Engine {
         }
         Ok(json!({
             "domain": domain,
-            "at": at,
+            "at": millis_z(newest_written)?,
             "by": by,
             "pages": marked,
+            "skipped": skipped,
             "only_page": mark.only_page,
         }))
     }
@@ -231,6 +243,14 @@ impl Engine {
         };
         Ok(text_mark(&row.content, path).map_or(Value::Null, |mark| mark.to_json()))
     }
+}
+
+/// `ms` (milliseconds since the epoch) as a mark writes it: RFC 3339 in UTC
+/// with milliseconds.
+fn millis_z(ms: i64) -> Result<String> {
+    Ok(time::Stamp::from_unix_millis(ms)
+        .ok_or_else(|| EngineError::Internal(format!("no time for {ms} ms")))?
+        .rfc3339_millis_z())
 }
 
 /// The refusal of a mark on a retired page.

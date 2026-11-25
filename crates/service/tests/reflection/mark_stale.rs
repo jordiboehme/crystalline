@@ -1025,3 +1025,163 @@ async fn a_mark_and_its_clearing_raise_nothing_on_other_pages() {
     );
 }
 
+// ---- Review fixes (F11 to F13) ----
+
+/// Write the mark `at` by `by` straight into the file of `path`, keeping
+/// its modified time: with a mark of the same length already there, the
+/// sync's stat check sees no change and the row keeps the old mark (what
+/// another writer's mark, or a lost row commit, looks like to the rows).
+fn mark_on_disk(fx: &Fx, path: &str, at: &str, by: &str) {
+    let abs = fx.root.join("reflections").join(path);
+    let modified = std::fs::metadata(&abs).unwrap().modified().unwrap();
+    let text = file(fx, path);
+    let mut prov = r::read_provenance(&text);
+    prov.page.set_mark(at.into(), by.into());
+    std::fs::write(&abs, r::write_provenance(&text, &prov).unwrap()).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&abs)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+/// A mark that landed on the page after the rows were read (another
+/// mark's, here written straight into the file) is never moved backwards:
+/// the page gets a time after it.
+#[tokio::test]
+async fn a_mark_never_moves_a_mark_the_rows_did_not_show_backwards() {
+    let fx = reflecting().await;
+    put(&fx, "a.md", PAGE).await;
+    put(&fx, "b.md", PAGE).await;
+    mark(&fx, &one("a.md"), &person()).await.unwrap();
+    let ahead = "2099-01-01T00:00:00.000Z";
+    mark_on_disk(&fx, "a.md", ahead, "jordi");
+    let answer = mark(
+        &fx,
+        &MarkStale {
+            pages: MarkPages::Many(vec!["a.md".into(), "b.md".into()]),
+            only_page: false,
+        },
+        &person(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pages(&answer), ["a.md", "b.md"]);
+    let a = record(&fx, "a.md");
+    assert_eq!(
+        a.refresh_requested.as_deref(),
+        Some("2099-01-01T00:00:00.001Z"),
+        "{answer}"
+    );
+    assert_eq!(a.refresh_requested_by.as_deref(), Some("jordi"));
+    // The answer's time is the newest the call wrote.
+    assert_eq!(answer["at"], "2099-01-01T00:00:00.001Z");
+    let b = record(&fx, "b.md");
+    assert!(b.refresh_requested.as_deref().unwrap() < "2099", "{b:?}");
+}
+
+/// An owned page that went missing or was retired after the rows were
+/// read is skipped and named in `skipped`; the other pages are marked and
+/// the call answers them, not an error.
+#[tokio::test]
+async fn a_page_gone_after_the_rows_were_read_is_skipped_and_named() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    owned(&fx, "arch/api.md", "arch.md").await;
+    owned(&fx, "arch/db.md", "arch.md").await;
+    owned(&fx, "arch/ui.md", "arch.md").await;
+    std::fs::remove_file(fx.root.join("reflections/arch/db.md")).unwrap();
+    // Retired in the file only: the row still reads it as live.
+    let abs = fx.root.join("reflections/arch/ui.md");
+    let text = file(&fx, "arch/ui.md");
+    std::fs::write(&abs, format!("---\nstatus: archived\n---\n{text}")).unwrap();
+
+    let answer = mark(&fx, &one("arch.md"), &person()).await.unwrap();
+    assert_eq!(pages(&answer), ["arch.md", "arch/api.md"], "{answer}");
+    assert_eq!(
+        answer["skipped"],
+        serde_json::json!(["arch/db.md", "arch/ui.md"]),
+        "{answer}"
+    );
+    assert!(record(&fx, "arch.md").refresh_requested.is_some());
+    assert!(record(&fx, "arch/api.md").refresh_requested.is_some());
+    assert!(!file(&fx, "arch/ui.md").contains("refresh_requested"));
+
+    // A named page gone the same way is skipped too.
+    std::fs::remove_file(fx.root.join("reflections/arch/api.md")).unwrap();
+    let answer = mark(
+        &fx,
+        &MarkStale {
+            pages: MarkPages::One("arch/api.md".into()),
+            only_page: true,
+        },
+        &person(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pages(&answer), Vec::<String>::new());
+    assert_eq!(answer["skipped"], serde_json::json!(["arch/api.md"]));
+    // Nothing skipped answers an empty list.
+    put(&fx, "c.md", PAGE).await;
+    let answer = mark(&fx, &one("c.md"), &person()).await.unwrap();
+    assert_eq!(answer["skipped"], serde_json::json!([]), "{answer}");
+}
+
+/// A re-mark whose row commit was lost leaves the file ahead of its row
+/// with the same length and modified time, which the sync never reads
+/// again. The reconcile lands the row from the file, so the next queue
+/// hands out the newer mark and its reconcile takes it off.
+#[tokio::test]
+async fn a_lost_mark_row_is_landed_by_the_reconcile() {
+    let fx = reflecting().await;
+    put(&fx, "a.md", PAGE).await;
+    let first = mark(&fx, &one("a.md"), &person()).await.unwrap();
+    fx.engine.fail_next_reflection_index();
+    mark(&fx, &one("a.md"), &person()).await.unwrap_err();
+    let second = record(&fx, "a.md").refresh_requested.unwrap();
+    assert_ne!(Some(second.as_str()), first["at"].as_str());
+    fx.engine.sync(None).await.unwrap();
+    let item = stale_of(&queue(&fx).await, "a.md").unwrap();
+    assert_eq!(
+        item["refresh_requested"]["at"], first["at"],
+        "the row is behind"
+    );
+
+    let receipt = reconcile(&fx, "a.md", item["version"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(receipt["refresh_requested"]["at"], second.as_str());
+    let item = stale_of(&queue(&fx).await, "a.md").expect("due by the newer mark");
+    assert_eq!(item["refresh_requested"]["at"], second.as_str(), "{item}");
+    reconcile(&fx, "a.md", item["version"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert!(!file(&fx, "a.md").contains("refresh_requested"));
+    assert!(stale_of(&queue(&fx).await, "a.md").is_none());
+}
+
+/// The same for an owned page under the owner's item: the owner's
+/// reconcile lands the owned page's row from its file.
+#[tokio::test]
+async fn a_lost_owned_mark_row_is_landed_by_the_owner_reconcile() {
+    let fx = reflecting().await;
+    put(&fx, "arch.md", PAGE).await;
+    owned(&fx, "arch/db.md", "arch.md").await;
+    mark(&fx, &one("arch.md"), &person()).await.unwrap();
+    reconcile(&fx, "arch/db.md", "").await.unwrap();
+    fx.engine.fail_next_reflection_index();
+    mark(&fx, &one("arch/db.md"), &person()).await.unwrap_err();
+    let second = record(&fx, "arch/db.md").refresh_requested.unwrap();
+    let item = stale_of(&queue(&fx).await, "arch.md").unwrap();
+    let receipt = reconcile(&fx, "arch.md", item["version"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["still_marked"],
+        serde_json::json!([{ "path": "arch/db.md", "at": second, "by": "jordi" }]),
+        "{receipt}"
+    );
+    let child = stale_of(&queue(&fx).await, "arch/db.md").expect("the child's own item");
+    assert_eq!(child["refresh_requested"]["at"], second.as_str(), "{child}");
+}

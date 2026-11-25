@@ -2022,8 +2022,10 @@ export type MarkStaleBody = {
  */
 export type MarkedStale = {
     /**
-     * The time every page of this call was marked with, RFC 3339 in UTC
-     * with milliseconds.
+     * The newest time this call marked a page with, RFC 3339 in UTC with
+     * milliseconds. Every page gets the call's time, except a page whose
+     * mark (another call's) landed meanwhile: it gets a time just after
+     * that mark, so a mark never moves backwards.
      */
     at: string;
     /**
@@ -2042,6 +2044,11 @@ export type MarkedStale = {
      * The pages marked, in order: each named page, then the pages it owns.
      */
     pages: Array<string>;
+    /**
+     * The pages left out because they went missing or were retired while
+     * the call ran; empty when none were.
+     */
+    skipped: Array<string>;
 };
 
 /**
