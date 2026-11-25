@@ -780,7 +780,7 @@ fn hidden_provision_tool(read_only: bool) -> bool {
 ///
 /// `status` is never refused: with nothing declared it answers a real, empty
 /// report, which is precisely how a caller learns there is nothing to decide.
-/// The three actions that reconcile artifacts are refused, because with
+/// Every action but `status` is refused, because with
 /// nothing declared they would report success while doing nothing at all.
 fn refused_provision_action(action: &ProvisionAction, provisioning_declared: bool) -> bool {
     !provisioning_declared && !matches!(action, ProvisionAction::Status)
@@ -789,7 +789,7 @@ fn refused_provision_action(action: &ProvisionAction, provisioning_declared: boo
 /// What a refused `provision` action tells the caller: the thing that has to
 /// exist before it can do anything, and the read that reports the state either
 /// way.
-const PROVISION_NOT_DECLARED: &str = "No registered domain declares a '## Provisioning' section in its MANIFEST, so there is nothing to allow, deny or reconcile. Add one to a domain's MANIFEST first; provision with action status reports the current state either way.";
+const PROVISION_NOT_DECLARED: &str = "No registered domain declares a '## Provisioning' section in its MANIFEST, so there is nothing to allow, deny, take, skip or reconcile. Add one to a domain's MANIFEST first; provision with action status reports the current state either way.";
 
 /// The MIME type every shipped skill is served with, as a resource and in the
 /// `skills` tool's full read: a `SKILL.md` is plain markdown.
@@ -4984,7 +4984,7 @@ impl McpServer {
     #[tool(
         name = "provision",
         title = "Provision harness artifacts",
-        description = "Provision the skills, commands, agents and MCP servers a domain ships into the user's coding harnesses. A domain declares artifact folders in its MANIFEST; each domain needs a one-time allow or deny decision from the user before anything installs. status shows decisions and pending domains, allow or deny records a decision and applies it, apply reconciles updates and removals. Installed artifacts update when the domain's files change and disappear when the domain is denied or removed. Until some registered domain's MANIFEST declares a '## Provisioning' section, status reports an empty state and allow, deny and apply refuse and say so.",
+        description = "Provision the skills, commands, agents and MCP servers a domain ships into the user's coding harnesses. A domain declares artifact folders in its MANIFEST; each domain needs a decision from the user before anything installs: all (allow), none (deny) or a pick (take or skip single artifacts named kind/name, for example skills/tide-tables). An artifact the author marks optional installs only when taken. allow installs everything except optional artifacts not taken, and keeps the ones taken; deny installs nothing; both replace a pick. skip on a domain with no decision yet installs everything else. status shows every domain's decision, each artifact as on or off with its optional mark, and pending domains; allow, deny, take and skip record the decision and apply it; apply reconciles updates and removals. Installed artifacts update when the domain's files change and disappear when the domain is denied, removed or the artifact is skipped. Until some registered domain's MANIFEST declares a '## Provisioning' section, status reports an empty state and allow, deny, take, skip and apply refuse and say so.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -5017,9 +5017,25 @@ impl McpServer {
                     ProvisionAction::Deny { domain }
                 }
             }
+            "take" | "skip" => {
+                let artifacts = p.artifacts.clone();
+                let Some(domain) = p.domain.clone().filter(|_| !artifacts.is_empty()) else {
+                    return Err(ErrorData::invalid_params(
+                        format!("provision {} requires domain and artifacts", p.action),
+                        None,
+                    ));
+                };
+                if p.action == "take" {
+                    ProvisionAction::Take { domain, artifacts }
+                } else {
+                    ProvisionAction::Skip { domain, artifacts }
+                }
+            }
             other => {
                 return Err(ErrorData::invalid_params(
-                    format!("provision action must be status, allow, deny or apply, got '{other}'"),
+                    format!(
+                        "provision action must be status, allow, deny, take, skip or apply, got '{other}'"
+                    ),
                     None,
                 ));
             }
@@ -5057,7 +5073,11 @@ impl McpServer {
         // it exists, so every check above answers the same whatever name was
         // passed, and here a domain this caller may not see is refused with
         // exactly the bytes an unregistered name gets.
-        if let ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } = &action {
+        if let ProvisionAction::Allow { domain }
+        | ProvisionAction::Deny { domain }
+        | ProvisionAction::Take { domain, .. }
+        | ProvisionAction::Skip { domain, .. } = &action
+        {
             self.engine
                 .require_domain(domain, &self.scope_of(&ctx))
                 .await
@@ -9080,14 +9100,22 @@ mod tests {
         let deny = ProvisionAction::Deny {
             domain: "eng".to_string(),
         };
+        let take = ProvisionAction::Take {
+            domain: "eng".to_string(),
+            artifacts: vec!["skills/tide-tables".to_string()],
+        };
+        let skip = ProvisionAction::Skip {
+            domain: "eng".to_string(),
+            artifacts: vec!["skills/tide-tables".to_string()],
+        };
         assert!(
             !refused_provision_action(&status, false),
             "an empty report is the answer, not a refusal"
         );
-        for action in [&apply, &allow, &deny] {
+        for action in [&apply, &allow, &deny, &take, &skip] {
             assert!(refused_provision_action(action, false), "{action:?}");
         }
-        for action in [&status, &apply, &allow, &deny] {
+        for action in [&status, &apply, &allow, &deny, &take, &skip] {
             assert!(!refused_provision_action(action, true), "{action:?}");
         }
     }

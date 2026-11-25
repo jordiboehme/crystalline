@@ -1181,13 +1181,19 @@ pub struct SkillsParams {
 /// Parameters for `provision`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProvisionParams {
-    /// What to do: "status" reports decisions, shipped artifacts and installed
-    /// state; "allow" or "deny" records the user's decision for `domain` and
+    /// What to do: "status" reports decisions, every artifact a domain ships
+    /// with whether it is installed, and installed state; "allow" or "deny"
+    /// records an all or nothing decision for `domain` and applies it; "take"
+    /// or "skip" installs or leaves out single artifacts of `domain` and
     /// applies it; "apply" reconciles current decisions.
     pub action: String,
-    /// The domain for allow or deny. Omit for status and apply.
+    /// The domain for allow, deny, take or skip. Omit for status and apply.
     #[serde(default)]
     pub domain: Option<String>,
+    /// The artifacts for take or skip, as <kind>/<name> exactly as status
+    /// lists them, for example "skills/tide-tables" or "mcps/lighthouse".
+    #[serde(default)]
+    pub artifacts: Vec<String>,
 }
 
 /// A params struct that names existing domains, so a caller may spell each
