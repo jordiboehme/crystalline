@@ -414,7 +414,23 @@ struct UpstreamEdit {
 /// the engrams under `reflections/` are changes like any other. This crate
 /// cannot read the index the mode is decided from, so the caller hands in
 /// how ([`declared_reflection_mode`] when it has nothing better).
+///
+/// A fresh subscribe carries no proposals, so it ends by pruning every copy
+/// of a proposed file an earlier subscription left in the state folder.
 pub async fn subscribe(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    reflection: fn(&Path) -> crystalline_core::ReflectionMode,
+) -> Result<SubscribeReport, RemoteError> {
+    let result = subscribe_inner(provider, spec, domain_root, state_dir, reflection).await;
+    prune_proposed_copies_after(state_dir);
+    result
+}
+
+/// The body of [`subscribe`], before its prune.
+async fn subscribe_inner(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
@@ -639,7 +655,24 @@ pub enum BranchCleanup {
 
 /// [`pull`], with the branch cleanup run or deferred as `cleanup`
 /// says. Everything else is the same pull.
+///
+/// A pull ends by pruning the copies of proposed files to what the records it
+/// saved still carry: a merged layer's content is in the base snapshot now,
+/// and a declined one is no longer in the tip.
 pub async fn pull_with(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    cleanup: BranchCleanup,
+) -> Result<PullReport, RemoteError> {
+    let result = pull_with_inner(provider, spec, domain_root, state_dir, cleanup).await;
+    prune_proposed_copies_after(state_dir);
+    result
+}
+
+/// The body of [`pull_with`], before its prune.
+async fn pull_with_inner(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
@@ -2361,7 +2394,26 @@ pub(crate) fn share_route(options: &ShareOptions<'_>, state: &OriginState) -> Sh
 /// share branch named per `share_branch_name` and opens the pull request;
 /// finally the proposal is recorded in state (status `Open`) and saved. Local
 /// files are never touched: a share only ever reads them.
+///
+/// Every added or modified file a share proposes is also kept as a local
+/// copy under the state folder (see [`state::write_proposed_copy`]), and the
+/// share ends by pruning those copies to what the saved records carry, on
+/// success and on failure alike.
 pub async fn propose(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    options: ShareOptions<'_>,
+) -> Result<ProposeOutcome, RemoteError> {
+    let result = propose_inner(provider, spec, domain_root, domain_name, state_dir, options).await;
+    prune_proposed_copies_after(state_dir);
+    result
+}
+
+/// The body of [`propose`], before its prune.
+async fn propose_inner(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
@@ -3767,6 +3819,43 @@ struct CollectedChanges {
     entries: ChangeEntries,
 }
 
+/// Keeps a local copy of `bytes`, the content a share is about to propose at
+/// `path`, so a later discard can put the file back to it without asking
+/// GitHub (see [`state::write_proposed_copy`]).
+///
+/// A share never fails over this cache: a copy that cannot be written is a
+/// warning, and a discard of that path falls back to fetching the blob the
+/// record names.
+fn keep_proposed_copy(state_dir: &Path, path: &str, bytes: &[u8]) {
+    if let Err(e) = state::write_proposed_copy(state_dir, bytes) {
+        tracing::warn!("could not keep a local copy of {path} for its proposal: {e}");
+    }
+}
+
+/// Prunes the copies of proposed files down to what the state saved under
+/// `state_dir` still carries ([`state::proposed_copies_kept`]).
+///
+/// Run at the end of every public writer that changes the proposal records
+/// (a share, a pull, a withdrawal, a subscribe), whether it succeeded or
+/// failed: a failed share may have kept copies for a record it never saved.
+/// It reads the state back from disk, so it keeps exactly what was saved. A
+/// state that cannot be read skips the prune, and a prune that fails is only
+/// logged: a missed prune costs disk space, never a wrong restore, since
+/// every copy is checked against its name when it is read.
+fn prune_proposed_copies_after(state_dir: &Path) {
+    let keep = match OriginState::load(state_dir) {
+        Ok(Some(state)) => state::proposed_copies_kept(&state),
+        Ok(None) => BTreeSet::new(),
+        Err(e) => {
+            tracing::debug!("not pruning the proposed copies: the state did not load: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state::prune_proposed_copies(state_dir, &keep) {
+        tracing::debug!("pruning the proposed copies failed: {e}");
+    }
+}
+
 /// Uploads a blob for every added or modified local file and collects
 /// everything both share paths - opening a new proposal and updating the open
 /// one - build their commit and their proposal body from.
@@ -3792,6 +3881,7 @@ async fn collect_changes(
             LocalChange::Added { path, sha256 } => {
                 let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
                 let bytes = read_working_file(&wt_path)?;
+                keep_proposed_copy(state_dir, path, &bytes);
                 let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
@@ -3811,6 +3901,7 @@ async fn collect_changes(
             LocalChange::Modified { path, sha256 } => {
                 let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
                 let bytes = read_working_file(&wt_path)?;
+                keep_proposed_copy(state_dir, path, &bytes);
                 let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
@@ -4673,6 +4764,7 @@ async fn collect_amend_changes(
         merged.insert(kept.path.clone(), kept);
     }
     for (path, bytes) in rebuild {
+        keep_proposed_copy(state_dir, &path, &bytes);
         let blob_sha = provider.create_blob(spec, &bytes).await?;
         // Every rebuilt path was inserted into `merged` by the pass above, in
         // the same iteration that queued it here, and nothing removes from
@@ -4695,6 +4787,7 @@ async fn collect_amend_changes(
                 }
                 let wt_path = checked_working_path(state_dir, domain_root, fresh.disk_path(path))?;
                 let bytes = read_working_file(&wt_path)?;
+                keep_proposed_copy(state_dir, path, &bytes);
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 merged.insert(
                     path.clone(),
@@ -5363,8 +5456,38 @@ async fn finish_pending_repair(
 /// detects with ([`ShareOptions::reflection`]): a layer shared while a
 /// switch was pending carries engrams under `reflections/`, and its revert
 /// reaches them as long as the switch is still pending.
+///
+/// A withdrawal ends by pruning the copies of proposed files to what the
+/// records it saved still carry, so the withdrawn layer's copies go.
 #[allow(clippy::too_many_arguments)]
 pub async fn withdraw(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    proposal_number: Option<u64>,
+    revert: bool,
+    stacks_allowed: bool,
+    reflection: crystalline_core::ReflectionMode,
+) -> Result<WithdrawReport, RemoteError> {
+    let result = withdraw_inner(
+        provider,
+        spec,
+        domain_root,
+        state_dir,
+        proposal_number,
+        revert,
+        stacks_allowed,
+        reflection,
+    )
+    .await;
+    prune_proposed_copies_after(state_dir);
+    result
+}
+
+/// The body of [`withdraw`], before its prune.
+#[allow(clippy::too_many_arguments)]
+async fn withdraw_inner(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,

@@ -12,7 +12,17 @@
 //! <dir>/artifacts/<kind>/ the team-domain mirror of the out-of-subtree
 //!                         artifact folders (skills, mcps) a MANIFEST declares
 //! <dir>/conflicts/<id>/   per-conflict copies of the base and upstream sides
+//! <dir>/proposed/<sha256> a copy of each file an open or merged proposal
+//!                         carries, named by the digest of its bytes
 //! ```
+//!
+//! The `proposed/` folder is what lets a discard put a file back to the
+//! content an open proposal carries without asking GitHub for it. It is
+//! bounded by the open proposals: a copy exists only for the added or
+//! modified files of an Open or Merged record ([`proposed_copies_kept`]),
+//! each at most the size a share accepts, and identical content is stored
+//! once. Every share, pull, withdrawal and subscribe prunes it down to that
+//! set ([`prune_proposed_copies`]).
 //!
 //! Relative paths are always forward-slash normalized in [`OriginState`] and
 //! on the wire; the platform path separator only appears at the filesystem
@@ -60,6 +70,7 @@ const CONFLICTS_DIR_NAME: &str = "conflicts";
 const CONFLICT_BASE_FILE_NAME: &str = "base";
 const CONFLICT_UPSTREAM_FILE_NAME: &str = "upstream";
 const ARTIFACTS_DIR_NAME: &str = "artifacts";
+const PROPOSED_DIR_NAME: &str = "proposed";
 
 /// The durable state of one domain's connection to its GitHub origin.
 ///
@@ -814,6 +825,160 @@ pub fn replace_base_tree(dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Resul
     Ok(())
 }
 
+/// Whether `name` has the shape of a copy name: exactly 64 lowercase hex
+/// characters, the digest [`sha256_hex`] produces. A digest from a tampered
+/// `state.json` that has any other shape is never joined onto a folder.
+fn is_copy_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What stands at `<dir>/proposed`.
+enum ProposedFolder {
+    /// Nothing.
+    Absent,
+    /// A real folder, never a link to one.
+    Real(PathBuf),
+    /// Something else: a file, a symlink, a junction. Never read or written
+    /// through.
+    Other(PathBuf),
+}
+
+fn proposed_folder(dir: &Path) -> Result<ProposedFolder, RemoteError> {
+    let path = dir.join(PROPOSED_DIR_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(ProposedFolder::Real(path)),
+        Ok(_) => Ok(ProposedFolder::Other(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProposedFolder::Absent),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Keeps `bytes` as a copy of a file a proposal carries, under
+/// `<dir>/proposed/<sha256>`, and returns that digest.
+///
+/// A copy that is already there and still hashes to its name is left alone.
+/// Anything else at that name (a copy that no longer matches, a link) is
+/// replaced: the bytes go to `<sha256>.tmp` first, created new after any
+/// stale one is removed, and are then renamed over the name, so a reader
+/// never sees half a copy. A `proposed` that is not a real folder (a file or
+/// a link) is refused, and nothing is written through it.
+pub fn write_proposed_copy(dir: &Path, bytes: &[u8]) -> Result<String, RemoteError> {
+    use std::io::Write as _;
+
+    let sha = sha256_hex(bytes);
+    let folder = match proposed_folder(dir)? {
+        ProposedFolder::Real(path) => path,
+        ProposedFolder::Absent => {
+            let path = dir.join(PROPOSED_DIR_NAME);
+            std::fs::create_dir_all(dir)?;
+            std::fs::create_dir(&path)?;
+            path
+        }
+        ProposedFolder::Other(path) => {
+            return Err(RemoteError::State(format!(
+                "{} is not a folder; no copy of a proposed file is written through it",
+                path.display()
+            )));
+        }
+    };
+    let path = folder.join(&sha);
+    if read_regular_file(&path)?.is_some_and(|kept| sha256_hex(&kept) == sha) {
+        return Ok(sha);
+    }
+    let tmp = folder.join(format!("{sha}.tmp"));
+    crate::tree::remove_tree(&tmp)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    drop(file);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_file() => crate::tree::remove_tree(&path)?,
+        _ => {}
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(sha)
+}
+
+/// The bytes of a regular file at `path`, or `None` when nothing or anything
+/// other than a regular file (a link, a folder) is there.
+fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, RemoteError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    read_optional(path)
+}
+
+/// The kept copy of the file a proposal carries at digest `sha256`, or
+/// `None` when there is none to trust.
+///
+/// `None` covers every way a copy can be missing or wrong: a name that is
+/// not a digest, no `proposed` folder or one that is not a real folder, no
+/// regular file under that name, and bytes that do not hash to the name. A
+/// copy that fails its digest is left where it is; the next
+/// [`write_proposed_copy`] of the right bytes replaces it. Reading never
+/// changes anything on disk.
+pub fn read_proposed_copy(dir: &Path, sha256: &str) -> Result<Option<Vec<u8>>, RemoteError> {
+    if !is_copy_name(sha256) {
+        return Ok(None);
+    }
+    let ProposedFolder::Real(folder) = proposed_folder(dir)? else {
+        return Ok(None);
+    };
+    Ok(read_regular_file(&folder.join(sha256))?.filter(|bytes| sha256_hex(bytes) == sha256))
+}
+
+/// Removes every entry of `<dir>/proposed` that is not a copy named in
+/// `keep`: copies no record carries any more, stray `.tmp` files and anything
+/// that is not a regular file. The folder itself goes once it is empty, and
+/// a `proposed` that is not a real folder is removed as it stands (a link as
+/// a link, never what it points at). A missing folder is not an error.
+pub fn prune_proposed_copies(dir: &Path, keep: &BTreeSet<String>) -> Result<(), RemoteError> {
+    let folder = match proposed_folder(dir)? {
+        ProposedFolder::Absent => return Ok(()),
+        ProposedFolder::Other(path) => return crate::tree::remove_tree(&path),
+        ProposedFolder::Real(path) => path,
+    };
+    for entry in std::fs::read_dir(&folder)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let regular = entry.file_type().is_ok_and(|t| t.is_file());
+        if regular && keep.contains(&name) {
+            continue;
+        }
+        crate::tree::remove_tree(&entry.path())?;
+    }
+    let now_empty = std::fs::read_dir(&folder)
+        .map(|mut e| e.next().is_none())
+        .unwrap_or(false);
+    if now_empty {
+        let _ = std::fs::remove_dir(&folder);
+    }
+    Ok(())
+}
+
+/// The copies `state` still needs: the digest of every added or modified
+/// file of every record in `state.proposals` that is Open or Merged, the
+/// records a chain tip is built from. A Declined or Withdrawn record is
+/// never in the tip, so its copies are not kept.
+pub fn proposed_copies_kept(state: &OriginState) -> BTreeSet<String> {
+    state
+        .proposals
+        .iter()
+        .filter(|p| matches!(p.status, ProposalStatus::Open | ProposalStatus::Merged))
+        .flat_map(|p| p.files.iter())
+        .filter(|f| matches!(f.change, ProposedChange::Added | ProposedChange::Modified))
+        .filter_map(|f| f.sha256.clone())
+        .collect()
+}
+
 /// The team-domain artifact mirror directory under `dir`, `<dir>/artifacts`.
 /// Holds one subdirectory per provisioned artifact kind, each mirroring the
 /// upstream folder an out-of-subtree provisioning decl points at, so a team
@@ -1560,6 +1725,220 @@ mod tests {
             std::fs::remove_dir(&gone).unwrap();
             replace_and_expect_a_real_base(dir.path());
         }
+    }
+
+    #[test]
+    fn a_proposed_copy_round_trips_by_its_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = write_proposed_copy(dir.path(), b"shared\r\n").unwrap();
+        assert_eq!(sha, sha256_hex(b"shared\r\n"));
+        assert_eq!(
+            read_proposed_copy(dir.path(), &sha).unwrap(),
+            Some(b"shared\r\n".to_vec()),
+            "the raw bytes, line endings and all"
+        );
+        assert_eq!(
+            read_proposed_copy(dir.path(), &sha256_hex(b"other")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_second_write_of_the_same_bytes_leaves_the_copy_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = write_proposed_copy(dir.path(), b"same").unwrap();
+        let path = dir.path().join("proposed").join(&sha);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(write_proposed_copy(dir.path(), b"same").unwrap(), sha);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "not written again"
+        );
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("proposed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![sha], "no tmp file left behind");
+    }
+
+    #[test]
+    fn a_copy_name_that_is_not_a_digest_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("proposed")).unwrap();
+        std::fs::write(dir.path().join("secret"), b"outside").unwrap();
+        for name in [
+            "../secret",
+            "SECRET",
+            "",
+            &"A".repeat(64),
+            &"g".repeat(64),
+            &format!("{}/x", "a".repeat(62)),
+        ] {
+            assert_eq!(
+                read_proposed_copy(dir.path(), name).unwrap(),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupted_copy_reads_none_and_stays_until_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = write_proposed_copy(dir.path(), b"right").unwrap();
+        let path = dir.path().join("proposed").join(&sha);
+        std::fs::write(&path, b"wrong").unwrap();
+        assert_eq!(read_proposed_copy(dir.path(), &sha).unwrap(), None);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"wrong",
+            "a read never removes"
+        );
+        write_proposed_copy(dir.path(), b"right").unwrap();
+        assert_eq!(
+            read_proposed_copy(dir.path(), &sha).unwrap(),
+            Some(b"right".to_vec()),
+            "the next write heals it"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_exactly_the_set_and_removes_the_empty_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep_sha = write_proposed_copy(dir.path(), b"keep").unwrap();
+        let drop_sha = write_proposed_copy(dir.path(), b"drop").unwrap();
+        let folder = dir.path().join("proposed");
+        std::fs::write(folder.join(format!("{keep_sha}.tmp")), b"half").unwrap();
+        std::fs::create_dir(folder.join("stray")).unwrap();
+
+        prune_proposed_copies(dir.path(), &BTreeSet::from([keep_sha.clone()])).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![keep_sha.clone()]);
+        assert_eq!(read_proposed_copy(dir.path(), &drop_sha).unwrap(), None);
+
+        prune_proposed_copies(dir.path(), &BTreeSet::new()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&folder).is_err(),
+            "the empty folder is gone"
+        );
+        prune_proposed_copies(dir.path(), &BTreeSet::new()).unwrap();
+    }
+
+    #[test]
+    fn the_kept_set_is_every_open_or_merged_file_with_content() {
+        let file = |path: &str, change, sha: Option<&str>| ProposedFile {
+            path: path.to_string(),
+            change,
+            sha256: sha.map(str::to_string),
+            blob_sha: None,
+            size: None,
+        };
+        let record = |number, status, files| Proposal {
+            number,
+            url: String::new(),
+            branch: String::new(),
+            title: String::new(),
+            created_at: time::now(),
+            status,
+            files,
+            head_commit: None,
+            pending_head_commit: None,
+            base_commit: None,
+            review_state: None,
+            feedback: Vec::new(),
+            updated_at: None,
+            author_login: None,
+        };
+        let mut state = OriginState::new("acme/kb", "main");
+        state.proposals = vec![
+            record(
+                1,
+                ProposalStatus::Open,
+                vec![
+                    file("a.md", ProposedChange::Added, Some("a")),
+                    file("d.md", ProposedChange::Deleted, None),
+                ],
+            ),
+            record(
+                2,
+                ProposalStatus::Merged,
+                vec![file("m.md", ProposedChange::Modified, Some("m"))],
+            ),
+            record(
+                3,
+                ProposalStatus::Declined,
+                vec![file("x.md", ProposedChange::Modified, Some("x"))],
+            ),
+            record(
+                4,
+                ProposalStatus::Withdrawn,
+                vec![file("w.md", ProposedChange::Added, Some("w"))],
+            ),
+        ];
+        assert_eq!(
+            proposed_copies_kept(&state),
+            BTreeSet::from(["a".to_string(), "m".to_string()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_proposed_is_never_written_or_read_through_and_prune_removes_it() {
+        for dangling in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = dir.path().join("elsewhere");
+            if !dangling {
+                std::fs::create_dir(&elsewhere).unwrap();
+                std::fs::write(elsewhere.join(sha256_hex(b"x")), b"x").unwrap();
+            }
+            std::os::unix::fs::symlink(&elsewhere, dir.path().join("proposed")).unwrap();
+
+            assert!(write_proposed_copy(dir.path(), b"y").is_err());
+            assert_eq!(
+                read_proposed_copy(dir.path(), &sha256_hex(b"x")).unwrap(),
+                None
+            );
+            prune_proposed_copies(dir.path(), &BTreeSet::new()).unwrap();
+            assert!(std::fs::symlink_metadata(dir.path().join("proposed")).is_err());
+            if !dangling {
+                assert!(
+                    elsewhere.join(sha256_hex(b"x")).exists(),
+                    "what the link pointed at is untouched"
+                );
+            }
+            write_proposed_copy(dir.path(), b"y").unwrap();
+            let meta = std::fs::symlink_metadata(dir.path().join("proposed")).unwrap();
+            assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_a_copy_name_or_its_tmp_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"not mine").unwrap();
+        let sha = sha256_hex(b"mine");
+        let folder = dir.path().join("proposed");
+        std::fs::create_dir(&folder).unwrap();
+        std::os::unix::fs::symlink(&target, folder.join(&sha)).unwrap();
+        std::os::unix::fs::symlink(&target, folder.join(format!("{sha}.tmp"))).unwrap();
+        assert_eq!(read_proposed_copy(dir.path(), &sha).unwrap(), None);
+
+        write_proposed_copy(dir.path(), b"mine").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"not mine");
+        let meta = std::fs::symlink_metadata(folder.join(&sha)).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(
+            read_proposed_copy(dir.path(), &sha).unwrap(),
+            Some(b"mine".to_vec())
+        );
     }
 
     #[test]

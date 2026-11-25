@@ -7110,7 +7110,8 @@ async fn a_deleted_file_replays_only_where_it_exists_below() {
 // `forget_blob_shas_keeping_size` reaches the kept-entry re-read.
 
 /// Strips the blob sha and size off every file the layer at `index` records,
-/// leaving the record in the pre-0.17.0 shape.
+/// leaving the record in the pre-0.17.0 shape. A version that old kept no
+/// local copies of proposed files either, so those go too.
 fn forget_blob_shas(state_dir: &Path, index: usize) {
     let mut state = load_state(state_dir);
     for file in state.proposals[index].files.iter_mut() {
@@ -7118,6 +7119,37 @@ fn forget_blob_shas(state_dir: &Path, index: usize) {
         file.size = None;
     }
     state.save(state_dir).unwrap();
+    forget_proposed_copies(state_dir);
+}
+
+/// Removes every local copy of a proposed file, the state a share made by a
+/// version before 0.37.0 leaves behind.
+fn forget_proposed_copies(state_dir: &Path) {
+    match std::fs::remove_dir_all(state_dir.join("proposed")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("removing the proposed copies: {e}"),
+    }
+}
+
+/// The digests of the local copies of proposed files, sorted.
+fn proposed_copies(state_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(state_dir.join("proposed")) {
+        Ok(entries) => entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("listing the proposed copies: {e}"),
+    };
+    names.sort();
+    names
+}
+
+/// The sorted digests of `contents`, what [`proposed_copies`] lists for them.
+fn digests(contents: &[&[u8]]) -> Vec<String> {
+    let mut names: Vec<String> = contents.iter().map(|c| sha256_hex(c)).collect();
+    names.sort();
+    names
 }
 
 /// [`forget_blob_shas`] with the recorded size left alone, which is what it
@@ -13355,4 +13387,223 @@ async fn a_reviewer_amendment_leaves_the_discard_on_what_this_machine_shared() {
         Some(amended),
         "the reviewer's commit stays on the branch"
     );
+}
+
+// The local copies of proposed files: a share keeps one per added or modified
+// file, and every share, pull, withdrawal and subscribe prunes them down to
+// what the saved records still carry.
+
+#[tokio::test]
+async fn a_share_keeps_a_copy_of_each_proposed_file() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/gone.md", b"bye\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/new.md"), b"new\n");
+    std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
+    let _ = proposed(stacked_share(&mock, &sub).await);
+
+    assert_eq!(
+        proposed_copies(&sub.state_dir),
+        digests(&[b"alpha v2\n", b"new\n"]),
+        "one copy per file with content, none for the deletion"
+    );
+    assert_eq!(
+        read(
+            &sub.state_dir
+                .join("proposed")
+                .join(sha256_hex(b"alpha v2\n"))
+        ),
+        b"alpha v2\n"
+    );
+}
+
+#[tokio::test]
+async fn a_merged_layer_leaves_its_copies_behind_at_the_pull() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    assert_eq!(proposed_copies(&sub.state_dir), digests(&[b"alpha v2\n"]));
+
+    let head = mock.branch_commit(&first.branch).expect("the layer head");
+    mock.set_branch("main", &head);
+    mock.set_proposal_state(first.number, ProposalState::Merged);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert!(load_state(&sub.state_dir).proposals.is_empty());
+    assert!(
+        std::fs::symlink_metadata(sub.state_dir.join("proposed")).is_err(),
+        "the folder is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawn_layer_drops_its_copies() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert_eq!(
+        proposed_copies(&sub.state_dir),
+        digests(&[b"alpha v2\n", b"beta\n"])
+    );
+
+    stacked_withdraw(&mock, &sub, Some(second.number), false).await;
+    assert_eq!(proposed_copies(&sub.state_dir), digests(&[b"alpha v2\n"]));
+    stacked_withdraw(&mock, &sub, Some(first.number), false).await;
+    assert!(proposed_copies(&sub.state_dir).is_empty());
+}
+
+#[tokio::test]
+async fn a_declined_layer_drops_its_copies_at_the_next_pull() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    mock.set_proposal_state(first.number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals[0].status, ProposalStatus::Declined);
+    assert!(proposed_copies(&sub.state_dir).is_empty());
+}
+
+#[tokio::test]
+async fn an_amend_swaps_the_changed_copy_and_keeps_the_rest() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let _ = updated(amend_share(&mock, &sub, first.number).await);
+
+    assert_eq!(
+        proposed_copies(&sub.state_dir),
+        digests(&[b"alpha v3\n", b"beta\n"])
+    );
+}
+
+#[tokio::test]
+async fn a_copy_two_layers_share_stays_until_both_leave() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/x.md"), b"same\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+    write(&sub.domain_root.join("notes/y.md"), b"same\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert_eq!(proposed_copies(&sub.state_dir), digests(&[b"same\n"]));
+
+    stacked_withdraw(&mock, &sub, Some(second.number), false).await;
+    assert_eq!(
+        proposed_copies(&sub.state_dir),
+        digests(&[b"same\n"]),
+        "the bottom layer still carries the content"
+    );
+    stacked_withdraw(&mock, &sub, Some(first.number), false).await;
+    assert!(proposed_copies(&sub.state_dir).is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_copy_write_does_not_fail_the_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.state_dir.join("proposed"), b"in the way\n");
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+
+    let report = proposed(stacked_share(&mock, &sub).await);
+
+    assert_eq!(report.updated, vec!["notes/a.md".to_string()]);
+    assert_eq!(load_state(&sub.state_dir).proposals.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_share_leaves_no_copies() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    assert_eq!(proposed_copies(&sub.state_dir), digests(&[b"alpha v2\n"]));
+
+    // The update of the open proposal moves its branch and then fails, before
+    // the record takes the new files.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    mock.fail_update_proposal(first.number);
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .expect_err("the update fails");
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        state.proposals[0].files[0].sha256,
+        Some(sha256_hex(b"alpha v2\n")),
+        "the record kept what it carried"
+    );
+    assert_eq!(
+        proposed_copies(&sub.state_dir),
+        digests(&[b"alpha v2\n"]),
+        "the copy the failed share kept is pruned"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_commit_leaves_no_copies() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let _ = committed(share_direct(&mock, &sub, direct()).await);
+    assert!(proposed_copies(&sub.state_dir).is_empty());
+}
+
+#[tokio::test]
+async fn a_fresh_subscribe_prunes_the_copies_an_earlier_one_left() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    mock.set_branch("main", &c1);
+    let work = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let state_dir = state.path().join("origin");
+    write(
+        &state_dir.join("proposed").join(sha256_hex(b"old\n")),
+        b"old\n",
+    );
+    subscribe(
+        &mock,
+        &spec(),
+        &work.path().join("domain"),
+        &state_dir,
+        declared_reflection_mode,
+    )
+    .await
+    .unwrap();
+    assert!(proposed_copies(&state_dir).is_empty());
 }
