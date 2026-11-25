@@ -895,14 +895,16 @@ pub struct ReflectParams {
     /// One-based page number. Defaults to 1.
     #[serde(default)]
     pub page: Option<usize>,
-    /// Whether to hand out `stale` items: pages whose freshness ran out and
-    /// that a reconcile brings in line with their pacts again. Omit for the
+    /// Whether to hand out `stale` items: pages whose freshness ran out or
+    /// that a person marked not fresh, and that a reconcile brings in line
+    /// with their pacts again. Omit for the
     /// default: a run (an unattended session or one holding a loop's
     /// lease) gets them, an interactive session does not. A stale item's
     /// `changed_engrams` counts the engrams changed since its last
     /// reconcile in the domains you may read, or is null when that is
     /// unknown (a domain on a connected server, or a file domain that could
-    /// not be walked).
+    /// not be walked). A count of 0 lets a page be recorded unchanged at
+    /// once, never a marked one (`refresh_requested` or `owned_marked`).
     // Left out when unset, so a call forwarded to an older server, which
     // refuses a key it does not know, carries it only when it was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
