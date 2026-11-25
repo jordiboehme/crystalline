@@ -1221,7 +1221,7 @@ pub struct ProvisionParams {
     /// The domain for allow, deny, take or skip. Omit for status and apply.
     #[serde(default)]
     pub domain: Option<String>,
-    /// The artifacts for take or skip, as <kind>/<name> exactly as status
+    /// The artifacts for take or skip, as `<kind>/<name>` exactly as status
     /// lists them, for example "skills/tide-tables" or "mcps/lighthouse".
     #[serde(default)]
     pub artifacts: Vec<String>,

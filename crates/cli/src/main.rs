@@ -2235,7 +2235,7 @@ enum ProvisionCommand {
     Skip {
         /// The domain to pick from.
         domain: String,
-        /// Artifacts as <kind>/<name>, for example skills/tide-tables.
+        /// Artifacts as kind/name, for example skills/tide-tables.
         /// `provision status` lists them.
         #[arg(required = true, num_args = 1..)]
         artifacts: Vec<String>,
@@ -2251,7 +2251,7 @@ enum ProvisionCommand {
     Take {
         /// The domain to pick from.
         domain: String,
-        /// Artifacts as <kind>/<name>, for example skills/tide-tables.
+        /// Artifacts as kind/name, for example skills/tide-tables.
         /// `provision status` lists them.
         #[arg(required = true, num_args = 1..)]
         artifacts: Vec<String>,
