@@ -261,7 +261,7 @@ fn share_markdown_agent_marks(files: &mut [ArtifactFile]) {
 
 /// [`ArtifactType`]'s declaration order, used to sort a scan's files the
 /// same way regardless of the order its source roots were given in.
-fn kind_order(kind: ArtifactType) -> u8 {
+pub(crate) fn kind_order(kind: ArtifactType) -> u8 {
     match kind {
         ArtifactType::Skills => 0,
         ArtifactType::Commands => 1,
@@ -616,7 +616,6 @@ fn list_artifacts_in(source_roots: &[(ArtifactType, PathBuf)]) -> ArtifactListin
     // Keyed by (kind order, key); the bool says whether a row came from a
     // markdown agent, so a later `.md` agent replaces an earlier `.toml` one.
     let mut rows: BTreeMap<(u8, String), (ArtifactListing, bool)> = BTreeMap::new();
-    let mut present: Vec<ArtifactType> = Vec::new();
 
     let mut add = |kind: ArtifactType, artifact: String, optional: bool, markdown_agent: bool| {
         let key = format!("{}/{}", kind.id(), artifact);
@@ -639,9 +638,6 @@ fn list_artifacts_in(source_roots: &[(ArtifactType, PathBuf)]) -> ArtifactListin
     };
 
     for (kind, root) in source_roots {
-        if root.is_dir() && !present.contains(kind) {
-            present.push(*kind);
-        }
         match kind {
             ArtifactType::Skills => {
                 for (name, skill_dir) in skill_entries(root, &mut notices) {
@@ -693,12 +689,26 @@ fn list_artifacts_in(source_roots: &[(ArtifactType, PathBuf)]) -> ArtifactListin
         }
     }
 
-    present.sort_by_key(|kind| kind_order(*kind));
     ArtifactListingReport {
         artifacts: rows.into_values().map(|(row, _)| row).collect(),
-        present_kinds: present,
+        present_kinds: present_kinds(source_roots),
         notices,
     }
+}
+
+/// The kinds with at least one source root in `source_roots` that exists on
+/// disk as a folder, in kind order. A kind missing here lists nothing, which
+/// must not be read as "the domain ships nothing of this kind": its root may
+/// just not be on this machine yet. Only stats the roots, never reads a file.
+pub(crate) fn present_kinds(source_roots: &[(ArtifactType, PathBuf)]) -> Vec<ArtifactType> {
+    let mut present: Vec<ArtifactType> = Vec::new();
+    for (kind, root) in source_roots {
+        if !present.contains(kind) && root.is_dir() {
+            present.push(*kind);
+        }
+    }
+    present.sort_by_key(|kind| kind_order(*kind));
+    present
 }
 
 /// Recursively collect every visible (non-hidden) file under `dir`, as

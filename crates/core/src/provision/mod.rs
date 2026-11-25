@@ -967,8 +967,8 @@ pub fn apply(
 
 // --- status -------------------------------------------------------------
 
-/// Where a domain sits in the status listing: allowed, undecided and denied
-/// domains that declare provisioning first, then the domains that declare
+/// Where a domain sits in the status listing: allowed (with `only` among
+/// them), undecided and denied domains that declare provisioning first, then the domains that declare
 /// none, then the virtual ones. Within a group the listing goes by name,
 /// case-insensitively, the same comparison `list_domains` uses.
 fn status_group(d: &DomainStatus) -> u8 {
@@ -979,7 +979,7 @@ fn status_group(d: &DomainStatus) -> u8 {
         return 3;
     }
     match d.decision {
-        Decision::Allowed => 0,
+        Decision::Allowed | Decision::Only => 0,
         Decision::Undecided => 1,
         Decision::Denied => 2,
     }
@@ -988,8 +988,12 @@ fn status_group(d: &DomainStatus) -> u8 {
 /// Which side of a provisioning decision a domain is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// `provision: true` - this domain's artifacts are provisioned.
+    /// `provision: true`, or an `except`/`also` map - everything the domain
+    /// ships is provisioned, apart from the names left out and the optional
+    /// artifacts not taken.
     Allowed,
+    /// `provision: {only: [...]}` - only the named artifacts are provisioned.
+    Only,
     /// `provision: false` - this domain's artifacts are never provisioned.
     Denied,
     /// `provision` absent - awaiting a decision.
@@ -1000,8 +1004,9 @@ impl Decision {
     /// The decision a [`DomainEntry`]'s own `provision` field carries.
     fn from_entry(entry: &DomainEntry) -> Decision {
         match &entry.provision {
-            Some(p) if p.includes_any() => Decision::Allowed,
-            Some(_) => Decision::Denied,
+            Some(Provision::All { .. }) => Decision::Allowed,
+            Some(Provision::Only(_)) => Decision::Only,
+            Some(Provision::Deny) => Decision::Denied,
             None => Decision::Undecided,
         }
     }
@@ -1025,6 +1030,36 @@ pub struct DomainStatus {
     pub counts: BTreeMap<String, usize>,
     /// How many `Provisioning` bullets failed to parse into a declaration.
     pub parse_problems: usize,
+    /// The lists of the decision, `None` for plain `true`, `false` and
+    /// undecided.
+    pub selection: Option<Provision>,
+    /// Every artifact the domain ships, one row per key in kind order and
+    /// then by key, with whether this machine's decision installs it. Empty
+    /// for a virtual domain and a domain that declares no provisioning.
+    pub artifacts: Vec<ArtifactState>,
+    /// Names in the decision's lists the domain does not ship now. Only for
+    /// kinds whose root exists on disk: a missing root makes no name stale.
+    pub stale: Vec<String>,
+    /// Names in the decision's lists that are not `<kind>/<name>`.
+    pub malformed: Vec<String>,
+}
+
+/// One artifact a domain ships, as [`DomainStatus::artifacts`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactState {
+    /// The provisioning key, `<kind>/<name>`.
+    pub key: String,
+    /// The artifact's kind.
+    pub kind: ArtifactType,
+    /// The key without its `<kind>/` prefix.
+    pub name: String,
+    /// Whether the author marked it `metadata: { provision: optional }`.
+    pub optional: bool,
+    /// Whether this machine's decision selects it. This is not whether every
+    /// harness installs it (a harness may have no surface for the kind); the
+    /// harness rows say what is installed. Always `false` for an undecided or
+    /// denied domain.
+    pub on: bool,
 }
 
 /// One harness's provisioning status, read straight from the receipt and a
@@ -1130,6 +1165,10 @@ pub fn status(
                 declares: false,
                 counts: BTreeMap::new(),
                 parse_problems: 0,
+                selection: selection_of(entry),
+                artifacts: Vec::new(),
+                stale: Vec::new(),
+                malformed: Vec::new(),
             });
             continue;
         }
@@ -1140,6 +1179,17 @@ pub fn status(
         let parse_problems = section.map(|s| s.problems.len()).unwrap_or(0);
         let roots = resolve_source_roots(name, entry);
         let (artifacts, _scan_notices) = scan_domain(name, &roots);
+        let (rows, stale, malformed) = if declares {
+            let rows = artifact_states(&artifacts, entry.provision.as_ref());
+            let (stale, malformed) = stale_and_malformed(
+                entry.provision.as_ref(),
+                &rows,
+                &model::present_kinds(&roots),
+            );
+            (rows, stale, malformed)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         domains.push(DomainStatus {
             domain: name.clone(),
             is_virtual: false,
@@ -1147,6 +1197,10 @@ pub fn status(
             declares,
             counts: count_artifacts(&artifacts),
             parse_problems,
+            selection: selection_of(entry),
+            artifacts: rows,
+            stale,
+            malformed,
         });
         // Drift and orphans are counted against what `apply` would install:
         // the decision's part of the scan, not the whole of it.
@@ -1203,6 +1257,82 @@ pub fn status(
         pending,
         virtual_with_decision,
     })
+}
+
+/// The decision's lists for [`DomainStatus::selection`]: the decision when
+/// it is a map, `None` for plain `true`, `false` and undecided.
+fn selection_of(entry: &DomainEntry) -> Option<Provision> {
+    entry.provision.clone().filter(|p| !p.is_plain_bool())
+}
+
+/// One row per artifact key of a full (unfiltered) scan, in kind order and
+/// then by key, with whether `decision` selects it.
+///
+/// Every file of a key shares one row: all files of a skill, and an `.md`
+/// and `.toml` agent with the same stem (the row is optional when any of its
+/// files is). Two MCP configs naming the same server give one row, the first
+/// in scan order, as [`list_artifacts`] does.
+fn artifact_states(
+    artifacts: &DomainArtifacts,
+    decision: Option<&Provision>,
+) -> Vec<ArtifactState> {
+    let mut rows: BTreeMap<(u8, String), (ArtifactType, bool)> = BTreeMap::new();
+    for file in &artifacts.files {
+        let slot = rows
+            .entry((model::kind_order(file.kind), artifact_key(file)))
+            .or_insert((file.kind, false));
+        slot.1 |= file.optional;
+    }
+    for mcp in &artifacts.mcps {
+        rows.entry((model::kind_order(ArtifactType::Mcps), mcp_key(mcp)))
+            .or_insert((ArtifactType::Mcps, mcp.optional));
+    }
+    rows.into_iter()
+        .map(|((_, key), (kind, optional))| {
+            let name = key
+                .split_once('/')
+                .map_or(key.as_str(), |(_, name)| name)
+                .to_string();
+            let on = decision.is_some_and(|d| d.selects(&key, optional));
+            ArtifactState {
+                key,
+                kind,
+                name,
+                optional,
+                on,
+            }
+        })
+        .collect()
+}
+
+/// The names in `decision`'s lists that are stale (well formed, of a kind
+/// whose root exists on disk, but not shipped now) and those that are
+/// malformed (not `<kind>/<name>`), each in list order without repeats.
+fn stale_and_malformed(
+    decision: Option<&Provision>,
+    rows: &[ArtifactState],
+    present: &[ArtifactType],
+) -> (Vec<String>, Vec<String>) {
+    let mut stale = Vec::new();
+    let mut malformed = Vec::new();
+    let Some(decision) = decision else {
+        return (stale, malformed);
+    };
+    let mut seen = HashSet::new();
+    for name in decision.names() {
+        if !seen.insert(name) {
+            continue;
+        }
+        match parse_artifact_key(name) {
+            None => malformed.push(name.to_string()),
+            Some((kind, _)) => {
+                if present.contains(&kind) && !rows.iter().any(|row| row.key == name) {
+                    stale.push(name.to_string());
+                }
+            }
+        }
+    }
+    (stale, malformed)
 }
 
 // --- session-start notices --------------------------------------------------
@@ -1740,14 +1870,16 @@ fn is_file_change(status: ActionStatus) -> bool {
 }
 
 /// One line per undecided domain that ships artifacts, naming its per-type
-/// counts and how to decide - raise it with the user, then apply the decision
-/// with the `provision` tool or the CLI. Empty when nothing is pending.
+/// counts and how to decide - ask the user for all, none or a pick, then apply
+/// it with the `provision` tool or the CLI. Counts only: no frontmatter is
+/// read here, so the hook keeps its latency budget; `provision status` lists
+/// each artifact and its optional mark. Empty when nothing is pending.
 fn render_pending(pending: &[PendingDomain]) -> Vec<String> {
     pending
         .iter()
         .map(|p| {
             format!(
-                "[crystalline] The `{}` domain ships artifacts to provision ({}) but has no decision yet - ask the user, then apply it with the `provision` tool or `crystalline provision allow {}`.",
+                "[crystalline] The `{}` domain ships artifacts to provision ({}) but has no decision yet - ask the user whether to install all, none or only some of them, then apply the answer with the `provision` tool (allow, deny, take or skip) or `crystalline provision allow {}`.",
                 p.domain,
                 render_counts(&p.counts),
                 p.domain
@@ -1756,11 +1888,25 @@ fn render_pending(pending: &[PendingDomain]) -> Vec<String> {
         .collect()
 }
 
-/// A domain's artifact counts as `kind: n` pairs in a stable order, for a
-/// pending line - for example `skills: 2, commands: 1`.
+/// A domain's artifact counts as `kind: n` pairs in [`ArtifactType`]
+/// declaration order, for a pending line - for example
+/// `skills: 2, commands: 1`. An id that names no kind goes last.
 fn render_counts(counts: &BTreeMap<String, usize>) -> String {
-    counts
-        .iter()
+    const ORDER: [ArtifactType; 4] = [
+        ArtifactType::Skills,
+        ArtifactType::Commands,
+        ArtifactType::Agents,
+        ArtifactType::Mcps,
+    ];
+    let mut pairs: Vec<(&String, &usize)> = counts.iter().collect();
+    pairs.sort_by_key(|(kind, _)| {
+        ORDER
+            .iter()
+            .position(|k| k.id() == kind.as_str())
+            .unwrap_or(ORDER.len())
+    });
+    pairs
+        .into_iter()
         .map(|(kind, n)| format!("{kind}: {n}"))
         .collect::<Vec<_>>()
         .join(", ")
@@ -2684,6 +2830,297 @@ mod tests {
         assert_eq!(
             report.harnesses[0].drift, 0,
             "the first-declared domain wins"
+        );
+    }
+
+    // --- status artifact rows ------------------------------------------------------
+
+    const OPTIONAL_MARK: &str = "---\nmetadata:\n  provision: optional\n---\n\nBody.\n";
+
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// A harbor that declares skills, agents and mcps: `skills/tide`
+    /// (required, two files), `skills/storm` (optional), `agents/pilot`
+    /// (required), `mcps/buoy` (required) and `mcps/lighthouse` (optional).
+    fn marked_harbor() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_manifest(
+            root,
+            "## Provisioning\n\n- skills: skills\n- agents: agents\n- mcps: mcps\n",
+        );
+        write_file(
+            root,
+            "skills/tide/SKILL.md",
+            "---\nname: tide\n---\n\nTides.\n",
+        );
+        write_file(root, "skills/tide/notes.md", "Notes.\n");
+        write_file(root, "skills/storm/SKILL.md", OPTIONAL_MARK);
+        write_file(root, "agents/pilot.md", "Steer.\n");
+        write_file(
+            root,
+            "mcps/buoy.json",
+            r#"{"name": "buoy", "server": {"type": "stdio"}}"#,
+        );
+        write_file(
+            root,
+            "mcps/lighthouse.json",
+            r#"{"name": "lighthouse", "metadata": {"provision": "optional"}, "server": {"type": "http"}}"#,
+        );
+        dir
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn status_of(global: &GlobalConfig) -> StatusReport {
+        let receipts = tempfile::tempdir().unwrap();
+        status(
+            global,
+            &receipts.path().join("receipt.json"),
+            &[],
+            &HashSet::new(),
+        )
+        .unwrap()
+    }
+
+    fn rows(d: &DomainStatus) -> Vec<(&str, bool, bool)> {
+        d.artifacts
+            .iter()
+            .map(|a| (a.key.as_str(), a.optional, a.on))
+            .collect()
+    }
+
+    fn domain<'a>(report: &'a StatusReport, name: &str) -> &'a DomainStatus {
+        report.domains.iter().find(|d| d.domain == name).unwrap()
+    }
+
+    fn picked_entry(dir: &Path, decision: Provision) -> DomainEntry {
+        let mut entry = DomainEntry::file(dir);
+        entry.provision = Some(decision);
+        entry
+    }
+
+    #[test]
+    fn status_lists_every_artifact_on_or_off_with_its_optional_mark() {
+        let (picked, plain, undecided, denied) = (
+            marked_harbor(),
+            marked_harbor(),
+            marked_harbor(),
+            marked_harbor(),
+        );
+        let pick = Provision::All {
+            except: names(&["skills/tide"]),
+            also: names(&["mcps/lighthouse"]),
+        };
+        let mut global = GlobalConfig::default();
+        let d = &mut global.domains;
+        d.insert("picked".into(), picked_entry(picked.path(), pick.clone()));
+        d.insert(
+            "plain".into(),
+            with_decision(DomainEntry::file(plain.path()), Some(true)),
+        );
+        d.insert("undecided".into(), DomainEntry::file(undecided.path()));
+        d.insert(
+            "denied".into(),
+            with_decision(DomainEntry::file(denied.path()), Some(false)),
+        );
+        let report = status_of(&global);
+
+        let picked = domain(&report, "picked");
+        assert_eq!(picked.selection, Some(pick));
+        assert_eq!(
+            rows(picked),
+            [
+                ("skills/storm", true, false),
+                ("skills/tide", false, false),
+                ("agents/pilot", false, true),
+                ("mcps/buoy", false, true),
+                ("mcps/lighthouse", true, true),
+            ]
+        );
+        let tide = &picked.artifacts[1];
+        assert_eq!(tide.kind, ArtifactType::Skills);
+        assert_eq!(tide.name, "tide");
+        assert!(picked.stale.is_empty() && picked.malformed.is_empty());
+
+        let plain = domain(&report, "plain");
+        assert_eq!(plain.selection, None);
+        assert_eq!(
+            rows(plain),
+            [
+                ("skills/storm", true, false),
+                ("skills/tide", false, true),
+                ("agents/pilot", false, true),
+                ("mcps/buoy", false, true),
+                ("mcps/lighthouse", true, false),
+            ]
+        );
+
+        for name in ["undecided", "denied"] {
+            let d = domain(&report, name);
+            assert_eq!(d.selection, None, "{name}");
+            assert_eq!(d.artifacts.len(), 5, "{name}");
+            assert!(d.artifacts.iter().all(|a| !a.on), "{name}");
+            let optional: Vec<&str> = d
+                .artifacts
+                .iter()
+                .filter(|a| a.optional)
+                .map(|a| a.key.as_str())
+                .collect();
+            assert_eq!(optional, ["skills/storm", "mcps/lighthouse"], "{name}");
+        }
+    }
+
+    #[test]
+    fn status_keeps_empty_artifact_lists_for_virtual_and_undeclaring_domains() {
+        let plain = tempfile::tempdir().unwrap();
+        write_manifest(plain.path(), "");
+        write_file(plain.path(), "skills/tide/SKILL.md", "Tides.\n");
+        let pick = Provision::Only(names(&["nonsense", "skills/gone"]));
+        let mut global = GlobalConfig::default();
+        global
+            .domains
+            .insert("plain".into(), picked_entry(plain.path(), pick.clone()));
+        let mut virtual_entry = DomainEntry::virtual_domain();
+        virtual_entry.provision = Some(pick);
+        global.domains.insert("cloud".into(), virtual_entry);
+        let report = status_of(&global);
+
+        assert_eq!(report.domains.len(), 2);
+        for d in &report.domains {
+            assert!(d.artifacts.is_empty(), "{}", d.domain);
+            assert!(d.stale.is_empty(), "{}", d.domain);
+            assert!(d.malformed.is_empty(), "{}", d.domain);
+        }
+    }
+
+    #[test]
+    fn status_names_stale_and_malformed_names() {
+        let (picked, only) = (marked_harbor(), marked_harbor());
+        let mut global = GlobalConfig::default();
+        let pick = Provision::All {
+            except: names(&["skills/old-charts", "skills", "boats/dinghy", "skills/tide"]),
+            also: names(&["mcps/gone", "mcps/lighthouse", "skills/old-charts"]),
+        }
+        .normalized();
+        global
+            .domains
+            .insert("picked".into(), picked_entry(picked.path(), pick));
+        let pick = Provision::Only(names(&["agents/pilot", "agents/ghost"])).normalized();
+        global
+            .domains
+            .insert("only".into(), picked_entry(only.path(), pick));
+        let report = status_of(&global);
+
+        let picked = domain(&report, "picked");
+        // `except` before `also`, each sorted; a name in both lists once.
+        assert_eq!(picked.stale, names(&["skills/old-charts", "mcps/gone"]));
+        assert_eq!(picked.malformed, names(&["boats/dinghy", "skills"]));
+        // A stale or malformed name adds no artifact row.
+        assert_eq!(picked.artifacts.len(), 5);
+
+        let only = domain(&report, "only");
+        assert_eq!(only.decision, Decision::Only);
+        assert_eq!(only.stale, names(&["agents/ghost"]));
+        assert!(only.malformed.is_empty());
+        assert_eq!(
+            rows(only),
+            [
+                ("skills/storm", true, false),
+                ("skills/tide", false, false),
+                ("agents/pilot", false, true),
+                ("mcps/buoy", false, false),
+                ("mcps/lighthouse", true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_root_reports_no_stale_names() {
+        let dir = tempfile::tempdir().unwrap();
+        // Commands and mcps are declared, but only the skills root is on disk
+        // (a mirror not pulled, a tools repository not checked out).
+        write_manifest(
+            dir.path(),
+            "## Provisioning\n\n- skills: skills\n- commands: commands\n- mcps: mcps\n",
+        );
+        write_file(dir.path(), "skills/tide/SKILL.md", "Tides.\n");
+        let pick = Provision::Only(names(&[
+            "commands/charts/plot-route",
+            "mcps/lighthouse",
+            "skills/old-charts",
+            "skills/tide",
+        ]));
+        let mut global = GlobalConfig::default();
+        global
+            .domains
+            .insert("harbor".into(), picked_entry(dir.path(), pick));
+        let report = status_of(&global);
+
+        let harbor = domain(&report, "harbor");
+        assert_eq!(harbor.stale, names(&["skills/old-charts"]));
+        assert_eq!(rows(harbor), [("skills/tide", false, true)]);
+    }
+
+    #[test]
+    fn only_sorts_with_allowed() {
+        let (alpha, bravo, aaa, abc) = (
+            shipping_domain("a1", "# A\n"),
+            shipping_domain("a2", "# A\n"),
+            shipping_domain("a3", "# A\n"),
+            shipping_domain("a4", "# A\n"),
+        );
+        let mut global = GlobalConfig::default();
+        let d = &mut global.domains;
+        d.insert(
+            "abc".into(),
+            with_decision(DomainEntry::file(abc.path()), Some(false)),
+        );
+        d.insert("aaa".into(), DomainEntry::file(aaa.path()));
+        d.insert(
+            "bravo".into(),
+            picked_entry(bravo.path(), Provision::Only(names(&["agents/a2"]))),
+        );
+        d.insert(
+            "alpha".into(),
+            with_decision(DomainEntry::file(alpha.path()), Some(true)),
+        );
+        let report = status_of(&global);
+
+        let order: Vec<(&str, Decision)> = report
+            .domains
+            .iter()
+            .map(|d| (d.domain.as_str(), d.decision))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("alpha", Decision::Allowed),
+                ("bravo", Decision::Only),
+                ("aaa", Decision::Undecided),
+                ("abc", Decision::Denied),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_pending_offers_all_none_or_pick() {
+        let pending = [PendingDomain {
+            domain: "harbor".to_string(),
+            counts: BTreeMap::from([("skills".to_string(), 2), ("mcps".to_string(), 1)]),
+        }];
+        assert_eq!(
+            render_pending(&pending),
+            vec![
+                "[crystalline] The `harbor` domain ships artifacts to provision (skills: 2, mcps: 1) but has no decision yet - ask the user whether to install all, none or only some of them, then apply the answer with the `provision` tool (allow, deny, take or skip) or `crystalline provision allow harbor`."
+                    .to_string()
+            ]
         );
     }
 }

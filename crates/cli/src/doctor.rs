@@ -740,7 +740,7 @@ pub struct HarnessDoctor {
 pub struct ProvisioningDomainDoctor {
     /// The domain name.
     pub name: String,
-    /// `"allowed"`, `"denied"` or `"undecided"`.
+    /// `"allowed"`, `"only"`, `"denied"` or `"undecided"`.
     pub decision: String,
     /// [`crystalline_core::manifest::ArtifactType::id`] to how many
     /// artifacts of that kind the domain ships.
@@ -5009,6 +5009,7 @@ fn provisioning_decision_label(decision: provision::Decision) -> &'static str {
     use provision::Decision::*;
     match decision {
         Allowed => "allowed",
+        Only => "only",
         Denied => "denied",
         Undecided => "undecided",
     }

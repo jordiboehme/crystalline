@@ -10475,6 +10475,7 @@ fn decision_id(decision: crystalline_core::provision::Decision) -> &'static str 
     use crystalline_core::provision::Decision::*;
     match decision {
         Allowed => "allowed",
+        Only => "only",
         Denied => "denied",
         Undecided => "undecided",
     }
