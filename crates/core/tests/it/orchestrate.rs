@@ -1210,3 +1210,7 @@ fn any_domain_declares_true_and_false_fixtures() {
         .insert("notes".to_string(), DomainEntry::virtual_domain());
     assert!(!provision::any_domain_declares(&plain_global));
 }
+
+// --- a pick of single artifacts and the optional mark --------------------------
+
+mod select;
